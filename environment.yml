@@ -1,0 +1,17 @@
+name: crml_env
+
+channels:
+  - conda-forge
+  - anaconda
+
+dependencies:
+  - conda-forge::python >=3.12.*
+  - conda-forge::numpy  >=2.1.*
+  - conda-forge::pip
+  - conda-forge::pandas
+  - conda-forge::pytest
+  - conda-forge::pytest-cov
+  - conda-forge::pyyaml
+  - anaconda::pydantic
+  - conda-forge::ruff
+  - conda-forge::mypy
