@@ -1,0 +1,52 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.pyd
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Unit test / coverage reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ruff
+.ruff_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+
+# IDE files
+.idea/
+.vscode/
+
+# Sphinx docs
+docs/_build/
+
+# Project planning (not source)
+implementation plan.txt
+CLAUDE.md
