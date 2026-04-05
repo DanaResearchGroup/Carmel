@@ -104,52 +104,6 @@ pytest tests/test_config.py
 pytest tests/test_config.py::TestCarmelConfig::test_minimal_config
 ```
 
-## Architecture
-
-### Current (Phase 0 — Foundations)
-
-```mermaid
-graph LR
-    CLI[CLI] --> Ver[Version]
-    CLI --> VC[Validate Config]
-    CLI --> IW[Init Workspace]
-    VC --> Config[Config Loader<br/>Pydantic Validation]
-    IW --> Paths[Path Utilities]
-    Log[Logging] -.-> CLI
-```
-
-| Module               | Purpose                                    |
-|----------------------|--------------------------------------------|
-| `carmel/config.py`   | Configuration loading and pydantic validation |
-| `carmel/paths.py`    | Path utilities and workspace initialization |
-| `carmel/logger.py`   | Centralized logging configuration           |
-| `Carmel.py`          | CLI entrypoint (repo root)                 |
-
-### Future (Phase 1+)
-
-Carmel will grow into a bounded ensemble of specialized agents:
-
-```mermaid
-graph TD
-    P[Planner] --> LA[Literature Agent]
-    P --> DA[Data Agent]
-    P --> RR[Revision Router]
-    P --> XD[X-Design Agent]
-    P --> EC[Execution Controller]
-    P --> RA[Reporting Agent]
-
-    EC --> T3[T3]
-    EC --> RMG[RMG]
-    EC --> ARC[ARC]
-    EC --> Cantera[Cantera]
-
-    LA --> Evidence[Evidence Store]
-    DA --> Benchmarks[Benchmarks]
-    RR --> Models[Models]
-```
-
-All agents operate under strict governance: deterministic code first, typed schemas, bounded autonomy, full provenance, and human-in-the-loop gates for expensive or high-stakes actions.
-
 ## License
 
 MIT — see [LICENSE](LICENSE).
