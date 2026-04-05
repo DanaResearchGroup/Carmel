@@ -1,4 +1,4 @@
-.PHONY: test lint typecheck format check install
+.PHONY: test lint typecheck format check install docs
 
 test:
 	pytest --cov --cov-report=term-missing
@@ -18,3 +18,6 @@ check: lint typecheck test
 
 install:
 	pip install -e ".[dev]"
+
+docs:
+	mkdocs serve

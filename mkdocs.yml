@@ -1,0 +1,47 @@
+site_name: Carmel
+site_description: Closed-loop campaign manager for predictive chemical kinetics
+site_url: https://danaresearchgroup.github.io/Carmel/
+repo_url: https://github.com/DanaResearchGroup/Carmel
+repo_name: DanaResearchGroup/Carmel
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - tables
+
+nav:
+  - Home: index.md
+  - Architecture: architecture.md
+  - Development: development.md
