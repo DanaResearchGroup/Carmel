@@ -143,16 +143,12 @@ graph TD
     EC --> ARC[ARC]
     EC --> Cantera[Cantera]
 
-    LA --> Evidence[(Evidence Store)]
-    DA --> Benchmarks[(Benchmarks)]
-    RR --> Models[(Models)]
+    LA --> Evidence[Evidence Store]
+    DA --> Benchmarks[Benchmarks]
+    RR --> Models[Models]
 ```
 
 All agents operate under strict governance: deterministic code first, typed schemas, bounded autonomy, full provenance, and human-in-the-loop gates for expensive or high-stakes actions.
-
-## Current Status
-
-**Phase 0 — Foundations.** This release provides a clean, tested Python package skeleton with configuration, workspace management, logging, and CLI. Chemistry logic and agent orchestration will be added in subsequent phases.
 
 ## License
 
