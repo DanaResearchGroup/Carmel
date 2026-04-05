@@ -1,12 +1,5 @@
 # Carmel
 
-[![CI](https://github.com/DanaResearchGroup/Carmel/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/Carmel/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/DanaResearchGroup/Carmel/branch/main/graph/badge.svg)](https://codecov.io/gh/DanaResearchGroup/Carmel)
-[![version](https://img.shields.io/badge/version-0.1.0-informational.svg)](https://github.com/DanaResearchGroup/Carmel)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
-[![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
 ```
         ██████╗ █████╗ ██████╗ ███╗   ███╗███████╗██╗
         ██╔════╝██╔══██╗██╔══██╗████╗ ████║██╔════╝██║
@@ -85,71 +78,3 @@ my-campaign/
 ├── reports/       # Final and intermediate reports
 └── runs/          # Executed tool runs and statuses
 ```
-
-## Development
-
-```bash
-make test        # Run tests with coverage
-make lint        # Lint and format check
-make typecheck   # Type check with mypy
-make check       # All of the above
-make format      # Auto-fix formatting
-make install     # Editable install with dev deps
-```
-
-To run a specific test:
-
-```bash
-pytest tests/test_config.py
-pytest tests/test_config.py::TestCarmelConfig::test_minimal_config
-```
-
-## Architecture
-
-### Current (Phase 0 — Foundations)
-
-```mermaid
-graph LR
-    CLI[CLI] --> Ver[Version]
-    CLI --> VC[Validate Config]
-    CLI --> IW[Init Workspace]
-    VC --> Config[Config Loader<br/>Pydantic Validation]
-    IW --> Paths[Path Utilities]
-    Log[Logging] -.-> CLI
-```
-
-| Module               | Purpose                                    |
-|----------------------|--------------------------------------------|
-| `carmel/config.py`   | Configuration loading and pydantic validation |
-| `carmel/paths.py`    | Path utilities and workspace initialization |
-| `carmel/logger.py`   | Centralized logging configuration           |
-| `Carmel.py`          | CLI entrypoint (repo root)                 |
-
-### Future (Phase 1+)
-
-Carmel will grow into a bounded ensemble of specialized agents:
-
-```mermaid
-graph TD
-    P[Planner] --> LA[Literature Agent]
-    P --> DA[Data Agent]
-    P --> RR[Revision Router]
-    P --> XD[X-Design Agent]
-    P --> EC[Execution Controller]
-    P --> RA[Reporting Agent]
-
-    EC --> T3[T3]
-    EC --> RMG[RMG]
-    EC --> ARC[ARC]
-    EC --> Cantera[Cantera]
-
-    LA --> Evidence[Evidence Store]
-    DA --> Benchmarks[Benchmarks]
-    RR --> Models[Models]
-```
-
-All agents operate under strict governance: deterministic code first, typed schemas, bounded autonomy, full provenance, and human-in-the-loop gates for expensive or high-stakes actions.
-
-## License
-
-MIT — see [LICENSE](LICENSE).

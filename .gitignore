@@ -44,8 +44,9 @@ venv/
 .idea/
 .vscode/
 
-# Sphinx docs
+# Docs build output
 docs/_build/
+site/
 
 # Project planning (not source)
 implementation plan.txt
