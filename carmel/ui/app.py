@@ -48,13 +48,19 @@ _log = get_logger("ui")
 
 
 def _resolve_workspaces_root(workspaces_root: Path | None) -> Path:
-    """Resolve the workspaces root directory."""
+    """Resolve the workspaces root directory.
+
+    Preference order:
+        1. explicit ``workspaces_root`` argument
+        2. ``$CARMEL_WORKSPACES`` env var
+        3. ``~/carmel_workspaces`` (user-level default, repo-independent)
+    """
     if workspaces_root is not None:
-        return Path(workspaces_root)
+        return Path(workspaces_root).expanduser()
     env = os.environ.get("CARMEL_WORKSPACES")
     if env:
-        return Path(env)
-    return Path.cwd() / "workspaces"
+        return Path(env).expanduser()
+    return Path.home() / "carmel_workspaces"
 
 
 def _safe_workspace_dirname(name: str) -> str:
