@@ -1,0 +1,66 @@
+{% extends "base.html" %}
+
+{% block title %}New Campaign — Carmel{% endblock %}
+
+{% block content %}
+<div class="dashboard-head">
+  <h1>New Kinetic Campaign</h1>
+  <span class="muted">Define the boundary conditions for the engine</span>
+</div>
+
+<form method="POST" action="{{ url_for('campaign_new') }}" class="form-stack">
+
+  <fieldset class="section">
+    <legend>Identity</legend>
+    <p class="hint">A short workspace name. Becomes the directory name on disk.</p>
+    <label for="ws-name">Workspace name</label>
+    <input id="ws-name" type="text" name="workspace_name" required value="{{ form.workspace_name if form else '' }}">
+  </fieldset>
+
+  <fieldset class="section">
+    <legend>Initial mixture</legend>
+    <p class="hint">One component per line: <code>species,mole_fraction[,smiles]</code></p>
+    <textarea name="mixture_components" rows="4" required>{{ form.mixture_components if form else 'CH4,0.05\nO2,0.20\nN2,0.75' }}</textarea>
+  </fieldset>
+
+  <fieldset class="section">
+    <legend>Target observables</legend>
+    <p class="hint">One per line: <code>name[,species]</code></p>
+    <textarea name="observables" rows="3" required>{{ form.observables if form else 'ignition_delay\nspecies_profile,OH' }}</textarea>
+  </fieldset>
+
+  <fieldset class="section">
+    <legend>Reactor systems</legend>
+    <p class="hint">
+      One per line: <code>type,Tmin,Tmax,Pmin,Pmax[,residence_s]</code>
+      &nbsp;·&nbsp; types: <code>jsr</code>, <code>pfr</code>, <code>batch</code>, <code>shock_tube</code>, <code>rcm</code>, <code>flame</code>
+    </p>
+    <textarea name="reactors" rows="3" required>{{ form.reactors if form else 'jsr,800,1200,1.0,5.0,1.0' }}</textarea>
+  </fieldset>
+
+  <fieldset class="section">
+    <legend>Budgets</legend>
+    <div class="form-row">
+      <div>
+        <label for="cpu">CPU hours</label>
+        <input id="cpu" type="number" name="cpu_hours" min="0.1" step="0.1" required value="{{ form.cpu_hours if form else '20' }}">
+      </div>
+      <div>
+        <label for="exp">Experiment budget (currency-like)</label>
+        <input id="exp" type="number" name="experiment_budget" min="0" step="100" required value="{{ form.experiment_budget if form else '0' }}">
+      </div>
+    </div>
+  </fieldset>
+
+  <fieldset class="section">
+    <legend>Notes (optional)</legend>
+    <p class="hint">Free-form context. Stored as part of the canonical campaign artifact.</p>
+    <textarea name="notes" rows="2">{{ form.notes if form else '' }}</textarea>
+  </fieldset>
+
+  <div class="actions">
+    <button type="submit" class="primary">Create &amp; initialize campaign</button>
+    <a class="btn" href="{{ url_for('index') }}">Cancel</a>
+  </div>
+</form>
+{% endblock %}

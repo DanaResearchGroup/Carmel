@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% from "_pill.html" import state_pill %}
+
+{% block title %}Campaigns — Carmel{% endblock %}
+
+{% block content %}
+<div class="dashboard-head">
+  <h1>Campaigns</h1>
+  <span class="muted">{{ campaigns | length }} total</span>
+</div>
+
+{% if campaigns %}
+  <table class="data">
+    <thead>
+      <tr>
+        <th>Workspace</th>
+        <th>Created</th>
+        <th>Reactors</th>
+        <th>Observables</th>
+        <th>CPU budget</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for c in campaigns %}
+        <tr>
+          <td><strong>{{ c.input.workspace_name }}</strong></td>
+          <td class="mono">{{ c.created_at | format_datetime }}</td>
+          <td>{{ c.input.target_reactor_systems | length }}</td>
+          <td>{{ c.input.target_observables | length }}</td>
+          <td>{{ "%.0f"|format(c.input.budgets.cpu_hours) }} h</td>
+          <td><a href="{{ url_for('campaign_dashboard', campaign_id=c.campaign_id) }}">open →</a></td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% else %}
+  <p class="empty">No campaigns yet. <a href="{{ url_for('campaign_new') }}">Create your first one</a>.</p>
+{% endif %}
+{% endblock %}
