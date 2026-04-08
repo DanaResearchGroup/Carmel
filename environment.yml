@@ -13,5 +13,6 @@ dependencies:
   - conda-forge::pytest-cov
   - conda-forge::pyyaml
   - anaconda::pydantic
+  - conda-forge::flask
   - conda-forge::ruff
   - conda-forge::mypy

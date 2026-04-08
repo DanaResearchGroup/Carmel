@@ -6,8 +6,30 @@ on:
   pull_request:
     branches: [main]
 
+# Two CI lanes:
+#
+#   1. REQUIRED LANE — `lint` + `test` jobs.
+#      Pure-Python, fast, no external chemistry stack. Must pass for merge.
+#
+#   2. BEST-EFFORT LANE — `tools` job.
+#      Installs the full RMG-Py / RMG-database / ARC / T3 stack via conda
+#      and exercises the real T3 subprocess path. Currently best-effort
+#      because of one specific upstream blocker:
+#
+#        ARC's arc/main.py imports `from distutils.spawn import find_executable`
+#        which was removed from the Python standard library in 3.12.
+#        Until that is migrated upstream (e.g. to `shutil.which`), T3
+#        cannot be imported on Python 3.12 even when the package is on
+#        sys.path. The `tests/test_t3_adapter.py::TestT3AdapterRealSubprocess`
+#        suite is gated on the stricter `is_t3_importable()` probe so it
+#        skips cleanly until that lands.
+#
+#      Once ARC ships the fix, the `tools` job becomes required and
+#      `continue-on-error` should be removed from its install steps.
+
 jobs:
   lint:
+    name: Lint + format + typecheck (required)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,6 +51,7 @@ jobs:
         run: make typecheck
 
   test:
+    name: Tests + packaging smoke (required)
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -50,9 +73,98 @@ jobs:
       - name: Run tests with coverage
         run: pytest --cov --cov-branch --cov-report=term-missing --cov-report=xml
 
+      - name: Packaging smoke — console script and Flask app boot
+        run: |
+          carmel version
+          carmel --help
+          carmel serve --help
+          python -c "from carmel.ui import create_app; app = create_app(); client = app.test_client(); r = client.get('/'); assert r.status_code == 200, f'expected 200, got {r.status_code}'; print('Flask app boot ok')"
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
           fail_ci_if_error: false
+
+  tools:
+    name: Real T3/ARC/RMG (best-effort, blocked on ARC distutils)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash -el {0}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          python-version: "3.12"
+          miniforge-version: latest
+          activate-environment: rmg_env
+          channels: conda-forge,defaults
+
+      - name: Cache conda packages
+        uses: actions/cache@v4
+        with:
+          path: ~/conda_pkgs_dir
+          key: ${{ runner.os }}-conda-${{ hashFiles('environment.yml') }}
+
+      - name: Clone RMG-Py
+        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-Py.git $HOME/RMG-Py
+
+      - name: Clone RMG-database
+        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-database.git $HOME/RMG-database
+
+      - name: Clone ARC
+        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/ARC.git $HOME/ARC
+
+      - name: Clone T3
+        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/T3.git $HOME/T3
+
+      # Install steps remain best-effort because the upstream RMG conda
+      # environment can be flaky and the chemistry stack is large.
+      # Once the toolchain stabilizes for Python 3.12 these should drop
+      # `continue-on-error`.
+      - name: Install RMG-Py environment
+        working-directory: ${{ env.HOME }}/RMG-Py
+        run: |
+          conda env update -n rmg_env -f environment.yml
+          make
+        continue-on-error: true
+
+      - name: Install ARC dependencies
+        working-directory: ${{ env.HOME }}/ARC
+        run: |
+          if [ -f environment.yml ]; then conda env update -n rmg_env -f environment.yml; fi
+          pip install -e .
+        continue-on-error: true
+
+      - name: Install T3 dependencies
+        working-directory: ${{ env.HOME }}/T3
+        run: |
+          if [ -f environment.yml ]; then conda env update -n rmg_env -f environment.yml; fi
+          pip install -e .
+        continue-on-error: true
+
+      - name: Set RMG paths
+        run: |
+          echo "PYTHONPATH=$HOME/RMG-Py:$HOME/ARC:$HOME/T3:$PYTHONPATH" >> $GITHUB_ENV
+          echo "rmgpy_path=$HOME/RMG-Py" >> $GITHUB_ENV
+          echo "T3_PATH=$HOME/T3" >> $GITHUB_ENV
+
+      - name: Install Carmel
+        run: pip install -e ".[dev]"
+
+      - name: Probe T3 importability
+        # If this fails the upstream blocker is still in effect.
+        # The next step's tests will skip cleanly via the @requires_t3 marker.
+        run: python -c "from carmel.adapters.t3 import is_t3_importable; print('T3 importable:', is_t3_importable())"
+        continue-on-error: true
+
+      # The test step itself does NOT use continue-on-error: if T3 is
+      # importable then the real subprocess test must pass. If T3 is not
+      # importable, the @requires_t3 marker skips it cleanly and pytest
+      # exits 0.
+      - name: Run T3-dependent tests
+        run: pytest tests/test_t3_adapter.py -v

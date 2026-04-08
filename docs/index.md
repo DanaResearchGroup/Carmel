@@ -12,69 +12,91 @@
 
 **Closed-loop campaign manager for predictive chemical kinetics.**
 
-Carmel automates the iterative cycle of building, validating, refining, validating, and revising predictive chemical kinetic models. It orchestrates simulation tools, literature evidence, experiment design, and model revision through a bounded ensemble of specialized agents with full provenance tracking and human-in-the-loop governance.
+Carmel automates the iterative cycle of building, validating, and
+revising predictive chemical kinetic models. It orchestrates simulation
+tools, experiment design, and model revision through a deterministic
+service layer with full provenance tracking and human-in-the-loop
+governance.
 
-## Installation
+## Phase 1 Capabilities
 
-### Prerequisites
+- **Structured campaign intake** through a local Flask UI
+- **Canonical campaign artifacts** persisted as YAML/JSON files
+- **Deterministic planner** producing a baseline T3 handshake action
+- **Approval policy engine** with budget-based auto-approval thresholds
+- **Real T3 subprocess adapter** that normalizes output into typed `DiagnosticsV1`
+- **Lifecycle state machine** with explicit transitions
+- **Append-only decision log** and per-action provenance records
+- **Graphical compute-selection view** rendered as deterministic SVG artifacts
+- **Free-text intake** as an advisory-only review path
 
-- Python 3.12+
-- [Conda](https://docs.conda.io/en/latest/)
-
-### Setup
+## Quick Start
 
 ```bash
-# Clone the repository
+# Clone
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
 
-# Create and activate the conda environment
+# Install
 conda env create -f environment.yml
 conda activate crml_env
-
-# Install Carmel in editable mode with dev dependencies
 make install
+
+# Launch the UI
+carmel serve --workspaces ./workspaces
 ```
 
-## Usage
+Then open http://127.0.0.1:5000.
 
-```bash
-# Show version
-carmel version
+## Configuration
 
-# Validate a configuration file
-carmel validate-config config.yaml
-
-# Initialize a new workspace
-carmel init-workspace my-campaign
-```
-
-### Configuration
-
-Carmel workspaces are configured via YAML:
+A campaign is defined by a structured input. The minimum is:
 
 ```yaml
 workspace_name: ethanol-combustion
-workspace_root: ./workspaces/ethanol
-logging_level: INFO
+initial_mixture:
+  components:
+    - species: C2H5OH
+      mole_fraction: 0.05
+    - species: O2
+      mole_fraction: 0.20
+    - species: N2
+      mole_fraction: 0.75
+target_observables:
+  - name: ignition_delay
+target_reactor_systems:
+  - reactor_type: jsr
+    temperature_range_K: [800, 1200]
+    pressure_range_bar: [1.0, 5.0]
+    residence_time_s: 1.0
 budgets:
-  cpu_hours: 500.0
-  experiment_budget: 10000.0
-metadata:
-  author: researcher
-  description: Ethanol oxidation mechanism development
+  cpu_hours: 20.0
+  experiment_budget: 0.0
 ```
 
-### Workspace Structure
+The Flask UI provides a structured form that maps to this schema. The
+canonical artifact lives at `<workspace>/campaign.yaml`.
 
-`carmel init-workspace` creates the standard directory scaffold:
+## Workspace Structure
+
+`carmel init-workspace` (and `create_campaign`) create:
 
 ```
 my-campaign/
-├── benchmarks/    # Curated benchmark bundles and credence records
-├── evidence/      # Literature memos, extracted records, source links
-├── models/        # Generated mechanism versions and diffs
-├── provenance/    # Hashes, versions, tool settings, costs
-├── reports/       # Final and intermediate reports
-└── runs/          # Executed tool runs and statuses
+├── campaign.yaml               # Canonical structured input
+├── approval_policy.yaml        # Active approval policy
+├── campaign_state.json         # Current lifecycle state
+├── plan.json / plan.md         # Current plan (canonical + rendered)
+├── decision_log.jsonl          # Append-only decision stream
+├── diagnostics.json            # Normalized T3 output (when available)
+├── benchmarks/  evidence/  models/  provenance/  reports/  runs/
 ```
+
+## CLI
+
+| Command                       | Purpose                              |
+|-------------------------------|--------------------------------------|
+| `carmel version`              | Print version                        |
+| `carmel validate-config FILE` | Validate a config file               |
+| `carmel init-workspace DIR`   | Initialize a workspace scaffold      |
+| `carmel serve`                | Launch the local Flask UI            |
