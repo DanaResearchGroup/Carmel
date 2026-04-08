@@ -1,0 +1,16 @@
+{# Reusable status pill macro for any campaign state value. #}
+{% macro state_pill(state_value) -%}
+  {%- set tone_map = {
+        'draft': 'default',
+        'validated': 'default',
+        'ready_for_planning': 'default',
+        'plan_pending_approval': 'warning',
+        'approved_for_execution': 'blue',
+        'running_t3': 'active',
+        'diagnostics_ready': 'success',
+        'completed_phase1': 'success',
+        'blocked': 'warning',
+        'failed': 'error',
+      } -%}
+  <span class="pill pill-{{ tone_map.get(state_value, 'default') }}">{{ state_value }}</span>
+{%- endmacro %}

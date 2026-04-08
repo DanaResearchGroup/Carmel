@@ -1,0 +1,196 @@
+{% extends "base.html" %}
+{% from "_pill.html" import state_pill %}
+
+{% block title %}{{ campaign.input.workspace_name }} — Carmel{% endblock %}
+
+{% block head_extra %}
+  {# Auto-refresh the dashboard while a T3 run is in flight. #}
+  {% if state.state.value == 'running_t3' %}
+    <meta http-equiv="refresh" content="5">
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+<div class="dashboard-head">
+  <h1>{{ campaign.input.workspace_name }}</h1>
+  {{ state_pill(state.state.value) }}
+</div>
+
+<div class="statusbar">
+  <div class="sb-group">
+    <span class="sb-label">Status</span>
+    {{ state_pill(state.state.value) }}
+  </div>
+  <div class="sb-group">
+    <span class="sb-label">Created</span>
+    <span class="sb-value">{{ campaign.created_at | format_datetime }}</span>
+  </div>
+  <div class="sb-group">
+    <span class="sb-label">Updated</span>
+    <span class="sb-value">{{ state.updated_at | format_datetime }}</span>
+  </div>
+  <div class="sb-group">
+    <span class="sb-label">CPU budget</span>
+    <span class="sb-value">{{ "%.1f"|format(campaign.input.budgets.cpu_hours) }} h</span>
+  </div>
+</div>
+
+<div class="grid">
+
+  {# ---------------- Campaign card ---------------- #}
+  <article class="card">
+    <div class="card-head"><h2>Campaign</h2></div>
+    <dl>
+      <dt>ID</dt><dd><code>{{ campaign.campaign_id }}</code></dd>
+      <dt>Workspace</dt><dd><code>{{ workspace_root }}</code></dd>
+      <dt>Reactors</dt><dd>{{ campaign.input.target_reactor_systems | length }}</dd>
+      <dt>Observables</dt><dd>{{ campaign.input.target_observables | length }}</dd>
+      <dt>Mixture</dt><dd>{{ campaign.input.initial_mixture.components | length }} component(s)</dd>
+      <dt>Entry mode</dt><dd>{{ campaign.input.entry_mode.value }}</dd>
+    </dl>
+  </article>
+
+  {# ---------------- Plan / approval card ---------------- #}
+  <article class="card {% if state.state.value == 'plan_pending_approval' %}pending-approval{% endif %}">
+    <div class="card-head">
+      <h2>Plan{% if plan %} · pending approval{% if state.state.value == 'plan_pending_approval' %} ⚠{% endif %}{% endif %}</h2>
+    </div>
+    {% if plan %}
+      <p class="muted" style="margin-top:0">{{ plan.rationale }}</p>
+      <ul style="padding-left:1.1rem; margin:0.5rem 0">
+        {% for action in plan.actions %}
+          <li>
+            <strong>{{ action.kind.value }}</strong> — {{ action.description }}<br>
+            <small class="mono muted">
+              {{ "%.1f"|format(action.estimated_cpu_hours) }} CPU·h · {{ action.approval_requirement.value }}
+            </small>
+          </li>
+        {% endfor %}
+      </ul>
+      {% if state.state.value == 'plan_pending_approval' %}
+        <div class="actions">
+          <form method="POST" action="{{ url_for('campaign_approve', campaign_id=campaign.campaign_id) }}" style="display:inline">
+            <button class="success">Approve &amp; execute</button>
+          </form>
+          <form method="POST" action="{{ url_for('campaign_reject', campaign_id=campaign.campaign_id) }}" style="display:inline">
+            <button class="danger">Reject</button>
+          </form>
+        </div>
+      {% elif state.state.value == 'approved_for_execution' %}
+        <form method="POST" action="{{ url_for('campaign_run', campaign_id=campaign.campaign_id) }}">
+          <button class="primary">Run T3</button>
+        </form>
+      {% endif %}
+    {% else %}
+      <p class="empty">No plan yet.</p>
+      {% if state.state.value == 'ready_for_planning' %}
+        <form method="POST" action="{{ url_for('campaign_plan', campaign_id=campaign.campaign_id) }}">
+          <button class="primary">Generate plan</button>
+        </form>
+      {% endif %}
+    {% endif %}
+  </article>
+
+  {# ---------------- Run status ---------------- #}
+  <article class="card {% if state.state.value == 'running_t3' %}active-running{% endif %}">
+    <div class="card-head"><h2>Run status</h2></div>
+    {% if state.state.value == 'running_t3' %}
+      <p>Run in progress. Page auto-refreshes every 5 seconds.</p>
+    {% elif latest_run_path %}
+      <dl>
+        <dt>Latest run record</dt><dd><code>runs/{{ latest_run_path }}</code></dd>
+      </dl>
+    {% else %}
+      <p class="empty">No runs yet.</p>
+    {% endif %}
+  </article>
+
+  {# ---------------- Diagnostics ---------------- #}
+  <article class="card">
+    <div class="card-head"><h2>Diagnostics</h2></div>
+    {% if diagnostics %}
+      <dl>
+        <dt>Run ID</dt><dd><code>{{ diagnostics.run_id }}</code></dd>
+        <dt>Generated</dt><dd>{{ diagnostics.generated_at | format_datetime }}</dd>
+        {% if diagnostics.level_of_theory %}<dt>Level of theory</dt><dd><code>{{ diagnostics.level_of_theory }}</code></dd>{% endif %}
+        {% if diagnostics.model_version %}<dt>Model version</dt><dd>{{ diagnostics.model_version }}</dd>{% endif %}
+        <dt>Species</dt><dd>{{ diagnostics.species_to_compute | length }}</dd>
+        <dt>Reactions</dt><dd>{{ diagnostics.reactions_to_compute | length }}</dd>
+        <dt>PDep networks</dt><dd>{{ diagnostics.pdep_networks_to_compute | length }}</dd>
+      </dl>
+    {% else %}
+      <p class="empty">No diagnostics yet.</p>
+    {% endif %}
+  </article>
+
+  {# ---------------- Compute selection (graphical) ---------------- #}
+  <article class="card wide">
+    <div class="card-head"><h2>Compute selection</h2></div>
+    <p class="muted" style="margin-top:0">
+      Generated from persisted T3 diagnostics under <code>models/</code>.
+    </p>
+    <div class="svg-block">
+      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='species_selection.svg') }}" type="image/svg+xml"></object>
+    </div>
+    <div class="svg-block">
+      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='reactions_selection.svg') }}" type="image/svg+xml"></object>
+    </div>
+    <div class="svg-block">
+      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='pdep_networks_selection.svg') }}" type="image/svg+xml"></object>
+    </div>
+  </article>
+
+  {# ---------------- Decision feed ---------------- #}
+  <article class="card wide">
+    <div class="card-head"><h2>Decision log · latest 20</h2></div>
+    {% if events %}
+      <ul class="feed">
+        {% for e in events %}
+          <li>
+            <span class="when">{{ e.timestamp | format_datetime }}</span>
+            <span class="what">
+              <strong>{{ e.event }}</strong>{% if e.status %} · {{ e.status }}{% endif %}{% if e.failure_code and e.failure_code != 'none' %} · {{ e.failure_code }}{% endif %}
+            </span>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="empty">No events yet.</p>
+    {% endif %}
+  </article>
+
+  {# ---------------- Artifacts quick-links ---------------- #}
+  <article class="card">
+    <div class="card-head"><h2>Artifacts</h2></div>
+    <ul class="artifacts">
+      <li><span class="file-name">campaign.yaml</span><span class="file-state present">canonical</span></li>
+      <li><span class="file-name">approval_policy.yaml</span><span class="file-state present">canonical</span></li>
+      <li><span class="file-name">campaign_state.json</span><span class="file-state present">canonical</span></li>
+      <li><span class="file-name">decision_log.jsonl</span><span class="file-state present">append-only</span></li>
+      <li>
+        <span class="file-name">plan.json</span>
+        <span class="file-state {% if plan %}present{% endif %}">{{ 'present' if plan else 'pending' }}</span>
+      </li>
+      <li>
+        <span class="file-name">diagnostics.json</span>
+        <span class="file-state {% if diagnostics %}present{% endif %}">{{ 'present' if diagnostics else 'pending' }}</span>
+      </li>
+    </ul>
+  </article>
+
+  {# ---------------- Free-text intake (advisory) ---------------- #}
+  <article class="card">
+    <div class="card-head"><h2>Free-text intake</h2></div>
+    <p class="muted" style="margin-top:0">
+      Advisory only. Free text is parsed into a review note and never becomes canonical campaign state.
+    </p>
+    <form method="POST" action="{{ url_for('campaign_free_text', campaign_id=campaign.campaign_id) }}">
+      <textarea name="free_text" rows="3" placeholder="Paste any context here..."></textarea>
+      <div class="actions">
+        <button type="submit">Save review</button>
+      </div>
+    </form>
+  </article>
+
+</div>
+{% endblock %}
