@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """T3 adapter — real subprocess execution and diagnostics normalization.
 
 T3 is the *Tandem Tool* from the ReactionMechanismGenerator org. T3 is

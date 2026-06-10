@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Phase 1 domain schemas for Carmel."""
 
 from carmel.schemas.approval import (

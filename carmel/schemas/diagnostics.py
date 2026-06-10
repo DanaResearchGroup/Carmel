@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Diagnostics schema for normalized T3 output."""
 
 from datetime import datetime

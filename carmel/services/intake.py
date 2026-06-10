@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Assistive free-text intake parsing protocol and stub backend.
 
 The intake parser is intentionally a typed protocol with a no-op stub

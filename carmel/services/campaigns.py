@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Campaign lifecycle services: creation, loading, listing."""
 
 from datetime import UTC, datetime

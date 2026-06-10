@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Flask application factory and routes for Carmel.
 
 The UI layer is intentionally thin: route handlers parse form data,

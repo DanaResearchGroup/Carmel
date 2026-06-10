@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Pure-Python SVG rendering for compute selection display.
 
 These renderers produce static SVG strings/files that visualize which

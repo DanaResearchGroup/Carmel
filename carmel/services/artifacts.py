@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Atomic JSON/YAML artifact read/write helpers."""
 
 import json

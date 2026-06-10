@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Deterministic rule-based planner for Phase 1."""
 
 from datetime import UTC, datetime

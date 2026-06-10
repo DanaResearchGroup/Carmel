@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """High-level orchestration of T3 execution and diagnostics persistence.
 
 This module owns the *workflow* around a T3 run: state transitions,
