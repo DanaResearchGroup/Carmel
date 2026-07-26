@@ -5,6 +5,7 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
@@ -12,6 +13,7 @@ from carmel.schemas.campaign import Campaign
 from carmel.schemas.plan import Plan, PlannedAction
 from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
+from carmel.services.authorization import ExecutionEnvelope, authorize_action, record_authorization
 
 PLAN_JSON_NAME = "plan.json"
 PLAN_MD_NAME = "plan.md"
@@ -90,6 +92,95 @@ def generate_initial_plan(
         rationale="Deterministic Phase 1 baseline plan",
         total_estimated_cpu_hours=estimated,
         requires_approval=requirement == ApprovalRequirement.REQUIRES_APPROVAL,
+    )
+
+
+def estimate_arc_cpu_hours(species: list[dict[str, Any]], reactions: list[dict[str, Any]]) -> float:
+    """Estimate CPU hours for a standalone ARC job.
+
+    A simple deterministic estimate: one unit per species plus two per reaction
+    (a reaction additionally needs a TS search). Sufficient to drive the
+    execution-envelope gate.
+    """
+    return float(max(1, len(species)) + 2 * len(reactions))
+
+
+def generate_arc_plan(
+    campaign: Campaign,
+    species: list[dict[str, Any]] | None = None,
+    reactions: list[dict[str, Any]] | None = None,
+    level_of_theory: str | None = None,
+    job_types: dict[str, bool] | None = None,
+    envelopes: dict[ActionKind, ExecutionEnvelope] | None = None,
+    workspace_root: Path | None = None,
+) -> Plan:
+    """Generate a single-action ``run_arc`` plan, gated by the execution envelope.
+
+    Peer to :func:`generate_initial_plan`. The action's approval requirement is
+    set by the shared, adapter-agnostic
+    :func:`carmel.services.authorization.authorize_action` against the ARC
+    envelope **and** the campaign's remaining ``cpu_hours`` — the same symmetric
+    gate applied to T3.
+
+    Args:
+        campaign: The campaign to plan for.
+        species: Species to compute (``[{label, smiles}]``); defaults to the
+            campaign's initial mixture when omitted.
+        reactions: Optional reactions to compute (``[{label}]``).
+        level_of_theory: Optional level of theory (a ``mock``-containing level
+            routes ARC to its Mockter adapter).
+        job_types: Optional ARC job-type profile.
+        envelopes: Optional envelope override (defaults to the conservative
+            per-adapter defaults).
+        workspace_root: Optional campaign workspace. When given, the envelope
+            authorization decision is appended to that workspace's decision log,
+            so the gate that set ``approval_requirement`` is auditable.
+
+    Returns:
+        A Plan with a single ``run_arc`` action.
+    """
+    species = species or [
+        {"label": c.species, **({"smiles": c.smiles} if c.smiles else {})}
+        for c in campaign.input.initial_mixture.components
+    ]
+    reactions = reactions or []
+    estimated = estimate_arc_cpu_hours(species, reactions)
+
+    parameters: dict[str, Any] = {"species": species}
+    if reactions:
+        parameters["reactions"] = reactions
+    if level_of_theory:
+        parameters["level_of_theory"] = level_of_theory
+    if job_types:
+        parameters["job_types"] = job_types
+
+    action = PlannedAction(
+        action_id=str(uuid4()),
+        kind=ActionKind.ARC_RUN,
+        description="Standalone ARC job — compute thermochemistry/rates for selected species",
+        estimated_cpu_hours=estimated,
+        estimated_cost=0.0,
+        rationale=(
+            f"Refine {len(species)} species"
+            + (f" and {len(reactions)} reaction(s)" if reactions else "")
+            + " with a single ARC job."
+        ),
+        approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        parameters=parameters,
+    )
+
+    result = authorize_action(action, campaign.input.budgets.cpu_hours, envelopes)
+    action = action.model_copy(update={"approval_requirement": result.requirement})
+    if workspace_root is not None:
+        record_authorization(workspace_root, action, result)
+    return Plan(
+        plan_id=str(uuid4()),
+        campaign_id=campaign.campaign_id,
+        created_at=datetime.now(UTC),
+        actions=[action],
+        rationale=f"ARC standalone plan ({result.rationale})",
+        total_estimated_cpu_hours=estimated,
+        requires_approval=result.requirement == ApprovalRequirement.REQUIRES_APPROVAL,
     )
 
 

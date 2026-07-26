@@ -35,6 +35,7 @@ from carmel.services.provenance import record
 from carmel.services.state_machine import can_transition, load_state, update_state
 
 DIAGNOSTICS_FILE_NAME = "diagnostics.json"
+ARC_DIAGNOSTICS_FILE_NAME = "arc_diagnostics.json"
 RUNS_DIR_NAME = "runs"
 MODELS_DIR_NAME = "models"
 
@@ -48,6 +49,24 @@ class T3AdapterProtocol(Protocol):
     Tests may provide an inline double conforming to this protocol — this
     is **not** a mock adapter mode in production code; production
     callers always inject the real adapter.
+    """
+
+    def run(
+        self,
+        workspace_root: Path,
+        campaign: Campaign,
+        action: PlannedAction,
+    ) -> tuple[RunRecord, DiagnosticsV1 | None]: ...
+
+
+class ARCAdapterProtocol(Protocol):
+    """Structural type for anything that can run an ARC action.
+
+    Same shape as :class:`T3AdapterProtocol` (the two adapters are peers). The
+    real implementation is :class:`carmel.adapters.arc.ARCAdapter`. Tests may
+    provide an inline double conforming to this protocol — this is **not** a mock
+    adapter mode in production code; production callers always inject the real
+    adapter.
     """
 
     def run(
@@ -75,7 +94,7 @@ def save_diagnostics(workspace_root: Path, diagnostics: DiagnosticsV1) -> Path:
 
 
 def load_diagnostics(workspace_root: Path) -> DiagnosticsV1 | None:
-    """Load persisted diagnostics, if present."""
+    """Load persisted T3 diagnostics, if present."""
     path = workspace_root / DIAGNOSTICS_FILE_NAME
     if not path.exists():
         return None
@@ -97,6 +116,25 @@ def clear_stale_diagnostics_artifacts(workspace_root: Path) -> None:
         (models_dir / filename).unlink(missing_ok=True)
 
 
+def save_arc_diagnostics(workspace_root: Path, diagnostics: DiagnosticsV1) -> Path:
+    """Persist arc_diagnostics.json at the workspace root.
+
+    ARC diagnostics are stored under a distinct filename so a standalone ARC job
+    never clobbers the T3 diagnostics (the two adapters are peers).
+    """
+    path = workspace_root / ARC_DIAGNOSTICS_FILE_NAME
+    write_json(path, diagnostics)
+    return path
+
+
+def load_arc_diagnostics(workspace_root: Path) -> DiagnosticsV1 | None:
+    """Load persisted ARC diagnostics, if present."""
+    path = workspace_root / ARC_DIAGNOSTICS_FILE_NAME
+    if not path.exists():
+        return None
+    return DiagnosticsV1.model_validate(read_json(path))
+
+
 def _default_adapter() -> T3AdapterProtocol:
     """Return the production T3 adapter (lazy import to avoid cycles)."""
     from carmel.adapters.t3 import T3Adapter
@@ -109,6 +147,13 @@ def _t3_tool_name() -> str:
     from carmel.adapters.t3 import T3_TOOL_NAME
 
     return T3_TOOL_NAME
+
+
+def _default_arc_adapter() -> ARCAdapterProtocol:
+    """Return the production ARC adapter (lazy import to avoid cycles)."""
+    from carmel.adapters.arc import ARCAdapter
+
+    return ARCAdapter()
 
 
 def execute_t3_action(
@@ -406,3 +451,92 @@ def _handle_unexpected_failure(
         )
 
     _log.error("T3 run raised an unexpected exception for campaign %s: %s", campaign.campaign_id, error)
+
+
+def execute_arc_action(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    adapter: ARCAdapterProtocol | None = None,
+) -> tuple[RunRecord, DiagnosticsV1 | None]:
+    """Run an ARC action end-to-end and persist all artifacts.
+
+    Peer to :func:`execute_t3_action`. Transitions state from
+    ``APPROVED_FOR_EXECUTION`` -> ``RUNNING_ARC`` -> ``RESULTS_READY`` ->
+    ``COMPLETED_PHASE1`` on success, or -> ``FAILED`` on any failure. Owns the
+    ARC workflow: state transitions, decision-log entries, provenance, and
+    run-record + diagnostics persistence.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign being executed.
+        action: The planned ``run_arc`` action.
+        adapter: Optional adapter override. Production passes ``None`` (the
+            default real adapter is used). Tests may pass an inline double
+            conforming to :class:`ARCAdapterProtocol`.
+
+    Returns:
+        Tuple of (RunRecord, DiagnosticsV1 or None on failure).
+    """
+    if adapter is None:
+        adapter = _default_arc_adapter()
+
+    update_state(workspace_root, CampaignStateValue.RUNNING_ARC, notes=f"action={action.action_id}")
+    started = datetime.now(UTC)
+    append_event(
+        workspace_root / "decision_log.jsonl",
+        {
+            "event": "arc_run_started",
+            "action_id": action.action_id,
+            "started_at": started.isoformat(),
+        },
+    )
+
+    run_record, diagnostics = adapter.run(
+        workspace_root=workspace_root,
+        campaign=campaign,
+        action=action,
+    )
+
+    save_run_record(workspace_root, run_record)
+    record(
+        workspace_root,
+        "arc_run",
+        {
+            "run_id": run_record.run_id,
+            "action_id": action.action_id,
+            "status": run_record.status.value,
+            "failure_code": run_record.failure_code.value,
+            "level_of_theory": run_record.level_of_theory,
+        },
+    )
+    append_event(
+        workspace_root / "decision_log.jsonl",
+        {
+            "event": "arc_run_finished",
+            "run_id": run_record.run_id,
+            "status": run_record.status.value,
+            "failure_code": run_record.failure_code.value,
+        },
+    )
+
+    if run_record.status == RunStatus.SUCCEEDED and diagnostics is not None:
+        save_arc_diagnostics(workspace_root, diagnostics)
+        write_selection_svgs(
+            workspace_root / "models" / "arc",
+            diagnostics.species_to_compute,
+            diagnostics.reactions_to_compute,
+            diagnostics.pdep_networks_to_compute,
+        )
+        update_state(workspace_root, CampaignStateValue.RESULTS_READY)
+        update_state(workspace_root, CampaignStateValue.COMPLETED_PHASE1)
+        _log.info("ARC run %s succeeded for campaign %s", run_record.run_id, campaign.campaign_id)
+    else:
+        update_state(
+            workspace_root,
+            CampaignStateValue.FAILED,
+            notes=run_record.error_message,
+        )
+        _log.warning("ARC run %s failed: %s", run_record.run_id, run_record.failure_code.value)
+
+    return run_record, diagnostics

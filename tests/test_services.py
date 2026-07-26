@@ -65,8 +65,11 @@ from carmel.services.drawing import (
     write_selection_svgs,
 )
 from carmel.services.execution import (
+    ARC_DIAGNOSTICS_FILE_NAME,
     DIAGNOSTICS_FILE_NAME,
+    execute_arc_action,
     execute_t3_action,
+    load_arc_diagnostics,
     load_diagnostics,
     save_diagnostics,
     save_run_record,
@@ -75,6 +78,7 @@ from carmel.services.execution import (
 from carmel.services.intake import StubIntakeParser, write_intake_review
 from carmel.services.planner import (
     estimate_t3_cpu_hours,
+    generate_arc_plan,
     generate_initial_plan,
     load_plan,
     plan_and_save,
@@ -1422,6 +1426,191 @@ class TestExecuteT3ActionDefensiveHandling:
         # failure was swallowed rather than masking the original error.
         state = load_state(ws)
         assert state.state == CampaignStateValue.RUNNING_T3
+
+
+# ----------------------- ARC planning -------------------------
+
+
+class TestGenerateArcPlan:
+    def test_single_arc_action(self, tmp_path: Path) -> None:
+        campaign = create_campaign(tmp_path / "ws", _make_input("arcplan"))
+        plan = generate_arc_plan(campaign)
+        assert len(plan.actions) == 1
+        assert plan.actions[0].kind == ActionKind.ARC_RUN
+
+    def test_species_default_from_mixture(self, tmp_path: Path) -> None:
+        campaign = create_campaign(tmp_path / "ws", _make_input("arcplan"))
+        plan = generate_arc_plan(campaign)
+        assert plan.actions[0].parameters["species"] == [{"label": "O2", "smiles": "[O][O]"}]
+
+    def test_within_envelope_auto_approves(self, tmp_path: Path) -> None:
+        campaign = create_campaign(tmp_path / "ws", _make_input("arcplan"))
+        plan = generate_arc_plan(campaign)  # 1 species -> 1 cpu-h, within ARC envelope + budget
+        assert not plan.requires_approval
+        assert plan.actions[0].approval_requirement == ApprovalRequirement.AUTO_APPROVED
+
+    def test_workspace_root_records_authorization(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        campaign = create_campaign(ws, _make_input("arcplan"))
+        plan = generate_arc_plan(campaign, workspace_root=ws)
+        events = read_events(ws / "decision_log.jsonl")
+        authz = [e for e in events if e["event"] == "execution_envelope_authorization"]
+        assert len(authz) == 1
+        assert authz[0]["adapter"] == "arc"
+        assert authz[0]["action_id"] == plan.actions[0].action_id
+        # The logged requirement must be the one the plan actually carries.
+        assert authz[0]["requirement"] == plan.actions[0].approval_requirement.value
+
+    def test_no_workspace_root_writes_no_authorization_event(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        campaign = create_campaign(ws, _make_input("arcplan"))
+        generate_arc_plan(campaign)
+        events = read_events(ws / "decision_log.jsonl")
+        assert [e for e in events if e["event"] == "execution_envelope_authorization"] == []
+
+    def test_over_envelope_requires_approval(self, tmp_path: Path) -> None:
+        # 3 reactions -> 1 + 2*3 = 7 cpu-h, over the ARC envelope (4) -> escalate.
+        campaign = create_campaign(tmp_path / "ws", _make_input("arcplan"))
+        plan = generate_arc_plan(campaign, reactions=[{"label": f"r{i}"} for i in range(3)])
+        assert plan.requires_approval
+        assert plan.actions[0].approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+
+
+# ----------------------- ARC execution path -------------------------
+
+
+def _arc_ready_workspace(tmp_path: Path) -> Path:
+    """Create a workspace with an approved ARC plan at APPROVED_FOR_EXECUTION."""
+    ws = tmp_path / "ws"
+    campaign = create_campaign(ws, _make_input("arcexec"))
+    plan = generate_arc_plan(campaign)
+    from carmel.services.planner import save_plan as _save
+
+    _save(ws, plan)
+    update_state(ws, CampaignStateValue.VALIDATED)
+    update_state(ws, CampaignStateValue.READY_FOR_PLANNING)
+    update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+    update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION)
+    return ws
+
+
+def _arc_success_diagnostics(campaign_id: str, run_id: str) -> DiagnosticsV1:
+    return DiagnosticsV1(
+        campaign_id=campaign_id,
+        run_id=run_id,
+        level_of_theory="wb97xd/def2tzvp",
+        generated_at=datetime.now(UTC),
+        species_to_compute=[SpeciesSelection(label="OH", smiles="[OH]")],
+        reactions_to_compute=[],
+        pdep_networks_to_compute=[],
+        tool_metadata={"adapter": "arc"},
+    )
+
+
+class _ARCSuccessAdapter:
+    """Inline test double — simulates a successful ARC run."""
+
+    def run(self, workspace_root, campaign, action):
+        run_id = str(uuid4())
+        now = datetime.now(UTC)
+        record = RunRecord(
+            run_id=run_id,
+            action_id=action.action_id,
+            tool_name="arc",
+            tool_version="test",
+            status=RunStatus.SUCCEEDED,
+            failure_code=FailureCode.NONE,
+            started_at=now,
+            ended_at=now,
+            estimated_cpu_hours=action.estimated_cpu_hours,
+            actual_cpu_hours=0.001,
+            submission_mode=SubmissionMode.SUBPROCESS,
+            command=["python", "ARC.py", "input.yml"],
+            level_of_theory="wb97xd/def2tzvp",
+        )
+        return record, _arc_success_diagnostics(campaign.campaign_id, run_id)
+
+
+class _ARCFailureAdapter:
+    """Inline test double — simulates a typed-failure ARC run."""
+
+    def __init__(self, failure_code: FailureCode) -> None:
+        self.failure_code = failure_code
+
+    def run(self, workspace_root, campaign, action):
+        now = datetime.now(UTC)
+        record = RunRecord(
+            run_id=str(uuid4()),
+            action_id=action.action_id,
+            tool_name="arc",
+            status=RunStatus.FAILED,
+            failure_code=self.failure_code,
+            started_at=now,
+            ended_at=now,
+            estimated_cpu_hours=action.estimated_cpu_hours,
+            submission_mode=SubmissionMode.SUBPROCESS,
+            error_message="boom",
+        )
+        return record, None
+
+
+class TestExecuteArcActionSuccess:
+    def test_success_transitions_to_completed(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        run_record, diagnostics = execute_arc_action(
+            ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter()
+        )
+        assert run_record.status == RunStatus.SUCCEEDED
+        assert diagnostics is not None
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_success_persists_arc_diagnostics_json(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        assert (ws / ARC_DIAGNOSTICS_FILE_NAME).exists()
+        assert load_arc_diagnostics(ws) is not None
+
+    def test_success_writes_svgs_under_arc_subdir(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        assert (ws / "models" / "arc" / "species_selection.svg").exists()
+
+    def test_success_appends_decision_log_events(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        kinds = [e.get("event") for e in read_events(ws / "decision_log.jsonl")]
+        assert "arc_run_started" in kinds
+        assert "arc_run_finished" in kinds
+
+    def test_success_writes_provenance(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        assert list((ws / "provenance").glob("*_arc_run.json"))
+
+
+class TestExecuteArcActionFailure:
+    def test_failure_transitions_to_failed(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        run_record, diagnostics = execute_arc_action(
+            ws, load_campaign(ws), plan.actions[0], adapter=_ARCFailureAdapter(FailureCode.SUBPROCESS_ERROR)
+        )
+        assert run_record.status == RunStatus.FAILED
+        assert diagnostics is None
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_failure_does_not_write_arc_diagnostics(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        execute_arc_action(
+            ws, load_campaign(ws), plan.actions[0], adapter=_ARCFailureAdapter(FailureCode.INVALID_OUTPUT)
+        )
+        assert not (ws / ARC_DIAGNOSTICS_FILE_NAME).exists()
 
 
 class TestExecuteT3ActionDefaultAdapter:
