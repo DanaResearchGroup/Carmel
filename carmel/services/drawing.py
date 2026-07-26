@@ -19,6 +19,11 @@ from carmel.schemas.diagnostics import (
 )
 from carmel.services.artifacts import write_text
 
+SPECIES_SVG_FILENAME = "species_selection.svg"
+REACTIONS_SVG_FILENAME = "reactions_selection.svg"
+PDEP_NETWORKS_SVG_FILENAME = "pdep_networks_selection.svg"
+SELECTION_SVG_FILENAMES = (SPECIES_SVG_FILENAME, REACTIONS_SVG_FILENAME, PDEP_NETWORKS_SVG_FILENAME)
+
 
 def _svg_header(width: int, height: int) -> str:
     """Return the opening tag of an SVG document."""
@@ -199,9 +204,9 @@ def write_selection_svgs(
         Mapping of artifact name to file path.
     """
     paths = {
-        "species": models_dir / "species_selection.svg",
-        "reactions": models_dir / "reactions_selection.svg",
-        "pdep_networks": models_dir / "pdep_networks_selection.svg",
+        "species": models_dir / SPECIES_SVG_FILENAME,
+        "reactions": models_dir / REACTIONS_SVG_FILENAME,
+        "pdep_networks": models_dir / PDEP_NETWORKS_SVG_FILENAME,
     }
     write_text(paths["species"], render_species_svg(species))
     write_text(paths["reactions"], render_reactions_svg(reactions))

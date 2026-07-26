@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 
+from carmel.adapters.t3 import T3_TOOL_NAME
 from carmel.schemas import (
     ActionKind,
     ApprovalPolicy,
@@ -15,6 +16,7 @@ from carmel.schemas import (
     ApprovalStatus,
     Budgets,
     CampaignInput,
+    CampaignState,
     CampaignStateValue,
     DiagnosticsV1,
     FailureCode,
@@ -31,6 +33,7 @@ from carmel.schemas import (
     SubmissionMode,
     TargetObservable,
 )
+from carmel.schemas.campaign import Campaign
 from carmel.services.approvals import (
     evaluate_action,
     load_policy,
@@ -219,6 +222,83 @@ class TestStateMachine:
         with pytest.raises(InvalidTransitionError):
             update_state(ws, CampaignStateValue.RUNNING_T3)
 
+    def test_failed_can_retry_to_approved_for_execution_only_from_running_t3(self) -> None:
+        assert can_transition(
+            CampaignStateValue.FAILED,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            failed_from=CampaignStateValue.RUNNING_T3,
+        )
+        assert not can_transition(CampaignStateValue.FAILED, CampaignStateValue.APPROVED_FOR_EXECUTION)
+
+    def test_failed_cannot_retry_when_failed_before_execution_was_approved(self) -> None:
+        for origin in [
+            CampaignStateValue.DRAFT,
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.BLOCKED,
+        ]:
+            assert not can_transition(
+                CampaignStateValue.FAILED,
+                CampaignStateValue.APPROVED_FOR_EXECUTION,
+                failed_from=origin,
+            )
+
+    def test_failed_cannot_transition_elsewhere(self) -> None:
+        assert not can_transition(
+            CampaignStateValue.FAILED, CampaignStateValue.RUNNING_T3, failed_from=CampaignStateValue.RUNNING_T3
+        )
+        assert not can_transition(
+            CampaignStateValue.FAILED, CampaignStateValue.COMPLETED_PHASE1, failed_from=CampaignStateValue.RUNNING_T3
+        )
+        assert not can_transition(
+            CampaignStateValue.FAILED, CampaignStateValue.DIAGNOSTICS_READY, failed_from=CampaignStateValue.RUNNING_T3
+        )
+
+    def test_update_state_refuses_retry_when_failed_before_approval(self, tmp_path: Path) -> None:
+        """D8: a campaign that failed during validation — before any plan
+        existed and before any human approved anything — must not be able
+        to reach APPROVED_FOR_EXECUTION. That would bypass the planning and
+        HITL approval gates entirely."""
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        update_state(ws, CampaignStateValue.VALIDATED)
+        update_state(ws, CampaignStateValue.FAILED, notes="boom")
+        with pytest.raises(InvalidTransitionError):
+            update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+
+    def test_update_state_retries_campaign_that_failed_from_running_t3(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        for target in [
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+        ]:
+            update_state(ws, target)
+        update_state(ws, CampaignStateValue.FAILED, notes="boom")
+        retried = update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+        assert retried.state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert retried.failed_from is None
+
+    def test_failed_from_cleared_once_campaign_leaves_failed(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        for target in [
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+        ]:
+            update_state(ws, target)
+        failed = update_state(ws, CampaignStateValue.FAILED, notes="boom")
+        assert failed.failed_from == CampaignStateValue.RUNNING_T3
+        retried = update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+        assert retried.failed_from is None
+
     def test_full_happy_path(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
         create_campaign(ws, _make_input())
@@ -377,6 +457,45 @@ class TestCampaigns:
         found = find_campaign_workspace(tmp_path, target.campaign_id)
         assert found is not None
         assert found.name == "zzz"
+
+    def test_find_workspace_ignores_untrusted_declared_workspace_root(self, tmp_path: Path) -> None:
+        """D9: ``campaign.yaml``'s ``workspace_root`` is untrusted,
+        user-editable data — and now load-bearing, because
+        ``clear_stale_diagnostics_artifacts`` unlinks files under the path
+        this function returns. A YAML file that lies about its own
+        location must not steer callers elsewhere."""
+        c = create_campaign(tmp_path / "real", _make_input("real"))
+        raw = read_yaml(tmp_path / "real" / "campaign.yaml")
+        raw["workspace_root"] = str(tmp_path / "elsewhere" / "bogus")
+        write_yaml(tmp_path / "real" / "campaign.yaml", raw)
+
+        found = find_campaign_workspace(tmp_path, c.campaign_id)
+
+        assert found == tmp_path / "real"
+
+    def test_find_workspace_missing_root_returns_none(self, tmp_path: Path) -> None:
+        assert find_campaign_workspace(tmp_path / "does-not-exist", "some-id") is None
+
+    def test_find_workspace_ignores_loose_files(self, tmp_path: Path) -> None:
+        # Named to sort before "zzz_real" so the loop must genuinely walk
+        # past (and `continue` on) this non-directory entry.
+        (tmp_path / "aaa_stray.txt").write_text("not a workspace", encoding="utf-8")
+        target = create_campaign(tmp_path / "zzz_real", _make_input("real"))
+        found = find_campaign_workspace(tmp_path, target.campaign_id)
+        assert found == tmp_path / "zzz_real"
+
+    def test_find_workspace_ignores_dirs_without_campaign_file(self, tmp_path: Path) -> None:
+        (tmp_path / "aaa_unrelated").mkdir()
+        target = create_campaign(tmp_path / "zzz_real", _make_input("real"))
+        found = find_campaign_workspace(tmp_path, target.campaign_id)
+        assert found == tmp_path / "zzz_real"
+
+    def test_find_workspace_skips_invalid_campaign_yaml(self, tmp_path: Path) -> None:
+        (tmp_path / "aaa_junk").mkdir()
+        (tmp_path / "aaa_junk" / "campaign.yaml").write_text("not: a campaign", encoding="utf-8")
+        target = create_campaign(tmp_path / "zzz_real", _make_input("real"))
+        found = find_campaign_workspace(tmp_path, target.campaign_id)
+        assert found == tmp_path / "zzz_real"
 
 
 # ----------------------- planner --------------------------------
@@ -745,6 +864,331 @@ class TestExecuteT3ActionFailure:
         finished = [e for e in events if e.get("event") == "t3_run_finished"]
         assert len(finished) == 1
         assert finished[0]["failure_code"] == "subprocess_error"
+
+    def test_failure_removes_stale_diagnostics_and_svgs_from_a_prior_run(self, tmp_path: Path) -> None:
+        """Regression guard: a failed run must never leave a previous run's
+        diagnostics.json / selection SVGs looking like current output."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        (ws / DIAGNOSTICS_FILE_NAME).write_text("{}", encoding="utf-8")
+        models_dir = ws / "models"
+        models_dir.mkdir(exist_ok=True)
+        stale_svgs = [
+            models_dir / "species_selection.svg",
+            models_dir / "reactions_selection.svg",
+            models_dir / "pdep_networks_selection.svg",
+        ]
+        for svg_path in stale_svgs:
+            svg_path.write_text("<svg>stale</svg>", encoding="utf-8")
+
+        execute_t3_action(
+            ws,
+            load_campaign(ws),
+            plan.actions[0],
+            adapter=_FailureAdapter(FailureCode.SUBPROCESS_ERROR),
+        )
+
+        assert not (ws / DIAGNOSTICS_FILE_NAME).exists()
+        for svg_path in stale_svgs:
+            assert not svg_path.exists()
+
+
+class TestExecuteT3ActionUnexpectedException:
+    """Regression guard for C5: an exception during execution must not wedge
+    the campaign in RUNNING_T3 with no reachable transition."""
+
+    class _RaisingAdapter:
+        def run(self, workspace_root: Path, campaign: object, action: PlannedAction) -> object:
+            raise RuntimeError("adapter blew up unexpectedly")
+
+    def test_exception_propagates_to_caller(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError, match="adapter blew up unexpectedly"):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+
+    def test_exception_leaves_campaign_failed_not_running(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_exception_writes_failed_run_record(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        run_files = list((ws / "runs").glob("*.json"))
+        assert len(run_files) == 1
+        saved = RunRecord.model_validate(read_json(run_files[0]))
+        assert saved.status == RunStatus.FAILED
+        assert saved.failure_code == FailureCode.UNKNOWN
+        assert "adapter blew up unexpectedly" in (saved.error_message or "")
+        # D7: the fabricated record must use the canonical tool name/mode
+        # constants rather than hardcoded literals.
+        assert saved.tool_name == T3_TOOL_NAME
+        assert saved.submission_mode == SubmissionMode.SUBPROCESS
+
+    def test_exception_appends_finished_event(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        events = read_events(ws / "decision_log.jsonl")
+        finished = [e for e in events if e.get("event") == "t3_run_finished"]
+        assert len(finished) == 1
+        assert finished[0]["failure_code"] == "unknown"
+
+    def test_campaign_can_retry_after_unexpected_exception(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        retried = update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+        assert retried.state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+
+class _RealRecordThenCrashAdapter:
+    """Adapter double that returns a real RunRecord/diagnostics pair, so a
+    later failure in ``execute_t3_action`` (e.g. ``save_diagnostics``
+    raising) must reuse this record's ``run_id`` rather than fabricating a
+    fresh one."""
+
+    def __init__(self) -> None:
+        self.run_id = "real-run-id-from-adapter"
+
+    def run(self, workspace_root: Path, campaign: Campaign, action: PlannedAction) -> tuple[RunRecord, DiagnosticsV1]:
+        now = datetime.now(UTC)
+        record = RunRecord(
+            run_id=self.run_id,
+            action_id=action.action_id,
+            tool_name=T3_TOOL_NAME,
+            tool_version="test",
+            status=RunStatus.SUCCEEDED,
+            failure_code=FailureCode.NONE,
+            started_at=now,
+            estimated_cpu_hours=action.estimated_cpu_hours,
+            actual_cpu_hours=0.001,
+            submission_mode=SubmissionMode.SUBPROCESS,
+            level_of_theory="b3lyp/6-31g(d,p)",
+        )
+        return record, _success_diagnostics(campaign.campaign_id, self.run_id)
+
+
+class TestExecuteT3ActionDefensiveHandling:
+    """Fixes for the adversarial-review defects D1-D6: ordering guarantees
+    and defensive failure handling around ``execute_t3_action``."""
+
+    def test_stale_artifacts_survive_a_failed_state_transition(self, tmp_path: Path) -> None:
+        """D1: clearing stale diagnostics must happen only AFTER the
+        RUNNING_T3 transition is validated. A campaign that is not
+        actually eligible for RUNNING_T3 must raise with the workspace
+        untouched — not silently delete a prior run's artifacts first."""
+        ws = tmp_path / "ws"
+        campaign = create_campaign(ws, _make_input("stale-guard"))
+        plan = generate_initial_plan(campaign, ApprovalPolicy(auto_approve_t3_under_cpu_hours=999.0))
+        from carmel.services.planner import save_plan as _save
+
+        _save(ws, plan)
+        # Deliberately left in DRAFT: not eligible for RUNNING_T3.
+        (ws / DIAGNOSTICS_FILE_NAME).write_text("{}", encoding="utf-8")
+        models_dir = ws / "models"
+        models_dir.mkdir(exist_ok=True)
+        stale_svg = models_dir / "species_selection.svg"
+        stale_svg.write_text("<svg>stale</svg>", encoding="utf-8")
+
+        with pytest.raises(InvalidTransitionError):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+
+        assert (ws / DIAGNOSTICS_FILE_NAME).exists()
+        assert stale_svg.exists()
+
+    def test_campaign_never_left_running_t3_when_decision_log_append_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D2: everything after the RUNNING_T3 transition succeeds must be
+        inside the protected region — even a failure as early as the
+        ``t3_run_started`` decision-log append must still drive the
+        campaign to FAILED, never leave it wedged in RUNNING_T3."""
+        import carmel.services.execution as execution_module
+
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        def _raise_append(*args: object, **kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(execution_module, "append_event", _raise_append)
+
+        with pytest.raises(OSError, match="disk full"):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_real_run_id_preserved_when_diagnostics_persistence_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D3/D4: if the adapter already returned a real RunRecord before a
+        later step (save_diagnostics) raises, the persisted failure record
+        must carry that real run_id — not a fabricated uuid4 — and
+        provenance must be recorded for the failure."""
+        import carmel.services.execution as execution_module
+
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        adapter = _RealRecordThenCrashAdapter()
+
+        def _raise_save_diagnostics(*args: object, **kwargs: object) -> Path:
+            raise OSError("disk full while saving diagnostics")
+
+        monkeypatch.setattr(execution_module, "save_diagnostics", _raise_save_diagnostics)
+
+        with pytest.raises(OSError, match="disk full while saving diagnostics"):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=adapter)
+
+        run_files = list((ws / "runs").glob("*.json"))
+        assert len(run_files) == 1
+        saved = RunRecord.model_validate(read_json(run_files[0]))
+        assert saved.run_id == adapter.run_id
+        assert saved.status == RunStatus.FAILED
+        assert saved.failure_code == FailureCode.UNKNOWN
+
+        provenance_files = list((ws / "provenance").glob("*_t3_run.json"))
+        assert provenance_files
+        recorded = read_json(provenance_files[0])
+        assert recorded["run_id"] == adapter.run_id
+        assert recorded["status"] == RunStatus.FAILED.value
+
+    def test_original_exception_not_masked_after_terminal_transition(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D5: an exception raised after the campaign has already reached a
+        terminal state (COMPLETED_PHASE1, which has no outgoing
+        transitions) must surface as itself — never as an
+        InvalidTransitionError from an unconditional FAILED transition
+        attempt. The handler must check ``can_transition`` first."""
+        import carmel.services.execution as execution_module
+
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        def _raise_after_completion(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("boom after completion")
+
+        monkeypatch.setattr(execution_module._log, "info", _raise_after_completion)
+
+        with pytest.raises(RuntimeError, match="boom after completion"):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_original_exception_not_masked_when_handlers_own_writes_fail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D5: if the handler's own best-effort persistence also fails, that
+        secondary failure must be swallowed (logged) — the caller must
+        still see the original exception, not one raised while trying to
+        record the failure."""
+        import carmel.services.execution as execution_module
+
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        class _RaisingAdapter:
+            def run(
+                self, workspace_root: Path, campaign: Campaign, action: PlannedAction
+            ) -> tuple[RunRecord, DiagnosticsV1 | None]:
+                raise RuntimeError("original adapter failure")
+
+        real_append_event = execution_module.append_event
+
+        def _raise_on_finished_event(log_path: Path, event: dict[str, object]) -> None:
+            # Let the initial "t3_run_started" append through so the
+            # RuntimeError below is genuinely raised by the adapter, not by
+            # this monkeypatch pre-empting it; only the handler's own
+            # "t3_run_finished" write (made while recovering from the
+            # adapter failure) fails.
+            if event.get("event") == "t3_run_finished":
+                raise OSError("decision log unavailable")
+            real_append_event(log_path, event)
+
+        monkeypatch.setattr(execution_module, "append_event", _raise_on_finished_event)
+
+        with pytest.raises(RuntimeError, match="original adapter failure"):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_RaisingAdapter())
+
+        # The state transition itself does not depend on append_event, so
+        # the campaign still lands in FAILED despite the handler's own
+        # decision-log writes failing.
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_no_succeeded_finished_event_when_diagnostics_save_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D6: diagnostics/SVGs must be durable before the decision log can
+        claim the run succeeded. If save_diagnostics fails, the log must
+        never contain a "succeeded" t3_run_finished event for that run."""
+        import carmel.services.execution as execution_module
+
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        adapter = _RealRecordThenCrashAdapter()
+
+        def _raise_save_diagnostics(*args: object, **kwargs: object) -> Path:
+            raise OSError("disk full while saving diagnostics")
+
+        monkeypatch.setattr(execution_module, "save_diagnostics", _raise_save_diagnostics)
+
+        with pytest.raises(OSError):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=adapter)
+
+        events = read_events(ws / "decision_log.jsonl")
+        finished = [e for e in events if e.get("event") == "t3_run_finished"]
+        assert len(finished) == 1
+        assert finished[0]["status"] != RunStatus.SUCCEEDED.value
+        assert finished[0]["run_id"] == adapter.run_id
+
+    def test_original_exception_survives_when_final_failed_transition_itself_raises(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The handler's own attempt to transition the campaign to FAILED can
+        itself raise (e.g. a concurrent writer corrupted campaign_state.json
+        between the earlier RUNNING_T3 transition and now). That secondary
+        failure must only be logged — the caller must still see the
+        original adapter exception, not the state-machine's."""
+        import carmel.services.execution as execution_module
+
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        class _RaisingAdapter:
+            def run(
+                self, workspace_root: Path, campaign: Campaign, action: PlannedAction
+            ) -> tuple[RunRecord, DiagnosticsV1 | None]:
+                raise RuntimeError("original adapter failure")
+
+        real_update_state = execution_module.update_state
+
+        def _raise_on_failed_transition(
+            workspace_root: Path,
+            target: CampaignStateValue,
+            notes: str | None = None,
+        ) -> CampaignState:
+            if target == CampaignStateValue.FAILED:
+                raise OSError("campaign_state.json corrupted by a concurrent writer")
+            return real_update_state(workspace_root, target, notes)
+
+        monkeypatch.setattr(execution_module, "update_state", _raise_on_failed_transition)
+
+        with pytest.raises(RuntimeError, match="original adapter failure"):
+            execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_RaisingAdapter())
+
+        # The campaign is left in RUNNING_T3 (the FAILED transition never
+        # committed), which is itself observable evidence the secondary
+        # failure was swallowed rather than masking the original error.
+        state = load_state(ws)
+        assert state.state == CampaignStateValue.RUNNING_T3
 
 
 class TestExecuteT3ActionDefaultAdapter:

@@ -58,6 +58,7 @@ class RunRecord(BaseModel):
     command: list[str] | None = None
     input_path: Path | None = None
     output_path: Path | None = None
-    log_path: Path | None = None
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
     level_of_theory: str | None = None
     error_message: str | None = None

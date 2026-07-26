@@ -121,6 +121,11 @@ def list_campaigns(workspaces_root: Path) -> list[Campaign]:
 def find_campaign_workspace(workspaces_root: Path, campaign_id: str) -> Path | None:
     """Find the workspace directory for a campaign by ID.
 
+    Returns the directory the campaign was actually discovered in, never
+    the ``workspace_root`` recorded inside ``campaign.yaml`` — that value
+    is untrusted user-editable data and callers (including code that
+    deletes files under the returned path) must not be steered by it.
+
     Args:
         workspaces_root: The parent workspaces directory.
         campaign_id: The campaign ID to find.
@@ -128,7 +133,20 @@ def find_campaign_workspace(workspaces_root: Path, campaign_id: str) -> Path | N
     Returns:
         The workspace directory, or None if not found.
     """
-    for campaign in list_campaigns(workspaces_root):
+    workspaces_root = Path(workspaces_root)
+    if not workspaces_root.exists():
+        return None
+    for child in sorted(workspaces_root.iterdir()):
+        if not child.is_dir():
+            continue
+        campaign_file = child / CAMPAIGN_FILE_NAME
+        if not campaign_file.exists():
+            continue
+        try:
+            campaign = load_campaign(child)
+        except (ValueError, OSError) as e:
+            _log.warning("Skipping invalid campaign at %s: %s", child, e)
+            continue
         if campaign.campaign_id == campaign_id:
-            return campaign.workspace_root
+            return child
     return None

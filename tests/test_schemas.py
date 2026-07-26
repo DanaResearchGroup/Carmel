@@ -228,6 +228,34 @@ class TestCampaignState:
         )
         assert s.state == CampaignStateValue.DRAFT
 
+    def test_failed_from_defaults_to_none(self) -> None:
+        s = CampaignState(
+            campaign_id="abc",
+            state=CampaignStateValue.DRAFT,
+            updated_at=datetime.now(UTC),
+        )
+        assert s.failed_from is None
+
+    def test_failed_from_round_trips(self) -> None:
+        s = CampaignState(
+            campaign_id="abc",
+            state=CampaignStateValue.FAILED,
+            updated_at=datetime.now(UTC),
+            failed_from=CampaignStateValue.RUNNING_T3,
+        )
+        loaded = CampaignState.model_validate_json(s.model_dump_json())
+        assert loaded.failed_from == CampaignStateValue.RUNNING_T3
+
+    def test_extra_field_forbidden_with_failed_from_present(self) -> None:
+        with pytest.raises(ValidationError):
+            CampaignState(
+                campaign_id="abc",
+                state=CampaignStateValue.FAILED,
+                updated_at=datetime.now(UTC),
+                failed_from=CampaignStateValue.RUNNING_T3,
+                surprise="nope",
+            )
+
 
 class TestPlan:
     def test_valid(self) -> None:
@@ -264,6 +292,23 @@ class TestRunRecord:
         )
         assert r.tool_name == "t3"
         assert r.failure_code == FailureCode.NONE
+
+    def test_stdout_and_stderr_paths_round_trip(self) -> None:
+        r = RunRecord(
+            run_id="r1",
+            action_id="a1",
+            tool_name="t3",
+            status=RunStatus.SUCCEEDED,
+            failure_code=FailureCode.NONE,
+            started_at=datetime.now(UTC),
+            submission_mode=SubmissionMode.SUBPROCESS,
+            stdout_path=Path("/tmp/run/carmel_stdout.log"),
+            stderr_path=Path("/tmp/run/carmel_stderr.log"),
+        )
+        dumped = r.model_dump(mode="json")
+        restored = RunRecord.model_validate(dumped)
+        assert restored.stdout_path == Path("/tmp/run/carmel_stdout.log")
+        assert restored.stderr_path == Path("/tmp/run/carmel_stderr.log")
 
 
 class TestDiagnosticsV1:

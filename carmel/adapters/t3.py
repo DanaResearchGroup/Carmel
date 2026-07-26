@@ -87,7 +87,16 @@ class T3Layout:
     EXECUTABLE_MODULE: str = "T3"  # python -m T3 fallback
 
     # Output layout
+    # LOG_FILENAME is T3's OWN log file: T3's logger (t3/logger.py) archives
+    # any pre-existing file at this path into a ``log_archive/`` subdir and
+    # then os.remove()s it before opening its own handle. Carmel must never
+    # write to this path — a Carmel-owned file descriptor pointed at it would
+    # be silently unlinked out from under the write the moment T3 starts
+    # logging. Carmel's own stdout/stderr capture uses the CARMEL_* filenames
+    # below instead.
     LOG_FILENAME: str = "t3.log"
+    CARMEL_STDOUT_FILENAME: str = "carmel_stdout.log"
+    CARMEL_STDERR_FILENAME: str = "carmel_stderr.log"
     ITERATION_GLOB: str = "iteration_*"
     ARC_SUBDIR: str = "ARC"
     RMG_SUBDIR: str = "RMG"
@@ -409,11 +418,28 @@ def _walk_iterations(project_dir: Path) -> list[Path]:
 def _aggregate_species_and_reactions(
     iteration_dirs: list[Path],
     info_filename: str,
-) -> tuple[list[SpeciesSelection], list[ReactionSelection], list[str]]:
+) -> tuple[list[SpeciesSelection], list[ReactionSelection]]:
     """Aggregate species and reactions across all iterations.
 
     Deduplicates by label, keeping the *latest* iteration's reason
     (so a species that converged later is reported as such).
+
+    The discriminator for "did ARC actually run this iteration" is the
+    presence of the iteration's ``ARC/`` subdirectory — T3 only creates
+    ``iteration_N/ARC/`` inside ``run_arc()``, and only calls that when
+    ARC calculations are actually required for that iteration;
+    ``set_paths()`` never creates the folder up front. So:
+
+    * No ``ARC/`` subdir at all: ARC legitimately did not run this
+      iteration (e.g. a converged terminal iteration, or a trailing
+      RMG-only iteration). This is skipped silently — it is normal.
+    * ``ARC/`` subdir exists but the info file is missing, or exists but
+      fails to parse into a mapping: ARC was launched but crashed (or
+      wrote something invalid) before it could save its info file. ARC
+      writes that file very late and unconditionally
+      (``save_project_info_file()``), so its absence or corruption means
+      something is genuinely wrong — this raises rather than being
+      swallowed into a warning.
 
     Args:
         iteration_dirs: Iteration directories to walk, in order.
@@ -421,31 +447,31 @@ def _aggregate_species_and_reactions(
             iteration's ``ARC/`` subdir (see :func:`arc_info_filename`).
 
     Returns:
-        A tuple of (species, reactions, warnings). Warnings record any
-        iteration whose info file was absent or unparseable — such an
-        iteration is skipped but the loss is no longer silent.
+        A tuple of (species, reactions).
+
+    Raises:
+        FileNotFoundError: If an iteration's ``ARC/`` subdir exists but
+            its info file does not.
+        ValueError: If an iteration's ARC info file exists but is not
+            valid YAML or does not parse to a mapping.
     """
     species_by_label: dict[str, SpeciesSelection] = {}
     reactions_by_label: dict[str, ReactionSelection] = {}
-    warnings: list[str] = []
     for it_dir in iteration_dirs:
         try:
             iteration = int(it_dir.name.split("_", 1)[-1])
         except ValueError:
             iteration = 0
-        info_path = it_dir / T3_LAYOUT.ARC_SUBDIR / info_filename
+        arc_dir = it_dir / T3_LAYOUT.ARC_SUBDIR
+        if not arc_dir.exists():
+            continue
+        info_path = arc_dir / info_filename
         if not info_path.exists():
-            message = f"ARC info file absent for iteration {it_dir.name}: {info_path} not found"
-            _log.warning(message)
-            warnings.append(message)
-            continue
-        try:
-            info = read_t3_info_file(info_path)
-        except (FileNotFoundError, ValueError) as e:
-            message = f"ARC info file for iteration {it_dir.name} is unparseable: {e}"
-            _log.warning(message)
-            warnings.append(message)
-            continue
+            raise FileNotFoundError(
+                f"ARC ran for iteration {it_dir.name} (ARC/ subdir exists) but did not save "
+                f"a project info file at {info_path}; something must be wrong with the ARC run."
+            )
+        info = read_t3_info_file(info_path)
         for raw in info.get(T3_LAYOUT.INFO_SPECIES_KEY, []) or []:
             sp_sel = _coerce_species_entry(raw, iteration)
             if sp_sel is not None:
@@ -454,7 +480,7 @@ def _aggregate_species_and_reactions(
             rxn_sel = _coerce_reaction_entry(raw, iteration)
             if rxn_sel is not None:
                 reactions_by_label[rxn_sel.label] = rxn_sel
-    return list(species_by_label.values()), list(reactions_by_label.values()), warnings
+    return list(species_by_label.values()), list(reactions_by_label.values())
 
 
 def _discover_pdep_networks(iteration_dirs: list[Path]) -> list[PDepNetworkSelection]:
@@ -509,9 +535,10 @@ def normalize_t3_outputs(
     Raises:
         ValueError: If no iterations are found and there are no PDep
             networks either (i.e. T3 produced nothing parseable), or if
-            iteration directories exist but yielded zero species, zero
-            reactions, and zero PDep networks (an invalid/unreadable
-            output rather than a legitimately empty run).
+            an iteration's ``ARC/`` subdir exists but its info file is
+            not valid YAML or does not parse to a mapping.
+        FileNotFoundError: If an iteration's ``ARC/`` subdir exists but
+            its info file is missing (ARC crashed before saving it).
     """
     iteration_dirs = _walk_iterations(project_dir)
     networks = _discover_pdep_networks(iteration_dirs)
@@ -523,13 +550,7 @@ def normalize_t3_outputs(
         )
 
     info_filename = arc_info_filename(input_dict)
-    species, reactions, warnings = _aggregate_species_and_reactions(iteration_dirs, info_filename)
-
-    if iteration_dirs and not species and not reactions and not networks:
-        raise ValueError(
-            f"T3 iteration directories exist under {project_dir} but no species, reactions, "
-            f"or PDep networks could be parsed from them. Warnings: {warnings}"
-        )
+    species, reactions = _aggregate_species_and_reactions(iteration_dirs, info_filename)
 
     return DiagnosticsV1(
         campaign_id=campaign_id,
@@ -542,7 +563,7 @@ def normalize_t3_outputs(
         reactions_to_compute=reactions,
         pdep_networks_to_compute=networks,
         pdep_sensitivity_flag=False,
-        warnings=warnings,
+        warnings=[],
         tool_metadata={
             "iteration_count": len(iteration_dirs),
             "pdep_network_count": len(networks),
@@ -587,14 +608,24 @@ class T3Adapter:
         run_id = str(uuid4())
         started = datetime.now(UTC)
         run_dir = workspace_root / "runs" / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
-        log_path = run_dir / T3_LAYOUT.LOG_FILENAME
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return self._failed_record(
+                run_id=run_id,
+                action=action,
+                started=started,
+                failure_code=FailureCode.SUBPROCESS_ERROR,
+                error_message=f"Could not create run directory {run_dir}: {e}",
+            ), None
+        stdout_path = run_dir / T3_LAYOUT.CARMEL_STDOUT_FILENAME
+        stderr_path = run_dir / T3_LAYOUT.CARMEL_STDERR_FILENAME
 
         # 1. Build and write input
         try:
             payload = build_t3_input(campaign)
             input_path = write_t3_input_file(run_dir, payload)
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, OSError) as e:
             return self._failed_record(
                 run_id=run_id,
                 action=action,
@@ -613,19 +644,21 @@ class T3Adapter:
                 failure_code=FailureCode.TOOL_NOT_FOUND,
                 error_message="T3 executable not found (no T3.py and t3 module not importable)",
                 input_path=input_path,
-                log_path=log_path,
             ), None
 
         # 3. Invoke T3 — note T3 has no --output flag, it writes next to the input
         command = [*t3_executable, str(input_path)]
         _log.info("Invoking T3: %s", " ".join(command))
         try:
-            with open(log_path, "w", encoding="utf-8") as log_file:
+            with (
+                open(stdout_path, "w", encoding="utf-8") as stdout_file,
+                open(stderr_path, "w", encoding="utf-8") as stderr_file,
+            ):
                 completed = subprocess.run(  # noqa: S603 -- T3 is a trusted tool
                     command,
                     cwd=run_dir,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT,
+                    stdout=stdout_file,
+                    stderr=stderr_file,
                     timeout=int(action.estimated_cpu_hours * 3600 + 600),
                     check=False,
                 )
@@ -637,7 +670,8 @@ class T3Adapter:
                 failure_code=FailureCode.TIMEOUT,
                 error_message=str(e),
                 input_path=input_path,
-                log_path=log_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 command=command,
             ), None
         except (OSError, subprocess.SubprocessError) as e:
@@ -648,7 +682,8 @@ class T3Adapter:
                 failure_code=FailureCode.SUBPROCESS_ERROR,
                 error_message=str(e),
                 input_path=input_path,
-                log_path=log_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 command=command,
             ), None
 
@@ -662,7 +697,8 @@ class T3Adapter:
                 failure_code=FailureCode.SUBPROCESS_ERROR,
                 error_message=f"T3 exited with code {completed.returncode}",
                 input_path=input_path,
-                log_path=log_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 command=command,
                 ended=ended,
             ), None
@@ -683,7 +719,8 @@ class T3Adapter:
                 failure_code=FailureCode.INVALID_OUTPUT,
                 error_message=str(e),
                 input_path=input_path,
-                log_path=log_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
                 command=command,
                 ended=ended,
             ), None
@@ -703,7 +740,8 @@ class T3Adapter:
             command=command,
             input_path=input_path,
             output_path=run_dir,
-            log_path=log_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
             level_of_theory=diagnostics.level_of_theory,
         )
         return run_record, diagnostics
@@ -716,7 +754,8 @@ class T3Adapter:
         failure_code: FailureCode,
         error_message: str,
         input_path: Path | None = None,
-        log_path: Path | None = None,
+        stdout_path: Path | None = None,
+        stderr_path: Path | None = None,
         command: list[str] | None = None,
         ended: datetime | None = None,
     ) -> RunRecord:
@@ -734,6 +773,7 @@ class T3Adapter:
             submission_mode=self.submission_mode,
             command=command,
             input_path=input_path,
-            log_path=log_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
             error_message=error_message,
         )

@@ -33,3 +33,13 @@ class CampaignState(BaseModel):
     state: CampaignStateValue
     updated_at: datetime
     notes: str | None = None
+    failed_from: CampaignStateValue | None = None
+    """The state the campaign was in immediately before it transitioned to
+    ``FAILED``. ``None`` when the campaign has never failed, and cleared
+    (set back to ``None``) as soon as the campaign leaves ``FAILED``.
+    Used to gate the ``FAILED`` → ``APPROVED_FOR_EXECUTION`` retry edge so
+    that only a genuine tool-execution failure of an already-approved plan
+    (failed from ``RUNNING_T3``) can retry — a failure during validation
+    or planning, before any human approved anything, must not bypass the
+    HITL approval gate.
+    """

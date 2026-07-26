@@ -597,7 +597,14 @@ class TestBuildT3InputOptionalFields:
 
 
 class TestAggregateEdgeCases:
-    """Malformed or partial T3 project trees must be skipped, not crash."""
+    """ARC/ subdir presence is the discriminator for whether ARC ran an iteration.
+
+    No ARC/ subdir at all is a legitimate skip (ARC simply did not run that
+    iteration). An ARC/ subdir that exists but is missing or has an
+    unparseable info file means ARC was launched but never finished writing
+    its output — that is invalid output and must raise, not be swallowed
+    into a warning.
+    """
 
     def test_reaction_entry_not_dict(self) -> None:
         assert _coerce_reaction_entry("not-a-dict", 1) is None
@@ -608,23 +615,95 @@ class TestAggregateEdgeCases:
         names = [p.name for p in _walk_iterations(tmp_path)]
         assert names == ["iteration_final", "iteration_1", "iteration_2"]
 
-    def test_iteration_without_info_file_is_skipped(self, tmp_path: Path) -> None:
-        """An iteration dir with no ARC info file at all now hard-fails.
+    def test_iteration_without_arc_subdir_is_skipped_silently(self, tmp_path: Path) -> None:
+        """No ARC/ subdir at all means ARC legitimately did not run this iteration.
 
-        Upstream T3 raises when its expected ARC info file is absent; Carmel
-        must not silently continue past a missing iteration.
+        This must be a silent, warning-free skip: T3 only creates
+        ``iteration_N/ARC/`` inside ``run_arc()``, and only calls that when
+        additional ARC calculations are actually required for that
+        iteration, so an iteration with no ARC/ subdir is normal (e.g. a
+        converged terminal iteration).
+        """
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / arc_info_filename({"project": "myproj"})).write_text(
+            "species:\n- label: OH\n  success: true\nreactions: []\n"
+        )
+        (tmp_path / "iteration_2").mkdir()
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert diagnostics.warnings == []
+
+    def test_arc_subdir_without_info_file_raises(self, tmp_path: Path) -> None:
+        """An ARC/ subdir with no info file means ARC crashed before saving it.
+
+        ARC writes ``<project>_info.yml`` very late and unconditionally via
+        ``save_project_info_file()``, outside any try/except, so its
+        absence means the ARC run itself is broken.
         """
         (tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR).mkdir(parents=True)
-        with pytest.raises(ValueError, match="iteration_1"):
+        with pytest.raises(FileNotFoundError, match="iteration_1"):
             normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
 
-    def test_malformed_info_file_is_skipped(self, tmp_path: Path) -> None:
-        """An unparseable ARC info file now hard-fails instead of being skipped silently."""
+    def test_arc_info_file_non_mapping_raises(self, tmp_path: Path) -> None:
+        """An ARC info file that parses to a bare list (not a mapping) must raise."""
         arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
         arc.mkdir(parents=True)
         (arc / arc_info_filename({"project": "myproj"})).write_text("- this is a list, not a mapping\n")
         with pytest.raises(ValueError, match="iteration_1"):
             normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
+
+    def test_arc_info_file_malformed_yaml_raises(self, tmp_path: Path) -> None:
+        """An ARC info file with malformed (unparseable) YAML must raise."""
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / arc_info_filename({"project": "myproj"})).write_text("species: [unterminated\n")
+        with pytest.raises(ValueError, match="iteration_1"):
+            normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
+
+    def test_arc_info_file_with_empty_lists_is_legitimate(self, tmp_path: Path) -> None:
+        """An info file that parses fine but has empty species/reactions contributes nothing."""
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / arc_info_filename({"project": "myproj"})).write_text("species: []\nreactions: []\n")
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
+        assert diagnostics.species_to_compute == []
+        assert diagnostics.reactions_to_compute == []
+        assert diagnostics.warnings == []
+
+    def test_trailing_rmg_only_iteration_has_no_arc_and_still_counts_networks(self, tmp_path: Path) -> None:
+        """A trailing RMG-only iteration (no ARC/ dir) is skipped but its pdep networks still count."""
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / arc_info_filename({"project": "myproj"})).write_text(
+            "species:\n- label: OH\n  success: true\nreactions: []\n"
+        )
+        pdep = tmp_path / "iteration_2" / T3_LAYOUT.RMG_SUBDIR / T3_LAYOUT.PDEP_SUBDIR
+        pdep.mkdir(parents=True)
+        (pdep / "network1_1.py").write_text("# network\n")
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert [n.network_id for n in diagnostics.pdep_networks_to_compute] == ["network1_1"]
+        assert diagnostics.warnings == []
+
+    def test_iteration_0_arc_only_no_rmg(self, tmp_path: Path) -> None:
+        """An iteration_0-shaped dir with only an ARC/ subdir (no RMG/) parses correctly."""
+        arc = tmp_path / "iteration_0" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / arc_info_filename({"project": "myproj"})).write_text(
+            "species:\n- label: OH\n  success: true\nreactions: []\n"
+        )
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert diagnostics.pdep_networks_to_compute == []
 
     def test_non_numeric_iteration_name_still_parsed(self, tmp_path: Path) -> None:
         arc = tmp_path / "iteration_final" / T3_LAYOUT.ARC_SUBDIR
@@ -660,23 +739,23 @@ class TestAggregateEdgeCases:
         arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
         arc.mkdir(parents=True)
         (arc / "T3_info.yml").write_text("species:\n- label: OH\n  success: true\nreactions: []\n")
-        with pytest.raises(ValueError, match="iteration_1"):
+        with pytest.raises(FileNotFoundError, match="iteration_1"):
             normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
 
-    def test_warnings_propagate_to_diagnostics_when_some_iterations_parse(self, tmp_path: Path) -> None:
-        """Warnings from bad iterations surface on DiagnosticsV1.warnings when at least
-        one other iteration parses successfully (so the overall run does not hard-fail)."""
+    def test_bad_iteration_after_good_one_raises_rather_than_warns(self, tmp_path: Path) -> None:
+        """A later iteration with ARC/ but no info file must raise even if an earlier one parsed fine.
+
+        Partial ARC-output loss is invalid output for the whole run, not a
+        soft warning tacked onto an otherwise-successful result.
+        """
         good_arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
         good_arc.mkdir(parents=True)
         (good_arc / arc_info_filename({"project": "myproj"})).write_text(
             "species:\n- label: OH\n  success: true\nreactions: []\n"
         )
         (tmp_path / "iteration_2" / T3_LAYOUT.ARC_SUBDIR).mkdir(parents=True)
-        diagnostics = normalize_t3_outputs(
-            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
-        )
-        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
-        assert any("iteration_2" in w for w in diagnostics.warnings)
+        with pytest.raises(FileNotFoundError, match="iteration_2"):
+            normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
 
 
 class TestT3AdapterInputBuildFailure:
@@ -693,6 +772,40 @@ class TestT3AdapterInputBuildFailure:
         assert run.status == RunStatus.FAILED
         assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
         assert "cannot build input" in (run.error_message or "")
+        assert run.input_path is None
+        assert diagnostics is None
+
+    def test_write_input_oserror_records_input_build_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        def _raise(_run_dir: Path, _payload: dict[str, object]) -> Path:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(t3_module, "write_t3_input_file", _raise)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
+        assert "disk full" in (run.error_message or "")
+        assert diagnostics is None
+
+    def test_run_dir_mkdir_oserror_records_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        ws = tmp_path / "ws"
+        ws.mkdir(parents=True)
+
+        def _raise(self: Path, *args: object, **kwargs: object) -> None:
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(t3_module.Path, "mkdir", _raise)
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.SUBPROCESS_ERROR
+        assert "permission denied" in (run.error_message or "")
         assert run.input_path is None
         assert diagnostics is None
 
@@ -746,6 +859,8 @@ class TestT3AdapterSuccessPath:
     def _fake_t3_command() -> list[str]:
         script = (
             "import pathlib, sys\n"
+            "print('hello from stdout')\n"
+            "print('hello from stderr', file=sys.stderr)\n"
             "arc = pathlib.Path('iteration_1/ARC')\n"
             "arc.mkdir(parents=True, exist_ok=True)\n"
             "arc.joinpath('ethanol_combustion_info.yml').write_text(\n"
@@ -788,7 +903,8 @@ class TestT3AdapterSuccessPath:
     def test_run_record_paths_and_timing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         run, _diagnostics = self._run(tmp_path, monkeypatch)
         assert run.input_path is not None and run.input_path.exists()
-        assert run.log_path is not None and run.log_path.exists()
+        assert run.stdout_path is not None and run.stdout_path.exists()
+        assert run.stderr_path is not None and run.stderr_path.exists()
         assert run.output_path is not None and run.output_path.is_dir()
         assert run.actual_cpu_hours is not None and run.actual_cpu_hours >= 0
         assert run.ended_at >= run.started_at
@@ -798,6 +914,23 @@ class TestT3AdapterSuccessPath:
         assert diagnostics is not None
         assert run.level_of_theory == diagnostics.level_of_theory
         assert run.level_of_theory is not None
+
+    def test_stdout_and_stderr_captured_under_carmel_owned_filenames(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard for C3: Carmel must never write its subprocess
+        capture to ``t3.log`` — that path is T3's own log file, which T3's
+        logger archives and unlinks on startup, silently discarding
+        anything Carmel wrote there."""
+        run, _diagnostics = self._run(tmp_path, monkeypatch)
+        assert run.stdout_path is not None
+        assert run.stderr_path is not None
+        assert run.stdout_path.name != T3_LAYOUT.LOG_FILENAME
+        assert run.stderr_path.name != T3_LAYOUT.LOG_FILENAME
+        assert run.stdout_path != run.stderr_path
+        assert "hello from stdout" in run.stdout_path.read_text(encoding="utf-8")
+        assert "hello from stderr" in run.stderr_path.read_text(encoding="utf-8")
+        assert "hello from stderr" not in run.stdout_path.read_text(encoding="utf-8")
 
 
 class TestT3AdapterRealSubprocess:
