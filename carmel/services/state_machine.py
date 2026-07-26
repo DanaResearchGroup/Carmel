@@ -79,6 +79,7 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
     CampaignStateValue.APPROVED_FOR_EXECUTION: frozenset(
         {
             CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.RUNNING_ARC,
             CampaignStateValue.FAILED,
         }
     ),
@@ -88,7 +89,19 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
             CampaignStateValue.FAILED,
         }
     ),
+    CampaignStateValue.RUNNING_ARC: frozenset(
+        {
+            CampaignStateValue.RESULTS_READY,
+            CampaignStateValue.FAILED,
+        }
+    ),
     CampaignStateValue.DIAGNOSTICS_READY: frozenset(
+        {
+            CampaignStateValue.COMPLETED_PHASE1,
+            CampaignStateValue.FAILED,
+        }
+    ),
+    CampaignStateValue.RESULTS_READY: frozenset(
         {
             CampaignStateValue.COMPLETED_PHASE1,
             CampaignStateValue.FAILED,
