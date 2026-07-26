@@ -33,6 +33,15 @@ on:
 #
 #      Once ARC ships the fix, the `tools` job becomes required and
 #      `continue-on-error: true` should be removed from the job.
+#
+#      The upstream stack is cloned at the top of the job so its commit
+#      SHAs can key three caches: conda's package tarballs, the solved
+#      conda environment, and RMG-Py's compiled Cython extensions. Those
+#      SHAs — not Carmel's own environment.yml — are what determine
+#      whether a cached environment is still valid, because they are what
+#      actually gets installed. Anything whose cache hit SKIPS a build
+#      step is keyed on an exact match with no restore-keys; see the
+#      comments on the individual cache steps for why.
 
 jobs:
   lint:
@@ -110,8 +119,34 @@ jobs:
     defaults:
       run:
         shell: bash -el {0}
+    env:
+      # conda's package cache. This has to be set explicitly: the default lives
+      # inside the miniconda installation, which actions/cache cannot restore
+      # into before setup-miniconda has run.
+      CONDA_PKGS_DIRS: /home/runner/conda_pkgs_dir
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+
+      # Cloned BEFORE the conda setup so the upstream commit SHAs are available
+      # to key the caches below. The upstream stack is what actually gets
+      # installed, so the caches must be keyed on those revisions — not on
+      # Carmel's own environment.yml, which describes a different environment
+      # entirely and never changes when RMG/ARC/T3 do.
+      - name: Clone the upstream chemistry stack
+        run: |
+          git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-Py.git "$HOME/RMG-Py"
+          git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-database.git "$HOME/RMG-database"
+          git clone --depth 1 https://github.com/ReactionMechanismGenerator/ARC.git "$HOME/ARC"
+          git clone --depth 1 https://github.com/ReactionMechanismGenerator/T3.git "$HOME/T3"
+
+      - name: Pin the upstream revisions for the cache keys
+        id: pins
+        run: |
+          for repo in RMG-Py RMG-database ARC T3; do
+            printf '%s %s\n' "$repo" "$(git -C "$HOME/$repo" rev-parse HEAD)"
+          done | tee "$HOME/upstream-pins.txt"
+          echo "stack=$(sha256sum "$HOME/upstream-pins.txt" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "rmgpy=$(git -C "$HOME/RMG-Py" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Miniconda
         uses: conda-incubator/setup-miniconda@fc2d68f6413eb2d87b895e92f8584b5b94a10167  # v3.3.0
@@ -121,44 +156,94 @@ jobs:
           activate-environment: rmg_env
           channels: conda-forge,defaults
 
+      # actions/cache needs a concrete path at step level, but $CONDA_PREFIX is
+      # only known once the environment is activated — so publish it through
+      # $GITHUB_ENV. Note this is the ONLY way ${{ env.X }} ever resolves: the
+      # env context sees vars from env: blocks and $GITHUB_ENV, never the
+      # runner's own shell environment. (${{ env.HOME }} silently expands to
+      # the empty string, which is why $HOME is used inside run: below.)
+      - name: Record the conda environment prefix
+        run: echo "ENV_PREFIX=$CONDA_PREFIX" >> "$GITHUB_ENV"
+
+      # Package tarballs. Safe to reuse across upstream revisions — conda
+      # validates every package against the solve before using it — so this
+      # entry takes restore-keys and degrades gracefully to a partial hit,
+      # which still saves most of the download time on a cache miss.
       - name: Cache conda packages
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
-          path: ~/conda_pkgs_dir
-          key: ${{ runner.os }}-conda-${{ hashFiles('environment.yml') }}
+          path: ${{ env.CONDA_PKGS_DIRS }}
+          key: ${{ runner.os }}-conda-pkgs-${{ steps.pins.outputs.stack }}
+          restore-keys: |
+            ${{ runner.os }}-conda-pkgs-
 
-      - name: Clone RMG-Py
-        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-Py.git $HOME/RMG-Py
+      # The solved environment itself — the expensive artifact. Deliberately NO
+      # restore-keys here: the install steps below are skipped on a hit, so a
+      # near-miss would silently test a stack built from different upstream
+      # revisions than the ones just checked out. An exact-match-or-rebuild
+      # policy is the only honest one when a hit suppresses the build.
+      - name: Cache the solved conda environment
+        id: cache-env
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: ${{ env.ENV_PREFIX }}
+          key: ${{ runner.os }}-rmg-env-py3.12-${{ steps.pins.outputs.stack }}
 
-      - name: Clone RMG-database
-        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-database.git $HOME/RMG-database
-
-      - name: Clone ARC
-        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/ARC.git $HOME/ARC
-
-      - name: Clone T3
-        run: git clone --depth 1 https://github.com/ReactionMechanismGenerator/T3.git $HOME/T3
+      # RMG-Py's compiled Cython extensions land in the source tree rather than
+      # the conda env, so they need their own entry — keyed on RMG-Py alone,
+      # since a change to ARC or T3 does not invalidate them.
+      - name: Cache the compiled RMG-Py tree
+        id: cache-rmgpy
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: |
+            ~/RMG-Py/build
+            ~/RMG-Py/**/*.so
+          key: ${{ runner.os }}-rmgpy-build-${{ steps.pins.outputs.rmgpy }}
 
       # The job carries `continue-on-error: true` so a collapse anywhere in
       # this heavy install chain (flaky upstream conda environment, large
-      # chemistry stack) cannot redden the required lanes above.
+      # chemistry stack, or a corrupt restored cache) cannot redden the
+      # required lanes above.
       - name: Install RMG-Py environment
+        if: steps.cache-env.outputs.cache-hit != 'true'
         run: |
           cd "$HOME/RMG-Py"
           conda env update -n rmg_env -f environment.yml
-          make
 
       - name: Install ARC dependencies
+        if: steps.cache-env.outputs.cache-hit != 'true'
         run: |
           cd "$HOME/ARC"
           if [ -f environment.yml ]; then conda env update -n rmg_env -f environment.yml; fi
           pip install -e .
 
       - name: Install T3 dependencies
+        if: steps.cache-env.outputs.cache-hit != 'true'
         run: |
           cd "$HOME/T3"
           if [ -f environment.yml ]; then conda env update -n rmg_env -f environment.yml; fi
           pip install -e .
+
+      - name: Build RMG-Py
+        if: steps.cache-rmgpy.outputs.cache-hit != 'true'
+        run: |
+          cd "$HOME/RMG-Py"
+          make
+
+      # Restoring a conda env by copying its directory is a pragmatic trick,
+      # not a supported conda operation. This step is the tripwire: if the
+      # restored env is subtly broken, fail here with a clear message rather
+      # than let a mangled interpreter masquerade as a real test result.
+      # It deliberately checks only the conda env itself — not the upstream
+      # packages, which are not on sys.path until "Set RMG paths" below and
+      # which have their own known import blocker (see the header comment).
+      - name: Verify the restored conda environment is usable
+        run: |
+          python -c "import sys, numpy, yaml; print('conda env ok:', sys.version)" || {
+            echo "::error::Restored conda environment is unusable. Bump the cache key or clear the caches."
+            exit 1
+          }
 
       - name: Set RMG paths
         run: |
