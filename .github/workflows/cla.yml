@@ -1,0 +1,61 @@
+name: CLA
+
+# Gates every pull request on a signed Contributor License Agreement.
+#
+# Contributors sign by commenting the exact statement in CLA.md on their PR.
+# The action records the signature — GitHub username, user id, PR number and
+# timestamp — into `signatures/version1/cla.json` on the `cla-signatures`
+# branch, and reports a status check that blocks merge until it is present.
+# Because identity is captured automatically, the signing comment is a single
+# line: the action compares the comment body for an exact match, so anything
+# appended to it (a name, an email) would fail to register as a signature.
+#
+# `pull_request_target` runs in the context of the BASE repository and so
+# carries write permissions even for pull requests opened from forks — which
+# is what lets a first-time external contributor's signature be recorded at
+# all. That trigger is only safe because nothing here checks out or executes
+# the pull request's code. Do not add actions/checkout to this workflow.
+#
+# Corporate CLAs are signed out of band (see CLA.md) and are not handled here;
+# add such contributors to `allowlist` once their agreement is on file.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    name: Check CLA signature
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check or record the contributor's CLA signature
+        if: >-
+          github.event_name == 'pull_request_target' ||
+          github.event.comment.body == 'recheck' ||
+          github.event.comment.body == 'I have read the Carmel CLA and I hereby sign the Individual Contributor License Agreement.'
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08  # v2.6.1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Kept off the default branch so signature commits never touch main.
+          branch: cla-signatures
+          path-to-signatures: signatures/version1/cla.json
+          path-to-document: https://github.com/DanaResearchGroup/Carmel/blob/main/CLA.md
+          custom-pr-sign-comment: I have read the Carmel CLA and I hereby sign the Individual Contributor License Agreement.
+          custom-notsigned-prcomment: |
+            Thanks for your contribution. Before this can be merged, Carmel needs a signed
+            Contributor License Agreement — please read **[CLA.md](https://github.com/DanaResearchGroup/Carmel/blob/main/CLA.md)**
+            and then post the following as a new comment on this pull request, on its own,
+            exactly as written:
+          custom-allsigned-prcomment: All contributors have signed the Carmel CLA.
+          # Bot accounts cannot hold copyright, so they have nothing to assign.
+          # Contributors covered by a signed Corporate CLA belong here too.
+          allowlist: dependabot[bot],github-actions[bot],*[bot]

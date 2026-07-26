@@ -90,17 +90,18 @@ aware that would make these representations inaccurate in any respect.
 
 ### How to sign (Individual)
 
-Comment on your pull request with:
+Comment on your pull request with exactly the following line, on its own:
 
-> I have read the Carmel CLA and I hereby sign the Individual Contributor License
-> Agreement.
->
-> Name: ______________________
-> GitHub username: ______________________
-> Email: ______________________
-> Date: ______________________
+> I have read the Carmel CLA and I hereby sign the Individual Contributor License Agreement.
 
-(Or complete the CLA-bot flow if the repository has one configured.)
+The CLA bot compares your comment against that sentence exactly, so post it by
+itself — text added before or after it will not register as a signature. Your
+GitHub username, user id, the pull request number and the date are recorded
+automatically, which is why you are not asked to type them here.
+
+Your signature is stored in `signatures/version1/cla.json` on the
+`cla-signatures` branch of this repository, and covers your present and future
+contributions to Carmel — you sign once, not per pull request.
 
 ---
 

@@ -34,9 +34,11 @@ project* when you contribute. It does two things the bare license does not:
    without disadvantaging the open-source community: the core stays Apache 2.0 for
    everyone.
 
-How to sign: comment on your first pull request with the statement indicated in
-[CLA.md](CLA.md), or follow whatever CLA-bot flow the repository has configured.
-A maintainer will confirm before merge.
+How to sign: the CLA bot comments on your first pull request with the statement
+to post, and reports a status check that blocks merge until you do. It is the
+exact line given under "How to sign (Individual)" in [CLA.md](CLA.md) — post it
+on its own, since the bot matches it exactly. You sign once; the signature
+covers your later contributions too.
 
 ### Lightweight alternative: DCO sign-off
 
