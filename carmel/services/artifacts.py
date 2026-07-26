@@ -4,6 +4,8 @@
 """Atomic JSON/YAML artifact read/write helpers."""
 
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,48 @@ def _model_to_jsonable(data: BaseModel | dict[str, Any]) -> Any:
     return data
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    """Atomically and durably write text content to ``path``.
+
+    Writes to a uniquely named temporary file in the same directory as
+    ``path`` (so the final rename stays on one filesystem and is atomic),
+    fsyncs the temp file's contents to disk, ``os.replace``s it into place,
+    then fsyncs the parent directory so the rename itself is durable.
+
+    Using a unique temp filename per call (rather than a fixed
+    ``path + ".tmp"`` name) is essential: concurrent writers to the same
+    ``path`` must never share a temp file, or their writes can interleave
+    into one file and the eventual rename can move a half-and-half document
+    into place, or a writer can lose a race with another writer's rename and
+    fail with ``FileNotFoundError``.
+
+    Args:
+        path: Destination file path.
+        content: Text content to write.
+
+    Raises:
+        OSError: If the write, fsync, or rename fails. Any partially
+            written temp file is removed before the exception propagates.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
 def write_yaml(path: Path, data: BaseModel | dict[str, Any]) -> None:
     """Atomically write a YAML file.
 
@@ -26,10 +70,7 @@ def write_yaml(path: Path, data: BaseModel | dict[str, Any]) -> None:
         data: A pydantic model or dict.
     """
     payload = _model_to_jsonable(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    tmp_path.replace(path)
+    _atomic_write(path, yaml.safe_dump(payload, sort_keys=False))
 
 
 def write_json(path: Path, data: BaseModel | dict[str, Any]) -> None:
@@ -40,10 +81,7 @@ def write_json(path: Path, data: BaseModel | dict[str, Any]) -> None:
         data: A pydantic model or dict.
     """
     payload = _model_to_jsonable(data)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    tmp_path.replace(path)
+    _atomic_write(path, json.dumps(payload, indent=2, default=str))
 
 
 def write_text(path: Path, content: str) -> None:
@@ -53,10 +91,7 @@ def write_text(path: Path, content: str) -> None:
         path: Destination file path.
         content: Text content.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    tmp_path.replace(path)
+    _atomic_write(path, content)
 
 
 def read_yaml(path: Path) -> dict[str, Any]:

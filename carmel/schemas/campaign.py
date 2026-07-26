@@ -3,6 +3,7 @@
 
 """Campaign and input schemas."""
 
+import math
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -79,8 +80,10 @@ class ReactorSystem(BaseModel):
     @field_validator("temperature_range_K", "pressure_range_bar")
     @classmethod
     def range_must_be_ordered(cls, v: tuple[float, float]) -> tuple[float, float]:
-        """Ensure ranges are (min, max) and positive."""
+        """Ensure ranges are finite, (min, max), and positive."""
         lo, hi = v
+        if not math.isfinite(lo) or not math.isfinite(hi):
+            raise ValueError(f"range values must be finite: got ({lo}, {hi})")
         if lo <= 0 or hi <= 0:
             raise ValueError("range values must be positive")
         if lo > hi:

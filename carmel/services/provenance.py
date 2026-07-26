@@ -3,10 +3,11 @@
 
 """Provenance recording for Carmel actions."""
 
-import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from carmel.services.artifacts import write_json
 
 PROVENANCE_DIR_NAME = "provenance"
 
@@ -36,5 +37,5 @@ def record(workspace_root: Path, name: str, payload: dict[str, Any]) -> Path:
         "recorded_at": datetime.now(UTC).isoformat(),
         **payload,
     }
-    file_path.write_text(json.dumps(full_payload, indent=2, default=str), encoding="utf-8")
+    write_json(file_path, full_payload)
     return file_path

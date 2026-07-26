@@ -157,12 +157,29 @@ class TestBuildT3Input:
         payload = build_t3_input(_campaign(tmp_path))
         species = payload[T3_LAYOUT.INPUT_RMG_KEY]["species"]
         assert all("label" in s and "concentration" in s for s in species)
-        assert all("smiles" in s for s in species)
+        mixture_labels = {"C2H5OH", "O2", "N2"}
+        assert all("smiles" in s for s in species if s["label"] in mixture_labels)
 
-    def test_no_observable_flag_when_species_not_in_mixture(self, tmp_path: Path) -> None:
+    def test_observable_not_in_mixture_emitted_as_new_species(self, tmp_path: Path) -> None:
+        """An observable species that is not an initial-mixture component (e.g. a
+        product) must still surface as an SA observable, emitted as an additional
+        zero-concentration species entry — the default campaign's
+        ``species_profile`` observable targets OH, which is not one of the
+        C2H5OH/O2/N2 mixture components.
+        """
         payload = build_t3_input(_campaign(tmp_path))
         species = payload[T3_LAYOUT.INPUT_RMG_KEY]["species"]
-        assert all(not s.get("SA_observable", False) for s in species)
+        oh = next(s for s in species if s["label"] == "OH")
+        assert oh["SA_observable"] is True
+        assert oh["concentration"] == 0.0
+        mixture_labels = {"C2H5OH", "O2", "N2"}
+        assert all(not s.get("SA_observable", False) for s in species if s["label"] in mixture_labels)
+
+    def test_blank_observable_species_raises(self, tmp_path: Path) -> None:
+        c = _campaign(tmp_path)
+        c.input.target_observables[1] = TargetObservable(name="species_profile", species="   ")
+        with pytest.raises(ValueError, match="blank species"):
+            build_t3_input(c)
 
     def test_observable_species_flag_when_in_mixture(self, tmp_path: Path) -> None:
         c = _campaign(tmp_path)
@@ -173,15 +190,50 @@ class TestBuildT3Input:
         assert o2["SA_observable"] is True
 
     def test_reactor_uses_real_t3_type(self, tmp_path: Path) -> None:
+        """T3/RMG only accept the literal strings 'gas batch constant T P' or
+        'liquid batch constant T V' (t3/schema.py RMGReactor.check_reactor_type).
+        Carmel's ReactorSystem is gas-phase only (it always carries
+        pressure_range_bar), so every non-FLAME ReactorType maps onto the gas
+        string — reactor_type must still be genuinely read, not hardcoded (see
+        test_all_gas_reactor_types_map_to_real_t3_type and
+        test_flame_reactor_type_raises for the discriminating coverage).
+        """
         payload = build_t3_input(_campaign(tmp_path))
         reactors = payload[T3_LAYOUT.INPUT_RMG_KEY]["reactors"]
         assert reactors[0]["type"] == "gas batch constant T P"
+
+    @pytest.mark.parametrize(
+        "reactor_type",
+        [ReactorType.JSR, ReactorType.PFR, ReactorType.BATCH, ReactorType.SHOCK_TUBE, ReactorType.RCM],
+    )
+    def test_all_gas_reactor_types_map_to_real_t3_type(self, tmp_path: Path, reactor_type: ReactorType) -> None:
+        campaign = _campaign(tmp_path)
+        campaign.input.target_reactor_systems[0].reactor_type = reactor_type
+        payload = build_t3_input(campaign)
+        reactor = payload[T3_LAYOUT.INPUT_RMG_KEY]["reactors"][0]
+        assert reactor["type"] == "gas batch constant T P"
+
+    def test_flame_reactor_type_raises(self, tmp_path: Path) -> None:
+        campaign = _campaign(tmp_path)
+        campaign.input.target_reactor_systems[0].reactor_type = ReactorType.FLAME
+        with pytest.raises(ValueError, match="reactor_type"):
+            build_t3_input(campaign)
 
     def test_reactor_temperature_is_range_list(self, tmp_path: Path) -> None:
         payload = build_t3_input(_campaign(tmp_path))
         reactor = payload[T3_LAYOUT.INPUT_RMG_KEY]["reactors"][0]
         assert reactor["T"] == [800.0, 1200.0]
         assert reactor["P"] == [1.0, 5.0]
+
+    def test_reactor_scalar_when_range_collapses(self, tmp_path: Path) -> None:
+        """A degenerate (min == max) temperature/pressure range must be emitted
+        as a bare float, not a redundant [x, x] list."""
+        campaign = _campaign(tmp_path)
+        campaign.input.target_reactor_systems[0].temperature_range_K = (900.0, 900.0)
+        campaign.input.target_reactor_systems[0].pressure_range_bar = (2.0, 2.0)
+        reactor = build_t3_input(campaign)[T3_LAYOUT.INPUT_RMG_KEY]["reactors"][0]
+        assert reactor["T"] == 900.0
+        assert reactor["P"] == 2.0
 
     def test_reactor_termination_time_present(self, tmp_path: Path) -> None:
         payload = build_t3_input(_campaign(tmp_path))
@@ -306,6 +358,16 @@ class TestCoerceEntries:
     def test_reaction_entry_missing_label(self) -> None:
         assert _coerce_reaction_entry({"reactants": ["A"]}, iteration=1) is None
 
+    def test_reaction_entry_matches_real_arc_contract(self) -> None:
+        """ARC's real <project>_info.yml reaction entries only ever carry
+        'label' and 'success' (see arc/main.py save_project_info_file) — never
+        reactants/products. Confirm the real shape parses cleanly, resolving
+        to empty reactant/product lists rather than erroring."""
+        sel = _coerce_reaction_entry({"label": "r1", "success": True}, iteration=1)
+        assert sel is not None
+        assert sel.reactants == []
+        assert sel.products == []
+
 
 # ---------------------------------------------------------------------------
 # Project walking and pdep discovery
@@ -342,6 +404,15 @@ class TestDiscoverPdepNetworks:
     def test_empty_when_no_pdep_dirs(self, tmp_path: Path) -> None:
         (tmp_path / "iteration_1" / "ARC").mkdir(parents=True)
         assert _discover_pdep_networks(_walk_iterations(tmp_path)) == []
+
+    def test_reason_names_iteration_not_rmg(self) -> None:
+        """net_file is .../iteration_N/RMG/pdep/networkX.py — the discovery
+        reason must name the iteration directory, not the intermediate 'RMG'
+        directory."""
+        nets = _discover_pdep_networks(_walk_iterations(FIXTURE_ROOT))
+        net = next(n for n in nets if n.network_id == "network1_1")
+        assert net.reason == "discovered at iteration_1"
+        assert all(n.reason == "discovered at iteration_1" for n in nets)
 
 
 # ---------------------------------------------------------------------------
@@ -997,10 +1068,14 @@ class TestBuildT3InputOptionalFields:
     """Optional campaign fields must be omitted rather than emitted as null."""
 
     def test_reactor_without_residence_time_omits_termination(self, tmp_path: Path) -> None:
+        """RMG requires at least one termination criterion (rmgpy/rmg/input.py
+        raises if none is given) — omitting termination_time must not leave a
+        reactor with zero criteria; it must fall back to termination_rate_ratio."""
         campaign = _campaign(tmp_path)
         campaign.input.target_reactor_systems[0].residence_time_s = None
         reactor = build_t3_input(campaign)[T3_LAYOUT.INPUT_RMG_KEY]["reactors"][0]
         assert "termination_time" not in reactor
+        assert reactor["termination_rate_ratio"] == 0.1
 
     def test_species_without_smiles_omits_smiles(self, tmp_path: Path) -> None:
         campaign = _campaign(tmp_path)

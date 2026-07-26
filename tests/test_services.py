@@ -1,5 +1,8 @@
 """Tests for Phase 1 service modules."""
 
+import json
+import os
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -158,6 +161,67 @@ class TestArtifacts:
         loaded = ApprovalPolicy.model_validate(read_yaml(path))
         assert loaded.auto_approve_t3_under_cpu_hours == 10.0
 
+    def test_concurrent_write_json_never_corrupts_file(self, tmp_path: Path) -> None:
+        """N threads hammering the same path must never race on a shared temp file.
+
+        A pre-fix implementation shared one ``path + ".tmp"`` name across all
+        writers, so concurrent writers could interleave into that one temp
+        file and rename a half-and-half document into place, or lose a race
+        with another writer's rename and raise ``FileNotFoundError``. Each
+        writer here also re-reads the file after writing: any transient
+        corruption or missing-file window must show up as a failure.
+
+        50 iterations per thread (with an 8-way barrier) was chosen because
+        the reviewer who found this bug observed failures in 184/200 runs of
+        a similarly sized loop pre-fix — decisive against the bug without
+        making the test slow or flaky in CI.
+        """
+        path = tmp_path / "shared.json"
+        write_json(path, {"n": -1})
+        n_threads = 8
+        n_iterations = 50
+        barrier = threading.Barrier(n_threads)
+        errors: list[BaseException] = []
+
+        def worker(thread_id: int) -> None:
+            barrier.wait()
+            for i in range(n_iterations):
+                try:
+                    write_json(path, {"thread": thread_id, "i": i})
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    assert "thread" in data and "i" in data
+                except BaseException as e:  # noqa: BLE001 - captured for the assertion below
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        final = json.loads(path.read_text(encoding="utf-8"))
+        assert "thread" in final and "i" in final
+        assert not list(tmp_path.glob("*.tmp"))
+
+    def test_write_json_cleans_up_temp_file_on_replace_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If the rename step fails, the orphaned temp file must be removed and the error re-raised."""
+        path = tmp_path / "out.json"
+        real_replace = os.replace
+
+        def failing_replace(src: str, dst: str) -> None:
+            raise OSError("simulated rename failure")
+
+        monkeypatch.setattr(os, "replace", failing_replace)
+        with pytest.raises(OSError, match="simulated rename failure"):
+            write_json(path, {"a": 1})
+        monkeypatch.setattr(os, "replace", real_replace)
+
+        assert not path.exists()
+        assert not list(tmp_path.glob("*.tmp"))
+
 
 # ----------------------- decision log ---------------------------
 
@@ -192,6 +256,50 @@ class TestDecisionLog:
         events = read_events(log)
         assert len(events) == 2
 
+    def test_read_skips_malformed_line(self, tmp_path: Path) -> None:
+        """A truncated/garbage line must not brick every future read of the log."""
+        log = tmp_path / "decision_log.jsonl"
+        append_event(log, {"event": "first"})
+        with open(log, "a", encoding="utf-8") as f:
+            f.write('{"event": "truncated", "notes": "oops\n')  # unterminated JSON
+        append_event(log, {"event": "third"})
+        events = read_events(log)
+        assert [e["event"] for e in events] == ["first", "third"]
+
+    def test_concurrent_append_produces_only_valid_json_lines(self, tmp_path: Path) -> None:
+        """Concurrent appenders from multiple threads must never interleave partial lines.
+
+        8 threads x 50 appends each (with a barrier to maximize contention)
+        was chosen for the same reason as the artifacts concurrency test:
+        enough iterations to be decisive against interleaving, few enough to
+        stay fast and non-flaky in CI.
+        """
+        log = tmp_path / "decision_log.jsonl"
+        n_threads = 8
+        n_iterations = 50
+        barrier = threading.Barrier(n_threads)
+        errors: list[BaseException] = []
+
+        def worker(thread_id: int) -> None:
+            barrier.wait()
+            for i in range(n_iterations):
+                try:
+                    append_event(log, {"event": f"t{thread_id}-{i}"})
+                except BaseException as e:  # noqa: BLE001 - captured for the assertion below
+                    errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        lines = log.read_text(encoding="utf-8").splitlines()
+        assert len(lines) == n_threads * n_iterations
+        for line in lines:
+            json.loads(line)  # raises if any line is malformed
+
 
 # ----------------------- state machine --------------------------
 
@@ -221,6 +329,45 @@ class TestStateMachine:
         create_campaign(ws, _make_input())
         with pytest.raises(InvalidTransitionError):
             update_state(ws, CampaignStateValue.RUNNING_T3)
+
+    def test_concurrent_update_state_exactly_one_thread_wins(self, tmp_path: Path) -> None:
+        """Two overlapping ``/run``-style requests must not both succeed.
+
+        Without the per-workspace advisory lock, two threads can both
+        ``load_state`` before either writes, both pass ``assert_transition``
+        against the same stale ``current_state``, and both persist a state
+        — a lost-update race (e.g. two requests both entering RUNNING_T3).
+        With the lock, the whole load-check-write cycle is serialized: the
+        second thread must observe the first thread's write and raise
+        ``InvalidTransitionError`` for the now-stale transition.
+        """
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        update_state(ws, CampaignStateValue.VALIDATED)
+        update_state(ws, CampaignStateValue.READY_FOR_PLANNING)
+        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION)
+
+        barrier = threading.Barrier(2)
+        results: list[CampaignState] = []
+        errors: list[BaseException] = []
+
+        def worker() -> None:
+            barrier.wait()
+            try:
+                results.append(update_state(ws, CampaignStateValue.RUNNING_T3))
+            except InvalidTransitionError as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(results) == 1
+        assert len(errors) == 1
+        assert isinstance(errors[0], InvalidTransitionError)
+        assert load_state(ws).state == CampaignStateValue.RUNNING_T3
 
     def test_blocked_cannot_be_unrejected_to_approved_for_execution(self) -> None:
         assert not can_transition(CampaignStateValue.BLOCKED, CampaignStateValue.APPROVED_FOR_EXECUTION)
@@ -381,6 +528,44 @@ class TestApprovals:
         action = _make_action(cpu_hours=0.0, kind=ActionKind.LITERATURE_SEARCH)
         policy = ApprovalPolicy(require_approval_for_literature=True)
         assert evaluate_action(action, policy) == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_action_over_declared_budget_requires_approval(self) -> None:
+        """A T3_RUN estimate within the policy threshold but over the campaign's
+        own declared cpu_hours budget must not be auto-approved — the campaign's
+        Budgets.cpu_hours was previously never read anywhere."""
+        budgets = Budgets(cpu_hours=1.0, experiment_budget=0.0)
+        action = _make_action(cpu_hours=2.0)  # under policy threshold (10.0), over budget (1.0)
+        result = evaluate_action(action, ApprovalPolicy(), budgets=budgets)
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_action_under_declared_budget_still_auto_approved(self) -> None:
+        budgets = Budgets(cpu_hours=20.0, experiment_budget=0.0)
+        action = _make_action(cpu_hours=2.0)
+        result = evaluate_action(action, ApprovalPolicy(), budgets=budgets)
+        assert result == ApprovalRequirement.AUTO_APPROVED
+
+    def test_no_budgets_falls_back_to_policy_only(self) -> None:
+        action = _make_action(cpu_hours=2.0)
+        assert evaluate_action(action, ApprovalPolicy(), budgets=None) == ApprovalRequirement.AUTO_APPROVED
+
+    def test_budget_violation_recorded_in_decision_log(self, tmp_path: Path) -> None:
+        ws = tmp_path
+        budgets = Budgets(cpu_hours=1.0, experiment_budget=0.0)
+        action = _make_action(cpu_hours=2.0)
+        result = evaluate_action(action, ApprovalPolicy(), budgets=budgets, workspace_root=ws)
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
+        events = read_events(ws / "decision_log.jsonl")
+        assert len(events) == 1
+        assert events[0]["event"] == "approval_decision"
+        assert events[0]["action_id"] == "a1"
+        assert events[0]["status"] == ApprovalStatus.PENDING.value
+        assert "budget" in events[0]["rationale"]
+
+    def test_arc_action_over_declared_budget_requires_approval(self) -> None:
+        budgets = Budgets(cpu_hours=1.0, experiment_budget=0.0)
+        action = _make_action(cpu_hours=2.0, kind=ActionKind.ARC_RUN)
+        result = evaluate_action(action, ApprovalPolicy(), budgets=budgets)
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
 
     def test_unknown_action_kind_fails_safe(self) -> None:
         """An action kind the policy does not recognize must not be auto-approved.
@@ -565,6 +750,33 @@ class TestPlanner:
         plan = plan_and_save(ws, c)
         assert (ws / "plan.json").exists()
         assert plan.campaign_id == c.campaign_id
+
+    def test_plan_and_save_enforces_the_declared_budget(self, tmp_path: Path) -> None:
+        """A declared budget must gate approval through the real planning path.
+
+        ``evaluate_action`` accepting a ``budgets`` argument proves nothing on
+        its own — the defect was that no production call site ever passed one,
+        so ``Budgets`` had no read site and an over-budget action was still
+        auto-approved with no human in the loop. This asserts the wiring, not
+        the helper.
+        """
+        ws = tmp_path / "ws"
+        campaign_input = _make_input().model_copy(update={"budgets": Budgets(cpu_hours=0.5, experiment_budget=0.0)})
+        c = create_campaign(ws, campaign_input)
+
+        plan = plan_and_save(ws, c)
+
+        action = plan.actions[0]
+        assert action.estimated_cpu_hours > 0.5, "fixture must actually exceed the budget"
+        assert action.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        rationales = [str(e.get("rationale", "")) for e in read_events(ws / "decision_log.jsonl")]
+        assert any("budget exceeded" in r for r in rationales)
+
+    def test_plan_and_save_auto_approves_within_budget(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        c = create_campaign(ws, _make_input())
+        plan = plan_and_save(ws, c)
+        assert plan.actions[0].approval_requirement == ApprovalRequirement.AUTO_APPROVED
 
 
 # ----------------------- drawing --------------------------------

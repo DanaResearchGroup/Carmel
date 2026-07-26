@@ -14,6 +14,7 @@ from carmel.schemas.approval import (
     ApprovalRequirement,
     ApprovalStatus,
 )
+from carmel.schemas.campaign import Budgets
 from carmel.schemas.plan import PlannedAction
 from carmel.services.artifacts import read_yaml, write_yaml
 from carmel.services.decision_log import append_event
@@ -31,17 +32,47 @@ def save_policy(workspace_root: Path, policy: ApprovalPolicy) -> None:
     write_yaml(workspace_root / POLICY_FILE_NAME, policy)
 
 
-def evaluate_action(action: PlannedAction, policy: ApprovalPolicy) -> ApprovalRequirement:
+def evaluate_action(
+    action: PlannedAction,
+    policy: ApprovalPolicy,
+    budgets: Budgets | None = None,
+    workspace_root: Path | None = None,
+) -> ApprovalRequirement:
     """Evaluate whether an action requires human approval under the policy.
 
     Args:
         action: The planned action to evaluate.
         policy: The active approval policy.
+        budgets: The campaign's declared budgets, if available. When given,
+            a compute-consuming action (``T3_RUN``/``ARC_RUN``) whose
+            ``estimated_cpu_hours`` exceeds ``budgets.cpu_hours`` is never
+            auto-approved, regardless of the policy threshold.
+        workspace_root: The campaign workspace root. When given together
+            with ``budgets``, a budget violation is recorded to the
+            decision log immediately.
 
     Returns:
-        ``AUTO_APPROVED`` if the action is below the threshold for its kind,
-        ``REQUIRES_APPROVAL`` otherwise.
+        ``AUTO_APPROVED`` if the action is below the threshold for its kind
+        and within the declared budget (if any), ``REQUIRES_APPROVAL``
+        otherwise.
     """
+    if (
+        budgets is not None
+        and action.kind in (ActionKind.T3_RUN, ActionKind.ARC_RUN)
+        and action.estimated_cpu_hours > budgets.cpu_hours
+    ):
+        if workspace_root is not None:
+            record_decision(
+                workspace_root,
+                action.action_id,
+                ApprovalStatus.PENDING,
+                decided_by="system",
+                rationale=(
+                    f"budget exceeded: estimated {action.estimated_cpu_hours:.2f} cpu_hours "
+                    f"> declared budget {budgets.cpu_hours:.2f} cpu_hours"
+                ),
+            )
+        return ApprovalRequirement.REQUIRES_APPROVAL
     if action.kind == ActionKind.T3_RUN:
         if action.estimated_cpu_hours <= policy.auto_approve_t3_under_cpu_hours:
             return ApprovalRequirement.AUTO_APPROVED

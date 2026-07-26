@@ -35,15 +35,28 @@ def estimate_t3_cpu_hours(campaign: Campaign) -> float:
     return float(2 * n_reactors + n_observables)
 
 
-def generate_initial_plan(campaign: Campaign, policy: ApprovalPolicy) -> Plan:
+def generate_initial_plan(
+    campaign: Campaign,
+    policy: ApprovalPolicy,
+    workspace_root: Path | None = None,
+) -> Plan:
     """Generate the deterministic Phase 1 initial plan.
 
     The Phase 1 initial plan always contains exactly one action: a T3
     handshake to produce a baseline mechanism and diagnostics.
 
+    The campaign's declared budgets are always passed to the approval
+    evaluation. Without that, ``Budgets`` would have no read site anywhere
+    in the codebase and a user declaring a 0.5 CPU-hour budget would still
+    have a 3 CPU-hour action auto-approved with no human in the loop —
+    silently violating the "all expensive actions gated by budget checks"
+    invariant.
+
     Args:
         campaign: The campaign to plan for.
         policy: The active approval policy.
+        workspace_root: The campaign workspace root. When given, a budget
+            violation is recorded to the decision log as it is detected.
 
     Returns:
         A Plan with a single T3-handshake action.
@@ -62,7 +75,12 @@ def generate_initial_plan(campaign: Campaign, policy: ApprovalPolicy) -> Plan:
         approval_requirement=ApprovalRequirement.AUTO_APPROVED,
         parameters={},
     )
-    requirement = evaluate_action(action, policy)
+    requirement = evaluate_action(
+        action,
+        policy,
+        budgets=campaign.input.budgets,
+        workspace_root=workspace_root,
+    )
     action = action.model_copy(update={"approval_requirement": requirement})
     return Plan(
         plan_id=str(uuid4()),
@@ -136,6 +154,6 @@ def plan_and_save(workspace_root: Path, campaign: Campaign) -> Plan:
         The generated and saved Plan.
     """
     policy = load_policy(workspace_root)
-    plan = generate_initial_plan(campaign, policy)
+    plan = generate_initial_plan(campaign, policy, workspace_root)
     save_plan(workspace_root, plan)
     return plan

@@ -45,7 +45,7 @@ from uuid import uuid4
 import yaml
 
 from carmel.logger import get_logger
-from carmel.schemas.campaign import Campaign
+from carmel.schemas.campaign import Campaign, MixtureComponent, ReactorSystem, ReactorType
 from carmel.schemas.diagnostics import (
     DiagnosticsV1,
     PDepNetworkSelection,
@@ -424,28 +424,66 @@ def _find_t3_executable() -> list[str] | None:
 # ---------------------------------------------------------------------------
 
 
-def _carmel_reactor_to_t3(reactor: Any) -> dict[str, Any]:
+# T3's RMG reactor only understands two literal ``type`` strings (see
+# ``t3/schema.py RMGReactor.check_reactor_type`` upstream):
+#   - "gas batch constant T P"
+#   - "liquid batch constant T V"
+# Carmel's ``ReactorSystem`` always carries a ``pressure_range_bar``, which
+# only makes sense for a gas-phase reactor, so every gas-phase
+# ``ReactorType`` maps onto the single gas-batch string. ``FLAME`` has no
+# RMG batch-reactor analog at all and is rejected outright rather than
+# silently mapped onto a batch reactor it does not behave like.
+_REACTOR_TYPE_TO_T3: dict[ReactorType, str] = {
+    ReactorType.JSR: "gas batch constant T P",
+    ReactorType.PFR: "gas batch constant T P",
+    ReactorType.BATCH: "gas batch constant T P",
+    ReactorType.SHOCK_TUBE: "gas batch constant T P",
+    ReactorType.RCM: "gas batch constant T P",
+}
+
+# Fallback termination criterion when a reactor carries no
+# ``residence_time_s``. T3/RMG requires at least one termination criterion
+# (see ``rmgpy/rmg/input.py``: it raises if none of
+# ``termination_conversion``/``termination_time``/``termination_rate_ratio``
+# is given). ``0.1`` mirrors the value paired with ``termination_time`` in
+# Carmel's own captured real T3 fixture (``tests/fixtures/t3/sample_project``).
+_DEFAULT_TERMINATION_RATE_RATIO = 0.1
+
+
+def _carmel_reactor_to_t3(reactor: ReactorSystem) -> dict[str, Any]:
     """Translate a Carmel ``ReactorSystem`` into a T3 RMG reactor dict.
 
     Carmel's ``ReactorSystem`` exposes ranges; T3's RMG reactor takes
     either scalars or 2-element ``[min, max]`` lists. We forward the
     range as a list so T3 generates conditions across the range.
+
+    Raises:
+        ValueError: If ``reactor.reactor_type`` has no T3/RMG batch-reactor
+            equivalent (currently only ``ReactorType.FLAME``).
     """
+    t3_type = _REACTOR_TYPE_TO_T3.get(reactor.reactor_type)
+    if t3_type is None:
+        raise ValueError(
+            f"reactor_type {reactor.reactor_type!r} has no T3/RMG batch-reactor equivalent "
+            "and cannot be translated into a T3 input"
+        )
     t_lo, t_hi = reactor.temperature_range_K
     p_lo, p_hi = reactor.pressure_range_bar
     t_value: float | list[float] = [t_lo, t_hi] if t_lo != t_hi else float(t_lo)
     p_value: float | list[float] = [p_lo, p_hi] if p_lo != p_hi else float(p_lo)
     out: dict[str, Any] = {
-        "type": "gas batch constant T P",
+        "type": t3_type,
         "T": t_value,
         "P": p_value,
     }
     if reactor.residence_time_s is not None:
         out["termination_time"] = [float(reactor.residence_time_s), "s"]
+    else:
+        out["termination_rate_ratio"] = _DEFAULT_TERMINATION_RATE_RATIO
     return out
 
 
-def _carmel_species_to_t3(component: Any, observable_labels: set[str]) -> dict[str, Any]:
+def _carmel_species_to_t3(component: MixtureComponent, observable_labels: set[str]) -> dict[str, Any]:
     """Translate a Carmel mixture component into a T3 RMG species dict."""
     out: dict[str, Any] = {
         "label": component.species,
@@ -470,8 +508,17 @@ def build_t3_input(campaign: Campaign) -> dict[str, Any]:
     Returns:
         A dict suitable for serialization as ``input.yml`` for T3.
     """
+    for observable in campaign.input.target_observables:
+        if observable.species is not None and not observable.species.strip():
+            raise ValueError(
+                f"target observable {observable.name!r} declares a blank species and cannot be "
+                "resolved to a T3 SA observable"
+            )
     observable_labels = {o.species for o in campaign.input.target_observables if o.species}
     species = [_carmel_species_to_t3(c, observable_labels) for c in campaign.input.initial_mixture.components]
+    mixture_labels = {c.species for c in campaign.input.initial_mixture.components}
+    for label in sorted(observable_labels - mixture_labels):
+        species.append({"label": label, "concentration": 0.0, "SA_observable": True})
     reactors = [_carmel_reactor_to_t3(r) for r in campaign.input.target_reactor_systems]
 
     return {
@@ -721,7 +768,7 @@ def _discover_pdep_networks(iteration_dirs: list[Path]) -> list[PDepNetworkSelec
                     network_id=network_id,
                     species=[],
                     reactions=[],
-                    reason=f"discovered at {net_file.parent.parent.name}",
+                    reason=f"discovered at {net_file.parent.parent.parent.name}",
                 ),
             )
     return list(networks.values())

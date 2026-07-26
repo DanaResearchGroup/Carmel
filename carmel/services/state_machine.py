@@ -3,11 +3,46 @@
 
 """Campaign lifecycle state machine."""
 
+import contextlib
+import fcntl
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 from carmel.schemas.state import CampaignState, CampaignStateValue
 from carmel.services.artifacts import read_json, write_json
+
+WORKSPACE_LOCK_FILE_NAME = ".carmel.lock"
+
+
+@contextlib.contextmanager
+def workspace_lock(workspace_root: Path) -> Iterator[None]:
+    """Hold an exclusive advisory lock on a campaign workspace.
+
+    Serializes any read-check-write or append cycle against a
+    ``<workspace_root>/.carmel.lock`` file so that concurrent callers (e.g.
+    two overlapping ``/run`` requests) cannot interleave their operations
+    into a lost-update race. The lock is process- and thread-safe: it is
+    acquired via ``fcntl.flock``, which blocks other processes and other
+    threads within this process alike until released.
+
+    This uses ``fcntl``, which is POSIX-only. That is acceptable here:
+    Carmel targets Linux CI and Linux/macOS local use, never Windows.
+
+    Args:
+        workspace_root: The campaign workspace root to lock.
+
+    Yields:
+        None. The lock is held for the duration of the ``with`` block.
+    """
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    lock_path = workspace_root / WORKSPACE_LOCK_FILE_NAME
+    with open(lock_path, "w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
 class InvalidTransitionError(ValueError):
@@ -144,14 +179,15 @@ def update_state(
     Raises:
         InvalidTransitionError: If the transition is not allowed.
     """
-    current_state = load_state(workspace_root)
-    assert_transition(current_state.state, target, current_state.failed_from)
-    new_state = CampaignState(
-        campaign_id=current_state.campaign_id,
-        state=target,
-        updated_at=datetime.now(UTC),
-        notes=notes,
-        failed_from=current_state.state if target == CampaignStateValue.FAILED else None,
-    )
-    save_state(workspace_root, new_state)
-    return new_state
+    with workspace_lock(workspace_root):
+        current_state = load_state(workspace_root)
+        assert_transition(current_state.state, target, current_state.failed_from)
+        new_state = CampaignState(
+            campaign_id=current_state.campaign_id,
+            state=target,
+            updated_at=datetime.now(UTC),
+            notes=notes,
+            failed_from=current_state.state if target == CampaignStateValue.FAILED else None,
+        )
+        save_state(workspace_root, new_state)
+        return new_state

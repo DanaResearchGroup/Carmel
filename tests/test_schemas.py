@@ -78,6 +78,10 @@ class TestMixtureComponent:
         with pytest.raises(ValidationError):
             MixtureComponent(species="", mole_fraction=0.5)
 
+    def test_nan_mole_fraction_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MixtureComponent(species="O2", mole_fraction=float("nan"))
+
 
 class TestInitialMixture:
     def test_valid(self) -> None:
@@ -112,6 +116,38 @@ class TestReactorSystem:
                 reactor_type=ReactorType.PFR,
                 temperature_range_K=(800.0, 1200.0),
                 pressure_range_bar=(-1.0, 5.0),
+            )
+
+    def test_nan_temperature_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ReactorSystem(
+                reactor_type=ReactorType.JSR,
+                temperature_range_K=(float("nan"), 1200.0),
+                pressure_range_bar=(1.0, 5.0),
+            )
+
+    def test_positive_infinity_temperature_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ReactorSystem(
+                reactor_type=ReactorType.JSR,
+                temperature_range_K=(800.0, float("inf")),
+                pressure_range_bar=(1.0, 5.0),
+            )
+
+    def test_negative_infinity_pressure_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ReactorSystem(
+                reactor_type=ReactorType.JSR,
+                temperature_range_K=(800.0, 1200.0),
+                pressure_range_bar=(float("-inf"), 5.0),
+            )
+
+    def test_positive_infinity_pressure_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ReactorSystem(
+                reactor_type=ReactorType.JSR,
+                temperature_range_K=(800.0, 1200.0),
+                pressure_range_bar=(1.0, float("inf")),
             )
 
 
