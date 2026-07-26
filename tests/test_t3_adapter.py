@@ -13,6 +13,7 @@ upstream ARC distutils blocker is in effect.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -63,10 +64,49 @@ from carmel.schemas import (
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "t3" / "sample_project"
 
+# Captured at import time, before the autouse fixture below can ever run, so
+# TestT3AdapterRealSubprocess can restore the ambient CI launcher environment
+# ($T3_CONDA_ENV / $T3_PYTHON / $T3_PATH) explicitly even though every other
+# test in this module starts from a cleared one.
+_AMBIENT_T3_ENV = {name: os.environ[name] for name in ("T3_CONDA_ENV", "T3_PYTHON", "T3_PATH") if name in os.environ}
+
+# Evaluated at collection time (module import), deliberately *before* the
+# autouse fixture below can clear anything — this must keep reading the real
+# ambient environment so the skip decision matches what
+# TestT3AdapterRealSubprocess will actually see. Do not "fix" this by moving
+# it after the fixture or by reading _AMBIENT_T3_ENV instead: pytest marks
+# are evaluated once, at collection, outside of any test's fixture scope, so
+# there is no fixture ordering to fight here.
 requires_t3 = pytest.mark.skipif(
     not is_t3_importable(),
     reason="T3 not actually importable (likely the ARC distutils blocker on Python 3.12)",
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_t3_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear T3 launcher env vars so every test starts from a known-empty env.
+
+    In CI, the workflow exports ``$T3_CONDA_ENV``, ``$T3_PYTHON``, and
+    ``$T3_PATH`` into the job environment so the real T3 subprocess test can
+    launch T3. Every *other* test in this module that deliberately breaks or
+    monkeypatches one part of the resolution chain (e.g. forcing
+    ``shutil.which`` to return None, or pointing ``$T3_PYTHON`` at a missing
+    interpreter) must not have its intent overridden by those ambient values
+    winning at a higher precedence step. So each test here starts from a
+    cleared environment and opts in explicitly to whatever env var it needs.
+
+    ``TestT3AdapterRealSubprocess`` is exempted: it genuinely needs the
+    ambient CI launcher environment, which is why it's captured into
+    ``_AMBIENT_T3_ENV`` at module import time (before this fixture could ever
+    clear it) and restored here explicitly for that class only.
+    """
+    monkeypatch.delenv("T3_CONDA_ENV", raising=False)
+    monkeypatch.delenv("T3_PYTHON", raising=False)
+    monkeypatch.delenv("T3_PATH", raising=False)
+    if request.cls is not None and request.cls.__name__ == "TestT3AdapterRealSubprocess":
+        for name, value in _AMBIENT_T3_ENV.items():
+            monkeypatch.setenv(name, value)
 
 
 def _campaign(workspace_root: Path) -> Campaign:
@@ -124,9 +164,32 @@ class TestT3Discovery:
     def test_is_t3_importable_returns_bool(self) -> None:
         assert isinstance(is_t3_importable(), bool)
 
-    def test_importable_implies_installed(self) -> None:
-        if is_t3_importable():
-            assert is_t3_installed()
+    def test_importable_and_installed_probe_different_environments(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``is_t3_importable() => is_t3_installed()`` is not a real invariant.
+
+        This test used to assert that implication. Under the three-env
+        deployment model it is false by design, not a bug: ``is_t3_importable``
+        probes whether ``t3`` imports inside the *resolved T3 interpreter*
+        (which may live in a separate conda env named by ``$T3_CONDA_ENV`` or
+        pointed to by ``$T3_PYTHON``), while ``is_t3_installed`` calls
+        ``importlib.util.find_spec("t3")`` in *Carmel's own process*. In the
+        normal three-env deployment, T3 is importable in its own env while
+        genuinely absent from Carmel's env, so the old invariant would fail
+        honestly, not spuriously.
+
+        Rather than delete the test outright, this rewrites it to demonstrate
+        the real, useful fact: the two probes can and do diverge, because
+        they answer questions about different environments. If a future
+        reader is tempted to "restore" the implication, don't — it contradicts
+        the three-env model by construction.
+        """
+        (tmp_path / "t3.py").write_text("__version__ = '9.9.9'\n")
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # only the *resolved* subprocess sees this
+        assert is_t3_importable() is True
+        assert is_t3_installed() is False
 
     def test_find_executable_returns_list_or_none(self) -> None:
         result = _find_t3_executable()
@@ -1465,6 +1528,49 @@ class TestT3AdapterStreamContract:
         assert "stub stdout line" not in stderr_text
 
 
+def _t3_diagnostic(run: Any, run_dir: Path) -> str:
+    """Build a diagnostic message explaining a real-T3-subprocess assertion failure.
+
+    Used as the second argument to every assertion in
+    ``TestT3AdapterRealSubprocess`` so a CI failure is self-explanatory
+    instead of a bare ``assert False``. Includes the resolved command, the
+    recorded ``failure_code``, a directory listing of the run directory, and
+    the last ~2000 characters of both captured output streams.
+
+    Args:
+        run: The ``RunRecord`` returned by ``T3Adapter.run``.
+        run_dir: The run's working directory (``run.input_path.parent``).
+
+    Returns:
+        A formatted, human-readable diagnostic string.
+    """
+
+    def _tail(path: Path | None, label: str) -> str:
+        if path is None:
+            return f"--- {label}: <no path recorded> ---"
+        if not path.exists():
+            return f"--- {label} ({path}): <file does not exist> ---"
+        text = path.read_text(encoding="utf-8", errors="replace")
+        tail = text[-2000:]
+        return f"--- {label} ({path}, last {len(tail)} of {len(text)} chars) ---\n{tail}"
+
+    if run_dir.exists():
+        try:
+            listing = "\n".join(sorted(p.name for p in run_dir.iterdir()))
+        except OSError as e:
+            listing = f"<could not list run dir: {e}>"
+    else:
+        listing = "<run dir does not exist>"
+
+    return (
+        f"command: {run.command}\n"
+        f"failure_code: {run.failure_code}\n"
+        f"--- run_dir listing ({run_dir}) ---\n{listing}\n"
+        f"{_tail(run.stdout_path, 'carmel_stdout.log')}\n"
+        f"{_tail(run.stderr_path, 'carmel_stderr.log')}"
+    )
+
+
 class TestT3AdapterRealSubprocess:
     """End-to-end subprocess tests — only run when T3 is actually importable."""
 
@@ -1485,18 +1591,20 @@ class TestT3AdapterRealSubprocess:
         """
         ws = tmp_path / "ws"
         ws.mkdir()
+        run_dir_guess = ws / "runs"  # best-effort location for diagnostics if input_path was never set
         adapter = T3Adapter(submission_mode=SubmissionMode.SUBPROCESS)
         run, diagnostics = adapter.run(workspace_root=ws, campaign=_campaign(ws), action=_action())
-        assert run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED)
+        run_dir = run.input_path.parent if run.input_path is not None else run_dir_guess
+        assert run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED), _t3_diagnostic(run, run_dir)
 
-        assert run.input_path is not None
-        assert run.input_path.exists()
+        assert run.input_path is not None, _t3_diagnostic(run, run_dir)
+        assert run.input_path.exists(), _t3_diagnostic(run, run_dir)
         run_dir = run.input_path.parent
 
         # T3 actually started an iteration and wrote its own log — proof
         # that a real T3 process ran, not just that some command exited.
-        assert (run_dir / "iteration_1").exists()
-        assert (run_dir / T3_LAYOUT.LOG_FILENAME).exists()
+        assert (run_dir / "iteration_1").exists(), _t3_diagnostic(run, run_dir)
+        assert (run_dir / T3_LAYOUT.LOG_FILENAME).exists(), _t3_diagnostic(run, run_dir)
 
         combined_output = ""
         if run.stdout_path is not None and run.stdout_path.exists():
@@ -1510,9 +1618,10 @@ class TestT3AdapterRealSubprocess:
             "Not a conda environment",
         ):
             assert signature not in combined_output, (
-                f"launch-failure signature {signature!r} found in captured output — T3 was never actually launched"
+                f"launch-failure signature {signature!r} found in captured output — "
+                f"T3 was never actually launched\n{_t3_diagnostic(run, run_dir)}"
             )
 
         if run.status == RunStatus.SUCCEEDED:
-            assert diagnostics is not None
-            assert diagnostics.run_id == run.run_id
+            assert diagnostics is not None, _t3_diagnostic(run, run_dir)
+            assert diagnostics.run_id == run.run_id, _t3_diagnostic(run, run_dir)
