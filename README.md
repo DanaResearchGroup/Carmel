@@ -47,14 +47,27 @@ make install
 
 T3 and ARC have Python requirements incompatible with Carmel's own
 environment, so real T3 execution expects T3 (with ARC) installed in a
-**separate** conda environment. Point Carmel at that environment's
-interpreter with `T3_PYTHON`:
+**separate** conda environment. Name that environment with `T3_CONDA_ENV`:
+
+```bash
+export T3_CONDA_ENV=t3_env
+```
+
+Carmel then launches T3 with `conda run -n t3_env`, which runs the
+environment's activation hooks. This is not the same as naming the
+environment's interpreter, and the difference is not cosmetic: ARC depends
+on Open Babel, whose conda package sets `BABEL_LIBDIR`/`BABEL_DATADIR` from
+an activation hook. Skip the hook and Open Babel loads no plugins, so
+`import arc` — and therefore `import t3` — fails outright.
+
+`T3_PYTHON` remains supported for deployments with no conda in the picture,
+and names T3's interpreter directly:
 
 ```bash
 export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
 ```
 
-If `T3_PYTHON` is unset, Carmel falls back to its own interpreter — only
+If neither is set, Carmel falls back to its own interpreter — only
 correct if T3/ARC happen to be installed directly into `crml_env`. See
 [docs/development.md](docs/development.md#three-env-deployment-model)
 for the full three-env layout (`rmg_env` / `t3_env` / `crml_env`).

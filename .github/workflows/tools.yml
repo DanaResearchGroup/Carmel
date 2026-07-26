@@ -36,8 +36,9 @@ concurrency:
 # one environment produces an unsatisfiable solve — conda does not fail fast
 # on it, it grinds.
 #
-# Carmel finds t3_env's interpreter through $T3_PYTHON. Without it Carmel would
-# invoke T3 with its own interpreter, which has neither t3 nor arc installed.
+# Carmel launches T3 through $T3_CONDA_ENV, i.e. `conda run -n t3_env`, so the
+# environment's activation hooks run. Naming the interpreter directly is not
+# equivalent and does not work here — see the "Set the tool paths" step.
 #
 # ARC's optional TS-search backends (KinBot, AutoTST, TS-GCN, Sella, TorchANI)
 # are deliberately NOT installed. They live in ARC's devtools/install_*.sh
@@ -190,11 +191,22 @@ jobs:
             }
           done
 
-      # T3_PYTHON is how Carmel finds t3_env's interpreter. Without it Carmel
-      # would launch T3 with its own, which has neither t3 nor arc installed.
+      # T3_CONDA_ENV is how Carmel launches T3: `conda run -n t3_env`, which
+      # runs the environment's activation hooks. That matters — a conda
+      # environment is NOT reducible to its interpreter path. danagroup's
+      # openbabel ships etc/conda/activate.d/openbabel-activate.sh, which
+      # exports BABEL_LIBDIR and BABEL_DATADIR; invoke t3_env/bin/python
+      # directly and those never get set, Open Babel loads zero plugins, and
+      # `from openbabel import pybel` dies unpacking an empty format list. ARC
+      # imports pybel and T3 imports ARC, so `import t3` fails and the only
+      # real-subprocess test skips while this lane reports green.
+      #
+      # T3_PYTHON is still set as the documented fallback for a non-conda or
+      # single-environment deployment; with T3_CONDA_ENV set it goes unused.
       - name: Set the tool paths
         run: |
           {
+            echo "T3_CONDA_ENV=t3_env"
             echo "T3_PYTHON=$CONDA_ROOT/envs/t3_env/bin/python"
             echo "T3_PATH=$HOME/T3"
             echo "rmgpy_path=$HOME/RMG-Py"
@@ -218,22 +230,33 @@ jobs:
 
       # is_t3_importable() answers True or False and swallows the reason, which
       # is useless exactly when the answer is False: the real-subprocess suite
-      # then skips and the lane reports green having tested nothing. Ask
-      # t3_env's own interpreter directly and print the traceback. This never
-      # fails the step — a diagnostic that can redden a lane gets deleted.
+      # then skips and the lane reports green having tested nothing. So print
+      # the actual traceback.
+      #
+      # Both invocation modes are probed on purpose. The direct one is expected
+      # to FAIL (no activation hooks -> no Open Babel plugins); `conda run` is
+      # expected to succeed. Keeping both visible means that if this lane ever
+      # regresses, the log says which of the two broke rather than just "False".
+      # Neither can fail the step — a diagnostic that can redden a lane is a
+      # diagnostic that gets deleted.
       - name: Explain why T3 does or does not import
         if: always()
         run: |
-          "$T3_PYTHON" -c "
+          probe='
           import traceback
-          for mod in ('arc', 't3'):
+          for mod in ("arc", "t3"):
               try:
                   __import__(mod)
-                  print(f'{mod}: OK')
+                  print(f"{mod}: OK")
               except BaseException:
-                  print(f'{mod}: FAILED')
+                  print(f"{mod}: FAILED")
                   traceback.print_exc()
-          " || echo "T3_PYTHON ($T3_PYTHON) could not be invoked at all"
+          '
+          echo "--- direct interpreter (no activation hooks; expected to fail) ---"
+          "$T3_PYTHON" -c "$probe" || echo "T3_PYTHON ($T3_PYTHON) could not be invoked at all"
+          echo "--- conda run -n $T3_CONDA_ENV (activation hooks run; expected to pass) ---"
+          conda run -n "$T3_CONDA_ENV" --no-capture-output python -c "$probe" \
+            || echo "conda run -n $T3_CONDA_ENV could not be invoked at all"
 
       # Relies on the job-level continue-on-error, not a step-level one: if T3
       # is reachable the real subprocess tests must pass and their failure must

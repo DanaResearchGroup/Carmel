@@ -141,7 +141,7 @@ centralized in the `T3Layout` constants block at the top of that file.
   case where T3 lives in a wholly separate environment that Carmel was
   never meant to import into directly.
 
-### Three-env deployment model and `T3_PYTHON`
+### Three-env deployment model and T3 invocation
 
 Carmel, T3, and RMG have mutually exclusive Python requirements and
 normally live in **three separate conda environments**:
@@ -150,24 +150,42 @@ normally live in **three separate conda environments**:
 |-------------|-----------------|------------|
 | `rmg_env`   | RMG-Py, Arkane  | `>=3.9,<3.12` |
 | `t3_env`    | T3 **and** ARC  | `=3.14` (T3 imports ARC in-process, so they must share an env; T3 in turn launches RMG as a subprocess under `rmg_env`) |
-| `crml_env`  | Carmel itself   | `>=3.12` |
+| `crml_env`  | Carmel itself   | `>=3.14` |
 
 Because of this, `_find_t3_executable()` and `is_t3_importable()` /
 `_t3_version()` must never assume T3 runs under Carmel's own
-`sys.executable`. The `T3_PYTHON` environment variable gives the path
-to `t3_env`'s interpreter:
+`sys.executable`. They all route through `_t3_python_command()`, which
+returns the argv prefix that runs a Python interpreter inside T3's
+environment. Resolution order:
 
-- If `$T3_PYTHON` is set and points to an existing, executable file, it
-  is used to launch and probe T3.
+- If `$T3_CONDA_ENV` is set and `conda` is on `PATH`, T3 is launched and
+  probed with `conda run -n <env> --no-capture-output python …`. This is
+  the supported way to run a command in a conda environment, and the same
+  mechanism T3 itself uses to launch RMG under `rmg_env`.
+- Otherwise, if `$T3_PYTHON` is set and points to an existing, executable
+  file, that interpreter is used directly. This is right for deployments
+  that do not involve conda.
 - Otherwise Carmel falls back to `sys.executable` — the correct choice
   for a single-env developer setup where Carmel and T3 share an
   environment (e.g. a from-source checkout with `t3`/`arc` installed
   directly into `crml_env`).
-- If `$T3_PYTHON` is set but invalid (missing or non-executable),
-  Carmel logs a warning and falls back to `sys.executable` rather than
-  raising, so a bad env var cannot crash the adapter's typed
-  success/failure contract; the misconfiguration still surfaces
-  honestly downstream as an ordinary not-importable/not-found failure.
+- If either variable is set but unusable (`conda` absent from `PATH`;
+  `$T3_PYTHON` missing or non-executable), Carmel logs a warning and
+  degrades to the next rule rather than raising, so a bad env var cannot
+  crash the adapter's typed success/failure contract; the misconfiguration
+  still surfaces honestly downstream as an ordinary
+  not-importable/not-found failure.
+
+**Naming the interpreter is not equivalent to activating the environment.**
+Conda packages may ship activation hooks under
+`$CONDA_PREFIX/etc/conda/activate.d/`, which running `<env>/bin/python`
+directly never executes. ARC depends on Open Babel, whose conda package
+exports `BABEL_LIBDIR` and `BABEL_DATADIR` from such a hook; without them
+Open Babel registers no plugins and `from openbabel import pybel` raises
+`ValueError: not enough values to unpack` while building its format table.
+The visible symptom is that `import arc` — and therefore `import t3` —
+fails, `is_t3_importable()` returns `False`, and every real-subprocess test
+skips. That is why `$T3_CONDA_ENV` takes precedence over `$T3_PYTHON`.
 
 ## Diagnostics Schema (DiagnosticsV1)
 

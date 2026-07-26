@@ -37,18 +37,39 @@ normally live in three separate conda environments:
 | `crml_env` | Carmel itself     | `>=3.12`         |
 
 T3 imports ARC in-process, so they must share an environment (`t3_env`);
-T3 in turn launches RMG as a subprocess under `rmg_env`. Point Carmel at
-T3's interpreter with the `T3_PYTHON` environment variable:
+T3 in turn launches RMG as a subprocess under `rmg_env`. Name T3's
+environment with the `T3_CONDA_ENV` environment variable:
+
+```bash
+export T3_CONDA_ENV=t3_env
+```
+
+Carmel launches T3 as `conda run -n t3_env --no-capture-output python ...`,
+the same way T3 itself launches RMG under `rmg_env`
+(`t3/runners/rmg_runner.py`).
+
+**Why `conda run` and not just the interpreter path.** A conda environment
+is not reducible to its interpreter. Packages may ship activation hooks in
+`$CONDA_PREFIX/etc/conda/activate.d/`, and running `<env>/bin/python`
+directly never executes them. ARC depends on Open Babel, whose conda
+package sets `BABEL_LIBDIR` and `BABEL_DATADIR` from exactly such a hook.
+Without them Open Babel loads zero plugins and `from openbabel import
+pybel` raises `ValueError: not enough values to unpack` while building its
+format table — so `import arc` fails, and with it `import t3`.
+
+`T3_PYTHON` still names T3's interpreter directly and is the right choice
+when conda is not involved at all:
 
 ```bash
 export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
 ```
 
-If `T3_PYTHON` is unset, Carmel falls back to its own interpreter
-(`sys.executable`) — only correct for a single-env developer setup where
-T3 and ARC happen to be installed directly into `crml_env`. See
-[architecture.md](architecture.md#three-env-deployment-model-and-t3_python)
-for full details, including how an invalid `T3_PYTHON` is handled.
+Resolution order is `T3_CONDA_ENV` → `T3_PYTHON` → `sys.executable`. The
+last is only correct for a single-env developer setup where T3 and ARC are
+installed directly into `crml_env`. See
+[architecture.md](architecture.md#three-env-deployment-model-and-t3-invocation)
+for full details, including how an invalid value for either variable is
+handled.
 
 ## Running the UI
 

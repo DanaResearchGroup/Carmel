@@ -91,6 +91,12 @@ class T3Layout:
     # cannot generally share an interpreter, so T3 must never be launched
     # (or probed) with Carmel's own `sys.executable`.
     T3_PYTHON_ENV_VAR: str = "T3_PYTHON"
+    # Env var naming a conda environment (e.g. "t3_env") to run T3 in via
+    # `conda run -n <env> --no-capture-output python ...` instead of a bare
+    # interpreter path. See `_t3_python_command` for why this matters: some
+    # packages T3/ARC depend on (e.g. openbabel) ship conda activation hooks
+    # that a direct interpreter invocation never runs.
+    T3_CONDA_ENV_VAR: str = "T3_CONDA_ENV"
 
     # Output layout
     # LOG_FILENAME is T3's OWN log file: T3's logger (t3/logger.py) archives
@@ -134,10 +140,16 @@ T3_TOOL_NAME: str = "t3"
 
 _log = get_logger("adapters.t3")
 
-# Keeps is_t3_importable()/_t3_version() subprocess probes cheap so they can
-# never hang a CI run: importing t3 (which drags in ARC) is not free, but it
-# should never take anywhere close to this long when it succeeds or fails.
-_T3_IMPORT_PROBE_TIMEOUT_S: float = 30.0
+# Keeps is_t3_importable()/_t3_version()/_t3_conda_env_error() subprocess
+# probes bounded so they can never hang a CI run. This budgets for the full
+# cold-start cost under the three-env deployment model: `conda run` first
+# has to activate the named environment (spawning a shell, running every
+# `etc/conda/activate.d/*.sh` hook, including openbabel's), and only then
+# does the child interpreter import ``t3``, which transitively imports ARC
+# and its own heavy dependency stack (openbabel, rdkit, ...). On a cold CI
+# runner this combination has been observed to take on the order of a
+# minute; 120s leaves real headroom without risking an unbounded hang.
+_T3_IMPORT_PROBE_TIMEOUT_S: float = 120.0
 
 
 # ---------------------------------------------------------------------------
@@ -182,25 +194,137 @@ def _resolve_t3_python() -> str:
     return sys.executable
 
 
-def is_t3_importable() -> bool:
-    """Return True if ``t3`` can actually be imported by T3's own interpreter.
+def _t3_python_command() -> list[str]:
+    """Resolve the argv prefix used to run a python interpreter inside T3's environment.
 
-    This probes the interpreter that will actually run T3 (see
-    :func:`_resolve_t3_python`), never Carmel's own process: under the
-    three-env deployment model those are different interpreters, so
-    importing ``t3`` in Carmel's own process proves nothing about whether
-    the resolved T3 interpreter can import it. In the single-env developer
-    case (``$T3_PYTHON`` unset, same interpreter as Carmel) this reduces to
-    the historical in-process check.
+    A conda environment is *not* reducible to its interpreter path: some
+    packages ship activation hooks under
+    ``$CONDA_PREFIX/etc/conda/activate.d/*.sh`` that only run when the
+    environment is *activated* (or entered via ``conda run``), never when
+    its interpreter binary is invoked directly. Concretely,
+    ``danagroup::openbabel`` ships ``openbabel-activate.sh``, which exports
+    ``BABEL_DATADIR``/``BABEL_LIBDIR``; without those, Open Babel loads zero
+    plugins and ``from openbabel import pybel`` raises ``ValueError: not
+    enough values to unpack (expected 2, got 1)`` at import time. ARC
+    imports ``pybel`` (``arc/species/conformers.py``) and T3 imports ARC, so
+    launching T3's interpreter directly breaks ``import t3`` itself. T3
+    already works around this exact class of problem when it launches RMG
+    (``conda run -n rmg_env bash -c "..."`` in
+    ``t3/runners/rmg_runner.py``); this function does the same one level up
+    for Carmel launching T3.
+
+    Resolution order:
+        1. ``$T3_CONDA_ENV`` if set and non-empty, and a ``conda``
+           executable is discoverable on ``$PATH``: returns
+           ``[conda, "run", "-n", <env>, "--no-capture-output", "python"]``.
+           ``--no-capture-output`` lets the caller's own stdout/stderr
+           redirection reach the child directly instead of being buffered
+           and replayed by ``conda run``.
+        2. ``$T3_CONDA_ENV`` set but ``conda`` not found on ``$PATH``: logs
+           a warning and falls through to (3) — a misconfigured env var
+           must never crash the adapter's typed success/failure contract,
+           per the same defensive posture as :func:`_resolve_t3_python`.
+        3. Otherwise, ``[_resolve_t3_python()]`` — correct for a single-env
+           developer setup or a non-conda deployment.
+
+    Returns:
+        The argv prefix to prepend to a python invocation (e.g. ``["-c",
+        "..."]`` or a script path) to run it inside T3's environment.
+    """
+    conda_env = os.environ.get(T3_LAYOUT.T3_CONDA_ENV_VAR)
+    if conda_env:
+        conda = shutil.which("conda")
+        if conda is not None:
+            return [conda, "run", "-n", conda_env, "--no-capture-output", "python"]
+        _log.warning(
+            "%s is set to %r but no 'conda' executable was found on PATH; falling back to %s",
+            T3_LAYOUT.T3_CONDA_ENV_VAR,
+            conda_env,
+            T3_LAYOUT.T3_PYTHON_ENV_VAR,
+        )
+    return [_resolve_t3_python()]
+
+
+def _t3_conda_env_error() -> str | None:
+    """Return why ``$T3_CONDA_ENV`` cannot be used, or None if fine/unset.
+
+    :func:`_t3_python_command` is deliberately non-raising: it always
+    returns *some* usable argv prefix, falling back to
+    ``[_resolve_t3_python()]`` when ``$T3_CONDA_ENV`` is set but ``conda``
+    is unusable. That fallback is correct as internal plumbing (discovery
+    must never throw), but it must never be used to silently launch T3
+    under the wrong interpreter — Carmel's own — when an operator
+    explicitly asked for a named conda environment. This function is the
+    explicit, callable check that :meth:`T3Adapter.run` uses to turn a
+    broken ``$T3_CONDA_ENV`` into a clean, greppable typed failure instead
+    of a silent downgrade.
+
+    Two distinct misconfigurations are detected, both surfaced the same
+    way:
+        1. ``$T3_CONDA_ENV`` is set but no ``conda`` executable is on
+           ``$PATH``.
+        2. ``conda`` is on ``$PATH`` but the named environment does not
+           exist or cannot actually be run (e.g. it was never created, or
+           is corrupt) — verified with a trivial ``python -c "pass"``
+           probe through ``conda run`` rather than trusting the env name.
+
+    Returns:
+        None if ``$T3_CONDA_ENV`` is unset, or if it is set and usable.
+        Otherwise, a human-readable message identifying which of the two
+        misconfigurations above was detected, suitable for direct use as
+        a ``RunRecord.error_message`` (greppable for
+        ``T3_CONDA_ENV`` and/or ``conda``).
+    """
+    conda_env = os.environ.get(T3_LAYOUT.T3_CONDA_ENV_VAR)
+    if not conda_env:
+        return None
+    conda = shutil.which("conda")
+    if conda is None:
+        return (
+            f"{T3_LAYOUT.T3_CONDA_ENV_VAR} is set to {conda_env!r} but no 'conda' executable "
+            "was found on PATH; refusing to silently launch T3 under a different interpreter"
+        )
+    try:
+        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured conda executable only
+            [conda, "run", "-n", conda_env, "--no-capture-output", "python", "-c", "pass"],
+            capture_output=True,
+            timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"{T3_LAYOUT.T3_CONDA_ENV_VAR} is set to {conda_env!r} but conda could not run it: {e}"
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        return (
+            f"{T3_LAYOUT.T3_CONDA_ENV_VAR} is set to {conda_env!r} but conda could not run "
+            f"a trivial command in it (exit {completed.returncode}); the environment may not "
+            f"exist or may be corrupt: {detail}"
+        )
+    return None
+
+
+def is_t3_importable() -> bool:
+    """Return True if ``t3`` can actually be imported by T3's own environment.
+
+    This probes the python command that will actually run T3 (see
+    :func:`_t3_python_command`), never Carmel's own process: under the
+    three-env deployment model that runs a different interpreter (and
+    possibly a different conda environment entirely), so importing ``t3``
+    in Carmel's own process proves nothing about whether T3's environment
+    can import it. In the single-env developer case (neither
+    ``$T3_CONDA_ENV`` nor ``$T3_PYTHON`` set, same interpreter as Carmel)
+    this reduces to the historical in-process check.
 
     This is stricter than :func:`is_t3_installed` because T3 may be
     discoverable on ``sys.path`` but fail to import (e.g. if a transitive
-    dependency like ARC uses ``distutils`` on Python 3.12).
+    dependency like ARC uses ``distutils`` on Python 3.12, or if openbabel's
+    conda activation hooks never ran — see :func:`_t3_python_command`).
     """
-    t3_python = _resolve_t3_python()
+    t3_python = _t3_python_command()
     try:
-        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter only
-            [t3_python, "-c", "import t3"],
+        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter/conda-run only
+            [*t3_python, "-c", "import t3"],
             capture_output=True,
             timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
             check=False,
@@ -216,16 +340,17 @@ def is_t3_installed() -> bool:
 
 
 def _t3_version() -> str | None:
-    """Return T3's version string if importable via T3's own interpreter, else None.
+    """Return T3's version string if importable via T3's own environment, else None.
 
-    Like :func:`is_t3_importable`, this probes the resolved T3 interpreter
-    (see :func:`_resolve_t3_python`) in a subprocess rather than importing
-    ``t3`` into Carmel's own process, for the same three-env reason.
+    Like :func:`is_t3_importable`, this probes the resolved T3 python
+    command (see :func:`_t3_python_command`) in a subprocess rather than
+    importing ``t3`` into Carmel's own process, for the same three-env
+    reason.
     """
-    t3_python = _resolve_t3_python()
+    t3_python = _t3_python_command()
     try:
-        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter only
-            [t3_python, "-c", "import t3; print(getattr(t3, '__version__', ''))"],
+        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter/conda-run only
+            [*t3_python, "-c", "import t3; print(getattr(t3, '__version__', ''))"],
             capture_output=True,
             timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
             check=False,
@@ -242,38 +367,54 @@ def _t3_version() -> str | None:
 def _find_t3_executable() -> list[str] | None:
     """Locate the T3 executable.
 
-    Preference order:
+    Preference order when ``$T3_CONDA_ENV`` is unset (no conda env was
+    requested, so Carmel's own environment is a legitimate place to look
+    for T3):
         1. ``$T3_PATH/T3.py`` if the env var is set
         2. ``T3.py`` next to the importable ``t3`` package
         3. ``T3.py`` discoverable via ``shutil.which``
         4. ``python -m T3`` if T3 is importable
 
-    Every branch launches T3 with the resolved T3 interpreter (see
-    :func:`_resolve_t3_python`), never unconditionally with Carmel's own
-    ``sys.executable``.
+    When ``$T3_CONDA_ENV`` is set, the named conda environment is
+    authoritative and steps 2-3 above are skipped entirely: Carmel must
+    never use its *own* ``importlib.util.find_spec``/``shutil.which``
+    discovery to pick a script path and then execute that path inside a
+    *different* interpreter/environment (a real risk of running the wrong
+    T3 checkout). In that case the order is:
+        1. ``$T3_PATH/T3.py`` if the env var is set (explicit operator
+           intent always wins)
+        2. ``python -m T3`` under ``conda run -n $T3_CONDA_ENV``
+
+    Every branch launches T3 with the resolved T3 python command (see
+    :func:`_t3_python_command`), never unconditionally with Carmel's own
+    ``sys.executable`` — and, when ``$T3_CONDA_ENV`` is set, via
+    ``conda run`` rather than a bare interpreter path, so that conda
+    activation hooks (e.g. openbabel's) actually run.
     """
-    t3_python = _resolve_t3_python()
+    t3_python = _t3_python_command()
+    conda_env = os.environ.get(T3_LAYOUT.T3_CONDA_ENV_VAR)
 
     env_path = os.environ.get("T3_PATH")
     if env_path:
         candidate = Path(env_path) / T3_LAYOUT.EXECUTABLE_SCRIPT
         if candidate.exists():
-            return [t3_python, str(candidate)]
+            return [*t3_python, str(candidate)]
 
-    spec = importlib.util.find_spec("t3")
-    if spec is not None and spec.origin is not None:
-        # spec.origin is .../t3/__init__.py; T3.py lives at the repo root
-        repo_root = Path(spec.origin).parent.parent
-        candidate = repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT
-        if candidate.exists():
-            return [t3_python, str(candidate)]
+    if not conda_env:
+        spec = importlib.util.find_spec("t3")
+        if spec is not None and spec.origin is not None:
+            # spec.origin is .../t3/__init__.py; T3.py lives at the repo root
+            repo_root = Path(spec.origin).parent.parent
+            candidate = repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT
+            if candidate.exists():
+                return [*t3_python, str(candidate)]
 
-    which = shutil.which(T3_LAYOUT.EXECUTABLE_SCRIPT)
-    if which is not None:
-        return [t3_python, which]
+        which = shutil.which(T3_LAYOUT.EXECUTABLE_SCRIPT)
+        if which is not None:
+            return [*t3_python, which]
 
     if is_t3_importable():
-        return [t3_python, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
+        return [*t3_python, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
 
     return None
 
@@ -699,6 +840,7 @@ class T3Adapter:
                 started=started,
                 failure_code=FailureCode.SUBPROCESS_ERROR,
                 error_message=f"Could not create run directory {run_dir}: {e}",
+                probe_version=False,
             ), None
         stdout_path = run_dir / T3_LAYOUT.CARMEL_STDOUT_FILENAME
         stderr_path = run_dir / T3_LAYOUT.CARMEL_STDERR_FILENAME
@@ -714,6 +856,22 @@ class T3Adapter:
                 started=started,
                 failure_code=FailureCode.INPUT_BUILD_ERROR,
                 error_message=str(e),
+                probe_version=False,
+            ), None
+
+        # 1.5. Reject a misconfigured $T3_CONDA_ENV up front, before ever
+        # trying to discover or launch anything under it — see
+        # _t3_conda_env_error for exactly what's checked.
+        conda_error = _t3_conda_env_error()
+        if conda_error is not None:
+            return self._failed_record(
+                run_id=run_id,
+                action=action,
+                started=started,
+                failure_code=FailureCode.TOOL_NOT_FOUND,
+                error_message=conda_error,
+                input_path=input_path,
+                probe_version=False,
             ), None
 
         # 2. Locate T3 executable
@@ -726,6 +884,7 @@ class T3Adapter:
                 failure_code=FailureCode.TOOL_NOT_FOUND,
                 error_message="T3 executable not found (no T3.py and t3 module not importable)",
                 input_path=input_path,
+                probe_version=False,
             ), None
 
         # 3. Invoke T3 — note T3 has no --output flag, it writes next to the input
@@ -840,13 +999,40 @@ class T3Adapter:
         stderr_path: Path | None = None,
         command: list[str] | None = None,
         ended: datetime | None = None,
+        probe_version: bool = True,
     ) -> RunRecord:
-        """Build a typed failure RunRecord."""
+        """Build a typed failure RunRecord.
+
+        Args:
+            run_id: The run identifier.
+            action: The planned action being run.
+            started: When the run started.
+            failure_code: The typed failure reason.
+            error_message: A human-readable failure description.
+            input_path: Path to the T3 input file, if it was written.
+            stdout_path: Path to captured stdout, if T3 was launched.
+            stderr_path: Path to captured stderr, if T3 was launched.
+            command: The resolved command that was (or would have been)
+                invoked.
+            ended: When the run ended; defaults to now.
+            probe_version: Whether to probe T3's version via a subprocess
+                call. Skipped for failures that occur before T3 was ever
+                launched (e.g. run-directory creation, input-build errors,
+                a missing executable, or a misconfigured
+                ``$T3_CONDA_ENV``): T3's version is undiscoverable in
+                those cases anyway, and probing regardless would spawn a
+                redundant subprocess (a second, possibly slow ``conda
+                run`` startup) purely to delay reporting a failure that is
+                already fully determined.
+
+        Returns:
+            A ``RunRecord`` with ``status=FAILED``.
+        """
         return RunRecord(
             run_id=run_id,
             action_id=action.action_id,
             tool_name=T3_TOOL_NAME,
-            tool_version=_t3_version(),
+            tool_version=_t3_version() if probe_version else None,
             status=RunStatus.FAILED,
             failure_code=failure_code,
             started_at=started,

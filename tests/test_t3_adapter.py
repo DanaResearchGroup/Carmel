@@ -31,6 +31,8 @@ from carmel.adapters.t3 import (
     _discover_pdep_networks,
     _find_t3_executable,
     _resolve_t3_python,
+    _t3_conda_env_error,
+    _t3_python_command,
     _t3_version,
     _walk_iterations,
     arc_info_filename,
@@ -128,7 +130,8 @@ class TestT3Discovery:
 
     def test_find_executable_returns_list_or_none(self) -> None:
         result = _find_t3_executable()
-        assert result is None or (isinstance(result, list) and result[0] == _resolve_t3_python())
+        prefix = _t3_python_command()
+        assert result is None or (isinstance(result, list) and result[: len(prefix)] == prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +503,109 @@ class TestT3AdapterFailures:
         assert diagnostics is None
 
 
+class TestT3CondaEnvError:
+    """Unit tests for ``_t3_conda_env_error()`` in isolation."""
+
+    def test_env_var_unset_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("T3_CONDA_ENV", raising=False)
+        assert _t3_conda_env_error() is None
+
+    def test_conda_missing_from_path_returns_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: None)
+        error = _t3_conda_env_error()
+        assert error is not None
+        assert "T3_CONDA_ENV" in error
+        assert "conda" in error.lower()
+
+    def test_named_env_does_not_exist_returns_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "no_such_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/bin/conda")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="EnvironmentLocationNotFound: could not find environment"
+        )
+        monkeypatch.setattr(t3_module.subprocess, "run", lambda *a, **k: completed)
+        error = _t3_conda_env_error()
+        assert error is not None
+        assert "no_such_env" in error
+        assert "EnvironmentLocationNotFound" in error
+
+    def test_conda_run_raises_oserror_returns_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/bin/conda")
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise OSError("boom")
+
+        monkeypatch.setattr(t3_module.subprocess, "run", _raise)
+        error = _t3_conda_env_error()
+        assert error is not None
+        assert "t3_env" in error
+
+    def test_env_usable_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/bin/conda")
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        monkeypatch.setattr(t3_module.subprocess, "run", lambda *a, **k: completed)
+        assert _t3_conda_env_error() is None
+
+
+class TestT3AdapterCondaEnvFailures:
+    """Adapter-level behavior when ``$T3_CONDA_ENV`` is set but unusable.
+
+    Both scenarios must be a clean, typed ``FailureCode.TOOL_NOT_FOUND``
+    failure rather than a silent fallback onto Carmel's own interpreter
+    (finding 1) or an indistinguishable "T3 not importable" result that
+    would otherwise let a broken CI conda env pass as a harmless skip
+    (finding 2).
+    """
+
+    def test_conda_missing_from_path_records_tool_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: None)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TOOL_NOT_FOUND
+        assert diagnostics is None
+        assert run.input_path is not None
+        assert run.input_path.exists()
+        assert "T3_CONDA_ENV" in (run.error_message or "")
+        assert "conda" in (run.error_message or "").lower()
+
+    def test_named_env_does_not_exist_records_tool_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "no_such_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/bin/conda")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="EnvironmentLocationNotFound: could not find environment"
+        )
+        monkeypatch.setattr(t3_module.subprocess, "run", lambda *a, **k: completed)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TOOL_NOT_FOUND
+        assert diagnostics is None
+        assert "no_such_env" in (run.error_message or "")
+
+
 class TestT3VersionProbe:
     """Tests for the importability and version probes.
 
@@ -572,6 +678,7 @@ class TestFindT3Executable:
 
         monkeypatch.delenv("T3_PATH", raising=False)
         monkeypatch.delenv("T3_PYTHON", raising=False)
+        monkeypatch.delenv("T3_CONDA_ENV", raising=False)
         monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: None)
         monkeypatch.setattr(t3_module.shutil, "which", lambda _name: None)
         monkeypatch.setattr(t3_module, "is_t3_importable", lambda: False)
@@ -656,6 +763,114 @@ class TestFindT3Executable:
         monkeypatch.setenv("T3_PYTHON", sys.executable)
         assert _find_t3_executable() == [sys.executable, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
 
+    def test_env_path_carries_conda_run_prefix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        script = tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# T3")
+        monkeypatch.setenv("T3_PATH", str(tmp_path))
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(
+            t3_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_t3_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "t3_env",
+            "--no-capture-output",
+            "python",
+            str(script),
+        ]
+
+    def test_module_invocation_carries_conda_run_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(
+            t3_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_t3_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "t3_env",
+            "--no-capture-output",
+            "python",
+            "-m",
+            T3_LAYOUT.EXECUTABLE_MODULE,
+        ]
+
+    def test_conda_env_set_ignores_carmel_own_package_sibling_script(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test: with $T3_CONDA_ENV set, Carmel must not discover
+        a T3.py sitting next to *Carmel's own* importable ``t3`` package
+        and then execute that script inside the named conda environment —
+        the two may be entirely different checkouts. The named conda
+        environment is authoritative; only $T3_PATH or `-m T3` inside it
+        may be used.
+        """
+        from carmel.adapters import t3 as t3_module
+
+        repo_root = tmp_path / "carmel_side_T3"
+        pkg = repo_root / "t3"
+        pkg.mkdir(parents=True)
+        (repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# wrong-checkout T3")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: spec)
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
+        monkeypatch.setattr(
+            t3_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_t3_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "t3_env",
+            "--no-capture-output",
+            "python",
+            "-m",
+            T3_LAYOUT.EXECUTABLE_MODULE,
+        ]
+
+    def test_conda_env_set_ignores_carmel_own_which_script(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Companion regression test to the one above, for the
+        ``shutil.which(T3.py)`` discovery step rather than the
+        ``importlib.util.find_spec`` one.
+        """
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
+        monkeypatch.setattr(
+            t3_module.shutil,
+            "which",
+            lambda name: (
+                "/opt/conda/bin/conda"
+                if name == "conda"
+                else ("/usr/local/bin/T3.py" if name == T3_LAYOUT.EXECUTABLE_SCRIPT else None)
+            ),
+        )
+        assert _find_t3_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "t3_env",
+            "--no-capture-output",
+            "python",
+            "-m",
+            T3_LAYOUT.EXECUTABLE_MODULE,
+        ]
+
 
 class TestResolveT3Python:
     """Tests for the ``$T3_PYTHON`` resolution helper directly."""
@@ -700,6 +915,82 @@ class TestResolveT3Python:
             f"T3_PYTHON is set to '{not_executable}' but is not an existing "
             f"executable file; falling back to {sys.executable}"
         )
+
+
+class TestT3PythonCommand:
+    """Tests for the ``$T3_CONDA_ENV``-aware python command resolution."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("T3_CONDA_ENV", raising=False)
+        monkeypatch.delenv("T3_PYTHON", raising=False)
+
+    def test_conda_env_set_and_conda_on_path_uses_conda_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.setattr(t3_module.shutil, "which", lambda name: "/opt/conda/bin/conda" if name == "conda" else None)
+        assert _t3_python_command() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "t3_env",
+            "--no-capture-output",
+            "python",
+        ]
+
+    def test_conda_env_set_but_conda_not_on_path_falls_back_with_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``_t3_python_command()`` itself stays non-raising and still falls
+        back to ``[_resolve_t3_python()]`` in this scenario — it is
+        low-level plumbing that must never throw. That fallback is *not*
+        what actually runs T3 under the wrong interpreter, though: this
+        exact scenario (``$T3_CONDA_ENV`` set, no ``conda`` on PATH) is
+        independently detected by ``_t3_conda_env_error()``, which
+        ``T3Adapter.run()`` checks before ever calling ``_t3_python_command()``
+        for real, converting it into an explicit ``FailureCode.TOOL_NOT_FOUND``
+        instead of silently launching Carmel's own interpreter as "T3" — see
+        TestT3AdapterCondaEnvFailures.test_conda_missing_from_path_records_tool_not_found.
+        """
+        from carmel.adapters import t3 as t3_module
+
+        # carmel's own logger sets `propagate = False` once `configure_logging()`
+        # has run anywhere in the process (see carmel/logger.py), which would
+        # silently swallow this warning from pytest's `caplog` (attached to the
+        # root logger); assert on the log call directly instead, matching the
+        # precedent in TestResolveT3Python.
+        warnings: list[tuple[Any, ...]] = []
+        monkeypatch.setattr(t3_module._log, "warning", lambda *args: warnings.append(args))
+        monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
+        monkeypatch.delenv("T3_PYTHON", raising=False)
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: None)
+        result = _t3_python_command()
+        assert result == [_resolve_t3_python()]
+        assert len(warnings) == 1
+        message = warnings[0][0] % warnings[0][1:]
+        assert "T3_CONDA_ENV" in message
+        assert "conda" in message.lower()
+
+        # The higher-level, adapter-facing check catches the same scenario
+        # explicitly rather than relying on the silent low-level fallback.
+        conda_error = _t3_conda_env_error()
+        assert conda_error is not None
+        assert "T3_CONDA_ENV" in conda_error
+        assert "conda" in conda_error.lower()
+
+    def test_conda_env_set_to_empty_string_is_treated_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("T3_CONDA_ENV", "")
+        monkeypatch.delenv("T3_PYTHON", raising=False)
+        assert _t3_python_command() == [sys.executable]
+
+    def test_conda_env_unset_and_t3_python_set_uses_t3_python(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        assert _t3_python_command() == [sys.executable]
+
+    def test_conda_env_and_t3_python_both_unset_uses_sys_executable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("T3_PYTHON", raising=False)
+        assert _t3_python_command() == [sys.executable]
 
 
 class TestBuildT3InputOptionalFields:
@@ -1055,18 +1346,98 @@ class TestT3AdapterSuccessPath:
         assert "hello from stderr" not in run.stdout_path.read_text(encoding="utf-8")
 
 
+class TestT3AdapterStreamContract:
+    """Behavioral test for the stream contract that ``conda run
+    --no-capture-output`` provides in production: a nonzero child exit
+    code propagates through exactly, and stdout/stderr land in separate
+    files without cross-contamination. Driven through the adapter's own
+    ``_find_t3_executable`` seam with a stub command so it never requires
+    a real conda environment.
+    """
+
+    @staticmethod
+    def _stub_command(exit_code: int) -> list[str]:
+        script = (
+            "import sys\n"
+            "print('stub stdout line')\n"
+            "print('stub stderr line', file=sys.stderr)\n"
+            f"sys.exit({exit_code})\n"
+        )
+        return [sys.executable, "-c", script]
+
+    def test_nonzero_exit_propagates_and_streams_stay_separate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "_find_t3_executable", lambda: self._stub_command(17))
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.SUBPROCESS_ERROR
+        assert "17" in (run.error_message or "")
+        assert diagnostics is None
+
+        assert run.stdout_path is not None and run.stdout_path.exists()
+        assert run.stderr_path is not None and run.stderr_path.exists()
+        stdout_text = run.stdout_path.read_text(encoding="utf-8")
+        stderr_text = run.stderr_path.read_text(encoding="utf-8")
+        assert "stub stdout line" in stdout_text
+        assert "stub stderr line" not in stdout_text
+        assert "stub stderr line" in stderr_text
+        assert "stub stdout line" not in stderr_text
+
+
 class TestT3AdapterRealSubprocess:
     """End-to-end subprocess tests — only run when T3 is actually importable."""
 
     @requires_t3
     def test_run_does_not_crash(self, tmp_path: Path) -> None:
+        """T3 needs the full RMG stack to actually converge, so we don't
+        assert SUCCEEDED here — a ground-truth local run against real T3
+        launched RMG, ran it for ~50s to non-convergence, and then T3
+        itself raised inside its own Cantera-fixing step (no
+        ``chem_annotated.yaml`` to fix), which Carmel correctly records as
+        FAILED. That is the expected *healthy* outcome of this test: T3 was
+        genuinely launched and ran a real iteration. What must not happen
+        is a tautological pass where nothing was actually launched (e.g.
+        ``conda run`` failing immediately, or the wrong interpreter being
+        used) yet the adapter still reports FAILED and this test still
+        goes green — so we assert concrete evidence of a real T3
+        invocation, not just a plausible-looking status.
+        """
         ws = tmp_path / "ws"
         ws.mkdir()
         adapter = T3Adapter(submission_mode=SubmissionMode.SUBPROCESS)
         run, diagnostics = adapter.run(workspace_root=ws, campaign=_campaign(ws), action=_action())
-        # We don't assert success because real T3 needs the full RMG stack;
-        # we just assert that the adapter produced a typed RunRecord.
         assert run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED)
+
+        assert run.input_path is not None
+        assert run.input_path.exists()
+        run_dir = run.input_path.parent
+
+        # T3 actually started an iteration and wrote its own log — proof
+        # that a real T3 process ran, not just that some command exited.
+        assert (run_dir / "iteration_1").exists()
+        assert (run_dir / T3_LAYOUT.LOG_FILENAME).exists()
+
+        combined_output = ""
+        if run.stdout_path is not None and run.stdout_path.exists():
+            combined_output += run.stdout_path.read_text(encoding="utf-8")
+        if run.stderr_path is not None and run.stderr_path.exists():
+            combined_output += run.stderr_path.read_text(encoding="utf-8")
+        for signature in (
+            "No module named",
+            "can't open file",
+            "command not found",
+            "Not a conda environment",
+        ):
+            assert signature not in combined_output, (
+                f"launch-failure signature {signature!r} found in captured output — T3 was never actually launched"
+            )
+
         if run.status == RunStatus.SUCCEEDED:
             assert diagnostics is not None
             assert diagnostics.run_id == run.run_id
