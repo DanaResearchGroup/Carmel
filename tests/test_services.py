@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import cast
 from uuid import uuid4
 
 import pytest
@@ -257,6 +259,40 @@ class TestApprovals:
         result = evaluate_action(action, ApprovalPolicy())
         assert result == ApprovalRequirement.REQUIRES_APPROVAL
 
+    def test_arc_over_threshold_requires_approval(self) -> None:
+        action = _make_action(cpu_hours=6.0, kind=ActionKind.ARC_RUN)
+        result = evaluate_action(action, ApprovalPolicy())
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_arc_exactly_at_threshold_auto_approved(self) -> None:
+        policy = ApprovalPolicy()
+        action = _make_action(cpu_hours=policy.auto_approve_arc_under_cpu_hours, kind=ActionKind.ARC_RUN)
+        assert evaluate_action(action, policy) == ApprovalRequirement.AUTO_APPROVED
+
+    def test_experiment_auto_approved_when_policy_allows(self) -> None:
+        action = _make_action(cpu_hours=0.0, kind=ActionKind.EXPERIMENT)
+        policy = ApprovalPolicy(require_approval_for_experiments=False)
+        assert evaluate_action(action, policy) == ApprovalRequirement.AUTO_APPROVED
+
+    def test_literature_auto_approved_by_default(self) -> None:
+        action = _make_action(cpu_hours=0.0, kind=ActionKind.LITERATURE_SEARCH)
+        assert evaluate_action(action, ApprovalPolicy()) == ApprovalRequirement.AUTO_APPROVED
+
+    def test_literature_requires_approval_when_policy_demands(self) -> None:
+        action = _make_action(cpu_hours=0.0, kind=ActionKind.LITERATURE_SEARCH)
+        policy = ApprovalPolicy(require_approval_for_literature=True)
+        assert evaluate_action(action, policy) == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_unknown_action_kind_fails_safe(self) -> None:
+        """An action kind the policy does not recognize must not be auto-approved.
+
+        Guards the HITL gate against a future ActionKind being added without a
+        corresponding policy branch.
+        """
+        unknown = SimpleNamespace(kind="some_future_kind", estimated_cpu_hours=0.0)
+        result = evaluate_action(cast(PlannedAction, unknown), ApprovalPolicy())
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
+
     def test_record_decision_appends_to_log(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
         create_campaign(ws, _make_input())
@@ -317,8 +353,30 @@ class TestCampaigns:
         assert found is not None
         assert found.name == "ws"
 
+    def test_list_campaigns_missing_root(self, tmp_path: Path) -> None:
+        assert list_campaigns(tmp_path / "does-not-exist") == []
+
+    def test_list_campaigns_ignores_loose_files(self, tmp_path: Path) -> None:
+        create_campaign(tmp_path / "good", _make_input("good"))
+        (tmp_path / "stray.txt").write_text("not a workspace")
+        campaigns = list_campaigns(tmp_path)
+        assert [c.input.workspace_name for c in campaigns] == ["good"]
+
+    def test_list_campaigns_ignores_dirs_without_campaign_file(self, tmp_path: Path) -> None:
+        create_campaign(tmp_path / "good", _make_input("good"))
+        (tmp_path / "unrelated").mkdir()
+        campaigns = list_campaigns(tmp_path)
+        assert [c.input.workspace_name for c in campaigns] == ["good"]
+
     def test_find_workspace_missing(self, tmp_path: Path) -> None:
         assert find_campaign_workspace(tmp_path, "missing-id") is None
+
+    def test_find_workspace_scans_past_non_matching(self, tmp_path: Path) -> None:
+        create_campaign(tmp_path / "aaa", _make_input("aaa"))
+        target = create_campaign(tmp_path / "zzz", _make_input("zzz"))
+        found = find_campaign_workspace(tmp_path, target.campaign_id)
+        assert found is not None
+        assert found.name == "zzz"
 
 
 # ----------------------- planner --------------------------------
@@ -412,6 +470,22 @@ class TestDrawing:
         for key in ("species", "reactions", "pdep_networks"):
             assert paths[key].exists()
             assert paths[key].read_text().startswith("<svg")
+
+    def test_render_reactions_includes_reason(self) -> None:
+        svg = render_reactions_svg(
+            [ReactionSelection(label="r1", reactants=["A"], products=["B"], reason="iteration 2 · success=True")]
+        )
+        assert "iteration 2" in svg
+
+    def test_render_reactions_truncates_long_reason(self) -> None:
+        svg = render_reactions_svg([ReactionSelection(label="r1", reactants=["A"], products=["B"], reason="x" * 200)])
+        assert "x" * 60 in svg
+        assert "x" * 61 not in svg
+
+    def test_render_reactions_escapes_reason(self) -> None:
+        svg = render_reactions_svg([ReactionSelection(label="r1", reactants=["A"], products=["B"], reason="<script>")])
+        assert "<script>" not in svg
+        assert "&lt;script&gt;" in svg
 
     def test_html_escape(self) -> None:
         svg = render_species_svg([SpeciesSelection(label="<script>")])

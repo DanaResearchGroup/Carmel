@@ -13,8 +13,12 @@ upstream ARC distutils blocker is in effect.
 
 from __future__ import annotations
 
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Any
 
 import pytest
 import yaml
@@ -26,6 +30,7 @@ from carmel.adapters.t3 import (
     _coerce_species_entry,
     _discover_pdep_networks,
     _find_t3_executable,
+    _t3_version,
     _walk_iterations,
     build_t3_input,
     extract_level_of_theory,
@@ -470,6 +475,266 @@ class TestT3AdapterFailures:
         assert run.status == RunStatus.FAILED
         assert run.failure_code == FailureCode.INVALID_OUTPUT
         assert diagnostics is None
+
+
+class TestT3VersionProbe:
+    """Tests for the importability and version probes."""
+
+    def test_importable_true_when_module_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module.importlib, "import_module", lambda _name: ModuleType("t3"))
+        assert is_t3_importable() is True
+
+    def test_version_returns_module_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        module = ModuleType("t3")
+        module.__version__ = "1.2.3"  # type: ignore[attr-defined]
+        monkeypatch.setattr(t3_module.importlib, "import_module", lambda _name: module)
+        assert _t3_version() == "1.2.3"
+
+    def test_version_none_when_module_has_no_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module.importlib, "import_module", lambda _name: ModuleType("t3"))
+        assert _t3_version() is None
+
+
+class TestFindT3Executable:
+    """Tests for T3 executable discovery precedence."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.delenv("T3_PATH", raising=False)
+        monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: None)
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(t3_module, "is_t3_importable", lambda: False)
+
+    def test_env_path_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# T3")
+        monkeypatch.setenv("T3_PATH", str(tmp_path))
+        assert _find_t3_executable() == ["python", str(tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT)]
+
+    def test_env_path_ignored_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("T3_PATH", str(tmp_path))
+        assert _find_t3_executable() is None
+
+    def test_falls_back_to_package_sibling_script(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        repo_root = tmp_path / "T3"
+        pkg = repo_root / "t3"
+        pkg.mkdir(parents=True)
+        (repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# T3")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: spec)
+        assert _find_t3_executable() == ["python", str(repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT)]
+
+    def test_package_sibling_skipped_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        pkg = tmp_path / "T3" / "t3"
+        pkg.mkdir(parents=True)
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: spec)
+        assert _find_t3_executable() is None
+
+    def test_falls_back_to_which(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/local/bin/T3.py")
+        assert _find_t3_executable() == ["python", "/usr/local/bin/T3.py"]
+
+    def test_falls_back_to_module_invocation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
+        assert _find_t3_executable() == ["python", "-m", T3_LAYOUT.EXECUTABLE_MODULE]
+
+    def test_returns_none_when_nothing_found(self) -> None:
+        assert _find_t3_executable() is None
+
+
+class TestBuildT3InputOptionalFields:
+    """Optional campaign fields must be omitted rather than emitted as null."""
+
+    def test_reactor_without_residence_time_omits_termination(self, tmp_path: Path) -> None:
+        campaign = _campaign(tmp_path)
+        campaign.input.target_reactor_systems[0].residence_time_s = None
+        reactor = build_t3_input(campaign)[T3_LAYOUT.INPUT_RMG_KEY]["reactors"][0]
+        assert "termination_time" not in reactor
+
+    def test_species_without_smiles_omits_smiles(self, tmp_path: Path) -> None:
+        campaign = _campaign(tmp_path)
+        campaign.input.initial_mixture.components[0].smiles = None
+        species = build_t3_input(campaign)[T3_LAYOUT.INPUT_RMG_KEY]["species"][0]
+        assert "smiles" not in species
+
+
+class TestAggregateEdgeCases:
+    """Malformed or partial T3 project trees must be skipped, not crash."""
+
+    def test_reaction_entry_not_dict(self) -> None:
+        assert _coerce_reaction_entry("not-a-dict", 1) is None
+
+    def test_walk_iterations_tolerates_non_numeric_suffix(self, tmp_path: Path) -> None:
+        for name in ("iteration_2", "iteration_final", "iteration_1"):
+            (tmp_path / name).mkdir()
+        names = [p.name for p in _walk_iterations(tmp_path)]
+        assert names == ["iteration_final", "iteration_1", "iteration_2"]
+
+    def test_iteration_without_info_file_is_skipped(self, tmp_path: Path) -> None:
+        (tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR).mkdir(parents=True)
+        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
+        assert diagnostics.species_to_compute == []
+
+    def test_malformed_info_file_is_skipped(self, tmp_path: Path) -> None:
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / T3_LAYOUT.T3_INFO_FILENAME).write_text("- this is a list, not a mapping\n")
+        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
+        assert diagnostics.species_to_compute == []
+        assert diagnostics.tool_metadata["iteration_count"] == 1
+
+    def test_non_numeric_iteration_name_still_parsed(self, tmp_path: Path) -> None:
+        arc = tmp_path / "iteration_final" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / T3_LAYOUT.T3_INFO_FILENAME).write_text("species:\n- label: OH\n  success: true\nreactions: []\n")
+        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert "iteration 0" in (diagnostics.species_to_compute[0].reason or "")
+
+    def test_unlabelled_entries_are_dropped(self, tmp_path: Path) -> None:
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / T3_LAYOUT.T3_INFO_FILENAME).write_text(
+            "species:\n- success: true\n- label: OH\n  success: true\n"
+            "reactions:\n- success: true\n- label: r1\n  success: true\n"
+        )
+        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert [r.label for r in diagnostics.reactions_to_compute] == ["r1"]
+
+
+class TestT3AdapterInputBuildFailure:
+    def test_unbuildable_input_records_input_build_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        def _raise(_campaign: Campaign) -> dict[str, object]:
+            raise ValueError("cannot build input")
+
+        monkeypatch.setattr(t3_module, "build_t3_input", _raise)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
+        assert "cannot build input" in (run.error_message or "")
+        assert run.input_path is None
+        assert diagnostics is None
+
+
+class TestT3AdapterSubprocessErrors:
+    def test_timeout_records_timeout_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        def _timeout(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(cmd="T3.py", timeout=1.0)
+
+        monkeypatch.setattr(t3_module, "_find_t3_executable", lambda: ["true"])
+        monkeypatch.setattr(t3_module.subprocess, "run", _timeout)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TIMEOUT
+        assert run.command is not None
+        assert diagnostics is None
+
+    def test_oserror_records_subprocess_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        def _oserror(*args: object, **kwargs: object) -> None:
+            raise OSError("exec format error")
+
+        monkeypatch.setattr(t3_module, "_find_t3_executable", lambda: ["true"])
+        monkeypatch.setattr(t3_module.subprocess, "run", _oserror)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.SUBPROCESS_ERROR
+        assert "exec format error" in (run.error_message or "")
+        assert diagnostics is None
+
+
+class TestT3AdapterSuccessPath:
+    """Drives the adapter's success path with a stand-in for the T3 executable.
+
+    The stand-in writes the same ``iteration_N/ARC/T3_info.yml`` layout the
+    real T3 produces, so the adapter's parse-and-record path is exercised
+    end to end without requiring the full RMG/ARC stack.
+    """
+
+    @staticmethod
+    def _fake_t3_command() -> list[str]:
+        script = (
+            "import pathlib, sys\n"
+            "arc = pathlib.Path('iteration_1/ARC')\n"
+            "arc.mkdir(parents=True, exist_ok=True)\n"
+            "arc.joinpath('T3_info.yml').write_text(\n"
+            "    'species:\\n- label: OH\\n  success: true\\n"
+            "reactions:\\n- label: r1\\n  reactants: [A]\\n  products: [B]\\n  success: true\\n'\n"
+            ")\n"
+            "pdep = pathlib.Path('iteration_1/RMG/pdep')\n"
+            "pdep.mkdir(parents=True, exist_ok=True)\n"
+            "pdep.joinpath('network1_1.py').write_text('# network')\n"
+        )
+        return [sys.executable, "-c", script]
+
+    def _run(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "_find_t3_executable", self._fake_t3_command)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        return T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+
+    def test_status_is_succeeded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run, diagnostics = self._run(tmp_path, monkeypatch)
+        assert run.status == RunStatus.SUCCEEDED
+        assert run.failure_code == FailureCode.NONE
+        assert diagnostics is not None
+
+    def test_diagnostics_link_back_to_run(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run, diagnostics = self._run(tmp_path, monkeypatch)
+        assert diagnostics is not None
+        assert diagnostics.run_id == run.run_id
+        assert diagnostics.campaign_id == "test-id"
+
+    def test_parsed_selections_reach_diagnostics(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _run_record, diagnostics = self._run(tmp_path, monkeypatch)
+        assert diagnostics is not None
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert [r.label for r in diagnostics.reactions_to_compute] == ["r1"]
+        assert len(diagnostics.pdep_networks_to_compute) == 1
+
+    def test_run_record_paths_and_timing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run, _diagnostics = self._run(tmp_path, monkeypatch)
+        assert run.input_path is not None and run.input_path.exists()
+        assert run.log_path is not None and run.log_path.exists()
+        assert run.output_path is not None and run.output_path.is_dir()
+        assert run.actual_cpu_hours is not None and run.actual_cpu_hours >= 0
+        assert run.ended_at >= run.started_at
+
+    def test_level_of_theory_carried_from_input(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        run, diagnostics = self._run(tmp_path, monkeypatch)
+        assert diagnostics is not None
+        assert run.level_of_theory == diagnostics.level_of_theory
+        assert run.level_of_theory is not None
 
 
 class TestT3AdapterRealSubprocess:
