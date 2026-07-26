@@ -20,14 +20,22 @@
 
   <fieldset class="section">
     <legend>Initial mixture</legend>
-    <p class="hint">One component per line: <code>species,mole_fraction[,smiles]</code></p>
-    <textarea name="mixture_components" rows="4" required>{{ form.mixture_components if form else 'CH4,0.05\nO2,0.20\nN2,0.75' }}</textarea>
+    <p class="hint">
+      One component per line: <code>species,mole_fraction[,smiles]</code>. A SMILES is required
+      to build the campaign — T3 cannot resolve a bare species label — but is optional here so
+      it can be filled in later; leaving it out fails the campaign build with a clear error.
+    </p>
+    <textarea name="mixture_components" rows="4" required>{{ form.mixture_components if form else 'CH4,0.05,C\nO2,0.20,[O][O]\nN2,0.75,N#N' }}</textarea>
   </fieldset>
 
   <fieldset class="section">
     <legend>Target observables</legend>
-    <p class="hint">One per line: <code>name[,species]</code></p>
-    <textarea name="observables" rows="3" required>{{ form.observables if form else 'ignition_delay\nspecies_profile,OH' }}</textarea>
+    <p class="hint">
+      One per line: <code>name[,species[,smiles]]</code>. A SMILES is required if
+      <code>species</code> is not one of the initial mixture components above — T3 cannot
+      resolve a bare species label.
+    </p>
+    <textarea name="observables" rows="3" required>{{ form.observables if form else 'ignition_delay\nspecies_profile,OH,[OH]' }}</textarea>
   </fieldset>
 
   <fieldset class="section">

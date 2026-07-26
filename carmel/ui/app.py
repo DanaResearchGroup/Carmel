@@ -80,7 +80,7 @@ def _build_input_from_form(form: dict[str, Any]) -> CampaignInput:
     Form fields expected:
         - workspace_name
         - mixture_components (textarea, one per line: ``species,fraction[,smiles]``)
-        - observables (textarea, one per line: ``name[,species]``)
+        - observables (textarea, one per line: ``name[,species[,smiles]]``)
         - reactors (textarea, one per line: ``type,Tmin,Tmax,Pmin,Pmax[,residence_s]``)
         - cpu_hours
         - experiment_budget
@@ -109,7 +109,8 @@ def _build_input_from_form(form: dict[str, Any]) -> CampaignInput:
             continue
         parts = [p.strip() for p in line.split(",")]
         species = parts[1] if len(parts) > 1 and parts[1] else None
-        observables.append(TargetObservable(name=parts[0], species=species))
+        smiles = parts[2] if len(parts) > 2 and parts[2] else None
+        observables.append(TargetObservable(name=parts[0], species=species, smiles=smiles))
 
     reactors: list[ReactorSystem] = []
     for line in (form.get("reactors", "") or "").splitlines():

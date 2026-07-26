@@ -52,6 +52,7 @@ class TargetObservable(BaseModel):
 
     name: str = Field(min_length=1)
     species: str | None = None
+    smiles: str | None = None
     description: str | None = None
 
 

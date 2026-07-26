@@ -484,13 +484,25 @@ def _carmel_reactor_to_t3(reactor: ReactorSystem) -> dict[str, Any]:
 
 
 def _carmel_species_to_t3(component: MixtureComponent, observable_labels: set[str]) -> dict[str, Any]:
-    """Translate a Carmel mixture component into a T3 RMG species dict."""
+    """Translate a Carmel mixture component into a T3 RMG species dict.
+
+    Raises:
+        ValueError: If *component* carries no structural descriptor. T3/RMG
+            rejects any species without a ``smiles``, ``adjlist``, or
+            ``inchi`` descriptor (see ``t3/utils/writer.py``), so Carmel
+            must fail here with a clear message rather than emit an input
+            T3 will refuse.
+    """
+    if not component.smiles:
+        raise ValueError(
+            f"mixture component {component.species!r} has no smiles and cannot be resolved to a "
+            "T3 species: a SMILES is required because T3 cannot resolve a bare label"
+        )
     out: dict[str, Any] = {
         "label": component.species,
         "concentration": float(component.mole_fraction),
+        "smiles": component.smiles,
     }
-    if component.smiles:
-        out["smiles"] = component.smiles
     if component.species in observable_labels:
         out["SA_observable"] = True
     return out
@@ -507,6 +519,12 @@ def build_t3_input(campaign: Campaign) -> dict[str, Any]:
 
     Returns:
         A dict suitable for serialization as ``input.yml`` for T3.
+
+    Raises:
+        ValueError: If a target observable declares a blank species, or if
+            a target observable that is not an initial-mixture component
+            carries no ``smiles`` (T3 cannot resolve a bare label to a
+            species), or if a mixture component carries no ``smiles``.
     """
     for observable in campaign.input.target_observables:
         if observable.species is not None and not observable.species.strip():
@@ -517,8 +535,17 @@ def build_t3_input(campaign: Campaign) -> dict[str, Any]:
     observable_labels = {o.species for o in campaign.input.target_observables if o.species}
     species = [_carmel_species_to_t3(c, observable_labels) for c in campaign.input.initial_mixture.components]
     mixture_labels = {c.species for c in campaign.input.initial_mixture.components}
+    observable_smiles_by_label = {
+        o.species: o.smiles for o in campaign.input.target_observables if o.species and o.smiles
+    }
     for label in sorted(observable_labels - mixture_labels):
-        species.append({"label": label, "concentration": 0.0, "SA_observable": True})
+        smiles = observable_smiles_by_label.get(label)
+        if not smiles:
+            raise ValueError(
+                f"target observable {label!r} is not an initial-mixture component and has no smiles: "
+                "a SMILES is required because T3 cannot resolve a bare label"
+            )
+        species.append({"label": label, "concentration": 0.0, "smiles": smiles, "SA_observable": True})
     reactors = [_carmel_reactor_to_t3(r) for r in campaign.input.target_reactor_systems]
 
     return {

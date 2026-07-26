@@ -124,7 +124,7 @@ def _campaign(workspace_root: Path) -> Campaign:
             ),
             target_observables=[
                 TargetObservable(name="ignition_delay"),
-                TargetObservable(name="species_profile", species="OH"),
+                TargetObservable(name="species_profile", species="OH", smiles="[OH]"),
             ],
             target_reactor_systems=[
                 ReactorSystem(
@@ -242,6 +242,25 @@ class TestBuildT3Input:
         c = _campaign(tmp_path)
         c.input.target_observables[1] = TargetObservable(name="species_profile", species="   ")
         with pytest.raises(ValueError, match="blank species"):
+            build_t3_input(c)
+
+    def test_observable_not_in_mixture_without_smiles_raises(self, tmp_path: Path) -> None:
+        """An observable species that is not an initial-mixture component and
+        carries no smiles has no structural descriptor T3/RMG could resolve
+        (bare labels are rejected — see ``t3/utils/writer.py``), so Carmel
+        must fail at input-build time with a clear message instead of
+        emitting an input T3 will refuse."""
+        c = _campaign(tmp_path)
+        c.input.target_observables[1] = TargetObservable(name="species_profile", species="OH")
+        with pytest.raises(ValueError, match="OH.*smiles"):
+            build_t3_input(c)
+
+    def test_mixture_component_without_smiles_raises(self, tmp_path: Path) -> None:
+        """A mixture component with no smiles has no structural descriptor
+        either, so it must fail the same way rather than reach T3."""
+        c = _campaign(tmp_path)
+        c.input.initial_mixture.components[0] = MixtureComponent(species="C2H5OH", mole_fraction=0.05)
+        with pytest.raises(ValueError, match="C2H5OH.*smiles"):
             build_t3_input(c)
 
     def test_observable_species_flag_when_in_mixture(self, tmp_path: Path) -> None:
@@ -1140,11 +1159,16 @@ class TestBuildT3InputOptionalFields:
         assert "termination_time" not in reactor
         assert reactor["termination_rate_ratio"] == 0.1
 
-    def test_species_without_smiles_omits_smiles(self, tmp_path: Path) -> None:
+    def test_species_without_smiles_raises(self, tmp_path: Path) -> None:
+        """A mixture component with no smiles has no structural descriptor
+        T3/RMG could resolve, so build_t3_input must fail loudly instead of
+        silently omitting the field (which produced a T3 input rejected
+        with ``ValueError: A species must have either an adjlist, smiles,
+        or inchi descriptor.``)."""
         campaign = _campaign(tmp_path)
         campaign.input.initial_mixture.components[0].smiles = None
-        species = build_t3_input(campaign)[T3_LAYOUT.INPUT_RMG_KEY]["species"][0]
-        assert "smiles" not in species
+        with pytest.raises(ValueError, match="smiles"):
+            build_t3_input(campaign)
 
 
 class TestAggregateEdgeCases:

@@ -91,7 +91,7 @@ from carmel.services.state_machine import (
 def _make_input(name: str = "test") -> CampaignInput:
     return CampaignInput(
         workspace_name=name,
-        initial_mixture=InitialMixture(components=[MixtureComponent(species="O2", mole_fraction=1.0)]),
+        initial_mixture=InitialMixture(components=[MixtureComponent(species="O2", mole_fraction=1.0, smiles="[O][O]")]),
         target_observables=[TargetObservable(name="ignition_delay")],
         target_reactor_systems=[
             ReactorSystem(
