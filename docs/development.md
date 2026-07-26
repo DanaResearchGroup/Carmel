@@ -115,7 +115,7 @@ There are two layers of T3 testing:
    `tests/test_t3_adapter.py`) — these run unconditionally against a
    small set of **real captured T3 artifacts** under
    `tests/fixtures/t3/sample_project/`. The fixture contains real
-   `T3_info.yml`, `input.yml`, and `RMG/pdep/network*.py` files copied
+   `<project>_info.yml`, `input.yml`, and `RMG/pdep/network*.py` files copied
    from the upstream T3 repo's own test data; see
    `tests/fixtures/t3/README.md` for provenance. These tests are how we
    guarantee the parser/normalization layer keeps matching T3's real

@@ -113,7 +113,7 @@ centralized in the `T3Layout` constants block at the top of that file.
     termination_time}`; level of theory lives in `qm.level_of_theory`.
   - **Invocation:** `python <T3_PATH>/T3.py <input.yml>` (no `--output`
     flag — T3 writes results next to the input file).
-  - **Output layout:** `<project_dir>/iteration_*/ARC/T3_info.yml` (real
+  - **Output layout:** `<project_dir>/iteration_*/ARC/<project>_info.yml` (real
     file: `{species: [{label, success}], reactions: [...]}`),
     `<project_dir>/iteration_*/RMG/pdep/network*.py`, and
     `<project_dir>/t3.log`. Level of theory is **never** written back —
@@ -126,7 +126,7 @@ centralized in the `T3Layout` constants block at the top of that file.
   chemistry; it forwards user-provided structure.
 - **Output normalization:** `normalize_t3_outputs(project_dir,
   input_dict, …)` walks `iteration_*/` subdirs, parses each
-  `T3_info.yml`, aggregates species/reactions across iterations, counts
+  `<project>_info.yml` (see `arc_info_filename()`), aggregates species/reactions across iterations, counts
   PDep networks, and pulls LOT from the input dict. The result is a
   typed `DiagnosticsV1`.
 - **Failure handling:** every error produces a typed `RunRecord` with a

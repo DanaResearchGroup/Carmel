@@ -16,7 +16,8 @@ The adapter is responsible for:
 2. Locating T3 (the executable script ``T3.py`` in the T3 repo, or the
    ``t3`` package as a module) and invoking it as a subprocess.
 3. Walking T3's project directory after a run, parsing the per-iteration
-   ``ARC/T3_info.yml`` files, and counting RMG PDep networks under
+   ``ARC/<project>_info.yml`` files (ARC's real output naming — see
+   ``arc_info_filename``), and counting RMG PDep networks under
    ``RMG/pdep/network*.py``.
 4. Normalizing the result into Carmel's ``DiagnosticsV1`` schema and
    producing a typed ``RunRecord``.
@@ -34,6 +35,7 @@ import importlib.util
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -65,7 +67,7 @@ from carmel.schemas.run import (
 #   - input schema: t3/schema.py (T3Sensitivity, RMGSpecies, RMGReactor)
 #   - executable:   T3.py at the T3 repo root
 #   - output:       Projects/<project>/iteration_N/{RMG,ARC}/...
-#                   ARC/T3_info.yml lists {species, reactions} with success flags
+#                   ARC/<project>_info.yml lists {species, reactions} with success flags
 #                   RMG/pdep/network*.py are RMG-style network files
 #                   t3.log is the top-level log
 #   - LOT:          comes from input qm.level_of_theory (T3 never writes it back)
@@ -91,7 +93,6 @@ class T3Layout:
     RMG_SUBDIR: str = "RMG"
     PDEP_SUBDIR: str = "pdep"
     PDEP_NETWORK_GLOB: str = "network*.py"
-    T3_INFO_FILENAME: str = "T3_info.yml"
 
     # Carmel-side input filename (we name our own copy)
     INPUT_FILENAME: str = "input.yml"
@@ -106,7 +107,7 @@ class T3Layout:
     QM_LOT_KEY: str = "level_of_theory"
     QM_ADAPTER_KEY: str = "adapter"
 
-    # T3_info.yml fields
+    # ARC per-iteration info file fields (<project>_info.yml)
     INFO_SPECIES_KEY: str = "species"
     INFO_REACTIONS_KEY: str = "reactions"
     INFO_LABEL_KEY: str = "label"
@@ -166,7 +167,7 @@ def _find_t3_executable() -> list[str] | None:
     if env_path:
         candidate = Path(env_path) / T3_LAYOUT.EXECUTABLE_SCRIPT
         if candidate.exists():
-            return ["python", str(candidate)]
+            return [sys.executable, str(candidate)]
 
     spec = importlib.util.find_spec("t3")
     if spec is not None and spec.origin is not None:
@@ -174,14 +175,14 @@ def _find_t3_executable() -> list[str] | None:
         repo_root = Path(spec.origin).parent.parent
         candidate = repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT
         if candidate.exists():
-            return ["python", str(candidate)]
+            return [sys.executable, str(candidate)]
 
     which = shutil.which(T3_LAYOUT.EXECUTABLE_SCRIPT)
     if which is not None:
-        return ["python", which]
+        return [sys.executable, which]
 
     if is_t3_importable():
-        return ["python", "-m", T3_LAYOUT.EXECUTABLE_MODULE]
+        return [sys.executable, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
 
     return None
 
@@ -303,8 +304,40 @@ def write_t3_input_file(target_dir: Path, payload: dict[str, Any]) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def arc_info_filename(input_dict: dict[str, Any]) -> str:
+    """Resolve the real ARC per-iteration info filename for a T3 input.
+
+    Mirrors upstream T3 exactly (``T3/t3/main.py``):
+    ``f"{project}_info.yml"`` where ``project`` is ``qm.project`` if the
+    ``qm`` block is a mapping with a non-empty ``project`` key, else the
+    T3 input's top-level ``project`` key.
+
+    Args:
+        input_dict: The parsed T3 input dict.
+
+    Returns:
+        The expected ARC info filename, e.g. ``"my_project_info.yml"``.
+
+    Raises:
+        ValueError: If no project name can be resolved from either the
+            ``qm`` block or the top-level input.
+    """
+    qm = input_dict.get(T3_LAYOUT.INPUT_QM_KEY)
+    project: Any = None
+    if isinstance(qm, dict):
+        project = qm.get(T3_LAYOUT.INPUT_PROJECT_KEY)
+    if not project:
+        project = input_dict.get(T3_LAYOUT.INPUT_PROJECT_KEY)
+    if not project:
+        raise ValueError(
+            "Cannot resolve ARC info filename: no non-empty 'project' key found in "
+            "either the qm block or the top-level T3 input."
+        )
+    return f"{project}_info.yml"
+
+
 def read_t3_info_file(path: Path) -> dict[str, Any]:
-    """Read a T3 ``T3_info.yml`` file as a dict.
+    """Read an ARC per-iteration ``<project>_info.yml`` file as a dict.
 
     Args:
         path: Path to the file.
@@ -315,11 +348,14 @@ def read_t3_info_file(path: Path) -> dict[str, Any]:
 
     Raises:
         FileNotFoundError: If the file does not exist.
-        ValueError: If the file is not a YAML mapping.
+        ValueError: If the file is not a YAML mapping or is not valid YAML.
     """
     if not path.exists():
         raise FileNotFoundError(f"T3 info file not found: {path}")
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as err:
+        raise ValueError(f"T3 info file is not valid YAML: {path}: {err}") from err
     if not isinstance(data, dict):
         raise ValueError(f"T3 info file must be a YAML mapping: {path}")
     data.setdefault(T3_LAYOUT.INFO_SPECIES_KEY, [])
@@ -372,26 +408,43 @@ def _walk_iterations(project_dir: Path) -> list[Path]:
 
 def _aggregate_species_and_reactions(
     iteration_dirs: list[Path],
-) -> tuple[list[SpeciesSelection], list[ReactionSelection]]:
+    info_filename: str,
+) -> tuple[list[SpeciesSelection], list[ReactionSelection], list[str]]:
     """Aggregate species and reactions across all iterations.
 
     Deduplicates by label, keeping the *latest* iteration's reason
     (so a species that converged later is reported as such).
+
+    Args:
+        iteration_dirs: Iteration directories to walk, in order.
+        info_filename: The ARC info filename to look for in each
+            iteration's ``ARC/`` subdir (see :func:`arc_info_filename`).
+
+    Returns:
+        A tuple of (species, reactions, warnings). Warnings record any
+        iteration whose info file was absent or unparseable — such an
+        iteration is skipped but the loss is no longer silent.
     """
     species_by_label: dict[str, SpeciesSelection] = {}
     reactions_by_label: dict[str, ReactionSelection] = {}
+    warnings: list[str] = []
     for it_dir in iteration_dirs:
         try:
             iteration = int(it_dir.name.split("_", 1)[-1])
         except ValueError:
             iteration = 0
-        info_path = it_dir / T3_LAYOUT.ARC_SUBDIR / T3_LAYOUT.T3_INFO_FILENAME
+        info_path = it_dir / T3_LAYOUT.ARC_SUBDIR / info_filename
         if not info_path.exists():
+            message = f"ARC info file absent for iteration {it_dir.name}: {info_path} not found"
+            _log.warning(message)
+            warnings.append(message)
             continue
         try:
             info = read_t3_info_file(info_path)
         except (FileNotFoundError, ValueError) as e:
-            _log.warning("Skipping malformed T3 info file %s: %s", info_path, e)
+            message = f"ARC info file for iteration {it_dir.name} is unparseable: {e}"
+            _log.warning(message)
+            warnings.append(message)
             continue
         for raw in info.get(T3_LAYOUT.INFO_SPECIES_KEY, []) or []:
             sp_sel = _coerce_species_entry(raw, iteration)
@@ -401,7 +454,7 @@ def _aggregate_species_and_reactions(
             rxn_sel = _coerce_reaction_entry(raw, iteration)
             if rxn_sel is not None:
                 reactions_by_label[rxn_sel.label] = rxn_sel
-    return list(species_by_label.values()), list(reactions_by_label.values())
+    return list(species_by_label.values()), list(reactions_by_label.values()), warnings
 
 
 def _discover_pdep_networks(iteration_dirs: list[Path]) -> list[PDepNetworkSelection]:
@@ -455,16 +508,27 @@ def normalize_t3_outputs(
 
     Raises:
         ValueError: If no iterations are found and there are no PDep
-            networks either (i.e. T3 produced nothing parseable).
+            networks either (i.e. T3 produced nothing parseable), or if
+            iteration directories exist but yielded zero species, zero
+            reactions, and zero PDep networks (an invalid/unreadable
+            output rather than a legitimately empty run).
     """
     iteration_dirs = _walk_iterations(project_dir)
-    species, reactions = _aggregate_species_and_reactions(iteration_dirs)
     networks = _discover_pdep_networks(iteration_dirs)
 
     if not iteration_dirs and not networks:
         raise ValueError(
             f"No T3 iteration directories or PDep networks found under {project_dir}. "
             f"T3 may not have produced any output."
+        )
+
+    info_filename = arc_info_filename(input_dict)
+    species, reactions, warnings = _aggregate_species_and_reactions(iteration_dirs, info_filename)
+
+    if iteration_dirs and not species and not reactions and not networks:
+        raise ValueError(
+            f"T3 iteration directories exist under {project_dir} but no species, reactions, "
+            f"or PDep networks could be parsed from them. Warnings: {warnings}"
         )
 
     return DiagnosticsV1(
@@ -478,7 +542,7 @@ def normalize_t3_outputs(
         reactions_to_compute=reactions,
         pdep_networks_to_compute=networks,
         pdep_sensitivity_flag=False,
-        warnings=[],
+        warnings=warnings,
         tool_metadata={
             "iteration_count": len(iteration_dirs),
             "pdep_network_count": len(networks),

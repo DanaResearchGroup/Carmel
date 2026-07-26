@@ -32,6 +32,7 @@ from carmel.adapters.t3 import (
     _find_t3_executable,
     _t3_version,
     _walk_iterations,
+    arc_info_filename,
     build_t3_input,
     extract_level_of_theory,
     is_t3_importable,
@@ -126,7 +127,7 @@ class TestT3Discovery:
 
     def test_find_executable_returns_list_or_none(self) -> None:
         result = _find_t3_executable()
-        assert result is None or (isinstance(result, list) and result[0] == "python")
+        assert result is None or (isinstance(result, list) and result[0] == sys.executable)
 
 
 # ---------------------------------------------------------------------------
@@ -208,19 +209,19 @@ class TestWriteT3InputFile:
 
 
 # ---------------------------------------------------------------------------
-# Reading and parsing T3_info.yml
+# Reading and parsing <project>_info.yml
 # ---------------------------------------------------------------------------
 
 
 class TestReadT3InfoFile:
     def test_reads_real_iteration_1_fixture(self) -> None:
-        info = read_t3_info_file(FIXTURE_ROOT / "iteration_1" / "ARC" / "T3_info.yml")
+        info = read_t3_info_file(FIXTURE_ROOT / "iteration_1" / "ARC" / "functional_2_thermo_info.yml")
         assert info["reactions"] == []
         assert info["species"][0]["label"] == "Imipramine_1_peroxy_0"
         assert info["species"][0]["success"] is True
 
     def test_reads_real_iteration_2_fixture(self) -> None:
-        info = read_t3_info_file(FIXTURE_ROOT / "iteration_2" / "ARC" / "T3_info.yml")
+        info = read_t3_info_file(FIXTURE_ROOT / "iteration_2" / "ARC" / "functional_2_thermo_info.yml")
         assert len(info["species"]) == 2
         labels = [s["label"] for s in info["species"]]
         assert "imipramine_ol_2_ket_4" in labels
@@ -235,6 +236,27 @@ class TestReadT3InfoFile:
         path.write_text("- list\n- only\n")
         with pytest.raises(ValueError, match="mapping"):
             read_t3_info_file(path)
+
+    def test_invalid_yaml_raises_value_error(self, tmp_path: Path) -> None:
+        path = tmp_path / "bad.yml"
+        path.write_text("species: [unterminated\n")
+        with pytest.raises(ValueError, match="not valid YAML"):
+            read_t3_info_file(path)
+
+
+class TestArcInfoFilename:
+    def test_resolves_from_top_level_project(self) -> None:
+        assert arc_info_filename({"project": "myproj"}) == "myproj_info.yml"
+
+    def test_qm_project_overrides_top_level_project(self) -> None:
+        assert arc_info_filename({"project": "myproj", "qm": {"project": "override"}}) == "override_info.yml"
+
+    def test_falls_back_to_top_level_when_qm_project_empty(self) -> None:
+        assert arc_info_filename({"project": "myproj", "qm": {"project": ""}}) == "myproj_info.yml"
+
+    def test_raises_when_no_project_resolvable(self) -> None:
+        with pytest.raises(ValueError, match="Cannot resolve ARC info filename"):
+            arc_info_filename({})
 
     def test_defaults_added_for_missing_keys(self, tmp_path: Path) -> None:
         path = tmp_path / "minimal.yml"
@@ -516,7 +538,7 @@ class TestFindT3Executable:
     def test_env_path_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         (tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# T3")
         monkeypatch.setenv("T3_PATH", str(tmp_path))
-        assert _find_t3_executable() == ["python", str(tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT)]
+        assert _find_t3_executable() == [sys.executable, str(tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT)]
 
     def test_env_path_ignored_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("T3_PATH", str(tmp_path))
@@ -531,7 +553,7 @@ class TestFindT3Executable:
         (repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# T3")
         spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
         monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: spec)
-        assert _find_t3_executable() == ["python", str(repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT)]
+        assert _find_t3_executable() == [sys.executable, str(repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT)]
 
     def test_package_sibling_skipped_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
@@ -546,13 +568,13 @@ class TestFindT3Executable:
         from carmel.adapters import t3 as t3_module
 
         monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/local/bin/T3.py")
-        assert _find_t3_executable() == ["python", "/usr/local/bin/T3.py"]
+        assert _find_t3_executable() == [sys.executable, "/usr/local/bin/T3.py"]
 
     def test_falls_back_to_module_invocation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
 
         monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
-        assert _find_t3_executable() == ["python", "-m", T3_LAYOUT.EXECUTABLE_MODULE]
+        assert _find_t3_executable() == [sys.executable, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
 
     def test_returns_none_when_nothing_found(self) -> None:
         assert _find_t3_executable() is None
@@ -587,36 +609,74 @@ class TestAggregateEdgeCases:
         assert names == ["iteration_final", "iteration_1", "iteration_2"]
 
     def test_iteration_without_info_file_is_skipped(self, tmp_path: Path) -> None:
+        """An iteration dir with no ARC info file at all now hard-fails.
+
+        Upstream T3 raises when its expected ARC info file is absent; Carmel
+        must not silently continue past a missing iteration.
+        """
         (tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR).mkdir(parents=True)
-        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
-        assert diagnostics.species_to_compute == []
+        with pytest.raises(ValueError, match="iteration_1"):
+            normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
 
     def test_malformed_info_file_is_skipped(self, tmp_path: Path) -> None:
+        """An unparseable ARC info file now hard-fails instead of being skipped silently."""
         arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
         arc.mkdir(parents=True)
-        (arc / T3_LAYOUT.T3_INFO_FILENAME).write_text("- this is a list, not a mapping\n")
-        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
-        assert diagnostics.species_to_compute == []
-        assert diagnostics.tool_metadata["iteration_count"] == 1
+        (arc / arc_info_filename({"project": "myproj"})).write_text("- this is a list, not a mapping\n")
+        with pytest.raises(ValueError, match="iteration_1"):
+            normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
 
     def test_non_numeric_iteration_name_still_parsed(self, tmp_path: Path) -> None:
         arc = tmp_path / "iteration_final" / T3_LAYOUT.ARC_SUBDIR
         arc.mkdir(parents=True)
-        (arc / T3_LAYOUT.T3_INFO_FILENAME).write_text("species:\n- label: OH\n  success: true\nreactions: []\n")
-        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
+        (arc / arc_info_filename({"project": "myproj"})).write_text(
+            "species:\n- label: OH\n  success: true\nreactions: []\n"
+        )
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
         assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
         assert "iteration 0" in (diagnostics.species_to_compute[0].reason or "")
 
     def test_unlabelled_entries_are_dropped(self, tmp_path: Path) -> None:
         arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
         arc.mkdir(parents=True)
-        (arc / T3_LAYOUT.T3_INFO_FILENAME).write_text(
+        (arc / arc_info_filename({"project": "myproj"})).write_text(
             "species:\n- success: true\n- label: OH\n  success: true\n"
             "reactions:\n- success: true\n- label: r1\n  success: true\n"
         )
-        diagnostics = normalize_t3_outputs(project_dir=tmp_path, input_dict={}, campaign_id="c", run_id="r")
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
         assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
         assert [r.label for r in diagnostics.reactions_to_compute] == ["r1"]
+
+    def test_old_t3_info_filename_is_not_recognized(self, tmp_path: Path) -> None:
+        """Regression guard: the old hardcoded 'T3_info.yml' name must not be accepted.
+
+        ARC really writes ``<project>_info.yml``; a file left at the
+        previously-invented literal name must be treated as absent and hard-fail.
+        """
+        arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        arc.mkdir(parents=True)
+        (arc / "T3_info.yml").write_text("species:\n- label: OH\n  success: true\nreactions: []\n")
+        with pytest.raises(ValueError, match="iteration_1"):
+            normalize_t3_outputs(project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r")
+
+    def test_warnings_propagate_to_diagnostics_when_some_iterations_parse(self, tmp_path: Path) -> None:
+        """Warnings from bad iterations surface on DiagnosticsV1.warnings when at least
+        one other iteration parses successfully (so the overall run does not hard-fail)."""
+        good_arc = tmp_path / "iteration_1" / T3_LAYOUT.ARC_SUBDIR
+        good_arc.mkdir(parents=True)
+        (good_arc / arc_info_filename({"project": "myproj"})).write_text(
+            "species:\n- label: OH\n  success: true\nreactions: []\n"
+        )
+        (tmp_path / "iteration_2" / T3_LAYOUT.ARC_SUBDIR).mkdir(parents=True)
+        diagnostics = normalize_t3_outputs(
+            project_dir=tmp_path, input_dict={"project": "myproj"}, campaign_id="c", run_id="r"
+        )
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert any("iteration_2" in w for w in diagnostics.warnings)
 
 
 class TestT3AdapterInputBuildFailure:
@@ -674,9 +734,12 @@ class TestT3AdapterSubprocessErrors:
 class TestT3AdapterSuccessPath:
     """Drives the adapter's success path with a stand-in for the T3 executable.
 
-    The stand-in writes the same ``iteration_N/ARC/T3_info.yml`` layout the
-    real T3 produces, so the adapter's parse-and-record path is exercised
-    end to end without requiring the full RMG/ARC stack.
+    The stand-in writes the same ``iteration_N/ARC/<project>_info.yml`` layout
+    real ARC produces (for the ``ethanol_combustion`` project used by
+    ``_campaign()``), so the adapter's parse-and-record path is exercised end
+    to end without requiring the full RMG/ARC stack. Per real ARC output,
+    reaction entries carry only ``label`` (an equation string) and
+    ``success`` — no ``reactants``/``products`` keys.
     """
 
     @staticmethod
@@ -685,9 +748,9 @@ class TestT3AdapterSuccessPath:
             "import pathlib, sys\n"
             "arc = pathlib.Path('iteration_1/ARC')\n"
             "arc.mkdir(parents=True, exist_ok=True)\n"
-            "arc.joinpath('T3_info.yml').write_text(\n"
+            "arc.joinpath('ethanol_combustion_info.yml').write_text(\n"
             "    'species:\\n- label: OH\\n  success: true\\n"
-            "reactions:\\n- label: r1\\n  reactants: [A]\\n  products: [B]\\n  success: true\\n'\n"
+            'reactions:\\n- label: "C2H5OH + OH <=> C2H5O + H2O"\\n  success: true\\n\'\n'
             ")\n"
             "pdep = pathlib.Path('iteration_1/RMG/pdep')\n"
             "pdep.mkdir(parents=True, exist_ok=True)\n"
@@ -719,7 +782,7 @@ class TestT3AdapterSuccessPath:
         _run_record, diagnostics = self._run(tmp_path, monkeypatch)
         assert diagnostics is not None
         assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
-        assert [r.label for r in diagnostics.reactions_to_compute] == ["r1"]
+        assert [r.label for r in diagnostics.reactions_to_compute] == ["C2H5OH + OH <=> C2H5O + H2O"]
         assert len(diagnostics.pdep_networks_to_compute) == 1
 
     def test_run_record_paths_and_timing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
