@@ -216,6 +216,25 @@ jobs:
               raise
           "
 
+      # is_t3_importable() answers True or False and swallows the reason, which
+      # is useless exactly when the answer is False: the real-subprocess suite
+      # then skips and the lane reports green having tested nothing. Ask
+      # t3_env's own interpreter directly and print the traceback. This never
+      # fails the step — a diagnostic that can redden a lane gets deleted.
+      - name: Explain why T3 does or does not import
+        if: always()
+        run: |
+          "$T3_PYTHON" -c "
+          import traceback
+          for mod in ('arc', 't3'):
+              try:
+                  __import__(mod)
+                  print(f'{mod}: OK')
+              except BaseException:
+                  print(f'{mod}: FAILED')
+                  traceback.print_exc()
+          " || echo "T3_PYTHON ($T3_PYTHON) could not be invoked at all"
+
       # Relies on the job-level continue-on-error, not a step-level one: if T3
       # is reachable the real subprocess tests must pass and their failure must
       # be visible. If it is not, the @requires_t3 marker skips them cleanly.
