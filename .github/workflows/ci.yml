@@ -85,8 +85,13 @@ jobs:
     name: Tests + packaging smoke (required)
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.12"]
+        # Both ends of what Carmel claims to support. 3.12 is the floor in
+        # pyproject.toml's requires-python; 3.14 is what crml_env actually
+        # resolves to, since environment.yml pins only `python >=3.12.*`.
+        # Testing 3.12 alone verified a python Carmel does not run on.
+        python-version: ["3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
