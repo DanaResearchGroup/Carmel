@@ -88,6 +88,7 @@ jobs:
           done | tee "$HOME/upstream-pins.txt"
           echo "stack=$(sha256sum "$HOME/upstream-pins.txt" | cut -c1-16)" >> "$GITHUB_OUTPUT"
           echo "rmgpy=$(git -C "$HOME/RMG-Py" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "arc=$(git -C "$HOME/ARC" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # No python-version here on purpose: each environment pins its own, and
       # they disagree. Forcing one at the installer level is what made the
@@ -132,6 +133,22 @@ jobs:
           path: ${{ env.CONDA_ROOT }}/envs
           key: ${{ runner.os }}-envs-${{ steps.pins.outputs.stack }}-${{ hashFiles('environment.yml') }}
 
+      # ARC has the same property as RMG-Py below: `arc.molecule.graph` and
+      # friends are Cython extensions declared in ARC's setup.py, and they
+      # compile into the ARC SOURCE tree, which is re-cloned fresh every run
+      # and is not part of the environment cache. Without this entry the
+      # extensions are rebuilt every run; without the always-run install step
+      # further down they are never built at all on an environment-cache hit,
+      # and `import arc` dies with ModuleNotFoundError: arc.molecule.graph.
+      - name: Cache the compiled ARC tree
+        id: cache-arc
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
+        with:
+          path: |
+            ~/ARC/build
+            ~/ARC/**/*.so
+          key: ${{ runner.os }}-arc-build-${{ steps.pins.outputs.arc }}
+
       # RMG-Py's compiled Cython extensions land in the source tree rather than
       # an environment, so they need their own entry — keyed on RMG-Py alone,
       # since a change to ARC or T3 does not invalidate them.
@@ -156,9 +173,6 @@ jobs:
         run: |
           conda env create -n t3_env -f "$HOME/T3/environment.yml"
           conda env update -n t3_env -f "$HOME/ARC/environment.yml"
-          conda activate t3_env
-          pip install -e "$HOME/ARC"
-          pip install -e "$HOME/T3"
 
       - name: Create crml_env (Carmel)
         if: steps.cache-envs.outputs.cache-hit != 'true'
@@ -170,6 +184,20 @@ jobs:
           conda activate rmg_env
           cd "$HOME/RMG-Py"
           make
+
+      # Deliberately NOT gated on the environment cache. The editable-install
+      # registration lives in the cached environment, but the compiled
+      # extensions live in the re-cloned ARC/T3 source trees, so gating this
+      # on a cache hit leaves a registered package whose C extensions do not
+      # exist — `import arc` then fails on arc.molecule.graph and every real
+      # test skips while the lane reports green. The compile itself is what
+      # the ARC build cache above makes cheap; this step stays cheap on a hit
+      # and correct on a miss.
+      - name: Install ARC and T3 into t3_env
+        run: |
+          conda activate t3_env
+          pip install -e "$HOME/ARC"
+          pip install -e "$HOME/T3"
 
       # Always reinstalled: Carmel's own code changes every commit, so this
       # must never be skipped on a cache hit the way the upstream installs are.
