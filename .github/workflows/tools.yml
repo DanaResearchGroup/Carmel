@@ -334,3 +334,17 @@ jobs:
               )
           print(f"real T3 execution tests that ran: {len(cases)}")
           PY
+
+      # ARC shares t3_env (see the lane header): T3 imports ARC in-process, so
+      # ARC is importable wherever T3 is. The ARC adapter's pure-Python and
+      # mocked tests run here for parity; the real ARC subprocess test
+      # (@requires_arc) becomes a strict "must not skip" gate — like the T3 one
+      # above — once the ARC adapter launches ARC through its conda env the way
+      # the T3 adapter now does (bare `python ARC.py` runs under crml_env, where
+      # arc is not importable). Until then this step relies on the job-level
+      # continue-on-error and does not assert the real test ran.
+      - name: Run ARC-dependent tests
+        if: always()
+        run: |
+          conda activate crml_env
+          pytest tests/test_arc_adapter.py -v --junitxml=arc-report.xml
