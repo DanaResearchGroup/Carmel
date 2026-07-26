@@ -73,12 +73,21 @@ jobs:
       - name: Run tests with coverage
         run: pytest --cov --cov-branch --cov-report=term-missing --cov-report=xml
 
-      - name: Packaging smoke — console script and Flask app boot
+      # Builds a wheel, installs it into a clean venv, and exercises it from a
+      # neutral working directory. An editable install run from the repo root
+      # cannot catch packaging faults: the repo root is on sys.path, so a
+      # module missing from the distribution (or a template/static asset that
+      # was never packaged) still resolves and the smoke test passes.
+      - name: Packaging smoke — wheel install, console script, and Flask app boot
         run: |
-          carmel version
-          carmel --help
-          carmel serve --help
-          python -c "from carmel.ui import create_app; app = create_app(); client = app.test_client(); r = client.get('/'); assert r.status_code == 200, f'expected 200, got {r.status_code}'; print('Flask app boot ok')"
+          python -m pip wheel --no-deps --wheel-dir dist .
+          python -m venv "$RUNNER_TEMP/smoke"
+          "$RUNNER_TEMP/smoke/bin/pip" install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/smoke/bin/carmel" version
+          "$RUNNER_TEMP/smoke/bin/carmel" --help
+          "$RUNNER_TEMP/smoke/bin/carmel" serve --help
+          "$RUNNER_TEMP/smoke/bin/python" -c "from carmel.ui import create_app; app = create_app(); client = app.test_client(); r = client.get('/'); assert r.status_code == 200, f'expected 200, got {r.status_code}'; assert client.get('/static/style.css').status_code == 200, 'static assets missing from the wheel'; print('Flask app boot ok')"
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5

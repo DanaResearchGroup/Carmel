@@ -32,8 +32,14 @@ carmel = "Carmel:cli"
 [tool.setuptools.dynamic]
 version = {attr = "carmel.version.__version__"}
 
+[tool.setuptools]
+py-modules = ["Carmel"]
+
 [tool.setuptools.packages.find]
 include = ["carmel*"]
+
+[tool.setuptools.package-data]
+"carmel.ui" = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
