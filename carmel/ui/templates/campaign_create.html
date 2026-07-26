@@ -9,6 +9,7 @@
 </div>
 
 <form method="POST" action="{{ url_for('campaign_new') }}" class="form-stack">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
   <fieldset class="section">
     <legend>Identity</legend>

@@ -6,9 +6,16 @@ from typing import Any
 
 import pytest
 from flask.testing import FlaskClient
+from werkzeug.test import TestResponse
 
 from carmel.schemas import CampaignStateValue
+from carmel.schemas.approval import ApprovalPolicy
+from carmel.services.approvals import save_policy
+from carmel.services.campaigns import find_campaign_workspace
+from carmel.services.decision_log import read_events
 from carmel.services.execution import save_diagnostics
+from carmel.services.planner import load_plan
+from carmel.services.state_machine import load_state
 from carmel.ui import create_app
 from carmel.ui.app import _resolve_workspaces_root
 
@@ -25,8 +32,25 @@ def workspaces_root(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def _csrf_token(client: FlaskClient) -> str:
+    """Render a form page to prime the session and return its CSRF token."""
+    assert client.get("/campaigns/new").status_code == 200
+    with client.session_transaction() as session:
+        token = session["csrf_token"]
+    assert isinstance(token, str) and token
+    return token
+
+
+def _post(client: FlaskClient, path: str, data: dict[str, str] | None = None, **kwargs: Any) -> TestResponse:
+    """POST with a valid CSRF token injected, mirroring a real form submit."""
+    payload: dict[str, str] = dict(data or {})
+    payload.setdefault("csrf_token", _csrf_token(client))
+    return client.open(path, method="POST", data=payload, **kwargs)
+
+
 def _create_via_form(client: FlaskClient, name: str = "ethanol") -> str:
-    response = client.post(
+    response = _post(
+        client,
         "/campaigns/new",
         data={
             "workspace_name": name,
@@ -66,7 +90,8 @@ class TestCampaignNew:
         assert response.status_code == 200
 
     def test_invalid_form_returns_400(self, client: FlaskClient) -> None:
-        response = client.post(
+        response = _post(
+            client,
             "/campaigns/new",
             data={
                 "workspace_name": "x",
@@ -96,7 +121,7 @@ class TestCampaignDashboard:
 class TestPlanFlow:
     def test_generate_plan(self, client: FlaskClient) -> None:
         cid = _create_via_form(client)
-        response = client.post(f"/campaigns/{cid}/plan", follow_redirects=False)
+        response = _post(client, f"/campaigns/{cid}/plan", follow_redirects=False)
         assert response.status_code == 302
         dashboard = client.get(f"/campaigns/{cid}").data
         assert b"baseline" in dashboard.lower() or b"Plan" in dashboard
@@ -111,8 +136,8 @@ class TestPlanFlow:
         ws = find_campaign_workspace(workspaces_root, cid)
         assert ws is not None
         save_policy(ws, ApprovalPolicy(auto_approve_t3_under_cpu_hours=0.1))
-        client.post(f"/campaigns/{cid}/plan")
-        response = client.post(f"/campaigns/{cid}/approve", follow_redirects=False)
+        _post(client, f"/campaigns/{cid}/plan")
+        response = _post(client, f"/campaigns/{cid}/approve", follow_redirects=False)
         assert response.status_code == 302
         from carmel.services.state_machine import load_state
 
@@ -127,8 +152,8 @@ class TestPlanFlow:
         ws = find_campaign_workspace(workspaces_root, cid)
         assert ws is not None
         save_policy(ws, ApprovalPolicy(auto_approve_t3_under_cpu_hours=0.1))
-        client.post(f"/campaigns/{cid}/plan")
-        response = client.post(f"/campaigns/{cid}/reject", follow_redirects=False)
+        _post(client, f"/campaigns/{cid}/plan")
+        response = _post(client, f"/campaigns/{cid}/reject", follow_redirects=False)
         assert response.status_code == 302
         from carmel.services.state_machine import load_state
 
@@ -142,7 +167,8 @@ class TestFreeTextIntake:
 
         ws = find_campaign_workspace(workspaces_root, cid)
         assert ws is not None
-        response = client.post(
+        response = _post(
+            client,
             f"/campaigns/{cid}/free-text",
             data={"free_text": "we want a methane mechanism"},
             follow_redirects=False,
@@ -181,7 +207,8 @@ class TestFormParsing:
     """Tests for translating posted form text into a CampaignInput."""
 
     def test_blank_lines_are_ignored(self, client: FlaskClient) -> None:
-        response = client.post(
+        response = _post(
+            client,
             "/campaigns/new",
             data={
                 "workspace_name": "blanks",
@@ -196,7 +223,8 @@ class TestFormParsing:
         assert response.status_code == 302
 
     def test_non_numeric_mole_fraction_returns_400(self, client: FlaskClient) -> None:
-        response = client.post(
+        response = _post(
+            client,
             "/campaigns/new",
             data={
                 "workspace_name": "bad-fraction",
@@ -211,7 +239,8 @@ class TestFormParsing:
         assert b"invalid mole fraction" in response.data
 
     def test_short_reactor_line_returns_400(self, client: FlaskClient) -> None:
-        response = client.post(
+        response = _post(
+            client,
             "/campaigns/new",
             data={
                 "workspace_name": "bad-reactor",
@@ -226,7 +255,8 @@ class TestFormParsing:
         assert b"reactor line must be" in response.data
 
     def test_missing_required_field_returns_400(self, client: FlaskClient) -> None:
-        response = client.post(
+        response = _post(
+            client,
             "/campaigns/new",
             data={
                 "mixture_components": "CH4,1.0",
@@ -241,7 +271,8 @@ class TestFormParsing:
     def test_observable_species_column_parsed(self, client: FlaskClient, workspaces_root: Path) -> None:
         from carmel.services.campaigns import find_campaign_workspace, load_campaign
 
-        client.post(
+        _post(
+            client,
             "/campaigns/new",
             data={
                 "workspace_name": "with-species",
@@ -260,7 +291,8 @@ class TestFormParsing:
 
     def test_duplicate_workspace_returns_400(self, client: FlaskClient) -> None:
         _create_via_form(client, "dupe")
-        response = client.post(
+        response = _post(
+            client,
             "/campaigns/new",
             data={
                 "workspace_name": "dupe",
@@ -296,7 +328,7 @@ class TestUnknownCampaign404:
         ],
     )
     def test_post_routes_404(self, client: FlaskClient, path: str) -> None:
-        assert client.post(path).status_code == 404
+        assert _post(client, path).status_code == 404
 
     def test_svg_route_404(self, client: FlaskClient) -> None:
         assert client.get("/campaigns/nope/svg/species_selection.svg").status_code == 404
@@ -316,8 +348,8 @@ class TestCampaignRun:
 
         monkeypatch.setattr(ui_app, "execute_t3_action", _fake_execute)
         cid = _create_via_form(client)
-        client.post(f"/campaigns/{cid}/plan")
-        response = client.post(f"/campaigns/{cid}/run", follow_redirects=False)
+        _post(client, f"/campaigns/{cid}/plan")
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
         assert response.status_code == 302
         assert response.headers["Location"].endswith(cid)
         assert called["action_id"] is not None
@@ -329,12 +361,12 @@ class TestCampaignRun:
         from carmel.services.planner import load_plan, save_plan
 
         cid = _create_via_form(client)
-        client.post(f"/campaigns/{cid}/plan")
+        _post(client, f"/campaigns/{cid}/plan")
         ws = find_campaign_workspace(workspaces_root, cid)
         assert ws is not None
         plan = load_plan(ws)
         save_plan(ws, plan.model_copy(update={"actions": []}))
-        assert client.post(f"/campaigns/{cid}/run").status_code == 400
+        assert _post(client, f"/campaigns/{cid}/run").status_code == 400
 
 
 class TestDashboardLatestRun:
@@ -444,3 +476,209 @@ class TestSvgArtifacts:
         response = client.get(f"/campaigns/{cid}/svg/species_selection.svg")
         assert response.status_code == 200
         assert b"<svg" in response.data
+
+
+def _plan_pending_approval(client: FlaskClient, workspaces_root: Path, name: str = "gated") -> tuple[str, Path]:
+    """Create a campaign whose plan requires human approval and generate it."""
+    cid = _create_via_form(client, name)
+    ws = find_campaign_workspace(workspaces_root, cid)
+    assert ws is not None
+    save_policy(ws, ApprovalPolicy(auto_approve_t3_under_cpu_hours=0.1))
+    assert _post(client, f"/campaigns/{cid}/plan").status_code == 302
+    return cid, ws
+
+
+class TestPlanStateGuard:
+    """The /plan route must validate the state transition before writing plan.json."""
+
+    def test_replan_after_user_approval_conflicts_and_preserves_plan(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid, ws = _plan_pending_approval(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/approve").status_code == 302
+        plan_before = (ws / "plan.json").read_bytes()
+        action_id_before = load_plan(ws).actions[0].action_id
+        response = _post(client, f"/campaigns/{cid}/plan")
+        assert response.status_code == 409
+        assert (ws / "plan.json").read_bytes() == plan_before
+        assert load_plan(ws).actions[0].action_id == action_id_before
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_replan_after_auto_approval_conflicts_and_preserves_plan(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid = _create_via_form(client, "auto-gated")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert _post(client, f"/campaigns/{cid}/plan").status_code == 302
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        plan_before = (ws / "plan.json").read_bytes()
+        response = _post(client, f"/campaigns/{cid}/plan")
+        assert response.status_code == 409
+        assert (ws / "plan.json").read_bytes() == plan_before
+
+
+class TestApprovalAuditIntegrity:
+    """Approval/rejection events must only be logged for operations that took effect."""
+
+    def test_double_approve_records_exactly_one_event_per_action(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid, ws = _plan_pending_approval(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/approve").status_code == 302
+        assert _post(client, f"/campaigns/{cid}/approve").status_code == 409
+        action_id = load_plan(ws).actions[0].action_id
+        approvals = [
+            e
+            for e in read_events(ws / "decision_log.jsonl")
+            if e.get("event") == "approval_decision"
+            and e.get("action_id") == action_id
+            and e.get("status") == "approved"
+        ]
+        assert len(approvals) == 1
+
+    def test_double_reject_records_exactly_one_event_per_action(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid, ws = _plan_pending_approval(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/reject").status_code == 302
+        assert _post(client, f"/campaigns/{cid}/reject").status_code == 409
+        action_id = load_plan(ws).actions[0].action_id
+        rejections = [
+            e
+            for e in read_events(ws / "decision_log.jsonl")
+            if e.get("event") == "approval_decision"
+            and e.get("action_id") == action_id
+            and e.get("status") == "rejected"
+        ]
+        assert len(rejections) == 1
+        assert load_state(ws).state == CampaignStateValue.BLOCKED
+
+    def test_approve_on_blocked_campaign_is_refused_and_not_runnable(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.ui import app as ui_app
+
+        executed: dict[str, object] = {}
+
+        def _fake_execute(ws: Path, campaign: object, action: object) -> tuple[None, None]:
+            executed["action_id"] = getattr(action, "action_id", None)
+            return None, None
+
+        monkeypatch.setattr(ui_app, "execute_t3_action", _fake_execute)
+        cid, ws = _plan_pending_approval(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/reject").status_code == 302
+        assert _post(client, f"/campaigns/{cid}/approve").status_code == 409
+        assert load_state(ws).state == CampaignStateValue.BLOCKED
+        events = read_events(ws / "decision_log.jsonl")
+        assert not any(e.get("event") == "approval_decision" and e.get("status") == "approved" for e in events)
+        assert _post(client, f"/campaigns/{cid}/run").status_code == 409
+        assert executed == {}
+
+
+class TestRunApprovalGate:
+    """The /run route must refuse actions with no effective approval decision."""
+
+    def test_run_without_recorded_approval_returns_409(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.ui import app as ui_app
+
+        executed: dict[str, object] = {}
+
+        def _fake_execute(ws: Path, campaign: object, action: object) -> tuple[None, None]:
+            executed["action_id"] = getattr(action, "action_id", None)
+            return None, None
+
+        monkeypatch.setattr(ui_app, "execute_t3_action", _fake_execute)
+        cid, ws = _plan_pending_approval(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/run").status_code == 409
+        assert executed == {}
+
+
+class TestCsrfProtection:
+    """Every state-changing POST must carry the session CSRF token."""
+
+    _FORM = {
+        "workspace_name": "csrf-check",
+        "mixture_components": "CH4,1.0",
+        "observables": "ignition_delay",
+        "reactors": "jsr,800,1200,1.0,5.0",
+        "cpu_hours": "10",
+        "experiment_budget": "0",
+    }
+
+    def test_post_without_token_returns_400(self, client: FlaskClient, workspaces_root: Path) -> None:
+        response = client.post("/campaigns/new", data=self._FORM)
+        assert response.status_code == 400
+        assert not (workspaces_root / "csrf-check").exists()
+
+    def test_post_with_wrong_token_of_correct_length_returns_400(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        token = _csrf_token(client)
+        wrong = ("a" if token[0] != "a" else "b") + token[1:]
+        assert wrong != token and len(wrong) == len(token)
+        response = client.post("/campaigns/new", data={**self._FORM, "csrf_token": wrong})
+        assert response.status_code == 400
+        assert not (workspaces_root / "csrf-check").exists()
+
+    def test_post_with_token_but_unprimed_session_returns_400(self, client: FlaskClient) -> None:
+        response = client.post("/campaigns/new", data={**self._FORM, "csrf_token": "attacker-guess"})
+        assert response.status_code == 400
+
+    def test_post_with_valid_token_succeeds(self, client: FlaskClient) -> None:
+        token = _csrf_token(client)
+        response = client.post("/campaigns/new", data={**self._FORM, "csrf_token": token})
+        assert response.status_code == 302
+
+    def test_token_is_stable_within_a_session(self, client: FlaskClient) -> None:
+        assert _csrf_token(client) == _csrf_token(client)
+
+    def test_get_requests_do_not_require_token(self, client: FlaskClient) -> None:
+        assert client.get("/").status_code == 200
+
+
+class TestCsrfFieldRendered:
+    """Every rendered POST form must embed the hidden CSRF field."""
+
+    @staticmethod
+    def _assert_every_post_form_has_token(html: str, expected_forms: int) -> None:
+        assert html.count('method="POST"') == expected_forms
+        assert html.count('name="csrf_token"') == expected_forms
+
+    def test_create_form(self, client: FlaskClient) -> None:
+        html = client.get("/campaigns/new").data.decode()
+        self._assert_every_post_form_has_token(html, expected_forms=1)
+
+    def test_dashboard_ready_for_planning(self, client: FlaskClient) -> None:
+        cid = _create_via_form(client, "render-ready")
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        self._assert_every_post_form_has_token(html, expected_forms=2)  # plan + free-text
+
+    def test_dashboard_pending_approval(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, _ = _plan_pending_approval(client, workspaces_root, "render-pending")
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        self._assert_every_post_form_has_token(html, expected_forms=3)  # approve + reject + free-text
+
+    def test_dashboard_approved(self, client: FlaskClient) -> None:
+        cid = _create_via_form(client, "render-approved")
+        assert _post(client, f"/campaigns/{cid}/plan").status_code == 302
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        self._assert_every_post_form_has_token(html, expected_forms=2)  # run + free-text
+
+
+class TestSecretKey:
+    """Secret-key resolution: env var honored, otherwise random per process."""
+
+    def test_unset_env_yields_distinct_random_keys(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("CARMEL_SECRET_KEY", raising=False)
+        app_one = create_app(workspaces_root=tmp_path / "one")
+        app_two = create_app(workspaces_root=tmp_path / "two")
+        assert app_one.secret_key != app_two.secret_key
+        assert app_one.secret_key != "carmel-dev-secret-do-not-use-in-prod"
+
+    def test_env_value_is_honored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("CARMEL_SECRET_KEY", "configured-secret")
+        app = create_app(workspaces_root=tmp_path)
+        assert app.secret_key == "configured-secret"

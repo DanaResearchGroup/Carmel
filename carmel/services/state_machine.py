@@ -62,7 +62,6 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
     CampaignStateValue.COMPLETED_PHASE1: frozenset(),
     CampaignStateValue.BLOCKED: frozenset(
         {
-            CampaignStateValue.APPROVED_FOR_EXECUTION,
             CampaignStateValue.FAILED,
         }
     ),

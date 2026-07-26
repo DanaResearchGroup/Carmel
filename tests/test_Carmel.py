@@ -166,6 +166,25 @@ class TestServeCommand:
         assert main(["serve", "--workspaces", str(target)]) == 0
         assert target.is_dir()
 
+    @pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.10", "example.com"])
+    def test_debug_on_non_loopback_host_is_rejected(
+        self, host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setattr("flask.Flask.run", lambda *args, **kwargs: None)
+        exit_code = main(["serve", "--workspaces", str(tmp_path), "--host", host, "--debug"])
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "--debug" in captured.err
+        assert host in captured.err
+        assert captured.out == ""
+
+    @pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+    def test_debug_on_loopback_host_is_allowed(
+        self, host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("flask.Flask.run", lambda *args, **kwargs: None)
+        assert main(["serve", "--workspaces", str(tmp_path), "--host", host, "--debug"]) == 0
+
 
 class TestCliEntryPoint:
     """Tests for the console-script entry point."""

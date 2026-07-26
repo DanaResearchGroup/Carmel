@@ -70,14 +70,17 @@
       {% if state.state.value == 'plan_pending_approval' %}
         <div class="actions">
           <form method="POST" action="{{ url_for('campaign_approve', campaign_id=campaign.campaign_id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="success">Approve &amp; execute</button>
           </form>
           <form method="POST" action="{{ url_for('campaign_reject', campaign_id=campaign.campaign_id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button class="danger">Reject</button>
           </form>
         </div>
       {% elif state.state.value == 'approved_for_execution' %}
         <form method="POST" action="{{ url_for('campaign_run', campaign_id=campaign.campaign_id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="primary">Run T3</button>
         </form>
       {% endif %}
@@ -85,6 +88,7 @@
       <p class="empty">No plan yet.</p>
       {% if state.state.value == 'ready_for_planning' %}
         <form method="POST" action="{{ url_for('campaign_plan', campaign_id=campaign.campaign_id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="primary">Generate plan</button>
         </form>
       {% endif %}
@@ -185,6 +189,7 @@
       Advisory only. Free text is parsed into a review note and never becomes canonical campaign state.
     </p>
     <form method="POST" action="{{ url_for('campaign_free_text', campaign_id=campaign.campaign_id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <textarea name="free_text" rows="3" placeholder="Paste any context here..."></textarea>
       <div class="actions">
         <button type="submit">Save review</button>

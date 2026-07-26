@@ -222,6 +222,25 @@ class TestStateMachine:
         with pytest.raises(InvalidTransitionError):
             update_state(ws, CampaignStateValue.RUNNING_T3)
 
+    def test_blocked_cannot_be_unrejected_to_approved_for_execution(self) -> None:
+        assert not can_transition(CampaignStateValue.BLOCKED, CampaignStateValue.APPROVED_FOR_EXECUTION)
+
+    def test_blocked_can_only_transition_to_failed(self) -> None:
+        for target in CampaignStateValue:
+            expected = target == CampaignStateValue.FAILED
+            assert can_transition(CampaignStateValue.BLOCKED, target) == expected
+
+    def test_update_state_refuses_unrejecting_a_blocked_campaign(self, tmp_path: Path) -> None:
+        """A rejected plan must be re-planned, never un-rejected into execution."""
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        update_state(ws, CampaignStateValue.VALIDATED)
+        update_state(ws, CampaignStateValue.READY_FOR_PLANNING)
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        update_state(ws, CampaignStateValue.BLOCKED, notes="user-rejected")
+        with pytest.raises(InvalidTransitionError):
+            update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION)
+
     def test_failed_can_retry_to_approved_for_execution_only_from_running_t3(self) -> None:
         assert can_transition(
             CampaignStateValue.FAILED,

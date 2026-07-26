@@ -11,6 +11,7 @@ lives in :mod:`carmel.services`.
 from __future__ import annotations
 
 import os
+import secrets
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -45,7 +46,8 @@ from carmel.services.decision_log import read_events
 from carmel.services.execution import execute_t3_action, load_diagnostics
 from carmel.services.intake import StubIntakeParser, write_intake_review
 from carmel.services.planner import load_plan, plan_and_save
-from carmel.services.state_machine import load_state, update_state
+from carmel.services.state_machine import can_transition, load_state, update_state
+from carmel.ui.csrf import init_csrf
 
 _log = get_logger("ui")
 
@@ -156,7 +158,11 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         template_folder="templates",
         static_folder="static",
     )
-    app.secret_key = os.environ.get("CARMEL_SECRET_KEY", "carmel-dev-secret-do-not-use-in-prod")
+    # Without CARMEL_SECRET_KEY a fresh random key is generated per process,
+    # which invalidates sessions (and CSRF tokens) across restarts — correct
+    # and acceptable for a single-user local tool.
+    app.secret_key = os.environ.get("CARMEL_SECRET_KEY") or secrets.token_hex(32)
+    init_csrf(app)
     workspaces = _resolve_workspaces_root(workspaces_root)
     workspaces.mkdir(parents=True, exist_ok=True)
     app.config["WORKSPACES_ROOT"] = workspaces
@@ -220,12 +226,13 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
+        state = load_state(ws)
+        if not can_transition(state.state, CampaignStateValue.PLAN_PENDING_APPROVAL, state.failed_from):
+            abort(409, description=f"Cannot plan a campaign in state {state.state.value!r}.")
         campaign = load_campaign(ws)
         plan = plan_and_save(ws, campaign)
-        if plan.requires_approval:
-            update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
-        else:
-            update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        if not plan.requires_approval:
             update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="auto-approved")
             for action in plan.actions:
                 record_decision(ws, action.action_id, ApprovalStatus.AUTO_APPROVED, decided_by="auto")
@@ -236,7 +243,11 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
+        state = load_state(ws)
+        if state.state != CampaignStateValue.PLAN_PENDING_APPROVAL:
+            abort(409, description=f"Cannot approve a campaign in state {state.state.value!r}.")
         plan = load_plan(ws)
+        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="user-approved")
         for action in plan.actions:
             record_decision(
                 ws,
@@ -245,7 +256,6 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
                 decided_by="user",
                 rationale="approved via UI",
             )
-        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="user-approved")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/reject", methods=["POST"])
@@ -253,7 +263,11 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
+        state = load_state(ws)
+        if state.state != CampaignStateValue.PLAN_PENDING_APPROVAL:
+            abort(409, description=f"Cannot reject a campaign in state {state.state.value!r}.")
         plan = load_plan(ws)
+        update_state(ws, CampaignStateValue.BLOCKED, notes="user-rejected")
         for action in plan.actions:
             record_decision(
                 ws,
@@ -262,7 +276,6 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
                 decided_by="user",
                 rationale="rejected via UI",
             )
-        update_state(ws, CampaignStateValue.BLOCKED, notes="user-rejected")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/run", methods=["POST"])
@@ -274,7 +287,16 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         plan = load_plan(ws)
         if not plan.actions:
             abort(400)
-        execute_t3_action(ws, campaign, plan.actions[0])
+        action = plan.actions[0]
+        decisions = [
+            event
+            for event in read_events(ws / "decision_log.jsonl")
+            if event.get("event") == "approval_decision" and event.get("action_id") == action.action_id
+        ]
+        approved = {ApprovalStatus.APPROVED.value, ApprovalStatus.AUTO_APPROVED.value}
+        if not decisions or decisions[-1].get("status") not in approved:
+            abort(409, description="Action has no recorded approval decision.")
+        execute_t3_action(ws, campaign, action)
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/free-text", methods=["POST"])

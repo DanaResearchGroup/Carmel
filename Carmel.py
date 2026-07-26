@@ -66,8 +66,19 @@ def _cmd_init_workspace(directory: Path) -> int:
     return 0
 
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 def _cmd_serve(workspaces: Path | None, host: str, port: int, debug: bool) -> int:
     """Launch the local Flask UI."""
+    if debug and host not in LOOPBACK_HOSTS:
+        print(
+            f"Refusing to serve with --debug on non-loopback host {host!r}: "
+            "the Werkzeug debugger allows remote code execution. "
+            "Use --host 127.0.0.1 or drop --debug.",
+            file=sys.stderr,
+        )
+        return 1
     from carmel.ui import create_app
 
     app = create_app(workspaces_root=workspaces)
