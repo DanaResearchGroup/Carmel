@@ -17,7 +17,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -30,6 +30,7 @@ from carmel.adapters.t3 import (
     _coerce_species_entry,
     _discover_pdep_networks,
     _find_t3_executable,
+    _resolve_t3_python,
     _t3_version,
     _walk_iterations,
     arc_info_filename,
@@ -127,7 +128,7 @@ class TestT3Discovery:
 
     def test_find_executable_returns_list_or_none(self) -> None:
         result = _find_t3_executable()
-        assert result is None or (isinstance(result, list) and result[0] == sys.executable)
+        assert result is None or (isinstance(result, list) and result[0] == _resolve_t3_python())
 
 
 # ---------------------------------------------------------------------------
@@ -500,26 +501,65 @@ class TestT3AdapterFailures:
 
 
 class TestT3VersionProbe:
-    """Tests for the importability and version probes."""
+    """Tests for the importability and version probes.
 
-    def test_importable_true_when_module_imports(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from carmel.adapters import t3 as t3_module
+    Both probes must interrogate the *resolved T3 interpreter* in a
+    subprocess (never Carmel's own in-process ``importlib``), since under
+    the three-env deployment model Carmel's own interpreter never has
+    ``t3`` installed. Pointing ``T3_PYTHON`` at ``sys.executable`` collapses
+    this back to the single-env case, letting these tests craft the probed
+    module via ``sys.path`` manipulation without a real T3 checkout.
+    """
 
-        monkeypatch.setattr(t3_module.importlib, "import_module", lambda _name: ModuleType("t3"))
+    def test_importable_true_when_resolved_interpreter_can_import(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "t3.py").write_text("__version__ = '1.2.3'\n")
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
         assert is_t3_importable() is True
 
-    def test_version_returns_module_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_importable_false_when_resolved_interpreter_cannot_import(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # empty dir: no t3 module here
+        assert is_t3_importable() is False
+
+    def test_importable_false_when_interpreter_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        missing = tmp_path / "no-such-interpreter"
+        monkeypatch.setattr("carmel.adapters.t3._resolve_t3_python", lambda: str(missing))
+        assert is_t3_importable() is False
+
+    def test_importable_false_on_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
 
-        module = ModuleType("t3")
-        module.__version__ = "1.2.3"  # type: ignore[attr-defined]
-        monkeypatch.setattr(t3_module.importlib, "import_module", lambda _name: module)
+        def _timeout(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(cmd="t3-probe", timeout=1.0)
+
+        monkeypatch.setattr(t3_module.subprocess, "run", _timeout)
+        assert is_t3_importable() is False
+
+    def test_version_returns_module_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "t3.py").write_text("__version__ = '1.2.3'\n")
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
         assert _t3_version() == "1.2.3"
 
-    def test_version_none_when_module_has_no_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from carmel.adapters import t3 as t3_module
+    def test_version_none_when_module_has_no_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "t3.py").write_text("# no __version__ attribute\n")
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+        assert _t3_version() is None
 
-        monkeypatch.setattr(t3_module.importlib, "import_module", lambda _name: ModuleType("t3"))
+    def test_version_none_when_not_importable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # empty dir: no t3 module here
+        assert _t3_version() is None
+
+    def test_version_none_when_interpreter_missing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        missing = tmp_path / "no-such-interpreter"
+        monkeypatch.setattr("carmel.adapters.t3._resolve_t3_python", lambda: str(missing))
         assert _t3_version() is None
 
 
@@ -531,6 +571,7 @@ class TestFindT3Executable:
         from carmel.adapters import t3 as t3_module
 
         monkeypatch.delenv("T3_PATH", raising=False)
+        monkeypatch.delenv("T3_PYTHON", raising=False)
         monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: None)
         monkeypatch.setattr(t3_module.shutil, "which", lambda _name: None)
         monkeypatch.setattr(t3_module, "is_t3_importable", lambda: False)
@@ -578,6 +619,87 @@ class TestFindT3Executable:
 
     def test_returns_none_when_nothing_found(self) -> None:
         assert _find_t3_executable() is None
+
+    def test_env_path_uses_t3_python_over_sys_executable(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# T3")
+        monkeypatch.setenv("T3_PATH", str(tmp_path))
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        result = _find_t3_executable()
+        assert result == [sys.executable, str(tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT)]
+        assert result is not None and result[0] != "python"  # sanity: it's a real path, not the fallback name
+
+    def test_package_sibling_uses_t3_python_over_sys_executable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        repo_root = tmp_path / "T3"
+        pkg = repo_root / "t3"
+        pkg.mkdir(parents=True)
+        (repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text("# T3")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(t3_module.importlib.util, "find_spec", lambda _name: spec)
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        assert _find_t3_executable() == [sys.executable, str(repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT)]
+
+    def test_which_uses_t3_python_over_sys_executable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/local/bin/T3.py")
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        assert _find_t3_executable() == [sys.executable, "/usr/local/bin/T3.py"]
+
+    def test_module_invocation_uses_t3_python_over_sys_executable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        assert _find_t3_executable() == [sys.executable, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
+
+
+class TestResolveT3Python:
+    """Tests for the ``$T3_PYTHON`` resolution helper directly."""
+
+    def test_unset_falls_back_to_sys_executable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("T3_PYTHON", raising=False)
+        assert _resolve_t3_python() == sys.executable
+
+    def test_set_to_real_executable_is_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("T3_PYTHON", sys.executable)
+        assert _resolve_t3_python() == sys.executable
+
+    def test_set_to_nonexistent_path_falls_back_with_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        warnings: list[tuple[Any, ...]] = []
+        monkeypatch.setattr(t3_module._log, "warning", lambda *args: warnings.append(args))
+        missing = tmp_path / "no-such-interpreter"
+        monkeypatch.setenv("T3_PYTHON", str(missing))
+        assert _resolve_t3_python() == sys.executable
+        assert len(warnings) == 1
+        assert warnings[0][0] % warnings[0][1:] == (
+            f"T3_PYTHON is set to '{missing}' but is not an existing executable file; falling back to {sys.executable}"
+        )
+
+    def test_set_to_non_executable_file_falls_back_with_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        warnings: list[tuple[Any, ...]] = []
+        monkeypatch.setattr(t3_module._log, "warning", lambda *args: warnings.append(args))
+        not_executable = tmp_path / "not-executable"
+        not_executable.write_text("not a real interpreter\n")
+        not_executable.chmod(0o644)
+        monkeypatch.setenv("T3_PYTHON", str(not_executable))
+        assert _resolve_t3_python() == sys.executable
+        assert len(warnings) == 1
+        assert warnings[0][0] % warnings[0][1:] == (
+            f"T3_PYTHON is set to '{not_executable}' but is not an existing "
+            f"executable file; falling back to {sys.executable}"
+        )
 
 
 class TestBuildT3InputOptionalFields:

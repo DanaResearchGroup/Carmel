@@ -111,15 +111,17 @@ centralized in the `T3Layout` constants block at the top of that file.
     `{project, t3, rmg, qm}`. Species use `{label, smiles, concentration,
     SA_observable}`; reactors use `{type: 'gas batch constant T P', T, P,
     termination_time}`; level of theory lives in `qm.level_of_theory`.
-  - **Invocation:** `python <T3_PATH>/T3.py <input.yml>` (no `--output`
-    flag — T3 writes results next to the input file).
+  - **Invocation:** `<t3-interpreter> <T3_PATH>/T3.py <input.yml>` (no
+    `--output` flag — T3 writes results next to the input file). The
+    interpreter is **not** assumed to be Carmel's own — see "Three-env
+    deployment model" below.
   - **Output layout:** `<project_dir>/iteration_*/ARC/<project>_info.yml` (real
     file: `{species: [{label, success}], reactions: [...]}`),
     `<project_dir>/iteration_*/RMG/pdep/network*.py`, and
     `<project_dir>/t3.log`. Level of theory is **never** written back —
     it must be read from the input dict.
-- **Submission modes:** `SUBPROCESS` (Phase 1, real `python T3.py …`),
-  `SERVER` and `LOCAL` (reserved).
+- **Submission modes:** `SUBPROCESS` (Phase 1, real `<t3-interpreter>
+  T3.py …`), `SERVER` and `LOCAL` (reserved).
 - **Input building:** `build_t3_input(campaign)` produces a typed dict
   matching T3's real schema and `write_t3_input_file()` writes it
   atomically under `runs/<run_id>/input.yml`. Carmel never invents
@@ -132,9 +134,40 @@ centralized in the `T3Layout` constants block at the top of that file.
 - **Failure handling:** every error produces a typed `RunRecord` with a
   specific `FailureCode` (`TOOL_NOT_FOUND`, `INPUT_BUILD_ERROR`,
   `SUBPROCESS_ERROR`, `INVALID_OUTPUT`, `TIMEOUT`).
-- **Discovery:** `is_t3_importable()` actually tries to `import t3`,
-  not just `find_spec` — this avoids the false-positive case where T3
-  is on `sys.path` but fails at import time (see CI lane note below).
+- **Discovery:** `is_t3_importable()` probes whether `t3` imports **in
+  T3's own resolved interpreter** (see below), not Carmel's own process
+  — this avoids both the false-positive case where T3 is on
+  Carmel's `sys.path` but fails at import time, and the false-negative
+  case where T3 lives in a wholly separate environment that Carmel was
+  never meant to import into directly.
+
+### Three-env deployment model and `T3_PYTHON`
+
+Carmel, T3, and RMG have mutually exclusive Python requirements and
+normally live in **three separate conda environments**:
+
+| Env         | Contains        | Python pin |
+|-------------|-----------------|------------|
+| `rmg_env`   | RMG-Py, Arkane  | `>=3.9,<3.12` |
+| `t3_env`    | T3 **and** ARC  | `=3.14` (T3 imports ARC in-process, so they must share an env; T3 in turn launches RMG as a subprocess under `rmg_env`) |
+| `crml_env`  | Carmel itself   | `>=3.12` |
+
+Because of this, `_find_t3_executable()` and `is_t3_importable()` /
+`_t3_version()` must never assume T3 runs under Carmel's own
+`sys.executable`. The `T3_PYTHON` environment variable gives the path
+to `t3_env`'s interpreter:
+
+- If `$T3_PYTHON` is set and points to an existing, executable file, it
+  is used to launch and probe T3.
+- Otherwise Carmel falls back to `sys.executable` — the correct choice
+  for a single-env developer setup where Carmel and T3 share an
+  environment (e.g. a from-source checkout with `t3`/`arc` installed
+  directly into `crml_env`).
+- If `$T3_PYTHON` is set but invalid (missing or non-executable),
+  Carmel logs a warning and falls back to `sys.executable` rather than
+  raising, so a bad env var cannot crash the adapter's typed
+  success/failure contract; the misconfiguration still surfaces
+  honestly downstream as an ordinary not-importable/not-found failure.
 
 ## Diagnostics Schema (DiagnosticsV1)
 

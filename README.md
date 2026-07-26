@@ -43,6 +43,22 @@ conda activate crml_env
 make install
 ```
 
+### Running real T3
+
+T3 and ARC have Python requirements incompatible with Carmel's own
+environment, so real T3 execution expects T3 (with ARC) installed in a
+**separate** conda environment. Point Carmel at that environment's
+interpreter with `T3_PYTHON`:
+
+```bash
+export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
+```
+
+If `T3_PYTHON` is unset, Carmel falls back to its own interpreter — only
+correct if T3/ARC happen to be installed directly into `crml_env`. See
+[docs/development.md](docs/development.md#three-env-deployment-model)
+for the full three-env layout (`rmg_env` / `t3_env` / `crml_env`).
+
 ## Usage
 
 ```bash

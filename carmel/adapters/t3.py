@@ -85,6 +85,12 @@ class T3Layout:
     # Subprocess invocation
     EXECUTABLE_SCRIPT: str = "T3.py"
     EXECUTABLE_MODULE: str = "T3"  # python -m T3 fallback
+    # Env var giving the path to T3's own interpreter (t3_env under the
+    # three-env deployment model: rmg_env / t3_env / crml_env — see
+    # carmel/adapters/t3.py module docstring / CLAUDE.md). Carmel and T3
+    # cannot generally share an interpreter, so T3 must never be launched
+    # (or probed) with Carmel's own `sys.executable`.
+    T3_PYTHON_ENV_VAR: str = "T3_PYTHON"
 
     # Output layout
     # LOG_FILENAME is T3's OWN log file: T3's logger (t3/logger.py) archives
@@ -128,24 +134,80 @@ T3_TOOL_NAME: str = "t3"
 
 _log = get_logger("adapters.t3")
 
+# Keeps is_t3_importable()/_t3_version() subprocess probes cheap so they can
+# never hang a CI run: importing t3 (which drags in ARC) is not free, but it
+# should never take anywhere close to this long when it succeeds or fails.
+_T3_IMPORT_PROBE_TIMEOUT_S: float = 30.0
+
 
 # ---------------------------------------------------------------------------
 # Discovery / availability
 # ---------------------------------------------------------------------------
 
 
+def _resolve_t3_python() -> str:
+    """Resolve the interpreter used to launch and probe T3.
+
+    Resolution order:
+        1. ``$T3_PYTHON`` if set and it points to an existing, executable
+           file — the interpreter of T3's own environment (``t3_env`` under
+           the three-env deployment model: ``rmg_env`` / ``t3_env`` /
+           ``crml_env``; T3 and ARC together pin ``python =3.14`` and must
+           share an environment, which is generally *not* Carmel's own).
+        2. ``sys.executable`` — Carmel's own interpreter, which stays
+           correct for a single-env developer setup where Carmel and T3
+           share an environment.
+
+    If ``$T3_PYTHON`` is set but does not point to an existing executable
+    file, this logs a warning and falls back to ``sys.executable`` rather
+    than raising: a bad env var must not crash the adapter's typed
+    success/failure contract (see :class:`T3Adapter`). The misconfiguration
+    still surfaces honestly downstream, as an ordinary
+    not-importable/not-found failure once the fallback interpreter is
+    actually used to probe or launch T3.
+
+    Returns:
+        Absolute or relative path to the interpreter to use for T3.
+    """
+    env_python = os.environ.get(T3_LAYOUT.T3_PYTHON_ENV_VAR)
+    if env_python:
+        if os.path.isfile(env_python) and os.access(env_python, os.X_OK):
+            return env_python
+        _log.warning(
+            "%s is set to %r but is not an existing executable file; falling back to %s",
+            T3_LAYOUT.T3_PYTHON_ENV_VAR,
+            env_python,
+            sys.executable,
+        )
+    return sys.executable
+
+
 def is_t3_importable() -> bool:
-    """Return True if the ``t3`` package can actually be imported.
+    """Return True if ``t3`` can actually be imported by T3's own interpreter.
+
+    This probes the interpreter that will actually run T3 (see
+    :func:`_resolve_t3_python`), never Carmel's own process: under the
+    three-env deployment model those are different interpreters, so
+    importing ``t3`` in Carmel's own process proves nothing about whether
+    the resolved T3 interpreter can import it. In the single-env developer
+    case (``$T3_PYTHON`` unset, same interpreter as Carmel) this reduces to
+    the historical in-process check.
 
     This is stricter than :func:`is_t3_installed` because T3 may be
     discoverable on ``sys.path`` but fail to import (e.g. if a transitive
     dependency like ARC uses ``distutils`` on Python 3.12).
     """
+    t3_python = _resolve_t3_python()
     try:
-        importlib.import_module("t3")
-    except Exception:  # pragma: no cover - any import-time error means unusable
+        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter only
+            [t3_python, "-c", "import t3"],
+            capture_output=True,
+            timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
-    return True
+    return completed.returncode == 0
 
 
 def is_t3_installed() -> bool:
@@ -154,13 +216,27 @@ def is_t3_installed() -> bool:
 
 
 def _t3_version() -> str | None:
-    """Return T3's version string if importable, else None."""
+    """Return T3's version string if importable via T3's own interpreter, else None.
+
+    Like :func:`is_t3_importable`, this probes the resolved T3 interpreter
+    (see :func:`_resolve_t3_python`) in a subprocess rather than importing
+    ``t3`` into Carmel's own process, for the same three-env reason.
+    """
+    t3_python = _resolve_t3_python()
     try:
-        module = importlib.import_module("t3")
-    except Exception:  # pragma: no cover - any import-time error means unusable
+        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter only
+            [t3_python, "-c", "import t3; print(getattr(t3, '__version__', ''))"],
+            capture_output=True,
+            timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
+            check=False,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
         return None
-    version = getattr(module, "__version__", None)
-    return str(version) if version is not None else None
+    if completed.returncode != 0:
+        return None
+    version = completed.stdout.strip()
+    return version or None
 
 
 def _find_t3_executable() -> list[str] | None:
@@ -171,12 +247,18 @@ def _find_t3_executable() -> list[str] | None:
         2. ``T3.py`` next to the importable ``t3`` package
         3. ``T3.py`` discoverable via ``shutil.which``
         4. ``python -m T3`` if T3 is importable
+
+    Every branch launches T3 with the resolved T3 interpreter (see
+    :func:`_resolve_t3_python`), never unconditionally with Carmel's own
+    ``sys.executable``.
     """
+    t3_python = _resolve_t3_python()
+
     env_path = os.environ.get("T3_PATH")
     if env_path:
         candidate = Path(env_path) / T3_LAYOUT.EXECUTABLE_SCRIPT
         if candidate.exists():
-            return [sys.executable, str(candidate)]
+            return [t3_python, str(candidate)]
 
     spec = importlib.util.find_spec("t3")
     if spec is not None and spec.origin is not None:
@@ -184,14 +266,14 @@ def _find_t3_executable() -> list[str] | None:
         repo_root = Path(spec.origin).parent.parent
         candidate = repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT
         if candidate.exists():
-            return [sys.executable, str(candidate)]
+            return [t3_python, str(candidate)]
 
     which = shutil.which(T3_LAYOUT.EXECUTABLE_SCRIPT)
     if which is not None:
-        return [sys.executable, which]
+        return [t3_python, which]
 
     if is_t3_importable():
-        return [sys.executable, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
+        return [t3_python, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
 
     return None
 

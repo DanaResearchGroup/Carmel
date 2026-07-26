@@ -6,7 +6,9 @@
 
 - Python 3.12+
 - [Conda](https://docs.conda.io/en/latest/)
-- For real T3 execution: T3, ARC, RMG-Py, RMG-database installed in the same env
+- For real T3 execution: T3 and ARC in their own environment (see
+  "Three-env deployment model" below) — do **not** try to install them
+  into `crml_env`, their Python pins are mutually exclusive with Carmel's.
 
 ### Initial Setup
 
@@ -22,6 +24,31 @@ conda activate crml_env
 # Install in editable mode with dev dependencies
 make install
 ```
+
+### Three-env deployment model
+
+Carmel, T3, and RMG have mutually exclusive Python requirements and
+normally live in three separate conda environments:
+
+| Env        | Contains          | Python pin       |
+|------------|-------------------|------------------|
+| `rmg_env`  | RMG-Py, Arkane    | `>=3.9,<3.12`    |
+| `t3_env`   | T3 **and** ARC    | `=3.14`          |
+| `crml_env` | Carmel itself     | `>=3.12`         |
+
+T3 imports ARC in-process, so they must share an environment (`t3_env`);
+T3 in turn launches RMG as a subprocess under `rmg_env`. Point Carmel at
+T3's interpreter with the `T3_PYTHON` environment variable:
+
+```bash
+export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
+```
+
+If `T3_PYTHON` is unset, Carmel falls back to its own interpreter
+(`sys.executable`) — only correct for a single-env developer setup where
+T3 and ARC happen to be installed directly into `crml_env`. See
+[architecture.md](architecture.md#three-env-deployment-model-and-t3_python)
+for full details, including how an invalid `T3_PYTHON` is handled.
 
 ## Running the UI
 
