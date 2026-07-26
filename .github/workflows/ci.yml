@@ -7,56 +7,19 @@ on:
     branches: [main]
 
 # A new push to a pull request makes the in-flight run obsolete, so cancel it
-# rather than let it hold a runner (the tools lane below occupies one for the
-# better part of an hour). Never cancel on main: those runs are the record of
-# what the branch actually did.
+# rather than let it hold a runner. Never cancel on main: those runs are the
+# record of what the branch actually did.
+#
+# The heavy chemistry-stack lane lives in tools.yml, NOT here, precisely so it
+# is not subject to this rule — cancelling it part-way discards both the work
+# and the caches it would have written.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Two CI lanes:
-#
-#   1. REQUIRED LANE — `lint` + `test` jobs.
-#      Pure-Python, fast, no external chemistry stack. Must pass for merge.
-#
-#   2. BEST-EFFORT LANE — `tools` job.
-#      Builds the real chemistry stack and exercises the real T3
-#      subprocess path. It carries `continue-on-error: true` at the job
-#      level, so a collapse anywhere in the heavy install chain cannot
-#      redden the required lanes above. Drop that once the lane has been
-#      green often enough to trust.
-#
-#      THREE conda environments, because the tools' python requirements
-#      are mutually exclusive and no single environment can satisfy them:
-#
-#        rmg_env   RMG-Py and Arkane          python >=3.9,<3.12
-#        t3_env    T3 and ARC together        python =3.14
-#        crml_env  Carmel itself              python >=3.12
-#
-#      They are separate processes, not imports. T3 launches RMG as a
-#      subprocess under rmg_env (T3/t3/runners/rmg_runner.py), and Carmel
-#      launches T3 as a subprocess under t3_env. ARC shares t3_env because
-#      T3 imports it in-process (arc.molecule, arc.species, ARC(...) at
-#      T3/t3/main.py). Merging these into one environment produces an
-#      unsatisfiable solve — conda does not fail fast on it, it grinds.
-#
-#      Carmel finds t3_env's interpreter through $T3_PYTHON. Without it
-#      Carmel would invoke T3 with its own interpreter, which has neither
-#      t3 nor arc installed.
-#
-#      ARC's optional TS-search backends (KinBot, AutoTST, TS-GCN, Sella,
-#      TorchANI) are deliberately NOT installed. They live in ARC's
-#      devtools/install_*.sh rather than its environment.yml, and nothing
-#      Carmel tests reaches them.
-#
-#      The upstream stack is cloned at the top of the job so its commit
-#      SHAs can key three caches: conda's package tarballs, the solved
-#      environments, and RMG-Py's compiled Cython extensions. Those
-#      SHAs — not Carmel's own environment.yml — are what determine
-#      whether a cached environment is still valid, because they are what
-#      actually gets installed. Anything whose cache hit SKIPS a build
-#      step is keyed on an exact match with no restore-keys; see the
-#      comments on the individual cache steps for why.
+# The REQUIRED lane: `lint` + `test`. Pure-Python, fast, no external chemistry
+# stack. Must pass for merge. The best-effort lane that builds the real
+# RMG/ARC/T3 stack is a separate workflow, tools.yml.
 
 jobs:
   lint:
@@ -68,7 +31,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
-          python-version: "3.12"
+          python-version: "3.14"
           cache: pip
           cache-dependency-path: pyproject.toml
 
@@ -87,11 +50,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Both ends of what Carmel claims to support. 3.12 is the floor in
-        # pyproject.toml's requires-python; 3.14 is what crml_env actually
-        # resolves to, since environment.yml pins only `python >=3.12.*`.
-        # Testing 3.12 alone verified a python Carmel does not run on.
-        python-version: ["3.12", "3.14"]
+        # 3.14 is what crml_env resolves to and what T3 and ARC require, so it
+        # is the only python Carmel actually runs on. requires-python is set to
+        # match, rather than advertising a 3.12 floor nothing verifies.
+        python-version: ["3.14"]
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
@@ -132,174 +94,3 @@ jobs:
           files: coverage.xml
           fail_ci_if_error: false
 
-  tools:
-    name: Real T3/ARC/RMG integration (best-effort)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    defaults:
-      run:
-        shell: bash -el {0}
-    env:
-      # conda's package cache. This has to be set explicitly: the default lives
-      # inside the miniconda installation, which actions/cache cannot restore
-      # into before setup-miniconda has run.
-      CONDA_PKGS_DIRS: /home/runner/conda_pkgs_dir
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
-
-      # Cloned BEFORE the conda setup so the upstream commit SHAs are available
-      # to key the caches below. The upstream stack is what actually gets
-      # installed, so the caches must be keyed on those revisions — not on
-      # Carmel's own environment.yml, which describes a different environment
-      # entirely and never changes when RMG/ARC/T3 do.
-      - name: Clone the upstream chemistry stack
-        run: |
-          git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-Py.git "$HOME/RMG-Py"
-          git clone --depth 1 https://github.com/ReactionMechanismGenerator/RMG-database.git "$HOME/RMG-database"
-          git clone --depth 1 https://github.com/ReactionMechanismGenerator/ARC.git "$HOME/ARC"
-          git clone --depth 1 https://github.com/ReactionMechanismGenerator/T3.git "$HOME/T3"
-
-      - name: Pin the upstream revisions for the cache keys
-        id: pins
-        run: |
-          for repo in RMG-Py RMG-database ARC T3; do
-            printf '%s %s\n' "$repo" "$(git -C "$HOME/$repo" rev-parse HEAD)"
-          done | tee "$HOME/upstream-pins.txt"
-          echo "stack=$(sha256sum "$HOME/upstream-pins.txt" | cut -c1-16)" >> "$GITHUB_OUTPUT"
-          echo "rmgpy=$(git -C "$HOME/RMG-Py" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-
-      # No python-version here on purpose: each environment pins its own, and
-      # they disagree. Forcing one at the installer level is what made the
-      # previous single-environment build unsatisfiable.
-      - name: Set up Miniconda
-        uses: conda-incubator/setup-miniconda@fc2d68f6413eb2d87b895e92f8584b5b94a10167  # v3.3.0
-        with:
-          miniforge-version: latest
-          channels: conda-forge,defaults
-
-      # actions/cache needs a concrete path at step level, but the conda root is
-      # only known once the installer has run — so publish it through
-      # $GITHUB_ENV. Note this is the ONLY way ${{ env.X }} ever resolves: the
-      # env context sees vars from env: blocks and $GITHUB_ENV, never the
-      # runner's own shell environment. (${{ env.HOME }} silently expands to
-      # the empty string, which is why $HOME is used inside run: below.)
-      - name: Record the conda root
-        run: echo "CONDA_ROOT=$(conda info --base)" >> "$GITHUB_ENV"
-
-      # Package tarballs. Safe to reuse across upstream revisions — conda
-      # validates every package against the solve before using it — so this
-      # entry takes restore-keys and degrades gracefully to a partial hit,
-      # which still saves most of the download time on a cache miss.
-      - name: Cache conda packages
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: ${{ env.CONDA_PKGS_DIRS }}
-          key: ${{ runner.os }}-conda-pkgs-${{ steps.pins.outputs.stack }}
-          restore-keys: |
-            ${{ runner.os }}-conda-pkgs-
-
-      # All three solved environments — the expensive artifact. Deliberately NO
-      # restore-keys: the build steps below are skipped on a hit, so a
-      # near-miss would silently test a stack built from different upstream
-      # revisions than the ones just checked out. An exact-match-or-rebuild
-      # policy is the only honest one when a hit suppresses the build. Carmel's
-      # own environment.yml joins the key because crml_env is built from it.
-      - name: Cache the solved conda environments
-        id: cache-envs
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: ${{ env.CONDA_ROOT }}/envs
-          key: ${{ runner.os }}-envs-${{ steps.pins.outputs.stack }}-${{ hashFiles('environment.yml') }}
-
-      # RMG-Py's compiled Cython extensions land in the source tree rather than
-      # an environment, so they need their own entry — keyed on RMG-Py alone,
-      # since a change to ARC or T3 does not invalidate them.
-      - name: Cache the compiled RMG-Py tree
-        id: cache-rmgpy
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
-        with:
-          path: |
-            ~/RMG-Py/build
-            ~/RMG-Py/**/*.so
-          key: ${{ runner.os }}-rmgpy-build-${{ steps.pins.outputs.rmgpy }}
-
-      # The job carries `continue-on-error: true` so a collapse anywhere in
-      # this heavy install chain (flaky upstream environment, large chemistry
-      # stack, or a corrupt restored cache) cannot redden the required lanes.
-      - name: Create rmg_env (RMG-Py, Arkane)
-        if: steps.cache-envs.outputs.cache-hit != 'true'
-        run: conda env create -n rmg_env -f "$HOME/RMG-Py/environment.yml"
-
-      - name: Create t3_env (T3 and ARC together)
-        if: steps.cache-envs.outputs.cache-hit != 'true'
-        run: |
-          conda env create -n t3_env -f "$HOME/T3/environment.yml"
-          conda env update -n t3_env -f "$HOME/ARC/environment.yml"
-          conda activate t3_env
-          pip install -e "$HOME/ARC"
-          pip install -e "$HOME/T3"
-
-      - name: Create crml_env (Carmel)
-        if: steps.cache-envs.outputs.cache-hit != 'true'
-        run: conda env create -n crml_env -f environment.yml
-
-      - name: Build RMG-Py
-        if: steps.cache-rmgpy.outputs.cache-hit != 'true'
-        run: |
-          conda activate rmg_env
-          cd "$HOME/RMG-Py"
-          make
-
-      # Always reinstalled: Carmel's own code changes every commit, so this
-      # must never be skipped on a cache hit the way the upstream installs are.
-      - name: Install Carmel into crml_env
-        run: |
-          conda activate crml_env
-          pip install -e ".[dev]"
-
-      # Restoring conda environments by copying their directory is a pragmatic
-      # trick, not a supported conda operation. This step is the tripwire: if a
-      # restored environment is subtly broken, fail here with a clear message
-      # rather than let a mangled interpreter masquerade as a real test result.
-      - name: Verify the three environments are usable
-        run: |
-          for env_name in rmg_env t3_env crml_env; do
-            conda run -n "$env_name" python -c "import sys; print('$env_name', sys.version)" || {
-              echo "::error::Environment $env_name is unusable. Bump the cache key or clear the caches."
-              exit 1
-            }
-          done
-
-      # T3_PYTHON is how Carmel finds t3_env's interpreter. Without it Carmel
-      # would launch T3 with its own, which has neither t3 nor arc installed.
-      - name: Set the tool paths
-        run: |
-          {
-            echo "T3_PYTHON=$CONDA_ROOT/envs/t3_env/bin/python"
-            echo "T3_PATH=$HOME/T3"
-            echo "rmgpy_path=$HOME/RMG-Py"
-          } >> "$GITHUB_ENV"
-
-      # This probe is the one diagnostic that reveals whether Carmel can
-      # actually reach a working T3, so it must NOT be swallowed. It exits 0 on
-      # a clean "importable" or "not importable" answer either way, and fails
-      # only on an unexpected error (e.g. Carmel itself failing to import).
-      - name: Probe T3 importability
-        run: |
-          conda activate crml_env
-          python -c "
-          try:
-              from carmel.adapters.t3 import is_t3_importable
-              print('T3 importable:', is_t3_importable())
-          except Exception as exc:
-              print(f'Unexpected error probing T3 importability: {exc!r}')
-              raise
-          "
-
-      # Relies on the job-level continue-on-error, not a step-level one: if T3
-      # is reachable the real subprocess tests must pass and their failure must
-      # be visible. If it is not, the @requires_t3 marker skips them cleanly.
-      - name: Run T3-dependent tests
-        run: |
-          conda activate crml_env
-          pytest tests/test_t3_adapter.py -v
