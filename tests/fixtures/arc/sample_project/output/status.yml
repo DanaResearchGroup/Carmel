@@ -1,0 +1,54 @@
+CH3:
+  conformers: 'single conformer passed isomorphism check; '
+  convergence: true
+  errors: ''
+  info: ''
+  isomorphism: 'opt passed isomorphism check; '
+  job_types:
+    bde: true
+    composite: false
+    conf_opt: true
+    conf_sp: false
+    fine: false
+    freq: false
+    irc: false
+    onedmin: false
+    opt: true
+    orbitals: false
+    rotors: true
+    sp: false
+  paths:
+    composite: ''
+    freq: ''
+    geo: output/calcs/Species/CH3/opt_a1657/output.yml
+    geo_coarse: ''
+    sp: ''
+  restart: ''
+  warnings: ''
+OH:
+  conformers: 'single conformer passed isomorphism check; '
+  convergence: true
+  errors: ''
+  info: ''
+  isomorphism: 'opt passed isomorphism check; '
+  job_types:
+    bde: true
+    composite: false
+    conf_opt: true
+    conf_sp: false
+    fine: false
+    freq: false
+    irc: false
+    onedmin: false
+    opt: true
+    orbitals: false
+    rotors: true
+    sp: false
+  paths:
+    composite: ''
+    freq: ''
+    geo: output/calcs/Species/OH/opt_a1656/output.yml
+    geo_coarse: ''
+    sp: ''
+  restart: ''
+  warnings: ''
