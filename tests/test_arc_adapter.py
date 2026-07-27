@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -26,8 +27,10 @@ from carmel.adapters.arc import (
     DEFAULT_JOB_TYPES,
     MOCK_LEVEL_OF_THEORY,
     ARCAdapter,
+    _arc_version,
     _coerce_reaction_entry,
     _coerce_species_entry,
+    _count_converged,
     _find_arc_executable,
     arc_info_filename,
     build_arc_input,
@@ -127,6 +130,104 @@ class TestARCDiscovery:
         result = _find_arc_executable()
         assert result is None or (isinstance(result, list) and result[0] == "python")
 
+    def test_is_arc_installed_true_when_spec_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: object())
+        assert is_arc_installed() is True
+
+    def test_is_arc_installed_false_when_spec_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: None)
+        assert is_arc_installed() is False
+
+    def test_is_arc_importable_true_when_import_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.importlib, "import_module", lambda _name: object())
+        assert is_arc_importable() is True
+
+    def test_is_arc_importable_false_when_import_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        def _raise(_name: str) -> None:
+            raise ImportError("no arc")
+
+        monkeypatch.setattr(arc_module.importlib, "import_module", _raise)
+        assert is_arc_importable() is False
+
+    def test_arc_version_returns_version_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.importlib, "import_module", lambda _name: SimpleNamespace(__version__="9.9.9"))
+        assert _arc_version() == "9.9.9"
+
+    def test_arc_version_none_when_module_has_no_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.importlib, "import_module", lambda _name: SimpleNamespace())
+        assert _arc_version() is None
+
+    def test_arc_version_none_when_import_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        def _raise(_name: str) -> None:
+            raise ImportError("no arc")
+
+        monkeypatch.setattr(arc_module.importlib, "import_module", _raise)
+        assert _arc_version() is None
+
+
+class TestFindARCExecutable:
+    """Precedence order of ``_find_arc_executable``, each branch isolated."""
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.delenv("ARC_PATH", raising=False)
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: None)
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+
+    def test_env_path_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# ARC")
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        assert _find_arc_executable() == ["python", str(tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
+
+    def test_env_path_ignored_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        assert _find_arc_executable() is None
+
+    def test_falls_back_to_package_sibling_script(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        repo_root = tmp_path / "ARC"
+        pkg = repo_root / "arc"
+        pkg.mkdir(parents=True)
+        (repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# ARC")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: spec)
+        assert _find_arc_executable() == ["python", str(repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
+
+    def test_package_sibling_skipped_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        pkg = tmp_path / "ARC" / "arc"
+        pkg.mkdir(parents=True)
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: spec)
+        assert _find_arc_executable() is None
+
+    def test_falls_back_to_which(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/local/bin/ARC.py")
+        assert _find_arc_executable() == ["python", "/usr/local/bin/ARC.py"]
+
+    def test_returns_none_when_nothing_found(self) -> None:
+        assert _find_arc_executable() is None
+
 
 # ---------------------------------------------------------------------------
 # Input building (real ARC contract)
@@ -172,6 +273,53 @@ class TestBuildARCInput:
     def test_default_job_types_are_opt_only(self, tmp_path: Path) -> None:
         payload = build_arc_input(_campaign(tmp_path), _action())
         assert payload[ARC_LAYOUT.INPUT_JOB_TYPES_KEY] == DEFAULT_JOB_TYPES
+
+    def test_mixture_species_without_smiles_omits_smiles_key(self, tmp_path: Path) -> None:
+        campaign = _campaign(tmp_path).model_copy(
+            update={
+                "input": _campaign(tmp_path).input.model_copy(
+                    update={
+                        "initial_mixture": InitialMixture(
+                            components=[MixtureComponent(species="AR", mole_fraction=1.0)]
+                        )
+                    }
+                )
+            }
+        )
+        payload = build_arc_input(campaign, _action())
+        assert payload[ARC_LAYOUT.INPUT_SPECIES_KEY] == [{"label": "AR"}]
+
+    def test_action_species_skips_invalid_entries(self, tmp_path: Path) -> None:
+        action = _action(
+            species=[
+                {"label": "OH"},  # valid, no smiles
+                {"smiles": "[CH3]"},  # missing label -> skipped
+                "not-a-dict",  # skipped
+                {"label": "H2O2", "smiles": "OO"},
+            ]
+        )
+        payload = build_arc_input(_campaign(tmp_path), action)
+        assert payload[ARC_LAYOUT.INPUT_SPECIES_KEY] == [
+            {"label": "OH"},
+            {"label": "H2O2", "smiles": "OO"},
+        ]
+
+    def test_action_species_all_invalid_falls_back_to_mixture(self, tmp_path: Path) -> None:
+        action = _action(species=[{"smiles": "[CH3]"}, "not-a-dict"])
+        payload = build_arc_input(_campaign(tmp_path), action)
+        labels = [s["label"] for s in payload[ARC_LAYOUT.INPUT_SPECIES_KEY]]
+        assert labels == ["OH", "CH3"]
+
+    def test_action_reactions_skips_invalid_entries(self, tmp_path: Path) -> None:
+        action = _action(
+            reactions=[
+                {"label": "A => B"},
+                {"reactants": ["A"]},  # missing label -> skipped
+                "not-a-dict",  # skipped
+            ]
+        )
+        payload = build_arc_input(_campaign(tmp_path), action)
+        assert payload[ARC_LAYOUT.INPUT_REACTIONS_KEY] == [{"label": "A => B"}]
 
 
 class TestWriteARCInputFile:
@@ -239,6 +387,17 @@ class TestCoerceEntries:
 
     def test_reaction_entry_missing_label(self) -> None:
         assert _coerce_reaction_entry({"reactants": ["A"]}) is None
+
+    def test_reaction_entry_non_dict(self) -> None:
+        assert _coerce_reaction_entry("nope") is None
+
+
+class TestCountConverged:
+    def test_none_output_returns_zero(self) -> None:
+        assert _count_converged(None) == 0
+
+    def test_empty_output_returns_zero(self) -> None:
+        assert _count_converged({}) == 0
 
 
 class TestArcInfoFilename:
@@ -332,6 +491,37 @@ class TestGoldenFixture:
             normalize_arc_outputs(tmp_path, input_dict, campaign_id="c", run_id="r")
 
 
+class TestNormalizeArcOutputsInline:
+    """Edge cases the golden fixture cannot exercise (it has no reactions)."""
+
+    def test_reactions_and_invalid_species_entries_are_handled(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "proj_info.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "species": [{"label": "OH", "success": True}, {"no_label": "bad"}],
+                    "reactions": [
+                        {"no_label": "bad"},
+                        {"label": "OH + CH3 => CH4 + O", "success": True},
+                    ],
+                }
+            )
+        )
+        diag = normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
+        assert [s.label for s in diag.species_to_compute] == ["OH"]
+        assert [r.label for r in diag.reactions_to_compute] == ["OH + CH3 => CH4 + O"]
+        assert diag.tool_metadata["reaction_count"] == 1
+
+    def test_output_only_without_info_file(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        (project / "output").mkdir(parents=True)
+        (project / "output" / "output.yml").write_text(yaml.safe_dump({"arc_version": "0.0.1", "species": []}))
+        diag = normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
+        assert diag.species_to_compute == []
+        assert diag.tool_metadata["arc_version"] == "0.0.1"
+
+
 # ---------------------------------------------------------------------------
 # Adapter failure paths (deterministic, no ARC needed)
 # ---------------------------------------------------------------------------
@@ -350,6 +540,36 @@ class TestARCAdapterFailures:
         assert diagnostics is None
         assert run.input_path is not None
         assert run.input_path.exists()
+
+    def test_input_build_error_is_typed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        def _raise(*_a: object, **_k: object) -> dict[str, Any]:
+            raise ValueError("boom")
+
+        monkeypatch.setattr(arc_module, "build_arc_input", _raise)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
+        assert diagnostics is None
+
+    def test_subprocess_raises_os_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+
+        def _raise_os_error(*_a: object, **_k: object) -> None:
+            raise OSError("no such executable")
+
+        monkeypatch.setattr(arc_module.subprocess, "run", _raise_os_error)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.SUBPROCESS_ERROR
+        assert diagnostics is None
 
     def test_subprocess_nonzero_exit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module

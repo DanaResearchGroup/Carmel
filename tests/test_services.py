@@ -1475,6 +1475,16 @@ class TestGenerateArcPlan:
         assert plan.requires_approval
         assert plan.actions[0].approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
 
+    def test_level_of_theory_recorded_in_parameters(self, tmp_path: Path) -> None:
+        campaign = create_campaign(tmp_path / "ws", _make_input("arcplan"))
+        plan = generate_arc_plan(campaign, level_of_theory="wb97xd/def2tzvp")
+        assert plan.actions[0].parameters["level_of_theory"] == "wb97xd/def2tzvp"
+
+    def test_job_types_recorded_in_parameters(self, tmp_path: Path) -> None:
+        campaign = create_campaign(tmp_path / "ws", _make_input("arcplan"))
+        plan = generate_arc_plan(campaign, job_types={"opt": True})
+        assert plan.actions[0].parameters["job_types"] == {"opt": True}
+
 
 # ----------------------- ARC execution path -------------------------
 
@@ -1611,6 +1621,24 @@ class TestExecuteArcActionFailure:
             ws, load_campaign(ws), plan.actions[0], adapter=_ARCFailureAdapter(FailureCode.INVALID_OUTPUT)
         )
         assert not (ws / ARC_DIAGNOSTICS_FILE_NAME).exists()
+        assert load_arc_diagnostics(ws) is None
+
+
+class TestExecuteArcActionDefaultAdapter:
+    """Verify that the default adapter is the real ARCAdapter."""
+
+    def test_no_adapter_uses_real_arc_adapter(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        # Force "ARC not found" so the real adapter returns FAILED quickly
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: None)
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        run_record, diagnostics = execute_arc_action(ws, load_campaign(ws), plan.actions[0])
+        assert run_record.status == RunStatus.FAILED
+        assert run_record.failure_code == FailureCode.TOOL_NOT_FOUND
+        assert diagnostics is None
+        assert load_state(ws).state == CampaignStateValue.FAILED
 
 
 class TestExecuteT3ActionDefaultAdapter:
