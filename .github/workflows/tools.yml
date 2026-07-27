@@ -238,7 +238,19 @@ jobs:
             echo "T3_PYTHON=$CONDA_ROOT/envs/t3_env/bin/python"
             echo "T3_PATH=$HOME/T3"
             echo "rmgpy_path=$HOME/RMG-Py"
+            echo "RMG_PATH=$HOME/RMG-Py"
+            echo "RMG_DB_PATH=$HOME/RMG-database"
           } >> "$GITHUB_ENV"
+
+      # RMG_PATH/RMG_DB_PATH are read by ARC's settings module, which is where
+      # T3 gets RMG_DB_PATH from (t3/main.py imports it from
+      # arc.settings.settings). ARC resolves it from those env vars first and
+      # otherwise guesses from a list of candidate locations -- $HOME/Code/
+      # RMG-database among them, which is why this works on a developer
+      # machine and not on a runner, where the clone lands in $HOME. Without
+      # them RMG_DB_PATH is None and T3 dies in its constructor with
+      # "expected str, bytes or os.PathLike object, not NoneType" before
+      # creating iteration_1.
 
       # This probe is the one diagnostic that reveals whether Carmel can
       # actually reach a working T3, so it must NOT be swallowed. It exits 0 on
