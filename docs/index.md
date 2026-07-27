@@ -37,10 +37,9 @@ governance.
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
 
-# Install
-conda env create -f environment.yml
-conda activate crml_env
+# Install (the chemistry stack, all three environments, and Carmel)
 make install
+conda activate crml_env
 
 # Launch the UI
 carmel serve --workspaces ./workspaces

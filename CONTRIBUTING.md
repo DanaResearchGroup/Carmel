@@ -69,8 +69,11 @@ conda env create -f environment.yml
 conda activate crml_env
 
 # Editable install with dev dependencies
-make install
+make install-dev
 ```
+
+To also run real campaigns, `make install` builds the whole external
+chemistry stack — see [docs/installation.md](docs/installation.md).
 
 Before opening a pull request:
 

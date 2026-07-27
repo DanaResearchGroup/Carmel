@@ -4,26 +4,28 @@
 
 ### Prerequisites
 
-- Python 3.12+
-- [Conda](https://docs.conda.io/en/latest/)
+- [Conda](https://conda-forge.org/download/), git, and a C toolchain
 - For real T3 execution: T3 and ARC in their own environment (see
   "Three-env deployment model" below) — do **not** try to install them
   into `crml_env`, their Python pins are mutually exclusive with Carmel's.
+  `make install` sets all three environments up for you.
 
 ### Initial Setup
 
+Working on Carmel's own code, with no real T3 execution:
+
 ```bash
-# Clone the repository
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
-
-# Create conda environment
 conda env create -f environment.yml
 conda activate crml_env
-
-# Install in editable mode with dev dependencies
-make install
+make install-dev
 ```
+
+To also run real campaigns, use `make install` instead — it builds all three
+environments and the external chemistry stack. See
+[installation.md](installation.md) for the full guide, the individual targets,
+and how to point it at checkouts you already have.
 
 ### Three-env deployment model
 
@@ -34,7 +36,7 @@ normally live in three separate conda environments:
 |------------|-------------------|------------------|
 | `rmg_env`  | RMG-Py, Arkane    | `>=3.9,<3.12`    |
 | `t3_env`   | T3 **and** ARC    | `=3.14`          |
-| `crml_env` | Carmel itself     | `>=3.12`         |
+| `crml_env` | Carmel itself     | `>=3.14`         |
 
 T3 imports ARC in-process, so they must share an environment (`t3_env`);
 T3 in turn launches RMG as a subprocess under `rmg_env`. Name T3's
@@ -171,12 +173,13 @@ There are two layers of T3 testing:
 
 2. **Real subprocess tests** (`TestT3AdapterRealSubprocess`) — only run
    when T3 can actually be imported (`is_t3_importable()` returns
-   True). This is stricter than just having T3 on `sys.path`: T3 imports
-   ARC, which currently uses `from distutils.spawn import find_executable`
-   in `arc/main.py`. Since `distutils` was removed from the Python
-   standard library in 3.12, T3 cannot be imported on 3.12 until that
-   migrates to `shutil.which` upstream. While that blocker is in
-   effect, these tests are skipped both locally and in CI.
+   True), which means a working `t3_env` reachable through
+   `$T3_CONDA_ENV`. `make install` sets that up; without it these tests
+   skip.
+
+   A skip is silent by design, which makes it dangerous: the suite goes
+   green having never launched T3. The `tools` lane therefore *fails*
+   when T3 is unreachable, rather than reporting the skip and passing.
 
 Locally, all parser/normalizer/execution-path tests still run; only the
 real-subprocess test is skipped.
@@ -220,20 +223,28 @@ on pull requests.
 ### Best-effort lane (`tools`)
 
 The `tools` job installs the full external chemistry stack
-(RMG-Py / RMG-database / ARC / T3 from GitHub) and runs the T3-dependent
-tests. It is currently **best-effort, blocked on the upstream ARC
-distutils issue** described in the T3-dependent Tests section above.
+(RMG-Py / RMG-database / ARC / T3 from GitHub) by running `make install` —
+the same command the README gives users — and then runs the T3-dependent
+tests. The job display name is `Real T3/ARC/RMG integration (best-effort)`.
 
-The `continue-on-error: true` flags are scoped narrowly to the heavy
-**install steps** (where the conda environment can legitimately fail
-on flaky upstream); the **test step itself does not skip on error**.
-When the ARC fix lands upstream, `is_t3_importable()` will return True,
-the real subprocess test will execute, and the lane should be promoted
-to required. At that point the `continue-on-error` lines should also
-be reviewed and likely removed.
+`continue-on-error: true` is set at the **job** level, not per step. So
+nothing in this lane can block a merge, including a genuine test failure.
+That is deliberate for now — the lane builds a large third-party stack and a
+flaky upstream must not redden a PR — but it has a sharp edge worth knowing:
+`gh run list` reports the *run* as successful while the *job* is red. Check
+the job, or `gh pr checks`, not the run.
 
-The job display name is `Real T3/ARC/RMG (best-effort, blocked on ARC
-distutils)` so reviewers see the status at a glance.
+The lane is expected to be green with the real integration test executing.
+Once it has been for a while, three things should change together: drop
+`continue-on-error`, drop "(best-effort)" from the job name, and add the job
+to the Protect Main ruleset. Required checks pin by job name, so renaming
+without updating the ruleset orphans the requirement and blocks every PR
+while every check shows green.
+
+Caches are keyed on the upstream commit SHAs rather than on Carmel's own
+`environment.yml`, since those revisions are what actually gets installed.
+No install step is gated on a cache hit: the installers decide from what is
+on disk, so the caches supply state and never a verdict.
 
 ## Adding New Functionality
 
