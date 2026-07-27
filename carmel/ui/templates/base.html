@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Carmel{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="https://unpkg.com/htmx.org@1.9.12" defer></script>
+  {% block head_extra %}{% endblock %}
+</head>
+<body>
+<div class="app">
+
+  <aside class="sidebar">
+    <div class="sidebar-brand">
+      <img src="{{ url_for('static', filename='favicon.svg') }}" alt="">
+      <div class="sidebar-brand-text">
+        <span class="name">Carmel</span>
+        <span class="tagline">APCK Engine</span>
+      </div>
+    </div>
+
+    <div class="sidebar-section">Workspace</div>
+    <nav>
+      <a href="{{ url_for('index') }}">Campaigns</a>
+      <a href="{{ url_for('campaign_new') }}">+ New Campaign</a>
+    </nav>
+
+    <div class="sidebar-footer">
+      Agentic Predictive<br>Chemical Kinetics Engine
+    </div>
+  </aside>
+
+  <main class="content">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        <ul class="flashes">
+          {% for category, message in messages %}
+            <li class="flash flash-{{ category }}">{{ message }}</li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+  </main>
+
+</div>
+</body>
+</html>

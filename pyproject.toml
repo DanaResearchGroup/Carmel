@@ -6,9 +6,10 @@ build-backend = "setuptools.build_meta"
 name = "carmel"
 dynamic = ["version"]
 description = "Closed-loop campaign manager for predictive chemical kinetics"
-license = {text = "MIT"}
-requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+requires-python = ">=3.14"
 dependencies = [
+    "flask>=3.0",
     "numpy>=2.1",
     "pandas>=2.0",
     "pydantic>=2.0",
@@ -31,8 +32,14 @@ carmel = "Carmel:cli"
 [tool.setuptools.dynamic]
 version = {attr = "carmel.version.__version__"}
 
+[tool.setuptools]
+py-modules = ["Carmel"]
+
 [tool.setuptools.packages.find]
 include = ["carmel*"]
+
+[tool.setuptools.package-data]
+"carmel.ui" = ["templates/*.html", "static/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -41,20 +48,25 @@ addopts = "-v --tb=short"
 
 [tool.coverage.run]
 source = ["."]
-omit = ["tests/*"]
+omit = ["tests/*", "tests/fixtures/*"]
 
 [tool.coverage.report]
 show_missing = true
 fail_under = 90
 
 [tool.ruff]
-target-version = "py312"
+# No target-version here on purpose: ruff derives it from
+# project.requires-python, which is the single source of truth for the
+# Python floor. Restating the floor is exactly how these two silently
+# drifted two minor versions apart.
 line-length = 120
+extend-exclude = ["tests/fixtures"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
-python_version = "3.12"
+# Must match project.requires-python above; mypy has no way to derive it.
+python_version = "3.14"
 strict = true
 plugins = ["pydantic.mypy"]

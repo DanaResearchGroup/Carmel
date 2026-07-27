@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Command-line interface for Carmel."""
 
 import argparse
@@ -13,7 +16,7 @@ def create_parser() -> argparse.ArgumentParser:
     """Create the Carmel CLI argument parser."""
     parser = argparse.ArgumentParser(
         prog="carmel",
-        description="Carmel: closed-loop campaign manager for predictive chemical kinetics",
+        description="Carmel: Agentic Predictive Chemical Kinetics Engine",
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -24,6 +27,12 @@ def create_parser() -> argparse.ArgumentParser:
 
     init = subparsers.add_parser("init-workspace", help="Initialize a workspace directory")
     init.add_argument("directory", type=Path, help="Path to the workspace directory")
+
+    serve = subparsers.add_parser("serve", help="Launch the local Flask UI")
+    serve.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    serve.add_argument("--host", type=str, default="127.0.0.1", help="Bind host")
+    serve.add_argument("--port", type=int, default=5000, help="Bind port")
+    serve.add_argument("--debug", action="store_true", help="Enable Flask debug mode")
 
     return parser
 
@@ -57,6 +66,27 @@ def _cmd_init_workspace(directory: Path) -> int:
     return 0
 
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _cmd_serve(workspaces: Path | None, host: str, port: int, debug: bool) -> int:
+    """Launch the local Flask UI."""
+    if debug and host not in LOOPBACK_HOSTS:
+        print(
+            f"Refusing to serve with --debug on non-loopback host {host!r}: "
+            "the Werkzeug debugger allows remote code execution. "
+            "Use --host 127.0.0.1 or drop --debug.",
+            file=sys.stderr,
+        )
+        return 1
+    from carmel.ui import create_app
+
+    app = create_app(workspaces_root=workspaces)
+    print(f"Carmel UI listening on http://{host}:{port}")
+    app.run(host=host, port=port, debug=debug)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and dispatch to the appropriate command.
 
@@ -75,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_validate_config(args.file)
     if args.command == "init-workspace":
         return _cmd_init_workspace(args.directory)
+    if args.command == "serve":
+        return _cmd_serve(args.workspaces, args.host, args.port, args.debug)
 
     parser.print_help()
     return 1

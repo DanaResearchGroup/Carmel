@@ -3,9 +3,9 @@
 [![CI](https://github.com/DanaResearchGroup/Carmel/actions/workflows/ci.yml/badge.svg)](https://github.com/DanaResearchGroup/Carmel/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/DanaResearchGroup/Carmel/branch/main/graph/badge.svg)](https://codecov.io/gh/DanaResearchGroup/Carmel)
 [![version](https://img.shields.io/badge/version-0.1.0-informational.svg)](https://github.com/DanaResearchGroup/Carmel)
-[![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14+](https://img.shields.io/badge/python-3.14%2B-blue.svg)](https://www.python.org/downloads/)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
 ```
         ██████╗ █████╗ ██████╗ ███╗   ███╗███████╗██╗
@@ -23,25 +23,57 @@ Carmel automates the iterative cycle of building, validating, refining, validati
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.12+
-- [Conda](https://docs.conda.io/en/latest/)
-
-### Setup
+You need [conda](https://conda-forge.org/download/) on your `PATH`, git, and a
+C toolchain. Then:
 
 ```bash
-# Clone the repository
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
-
-# Create and activate the conda environment
-conda env create -f environment.yml
-conda activate crml_env
-
-# Install Carmel in editable mode with dev dependencies
 make install
+conda activate crml_env
+carmel --help
 ```
+
+`make install` clones the external chemistry stack (RMG-Py, RMG-database, ARC,
+T3), builds the three conda environments Carmel needs, installs Carmel, and
+records where everything ended up. Budget around 40 minutes the first time;
+re-running takes seconds, because every step checks what is already on disk.
+
+Working on Carmel's own code and not running real campaigns? `make install-dev`
+installs Carmel and its dev dependencies into the current environment and
+stops there.
+
+Run `make help` for the individual targets, and see
+[docs/installation.md](docs/installation.md) for pointing the installer at
+checkouts you already have, and for troubleshooting.
+
+### Why three environments
+
+T3, ARC and RMG-Py have mutually exclusive Python requirements, so they cannot
+share one environment. Carmel runs them as **separate processes**: `rmg_env`
+holds RMG-Py and Arkane, `t3_env` holds T3 and ARC together, and `crml_env`
+holds Carmel.
+
+Carmel launches T3 with `conda run -n $T3_CONDA_ENV`, which runs that
+environment's activation hooks. That is not the same as naming the
+environment's interpreter, and the difference is not cosmetic: ARC depends on
+Open Babel, whose conda package sets `BABEL_LIBDIR`/`BABEL_DATADIR` from an
+activation hook. Skip the hook and Open Babel loads no plugins, so `import arc`
+— and therefore `import t3` — fails outright.
+
+`make install` writes `T3_CONDA_ENV` (along with `T3_PATH`, `RMG_PATH` and
+`RMG_DB_PATH`) into `crml_env`'s own activation hook, so `conda activate
+crml_env` is all the setup there is. `T3_PYTHON` remains supported for
+deployments with no conda in the picture, and names T3's interpreter directly:
+
+```bash
+export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
+```
+
+If neither is set, Carmel falls back to its own interpreter — only correct if
+T3/ARC happen to be installed directly into `crml_env`. See
+[docs/architecture.md](docs/architecture.md#three-env-deployment-model-and-t3-invocation)
+for the full layout.
 
 ## Usage
 
@@ -94,7 +126,7 @@ make lint        # Lint and format check
 make typecheck   # Type check with mypy
 make check       # All of the above
 make format      # Auto-fix formatting
-make install     # Editable install with dev deps
+make install-dev # Editable install with dev deps, current environment only
 ```
 
 To run a specific test:
@@ -106,4 +138,9 @@ pytest tests/test_config.py::TestCarmelConfig::test_minimal_config
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+Carmel is the open-source **core**. Contributions are welcome under the terms in
+[CONTRIBUTING.md](CONTRIBUTING.md); a signed [Contributor License Agreement](CLA.md)
+(or DCO sign-off for small fixes) is required before a first contribution can be
+merged.

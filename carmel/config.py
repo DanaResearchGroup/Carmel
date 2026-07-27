@@ -1,3 +1,6 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
 """Configuration loading and validation for Carmel."""
 
 from pathlib import Path
