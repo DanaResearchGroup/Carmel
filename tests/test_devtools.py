@@ -291,3 +291,51 @@ class TestTheLaneProvesSomething:
         assert "class TestT3AdapterRealSubprocess" in suite, (
             "the tools lane asserts on TestT3AdapterRealSubprocess; renaming it silently turns that gate into a no-op"
         )
+
+
+class TestThePythonFloorIsDeclaredOnce:
+    """Every declaration of the Python floor must agree with pyproject.toml.
+
+    Six locations once disagreed across three minor versions, with
+    `requires-python = ">=3.14"` making the package uninstallable on the
+    3.12 the README advertised. Agreement is only stable if something
+    checks it, so this reads the floor from the one source of truth and
+    holds every restatement against it.
+    """
+
+    @staticmethod
+    def floor() -> tuple[int, int]:
+        """Return the (major, minor) floor from ``requires-python``."""
+        text = (REPO_ROOT / "pyproject.toml").read_text()
+        match = re.search(r'^requires-python\s*=\s*"[><=~!]*\s*(\d+)\.(\d+)', text, flags=re.MULTILINE)
+        assert match, "pyproject.toml declares no requires-python"
+        return int(match.group(1)), int(match.group(2))
+
+    def test_mypy_targets_the_declared_floor(self) -> None:
+        text = (REPO_ROOT / "pyproject.toml").read_text()
+        match = re.search(r'^python_version\s*=\s*"(\d+)\.(\d+)"', text, flags=re.MULTILINE)
+        assert match, "the mypy config no longer pins python_version"
+        assert (int(match.group(1)), int(match.group(2))) == self.floor()
+
+    def test_ruff_does_not_restate_the_floor(self) -> None:
+        """Ruff derives target-version from requires-python; restating it drifts."""
+        text = (REPO_ROOT / "pyproject.toml").read_text()
+        assert not re.search(r"^target-version\s*=", text, flags=re.MULTILINE), (
+            "remove target-version: ruff reads requires-python, and a second copy of the floor drifts from it"
+        )
+
+    def test_the_conda_environment_matches_the_floor(self) -> None:
+        text = (REPO_ROOT / "environment.yml").read_text()
+        match = re.search(r"python\s*>=\s*(\d+)\.(\d+)", text)
+        assert match, "environment.yml no longer pins a python floor for crml_env"
+        assert (int(match.group(1)), int(match.group(2))) == self.floor()
+
+    @pytest.mark.parametrize("workflow", ["ci.yml", "docs.yml"], ids=lambda name: name)
+    def test_every_workflow_python_matches_the_floor(self, workflow: str) -> None:
+        """A lane on an older Python tests something users cannot install."""
+        major, minor = self.floor()
+        text = (REPO_ROOT / ".github" / "workflows" / workflow).read_text()
+        declared = re.findall(r'python-version:\s*\[?\s*"(\d+\.\d+)"', text)
+        assert declared, f"{workflow} declares no python-version"
+        for value in declared:
+            assert value == f"{major}.{minor}", f"{workflow} runs on {value}, but the floor is {major}.{minor}"

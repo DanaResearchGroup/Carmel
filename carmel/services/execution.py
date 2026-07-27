@@ -16,6 +16,7 @@ Production callers always pass the real :class:`T3Adapter`.
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -135,20 +136,115 @@ def execute_t3_action(
     """
     if adapter is None:
         adapter = _default_adapter()
+    started = begin_t3_run(workspace_root, action)
+    return _finish_t3_run(workspace_root, campaign, action, adapter, started)
 
-    # Validate the transition BEFORE touching any artifacts. A campaign
-    # that is not actually eligible for RUNNING_T3 (e.g. a double-submitted
-    # request, a stale bookmark) must raise here with the workspace
-    # untouched — clearing stale diagnostics only after this succeeds.
+
+def begin_t3_run(workspace_root: Path, action: PlannedAction) -> datetime:
+    """Enter ``RUNNING_T3``, refusing the run if the campaign is not eligible.
+
+    Kept separate from the work itself so that a caller running T3 in the
+    background (see :func:`start_t3_action`) still performs this check
+    *synchronously*, in its own thread. That ordering is what makes a
+    double-submitted run fail loudly for the user who submitted it,
+    instead of being accepted and then racing a run already in flight.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        action: The planned T3 action.
+
+    Returns:
+        The run's start timestamp.
+
+    Raises:
+        InvalidTransitionError: If the campaign is not eligible to enter
+            ``RUNNING_T3``. The workspace is left untouched.
+    """
     update_state(workspace_root, CampaignStateValue.RUNNING_T3, notes=f"action={action.action_id}")
-    started = datetime.now(UTC)
+    return datetime.now(UTC)
 
+
+def start_t3_action(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    adapter: T3AdapterProtocol | None = None,
+) -> threading.Thread:
+    """Enter ``RUNNING_T3`` now and run the action on a background thread.
+
+    T3 runs for minutes to hours; executed inline it holds a web request
+    open far past any browser or reverse-proxy timeout, so the redirect to
+    the auto-refreshing dashboard never arrives and the whole
+    ``RUNNING_T3`` UX is unreachable from the tab that started the run.
+
+    The state transition is deliberately *not* backgrounded — see
+    :func:`begin_t3_run`. Only the work that follows it is.
+
+    The returned thread is a daemon: a run outlives neither its own
+    process tree (the adapter kills that on timeout) nor an operator who
+    stops the server — killing the server leaves T3 running unsupervised,
+    since Carmel's supervision lives in the process being stopped.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign being executed.
+        action: The planned T3 action.
+        adapter: Optional adapter override; production passes ``None``.
+
+    Returns:
+        The started thread. Callers that need the run to finish — tests,
+        and any future synchronous caller — can ``join()`` it rather than
+        polling the workspace.
+
+    Raises:
+        InvalidTransitionError: If the campaign is not eligible to enter
+            ``RUNNING_T3``. Raised in the calling thread, before any
+            background work starts.
+    """
+    if adapter is None:
+        adapter = _default_adapter()
+    started = begin_t3_run(workspace_root, action)
+
+    def _run() -> None:
+        try:
+            _finish_t3_run(workspace_root, campaign, action, adapter, started)
+        except Exception:
+            # _finish_t3_run has already driven the campaign to FAILED and
+            # persisted the failure; re-raising into the thread's excepthook
+            # would only print a traceback nobody is waiting on.
+            _log.error("Background T3 run failed for campaign %s", campaign.campaign_id, exc_info=True)
+
+    thread = threading.Thread(target=_run, name=f"carmel-t3-{campaign.campaign_id}", daemon=True)
+    thread.start()
+    return thread
+
+
+def _finish_t3_run(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    adapter: T3AdapterProtocol,
+    started: datetime,
+) -> tuple[RunRecord, DiagnosticsV1 | None]:
+    """Run the action and persist every artifact, assuming ``RUNNING_T3``.
+
+    The campaign must already have entered ``RUNNING_T3`` (see
+    :func:`begin_t3_run`). Everything here is inside the protected region:
+    any failure must still be able to drive the campaign to ``FAILED``
+    rather than leaving it wedged in ``RUNNING_T3``.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign being executed.
+        action: The planned T3 action.
+        adapter: The adapter to run.
+        started: The run's start timestamp, from :func:`begin_t3_run`.
+
+    Returns:
+        Tuple of (RunRecord, DiagnosticsV1 or None on failure).
+    """
     run_record: RunRecord | None = None
     try:
-        # Now that the campaign has genuinely entered RUNNING_T3, every
-        # subsequent step is inside this protected region: any failure
-        # from here on must still be able to drive the campaign to FAILED
-        # rather than leaving it wedged in RUNNING_T3.
         clear_stale_diagnostics_artifacts(workspace_root)
         append_event(
             workspace_root / "decision_log.jsonl",

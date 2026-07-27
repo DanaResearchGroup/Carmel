@@ -1,5 +1,6 @@
 """Tests for the Carmel Flask UI."""
 
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,7 @@ from werkzeug.test import TestResponse
 
 from carmel.schemas import CampaignStateValue
 from carmel.schemas.approval import ApprovalPolicy
+from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services.approvals import save_policy
 from carmel.services.campaigns import find_campaign_workspace
 from carmel.services.decision_log import read_events
@@ -342,11 +344,10 @@ class TestCampaignRun:
 
         called: dict[str, object] = {}
 
-        def _fake_execute(ws: Path, campaign: object, action: object) -> tuple[None, None]:
+        def _fake_execute(ws: Path, campaign: object, action: object) -> None:
             called["action_id"] = getattr(action, "action_id", None)
-            return None, None
 
-        monkeypatch.setattr(ui_app, "execute_t3_action", _fake_execute)
+        monkeypatch.setattr(ui_app, "start_t3_action", _fake_execute)
         cid = _create_via_form(client)
         _post(client, f"/campaigns/{cid}/plan")
         response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
@@ -561,11 +562,10 @@ class TestApprovalAuditIntegrity:
 
         executed: dict[str, object] = {}
 
-        def _fake_execute(ws: Path, campaign: object, action: object) -> tuple[None, None]:
+        def _fake_execute(ws: Path, campaign: object, action: object) -> None:
             executed["action_id"] = getattr(action, "action_id", None)
-            return None, None
 
-        monkeypatch.setattr(ui_app, "execute_t3_action", _fake_execute)
+        monkeypatch.setattr(ui_app, "start_t3_action", _fake_execute)
         cid, ws = _plan_pending_approval(client, workspaces_root)
         assert _post(client, f"/campaigns/{cid}/reject").status_code == 302
         assert _post(client, f"/campaigns/{cid}/approve").status_code == 409
@@ -586,11 +586,10 @@ class TestRunApprovalGate:
 
         executed: dict[str, object] = {}
 
-        def _fake_execute(ws: Path, campaign: object, action: object) -> tuple[None, None]:
+        def _fake_execute(ws: Path, campaign: object, action: object) -> None:
             executed["action_id"] = getattr(action, "action_id", None)
-            return None, None
 
-        monkeypatch.setattr(ui_app, "execute_t3_action", _fake_execute)
+        monkeypatch.setattr(ui_app, "start_t3_action", _fake_execute)
         cid, ws = _plan_pending_approval(client, workspaces_root)
         assert _post(client, f"/campaigns/{cid}/run").status_code == 409
         assert executed == {}
@@ -682,3 +681,136 @@ class TestSecretKey:
         monkeypatch.setenv("CARMEL_SECRET_KEY", "configured-secret")
         app = create_app(workspaces_root=tmp_path)
         assert app.secret_key == "configured-secret"
+
+
+class TestRunIsAsynchronous:
+    """POST /run must return while T3 is still running.
+
+    Executed inline, a run holds the request open for
+    ``estimated_cpu_hours * 3600 + 600`` seconds — 3.2 hours for a minimal
+    campaign. The browser times out long before that, so the redirect to
+    the auto-refreshing running dashboard never arrives and the whole
+    ``RUNNING_T3`` UX is unreachable from the tab that started the run.
+
+    These tests therefore assert on what the *user* gets: a response that
+    arrives while the adapter is still blocked mid-run.
+    """
+
+    class _BlockingAdapter:
+        """Blocks inside ``run`` until released, like a real T3 invocation."""
+
+        submission_mode = SubmissionMode.SUBPROCESS
+
+        def __init__(self) -> None:
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def run(self, workspace_root: Path, campaign: Any, action: Any) -> tuple[RunRecord, None]:
+            self.entered.set()
+            assert self.release.wait(timeout=60), "the test never released the adapter"
+            return RunRecord(
+                run_id="blocking-run",
+                action_id=action.action_id,
+                tool_name="t3",
+                status=RunStatus.FAILED,
+                failure_code=FailureCode.SUBPROCESS_ERROR,
+                started_at=datetime.now(UTC),
+                ended_at=datetime.now(UTC),
+                submission_mode=SubmissionMode.SUBPROCESS,
+                error_message="released by the test",
+            ), None
+
+    def _arrange(
+        self, client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+    ) -> tuple[str, _BlockingAdapter, list[threading.Thread]]:
+        from carmel.services import execution as execution_module
+        from carmel.ui import app as ui_app
+
+        adapter = self._BlockingAdapter()
+        monkeypatch.setattr(execution_module, "_default_adapter", lambda: adapter)
+
+        threads: list[threading.Thread] = []
+        real_start = ui_app.start_t3_action
+
+        def _capture(ws: Path, campaign: Any, action: Any) -> threading.Thread:
+            thread = real_start(ws, campaign, action)
+            threads.append(thread)
+            return thread
+
+        monkeypatch.setattr(ui_app, "start_t3_action", _capture)
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")
+        return cid, adapter, threads
+
+    def test_run_returns_while_t3_is_still_running(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cid, adapter, threads = self._arrange(client, monkeypatch)
+        try:
+            response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+            assert response.status_code == 302
+            # The response is in hand and the adapter has not been released:
+            # inline execution could not have produced this.
+            assert adapter.entered.wait(timeout=30), "the background run never started"
+            assert not adapter.release.is_set()
+
+            ws = find_campaign_workspace(workspaces_root, cid)
+            assert ws is not None
+            assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+        finally:
+            adapter.release.set()
+            for thread in threads:
+                thread.join(timeout=60)
+
+    def test_background_run_completes_the_state_machine(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Returning early must not mean the run is forgotten."""
+        cid, adapter, threads = self._arrange(client, monkeypatch)
+        _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+        assert adapter.entered.wait(timeout=30)
+        adapter.release.set()
+        for thread in threads:
+            thread.join(timeout=60)
+            assert not thread.is_alive()
+
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert load_state(ws).state == CampaignStateValue.FAILED
+        events = read_events(ws / "decision_log.jsonl")
+        assert any(event.get("event") == "t3_run_finished" for event in events)
+
+    def test_second_run_while_running_is_a_conflict_not_a_crash(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The running dashboard auto-refreshes, so re-clicking Run is easy."""
+        cid, adapter, threads = self._arrange(client, monkeypatch)
+        try:
+            assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 302
+            assert adapter.entered.wait(timeout=30)
+            assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
+        finally:
+            adapter.release.set()
+            for thread in threads:
+                thread.join(timeout=60)
+        assert len(threads) == 1, "the rejected second submit still started a background run"
+
+    def test_losing_a_concurrent_race_is_a_409_not_a_500(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The preflight is a read, so it cannot be authoritative.
+
+        Two POSTs can both pass `can_transition` and then race the locked
+        transition inside `start_t3_action`. The loser must see a conflict,
+        not a traceback.
+        """
+        from carmel.services.state_machine import InvalidTransitionError
+        from carmel.ui import app as ui_app
+
+        def _lost_the_race(ws: Path, campaign: Any, action: Any) -> threading.Thread:
+            raise InvalidTransitionError("approved_for_execution -> running_t3 is not permitted")
+
+        monkeypatch.setattr(ui_app, "start_t3_action", _lost_the_race)
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409

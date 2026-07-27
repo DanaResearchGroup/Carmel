@@ -43,10 +43,10 @@ from carmel.services.campaigns import (
     load_campaign,
 )
 from carmel.services.decision_log import read_events
-from carmel.services.execution import execute_t3_action, load_diagnostics
+from carmel.services.execution import load_diagnostics, start_t3_action
 from carmel.services.intake import StubIntakeParser, write_intake_review
 from carmel.services.planner import load_plan, plan_and_save
-from carmel.services.state_machine import can_transition, load_state, update_state
+from carmel.services.state_machine import InvalidTransitionError, can_transition, load_state, update_state
 from carmel.ui.csrf import init_csrf
 
 _log = get_logger("ui")
@@ -297,7 +297,21 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         approved = {ApprovalStatus.APPROVED.value, ApprovalStatus.AUTO_APPROVED.value}
         if not decisions or decisions[-1].get("status") not in approved:
             abort(409, description="Action has no recorded approval decision.")
-        execute_t3_action(ws, campaign, action)
+        # Preflight the transition rather than letting it raise out of the
+        # service layer as a 500. Re-clicking Run — which the auto-refreshing
+        # running dashboard now makes easy to do — must read as a conflict,
+        # not a crash.
+        current = load_state(ws).state
+        if not can_transition(current, CampaignStateValue.RUNNING_T3):
+            abort(409, description=f"Cannot start a run for a campaign in state {current.value!r}.")
+        try:
+            start_t3_action(ws, campaign, action)
+        except InvalidTransitionError:
+            # The preflight above is a read, so it cannot be authoritative:
+            # a concurrent POST can win the race between it and the locked
+            # transition inside start_t3_action. The loser must still see a
+            # conflict rather than a 500.
+            abort(409, description="A run for this campaign was started concurrently.")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/free-text", methods=["POST"])

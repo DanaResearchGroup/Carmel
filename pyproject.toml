@@ -55,7 +55,10 @@ show_missing = true
 fail_under = 90
 
 [tool.ruff]
-target-version = "py312"
+# No target-version here on purpose: ruff derives it from
+# project.requires-python, which is the single source of truth for the
+# Python floor. Restating the floor is exactly how these two silently
+# drifted two minor versions apart.
 line-length = 120
 extend-exclude = ["tests/fixtures"]
 
@@ -63,6 +66,7 @@ extend-exclude = ["tests/fixtures"]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
-python_version = "3.12"
+# Must match project.requires-python above; mypy has no way to derive it.
+python_version = "3.14"
 strict = true
 plugins = ["pydantic.mypy"]

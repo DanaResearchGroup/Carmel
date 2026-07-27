@@ -27,6 +27,13 @@ environments and the external chemistry stack. See
 [installation.md](installation.md) for the full guide, the individual targets,
 and how to point it at checkouts you already have.
 
+**Activate `crml_env` before running anything.** Carmel's floor of Python
+3.14 is not only a packaging constraint: the source uses 3.14 syntax, so an
+older interpreter fails while *parsing* it. Running `pytest` on, say, 3.12
+reports a `SyntaxError` during collection rather than anything about
+versions. The floor is declared once, in `requires-python`; `mypy` and the
+CI workflows are held against it by a test.
+
 ### Three-env deployment model
 
 Carmel, T3, and RMG have mutually exclusive Python requirements and

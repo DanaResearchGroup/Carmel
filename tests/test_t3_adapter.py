@@ -13,9 +13,13 @@ upstream ARC distutils blocker is in effect.
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
+import signal
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,9 +36,11 @@ from carmel.adapters.t3 import (
     _discover_pdep_networks,
     _find_t3_executable,
     _resolve_t3_python,
+    _run_in_process_group,
     _t3_conda_env_error,
     _t3_python_command,
     _t3_version,
+    _terminate_process_tree,
     _walk_iterations,
     arc_info_filename,
     build_t3_input,
@@ -681,7 +687,7 @@ class TestT3CondaEnvError:
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="EnvironmentLocationNotFound: could not find environment"
         )
-        monkeypatch.setattr(t3_module.subprocess, "run", lambda *a, **k: completed)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", lambda *a, **k: completed)
         error = _t3_conda_env_error()
         assert error is not None
         assert "no_such_env" in error
@@ -696,7 +702,7 @@ class TestT3CondaEnvError:
         def _raise(*args: object, **kwargs: object) -> None:
             raise OSError("boom")
 
-        monkeypatch.setattr(t3_module.subprocess, "run", _raise)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", _raise)
         error = _t3_conda_env_error()
         assert error is not None
         assert "t3_env" in error
@@ -707,7 +713,7 @@ class TestT3CondaEnvError:
         monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
         monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/bin/conda")
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-        monkeypatch.setattr(t3_module.subprocess, "run", lambda *a, **k: completed)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", lambda *a, **k: completed)
         assert _t3_conda_env_error() is None
 
 
@@ -749,7 +755,7 @@ class TestT3AdapterCondaEnvFailures:
         completed = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr="EnvironmentLocationNotFound: could not find environment"
         )
-        monkeypatch.setattr(t3_module.subprocess, "run", lambda *a, **k: completed)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", lambda *a, **k: completed)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
@@ -796,7 +802,7 @@ class TestT3VersionProbe:
         def _timeout(*args: object, **kwargs: object) -> None:
             raise subprocess.TimeoutExpired(cmd="t3-probe", timeout=1.0)
 
-        monkeypatch.setattr(t3_module.subprocess, "run", _timeout)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", _timeout)
         assert is_t3_importable() is False
 
     def test_version_returns_module_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1393,7 +1399,7 @@ class TestT3AdapterSubprocessErrors:
             raise subprocess.TimeoutExpired(cmd="T3.py", timeout=1.0)
 
         monkeypatch.setattr(t3_module, "_find_t3_executable", lambda: ["true"])
-        monkeypatch.setattr(t3_module.subprocess, "run", _timeout)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", _timeout)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
@@ -1409,7 +1415,7 @@ class TestT3AdapterSubprocessErrors:
             raise OSError("exec format error")
 
         monkeypatch.setattr(t3_module, "_find_t3_executable", lambda: ["true"])
-        monkeypatch.setattr(t3_module.subprocess, "run", _oserror)
+        monkeypatch.setattr(t3_module, "_run_in_process_group", _oserror)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
@@ -1649,3 +1655,389 @@ class TestT3AdapterRealSubprocess:
         if run.status == RunStatus.SUCCEEDED:
             assert diagnostics is not None, _t3_diagnostic(run, run_dir)
             assert diagnostics.run_id == run.run_id, _t3_diagnostic(run, run_dir)
+
+
+class TestProcessTreeTermination:
+    """A timeout must kill T3's children, not just the wrapper Carmel holds.
+
+    These tests launch a real process tree and assert on the *grandchild*.
+    Asserting that the call returned, or that the direct child died, is
+    exactly what the old code already satisfied while T3 and RMG kept
+    running: `subprocess.run(timeout=...)` killed the `conda run` wrapper
+    and orphaned everything underneath it.
+    """
+
+    # parent spawns a grandchild that outlives it, then blocks forever.
+    _TREE = (
+        "import subprocess, sys, time, pathlib;"
+        "gc = subprocess.Popen([sys.executable, '-c',"
+        ' "import sys,time,pathlib;\\n"'
+        ' "p = pathlib.Path(sys.argv[1]);\\n"'
+        ' "[ (p.write_text(str(i)), time.sleep(0.05)) for i in range(2000) ]",'
+        " sys.argv[1]]);"
+        "pathlib.Path(sys.argv[2]).write_text(str(gc.pid));"
+        "time.sleep(300)"
+    )
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:  # pragma: no cover -- not reachable as the same user
+            return True
+        return True
+
+    @classmethod
+    def _died_within(cls, pid: int, timeout_s: float = 15.0) -> bool:
+        """Poll until *pid* is gone, or *timeout_s* elapses.
+
+        Killing a tree is asynchronous in a way a single sample cannot
+        capture: once the direct child is reaped, a descendant is
+        reparented to init and stays a zombie — for which ``kill(pid, 0)``
+        still succeeds — until init reaps it. Sampling instantly makes the
+        assertion flaky; waiting does not weaken it, because a survivor
+        never dies and still fails.
+        """
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not cls._alive(pid):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _launch_tree(self, tmp_path: Path) -> tuple[Path, Path]:
+        heartbeat = tmp_path / "heartbeat"
+        pid_file = tmp_path / "grandchild.pid"
+        return heartbeat, pid_file
+
+    def _grandchild_pid(self, pid_file: Path, timeout_s: float = 20.0) -> int:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if pid_file.exists() and pid_file.read_text().strip():
+                return int(pid_file.read_text().strip())
+            time.sleep(0.05)
+        raise AssertionError(f"the child never reported a grandchild pid at {pid_file}")
+
+    def test_timeout_kills_the_grandchild(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The regression test for the orphan. Fails against the old code."""
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "_KILL_GRACE_PERIOD_S", 1.0)
+        heartbeat, pid_file = self._launch_tree(tmp_path)
+        command = [sys.executable, "-c", self._TREE, str(heartbeat), str(pid_file)]
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_in_process_group(command, timeout=3.0)
+
+        grandchild = self._grandchild_pid(pid_file)
+        assert self._died_within(grandchild), (
+            f"grandchild {grandchild} survived the timeout — Carmel would have recorded "
+            "TIMEOUT while the real work kept running"
+        )
+
+    def test_timeout_stops_the_grandchild_writing(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Liveness, not just the process table: the writes must actually stop."""
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module, "_KILL_GRACE_PERIOD_S", 1.0)
+        heartbeat, pid_file = self._launch_tree(tmp_path)
+        command = [sys.executable, "-c", self._TREE, str(heartbeat), str(pid_file)]
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_in_process_group(command, timeout=3.0)
+
+        before = heartbeat.read_text() if heartbeat.exists() else ""
+        time.sleep(1.0)
+        after = heartbeat.read_text() if heartbeat.exists() else ""
+        assert before == after, "the grandchild was still writing after the tree was killed"
+
+    def test_normal_completion_is_unaffected(self, tmp_path: Path) -> None:
+        completed = _run_in_process_group(
+            [sys.executable, "-c", "print('ok')"],
+            timeout=60.0,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert completed.returncode == 0
+        assert completed.stdout.strip() == "ok"
+
+    def test_nonzero_exit_is_returned_not_raised(self) -> None:
+        completed = _run_in_process_group([sys.executable, "-c", "raise SystemExit(3)"], timeout=60.0)
+        assert completed.returncode == 3
+
+    def test_child_runs_in_its_own_process_group(self, tmp_path: Path) -> None:
+        """Without this, killpg would take down Carmel and its web server."""
+        out = tmp_path / "pgid"
+        _run_in_process_group(
+            [sys.executable, "-c", f"import os, pathlib; pathlib.Path({str(out)!r}).write_text(str(os.getpgid(0)))"],
+            timeout=60.0,
+        )
+        assert int(out.read_text()) != os.getpgid(0)
+
+    def test_output_files_receive_the_child_output(self, tmp_path: Path) -> None:
+        out_path = tmp_path / "out.log"
+        err_path = tmp_path / "err.log"
+        with open(out_path, "w", encoding="utf-8") as out, open(err_path, "w", encoding="utf-8") as err:
+            _run_in_process_group(
+                [sys.executable, "-c", "import sys; print('to-stdout'); print('to-stderr', file=sys.stderr)"],
+                timeout=60.0,
+                stdout=out,
+                stderr=err,
+            )
+        assert "to-stdout" in out_path.read_text(encoding="utf-8")
+        assert "to-stderr" in err_path.read_text(encoding="utf-8")
+
+    def test_missing_executable_raises_oserror(self) -> None:
+        with pytest.raises(OSError):
+            _run_in_process_group(["/nonexistent/carmel-not-a-binary"], timeout=60.0)
+
+    def test_terminate_is_safe_on_an_already_dead_child(self) -> None:
+        """Reaping twice, or signalling a group that is already gone, must not raise."""
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        proc.wait()
+        _terminate_process_tree(proc)
+
+    def test_sigkill_escalation_when_sigterm_is_ignored(self, tmp_path: Path) -> None:
+        """A tree that traps SIGTERM must still not survive the timeout.
+
+        The grandchild ignores SIGTERM too, on purpose: a version of this
+        test with a childless child passes even against a kill that only
+        ever reaches the direct child.
+        """
+        pid_file = tmp_path / "grandchild.pid"
+        ignores_sigterm = (
+            "import signal, subprocess, sys, time, pathlib;"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+            "gc = subprocess.Popen([sys.executable, '-c',"
+            ' "import signal, sys, time, pathlib\\n"'
+            ' "signal.signal(signal.SIGTERM, signal.SIG_IGN)\\n"'
+            " \"pathlib.Path(sys.argv[1]).write_text(str(__import__('os').getpid()))\\n\""
+            ' "time.sleep(300)\\n",'
+            " sys.argv[1]]);"
+            "time.sleep(300)"
+        )
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", ignores_sigterm, str(pid_file)],
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not (pid_file.exists() and pid_file.read_text().strip()):
+            time.sleep(0.05)
+        grandchild = int(pid_file.read_text().strip())
+
+        _terminate_process_tree(proc, grace_period_s=1.0)
+        assert proc.poll() is not None, "a SIGTERM-ignoring child survived _terminate_process_tree"
+        assert self._died_within(proc.pid)
+        assert self._died_within(grandchild), "a SIGTERM-ignoring GRANDCHILD survived the escalation"
+
+
+class TestAdapterTimeoutKillsTheToolTree:
+    """End-to-end through T3Adapter.run, with a stub standing in for T3.py.
+
+    The helper tests cover the mechanism; this covers the wiring — that the
+    adapter actually routes its real invocation through it, with the real
+    command building, cwd, and output files. The stub is a real script in a
+    real subprocess that spawns a real grandchild, exactly as T3 spawns RMG.
+    """
+
+    _STUB_T3 = """
+import os, subprocess, sys, time, pathlib
+here = pathlib.Path(__file__).parent
+grandchild = subprocess.Popen([
+    sys.executable, "-c",
+    "import sys, time, pathlib\\n"
+    "p = pathlib.Path(sys.argv[1])\\n"
+    "[(p.write_text(str(i)), time.sleep(0.05)) for i in range(2000)]\\n",
+    str(here / "grandchild_heartbeat"),
+])
+(here / "grandchild.pid").write_text(str(grandchild.pid))
+time.sleep(300)
+"""
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @staticmethod
+    def _instant_action() -> PlannedAction:
+        """Zero estimated hours, so the timeout is the buffer alone."""
+        return PlannedAction(
+            action_id="action-timeout",
+            kind=ActionKind.T3_RUN,
+            description="run T3",
+            estimated_cpu_hours=0.0,
+            rationale="test",
+            approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        )
+
+    def test_timeout_leaves_no_surviving_tool_process(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        t3_home = tmp_path / "fake_t3"
+        t3_home.mkdir()
+        (t3_home / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text(self._STUB_T3, encoding="utf-8")
+
+        monkeypatch.setenv("T3_PATH", str(t3_home))
+        monkeypatch.delenv(T3_LAYOUT.T3_CONDA_ENV_VAR, raising=False)
+        monkeypatch.delenv(T3_LAYOUT.T3_PYTHON_ENV_VAR, raising=False)
+        monkeypatch.setattr(t3_module, "_RUN_TIMEOUT_BUFFER_S", 3.0)
+        monkeypatch.setattr(t3_module, "_KILL_GRACE_PERIOD_S", 1.0)
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=self._instant_action())
+
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TIMEOUT
+        assert diagnostics is None
+
+        pid_file = t3_home / "grandchild.pid"
+        assert pid_file.exists(), "the stub never got far enough to spawn a grandchild"
+        grandchild = int(pid_file.read_text())
+        assert not self._alive(grandchild), f"grandchild {grandchild} outlived the run Carmel recorded as TIMEOUT"
+
+        heartbeat = t3_home / "grandchild_heartbeat"
+        before = heartbeat.read_text() if heartbeat.exists() else ""
+        time.sleep(0.75)
+        assert (heartbeat.read_text() if heartbeat.exists() else "") == before
+
+    def test_timeout_message_says_the_tree_was_killed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The record must not claim more, or less, than what happened."""
+        from carmel.adapters import t3 as t3_module
+
+        t3_home = tmp_path / "fake_t3"
+        t3_home.mkdir()
+        (t3_home / T3_LAYOUT.EXECUTABLE_SCRIPT).write_text(self._STUB_T3, encoding="utf-8")
+        monkeypatch.setenv("T3_PATH", str(t3_home))
+        monkeypatch.delenv(T3_LAYOUT.T3_CONDA_ENV_VAR, raising=False)
+        monkeypatch.delenv(T3_LAYOUT.T3_PYTHON_ENV_VAR, raising=False)
+        monkeypatch.setattr(t3_module, "_RUN_TIMEOUT_BUFFER_S", 3.0)
+        monkeypatch.setattr(t3_module, "_KILL_GRACE_PERIOD_S", 1.0)
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, _ = T3Adapter().run(workspace_root=ws, campaign=_campaign(ws), action=self._instant_action())
+        assert "killed" in (run.error_message or "")
+
+
+@contextlib.contextmanager
+def monkeypatched_grace(module: Any, seconds: float) -> Any:
+    """Temporarily shorten the SIGTERM->SIGKILL grace period."""
+    original = module._KILL_GRACE_PERIOD_S
+    module._KILL_GRACE_PERIOD_S = seconds
+    try:
+        yield
+    finally:
+        module._KILL_GRACE_PERIOD_S = original
+
+
+class TestShutdownKillsLiveTrees:
+    """A run executes on a daemon thread, which interpreter exit does not join.
+
+    Without the atexit sweep, stopping the server leaves T3 and RMG running
+    with no supervisor — the same orphaning this module exists to prevent,
+    one layer up. It cannot help when Carmel is SIGKILLed; nothing can.
+    """
+
+    def test_a_running_tree_is_registered_and_then_forgotten(self, tmp_path: Path) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        seen: list[int] = []
+        real_register = t3_module._register_live_tree
+
+        def _spy(proc: subprocess.Popen[Any]) -> None:
+            seen.append(proc.pid)
+            real_register(proc)
+
+        t3_module._register_live_tree = _spy  # type: ignore[assignment]
+        try:
+            _run_in_process_group([sys.executable, "-c", "pass"], timeout=60.0)
+        finally:
+            t3_module._register_live_tree = real_register  # type: ignore[assignment]
+
+        assert seen, "the process tree was never registered for shutdown cleanup"
+        assert not t3_module._LIVE_TREES, "a finished tree is still registered"
+
+    def test_shutdown_kills_a_tree_that_is_still_running(self) -> None:
+        from carmel.adapters import t3 as t3_module
+
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", "import time; time.sleep(300)"],
+            start_new_session=True,
+        )
+        t3_module._register_live_tree(proc)
+        try:
+            with monkeypatched_grace(t3_module, 1.0):
+                t3_module._terminate_live_trees()
+            assert proc.poll() is not None, "shutdown left a live T3 process tree behind"
+        finally:
+            t3_module._forget_live_tree(proc)
+            if proc.poll() is None:  # pragma: no cover -- only if the sweep failed
+                proc.kill()
+                proc.wait()
+
+    def test_shutdown_ignores_trees_that_already_finished(self) -> None:
+        """A finished process must not be signalled again during shutdown."""
+        from carmel.adapters import t3 as t3_module
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        proc.wait()
+        t3_module._register_live_tree(proc)
+        try:
+            t3_module._terminate_live_trees()
+        finally:
+            t3_module._forget_live_tree(proc)
+
+    def test_falls_back_to_killing_the_child_when_killpg_does_not_land(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A group signal can fail (EPERM, a setsid'ed descendant).
+
+        The calling thread must not be left waiting forever on a child that
+        the group signal never reached.
+        """
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module.os, "killpg", lambda pgid, sig: None)
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", "import time; time.sleep(300)"],
+            start_new_session=True,
+        )
+        try:
+            t3_module._terminate_process_tree(proc, grace_period_s=1.0)
+            assert proc.poll() is not None, "the child outlived a killpg that never landed"
+        finally:
+            if proc.poll() is None:  # pragma: no cover -- only if the fallback failed
+                proc.kill()
+                proc.wait()
+
+    def test_an_unreapable_child_is_reported_rather_than_hung_on(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Last resort: say so loudly, but return. Never block forever."""
+        from carmel.adapters import t3 as t3_module
+
+        monkeypatch.setattr(t3_module.os, "killpg", lambda pgid, sig: None)
+        proc = subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", "import time; time.sleep(300)"],
+            start_new_session=True,
+        )
+        monkeypatch.setattr(proc, "kill", lambda: None)
+
+        emitter = logging.getLogger("carmel.adapters.t3")
+        emitter.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.ERROR):
+                t3_module._terminate_process_tree(proc, grace_period_s=0.5)
+            assert any("Could not reap process" in record.message for record in caplog.records)
+        finally:
+            emitter.removeHandler(caplog.handler)
+            # NOT proc.kill(): it is monkeypatched to a no-op for this test,
+            # so waiting on it would block until the child's own sleep ends.
+            os.kill(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=30)

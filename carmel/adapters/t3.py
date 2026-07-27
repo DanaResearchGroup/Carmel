@@ -31,11 +31,16 @@ locally if T3 cannot actually be imported.
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import importlib.util
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -150,6 +155,203 @@ _log = get_logger("adapters.t3")
 # runner this combination has been observed to take on the order of a
 # minute; 120s leaves real headroom without risking an unbounded hang.
 _T3_IMPORT_PROBE_TIMEOUT_S: float = 120.0
+
+# How long a timed-out process tree is given to exit on SIGTERM before it is
+# SIGKILLed. T3 traps nothing in particular, but RMG can be mid-write to a
+# chemkin file; a few seconds of grace lets it close cleanly, and the SIGKILL
+# guarantees it cannot outlive the timeout regardless.
+_KILL_GRACE_PERIOD_S: float = 10.0
+
+_SECONDS_PER_HOUR: float = 3600.0
+
+# Slack added to a run's estimated CPU budget before it is treated as hung.
+# Named rather than inlined so the timeout path can be exercised end-to-end
+# without a ten-minute test: a timeout that is only ever reached after the
+# shortest possible run is a timeout nothing verifies.
+_RUN_TIMEOUT_BUFFER_S: float = 600.0
+
+
+# ---------------------------------------------------------------------------
+# Subprocess execution — process-group aware
+#
+# Carmel does not launch leaf processes. It launches `conda run`, which
+# launches T3, which launches RMG (and ARC, and cluster jobs). Killing only
+# the direct child therefore kills the *wrapper* and orphans the actual work:
+# verified directly — with `subprocess.run(timeout=...)`, the conda wrapper
+# dies while T3 and RMG stay alive and keep writing into a run directory
+# Carmel has already recorded as TIMEOUT. `start_new_session=True` alone does
+# not help (also verified); it is what makes killing the *group* safe, because
+# without it the child shares Carmel's own process group and killpg would take
+# down Carmel and its web server too.
+# ---------------------------------------------------------------------------
+
+
+# Every tool process tree currently running, so interpreter shutdown can take
+# them with it. A run executes on a daemon thread, which is *not* joined at
+# exit, so without this a stopped server leaves T3 and RMG running with no
+# supervisor — the same orphaning this module exists to prevent, one layer up.
+# It cannot help when Carmel is SIGKILLed; nothing running in Carmel can.
+_LIVE_TREES: set[subprocess.Popen[Any]] = set()
+_LIVE_TREES_LOCK = threading.Lock()
+
+
+def _register_live_tree(proc: subprocess.Popen[Any]) -> None:
+    """Track *proc* so it can be killed if the interpreter shuts down.
+
+    Args:
+        proc: A process started with ``start_new_session=True``.
+    """
+    with _LIVE_TREES_LOCK:
+        _LIVE_TREES.add(proc)
+
+
+def _forget_live_tree(proc: subprocess.Popen[Any]) -> None:
+    """Stop tracking *proc*; it has finished or has already been killed.
+
+    Args:
+        proc: The process to forget.
+    """
+    with _LIVE_TREES_LOCK:
+        _LIVE_TREES.discard(proc)
+
+
+def _terminate_live_trees() -> None:
+    """Kill every still-running tool process tree. Registered with ``atexit``."""
+    with _LIVE_TREES_LOCK:
+        survivors = [proc for proc in _LIVE_TREES if proc.poll() is None]
+    for proc in survivors:
+        _log.warning("Interpreter is shutting down; killing the T3 process tree at pid %s", proc.pid)
+        with contextlib.suppress(Exception):
+            _terminate_process_tree(proc)
+
+
+atexit.register(_terminate_live_trees)
+
+
+def _terminate_process_tree(proc: subprocess.Popen[Any], grace_period_s: float | None = None) -> None:
+    """Kill *proc* and every descendant sharing its process group, then reap it.
+
+    *proc* must have been started with ``start_new_session=True``, which
+    makes it the leader of a brand-new process group whose id equals its
+    pid — so its pid doubles as the group id, and no ``getpgid`` lookup
+    that could race with the child exiting is needed.
+
+    The escalation is SIGTERM, then SIGKILL after *grace_period_s*, and
+    the direct child is reaped **last**. That ordering is the whole point:
+    an unreaped child — even a zombie — keeps its pid, and therefore the
+    group id, reserved, so the SIGKILL cannot land on an unrelated process
+    that recycled the pid in the meantime.
+
+    Nothing here polls the child during the grace period, deliberately.
+    ``Popen.poll`` *reaps* an exited child, which would release exactly the
+    pid this function still needs reserved. Buying an early exit with that
+    reservation is what makes the recycling race real, so the full grace is
+    waited out instead and the SIGKILL is sent unconditionally — signalling
+    an already-empty group is a harmless ESRCH. This is the timeout path;
+    it has already waited hours, and a few more seconds cost nothing.
+
+    On a platform without ``os.killpg`` (i.e. not POSIX) this degrades to
+    killing the direct child only, which is what the standard library
+    would have done anyway.
+
+    Args:
+        proc: The running child process.
+        grace_period_s: Seconds to wait between SIGTERM and SIGKILL, and
+            the bound on each subsequent attempt to reap the child.
+            Defaults to ``_KILL_GRACE_PERIOD_S``, read at call time so it
+            can be shortened for tests.
+    """
+    if grace_period_s is None:
+        grace_period_s = _KILL_GRACE_PERIOD_S
+    if not hasattr(os, "killpg"):  # pragma: no cover -- POSIX-only branch
+        proc.kill()
+        proc.wait()
+        return
+
+    pgid = proc.pid
+    # A group that is already gone is a success, not an error: the tree can
+    # exit between the timeout firing and the signal being delivered.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGTERM)
+    time.sleep(grace_period_s)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
+
+    # Bounded, because an unbounded wait here would hang the calling thread
+    # forever in the one case that matters: a SIGKILL that never landed.
+    try:
+        proc.wait(timeout=grace_period_s)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        try:
+            proc.wait(timeout=grace_period_s)
+        except subprocess.TimeoutExpired:
+            _log.error(
+                "Could not reap process %s after SIGKILL; a T3 process tree may still be running as group %s",
+                proc.pid,
+                pgid,
+            )
+
+
+def _run_in_process_group(
+    command: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+    stdout: Any = None,
+    stderr: Any = None,
+    text: bool = False,
+) -> subprocess.CompletedProcess[Any]:
+    """Run *command* in its own process group, killing the whole tree on timeout.
+
+    A drop-in replacement for ``subprocess.run(...)`` for every call that
+    launches T3 (directly or through ``conda run``). The difference is the
+    only one that matters here: when the timeout expires, or the calling
+    thread is interrupted, every descendant is killed rather than just the
+    process Carmel happens to hold a handle to.
+
+    Args:
+        command: The argv to execute.
+        timeout: Seconds to wait before killing the tree.
+        cwd: Working directory for the child.
+        stdout: Passed through to ``Popen`` (a file object, ``PIPE``, or None).
+        stderr: Passed through to ``Popen``.
+        text: Whether to decode captured output as text.
+
+    Returns:
+        A ``CompletedProcess`` exactly as ``subprocess.run`` would return.
+
+    Raises:
+        subprocess.TimeoutExpired: If *timeout* expires. The process tree
+            has already been killed and reaped when this propagates.
+        OSError: If the child cannot be spawned at all.
+    """
+    proc: subprocess.Popen[Any] = subprocess.Popen(  # noqa: S603 -- resolved, locally-configured commands only
+        command,
+        cwd=cwd,
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        start_new_session=True,
+    )
+    _register_live_tree(proc)
+    try:
+        captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
+    except BaseException:
+        # Covers TimeoutExpired and anything that interrupts the wait
+        # (KeyboardInterrupt, a thread being torn down): in every case the
+        # tree must not outlive the call that started it.
+        _terminate_process_tree(proc)
+        # Drain and close the pipes. communicate() abandoned them when it
+        # raised, and the tree is dead now, so this returns immediately —
+        # without it the read ends stay open until the Popen is collected.
+        with contextlib.suppress(Exception):
+            proc.communicate(timeout=_KILL_GRACE_PERIOD_S)
+        raise
+    finally:
+        _forget_live_tree(proc)
+    return subprocess.CompletedProcess(command, proc.returncode, captured_stdout, captured_stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -285,11 +487,11 @@ def _t3_conda_env_error() -> str | None:
             "was found on PATH; refusing to silently launch T3 under a different interpreter"
         )
     try:
-        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured conda executable only
+        completed = _run_in_process_group(
             [conda, "run", "-n", conda_env, "--no-capture-output", "python", "-c", "pass"],
-            capture_output=True,
             timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -323,13 +525,13 @@ def is_t3_importable() -> bool:
     """
     t3_python = _t3_python_command()
     try:
-        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter/conda-run only
+        completed = _run_in_process_group(
             [*t3_python, "-c", "import t3"],
-            capture_output=True,
             timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return False
     return completed.returncode == 0
 
@@ -349,14 +551,14 @@ def _t3_version() -> str | None:
     """
     t3_python = _t3_python_command()
     try:
-        completed = subprocess.run(  # noqa: S603 -- resolved, locally-configured interpreter/conda-run only
+        completed = _run_in_process_group(
             [*t3_python, "-c", "import t3; print(getattr(t3, '__version__', ''))"],
-            capture_output=True,
             timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
-            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
-    except (OSError, subprocess.SubprocessError):
+    except OSError, subprocess.SubprocessError:
         return None
     if completed.returncode != 0:
         return None
@@ -969,21 +1171,25 @@ class T3Adapter:
                 open(stdout_path, "w", encoding="utf-8") as stdout_file,
                 open(stderr_path, "w", encoding="utf-8") as stderr_file,
             ):
-                completed = subprocess.run(  # noqa: S603 -- T3 is a trusted tool
+                completed = _run_in_process_group(
                     command,
                     cwd=run_dir,
                     stdout=stdout_file,
                     stderr=stderr_file,
-                    timeout=int(action.estimated_cpu_hours * 3600 + 600),
-                    check=False,
+                    timeout=action.estimated_cpu_hours * _SECONDS_PER_HOUR + _RUN_TIMEOUT_BUFFER_S,
                 )
         except subprocess.TimeoutExpired as e:
+            # The process tree is already dead by the time this is caught —
+            # see _terminate_process_tree. That is what makes the TIMEOUT
+            # recorded below true rather than merely reported: before this,
+            # T3 and its RMG children kept running and kept writing into
+            # run_dir long after Carmel had declared the run timed out.
             return self._failed_record(
                 run_id=run_id,
                 action=action,
                 started=started,
                 failure_code=FailureCode.TIMEOUT,
-                error_message=str(e),
+                error_message=f"{e}; T3 and every process it started were killed",
                 input_path=input_path,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,

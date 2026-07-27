@@ -187,6 +187,61 @@ The visible symptom is that `import arc` — and therefore `import t3` —
 fails, `is_t3_importable()` returns `False`, and every real-subprocess test
 skips. That is why `$T3_CONDA_ENV` takes precedence over `$T3_PYTHON`.
 
+### Process trees, timeouts, and what TIMEOUT means
+
+Carmel never launches a leaf process. It launches `conda run`, which
+launches T3, which launches RMG — so killing only the direct child kills
+the *wrapper* and leaves the actual computation running.
+
+The adapter therefore starts every tool invocation with
+`start_new_session=True`, giving it a process group of its own, and on
+timeout signals the whole group: `SIGTERM`, then `SIGKILL` after a grace
+period. The direct child is reaped last, so its pid — which is also the
+group id — cannot be recycled before the final signal is sent.
+
+Nothing polls the child during that grace period, deliberately.
+`Popen.poll` *reaps* an exited child, releasing the very pid the group id
+depends on; buying an early exit with it is what would make the recycling
+race real. So the grace is waited out in full and the `SIGKILL` is sent
+unconditionally — signalling an already-empty group is a harmless `ESRCH`.
+This is the timeout path, which has already waited hours.
+
+`start_new_session` is not an optimisation, and on its own it fixes
+nothing: without it the child would share Carmel's *own* process group,
+and signalling that group would kill Carmel and its web server too.
+
+This is what makes a recorded `TIMEOUT` true. Previously a timed-out run
+left T3 and RMG alive, still holding the inherited log file descriptors
+and still writing into a run directory Carmel had already declared
+finished.
+
+Two limits are deliberate and worth stating:
+
+- **Anything that leaves the process group survives.** A T3 run that
+  submits jobs to a cluster scheduler puts that work beyond any group
+  Carmel can signal; killing the tree does not cancel a queued job.
+- **The timeout is `estimated_cpu_hours * 3600 + 600` seconds.** It bounds
+  a hung run, not a slow one — a run is killed once it exceeds its own
+  estimated budget by ten minutes.
+
+### Runs execute in the background
+
+`POST /run` performs the `RUNNING_T3` transition in the request thread and
+then hands the work to a daemon thread, returning immediately. Executed
+inline, a run holds the request open for hours: the browser times out, the
+redirect to the auto-refreshing dashboard never arrives, and the whole
+`RUNNING_T3` UX is unreachable from the tab that started the run.
+
+The *transition* stays synchronous on purpose. It is what rejects a
+double-submitted run — with a `409`, in the request that submitted it —
+rather than accepting it and racing a run already in flight.
+
+Because the worker is a daemon thread, interpreter exit does not join it.
+An `atexit` sweep therefore kills every still-running tool process tree on
+shutdown, so stopping the server does not leave T3 and RMG behind — the
+same orphaning described above, one layer up. It cannot help if Carmel
+itself is `SIGKILL`ed; nothing running inside Carmel can.
+
 ## Diagnostics Schema (DiagnosticsV1)
 
 The single Carmel-internal contract for T3 output. Includes:

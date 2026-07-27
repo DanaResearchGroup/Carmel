@@ -27,7 +27,7 @@ concurrency:
 #
 #   rmg_env   RMG-Py and Arkane          python >=3.9,<3.12
 #   t3_env    T3 and ARC together        python =3.14
-#   crml_env  Carmel itself              python >=3.12
+#   crml_env  Carmel itself              python >=3.14
 #
 # They are separate processes, not imports. T3 launches RMG as a subprocess
 # under rmg_env (T3/t3/runners/rmg_runner.py), and Carmel launches T3 as a

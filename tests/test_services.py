@@ -1,6 +1,7 @@
 """Tests for Phase 1 service modules."""
 
 import json
+import logging
 import os
 import threading
 from datetime import UTC, datetime
@@ -69,6 +70,7 @@ from carmel.services.execution import (
     load_diagnostics,
     save_diagnostics,
     save_run_record,
+    start_t3_action,
 )
 from carmel.services.intake import StubIntakeParser, write_intake_review
 from carmel.services.planner import (
@@ -1437,3 +1439,70 @@ class TestExecuteT3ActionDefaultAdapter:
         assert run_record.failure_code == FailureCode.TOOL_NOT_FOUND
         assert diagnostics is None
         assert load_state(ws).state == CampaignStateValue.FAILED
+
+
+class TestStartT3Action:
+    """The background entry point the web UI uses.
+
+    The transition must stay in the caller's thread — that is what makes a
+    double-submitted run fail for the user who submitted it — while the
+    work itself must not.
+    """
+
+    def test_returns_a_thread_that_completes_the_run(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        thread = start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+        thread.join(timeout=60)
+        assert not thread.is_alive()
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_transition_happens_before_returning(self, tmp_path: Path) -> None:
+        """RUNNING_T3 must be on disk by the time the caller gets control back."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        release = threading.Event()
+
+        class _Blocking:
+            def run(self, workspace_root: Path, campaign: object, action: PlannedAction) -> object:
+                release.wait(timeout=60)
+                raise RuntimeError("released")
+
+        thread = start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_Blocking())
+        assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+        release.set()
+        thread.join(timeout=60)
+
+    def test_ineligible_campaign_raises_in_the_calling_thread(self, tmp_path: Path) -> None:
+        """A caller must be able to turn a rejected run into a 409, not a 500."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        first = start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+        first.join(timeout=60)
+        with pytest.raises(InvalidTransitionError):
+            start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+
+    def test_adapter_exception_is_logged_not_swallowed_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Nobody is waiting on the thread, so the log is the only witness."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        class _Raising:
+            def run(self, workspace_root: Path, campaign: object, action: PlannedAction) -> object:
+                raise RuntimeError("adapter blew up in the background")
+
+        # Carmel's loggers set propagate=False, so caplog's root handler
+        # never sees them; attach it to the emitting logger directly.
+        emitter = logging.getLogger("carmel.services.execution")
+        emitter.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.ERROR):
+                thread = start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_Raising())
+                thread.join(timeout=60)
+        finally:
+            emitter.removeHandler(caplog.handler)
+
+        assert load_state(ws).state == CampaignStateValue.FAILED
+        assert any("Background T3 run failed" in record.message for record in caplog.records)
