@@ -97,15 +97,37 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
     CampaignStateValue.COMPLETED_PHASE1: frozenset(),
     CampaignStateValue.BLOCKED: frozenset(
         {
+            CampaignStateValue.READY_FOR_PLANNING,
             CampaignStateValue.FAILED,
         }
     ),
     CampaignStateValue.FAILED: frozenset(
         {
+            CampaignStateValue.READY_FOR_PLANNING,
             CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.DIAGNOSTICS_READY,
         }
     ),
 }
+
+
+RECOVERY_TARGETS: dict[CampaignStateValue, CampaignStateValue] = {
+    CampaignStateValue.RUNNING_T3: CampaignStateValue.APPROVED_FOR_EXECUTION,
+    CampaignStateValue.APPROVED_FOR_EXECUTION: CampaignStateValue.APPROVED_FOR_EXECUTION,
+    CampaignStateValue.DIAGNOSTICS_READY: CampaignStateValue.DIAGNOSTICS_READY,
+}
+"""Where a campaign that failed from a given state may resume *directly*.
+
+``APPROVED_FOR_EXECUTION`` maps to itself because a plan can fail between
+being approved and being launched — the adapter refuses to start, the
+workspace is unwritable — and such a campaign has an approved plan and no
+run. Sending it back through planning would discard an approval it
+already holds, for a run that never happened.
+
+Every other origin — and an unrecorded one — recovers only through
+``READY_FOR_PLANNING``, which is always available (see
+:func:`can_transition`).
+"""
 
 
 STATE_FILE_NAME = "campaign_state.json"
@@ -118,25 +140,36 @@ def can_transition(
 ) -> bool:
     """Check whether a state transition is allowed.
 
+    Recovery out of ``FAILED`` obeys one rule: an exit may only return the
+    campaign to a state it has demonstrably already reached, never to a
+    later one. ``READY_FOR_PLANNING`` is therefore always available — it
+    re-runs planning and the HITL approval gate from the start, so it
+    cannot bypass anything — while the two direct resumes in
+    :data:`RECOVERY_TARGETS` are each gated on the campaign having
+    actually been in that state when it failed.
+
     Args:
         current: The current state.
         target: The proposed next state.
         failed_from: The state the campaign failed from, if ``current`` is
-            ``FAILED``. Required to permit ``FAILED`` → ``APPROVED_FOR_EXECUTION``:
-            that retry edge is a genuine tool-execution retry — allowed only
-            when the campaign failed from ``RUNNING_T3`` (an already-approved
-            plan). A campaign that failed before planning or approval (e.g.
-            from ``DRAFT``, ``VALIDATED``, ``READY_FOR_PLANNING``,
-            ``PLAN_PENDING_APPROVAL``, or ``BLOCKED``) must not be able to
-            reach execution without going back through the HITL approval gate.
+            ``FAILED``. Required to permit the direct resumes:
+            ``APPROVED_FOR_EXECUTION`` (retry a tool run of an
+            already-approved plan) is allowed only when the campaign failed
+            from ``RUNNING_T3``, and ``DIAGNOSTICS_READY`` (adopt
+            diagnostics already on disk) only when it failed from
+            ``DIAGNOSTICS_READY``. A campaign that failed before planning
+            or approval — from ``DRAFT``, ``VALIDATED``,
+            ``READY_FOR_PLANNING``, ``PLAN_PENDING_APPROVAL``, or
+            ``BLOCKED`` — must go back through the approval gate, and does
+            so via ``READY_FOR_PLANNING``.
 
     Returns:
         True if the transition is allowed.
     """
     if target not in VALID_TRANSITIONS.get(current, frozenset()):
         return False
-    if current == CampaignStateValue.FAILED and target == CampaignStateValue.APPROVED_FOR_EXECUTION:
-        return failed_from == CampaignStateValue.RUNNING_T3
+    if current == CampaignStateValue.FAILED and target != CampaignStateValue.READY_FOR_PLANNING:
+        return failed_from is not None and RECOVERY_TARGETS.get(failed_from) == target
     return True
 
 

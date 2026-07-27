@@ -146,9 +146,10 @@ pytest tests/test_ui.py
 | `test_logger.py`           | Logger setup, archival, header/footer           |
 | `test_Carmel.py`           | CLI commands                                    |
 | `test_schemas.py`          | Phase 1 pydantic schemas                        |
-| `test_services.py`         | Artifacts, state machine, approvals, planner, drawing, intake, provenance |
+| `test_services.py`         | Artifacts, state machine, recovery, process groups, approvals, planner, drawing, intake, provenance |
 | `test_t3_adapter.py`       | T3 input building, output parsing, failure handling, optional subprocess |
 | `test_ui.py`               | Flask routes via the test client                |
+| `helpers.py`               | Not a test file — shared helpers for the tests that drive real process groups and in-flight run records |
 
 ### Test Expectations
 

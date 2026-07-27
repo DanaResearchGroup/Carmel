@@ -55,6 +55,8 @@ my-campaign/
 ├── campaign.yaml               # Canonical structured input
 ├── approval_policy.yaml        # Active approval policy
 ├── campaign_state.json         # Current lifecycle state
+├── active_run.json             # Present only while a run is in flight
+├── active_run.lock             # Held by the process supervising that run
 ├── plan.json                   # Current plan (canonical)
 ├── plan.md                     # Rendered plan summary
 ├── decision_log.jsonl          # Append-only decision stream
@@ -77,11 +79,126 @@ draft → validated → ready_for_planning → plan_pending_approval
                                      ↓
                           diagnostics_ready → completed_phase1
 
-(any state can also transition to → blocked or → failed)
+(every state except completed_phase1 can also transition to → failed;
+ only plan_pending_approval can transition to → blocked, by rejection)
 ```
 
 `carmel/services/state_machine.py` contains the explicit transition
 table. Invalid transitions raise `InvalidTransitionError`.
+
+### Recovery: getting out of `failed` and `blocked`
+
+A campaign that cannot leave `failed` is unusable, and every button on
+its dashboard raises. But an unconditional edge back to
+`approved_for_execution` would be worse: `failed` is reachable from
+`draft` and `validated` too, so that edge would let a campaign reach
+execution having never passed the approval gate.
+
+Recovery therefore obeys one rule — **an exit from `failed` may only
+return a campaign to a state it demonstrably already reached, never to a
+later one.** Three edges follow from it:
+
+| Exit | Available when | Meaning |
+|------|----------------|---------|
+| → `ready_for_planning` | always | Discard the plan and re-plan. Bypasses nothing: planning and the approval policy both run again from the start. |
+| → `approved_for_execution` | `failed_from == running_t3` or `approved_for_execution` | Retry a tool run of a plan that was already approved — whether it failed during the run, or between approval and launch. |
+| → `diagnostics_ready` | `failed_from == diagnostics_ready` | Adopt diagnostics already durable on disk, for a run that succeeded and then failed while being recorded as complete. |
+
+`CampaignState.failed_from` records the origin, and the direct resumes
+are gated on it. A state file Carmel did not write has no origin
+recorded, so only re-planning is offered — which is exactly the edge
+that needs no history to be safe.
+
+`blocked` (a rejected plan) exits the same way, to `ready_for_planning`.
+The plan is never un-rejected; a new one is generated and judged afresh.
+
+### Recovering a run whose supervisor died
+
+`running_t3` is the one state whose truth cannot be read off disk. If
+the Carmel process supervising a run is killed, no `except` runs, nobody
+writes the run's ending, and the campaign sits in `running_t3` forever
+while the dashboard promises progress.
+
+Guessing is harmful in both directions. Guessing "still running" wedges
+the campaign, which is the bug. Guessing "finished" is worse: it records
+the run as failed while T3 and RMG carry on writing into the workspace —
+the same defect the process-tree kill prevents, moved one layer up.
+
+So each run leaves two things behind, both at the workspace root:
+
+* `active_run.lock`, held under an exclusive `flock` for the run's
+  duration. The kernel releases it when the holder dies, however it
+  dies. A lock that can be taken therefore *proves* no supervisor
+  survives — unlike a heartbeat, it cannot go stale, and unlike a
+  recorded pid, it cannot be fooled by pid reuse.
+* `active_run.json`, holding the tool's process group id **together with
+  the group leader's start time and its kernel-observed command line**,
+  read back from `/proc` at launch.
+
+The lock is taken *before* the campaign ever reads as `running_t3`, and
+released by whichever thread finishes the run. Were it taken by the
+background thread instead, there would be an instant in which the
+campaign is running with no lock held and no record written — and a probe
+landing there would conclude nothing had ever started and offer to
+abandon a run that was about to launch.
+
+`probe_run_liveness()` combines them into one of five findings —
+`supervised`, `orphaned`, `unsupervised`, `no_record`, or `unknown` —
+which the dashboard reports verbatim rather than paraphrasing. It also
+decides whether the page auto-refreshes: a run nobody is supervising
+stops promising progress and offers a way out instead.
+
+Abandoning a run makes "this run is over" *true* rather than merely
+recorded. A supervised run is refused outright. An orphaned tool tree is
+stopped first, and only then is the campaign moved to `failed`.
+
+The leader's identity is recorded next to the pgid because a pgid alone
+is not proof of identity. Once every process in a group has exited, the
+leader's pid is free for the kernel to reuse, and an unrelated process
+that later becomes a group leader inherits that number. Signalling on the
+pgid alone would kill a stranger. `carmel/services/processes.py`
+therefore re-confirms, from `/proc`, that the group's leader is the very
+process this run launched before it signals anything.
+
+Identity is the leader's **start time** (`/proc/<pid>/stat` field 22),
+not its command line. Start time is the only reuse-proof pin: the kernel
+does not carry it over when it recycles a pid, so a group leader that
+started at a different instant is not this run's, whatever it is running.
+The command line is recorded too — as a human-readable label and a
+fallback for records written before the start-time pin — but it is *not*
+the identity, for two reasons. A reused pid can rerun the same argv, so
+the command line is too weak on its own. And it is also wrong for the
+deployment that actually ships: a `conda run` launch execs a `#!`
+wrapper, and the kernel rewrites its argv to prepend the interpreter, so
+the argv Carmel passed to `Popen` never matches what `/proc` reports.
+Recovery records the kernel's own view, read back at launch, so a later
+recovery compares like with like.
+
+That check has three distinct ways to come back negative, and they are
+**not** the same finding:
+
+| What `/proc` shows | Meaning | Carmel's response |
+|--------------------|---------|-------------------|
+| Leader started at a *different* time | The id was reused, which is only possible once the group emptied — so this run's processes have ended | `unsupervised`; the run is over |
+| Leader is gone, group still alive | Most likely T3 and RMG outliving the `conda run` that launched them | `unknown`; neither signalled nor called over |
+| No `/proc` at all, or no recorded identity | Nothing can be established | `unknown`; same |
+
+Collapsing the middle row into the first is a data-corruption bug, not a
+cosmetic one: it reports a live RMG as finished, and abandoning then
+writes a terminal run record while the tool keeps writing into the same
+workspace. A campaign in that state is reported honestly, with its
+process group id, and the operator is asked to stop the tree by hand —
+after which the group is empty and the ordinary path applies. Refusing to
+guess is the correct direction to fail in; the alternatives are killing a
+stranger's processes or corrupting a live run.
+
+Once a signal *has* been sent, the question changes from "is this group
+still recognizable?" to "is anything in it still running?" A SIGTERM that
+the leader honours and a descendant ignores leaves the group alive with
+its leader gone — no longer identifiable, but emphatically not stopped.
+Escalation to SIGKILL therefore waits on the group falling quiet, counting
+only processes that are actually executing: a zombie answers `killpg` but
+holds no file descriptors and can write nothing.
 
 ## Approval Policy
 

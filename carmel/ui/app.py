@@ -42,10 +42,20 @@ from carmel.services.campaigns import (
     list_campaigns,
     load_campaign,
 )
-from carmel.services.decision_log import read_events
-from carmel.services.execution import load_diagnostics, start_t3_action
+from carmel.services.decision_log import append_event, read_events
+from carmel.services.execution import (
+    RunStillLiveError,
+    abandon_t3_run,
+    load_diagnostics,
+    start_t3_action,
+)
 from carmel.services.intake import StubIntakeParser, write_intake_review
 from carmel.services.planner import load_plan, plan_and_save
+from carmel.services.recovery import (
+    LockStateUnknownError,
+    RunAlreadySupervisedError,
+    probe_run_liveness,
+)
 from carmel.services.state_machine import InvalidTransitionError, can_transition, load_state, update_state
 from carmel.ui.csrf import init_csrf
 
@@ -211,6 +221,10 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         if runs_dir.exists():
             run_files = sorted(runs_dir.glob("*.json"))
             latest_run_path = run_files[-1] if run_files else None
+        # Only probed while the campaign claims to be running: it is the
+        # one state whose truth cannot be read off disk, and the answer
+        # decides whether the page shows progress or a way out.
+        liveness = probe_run_liveness(ws) if state.state == CampaignStateValue.RUNNING_T3 else None
         return render_template(
             "campaign_dashboard.html",
             campaign=campaign,
@@ -220,6 +234,7 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
             events=events[-20:],
             latest_run_path=latest_run_path.name if latest_run_path else None,
             workspace_root=str(ws),
+            liveness=liveness,
         )
 
     @app.route("/campaigns/<campaign_id>/plan", methods=["POST"])
@@ -306,12 +321,121 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
             abort(409, description=f"Cannot start a run for a campaign in state {current.value!r}.")
         try:
             start_t3_action(ws, campaign, action)
-        except InvalidTransitionError:
+        except InvalidTransitionError, RunAlreadySupervisedError:
             # The preflight above is a read, so it cannot be authoritative:
             # a concurrent POST can win the race between it and the locked
-            # transition inside start_t3_action. The loser must still see a
-            # conflict rather than a 500.
+            # transition inside start_t3_action. Whether the loser trips the
+            # state check or the run lock first depends only on timing, so
+            # both must read as a conflict rather than a 500.
             abort(409, description="A run for this campaign was started concurrently.")
+        except LockStateUnknownError as e:
+            # The workspace's filesystem cannot answer whether a run lock is
+            # held (no working flock). That is an environment fault, not the
+            # caller's — a 503, not a 500 or a 409.
+            abort(503, description=f"Cannot determine run-lock state for this workspace: {e}")
+        return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
+
+    @app.route("/campaigns/<campaign_id>/replan", methods=["POST"])
+    def campaign_replan(campaign_id: str) -> Response:
+        """Send a failed or rejected campaign back to planning.
+
+        The universal way out of a wedged campaign. It is always available
+        because it bypasses nothing: the plan is regenerated and re-judged
+        against the approval policy from scratch.
+        """
+        ws = find_campaign_workspace(workspaces, campaign_id)
+        if ws is None:
+            abort(404)
+        state = load_state(ws)
+        if not can_transition(state.state, CampaignStateValue.READY_FOR_PLANNING, state.failed_from):
+            abort(409, description=f"Cannot re-plan a campaign in state {state.state.value!r}.")
+        update_state(ws, CampaignStateValue.READY_FOR_PLANNING, notes="recovered: re-planning")
+        append_event(
+            ws / "decision_log.jsonl",
+            {"event": "campaign_recovered", "recovery": "replan", "from_state": state.state.value},
+        )
+        flash("Campaign returned to planning. Generate a new plan to continue.", "info")
+        return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
+
+    @app.route("/campaigns/<campaign_id>/retry", methods=["POST"])
+    def campaign_retry(campaign_id: str) -> Response:
+        """Re-arm a campaign whose already-approved tool run failed.
+
+        Reachable when the campaign failed from ``RUNNING_T3`` or from
+        ``APPROVED_FOR_EXECUTION`` (a run that failed after approval but
+        before it launched) — the two origins ``RECOVERY_TARGETS`` maps
+        back to ``APPROVED_FOR_EXECUTION``. Either way the approval this
+        returns to is one a human (or the policy) already gave for this
+        very plan, so retry keeps it rather than discarding it through a
+        re-plan.
+        """
+        ws = find_campaign_workspace(workspaces, campaign_id)
+        if ws is None:
+            abort(404)
+        state = load_state(ws)
+        if not can_transition(state.state, CampaignStateValue.APPROVED_FOR_EXECUTION, state.failed_from):
+            abort(409, description=f"Cannot retry a campaign in state {state.state.value!r}.")
+        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="recovered: retrying the run")
+        append_event(
+            ws / "decision_log.jsonl",
+            {"event": "campaign_recovered", "recovery": "retry", "from_state": state.state.value},
+        )
+        flash("Run re-armed. Use Run T3 to start it again.", "info")
+        return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
+
+    @app.route("/campaigns/<campaign_id>/finalize", methods=["POST"])
+    def campaign_finalize(campaign_id: str) -> Response:
+        """Complete a campaign from diagnostics already persisted on disk.
+
+        Covers the run that produced real diagnostics and then failed
+        while being recorded as complete. Re-running a multi-hour T3 job
+        to recover output already sitting in the workspace would be
+        absurd, so this adopts it instead.
+        """
+        ws = find_campaign_workspace(workspaces, campaign_id)
+        if ws is None:
+            abort(404)
+        state = load_state(ws)
+        resuming = state.state == CampaignStateValue.FAILED
+        if resuming:
+            if not can_transition(state.state, CampaignStateValue.DIAGNOSTICS_READY, state.failed_from):
+                abort(409, description=f"Cannot complete a campaign in state {state.state.value!r}.")
+        elif state.state != CampaignStateValue.DIAGNOSTICS_READY:
+            abort(409, description=f"Cannot complete a campaign in state {state.state.value!r}.")
+        if load_diagnostics(ws) is None:
+            abort(409, description="There are no persisted diagnostics to complete this campaign from.")
+        if resuming:
+            update_state(ws, CampaignStateValue.DIAGNOSTICS_READY, notes="recovered: adopting persisted diagnostics")
+        update_state(ws, CampaignStateValue.COMPLETED_PHASE1, notes="recovered: completed from persisted diagnostics")
+        append_event(
+            ws / "decision_log.jsonl",
+            {"event": "campaign_recovered", "recovery": "finalize", "from_state": state.state.value},
+        )
+        flash("Campaign completed from its persisted diagnostics.", "info")
+        return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
+
+    @app.route("/campaigns/<campaign_id>/abandon", methods=["POST"])
+    def campaign_abandon(campaign_id: str) -> Response:
+        """End a run whose supervising Carmel process died.
+
+        Refuses while anything is still executing — see
+        :func:`~carmel.services.execution.abandon_t3_run`, which stops an
+        orphaned tool tree before it lets the campaign be called failed.
+        """
+        ws = find_campaign_workspace(workspaces, campaign_id)
+        if ws is None:
+            abort(404)
+        campaign = load_campaign(ws)
+        state = load_state(ws)
+        if state.state != CampaignStateValue.RUNNING_T3:
+            abort(409, description=f"Cannot abandon a run for a campaign in state {state.state.value!r}.")
+        try:
+            _, report = abandon_t3_run(ws, campaign)
+        except RunStillLiveError as e:
+            abort(409, description=str(e))
+        except InvalidTransitionError:
+            abort(409, description="The campaign changed state while it was being abandoned.")
+        flash(f"Run abandoned. {report.detail}", "info")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/free-text", methods=["POST"])

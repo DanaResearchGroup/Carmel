@@ -227,6 +227,13 @@ main.content {
   box-shadow: 0 0 0 3px var(--accent-blue-bg), var(--shadow-sm);
 }
 
+/* Needs recovery */
+.card.needs-recovery {
+  border-color: var(--accent-error);
+  box-shadow: 0 0 0 3px var(--accent-error-bg), var(--shadow-sm);
+  background: linear-gradient(180deg, var(--accent-error-bg) 0%, var(--card-bg) 60px);
+}
+
 /* ----------------------- Status pills ----------------------- */
 .pill {
   display: inline-flex;

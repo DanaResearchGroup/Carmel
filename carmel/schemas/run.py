@@ -28,6 +28,7 @@ class FailureCode(StrEnum):
     TIMEOUT = "timeout"
     TOOL_NOT_FOUND = "tool_not_found"
     INPUT_BUILD_ERROR = "input_build_error"
+    ABANDONED = "abandoned"
     UNKNOWN = "unknown"
 
 
@@ -37,6 +38,45 @@ class SubmissionMode(StrEnum):
     SUBPROCESS = "subprocess"
     SERVER = "server"
     LOCAL = "local"
+
+
+class ActiveRun(BaseModel):
+    """A tool run believed to be in flight, and what to reap if it is not.
+
+    Written when a run starts and removed when it finishes, so its mere
+    presence means "a run was started and never recorded an ending". That
+    is not the same as "a run is still going": the Carmel process
+    supervising it may have been killed. Liveness is established
+    separately, from the supervisor lock and the recorded process group —
+    see :mod:`carmel.services.recovery`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action_id: str = Field(min_length=1)
+    started_at: datetime
+    supervisor_pid: int = Field(gt=0)
+    """The Carmel process that started the run. Recorded for operators to
+    read; liveness is never inferred from it, because a pid outlives its
+    process only until the kernel reuses the number."""
+
+    process_group_id: int | None = Field(default=None, gt=0)
+    """The tool's process group, once it has been launched. None while the
+    run is being prepared, and on any run whose tool never started."""
+
+    command: list[str] | None = None
+    """The group leader's kernel-observed argv, read back from ``/proc``
+    when the tool was launched. A human-readable label and the fallback
+    identity for records written before ``leader_starttime`` existed; not
+    the primary identity, because a reused pid can rerun the same argv."""
+
+    leader_starttime: int | None = Field(default=None, ge=0)
+    """The group leader's start time (``/proc/<pid>/stat`` field 22), in
+    clock ticks since boot. The reuse-proof identity confirming a surviving
+    group really is this run's before anything signals it: the kernel does
+    not carry a start time over when it recycles a pid. None on records
+    written before this field, and when ``/proc`` could not be read at
+    launch."""
 
 
 class RunRecord(BaseModel):
