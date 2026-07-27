@@ -58,4 +58,7 @@ jobs:
           custom-allsigned-prcomment: All contributors have signed the Carmel CLA.
           # Bot accounts cannot hold copyright, so they have nothing to assign.
           # Contributors covered by a signed Corporate CLA belong here too.
-          allowlist: dependabot[bot],github-actions[bot],*[bot]
+          # The project owner (alongd) is the CLA's licensee/copyright holder —
+          # there is no one for them to assign rights to, so they are allowlisted
+          # rather than asked to sign their own agreement.
+          allowlist: dependabot[bot],github-actions[bot],*[bot],alongd
