@@ -23,6 +23,7 @@ import pytest
 import yaml
 
 from carmel.adapters.arc import (
+    ARC_GUARDRAILS,
     ARC_LAYOUT,
     DEFAULT_JOB_TYPES,
     MOCK_LEVEL_OF_THEORY,
@@ -39,6 +40,7 @@ from carmel.adapters.arc import (
     is_arc_installed,
     normalize_arc_outputs,
     read_arc_info_file,
+    read_arc_output_file,
     resolve_project_info_file,
     write_arc_input_file,
 )
@@ -289,37 +291,79 @@ class TestBuildARCInput:
         payload = build_arc_input(campaign, _action())
         assert payload[ARC_LAYOUT.INPUT_SPECIES_KEY] == [{"label": "AR"}]
 
-    def test_action_species_skips_invalid_entries(self, tmp_path: Path) -> None:
+    def test_action_species_with_one_malformed_entry_raises(self, tmp_path: Path) -> None:
+        """A present ``species`` list is the exact requested target set: a
+        single malformed entry must raise, not silently retarget onto the
+        valid subset (that would run a different, smaller job than asked)."""
         action = _action(
             species=[
                 {"label": "OH"},  # valid, no smiles
-                {"smiles": "[CH3]"},  # missing label -> skipped
-                "not-a-dict",  # skipped
+                {"smiles": "[CH3]"},  # missing label -> malformed
+                "not-a-dict",  # malformed
                 {"label": "H2O2", "smiles": "OO"},
             ]
         )
-        payload = build_arc_input(_campaign(tmp_path), action)
-        assert payload[ARC_LAYOUT.INPUT_SPECIES_KEY] == [
-            {"label": "OH"},
-            {"label": "H2O2", "smiles": "OO"},
-        ]
+        with pytest.raises(ValueError, match="contains malformed entries") as excinfo:
+            build_arc_input(_campaign(tmp_path), action)
+        assert "not-a-dict" in str(excinfo.value)
 
-    def test_action_species_all_invalid_falls_back_to_mixture(self, tmp_path: Path) -> None:
+    def test_action_species_all_invalid_raises_and_surfaces_dropped(self, tmp_path: Path) -> None:
+        """F9: a present-but-unusable ``species`` must not silently fall back
+        to the full mixture — the caller asked for specific targets and would
+        otherwise get a different (much larger) job."""
         action = _action(species=[{"smiles": "[CH3]"}, "not-a-dict"])
-        payload = build_arc_input(_campaign(tmp_path), action)
-        labels = [s["label"] for s in payload[ARC_LAYOUT.INPUT_SPECIES_KEY]]
-        assert labels == ["OH", "CH3"]
+        with pytest.raises(ValueError, match="contains malformed entries") as excinfo:
+            build_arc_input(_campaign(tmp_path), action)
+        assert "not-a-dict" in str(excinfo.value)
 
-    def test_action_reactions_skips_invalid_entries(self, tmp_path: Path) -> None:
+    def test_action_species_empty_list_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="'species' is present but empty"):
+            build_arc_input(_campaign(tmp_path), _action(species=[]))
+
+    def test_action_species_absent_falls_back_to_mixture(self, tmp_path: Path) -> None:
+        """The 'species' key absent entirely is the only case that falls back
+        to the campaign mixture — this must keep working unmodified."""
+        payload = build_arc_input(_campaign(tmp_path), _action())
+        assert [s["label"] for s in payload[ARC_LAYOUT.INPUT_SPECIES_KEY]] == ["OH", "CH3"]
+
+    def test_action_reactions_all_invalid_raises_and_surfaces_dropped(self, tmp_path: Path) -> None:
+        action = _action(reactions=[{"reactants": ["A"]}, "not-a-dict"])
+        with pytest.raises(ValueError, match="contains malformed entries") as excinfo:
+            build_arc_input(_campaign(tmp_path), action)
+        assert "not-a-dict" in str(excinfo.value)
+
+    @pytest.mark.parametrize("bad", ["../evil", "a/b", "a\\b", ".."])
+    def test_unsafe_project_name_rejected(self, tmp_path: Path, bad: str) -> None:
+        """F10: the project name flows into path joins (``<project>_info.yml``),
+        so a separator or ``..`` must be rejected up front."""
+        with pytest.raises(ValueError, match="must not contain path separators"):
+            build_arc_input(_campaign(tmp_path), _action(project=bad))
+
+    def test_action_reactions_with_one_malformed_entry_raises(self, tmp_path: Path) -> None:
+        """A non-empty 'reactions' list is the exact requested target set: a
+        single malformed entry must raise, not silently drop it."""
         action = _action(
             reactions=[
                 {"label": "A => B"},
-                {"reactants": ["A"]},  # missing label -> skipped
-                "not-a-dict",  # skipped
+                {"reactants": ["A"]},  # missing label -> malformed
+                "not-a-dict",  # malformed
             ]
         )
-        payload = build_arc_input(_campaign(tmp_path), action)
-        assert payload[ARC_LAYOUT.INPUT_REACTIONS_KEY] == [{"label": "A => B"}]
+        with pytest.raises(ValueError, match="contains malformed entries") as excinfo:
+            build_arc_input(_campaign(tmp_path), action)
+        assert "not-a-dict" in str(excinfo.value)
+
+    def test_action_reactions_absent_yields_no_reactions(self, tmp_path: Path) -> None:
+        payload = build_arc_input(_campaign(tmp_path), _action())
+        assert ARC_LAYOUT.INPUT_REACTIONS_KEY not in payload
+        assert payload[ARC_LAYOUT.INPUT_TS_ADAPTERS_KEY] == []
+
+    def test_action_reactions_present_empty_is_valid_species_only_job(self, tmp_path: Path) -> None:
+        """reactions=[] is a legitimate species-only thermo job: no raise,
+        and no reactions are sent to ARC."""
+        payload = build_arc_input(_campaign(tmp_path), _action(reactions=[]))
+        assert ARC_LAYOUT.INPUT_REACTIONS_KEY not in payload
+        assert payload[ARC_LAYOUT.INPUT_TS_ADAPTERS_KEY] == []
 
 
 class TestWriteARCInputFile:
@@ -354,12 +398,34 @@ class TestReadARCInfoFile:
         with pytest.raises(ValueError, match="mapping"):
             read_arc_info_file(path)
 
+    def test_invalid_yaml_raises_value_error(self, tmp_path: Path) -> None:
+        """F11: yaml.YAMLError is not a ValueError; without the wrap it would
+        escape the adapter's typed INVALID_OUTPUT contract."""
+        path = tmp_path / "bad.yml"
+        path.write_text("species: [unterminated\n")
+        with pytest.raises(ValueError, match="not valid YAML"):
+            read_arc_info_file(path)
+
     def test_defaults_missing_keys(self, tmp_path: Path) -> None:
         path = tmp_path / "minimal.yml"
         path.write_text("project: x\n")
         info = read_arc_info_file(path)
         assert info["species"] == []
         assert info["reactions"] == []
+
+
+class TestReadARCOutputFile:
+    def test_missing_returns_none(self, tmp_path: Path) -> None:
+        assert read_arc_output_file(tmp_path) is None
+
+    def test_invalid_yaml_raises_value_error(self, tmp_path: Path) -> None:
+        """F11: same wrap as the info file — corrupt YAML must surface as the
+        typed ValueError, not an unhandled yaml.YAMLError."""
+        out = tmp_path / "output"
+        out.mkdir()
+        (out / "output.yml").write_text("arc_version: [unterminated\n")
+        with pytest.raises(ValueError, match="not valid YAML"):
+            read_arc_output_file(tmp_path)
 
 
 class TestCoerceEntries:
@@ -513,13 +579,16 @@ class TestNormalizeArcOutputsInline:
         assert [r.label for r in diag.reactions_to_compute] == ["OH + CH3 => CH4 + O"]
         assert diag.tool_metadata["reaction_count"] == 1
 
-    def test_output_only_without_info_file(self, tmp_path: Path) -> None:
+    def test_output_only_without_info_file_raises(self, tmp_path: Path) -> None:
+        """F12: an output.yml with no ``<project>_info.yml`` is not a success.
+        ARC writes the info file unconditionally at the end of a run, so its
+        absence means the run died — returning SUCCESS with empty
+        species/reactions would silently lose every result."""
         project = tmp_path / "proj"
         (project / "output").mkdir(parents=True)
         (project / "output" / "output.yml").write_text(yaml.safe_dump({"arc_version": "0.0.1", "species": []}))
-        diag = normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
-        assert diag.species_to_compute == []
-        assert diag.tool_metadata["arc_version"] == "0.0.1"
+        with pytest.raises(ValueError, match="No ARC info file"):
+            normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
 
 
 # ---------------------------------------------------------------------------
@@ -553,6 +622,48 @@ class TestARCAdapterFailures:
         run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
         assert run.status == RunStatus.FAILED
         assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
+        assert diagnostics is None
+
+    def test_run_dir_creation_failure_is_typed(self, tmp_path: Path) -> None:
+        """F8: an OSError from run_dir.mkdir must return a typed
+        SUBPROCESS_ERROR record, not escape the adapter (mirrors T3)."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "runs").write_text("not a directory")
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.SUBPROCESS_ERROR
+        assert "Could not create run directory" in (run.error_message or "")
+        assert diagnostics is None
+
+    def test_input_write_os_error_is_typed(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """F8: write_arc_input_file does mkdir+write_text, which raise OSError —
+        that must map to INPUT_BUILD_ERROR like the T3 input-build path."""
+        from carmel.adapters import arc as arc_module
+
+        def _raise(*_a: object, **_k: object) -> Path:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(arc_module, "write_arc_input_file", _raise)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
+        assert "disk full" in (run.error_message or "")
+        assert diagnostics is None
+
+    def test_species_present_but_all_invalid_is_input_build_error(self, tmp_path: Path) -> None:
+        """F9 end-to-end: the ValueError from _resolve_species must surface as
+        a typed INPUT_BUILD_ERROR, never as a silently retargeted job."""
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(
+            workspace_root=ws, campaign=_campaign(ws), action=_action(species=["not-a-dict"])
+        )
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INPUT_BUILD_ERROR
+        assert "malformed entries" in (run.error_message or "")
         assert diagnostics is None
 
     def test_subprocess_raises_os_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -651,6 +762,31 @@ class TestARCAdapterFailures:
         assert sorted(s.label for s in diagnostics.species_to_compute) == ["CH3", "OH"]
         assert diagnostics.level_of_theory == MOCK_LEVEL_OF_THEORY
 
+    def test_corrupt_info_yaml_is_typed_invalid_output(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """F11 end-to-end: a corrupt ``<project>_info.yml`` must produce a typed
+        INVALID_OUTPUT record — yaml.YAMLError must not escape run()."""
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+
+        class _Completed:
+            returncode = 0
+
+        def _fake_run(command: list[str], cwd: Path, **kwargs: object) -> _Completed:
+            run_dir = Path(cwd)
+            payload = yaml.safe_load((run_dir / "input.yml").read_text())
+            (run_dir / arc_info_filename(payload)).write_text("species: [unterminated\n")
+            return _Completed()
+
+        monkeypatch.setattr(arc_module.subprocess, "run", _fake_run)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INVALID_OUTPUT
+        assert "not valid YAML" in (run.error_message or "")
+        assert diagnostics is None
+
     def test_estimate_cost_uses_declared_estimate(self) -> None:
         assert ARCAdapter().estimate_cost(_action()) == 1.0
 
@@ -658,6 +794,71 @@ class TestARCAdapterFailures:
         action = _action(species=[{"label": "A"}, {"label": "B"}], reactions=[{"label": "A => B"}])
         action = action.model_copy(update={"estimated_cpu_hours": 0.0})
         assert ARCAdapter().estimate_cost(action) == 4.0  # 2 species + 2*1 reaction
+
+    def test_estimate_cost_with_campaign_reflects_mixture_fallback(self, tmp_path: Path) -> None:
+        """F13: with no explicit species, the estimate must reflect the mixture
+        the input actually resolves to, not a single-species floor."""
+        action = _action().model_copy(update={"estimated_cpu_hours": 0.0})
+        adapter = ARCAdapter()
+        assert adapter.estimate_cost(action) == 1.0  # without the campaign: blind floor
+        assert adapter.estimate_cost(action, _campaign(tmp_path)) == 2.0  # OH + CH3
+
+    def test_estimate_cost_with_campaign_counts_resolved_species_and_reactions(self, tmp_path: Path) -> None:
+        action = _action(species=[{"label": "A"}, {"label": "B"}], reactions=[{"label": "A => B"}])
+        action = action.model_copy(update={"estimated_cpu_hours": 0.0})
+        assert ARCAdapter().estimate_cost(action, _campaign(tmp_path)) == 4.0
+
+    def test_estimate_cost_with_campaign_survives_unresolvable_parameters(self, tmp_path: Path) -> None:
+        """estimate_cost must never raise (it runs inside _failed_record too):
+        unresolvable parameters fall back to the raw-parameter estimate."""
+        action = _action(species=[{"smiles": "no-label"}]).model_copy(update={"estimated_cpu_hours": 0.0})
+        assert ARCAdapter().estimate_cost(action, _campaign(tmp_path)) == 1.0
+
+    def test_timeout_budget_reflects_resolved_input(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """F13 end-to-end: the subprocess wall-clock must be derived from the
+        resolved input size (2 mixture species), not the absent species param."""
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+        captured: dict[str, object] = {}
+
+        class _Completed:
+            returncode = 1
+
+        def _fake_run(command: list[str], cwd: Path, **kwargs: object) -> _Completed:
+            captured.update(kwargs)
+            return _Completed()
+
+        monkeypatch.setattr(arc_module.subprocess, "run", _fake_run)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        action = _action().model_copy(update={"estimated_cpu_hours": 0.0})
+        ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=action)
+        assert captured["timeout"] == int(2 * 3600 + ARC_GUARDRAILS.subprocess_grace_seconds)
+
+    def test_failed_record_estimate_reflects_resolved_input(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed run record must carry the same resolved-input estimate as
+        timeout/success records, not the blind single-species floor — even
+        though the estimate is only used for bookkeeping once ARC has failed."""
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+
+        class _Completed:
+            returncode = 1
+
+        monkeypatch.setattr(arc_module.subprocess, "run", lambda *a, **k: _Completed())
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        action = _action().model_copy(update={"estimated_cpu_hours": 0.0})
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=action)
+        assert run.status == RunStatus.FAILED
+        assert diagnostics is None
+        # 2 mixture species (OH + CH3) resolved via the campaign, not the blind
+        # single-species floor that ignores the campaign entirely.
+        assert run.estimated_cpu_hours == 2.0
 
 
 class TestARCAdapterRealSubprocess:

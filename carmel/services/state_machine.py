@@ -137,11 +137,12 @@ def can_transition(
         failed_from: The state the campaign failed from, if ``current`` is
             ``FAILED``. Required to permit ``FAILED`` → ``APPROVED_FOR_EXECUTION``:
             that retry edge is a genuine tool-execution retry — allowed only
-            when the campaign failed from ``RUNNING_T3`` (an already-approved
-            plan). A campaign that failed before planning or approval (e.g.
-            from ``DRAFT``, ``VALIDATED``, ``READY_FOR_PLANNING``,
-            ``PLAN_PENDING_APPROVAL``, or ``BLOCKED``) must not be able to
-            reach execution without going back through the HITL approval gate.
+            when the campaign failed from ``RUNNING_T3`` or ``RUNNING_ARC``
+            (an already-approved plan). A campaign that failed before planning
+            or approval (e.g. from ``DRAFT``, ``VALIDATED``,
+            ``READY_FOR_PLANNING``, ``PLAN_PENDING_APPROVAL``, or ``BLOCKED``)
+            must not be able to reach execution without going back through the
+            HITL approval gate.
 
     Returns:
         True if the transition is allowed.
@@ -149,7 +150,7 @@ def can_transition(
     if target not in VALID_TRANSITIONS.get(current, frozenset()):
         return False
     if current == CampaignStateValue.FAILED and target == CampaignStateValue.APPROVED_FOR_EXECUTION:
-        return failed_from == CampaignStateValue.RUNNING_T3
+        return failed_from in (CampaignStateValue.RUNNING_T3, CampaignStateValue.RUNNING_ARC)
     return True
 
 

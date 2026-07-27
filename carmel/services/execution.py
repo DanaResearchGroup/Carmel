@@ -17,6 +17,7 @@ Production callers always pass the real :class:`T3Adapter`.
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -38,6 +39,7 @@ DIAGNOSTICS_FILE_NAME = "diagnostics.json"
 ARC_DIAGNOSTICS_FILE_NAME = "arc_diagnostics.json"
 RUNS_DIR_NAME = "runs"
 MODELS_DIR_NAME = "models"
+ARC_MODELS_SUBDIR_NAME = "arc"
 
 _log = get_logger("services.execution")
 
@@ -116,6 +118,22 @@ def clear_stale_diagnostics_artifacts(workspace_root: Path) -> None:
         (models_dir / filename).unlink(missing_ok=True)
 
 
+def clear_stale_arc_diagnostics_artifacts(workspace_root: Path) -> None:
+    """Remove any previous run's ``arc_diagnostics.json`` and selection SVGs.
+
+    ARC mirror of :func:`clear_stale_diagnostics_artifacts`: called before
+    every ARC run starts so that a run which never reaches its success
+    branch — whether it returns a typed failure or the process crashes
+    outright — cannot leave a prior run's ARC diagnostics and SVGs on disk
+    looking like current output. Tolerant of the files not existing (first
+    run, or a prior run that never produced them).
+    """
+    (workspace_root / ARC_DIAGNOSTICS_FILE_NAME).unlink(missing_ok=True)
+    models_dir = workspace_root / MODELS_DIR_NAME / ARC_MODELS_SUBDIR_NAME
+    for filename in SELECTION_SVG_FILENAMES:
+        (models_dir / filename).unlink(missing_ok=True)
+
+
 def save_arc_diagnostics(workspace_root: Path, diagnostics: DiagnosticsV1) -> Path:
     """Persist arc_diagnostics.json at the workspace root.
 
@@ -154,6 +172,13 @@ def _default_arc_adapter() -> ARCAdapterProtocol:
     from carmel.adapters.arc import ARCAdapter
 
     return ARCAdapter()
+
+
+def _arc_tool_name() -> str:
+    """Return the canonical ARC tool name (lazy import to avoid cycles)."""
+    from carmel.adapters.arc import ARC_TOOL_NAME
+
+    return ARC_TOOL_NAME
 
 
 def execute_t3_action(
@@ -355,7 +380,19 @@ def _finish_t3_run(
 
         return run_record, diagnostics
     except Exception as e:
-        _handle_unexpected_failure(workspace_root, campaign, action, adapter, started, run_record, e)
+        _handle_unexpected_failure(
+            workspace_root,
+            campaign,
+            action,
+            adapter,
+            started,
+            run_record,
+            e,
+            tool_name=_t3_tool_name,
+            provenance_kind="t3_run",
+            finished_event="t3_run_finished",
+            tool_label="T3",
+        )
         raise
 
 
@@ -363,14 +400,21 @@ def _handle_unexpected_failure(
     workspace_root: Path,
     campaign: Campaign,
     action: PlannedAction,
-    adapter: T3AdapterProtocol,
+    adapter: T3AdapterProtocol | ARCAdapterProtocol,
     started: datetime,
     run_record: RunRecord | None,
     error: Exception,
+    *,
+    tool_name: Callable[[], str],
+    provenance_kind: str,
+    finished_event: str,
+    tool_label: str,
 ) -> None:
-    """Best-effort cleanup after an unexpected exception in ``execute_t3_action``.
+    """Best-effort cleanup after an unexpected exception during execution.
 
-    This function must never raise anything: the caller's ``raise`` must
+    Tool-agnostic: shared by ``execute_t3_action`` and ``execute_arc_action``,
+    parameterized by the tool's canonical name and its provenance/decision-log
+    keys. This function must never raise anything: the caller's ``raise`` must
     re-surface ``error`` unmodified, not an ``InvalidTransitionError`` or an
     exception from this function's own persistence attempts. If the
     adapter already returned a real ``run_record`` before the failure, it
@@ -380,12 +424,23 @@ def _handle_unexpected_failure(
     Args:
         workspace_root: The campaign workspace root.
         campaign: The campaign being executed.
-        action: The planned T3 action.
+        action: The planned action.
         adapter: The adapter that was invoked for this run (used to derive
             ``submission_mode`` when no real run record exists).
         started: When the run started.
         run_record: The real RunRecord the adapter returned, if any.
         error: The original exception that triggered this handler.
+        tool_name: Lazily-called resolver for the canonical tool name
+            (e.g. ``_t3_tool_name`` or ``_arc_tool_name``), used only to
+            fabricate a run record when no real ``run_record`` exists. Passed
+            as a callable rather than an already-resolved string so this
+            (rarely exercised) cleanup path doesn't pay for a lookup whose
+            result may not even be used.
+        provenance_kind: Provenance record kind (e.g. ``"t3_run"``).
+        finished_event: Decision-log finished-event name
+            (e.g. ``"t3_run_finished"``).
+        tool_label: Human-readable tool label for log messages
+            (e.g. ``"T3"``).
     """
     ended = datetime.now(UTC)
     if run_record is not None:
@@ -401,7 +456,7 @@ def _handle_unexpected_failure(
         failed_record = RunRecord(
             run_id=str(uuid4()),
             action_id=action.action_id,
-            tool_name=_t3_tool_name(),
+            tool_name=tool_name(),
             status=RunStatus.FAILED,
             failure_code=FailureCode.UNKNOWN,
             started_at=started,
@@ -414,7 +469,7 @@ def _handle_unexpected_failure(
         save_run_record(workspace_root, failed_record)
         record(
             workspace_root,
-            "t3_run",
+            provenance_kind,
             {
                 "run_id": failed_record.run_id,
                 "action_id": action.action_id,
@@ -426,7 +481,7 @@ def _handle_unexpected_failure(
         append_event(
             workspace_root / "decision_log.jsonl",
             {
-                "event": "t3_run_finished",
+                "event": finished_event,
                 "run_id": failed_record.run_id,
                 "status": failed_record.status.value,
                 "failure_code": failed_record.failure_code.value,
@@ -450,7 +505,7 @@ def _handle_unexpected_failure(
             exc_info=True,
         )
 
-    _log.error("T3 run raised an unexpected exception for campaign %s: %s", campaign.campaign_id, error)
+    _log.error("%s run raised an unexpected exception for campaign %s: %s", tool_label, campaign.campaign_id, error)
 
 
 def execute_arc_action(
@@ -465,7 +520,10 @@ def execute_arc_action(
     ``APPROVED_FOR_EXECUTION`` -> ``RUNNING_ARC`` -> ``RESULTS_READY`` ->
     ``COMPLETED_PHASE1`` on success, or -> ``FAILED`` on any failure. Owns the
     ARC workflow: state transitions, decision-log entries, provenance, and
-    run-record + diagnostics persistence.
+    run-record + diagnostics persistence. As with T3, everything after the
+    ``RUNNING_ARC`` transition succeeds runs inside a protected region: any
+    unexpected exception still drives the campaign to ``FAILED`` rather than
+    leaving it wedged in ``RUNNING_ARC``.
 
     Args:
         workspace_root: The campaign workspace root.
@@ -477,66 +535,94 @@ def execute_arc_action(
 
     Returns:
         Tuple of (RunRecord, DiagnosticsV1 or None on failure).
+
+    Raises:
+        InvalidTransitionError: If the campaign is not eligible to enter
+            ``RUNNING_ARC``. The workspace is left untouched.
     """
     if adapter is None:
         adapter = _default_arc_adapter()
 
     update_state(workspace_root, CampaignStateValue.RUNNING_ARC, notes=f"action={action.action_id}")
     started = datetime.now(UTC)
-    append_event(
-        workspace_root / "decision_log.jsonl",
-        {
-            "event": "arc_run_started",
-            "action_id": action.action_id,
-            "started_at": started.isoformat(),
-        },
-    )
-
-    run_record, diagnostics = adapter.run(
-        workspace_root=workspace_root,
-        campaign=campaign,
-        action=action,
-    )
-
-    save_run_record(workspace_root, run_record)
-    record(
-        workspace_root,
-        "arc_run",
-        {
-            "run_id": run_record.run_id,
-            "action_id": action.action_id,
-            "status": run_record.status.value,
-            "failure_code": run_record.failure_code.value,
-            "level_of_theory": run_record.level_of_theory,
-        },
-    )
-    append_event(
-        workspace_root / "decision_log.jsonl",
-        {
-            "event": "arc_run_finished",
-            "run_id": run_record.run_id,
-            "status": run_record.status.value,
-            "failure_code": run_record.failure_code.value,
-        },
-    )
-
-    if run_record.status == RunStatus.SUCCEEDED and diagnostics is not None:
-        save_arc_diagnostics(workspace_root, diagnostics)
-        write_selection_svgs(
-            workspace_root / "models" / "arc",
-            diagnostics.species_to_compute,
-            diagnostics.reactions_to_compute,
-            diagnostics.pdep_networks_to_compute,
+    run_record: RunRecord | None = None
+    try:
+        clear_stale_arc_diagnostics_artifacts(workspace_root)
+        append_event(
+            workspace_root / "decision_log.jsonl",
+            {
+                "event": "arc_run_started",
+                "action_id": action.action_id,
+                "started_at": started.isoformat(),
+            },
         )
-        update_state(workspace_root, CampaignStateValue.RESULTS_READY)
-        update_state(workspace_root, CampaignStateValue.COMPLETED_PHASE1)
-        _log.info("ARC run %s succeeded for campaign %s", run_record.run_id, campaign.campaign_id)
-    else:
-        update_state(
+
+        run_record, diagnostics = adapter.run(
+            workspace_root=workspace_root,
+            campaign=campaign,
+            action=action,
+        )
+
+        if run_record.status == RunStatus.SUCCEEDED and diagnostics is not None:
+            # Diagnostics/SVGs must be durable BEFORE the decision log
+            # claims the run succeeded — otherwise a failure here would
+            # leave a "succeeded" finished event contradicted by the
+            # UNKNOWN-failure event that follows it. Same ordering as T3.
+            save_arc_diagnostics(workspace_root, diagnostics)
+            write_selection_svgs(
+                workspace_root / MODELS_DIR_NAME / ARC_MODELS_SUBDIR_NAME,
+                diagnostics.species_to_compute,
+                diagnostics.reactions_to_compute,
+                diagnostics.pdep_networks_to_compute,
+            )
+
+        save_run_record(workspace_root, run_record)
+        record(
             workspace_root,
-            CampaignStateValue.FAILED,
-            notes=run_record.error_message,
+            "arc_run",
+            {
+                "run_id": run_record.run_id,
+                "action_id": action.action_id,
+                "status": run_record.status.value,
+                "failure_code": run_record.failure_code.value,
+                "level_of_theory": run_record.level_of_theory,
+            },
         )
-        _log.warning("ARC run %s failed: %s", run_record.run_id, run_record.failure_code.value)
+        append_event(
+            workspace_root / "decision_log.jsonl",
+            {
+                "event": "arc_run_finished",
+                "run_id": run_record.run_id,
+                "status": run_record.status.value,
+                "failure_code": run_record.failure_code.value,
+            },
+        )
 
-    return run_record, diagnostics
+        if run_record.status == RunStatus.SUCCEEDED and diagnostics is not None:
+            update_state(workspace_root, CampaignStateValue.RESULTS_READY)
+            update_state(workspace_root, CampaignStateValue.COMPLETED_PHASE1)
+            _log.info("ARC run %s succeeded for campaign %s", run_record.run_id, campaign.campaign_id)
+        else:
+            update_state(
+                workspace_root,
+                CampaignStateValue.FAILED,
+                notes=run_record.error_message,
+            )
+            _log.warning("ARC run %s failed: %s", run_record.run_id, run_record.failure_code.value)
+
+        return run_record, diagnostics
+    except Exception as e:
+        _handle_unexpected_failure(
+            workspace_root,
+            campaign,
+            action,
+            adapter,
+            started,
+            run_record,
+            e,
+            tool_name=_arc_tool_name,
+            provenance_kind="arc_run",
+            finished_event="arc_run_finished",
+            tool_label="ARC",
+        )
+        raise

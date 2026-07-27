@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from carmel.adapters.arc import ARC_TOOL_NAME
 from carmel.adapters.t3 import T3_TOOL_NAME
 from carmel.schemas import (
     ActionKind,
@@ -394,11 +395,16 @@ class TestStateMachine:
         with pytest.raises(InvalidTransitionError):
             update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION)
 
-    def test_failed_can_retry_to_approved_for_execution_only_from_running_t3(self) -> None:
+    def test_failed_can_retry_to_approved_for_execution_only_from_a_running_tool(self) -> None:
         assert can_transition(
             CampaignStateValue.FAILED,
             CampaignStateValue.APPROVED_FOR_EXECUTION,
             failed_from=CampaignStateValue.RUNNING_T3,
+        )
+        assert can_transition(
+            CampaignStateValue.FAILED,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            failed_from=CampaignStateValue.RUNNING_ARC,
         )
         assert not can_transition(CampaignStateValue.FAILED, CampaignStateValue.APPROVED_FOR_EXECUTION)
 
@@ -448,6 +454,24 @@ class TestStateMachine:
             CampaignStateValue.PLAN_PENDING_APPROVAL,
             CampaignStateValue.APPROVED_FOR_EXECUTION,
             CampaignStateValue.RUNNING_T3,
+        ]:
+            update_state(ws, target)
+        update_state(ws, CampaignStateValue.FAILED, notes="boom")
+        retried = update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+        assert retried.state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert retried.failed_from is None
+
+    def test_update_state_retries_campaign_that_failed_from_running_arc(self, tmp_path: Path) -> None:
+        """F4: a campaign that failed mid-ARC-execution (an already-approved
+        plan) must be retryable, exactly like the T3 retry edge."""
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        for target in [
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_ARC,
         ]:
             update_state(ws, target)
         update_state(ws, CampaignStateValue.FAILED, notes="boom")
@@ -1622,6 +1646,205 @@ class TestExecuteArcActionFailure:
         )
         assert not (ws / ARC_DIAGNOSTICS_FILE_NAME).exists()
         assert load_arc_diagnostics(ws) is None
+
+
+class TestExecuteArcActionUnexpectedException:
+    """F5 — ARC mirror of the T3 C5 guard: an unexpected exception during
+    execution must not wedge the campaign in RUNNING_ARC with no reachable
+    transition."""
+
+    class _RaisingAdapter:
+        def run(
+            self, workspace_root: Path, campaign: Campaign, action: PlannedAction
+        ) -> tuple[RunRecord, DiagnosticsV1 | None]:
+            raise RuntimeError("arc adapter blew up unexpectedly")
+
+    def test_exception_propagates_to_caller(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError, match="arc adapter blew up unexpectedly"):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+
+    def test_exception_leaves_campaign_failed_not_running(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_exception_writes_failed_run_record(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        run_files = list((ws / "runs").glob("*.json"))
+        assert len(run_files) == 1
+        saved = RunRecord.model_validate(read_json(run_files[0]))
+        assert saved.status == RunStatus.FAILED
+        assert saved.failure_code == FailureCode.UNKNOWN
+        assert "arc adapter blew up unexpectedly" in (saved.error_message or "")
+        # The fabricated record must use the canonical ARC tool name/mode
+        # constants rather than hardcoded literals (mirror of D7).
+        assert saved.tool_name == ARC_TOOL_NAME
+        assert saved.submission_mode == SubmissionMode.SUBPROCESS
+
+    def test_exception_appends_finished_event_and_provenance(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        events = read_events(ws / "decision_log.jsonl")
+        finished = [e for e in events if e.get("event") == "arc_run_finished"]
+        assert len(finished) == 1
+        assert finished[0]["failure_code"] == "unknown"
+        assert list((ws / "provenance").glob("*_arc_run.json"))
+
+    def test_campaign_can_retry_after_unexpected_exception(self, tmp_path: Path) -> None:
+        """F4 + F5 together: FAILED-from-RUNNING_ARC must be retryable."""
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with pytest.raises(RuntimeError):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=self._RaisingAdapter())
+        retried = update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+        assert retried.state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+
+class _ARCRealRecordThenCrashAdapter:
+    """ARC double that returns a real SUCCEEDED RunRecord/diagnostics pair, so
+    a later persistence failure in ``execute_arc_action`` must reuse this
+    record's ``run_id`` rather than fabricating a fresh one (mirror of
+    ``_RealRecordThenCrashAdapter``)."""
+
+    def __init__(self) -> None:
+        self.run_id = "real-arc-run-id-from-adapter"
+
+    def run(self, workspace_root: Path, campaign: Campaign, action: PlannedAction) -> tuple[RunRecord, DiagnosticsV1]:
+        now = datetime.now(UTC)
+        record = RunRecord(
+            run_id=self.run_id,
+            action_id=action.action_id,
+            tool_name=ARC_TOOL_NAME,
+            tool_version="test",
+            status=RunStatus.SUCCEEDED,
+            failure_code=FailureCode.NONE,
+            started_at=now,
+            estimated_cpu_hours=action.estimated_cpu_hours,
+            actual_cpu_hours=0.001,
+            submission_mode=SubmissionMode.SUBPROCESS,
+            level_of_theory="wb97xd/def2tzvp",
+        )
+        return record, _arc_success_diagnostics(campaign.campaign_id, self.run_id)
+
+
+class TestExecuteArcActionOrderingAndStaleArtifacts:
+    """F6/F7 — ARC mirrors of the T3 D1/D3/D6 ordering and stale-artifact
+    guards."""
+
+    def test_no_succeeded_finished_event_when_diagnostics_save_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F6: ARC diagnostics/SVGs must be durable before the decision log can
+        claim the run succeeded. If save_arc_diagnostics fails, the log must
+        never contain a "succeeded" arc_run_finished event for that run."""
+        import carmel.services.execution as execution_module
+
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        adapter = _ARCRealRecordThenCrashAdapter()
+
+        def _raise_save_arc_diagnostics(*args: object, **kwargs: object) -> Path:
+            raise OSError("disk full while saving arc diagnostics")
+
+        monkeypatch.setattr(execution_module, "save_arc_diagnostics", _raise_save_arc_diagnostics)
+
+        with pytest.raises(OSError, match="disk full while saving arc diagnostics"):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=adapter)
+
+        events = read_events(ws / "decision_log.jsonl")
+        finished = [e for e in events if e.get("event") == "arc_run_finished"]
+        assert len(finished) == 1
+        assert finished[0]["status"] != RunStatus.SUCCEEDED.value
+        assert finished[0]["run_id"] == adapter.run_id
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_real_run_id_preserved_when_diagnostics_persistence_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F5/F6: the persisted failure record must carry the adapter's real
+        run_id — not a fabricated uuid4 — and provenance must be recorded."""
+        import carmel.services.execution as execution_module
+
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        adapter = _ARCRealRecordThenCrashAdapter()
+
+        def _raise_save_arc_diagnostics(*args: object, **kwargs: object) -> Path:
+            raise OSError("disk full while saving arc diagnostics")
+
+        monkeypatch.setattr(execution_module, "save_arc_diagnostics", _raise_save_arc_diagnostics)
+
+        with pytest.raises(OSError, match="disk full while saving arc diagnostics"):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=adapter)
+
+        run_files = list((ws / "runs").glob("*.json"))
+        assert len(run_files) == 1
+        saved = RunRecord.model_validate(read_json(run_files[0]))
+        assert saved.run_id == adapter.run_id
+        assert saved.status == RunStatus.FAILED
+        assert saved.failure_code == FailureCode.UNKNOWN
+
+        provenance_files = list((ws / "provenance").glob("*_arc_run.json"))
+        assert provenance_files
+        recorded = read_json(provenance_files[0])
+        assert recorded["run_id"] == adapter.run_id
+        assert recorded["status"] == RunStatus.FAILED.value
+
+    def test_failure_removes_stale_arc_diagnostics_and_svgs_from_a_prior_run(self, tmp_path: Path) -> None:
+        """F7: a failed ARC run must never leave a previous run's
+        arc_diagnostics.json / models/arc SVGs looking like current output."""
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        (ws / ARC_DIAGNOSTICS_FILE_NAME).write_text("{}", encoding="utf-8")
+        arc_models_dir = ws / "models" / "arc"
+        arc_models_dir.mkdir(parents=True, exist_ok=True)
+        stale_svgs = [
+            arc_models_dir / "species_selection.svg",
+            arc_models_dir / "reactions_selection.svg",
+            arc_models_dir / "pdep_networks_selection.svg",
+        ]
+        for svg_path in stale_svgs:
+            svg_path.write_text("<svg>stale</svg>", encoding="utf-8")
+
+        execute_arc_action(
+            ws, load_campaign(ws), plan.actions[0], adapter=_ARCFailureAdapter(FailureCode.SUBPROCESS_ERROR)
+        )
+
+        assert not (ws / ARC_DIAGNOSTICS_FILE_NAME).exists()
+        for svg_path in stale_svgs:
+            assert not svg_path.exists()
+
+    def test_stale_arc_artifacts_survive_a_failed_state_transition(self, tmp_path: Path) -> None:
+        """F7 (D1 mirror): clearing stale ARC artifacts must happen only AFTER
+        the RUNNING_ARC transition is validated. An ineligible campaign must
+        raise with the workspace untouched."""
+        ws = tmp_path / "ws"
+        campaign = create_campaign(ws, _make_input("arc-stale-guard"))
+        plan = generate_arc_plan(campaign)
+        from carmel.services.planner import save_plan as _save
+
+        _save(ws, plan)
+        # Deliberately left in DRAFT: not eligible for RUNNING_ARC.
+        (ws / ARC_DIAGNOSTICS_FILE_NAME).write_text("{}", encoding="utf-8")
+        arc_models_dir = ws / "models" / "arc"
+        arc_models_dir.mkdir(parents=True)
+        stale_svg = arc_models_dir / "species_selection.svg"
+        stale_svg.write_text("<svg>stale</svg>", encoding="utf-8")
+
+        with pytest.raises(InvalidTransitionError):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+
+        assert (ws / ARC_DIAGNOSTICS_FILE_NAME).exists()
+        assert stale_svg.exists()
 
 
 class TestExecuteArcActionDefaultAdapter:

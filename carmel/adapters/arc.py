@@ -232,31 +232,71 @@ def _resolve_species(campaign: Campaign, action: PlannedAction) -> list[dict[str
     """Resolve the ARC species list from the action, falling back to the mixture.
 
     An agent-planned ``run_arc`` action carries the exact species to compute in
-    ``action.parameters["species"]``. When absent (a standalone job), we derive a
-    species list from the campaign's initial mixture.
+    ``action.parameters["species"]``. When the key is absent entirely (a
+    standalone job), we derive a species list from the campaign's initial
+    mixture. When the key is present, it is the exact requested target set:
+    an empty list, or any malformed entry, raises rather than silently
+    dropping entries or falling back to the mixture — the caller asked for
+    specific targets and must get exactly that job, or an explicit error.
+
+    Raises:
+        ValueError: If ``species`` is present but empty, or contains any
+            entry that is not a dict with a non-empty ``label``.
     """
-    raw = action.parameters.get("species")
-    if raw:
-        species: list[dict[str, Any]] = []
-        for entry in raw:
-            if isinstance(entry, dict) and entry.get("label"):
-                item: dict[str, Any] = {"label": str(entry["label"])}
-                if entry.get("smiles"):
-                    item["smiles"] = str(entry["smiles"])
-                species.append(item)
-        if species:
-            return species
-    return [_campaign_species_to_arc(c) for c in campaign.input.initial_mixture.components]
+    if "species" not in action.parameters:
+        return [_campaign_species_to_arc(c) for c in campaign.input.initial_mixture.components]
+    raw = action.parameters["species"]
+    entries = list(raw or [])
+    if not entries:
+        raise ValueError("Action parameter 'species' is present but empty; at least one species is required")
+    species: list[dict[str, Any]] = []
+    malformed: list[Any] = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("label"):
+            item: dict[str, Any] = {"label": str(entry["label"])}
+            if entry.get("smiles"):
+                item["smiles"] = str(entry["smiles"])
+            species.append(item)
+        else:
+            malformed.append(entry)
+    if malformed:
+        raise ValueError(
+            "Action parameter 'species' contains malformed entries (each must be a "
+            f"dict with a non-empty 'label'); rejected entries: {malformed!r}"
+        )
+    return species
 
 
 def _resolve_reactions(action: PlannedAction) -> list[dict[str, Any]]:
-    """Resolve the ARC reactions list from the action (optional)."""
-    raw = action.parameters.get("reactions")
+    """Resolve the ARC reactions list from the action (optional).
+
+    When the ``reactions`` key is absent entirely, or present but an empty
+    list, there are legitimately no reactions to compute (a species-only
+    thermo job is valid). When it is present and non-empty, every entry must
+    be valid; any malformed entry raises instead of silently dropping it.
+
+    Raises:
+        ValueError: If ``reactions`` is present, non-empty, and contains any
+            entry that is not a dict with a non-empty ``label``.
+    """
+    if "reactions" not in action.parameters:
+        return []
+    raw = action.parameters["reactions"]
+    entries = list(raw or [])
+    if not entries:
+        return []
     reactions: list[dict[str, Any]] = []
-    if raw:
-        for entry in raw:
-            if isinstance(entry, dict) and entry.get("label"):
-                reactions.append({"label": str(entry["label"])})
+    malformed: list[Any] = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("label"):
+            reactions.append({"label": str(entry["label"])})
+        else:
+            malformed.append(entry)
+    if malformed:
+        raise ValueError(
+            "Action parameter 'reactions' contains malformed entries (each must be a "
+            f"dict with a non-empty 'label'); rejected entries: {malformed!r}"
+        )
     return reactions
 
 
@@ -274,9 +314,19 @@ def build_arc_input(campaign: Campaign, action: PlannedAction) -> dict[str, Any]
 
     Returns:
         A dict suitable for serialization to ``input.yml`` for ARC.
+
+    Raises:
+        ValueError: If the project name is unsafe for path joins, or if a
+            present ``species``/``reactions`` parameter yields no valid
+            entries (see :func:`_resolve_species` / :func:`_resolve_reactions`).
     """
     params = action.parameters
     project = str(params.get("project") or campaign.input.workspace_name)
+    if "/" in project or "\\" in project or ".." in project:
+        # The project name flows into path joins (``<project>_info.yml`` under
+        # the run dir); a separator or ``..`` would let the resolved info path
+        # escape the run directory.
+        raise ValueError(f"Invalid ARC project name {project!r}: must not contain path separators or '..'")
     level_of_theory = str(params.get("level_of_theory") or DEFAULT_LEVEL_OF_THEORY)
     job_types = params.get("job_types") or dict(DEFAULT_JOB_TYPES)
     reactions = _resolve_reactions(action)
@@ -377,11 +427,14 @@ def read_arc_info_file(path: Path) -> dict[str, Any]:
 
     Raises:
         FileNotFoundError: If the file does not exist.
-        ValueError: If the file is not a YAML mapping.
+        ValueError: If the file is not a YAML mapping or is not valid YAML.
     """
     if not path.exists():
         raise FileNotFoundError(f"ARC info file not found: {path}")
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as err:
+        raise ValueError(f"ARC info file is not valid YAML: {path}: {err}") from err
     if not isinstance(data, dict):
         raise ValueError(f"ARC info file must be a YAML mapping: {path}")
     data.setdefault(ARC_LAYOUT.INFO_SPECIES_KEY, [])
@@ -390,11 +443,18 @@ def read_arc_info_file(path: Path) -> dict[str, Any]:
 
 
 def read_arc_output_file(project_dir: Path) -> dict[str, Any] | None:
-    """Read ``output/output.yml`` from an ARC project dir, if present."""
+    """Read ``output/output.yml`` from an ARC project dir, if present.
+
+    Raises:
+        ValueError: If the file exists but is not valid YAML.
+    """
     path = project_dir / ARC_LAYOUT.OUTPUT_SUBDIR / ARC_LAYOUT.OUTPUT_FILENAME
     if not path.exists():
         return None
-    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as err:
+        raise ValueError(f"ARC output file is not valid YAML: {path}: {err}") from err
     return data if isinstance(data, dict) else None
 
 
@@ -462,29 +522,32 @@ def normalize_arc_outputs(
         A validated ``DiagnosticsV1``.
 
     Raises:
-        ValueError: If ARC produced no parseable output (no info file and no
-            ``output.yml``).
+        ValueError: If ARC did not write its ``<project>_info.yml``. ARC saves
+            that file unconditionally at the end of a run
+            (``save_project_info_file``), so its absence means the run did not
+            complete — even when an ``output/output.yml`` exists. Treating
+            that as success would silently report zero species/reactions.
     """
     info_path = resolve_project_info_file(project_dir, input_dict)
     output_dict = read_arc_output_file(project_dir)
 
-    if info_path is None and output_dict is None:
+    if info_path is None:
         raise ValueError(
-            f"No ARC info file or output.yml found under {project_dir}. ARC may not have produced any output."
+            f"No ARC info file found under {project_dir}. ARC writes it unconditionally at the end "
+            "of a run, so a missing info file means ARC did not run to completion."
         )
 
     species: list[SpeciesSelection] = []
     reactions: list[ReactionSelection] = []
-    if info_path is not None:
-        info = read_arc_info_file(info_path)
-        for raw in info.get(ARC_LAYOUT.INFO_SPECIES_KEY, []) or []:
-            sel = _coerce_species_entry(raw)
-            if sel is not None:
-                species.append(sel)
-        for raw in info.get(ARC_LAYOUT.INFO_REACTIONS_KEY, []) or []:
-            rxn = _coerce_reaction_entry(raw)
-            if rxn is not None:
-                reactions.append(rxn)
+    info = read_arc_info_file(info_path)
+    for raw in info.get(ARC_LAYOUT.INFO_SPECIES_KEY, []) or []:
+        sel = _coerce_species_entry(raw)
+        if sel is not None:
+            species.append(sel)
+    for raw in info.get(ARC_LAYOUT.INFO_REACTIONS_KEY, []) or []:
+        rxn = _coerce_reaction_entry(raw)
+        if rxn is not None:
+            reactions.append(rxn)
 
     arc_version = output_dict.get(ARC_LAYOUT.OUTPUT_VERSION_KEY) if output_dict else None
 
@@ -531,16 +594,29 @@ class ARCAdapter:
         self.submission_mode = submission_mode
         self.guardrails = guardrails
 
-    def estimate_cost(self, action: PlannedAction) -> float:
+    def estimate_cost(self, action: PlannedAction, campaign: Campaign | None = None) -> float:
         """Estimate the CPU-hour cost of a ``run_arc`` action.
 
-        Uses the action's declared estimate when present; otherwise falls back to
-        a conservative per-species/per-reaction estimate. This feeds the shared,
-        adapter-agnostic execution envelope in
-        :mod:`carmel.services.authorization`.
+        Uses the action's declared estimate when present; otherwise falls back
+        to a conservative per-species/per-reaction estimate. When ``campaign``
+        is given, that fallback counts the species/reactions the ARC input
+        actually resolves to (including the mixture fallback when the action
+        omits ``species``) — otherwise an action with no explicit species
+        would be costed (and its subprocess wall-clock bounded) as a single
+        species while the job computes the whole mixture. This feeds the
+        shared, adapter-agnostic execution envelope in
+        :mod:`carmel.services.authorization` and the subprocess timeout.
         """
         if action.estimated_cpu_hours > 0:
             return float(action.estimated_cpu_hours)
+        if campaign is not None:
+            try:
+                n_species = len(_resolve_species(campaign, action))
+                n_reactions = len(_resolve_reactions(action))
+            except KeyError, TypeError, ValueError:
+                pass  # unresolvable parameters — fall back to the raw counts below
+            else:
+                return float(max(1, n_species) + 2 * n_reactions)
         n_species = len(action.parameters.get("species") or [])
         n_reactions = len(action.parameters.get("reactions") or [])
         return float(max(1, n_species) + 2 * n_reactions)
@@ -560,7 +636,17 @@ class ARCAdapter:
         run_id = str(uuid4())
         started = datetime.now(UTC)
         run_dir = workspace_root / "runs" / run_id
-        run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            run_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return self._failed_record(
+                run_id=run_id,
+                action=action,
+                started=started,
+                campaign=campaign,
+                failure_code=FailureCode.SUBPROCESS_ERROR,
+                error_message=f"Could not create run directory {run_dir}: {e}",
+            ), None
         stdout_path = run_dir / ARC_LAYOUT.CARMEL_STDOUT_FILENAME
         stderr_path = run_dir / ARC_LAYOUT.CARMEL_STDERR_FILENAME
         input_path = run_dir / ARC_LAYOUT.INPUT_FILENAME
@@ -569,11 +655,12 @@ class ARCAdapter:
         try:
             payload = build_arc_input(campaign, action)
             input_path = write_arc_input_file(run_dir, payload)
-        except (KeyError, TypeError, ValueError) as e:
+        except (KeyError, TypeError, ValueError, OSError) as e:
             return self._failed_record(
                 run_id=run_id,
                 action=action,
                 started=started,
+                campaign=campaign,
                 failure_code=FailureCode.INPUT_BUILD_ERROR,
                 error_message=f"Failed to build ARC input: {e}",
                 input_path=input_path,
@@ -588,6 +675,7 @@ class ARCAdapter:
                 run_id=run_id,
                 action=action,
                 started=started,
+                campaign=campaign,
                 failure_code=FailureCode.TOOL_NOT_FOUND,
                 error_message="ARC executable not found (no ARC.py and arc not importable)",
                 input_path=input_path,
@@ -599,7 +687,7 @@ class ARCAdapter:
         #    location, so it writes its output tree directly under run_dir.
         command = [*arc_executable, str(input_path)]
         _log.info("Invoking ARC: %s", " ".join(command))
-        timeout = int(self.estimate_cost(action) * 3600 + self.guardrails.subprocess_grace_seconds)
+        timeout = int(self.estimate_cost(action, campaign) * 3600 + self.guardrails.subprocess_grace_seconds)
         try:
             with (
                 open(stdout_path, "w", encoding="utf-8") as stdout_file,
@@ -618,6 +706,7 @@ class ARCAdapter:
                 run_id=run_id,
                 action=action,
                 started=started,
+                campaign=campaign,
                 failure_code=FailureCode.TIMEOUT,
                 error_message=str(e),
                 input_path=input_path,
@@ -630,6 +719,7 @@ class ARCAdapter:
                 run_id=run_id,
                 action=action,
                 started=started,
+                campaign=campaign,
                 failure_code=FailureCode.SUBPROCESS_ERROR,
                 error_message=str(e),
                 input_path=input_path,
@@ -645,6 +735,7 @@ class ARCAdapter:
                 run_id=run_id,
                 action=action,
                 started=started,
+                campaign=campaign,
                 ended=ended,
                 failure_code=FailureCode.SUBPROCESS_ERROR,
                 error_message=f"ARC exited with code {completed.returncode}",
@@ -667,6 +758,7 @@ class ARCAdapter:
                 run_id=run_id,
                 action=action,
                 started=started,
+                campaign=campaign,
                 ended=ended,
                 failure_code=FailureCode.INVALID_OUTPUT,
                 error_message=f"Failed to normalize ARC output: {e}",
@@ -687,7 +779,7 @@ class ARCAdapter:
             ended_at=ended,
             # The same estimate the envelope and timeout were computed from, so
             # budget auditing matches what the adapter actually reserved.
-            estimated_cpu_hours=self.estimate_cost(action),
+            estimated_cpu_hours=self.estimate_cost(action, campaign),
             actual_cpu_hours=(ended - started).total_seconds() / 3600.0,
             submission_mode=self.submission_mode,
             command=command,
@@ -706,13 +798,20 @@ class ARCAdapter:
         started: datetime,
         failure_code: FailureCode,
         error_message: str,
+        campaign: Campaign | None = None,
         input_path: Path | None = None,
         stdout_path: Path | None = None,
         stderr_path: Path | None = None,
         command: list[str] | None = None,
         ended: datetime | None = None,
     ) -> RunRecord:
-        """Build a typed failure RunRecord."""
+        """Build a typed failure RunRecord.
+
+        ``campaign`` is threaded through to :meth:`estimate_cost` so failed
+        run records carry the same resolved-input estimate as timeout/success
+        records, rather than the blind single-species fallback used when the
+        campaign (and thus the actual species/reaction count) is unknown.
+        """
         return RunRecord(
             run_id=run_id,
             action_id=action.action_id,
@@ -722,7 +821,7 @@ class ARCAdapter:
             failure_code=failure_code,
             started_at=started,
             ended_at=ended or datetime.now(UTC),
-            estimated_cpu_hours=self.estimate_cost(action),
+            estimated_cpu_hours=self.estimate_cost(action, campaign),
             submission_mode=self.submission_mode,
             command=command,
             input_path=input_path,
