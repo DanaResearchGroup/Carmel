@@ -65,6 +65,7 @@ from carmel.schemas import (
     Budgets,
     Campaign,
     CampaignInput,
+    CampaignStateValue,
     FailureCode,
     InitialMixture,
     MixtureComponent,
@@ -1689,3 +1690,95 @@ class TestARCAdapterRealSubprocess:
         if run.status == RunStatus.SUCCEEDED:
             assert diagnostics is not None
             assert diagnostics.run_id == run.run_id
+
+    @requires_arc
+    def test_mockter_through_carmel_ui_reaches_completed_phase1(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ARC end to end THROUGH CARMEL, not just through the adapter.
+
+        The whole production path a browser drives, with the real Mockter
+        subprocess underneath: create a campaign → generate a ``run_arc``
+        plan (Mockter level of theory, auto-approved by the combined gate)
+        → POST /run (dispatches on the action kind to ``start_arc_action``)
+        → background thread runs ARC under supervision → ``RESULTS_READY``
+        → ``COMPLETED_PHASE1`` → the dashboard shows the ARC diagnostics.
+
+        Deliberately strict where ``test_run_does_not_crash`` is tolerant:
+        the golden fixture proves Mockter converges these two species, so
+        anything short of ``COMPLETED_PHASE1`` here means some layer between
+        the UI and ARC — not ARC itself — dropped the result.
+
+        Lives in this class so the tools lane's must-not-skip gate covers
+        it and the ambient launcher environment is restored for it.
+        """
+        import threading
+
+        from carmel.services.campaigns import find_campaign_workspace
+        from carmel.services.execution import load_arc_diagnostics
+        from carmel.services.planner import load_plan
+        from carmel.services.state_machine import load_state
+        from carmel.ui import app as ui_app
+        from carmel.ui import create_app
+
+        app = create_app(workspaces_root=tmp_path)
+        app.config["TESTING"] = True
+        client = app.test_client()
+
+        threads: list[threading.Thread] = []
+        real_start = ui_app.start_arc_action
+
+        def _capture(ws: Path, campaign: Campaign, action: PlannedAction) -> threading.Thread:
+            thread = real_start(ws, campaign, action)
+            threads.append(thread)
+            return thread
+
+        monkeypatch.setattr(ui_app, "start_arc_action", _capture)
+
+        def _post(path: str, data: dict[str, str] | None = None) -> Any:
+            assert client.get("/campaigns/new").status_code == 200
+            with client.session_transaction() as session:
+                token = session["csrf_token"]
+            payload = dict(data or {})
+            payload.setdefault("csrf_token", token)
+            return client.post(path, data=payload)
+
+        response = _post(
+            "/campaigns/new",
+            {
+                "workspace_name": "mockter-ui-e2e",
+                "mixture_components": "OH,0.05,[OH]\nCH3,0.20,[CH3]",
+                "observables": "ignition_delay",
+                "reactors": "jsr,800,1200,1.0,5.0,1.0",
+                "cpu_hours": "20",
+                "experiment_budget": "0",
+            },
+        )
+        assert response.status_code == 302
+        cid = response.headers["Location"].rsplit("/", 1)[-1]
+        ws = find_campaign_workspace(tmp_path, cid)
+        assert ws is not None
+
+        planned = _post(f"/campaigns/{cid}/plan", {"tool": "arc", "level_of_theory": MOCK_LEVEL_OF_THEORY})
+        assert planned.status_code == 302
+        plan = load_plan(ws)
+        assert plan.actions[0].kind == ActionKind.ARC_RUN
+        assert not plan.requires_approval, "the small Mockter action must stay auto-approved"
+
+        assert _post(f"/campaigns/{cid}/run").status_code == 302
+        assert threads, "the run route never started an ARC action"
+        for thread in threads:
+            thread.join(timeout=1800)
+            assert not thread.is_alive(), "the background ARC run never finished"
+
+        run_files = sorted((ws / "runs").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        detail = run_files[-1].read_text(encoding="utf-8") if run_files else "no run record was written"
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1, detail
+
+        diagnostics = load_arc_diagnostics(ws)
+        assert diagnostics is not None
+        assert sorted(s.label for s in diagnostics.species_to_compute) == ["CH3", "OH"]
+
+        page = client.get(f"/campaigns/{cid}").data
+        assert "Diagnostics · ARC".encode() in page
+        assert diagnostics.run_id.encode() in page

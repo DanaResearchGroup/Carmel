@@ -87,6 +87,7 @@ from carmel.services.execution import (
     load_diagnostics,
     save_diagnostics,
     save_run_record,
+    start_arc_action,
     start_t3_action,
 )
 from carmel.services.intake import StubIntakeParser, write_intake_review
@@ -2071,6 +2072,112 @@ class TestExecuteArcActionDefaultAdapter:
         assert run_record.failure_code == FailureCode.TOOL_NOT_FOUND
         assert diagnostics is None
         assert load_state(ws).state == CampaignStateValue.FAILED
+
+
+class TestStartArcAction:
+    """The background ARC entry point the web UI's /run route uses.
+
+    ARC mirror of :class:`TestStartT3Action`: the RUNNING_ARC transition
+    must stay in the caller's thread — that is what makes a double-submitted
+    run fail for the user who submitted it — while the work itself must not.
+    """
+
+    def test_returns_a_thread_that_completes_the_run(self, tmp_path: Path) -> None:
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        thread = start_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        thread.join(timeout=60)
+        assert not thread.is_alive()
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+        assert load_arc_diagnostics(ws) is not None
+
+    def test_transition_happens_before_returning(self, tmp_path: Path) -> None:
+        """RUNNING_ARC must be on disk by the time the caller gets control back."""
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        release = threading.Event()
+
+        class _Blocking:
+            def run(
+                self,
+                workspace_root: Path,
+                campaign: object,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
+            ) -> object:
+                release.wait(timeout=60)
+                raise RuntimeError("released")
+
+        thread = start_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_Blocking())
+        assert load_state(ws).state == CampaignStateValue.RUNNING_ARC
+        release.set()
+        thread.join(timeout=60)
+
+    def test_ineligible_campaign_raises_in_the_calling_thread(self, tmp_path: Path) -> None:
+        """A caller must be able to turn a rejected run into a 409, not a 500."""
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        first = start_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        first.join(timeout=60)
+        with pytest.raises(InvalidTransitionError):
+            start_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+
+    def test_adapter_exception_is_logged_not_swallowed_silently(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Nobody is waiting on the thread, so the log is the only witness."""
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        class _Raising:
+            def run(
+                self,
+                workspace_root: Path,
+                campaign: object,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
+            ) -> object:
+                raise RuntimeError("arc adapter blew up in the background")
+
+        # Carmel's loggers set propagate=False, so caplog's root handler
+        # never sees them; attach it to the emitting logger directly.
+        emitter = logging.getLogger("carmel.services.execution")
+        emitter.addHandler(caplog.handler)
+        try:
+            with caplog.at_level(logging.ERROR):
+                thread = start_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_Raising())
+                thread.join(timeout=60)
+        finally:
+            emitter.removeHandler(caplog.handler)
+
+        assert load_state(ws).state == CampaignStateValue.FAILED
+        assert any("Background ARC run failed" in record.message for record in caplog.records)
+
+    def test_a_thread_that_cannot_start_releases_the_lock_and_fails_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """RUNNING_ARC with no thread would be a permanent wedge.
+
+        If the daemon thread cannot start after the transition, nothing
+        would ever run the protected region: no outcome, no lock release.
+        The failure path must release supervision and fail the campaign so
+        retry can re-arm it.
+        """
+        ws = _arc_ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        def _cannot_start(self: threading.Thread) -> None:
+            raise RuntimeError("no threads left")
+
+        monkeypatch.setattr(threading.Thread, "start", _cannot_start)
+        with pytest.raises(RuntimeError, match="no threads left"):
+            start_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+
+        assert load_state(ws).state == CampaignStateValue.FAILED
+        assert load_state(ws).failed_from == CampaignStateValue.RUNNING_ARC
+        assert load_active_run(ws) is None
+        with supervise_run(ws, "prove-the-lock-is-free"):
+            pass
 
 
 class TestExecuteT3ActionDefaultAdapter:

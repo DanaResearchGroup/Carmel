@@ -281,3 +281,32 @@ def plan_and_save(workspace_root: Path, campaign: Campaign) -> Plan:
     plan = generate_initial_plan(campaign, policy, workspace_root)
     save_plan(workspace_root, plan)
     return plan
+
+
+def plan_and_save_arc(
+    workspace_root: Path,
+    campaign: Campaign,
+    level_of_theory: str | None = None,
+) -> Plan:
+    """Generate a single-action ``run_arc`` plan and persist it.
+
+    ARC peer of :func:`plan_and_save`, and the production entry point the
+    UI's plan route uses when the operator asks for an ARC plan instead of
+    the T3 baseline. Delegates to :func:`generate_arc_plan` with the
+    workspace attached, so the combined gate judges the action against the
+    workspace's persisted policy and *remaining* budget, and records its
+    authorization to the decision log.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign to plan for.
+        level_of_theory: Optional level of theory for the ARC job (a
+            ``mock``-containing level routes ARC to its Mockter adapter).
+            Species default to the campaign's initial mixture.
+
+    Returns:
+        The generated and saved Plan.
+    """
+    plan = generate_arc_plan(campaign, level_of_theory=level_of_theory, workspace_root=workspace_root)
+    save_plan(workspace_root, plan)
+    return plan

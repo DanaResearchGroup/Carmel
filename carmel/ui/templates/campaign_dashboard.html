@@ -83,16 +83,23 @@
       {% elif state.state.value == 'approved_for_execution' %}
         <form method="POST" action="{{ url_for('campaign_run', campaign_id=campaign.campaign_id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <button class="primary">Run T3</button>
+          <button class="primary">Run {{ 'ARC' if plan_tool == 'arc' else 'T3' }}</button>
         </form>
       {% endif %}
     {% else %}
       <p class="empty">No plan yet.</p>
       {% if state.state.value == 'ready_for_planning' %}
-        <form method="POST" action="{{ url_for('campaign_plan', campaign_id=campaign.campaign_id) }}">
-          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <button class="primary">Generate plan</button>
-        </form>
+        <div class="actions">
+          <form method="POST" action="{{ url_for('campaign_plan', campaign_id=campaign.campaign_id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="primary">Generate plan</button>
+          </form>
+          <form method="POST" action="{{ url_for('campaign_plan', campaign_id=campaign.campaign_id) }}" style="display:inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="tool" value="arc">
+            <button>Generate ARC plan</button>
+          </form>
+        </div>
       {% endif %}
     {% endif %}
   </article>
@@ -191,20 +198,25 @@
   </article>
   {% endif %}
 
-  {# ---------------- Diagnostics ---------------- #}
+  {# ---------------- Diagnostics ----------------
+     The view passes at most one of diagnostics / arc_diagnostics — the one
+     belonging to the tool that produced the campaign's current state — so a
+     stale diagnostics.json left behind by an earlier T3 life is never shown
+     against an ARC result, or vice versa. #}
+  {% set diag = arc_diagnostics or diagnostics %}
   <article class="card">
-    <div class="card-head"><h2>Diagnostics</h2></div>
-    {% if diagnostics %}
+    <div class="card-head"><h2>Diagnostics{% if arc_diagnostics %} · ARC{% elif diagnostics %} · T3{% endif %}</h2></div>
+    {% if diag %}
       <dl>
-        <dt>Run ID</dt><dd><code>{{ diagnostics.run_id }}</code></dd>
-        <dt>Generated</dt><dd>{{ diagnostics.generated_at | format_datetime }}</dd>
-        {% if diagnostics.level_of_theory %}<dt>Level of theory</dt><dd><code>{{ diagnostics.level_of_theory }}</code></dd>{% endif %}
-        {% if diagnostics.model_version %}<dt>Model version</dt><dd>{{ diagnostics.model_version }}</dd>{% endif %}
-        <dt>Species</dt><dd>{{ diagnostics.species_to_compute | length }}</dd>
-        <dt>Reactions</dt><dd>{{ diagnostics.reactions_to_compute | length }}</dd>
-        <dt>PDep networks</dt><dd>{{ diagnostics.pdep_networks_to_compute | length }}</dd>
+        <dt>Run ID</dt><dd><code>{{ diag.run_id }}</code></dd>
+        <dt>Generated</dt><dd>{{ diag.generated_at | format_datetime }}</dd>
+        {% if diag.level_of_theory %}<dt>Level of theory</dt><dd><code>{{ diag.level_of_theory }}</code></dd>{% endif %}
+        {% if diag.model_version %}<dt>Model version</dt><dd>{{ diag.model_version }}</dd>{% endif %}
+        <dt>Species</dt><dd>{{ diag.species_to_compute | length }}</dd>
+        <dt>Reactions</dt><dd>{{ diag.reactions_to_compute | length }}</dd>
+        <dt>PDep networks</dt><dd>{{ diag.pdep_networks_to_compute | length }}</dd>
       </dl>
-      {% if state.state.value == 'diagnostics_ready' %}
+      {% if state.state.value in ('diagnostics_ready', 'results_ready') %}
         <form method="POST" action="{{ url_for('campaign_finalize', campaign_id=campaign.campaign_id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
           <button class="success">Complete phase 1</button>
@@ -216,19 +228,24 @@
   </article>
 
   {# ---------------- Compute selection (graphical) ---------------- #}
+  {% set svg_tool = results_tool or plan_tool or 't3' %}
   <article class="card wide">
     <div class="card-head"><h2>Compute selection</h2></div>
     <p class="muted" style="margin-top:0">
-      Generated from persisted T3 diagnostics under <code>models/</code>.
+      {% if svg_tool == 'arc' %}
+        Generated from persisted ARC diagnostics under <code>models/arc/</code>.
+      {% else %}
+        Generated from persisted T3 diagnostics under <code>models/</code>.
+      {% endif %}
     </p>
     <div class="svg-block">
-      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='species_selection.svg') }}" type="image/svg+xml"></object>
+      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='species_selection.svg', tool=svg_tool) }}" type="image/svg+xml"></object>
     </div>
     <div class="svg-block">
-      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='reactions_selection.svg') }}" type="image/svg+xml"></object>
+      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='reactions_selection.svg', tool=svg_tool) }}" type="image/svg+xml"></object>
     </div>
     <div class="svg-block">
-      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='pdep_networks_selection.svg') }}" type="image/svg+xml"></object>
+      <object data="{{ url_for('campaign_svg', campaign_id=campaign.campaign_id, artifact='pdep_networks_selection.svg', tool=svg_tool) }}" type="image/svg+xml"></object>
     </div>
   </article>
 
@@ -265,7 +282,11 @@
       </li>
       <li>
         <span class="file-name">diagnostics.json</span>
-        <span class="file-state {% if diagnostics %}present{% endif %}">{{ 'present' if diagnostics else 'pending' }}</span>
+        <span class="file-state {% if diagnostics_on_disk %}present{% endif %}">{{ 'present' if diagnostics_on_disk else 'pending' }}</span>
+      </li>
+      <li>
+        <span class="file-name">arc_diagnostics.json</span>
+        <span class="file-state {% if arc_diagnostics_on_disk %}present{% endif %}">{{ 'present' if arc_diagnostics_on_disk else 'pending' }}</span>
       </li>
     </ul>
   </article>

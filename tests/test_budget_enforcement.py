@@ -43,6 +43,7 @@ from carmel.services.execution import (
     execute_arc_action,
     execute_t3_action,
     save_run_record,
+    start_arc_action,
     start_t3_action,
 )
 from carmel.services.planner import generate_arc_plan, generate_initial_plan, load_plan, save_plan
@@ -412,6 +413,24 @@ class TestLaunchRecheck:
             start_t3_action(ws, load_campaign(ws), action, adapter=_SuccessAdapter())
         assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
         assert load_active_run(ws) is None
+
+    def test_start_arc_action_is_refused_synchronously(self, tmp_path: Path) -> None:
+        """The backgrounded ARC entry point is guarded exactly like T3's.
+
+        The refusal must land in the calling thread — before supervision,
+        before RUNNING_ARC — so the UI can map it to a 409 and nothing is
+        left wedged or reserved.
+        """
+        ws = _approved_arc_workspace(tmp_path)
+        action = load_plan(ws).actions[0]
+        _consume(ws, 19.5)  # remaining 0.5 < estimate 1.0
+
+        with pytest.raises(BudgetExceededError):
+            start_arc_action(ws, load_campaign(ws), action, adapter=_SuccessAdapter())
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert load_active_run(ws) is None
+        with supervise_run(ws, "prove-the-lock-is-free"):
+            pass
 
     def test_arc_launch_is_gated_symmetrically(self, tmp_path: Path) -> None:
         ws = _approved_arc_workspace(tmp_path)

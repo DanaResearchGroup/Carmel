@@ -880,12 +880,149 @@ def execute_arc_action(
     _require_launch_authorization(workspace_root, campaign, action)
     supervision = start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
     try:
-        update_state(workspace_root, CampaignStateValue.RUNNING_ARC, notes=f"action={action.action_id}")
+        started = begin_arc_run(workspace_root, action)
     except BaseException:
         supervision.close()
         raise
-    started = datetime.now(UTC)
+    return _finish_arc_run(workspace_root, campaign, action, adapter, started, supervision)
 
+
+def begin_arc_run(workspace_root: Path, action: PlannedAction) -> datetime:
+    """Enter ``RUNNING_ARC``, refusing the run if the campaign is not eligible.
+
+    ARC mirror of :func:`begin_t3_run`. Kept separate from the work itself
+    so that a caller running ARC in the background (see
+    :func:`start_arc_action`) still performs this check *synchronously*, in
+    its own thread. That ordering is what makes a double-submitted run fail
+    loudly for the user who submitted it, instead of being accepted and
+    then racing a run already in flight.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        action: The planned ``run_arc`` action.
+
+    Returns:
+        The run's start timestamp.
+
+    Raises:
+        InvalidTransitionError: If the campaign is not eligible to enter
+            ``RUNNING_ARC``. The workspace is left untouched.
+    """
+    update_state(workspace_root, CampaignStateValue.RUNNING_ARC, notes=f"action={action.action_id}")
+    return datetime.now(UTC)
+
+
+def start_arc_action(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    adapter: ARCAdapterProtocol | None = None,
+) -> threading.Thread:
+    """Enter ``RUNNING_ARC`` now and run the action on a background thread.
+
+    ARC mirror of :func:`start_t3_action` — see that function for the full
+    rationale. An ARC job runs for minutes to hours; executed inline it
+    holds a web request open far past any browser timeout, so the redirect
+    to the auto-refreshing dashboard never arrives.
+
+    Ordering invariants are identical to T3's: the live launch
+    authorization re-check runs first (before anything is taken, so a
+    refusal wedges nothing), supervision is taken second, and the
+    ``RUNNING_ARC`` transition happens third — synchronously, in the
+    caller's thread — so no instant exists in which the campaign reads as
+    ``RUNNING_ARC`` while no run lock is held. Only the protected region
+    (:func:`_finish_arc_run`) is backgrounded.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign being executed.
+        action: The planned ``run_arc`` action.
+        adapter: Optional adapter override; production passes ``None``.
+
+    Returns:
+        The started daemon thread. Callers that need the run to finish —
+        tests, and any future synchronous caller — can ``join()`` it
+        rather than polling the workspace.
+
+    Raises:
+        InvalidTransitionError: If the campaign is not eligible to enter
+            ``RUNNING_ARC``. Raised in the calling thread, before any
+            background work starts.
+        RunAlreadySupervisedError: If a live process already holds this
+            campaign's run lock. Raised before the transition, so the
+            campaign is left to the run that already owns it.
+        BudgetExceededError: If the live authorization re-check refuses
+            the launch — see :func:`_require_launch_authorization`. Raised
+            synchronously, before supervision or any state change.
+    """
+    if adapter is None:
+        adapter = _default_arc_adapter()
+    _require_launch_authorization(workspace_root, campaign, action)
+    supervision = start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
+    try:
+        started = begin_arc_run(workspace_root, action)
+    except BaseException:
+        supervision.close()
+        raise
+
+    def _run() -> None:
+        try:
+            _finish_arc_run(workspace_root, campaign, action, adapter, started, supervision)
+        except Exception:
+            # _finish_arc_run has already driven the campaign to FAILED and
+            # persisted the failure; re-raising into the thread's excepthook
+            # would only print a traceback nobody is waiting on.
+            _log.error("Background ARC run failed for campaign %s", campaign.campaign_id, exc_info=True)
+
+    thread = threading.Thread(target=_run, name=f"carmel-arc-{campaign.campaign_id}", daemon=True)
+    try:
+        thread.start()
+    except BaseException:
+        # The campaign is already in RUNNING_ARC, but no thread will ever
+        # run _finish_arc_run, so nothing would release the lock or record
+        # an outcome — the exact permanent wedge this run path exists to
+        # avoid, one layer up. Release supervision and fail the run so it
+        # reads as recoverable (retry re-arms it) rather than as forever
+        # in flight.
+        supervision.close()
+        with contextlib.suppress(Exception):
+            update_state(
+                workspace_root,
+                CampaignStateValue.FAILED,
+                notes="the ARC run thread could not be started",
+            )
+        raise
+    return thread
+
+
+def _finish_arc_run(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    adapter: ARCAdapterProtocol,
+    started: datetime,
+    supervision: RunSupervision,
+) -> tuple[RunRecord, DiagnosticsV1 | None]:
+    """Run the ARC work, persist every artifact, and leave ``RUNNING_ARC``.
+
+    ARC mirror of :func:`_finish_t3_run`: called with the campaign already
+    in ``RUNNING_ARC`` (see :func:`begin_arc_run`), everything here runs
+    inside the protected region — any failure still drives the campaign to
+    ``FAILED`` rather than leaving it wedged — and the passed-in
+    :class:`~carmel.services.recovery.RunSupervision` (already holding the
+    campaign's run lock) is closed on every exit path.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign being executed.
+        action: The planned ``run_arc`` action.
+        adapter: The ARC adapter to invoke.
+        started: The run's start timestamp, from :func:`begin_arc_run`.
+        supervision: The live supervision guarding this run.
+
+    Returns:
+        Tuple of (RunRecord, DiagnosticsV1 or None on failure).
+    """
     with contextlib.closing(supervision):
         run_record: RunRecord | None = None
         try:
