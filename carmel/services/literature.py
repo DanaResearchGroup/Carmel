@@ -878,6 +878,10 @@ def _research_loop(
         # would overstate what the run actually did (Finding 6).
         executed_queries = proposal.queries[:MAX_QUERIES_PER_ROUND]
         dropped_queries = proposal.queries[MAX_QUERIES_PER_ROUND:]
+        # Queries never run before. These are what make ANOTHER round worth paying for:
+        # their results have not been shown to the agent yet, so the round after this one
+        # can still produce something this one could not.
+        fresh_queries = [q for q in executed_queries if q not in state.queries]
         for query in executed_queries:
             if query not in state.queries:
                 state.queries.append(query)
@@ -929,7 +933,19 @@ def _research_loop(
         if proposal.done:
             state.stop_reason = StopReason.SELF_TERMINATED
             return
-        if not new_findings:
+        # Stop only when nothing could change next round: no new findings AND no query
+        # whose results the agent has not already seen.
+        #
+        # Requiring new findings alone ended EVERY run after round 1. The agent cannot
+        # produce a finding in round 1 by construction -- a finding needs a verbatim
+        # quote, quotes come from fetched documents, and documents come from search
+        # results, which are not fed back until the NEXT round. So round 1 always
+        # returned zero findings, the loop always stopped, and the search results it had
+        # just paid for were never shown to anyone. The propose -> search -> read ->
+        # propose round-trip that this loop exists to perform had never once run. Tests
+        # missed it because a scripted mock returns findings in round 1, which no real
+        # model can do.
+        if not new_findings and not fresh_queries:
             state.stop_reason = StopReason.NO_NEW_INFORMATION
             return
 

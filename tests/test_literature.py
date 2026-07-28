@@ -671,11 +671,14 @@ class TestRunRecord:
         budget = AgentBudgetConfig(max_model_calls=1)
         deps, _, config = _make_deps([_proposal(findings=[], done=False)], budget=budget)
         report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
-        # done=False with no findings stops via NO_NEW_INFORMATION, so force a budget report:
-        assert report.stop_reason == StopReason.NO_NEW_INFORMATION
-        budget_report = report.model_copy(update={"stop_reason": StopReason.MAX_TOKENS})
+        # A round that issues fresh queries but no findings now continues to a second
+        # round (its results have not been shown yet), so the one-call ceiling is what
+        # actually stops the run. This used to report NO_NEW_INFORMATION instead: the
+        # loop always ended after round 1, so no budget ceiling could ever be reached
+        # and this test had to fabricate a budget stop to exercise the mapping.
+        assert report.stop_reason == StopReason.MAX_MODEL_CALLS
 
-        record = run_record_for(budget_report, _action())
+        record = run_record_for(report, _action())
 
         assert record.status == RunStatus.FAILED
         assert record.failure_code == FailureCode.BUDGET_EXCEEDED
@@ -927,3 +930,43 @@ class TestAcquisitionTriage:
 
         assert load_manifest(campaign.workspace_root).requests == []
         assert any("neither a DOI nor a URL" in w for w in report.warnings)
+
+
+class TestResearchLoopReachesASecondRound:
+    """The loop's whole purpose is propose -> search -> read -> propose. It could not
+    do that: round 1 cannot contain findings (a finding needs a quote, quotes come from
+    fetched documents, documents come from search results, and results are only fed back
+    the NEXT round), so the "no new findings" stop fired every time and the search
+    results the run had just paid for were never shown to anyone."""
+
+    def test_search_results_are_fed_back_to_a_second_round(self, campaign: Campaign) -> None:
+        results = {"q1": [SearchResult(title="A paper", url=SOURCE_URL, snippet="abstract")]}
+        deps, model, config = _make_deps(
+            [
+                _proposal(findings=[], queries=["q1"], done=False),
+                _proposal(findings=[_finding_dict()], queries=["q1"], done=True),
+                _assessment(),
+            ],
+            search=results,
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(model.calls) >= 2, "the agent was never asked a second time"
+        assert "A paper" in model.calls[1]["user_prompt"], "round 2 did not include the search results"
+        assert report.stop_reason == StopReason.SELF_TERMINATED
+
+    def test_a_round_repeating_only_stale_queries_still_stops(self, campaign: Campaign) -> None:
+        """The stop condition must not become unreachable: an agent that keeps
+        re-issuing queries it has already run learns nothing new and must terminate."""
+        deps, _, config = _make_deps(
+            [
+                _proposal(findings=[], queries=["q1"], done=False),
+                _proposal(findings=[], queries=["q1"], done=False),
+            ],
+            search={"q1": []},
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.stop_reason == StopReason.NO_NEW_INFORMATION

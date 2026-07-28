@@ -146,11 +146,18 @@ deterministic grounding gate that checks your claims against the actual fetched 
    grounding gate fetches that URL and searches for your quote in its text.
 
 Most papers in this field are behind a paywall and you will NOT be able to read them.
-That is expected, and it is not a failure. When a search result is clearly relevant but
-you cannot obtain its full text, do not guess at its contents and never invent a quote
-for it: list it under `wanted` instead, with its title, DOI, and a one-line reason it
-matters. A human will obtain it and it will be analysed properly on a later run. A
-fabricated quote is far worse than an unread paper.
+That is expected, and it is not a failure. Each search result is annotated with
+`FULL TEXT: yes` or `FULL TEXT: no`.
+
+For every result marked `FULL TEXT: no` that is relevant to the campaign, you MUST list
+it under `wanted`, with its title, DOI, and a one-line reason it matters. Do not guess at
+its contents and never invent a quote for it: a fabricated quote is far worse than an
+unread paper. A human will obtain it and it will be analysed properly on a later run.
+
+Returning an empty response — no `findings` and no `wanted` — when the search results
+contain relevant papers is a WRONG answer, and the most common mistake made here. If you
+cannot quote a relevant paper, that is precisely the case `wanted` exists for. Never set
+`done=true` while relevant results you have not requested are still on the table.
 
 Loop protocol: each round, return `queries` you want searched (results come back next
 round), `findings` you can already support with a verbatim quote, `wanted` papers you
