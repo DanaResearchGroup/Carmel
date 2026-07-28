@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from logging import Logger
 from pathlib import Path
 from typing import Any, Protocol
@@ -192,6 +193,8 @@ def run_in_process_group(
     register: Any = _register_live_tree,
     forget: Any = _forget_live_tree,
     drain_timeout: float = 10.0,
+    on_process_start: Callable[[int, list[str]], None] | None = None,
+    logger: Logger = _log,
 ) -> subprocess.CompletedProcess[Any]:
     """Run *command* in its own process group, killing the whole tree on timeout.
 
@@ -224,6 +227,14 @@ def run_in_process_group(
             to 10.0; a caller wrapper should pass its own kill-grace-period
             constant (e.g. T3's ``_KILL_GRACE_PERIOD_S``), read at call
             time so it can be shortened for tests.
+        on_process_start: Optional callback invoked with the new process
+            group id and *command* as soon as the tool is running, so a
+            supervisor can persist what to reap if it is killed before the
+            run ends. ``start_new_session`` makes the child a group
+            leader, so its pid is the group id. If the callback raises,
+            the just-started tree is killed and the error propagates.
+        logger: Logger used if *on_process_start* fails. Defaults to this
+            module's logger; a caller wrapper may pass its own.
 
     Returns:
         A ``CompletedProcess`` exactly as ``subprocess.run`` would return.
@@ -243,18 +254,35 @@ def run_in_process_group(
     )
     register(proc)
     try:
-        captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
-    except BaseException:
-        # Covers TimeoutExpired and anything that interrupts the wait
-        # (KeyboardInterrupt, a thread being torn down): in every case the
-        # tree must not outlive the call that started it.
-        terminate(proc)
-        # Drain and close the pipes. communicate() abandoned them when it
-        # raised, and the tree is dead now, so this returns immediately —
-        # without it the read ends stay open until the Popen is collected.
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=drain_timeout)
-        raise
+        if on_process_start is not None:
+            try:
+                on_process_start(proc.pid, command)
+            except BaseException:
+                # A tree nothing can identify is worse than no tree at
+                # all. It would outlive this process unrecorded, and a
+                # later recovery reads such a run exactly like one that
+                # never launched — so it would offer to abandon a campaign
+                # whose tool is still writing into it. Stop what was just
+                # started rather than run it blind.
+                logger.error("Could not record the process group of pid %s; stopping it", proc.pid)
+                terminate(proc)
+                with contextlib.suppress(Exception):
+                    proc.communicate(timeout=drain_timeout)
+                raise
+        try:
+            captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
+        except BaseException:
+            # Covers TimeoutExpired and anything that interrupts the wait
+            # (KeyboardInterrupt, a thread being torn down): in every case
+            # the tree must not outlive the call that started it.
+            terminate(proc)
+            # Drain and close the pipes. communicate() abandoned them when
+            # it raised, and the tree is dead now, so this returns
+            # immediately — without it the read ends stay open until the
+            # Popen is collected.
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=drain_timeout)
+            raise
     finally:
         forget(proc)
     return subprocess.CompletedProcess(command, proc.returncode, captured_stdout, captured_stderr)

@@ -1238,6 +1238,44 @@ class TestARCAdapterFailures:
         assert run.failure_code == FailureCode.SUBPROCESS_ERROR
         assert diagnostics is None
 
+    def test_the_adapter_passes_the_recorder_through_to_the_launch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The adapter must actually forward ``on_process_start``, not accept it.
+
+        ARC mirror of the T3 test of the same name: a test of the shared
+        launcher alone passes happily when the adapter takes the argument
+        and drops it on the floor. Every real run would then launch ARC
+        with no recorded process group, and every service-level test would
+        still be green, because those use adapter doubles that call the
+        recorder themselves.
+        """
+        from carmel.adapters import arc as arc_module
+
+        seen: list[object] = []
+
+        def _capture(*_args: object, **kwargs: object) -> None:
+            seen.append(kwargs.get("on_process_start"))
+            raise OSError("stop here, the launch is all this checks")
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _capture)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+
+        def _recorder(_pgid: int, _argv: list[str]) -> None:  # pragma: no cover -- never invoked
+            raise AssertionError("the stub never launches anything")
+
+        ARCAdapter().run(
+            workspace_root=ws,
+            campaign=_campaign(ws),
+            action=_action(),
+            on_process_start=_recorder,
+        )
+        # Later entries are the version probe, which is a separate launch
+        # and deliberately unrecorded; the first is ARC itself.
+        assert seen[0] is _recorder, "the adapter dropped the recorder instead of forwarding it"
+
     def test_subprocess_nonzero_exit(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
 

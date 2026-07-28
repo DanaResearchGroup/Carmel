@@ -4,8 +4,10 @@
 {% block title %}{{ campaign.input.workspace_name }} — Carmel{% endblock %}
 
 {% block head_extra %}
-  {# Auto-refresh the dashboard while a T3 run is in flight. #}
-  {% if state.state.value == 'running_t3' %}
+  {# Auto-refresh only while a run is genuinely being supervised. Refreshing
+     on a run whose supervisor died reloads a stale promise every 5 seconds
+     forever, and hides the recovery this page is offering. #}
+  {% if state.state.value in ('running_t3', 'running_arc') and liveness and liveness.liveness.value == 'supervised' %}
     <meta http-equiv="refresh" content="5">
   {% endif %}
 {% endblock %}
@@ -53,7 +55,7 @@
   {# ---------------- Plan / approval card ---------------- #}
   <article class="card {% if state.state.value == 'plan_pending_approval' %}pending-approval{% endif %}">
     <div class="card-head">
-      <h2>Plan{% if plan %} · pending approval{% if state.state.value == 'plan_pending_approval' %} ⚠{% endif %}{% endif %}</h2>
+      <h2>Plan{% if state.state.value == 'plan_pending_approval' %} · pending approval ⚠{% endif %}</h2>
     </div>
     {% if plan %}
       <p class="muted" style="margin-top:0">{{ plan.rationale }}</p>
@@ -96,10 +98,45 @@
   </article>
 
   {# ---------------- Run status ---------------- #}
-  <article class="card {% if state.state.value == 'running_t3' %}active-running{% endif %}">
+  {% set supervised = liveness and liveness.liveness.value == 'supervised' %}
+  <article class="card
+    {%- if state.state.value in ('running_t3', 'running_arc') %}{{ ' active-running' if supervised else ' needs-recovery' }}{% endif %}">
     <div class="card-head"><h2>Run status</h2></div>
-    {% if state.state.value == 'running_t3' %}
+    {% if state.state.value in ('running_t3', 'running_arc') and supervised %}
       <p>Run in progress. Page auto-refreshes every 5 seconds.</p>
+      {% if liveness.active_run %}
+        <dl>
+          <dt>Started</dt><dd>{{ liveness.active_run.started_at | format_datetime }}</dd>
+          <dt>Supervised by</dt><dd><code>pid {{ liveness.active_run.supervisor_pid }}</code></dd>
+        </dl>
+      {% endif %}
+    {% elif state.state.value in ('running_t3', 'running_arc') %}
+      <p><strong>This run is not being supervised.</strong></p>
+      <p class="muted">{{ liveness.detail }}</p>
+      {% if liveness.active_run and liveness.active_run.process_group_id %}
+        <dl>
+          <dt>Started</dt><dd>{{ liveness.active_run.started_at | format_datetime }}</dd>
+          <dt>Tool process group</dt><dd><code>{{ liveness.active_run.process_group_id }}</code></dd>
+        </dl>
+      {% endif %}
+      {% if liveness.liveness.value == 'unknown' %}
+        <p class="muted">
+          Carmel will not offer to abandon this run, because it cannot establish that
+          nothing is still writing into the workspace. Stop the process group above by
+          hand; once it is empty this run can be abandoned safely.
+        </p>
+      {% else %}
+        <form method="POST" action="{{ url_for('campaign_abandon', campaign_id=campaign.campaign_id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="danger">
+            {%- if liveness.liveness.value == 'orphaned' -%}
+              Stop the tool and abandon this run
+            {%- else -%}
+              Abandon this run
+            {%- endif -%}
+          </button>
+        </form>
+      {% endif %}
     {% elif latest_run_path %}
       <dl>
         <dt>Latest run record</dt><dd><code>runs/{{ latest_run_path }}</code></dd>
@@ -108,6 +145,51 @@
       <p class="empty">No runs yet.</p>
     {% endif %}
   </article>
+
+  {# ---------------- Recovery ---------------- #}
+  {% if state.state.value in ['failed', 'blocked'] %}
+  <article class="card wide needs-recovery">
+    <div class="card-head"><h2>Recovery</h2></div>
+    {% if state.state.value == 'failed' %}
+      <p style="margin-top:0">
+        This campaign failed{% if state.failed_from %} while it was
+        <strong>{{ state.failed_from.value }}</strong>{% endif %}.
+      </p>
+      {% if state.notes %}<p class="mono muted">{{ state.notes }}</p>{% endif %}
+    {% else %}
+      <p style="margin-top:0">
+        This campaign's plan was rejected. The plan cannot be un-rejected — generate a
+        new one and it will be judged against the approval policy again.
+      </p>
+    {% endif %}
+    <div class="actions">
+      {% if state.state.value == 'failed' and state.failed_from
+            and state.failed_from.value in ('running_t3', 'running_arc', 'approved_for_execution') %}
+        <form method="POST" action="{{ url_for('campaign_retry', campaign_id=campaign.campaign_id) }}" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="primary">Retry the run</button>
+        </form>
+      {% endif %}
+      {% if state.state.value == 'failed' and state.failed_from
+            and ((diagnostics and state.failed_from.value == 'diagnostics_ready')
+                 or (arc_diagnostics and state.failed_from.value == 'results_ready')) %}
+        <form method="POST" action="{{ url_for('campaign_finalize', campaign_id=campaign.campaign_id) }}" style="display:inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="success">Complete from persisted diagnostics</button>
+        </form>
+      {% endif %}
+      <form method="POST" action="{{ url_for('campaign_replan', campaign_id=campaign.campaign_id) }}" style="display:inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button>Re-plan from scratch</button>
+      </form>
+    </div>
+    <p class="muted" style="margin-bottom:0">
+      Re-planning discards the current plan and runs planning and approval again from the
+      start, so it is always available. The other routes resume only where this campaign
+      had already got to.
+    </p>
+  </article>
+  {% endif %}
 
   {# ---------------- Diagnostics ---------------- #}
   <article class="card">
@@ -122,6 +204,12 @@
         <dt>Reactions</dt><dd>{{ diagnostics.reactions_to_compute | length }}</dd>
         <dt>PDep networks</dt><dd>{{ diagnostics.pdep_networks_to_compute | length }}</dd>
       </dl>
+      {% if state.state.value == 'diagnostics_ready' %}
+        <form method="POST" action="{{ url_for('campaign_finalize', campaign_id=campaign.campaign_id) }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="success">Complete phase 1</button>
+        </form>
+      {% endif %}
     {% else %}
       <p class="empty">No diagnostics yet.</p>
     {% endif %}

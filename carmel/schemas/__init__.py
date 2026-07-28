@@ -30,7 +30,7 @@ from carmel.schemas.diagnostics import (
     SpeciesSelection,
 )
 from carmel.schemas.plan import Plan, PlannedAction
-from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
+from carmel.schemas.run import ActiveRun, FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.schemas.state import CampaignState, CampaignStateValue
 
 __all__ = [
@@ -56,6 +56,7 @@ __all__ = [
     "ReactionSelection",
     "ReactorSystem",
     "ReactorType",
+    "ActiveRun",
     "RunRecord",
     "RunStatus",
     "SensitivityEntry",

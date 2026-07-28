@@ -32,6 +32,7 @@ import importlib.util
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -197,6 +198,7 @@ def _arc_run_in_process_group(
     stdout: Any = None,
     stderr: Any = None,
     text: bool = False,
+    on_process_start: Callable[[int, list[str]], None] | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     """Run *command* in its own process group, killing the whole tree on timeout.
 
@@ -211,6 +213,11 @@ def _arc_run_in_process_group(
         stdout: Passed through to ``Popen`` (a file object, ``PIPE``, or None).
         stderr: Passed through to ``Popen``.
         text: Whether to decode captured output as text.
+        on_process_start: Optional callback invoked with the new process
+            group id and *command* as soon as the tool is running, so a
+            supervisor can persist what to reap if it is killed before the
+            run ends. ``start_new_session`` makes the child a group
+            leader, so its pid is the group id.
 
     Returns:
         A ``CompletedProcess`` exactly as ``subprocess.run`` would return.
@@ -231,6 +238,8 @@ def _arc_run_in_process_group(
         register=_launcher._register_live_tree,
         forget=_launcher._forget_live_tree,
         drain_timeout=_KILL_GRACE_PERIOD_S,
+        on_process_start=on_process_start,
+        logger=_log,
     )
 
 
@@ -794,12 +803,22 @@ class ARCAdapter:
         workspace_root: Path,
         campaign: Campaign,
         action: PlannedAction,
+        on_process_start: Callable[[int, list[str]], None] | None = None,
     ) -> tuple[RunRecord, DiagnosticsV1 | None]:
         """Run one ARC job end-to-end and return a typed RunRecord + diagnostics.
 
         On any failure a ``RunRecord`` with ``status=FAILED`` and a typed
         ``FailureCode`` is returned (diagnostics ``None``); this method never
         raises for an ARC-side failure.
+
+        Args:
+            workspace_root: The campaign workspace root.
+            campaign: The campaign this action belongs to.
+            action: The approved action to execute.
+            on_process_start: Optional callback invoked with ARC's process
+                group id and argv as soon as ARC is running, so a
+                supervisor can persist what to reap if Carmel is killed
+                before the run ends.
         """
         run_id = str(uuid4())
         started = datetime.now(UTC)
@@ -888,6 +907,7 @@ class ARCAdapter:
                     stdout=stdout_file,
                     stderr=stderr_file,
                     timeout=timeout,
+                    on_process_start=on_process_start,
                 )
         except subprocess.TimeoutExpired as e:
             # The process tree is already dead by the time this is caught —

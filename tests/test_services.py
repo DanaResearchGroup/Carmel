@@ -1,9 +1,15 @@
 """Tests for Phase 1 service modules."""
 
+import errno
 import json
 import logging
 import os
+import signal
+import subprocess
+import sys
 import threading
+import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,10 +18,14 @@ from uuid import uuid4
 
 import pytest
 
+import carmel.services.execution
+import carmel.services.processes
+import carmel.services.recovery
 from carmel.adapters.arc import ARC_TOOL_NAME
 from carmel.adapters.t3 import T3_TOOL_NAME
 from carmel.schemas import (
     ActionKind,
+    ActiveRun,
     ApprovalPolicy,
     ApprovalRequirement,
     ApprovalStatus,
@@ -68,6 +78,9 @@ from carmel.services.drawing import (
 from carmel.services.execution import (
     ARC_DIAGNOSTICS_FILE_NAME,
     DIAGNOSTICS_FILE_NAME,
+    RunStillLiveError,
+    abandon_arc_run,
+    abandon_t3_run,
     execute_arc_action,
     execute_t3_action,
     load_arc_diagnostics,
@@ -86,12 +99,42 @@ from carmel.services.planner import (
     render_plan_markdown,
     save_plan,
 )
+from carmel.services.processes import (
+    ProcessGroupStatus,
+    inspect_process_group,
+    kill_process_group,
+    process_group_command,
+    process_group_exists,
+    process_group_is_running,
+    process_starttime,
+)
 from carmel.services.provenance import record
+from carmel.services.recovery import (
+    LockStateUnknownError,
+    ProcessGroupNotRecordedError,
+    RunAlreadySupervisedError,
+    RunLiveness,
+    active_run_path,
+    load_active_run,
+    probe_run_liveness,
+    record_process_group,
+    start_supervision,
+    supervise_run,
+    supervisor_is_alive,
+)
 from carmel.services.state_machine import (
+    VALID_TRANSITIONS,
     InvalidTransitionError,
     can_transition,
     load_state,
     update_state,
+)
+from tests.helpers import (
+    _died_within,
+    _is_running,
+    _shebang_leader_tree,
+    _strand_active_run,
+    _tool_tree,
 )
 
 
@@ -379,10 +422,146 @@ class TestStateMachine:
     def test_blocked_cannot_be_unrejected_to_approved_for_execution(self) -> None:
         assert not can_transition(CampaignStateValue.BLOCKED, CampaignStateValue.APPROVED_FOR_EXECUTION)
 
-    def test_blocked_can_only_transition_to_failed(self) -> None:
+    def test_blocked_can_only_be_re_planned_or_failed(self) -> None:
         for target in CampaignStateValue:
-            expected = target == CampaignStateValue.FAILED
+            expected = target in {CampaignStateValue.FAILED, CampaignStateValue.READY_FOR_PLANNING}
             assert can_transition(CampaignStateValue.BLOCKED, target) == expected
+
+    def test_blocked_campaign_can_be_re_planned(self, tmp_path: Path) -> None:
+        """A rejected plan is discarded and re-planned, not un-rejected.
+
+        The only route out of BLOCKED is back to planning, so the rejected
+        plan cannot reach execution: it must be regenerated and re-judged
+        against the approval policy first.
+        """
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        update_state(ws, CampaignStateValue.VALIDATED)
+        update_state(ws, CampaignStateValue.READY_FOR_PLANNING)
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        update_state(ws, CampaignStateValue.BLOCKED, notes="user-rejected")
+        assert not can_transition(CampaignStateValue.BLOCKED, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        recovered = update_state(ws, CampaignStateValue.READY_FOR_PLANNING, notes="re-plan")
+        assert recovered.state == CampaignStateValue.READY_FOR_PLANNING
+
+    def test_every_origin_of_failed_has_at_least_one_legal_exit(self) -> None:
+        """The wedge this milestone exists to remove.
+
+        Before recovery edges existed, 7 of the 8 states that could reach
+        FAILED had zero legal exits from it: the campaign was unrecoverable
+        and every UI action raised. The ARC states RUNNING_ARC and
+        RESULTS_READY bring the count of FAILED-reaching origins to 10.
+        """
+        origins = [state for state, targets in VALID_TRANSITIONS.items() if CampaignStateValue.FAILED in targets]
+        assert len(origins) == 10
+        for origin in [*origins, None]:
+            exits = [
+                target
+                for target in CampaignStateValue
+                if can_transition(CampaignStateValue.FAILED, target, failed_from=origin)
+            ]
+            assert exits, f"campaign that failed from {origin} has no legal exit"
+
+    def test_recovery_never_advances_a_campaign_past_a_gate_it_did_not_pass(self) -> None:
+        """No exit from FAILED may reach a state later than the one it failed from.
+
+        ``READY_FOR_PLANNING`` is exempt: it is *earlier* than every origin
+        and re-runs planning and approval in full.
+        """
+        order = [
+            CampaignStateValue.DRAFT,
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.DIAGNOSTICS_READY,
+            CampaignStateValue.COMPLETED_PHASE1,
+        ]
+        for origin in order:
+            for target in CampaignStateValue:
+                if not can_transition(CampaignStateValue.FAILED, target, failed_from=origin):
+                    continue
+                if target == CampaignStateValue.READY_FOR_PLANNING:
+                    continue
+                assert order.index(target) <= order.index(origin), f"recovering from {origin} to {target} skips a gate"
+
+    def test_failed_from_diagnostics_ready_resumes_at_diagnostics_ready(self, tmp_path: Path) -> None:
+        """The concretely reachable wedge: T3 succeeded, finalizing did not.
+
+        ``_finish_t3_run`` commits DIAGNOSTICS_READY and then
+        COMPLETED_PHASE1. If the second write fails, the campaign lands in
+        FAILED with real diagnostics already durable on disk — re-running
+        a multi-hour T3 job to recover them would be absurd.
+        """
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        for target in [
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.DIAGNOSTICS_READY,
+        ]:
+            update_state(ws, target)
+        update_state(ws, CampaignStateValue.FAILED, notes="disk full")
+        resumed = update_state(ws, CampaignStateValue.DIAGNOSTICS_READY, notes="resume")
+        assert resumed.state == CampaignStateValue.DIAGNOSTICS_READY
+        assert can_transition(resumed.state, CampaignStateValue.COMPLETED_PHASE1)
+
+    def test_only_the_matching_origins_unlock_a_direct_resume(self) -> None:
+        """Each direct resume is opened by a named set of origins and no other.
+
+        Spelled out rather than derived from ``RECOVERY_TARGETS``, so that
+        widening that table has to be a deliberate edit here too.
+        """
+        for target, unlocked_by in [
+            (
+                CampaignStateValue.APPROVED_FOR_EXECUTION,
+                {
+                    CampaignStateValue.RUNNING_T3,
+                    CampaignStateValue.RUNNING_ARC,
+                    CampaignStateValue.APPROVED_FOR_EXECUTION,
+                },
+            ),
+            (CampaignStateValue.DIAGNOSTICS_READY, {CampaignStateValue.DIAGNOSTICS_READY}),
+            (CampaignStateValue.RESULTS_READY, {CampaignStateValue.RESULTS_READY}),
+        ]:
+            for origin in CampaignStateValue:
+                assert can_transition(CampaignStateValue.FAILED, target, failed_from=origin) == (origin in unlocked_by)
+
+    def test_a_plan_approved_but_never_launched_resumes_without_re_planning(self, tmp_path: Path) -> None:
+        """Failing between approval and launch must not discard the approval.
+
+        The plan was approved and no run ever happened, so there is
+        nothing for a fresh planning pass to redo.
+        """
+        ws = tmp_path / "ws"
+        create_campaign(ws, _make_input())
+        for target in [
+            CampaignStateValue.VALIDATED,
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+        ]:
+            update_state(ws, target)
+        update_state(ws, CampaignStateValue.FAILED, notes="adapter refused to start")
+        resumed = update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="retry")
+        assert resumed.state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert can_transition(resumed.state, CampaignStateValue.RUNNING_T3)
+
+    def test_re_planning_is_available_even_when_the_origin_was_never_recorded(self) -> None:
+        """``failed_from`` is None on any state file Carmel did not write.
+
+        Such a campaign cannot use a direct resume — nothing says which
+        gates it passed — but it must still not be stranded.
+        """
+        assert can_transition(CampaignStateValue.FAILED, CampaignStateValue.READY_FOR_PLANNING, failed_from=None)
+        assert not can_transition(
+            CampaignStateValue.FAILED, CampaignStateValue.APPROVED_FOR_EXECUTION, failed_from=None
+        )
+        assert not can_transition(CampaignStateValue.FAILED, CampaignStateValue.DIAGNOSTICS_READY, failed_from=None)
 
     def test_update_state_refuses_unrejecting_a_blocked_campaign(self, tmp_path: Path) -> None:
         """A rejected plan must be re-planned, never un-rejected into execution."""
@@ -939,7 +1118,7 @@ def _success_diagnostics(campaign_id: str, run_id: str) -> DiagnosticsV1:
 class _SuccessAdapter:
     """Inline test double — simulates a successful T3 run."""
 
-    def run(self, workspace_root, campaign, action):
+    def run(self, workspace_root, campaign, action, on_process_start=None):
         run_id = str(uuid4())
         now = datetime.now(UTC)
         record = RunRecord(
@@ -967,7 +1146,7 @@ class _FailureAdapter:
         self.failure_code = failure_code
         self.error_message = error_message
 
-    def run(self, workspace_root, campaign, action):
+    def run(self, workspace_root, campaign, action, on_process_start=None):
         run_id = str(uuid4())
         now = datetime.now(UTC)
         record = RunRecord(
@@ -1159,7 +1338,13 @@ class TestExecuteT3ActionUnexpectedException:
     the campaign in RUNNING_T3 with no reachable transition."""
 
     class _RaisingAdapter:
-        def run(self, workspace_root: Path, campaign: object, action: PlannedAction) -> object:
+        def run(
+            self,
+            workspace_root: Path,
+            campaign: object,
+            action: PlannedAction,
+            on_process_start: Callable[[int, list[str]], None] | None = None,
+        ) -> object:
             raise RuntimeError("adapter blew up unexpectedly")
 
     def test_exception_propagates_to_caller(self, tmp_path: Path) -> None:
@@ -1219,7 +1404,13 @@ class _RealRecordThenCrashAdapter:
     def __init__(self) -> None:
         self.run_id = "real-run-id-from-adapter"
 
-    def run(self, workspace_root: Path, campaign: Campaign, action: PlannedAction) -> tuple[RunRecord, DiagnosticsV1]:
+    def run(
+        self,
+        workspace_root: Path,
+        campaign: Campaign,
+        action: PlannedAction,
+        on_process_start: Callable[[int, list[str]], None] | None = None,
+    ) -> tuple[RunRecord, DiagnosticsV1]:
         now = datetime.now(UTC)
         record = RunRecord(
             run_id=self.run_id,
@@ -1358,7 +1549,11 @@ class TestExecuteT3ActionDefensiveHandling:
 
         class _RaisingAdapter:
             def run(
-                self, workspace_root: Path, campaign: Campaign, action: PlannedAction
+                self,
+                workspace_root: Path,
+                campaign: Campaign,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
             ) -> tuple[RunRecord, DiagnosticsV1 | None]:
                 raise RuntimeError("original adapter failure")
 
@@ -1425,7 +1620,11 @@ class TestExecuteT3ActionDefensiveHandling:
 
         class _RaisingAdapter:
             def run(
-                self, workspace_root: Path, campaign: Campaign, action: PlannedAction
+                self,
+                workspace_root: Path,
+                campaign: Campaign,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
             ) -> tuple[RunRecord, DiagnosticsV1 | None]:
                 raise RuntimeError("original adapter failure")
 
@@ -1544,7 +1743,7 @@ def _arc_success_diagnostics(campaign_id: str, run_id: str) -> DiagnosticsV1:
 class _ARCSuccessAdapter:
     """Inline test double — simulates a successful ARC run."""
 
-    def run(self, workspace_root, campaign, action):
+    def run(self, workspace_root, campaign, action, on_process_start=None):
         run_id = str(uuid4())
         now = datetime.now(UTC)
         record = RunRecord(
@@ -1571,7 +1770,7 @@ class _ARCFailureAdapter:
     def __init__(self, failure_code: FailureCode) -> None:
         self.failure_code = failure_code
 
-    def run(self, workspace_root, campaign, action):
+    def run(self, workspace_root, campaign, action, on_process_start=None):
         now = datetime.now(UTC)
         record = RunRecord(
             run_id=str(uuid4()),
@@ -1655,7 +1854,11 @@ class TestExecuteArcActionUnexpectedException:
 
     class _RaisingAdapter:
         def run(
-            self, workspace_root: Path, campaign: Campaign, action: PlannedAction
+            self,
+            workspace_root: Path,
+            campaign: Campaign,
+            action: PlannedAction,
+            on_process_start: Callable[[int, list[str]], None] | None = None,
         ) -> tuple[RunRecord, DiagnosticsV1 | None]:
             raise RuntimeError("arc adapter blew up unexpectedly")
 
@@ -1718,7 +1921,13 @@ class _ARCRealRecordThenCrashAdapter:
     def __init__(self) -> None:
         self.run_id = "real-arc-run-id-from-adapter"
 
-    def run(self, workspace_root: Path, campaign: Campaign, action: PlannedAction) -> tuple[RunRecord, DiagnosticsV1]:
+    def run(
+        self,
+        workspace_root: Path,
+        campaign: Campaign,
+        action: PlannedAction,
+        on_process_start: Callable[[int, list[str]], None] | None = None,
+    ) -> tuple[RunRecord, DiagnosticsV1]:
         now = datetime.now(UTC)
         record = RunRecord(
             run_id=self.run_id,
@@ -1904,7 +2113,13 @@ class TestStartT3Action:
         release = threading.Event()
 
         class _Blocking:
-            def run(self, workspace_root: Path, campaign: object, action: PlannedAction) -> object:
+            def run(
+                self,
+                workspace_root: Path,
+                campaign: object,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
+            ) -> object:
                 release.wait(timeout=60)
                 raise RuntimeError("released")
 
@@ -1930,7 +2145,13 @@ class TestStartT3Action:
         plan = load_plan(ws)
 
         class _Raising:
-            def run(self, workspace_root: Path, campaign: object, action: PlannedAction) -> object:
+            def run(
+                self,
+                workspace_root: Path,
+                campaign: object,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
+            ) -> object:
                 raise RuntimeError("adapter blew up in the background")
 
         # Carmel's loggers set propagate=False, so caplog's root handler
@@ -1946,3 +2167,1133 @@ class TestStartT3Action:
 
         assert load_state(ws).state == CampaignStateValue.FAILED
         assert any("Background T3 run failed" in record.message for record in caplog.records)
+
+
+# ----------------------- process groups -------------------------
+
+
+class TestProcessGroupInspection:
+    def test_a_live_group_exists(self) -> None:
+        with _tool_tree() as tree:
+            assert process_group_exists(tree.pgid)
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_dead_group_does_not_exist(self) -> None:
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+        assert not process_group_exists(tree.pgid)
+
+    def test_a_group_we_may_not_signal_still_counts_as_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """EPERM means "exists but not signalable", never "gone".
+
+        Reporting such a group as gone would let a caller conclude a run
+        had ended when it is still executing.
+        """
+        monkeypatch.setattr(os, "killpg", _raise(PermissionError))
+        assert process_group_exists(4242)
+
+    def test_group_command_reads_the_leaders_argv(self) -> None:
+        with _tool_tree() as tree:
+            assert process_group_command(tree.pgid) == tree.command
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_group_command_is_none_when_the_leader_is_gone(self) -> None:
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+        assert _died_within(tree.pgid)
+        assert process_group_command(tree.pgid) is None
+
+    def test_group_command_is_none_for_a_zombie_leader(self) -> None:
+        """A zombie's ``/proc`` entry survives, but its cmdline reads empty.
+
+        The leader is this process's own unreaped child, so it lingers as a
+        zombie with a live ``/proc/<pid>`` but an empty ``cmdline`` — which
+        must read as no command, not as an empty argv that could spuriously
+        match one.
+        """
+        with _tool_tree() as tree:
+            os.kill(tree.leader_pid, signal.SIGKILL)
+            deadline = time.monotonic() + 15
+            while _is_running(tree.leader_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert Path(f"/proc/{tree.leader_pid}").exists(), "the unreaped zombie keeps its /proc entry"
+            assert process_group_command(tree.pgid) is None
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_matching_group_is_recognized_as_ours(self) -> None:
+        with _tool_tree() as tree:
+            assert inspect_process_group(tree.pgid, tree.command, None) == ProcessGroupStatus.RUNNING
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_group_running_a_different_command_is_not_ours(self) -> None:
+        """The pid-reuse case: the recorded pgid is live, but not this run's."""
+        with _tool_tree() as tree:
+            status = inspect_process_group(tree.pgid, ["/usr/bin/something-else"], None)
+            assert status == ProcessGroupStatus.UNRECOGNIZED
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_group_with_no_recorded_command_cannot_be_confirmed(self) -> None:
+        with _tool_tree() as tree:
+            assert inspect_process_group(tree.pgid, None, None) == ProcessGroupStatus.UNKNOWN_LIVE
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_group_whose_leader_died_is_not_reported_as_finished(self) -> None:
+        """The bug this status exists to stop: live descendants read as "over".
+
+        Carmel launches ``conda run`` (the group leader), which launches
+        T3, which launches RMG. Kill the leader and the descendants are
+        reparented to init but stay in the group, still writing. The
+        leader's ``/proc`` entry is gone, so nothing identifies them — and
+        reporting that as UNRECOGNIZED would let recovery mark the run
+        finished underneath a live RMG.
+        """
+        with _tool_tree() as tree:
+            os.kill(tree.leader_pid, signal.SIGKILL)
+            tree.proc.wait(timeout=15)
+            assert not Path(f"/proc/{tree.leader_pid}").exists()
+            assert _is_running(tree.grandchild_pid), "the grandchild should have outlived its parent"
+
+            assert process_group_exists(tree.pgid), "the group is still non-empty"
+            assert inspect_process_group(tree.pgid, tree.command, None) == ProcessGroupStatus.UNKNOWN_LIVE
+
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_reaped_group_is_not_running(self) -> None:
+        """The ordinary end state: nothing left in the group at all."""
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+            tree.proc.wait(timeout=15)
+            assert _died_within(tree.grandchild_pid)
+        assert not process_group_is_running(tree.pgid)
+
+    def test_a_zombie_leader_is_not_a_running_group(self) -> None:
+        """A zombie answers ``killpg`` but cannot write anything.
+
+        Counting it as running would make a fully stopped tree look like
+        one that survived SIGKILL, and every abandon would then refuse.
+        """
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+            assert _died_within(tree.grandchild_pid)
+            # The leader is this process's own child, so nothing has
+            # reaped it: it is still in the group and still signallable.
+            assert process_group_exists(tree.pgid), "the zombie keeps the group non-empty"
+            assert not process_group_is_running(tree.pgid), "but nothing in it is executing"
+
+    def test_a_group_is_reported_running_when_proc_cannot_be_enumerated(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Without ``/proc`` nothing has been *shown* to have stopped.
+
+        The direction matters: reporting "stopped" here would let a kill
+        claim success it never verified.
+        """
+        monkeypatch.setattr(carmel.services.processes, "PROC_ROOT", tmp_path / "no-such-proc")
+        with _tool_tree() as tree:
+            assert process_group_is_running(tree.pgid)
+            assert inspect_process_group(tree.pgid, tree.command, None) == ProcessGroupStatus.UNKNOWN_LIVE
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_process_that_exits_mid_scan_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Enumerating ``/proc`` races every process on the machine."""
+        real_read = Path.read_text
+
+        def _vanish(self: Path, *args: object, **kwargs: object) -> str:
+            if self.name == "stat":
+                raise OSError("vanished between listing and reading")
+            return real_read(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "read_text", _vanish)
+        with _tool_tree() as tree:
+            assert not process_group_is_running(tree.pgid), "every entry vanished, so none can be counted"
+            monkeypatch.undo()
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_dead_group_is_gone_whatever_was_recorded(self) -> None:
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+        assert inspect_process_group(tree.pgid, tree.command, None) == ProcessGroupStatus.GONE
+        assert inspect_process_group(tree.pgid, None, None) == ProcessGroupStatus.GONE
+
+    def test_start_time_reads_field_22_of_proc_stat(self) -> None:
+        with _tool_tree() as tree:
+            starttime = process_starttime(tree.pgid)
+            assert starttime is not None and starttime > 0
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_start_time_is_none_for_a_gone_leader(self) -> None:
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+        assert _died_within(tree.pgid)
+        assert process_starttime(tree.pgid) is None
+
+    def test_a_matching_start_time_confirms_the_group_is_ours(self) -> None:
+        """The reuse-proof identity: right pid *and* right start time."""
+        with _tool_tree() as tree:
+            starttime = process_starttime(tree.pgid)
+            assert inspect_process_group(tree.pgid, tree.command, starttime) == ProcessGroupStatus.RUNNING
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_stale_start_time_reads_as_a_reused_pid(self) -> None:
+        """A recycled pid keeps the argv but not the start time.
+
+        The command line still matches — this is the same live tree — but
+        a start time from before the (hypothetical) reuse must be read as
+        "not this run's", the case the command-line comparison alone cannot
+        catch.
+        """
+        with _tool_tree() as tree:
+            starttime = process_starttime(tree.pgid)
+            assert starttime is not None
+            status = inspect_process_group(tree.pgid, tree.command, starttime - 1)
+            assert status == ProcessGroupStatus.UNRECOGNIZED
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_start_time_of_a_vanished_leader_is_unknown_not_finished(self) -> None:
+        """Start-time identity degrades the same safe way the argv one does.
+
+        Kill the leader while a descendant survives: the group is alive but
+        its leader's ``/proc`` entry is gone, so the recorded start time can
+        no longer be read. That must read as UNKNOWN_LIVE — never as the run
+        being over — because the survivors are most likely T3 and RMG.
+        """
+        with _tool_tree() as tree:
+            starttime = process_starttime(tree.pgid)
+            os.kill(tree.leader_pid, signal.SIGKILL)
+            tree.proc.wait(timeout=15)
+            assert not Path(f"/proc/{tree.leader_pid}").exists()
+            assert _is_running(tree.grandchild_pid)
+            assert inspect_process_group(tree.pgid, tree.command, starttime) == ProcessGroupStatus.UNKNOWN_LIVE
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_group_of_only_zombies_is_gone_not_running(self) -> None:
+        """A group with nothing executing is over, even if a zombie matches.
+
+        Kill the whole group: the grandchild is reaped by init, but the
+        leader is this process's own unreaped child, so it lingers as a
+        zombie whose ``/proc`` entry — and start time — survive. The
+        identity check would match that zombie, so ``inspect`` must first
+        rule out a group in which nothing is actually running, or it reports
+        a stopped run as still going and refuses recovery forever.
+        """
+        with _tool_tree() as tree:
+            starttime = process_starttime(tree.pgid)
+            os.killpg(tree.pgid, signal.SIGKILL)
+            deadline = time.monotonic() + 15
+            while _is_running(tree.leader_pid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert Path(f"/proc/{tree.leader_pid}").exists(), "the unreaped zombie keeps its /proc entry"
+            assert process_starttime(tree.pgid) == starttime, "the zombie's start time still matches"
+            assert inspect_process_group(tree.pgid, tree.command, starttime) == ProcessGroupStatus.GONE
+
+    def test_a_shebang_launched_leader_is_recognized_from_proc(self) -> None:
+        """Finding #1: a ``conda``-shaped launch must still be identifiable.
+
+        The kernel prepends the interpreter to a ``#!`` wrapper's argv, so
+        the launched ``command`` never matches ``/proc``. Comparing the
+        launched argv would misfire and read a live orphan as finished. The
+        kernel-observed command line (what recovery records) does match, and
+        the start time confirms it beyond doubt.
+        """
+        with _shebang_leader_tree() as tree:
+            observed = process_group_command(tree.pgid)
+            assert observed is not None
+            assert observed != tree.command, "the launched argv should differ from /proc's"
+            assert observed[1:] == tree.command, "the kernel prepended the interpreter"
+
+            # The launched argv is not recognized; the kernel's is.
+            assert inspect_process_group(tree.pgid, tree.command, None) == ProcessGroupStatus.UNRECOGNIZED
+            assert inspect_process_group(tree.pgid, observed, None) == ProcessGroupStatus.RUNNING
+            starttime = process_starttime(tree.pgid)
+            assert inspect_process_group(tree.pgid, tree.command, starttime) == ProcessGroupStatus.RUNNING
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+
+class TestKillProcessGroup:
+    def test_kills_the_whole_tree_not_just_the_leader(self) -> None:
+        """The grandchild assertion lives in ``_tool_tree``'s exit."""
+        with _tool_tree() as tree:
+            assert kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.5)
+
+    def test_escalates_to_sigkill_when_sigterm_is_ignored(self) -> None:
+        with _tool_tree(ignore_sigterm=True) as tree:
+            assert kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.5)
+
+    def test_a_descendant_outliving_the_leader_is_not_success(self) -> None:
+        """The asymmetric kill: SIGTERM takes the leader, a child ignores it.
+
+        The group is then alive with its leader gone — running, and
+        unidentifiable, at the same time. Checking identity after SIGTERM
+        reads that as "no longer ours" and returns success over a live
+        RMG; only asking whether anything is still *executing* escalates
+        to SIGKILL and actually stops it.
+        """
+        with _tool_tree(only_grandchild_ignores=True) as tree:
+            assert kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.5)
+            assert _died_within(tree.grandchild_pid), "the stubborn grandchild was never killed"
+
+    def test_refuses_to_signal_a_group_that_is_not_ours(self) -> None:
+        """The whole reason the launched argv is recorded next to the pgid.
+
+        Signalling on a recycled pgid would kill an unrelated process
+        group — the same class of collateral damage the process-tree kill
+        was introduced to avoid, aimed at a stranger instead.
+        """
+        with _tool_tree() as tree:
+            assert not kill_process_group(tree.pgid, ["/usr/bin/not-ours"], None, grace_period_s=0.5)
+            # Both processes must be genuinely executing, not zombies: a
+            # kill that went ahead anyway would leave corpses that still
+            # satisfy killpg(pgid, 0) and a bare /proc check.
+            assert _is_running(tree.leader_pid), "an unrecognized group's leader was signalled"
+            assert _is_running(tree.grandchild_pid), "an unrecognized group's child was signalled"
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_an_already_dead_group_is_reported_clear(self) -> None:
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+        assert kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.5)
+
+    def test_reports_failure_when_it_may_not_signal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        with _tool_tree() as tree:
+            monkeypatch.setattr(os, "killpg", _forbid_signals(tree.pgid))
+            assert not kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.1)
+            assert _is_running(tree.grandchild_pid)
+            monkeypatch.undo()
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_reports_failure_when_the_group_survives_sigkill(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A group that outlives SIGKILL must never be reported as stopped."""
+        with _tool_tree(ignore_sigterm=True) as tree:
+            monkeypatch.setattr(carmel.services.processes, "_REAP_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(os, "killpg", _swallow_sigkill(tree.pgid))
+            logger = logging.getLogger("carmel.services.processes")
+            logger.addHandler(caplog.handler)
+            try:
+                assert not kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.2)
+            finally:
+                logger.removeHandler(caplog.handler)
+            assert "survived SIGKILL" in caplog.text
+            monkeypatch.undo()
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_reports_failure_when_sigkill_specifically_is_denied(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """SIGTERM may be permitted while SIGKILL is not.
+
+        A privilege-dropping child can accept the polite signal and refuse
+        the forceful one; the group is then still running and must be
+        reported as such.
+        """
+        with _tool_tree(ignore_sigterm=True) as tree:
+            monkeypatch.setattr(os, "killpg", _forbid_signal(tree.pgid, signal.SIGKILL))
+            assert not kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.2)
+            assert _is_running(tree.grandchild_pid)
+            monkeypatch.undo()
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_signal_reporting_no_such_group_is_not_proof_the_group_stopped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Delivery is not the same fact as termination.
+
+        ``ESRCH`` from ``killpg`` says the signal reached nothing, which is
+        fine to treat as delivered — but the verdict has to come from
+        observing the group afterwards. Here the signals all report the
+        group gone while it demonstrably keeps running, and the answer must
+        still be "not stopped".
+        """
+        with _tool_tree() as tree:
+            monkeypatch.setattr(carmel.services.processes, "_REAP_TIMEOUT_S", 0.2)
+            monkeypatch.setattr(os, "killpg", _vanish_on_signal(tree.pgid))
+            assert not kill_process_group(tree.pgid, tree.command, None, grace_period_s=0.1)
+            assert _is_running(tree.grandchild_pid)
+            monkeypatch.undo()
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+
+def _vanish_on_signal(pgid: int) -> Callable[..., None]:
+    """Return a killpg replacement where *pgid* exists but cannot be signalled.
+
+    ``sig=0`` (the existence probe) still succeeds, so the group reads as
+    live; any real signal reports it already gone.
+    """
+    real = os.killpg
+
+    def _killpg(target: int, sig: int) -> None:
+        if target == pgid and sig != 0:
+            raise ProcessLookupError("no such process group")
+        real(target, sig)
+
+    return _killpg
+
+
+def _forbid_signal(pgid: int, forbidden: signal.Signals) -> Callable[..., None]:
+    """Return a killpg replacement that denies only *forbidden* to *pgid*."""
+    real = os.killpg
+
+    def _killpg(target: int, sig: int) -> None:
+        if target == pgid and sig == forbidden:
+            raise PermissionError("not permitted")
+        real(target, sig)
+
+    return _killpg
+
+
+def _raise(exc: type[BaseException]) -> Callable[..., None]:
+    """Return a killpg replacement that always raises *exc*."""
+
+    def _killpg(_pgid: int, _sig: int) -> None:
+        raise exc()
+
+    return _killpg
+
+
+def _forbid_signals(pgid: int) -> Callable[..., None]:
+    """Return a killpg replacement that denies real signals to *pgid*."""
+    real = os.killpg
+
+    def _killpg(target: int, sig: int) -> None:
+        if target == pgid and sig != 0:
+            raise PermissionError("not permitted")
+        real(target, sig)
+
+    return _killpg
+
+
+def _swallow_sigkill(pgid: int) -> Callable[..., None]:
+    """Return a killpg replacement that drops every real signal to *pgid*."""
+    real = os.killpg
+
+    def _killpg(target: int, sig: int) -> None:
+        if target == pgid and sig != 0:
+            return
+        real(target, sig)
+
+    return _killpg
+
+
+# ----------------------- run supervision & recovery -------------
+
+
+def _running_workspace(tmp_path: Path) -> Path:
+    """Create a workspace sitting in RUNNING_T3 with no live supervisor."""
+    ws = _ready_workspace(tmp_path)
+    update_state(ws, CampaignStateValue.RUNNING_T3)
+    return ws
+
+
+class TestSupervisorLock:
+    def test_a_fresh_workspace_has_no_supervisor(self, tmp_path: Path) -> None:
+        assert not supervisor_is_alive(tmp_path)
+
+    def test_a_run_in_progress_is_detectable_from_the_same_process(self, tmp_path: Path) -> None:
+        """The web request and the run thread share a process.
+
+        ``flock`` conflicts between two file descriptors even inside one
+        process, which is what makes a dashboard request able to see the
+        run its own server is executing.
+        """
+        with supervise_run(tmp_path, "act-1"):
+            assert supervisor_is_alive(tmp_path)
+        assert not supervisor_is_alive(tmp_path)
+
+    def test_a_probe_does_not_block_another_concurrent_probe(self, tmp_path: Path) -> None:
+        """Two liveness probes must not read each other as a live supervisor.
+
+        A dead run leaves the lock free. The probe takes it *shared*, so a
+        second probe running while the first still holds it takes a
+        compatible shared lock and correctly reads the lock as free. Were
+        the probe exclusive, that concurrent probe would get ``EWOULDBLOCK``
+        and falsely report a live supervisor — re-wedging a finished run on
+        the auto-refreshing dashboard. Holding a shared lock here stands in
+        for that concurrent probe deterministically.
+        """
+        import fcntl
+
+        from carmel.services.recovery import _open_lock_file
+
+        other_probe = _open_lock_file(tmp_path)
+        fcntl.flock(other_probe, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        try:
+            assert supervisor_is_alive(tmp_path) is False, "a shared probe must not block on another shared probe"
+        finally:
+            fcntl.flock(other_probe, fcntl.LOCK_UN)
+            other_probe.close()
+
+    def test_the_in_flight_record_exists_only_for_the_duration(self, tmp_path: Path) -> None:
+        with supervise_run(tmp_path, "act-1"):
+            active = load_active_run(tmp_path)
+            assert active is not None
+            assert active.action_id == "act-1"
+            assert active.supervisor_pid == os.getpid()
+            assert active.process_group_id is None
+        assert load_active_run(tmp_path) is None
+
+    def test_a_second_supervisor_is_refused(self, tmp_path: Path) -> None:
+        with (
+            supervise_run(tmp_path, "act-1"),
+            pytest.raises(RunAlreadySupervisedError),
+            supervise_run(tmp_path, "act-2"),
+        ):
+            pass
+
+    def test_the_record_survives_a_supervisor_that_never_finishes(self, tmp_path: Path) -> None:
+        """The whole point of the record: it outlives its writer."""
+        _strand_active_run(tmp_path, process_group_id=4242, command=["conda", "run"])
+        assert not supervisor_is_alive(tmp_path)
+        active = load_active_run(tmp_path)
+        assert active is not None
+        assert active.process_group_id == 4242
+
+    def test_the_launched_process_group_is_recorded(self, tmp_path: Path) -> None:
+        with supervise_run(tmp_path, "act-1") as supervision:
+            supervision.record_process_group(4242, ["conda", "run", "-n", "t3_env"])
+            active = load_active_run(tmp_path)
+            assert active is not None
+            assert active.process_group_id == 4242
+            assert active.command == ["conda", "run", "-n", "t3_env"]
+
+    def test_recording_reads_the_kernel_identity_not_the_launched_argv(self, tmp_path: Path) -> None:
+        """Finding #1: a ``conda``-shaped launch is recorded as ``/proc`` sees it.
+
+        Storing the launched argv would persist ``[<wrapper>, run, ...]``,
+        which never matches the ``[<python>, <wrapper>, run, ...]`` the
+        kernel reports for a ``#!`` script — so a later recovery would fail
+        to recognize a live orphan and declare it finished. Recording the
+        kernel's own view of the command, plus the start time, is what keeps
+        the tool identifiable across the deployment path that actually ships.
+        """
+        with _shebang_leader_tree() as tree, supervise_run(tmp_path, "act-1") as supervision:
+            supervision.record_process_group(tree.pgid, tree.command)
+            active = load_active_run(tmp_path)
+            assert active is not None
+            assert active.command == process_group_command(tree.pgid)
+            assert active.command != tree.command, "the launched argv would not have matched /proc"
+            assert active.leader_starttime == process_starttime(tree.pgid)
+            assert active.leader_starttime is not None
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_recording_falls_back_to_the_launched_argv_when_proc_is_unreadable(self, tmp_path: Path) -> None:
+        """A pgid whose ``/proc`` cannot be read keeps the passed argv as a label."""
+        with supervise_run(tmp_path, "act-1") as supervision:
+            supervision.record_process_group(4242, ["conda", "run"])
+            active = load_active_run(tmp_path)
+            assert active is not None
+            assert active.command == ["conda", "run"]
+            assert active.leader_starttime is None
+
+    def test_recording_a_group_with_no_run_in_flight_is_an_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ProcessGroupNotRecordedError, match="No in-flight run record"):
+            record_process_group(tmp_path, 4242, ["conda"])
+
+    def test_the_lock_dies_with_a_supervisor_in_another_process(self, tmp_path: Path) -> None:
+        """The claim the whole module rests on, tested across a real process.
+
+        Every other lock test here takes and releases the lock inside the
+        test process, which proves only that ``flock`` conflicts with
+        itself. The actual premise is stronger and is the reason a lock
+        was chosen over a heartbeat or a pid: the *kernel* drops it when
+        the holder dies, however it dies. SIGKILL runs no cleanup code, so
+        nothing but the kernel can be releasing it here.
+        """
+        holder = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import pathlib, sys, time; sys.path.insert(0, sys.argv[1]);"
+                "from carmel.services.recovery import start_supervision;"
+                # Bound to a name deliberately: the lock lives exactly as
+                # long as the supervision object that owns its file does.
+                "held = start_supervision(pathlib.Path(sys.argv[2]), 'act-1');"
+                "print('locked', flush=True); time.sleep(300)",
+                str(Path(__file__).resolve().parent.parent),
+                str(tmp_path),
+            ],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert holder.stdout is not None
+            assert holder.stdout.readline().strip() == "locked"
+            assert supervisor_is_alive(tmp_path), "another process holds the lock"
+
+            holder.kill()
+            holder.wait(timeout=15)
+            assert not supervisor_is_alive(tmp_path), "the kernel must drop the lock of a killed holder"
+            assert load_active_run(tmp_path) is not None, "the record outlives the supervisor"
+        finally:
+            if holder.poll() is None:  # pragma: no cover -- only on assertion failure
+                holder.kill()
+                holder.wait(timeout=15)
+
+    def test_a_lock_that_cannot_be_taken_for_an_unrelated_reason_is_not_contention(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``ENOLCK`` is the absence of an answer, not the answer "held"."""
+
+        def _no_locks(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        monkeypatch.setattr(carmel.services.recovery.fcntl, "flock", _no_locks)
+        with pytest.raises(LockStateUnknownError):
+            supervisor_is_alive(tmp_path)
+        with pytest.raises(LockStateUnknownError):
+            start_supervision(tmp_path, "act-1")
+
+    def test_an_unopenable_lock_file_is_not_an_answer_either(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unwritable workspace must not read as "a supervisor is alive"."""
+
+        def _no_open(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.EACCES, "permission denied")
+
+        monkeypatch.setattr(carmel.services.recovery, "_open_lock_file", _no_open)
+        with pytest.raises(LockStateUnknownError, match="Could not open"):
+            supervisor_is_alive(tmp_path)
+        with pytest.raises(LockStateUnknownError, match="Could not open"):
+            start_supervision(tmp_path, "act-1")
+
+    def test_a_record_that_cannot_be_written_at_all_releases_the_lock(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failing to start must not leave the campaign locked against retry.
+
+        The lock is taken before the record is written, so a write failure
+        that kept hold of it would wedge the campaign exactly as hard as
+        the bug this module exists to fix.
+        """
+
+        def _explode(*_args: object, **_kwargs: object) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(carmel.services.recovery, "write_json", _explode)
+        with pytest.raises(OSError, match="disk full"):
+            start_supervision(tmp_path, "act-1")
+        monkeypatch.undo()
+        assert not supervisor_is_alive(tmp_path), "the lock must not survive a failed start"
+
+    def test_an_unreadable_record_is_treated_as_absent(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """A corrupt record must not be what stops a campaign being recovered."""
+        active_run_path(tmp_path).write_text("{not json", encoding="utf-8")
+        logger = logging.getLogger("carmel.services.recovery")
+        logger.addHandler(caplog.handler)
+        try:
+            assert load_active_run(tmp_path) is None
+        finally:
+            logger.removeHandler(caplog.handler)
+        assert "unreadable active-run record" in caplog.text
+
+    def test_a_record_that_cannot_be_written_fails_the_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A run nothing can track must not be allowed to proceed.
+
+        This was best-effort once, on the reasoning that bookkeeping for a
+        future recovery should never break the run itself. It inverts: a
+        run with no recorded process group reads afterwards exactly like a
+        run that never launched, so recovery would offer to abandon a
+        campaign whose T3 is still writing into it.
+        """
+
+        def _explode(*_args: object, **_kwargs: object) -> None:
+            raise OSError("disk full")
+
+        with supervise_run(tmp_path, "act-1") as supervision:
+            monkeypatch.setattr(carmel.services.recovery, "write_json", _explode)
+            try:
+                with pytest.raises(ProcessGroupNotRecordedError, match="4242"):
+                    supervision.record_process_group(4242, ["conda"])
+            finally:
+                monkeypatch.undo()
+
+
+class TestProbeRunLiveness:
+    def test_a_supervised_run_is_reported_in_progress(self, tmp_path: Path) -> None:
+        with supervise_run(tmp_path, "act-1"):
+            report = probe_run_liveness(tmp_path)
+        assert report.liveness == RunLiveness.SUPERVISED
+        assert not report.is_finished
+
+    def test_nothing_recorded_is_reported_as_such(self, tmp_path: Path) -> None:
+        report = probe_run_liveness(tmp_path)
+        assert report.liveness == RunLiveness.NO_RECORD
+        assert report.is_finished
+        assert report.active_run is None
+
+    def test_a_run_whose_tool_never_launched_is_finished(self, tmp_path: Path) -> None:
+        _strand_active_run(tmp_path, process_group_id=None, command=None)
+        report = probe_run_liveness(tmp_path)
+        assert report.liveness == RunLiveness.UNSUPERVISED
+        assert report.is_finished
+
+    def test_a_dead_process_group_is_finished(self, tmp_path: Path) -> None:
+        with _tool_tree() as tree:
+            os.killpg(tree.pgid, signal.SIGKILL)
+        _strand_active_run(tmp_path, tree.pgid, tree.command)
+        report = probe_run_liveness(tmp_path)
+        assert report.liveness == RunLiveness.UNSUPERVISED
+        assert report.is_finished
+
+    def test_a_live_tool_with_no_supervisor_is_orphaned(self, tmp_path: Path) -> None:
+        """The case a naive "mark it failed" button would silently abandon."""
+        with _tool_tree() as tree:
+            _strand_active_run(tmp_path, tree.pgid, tree.command)
+            report = probe_run_liveness(tmp_path)
+            assert report.liveness == RunLiveness.ORPHANED
+            assert not report.is_finished
+            assert str(tree.pgid) in report.detail
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_recycled_process_group_is_not_mistaken_for_the_run(self, tmp_path: Path) -> None:
+        """A live group running something else is not evidence of this run."""
+        with _tool_tree() as tree:
+            _strand_active_run(tmp_path, tree.pgid, ["/usr/bin/some-other-tool"])
+            report = probe_run_liveness(tmp_path)
+            assert report.liveness == RunLiveness.UNSUPERVISED
+            assert report.is_finished
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_conda_launched_orphan_is_recognized_not_declared_finished(self, tmp_path: Path) -> None:
+        """Finding #1, end to end: the production deployment path.
+
+        Under ``$T3_CONDA_ENV`` the tool is a ``#!`` wrapper, so the argv
+        Carmel launched never matches what ``/proc`` reports. Recorded as
+        recovery actually records it — the kernel-observed command and the
+        start time — a live orphan reads as ORPHANED. Recorded the pre-fix
+        way (launched argv, no start time) the very same live tree reads as
+        UNSUPERVISED: the run declared over while it keeps writing.
+        """
+        with _shebang_leader_tree() as tree:
+            observed = process_group_command(tree.pgid)
+            starttime = process_starttime(tree.pgid)
+
+            _strand_active_run(tmp_path, tree.pgid, observed, leader_starttime=starttime)
+            report = probe_run_liveness(tmp_path)
+            assert report.liveness == RunLiveness.ORPHANED
+            assert not report.is_finished
+
+            _strand_active_run(tmp_path, tree.pgid, tree.command, leader_starttime=None)
+            regressed = probe_run_liveness(tmp_path)
+            assert regressed.liveness == RunLiveness.UNSUPERVISED, "the pre-fix record lost a live orphan"
+
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_start_time_from_before_pid_reuse_reads_as_finished(self, tmp_path: Path) -> None:
+        """A stale start time on a live pgid is positive evidence of reuse.
+
+        The command line still matches — same live tree — but a start time
+        recorded before the pid was (hypothetically) recycled proves the
+        group Carmel launched is gone, so the run is over. This is the case
+        the argv comparison alone could never catch.
+        """
+        with _tool_tree() as tree:
+            starttime = process_starttime(tree.pgid)
+            assert starttime is not None
+            _strand_active_run(tmp_path, tree.pgid, tree.command, leader_starttime=starttime - 1)
+            report = probe_run_liveness(tmp_path)
+            assert report.liveness == RunLiveness.UNSUPERVISED
+            assert report.is_finished
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_tool_that_outlived_its_launcher_is_never_called_finished(self, tmp_path: Path) -> None:
+        """The corruption path: live RMG reported as a run that has ended.
+
+        Carmel launches ``conda run`` as the group leader; T3 and RMG live
+        beneath it. Kill only the leader and the descendants survive in
+        the group, still writing into the workspace — but the leader's
+        ``/proc`` entry is gone, so nothing identifies them any more.
+        Classifying that as "this run's processes have ended" is what let
+        a campaign be abandoned out from under a live RMG.
+        """
+        with _tool_tree() as tree:
+            _strand_active_run(tmp_path, tree.pgid, tree.command)
+            os.kill(tree.leader_pid, signal.SIGKILL)
+            tree.proc.wait(timeout=15)
+            assert _is_running(tree.grandchild_pid), "the grandchild should have outlived its parent"
+
+            report = probe_run_liveness(tmp_path)
+            assert report.liveness == RunLiveness.UNKNOWN
+            assert not report.is_finished, "a live descendant must never read as finished"
+            assert str(tree.pgid) in report.detail
+
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_lock_that_cannot_be_interrogated_reports_unknown(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No working ``flock`` must not silently mean "a supervisor is alive".
+
+        That is the permanent wedge this module exists to remove, and an
+        NFS mount without a lock daemon would reinstate it.
+        """
+
+        def _no_locks(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        monkeypatch.setattr(carmel.services.recovery.fcntl, "flock", _no_locks)
+        report = probe_run_liveness(tmp_path)
+        assert report.liveness == RunLiveness.UNKNOWN
+        assert not report.is_finished
+
+
+class TestAbandonT3Run:
+    def test_a_supervised_run_is_refused(self, tmp_path: Path) -> None:
+        ws = _running_workspace(tmp_path)
+        with supervise_run(ws, "act-1"), pytest.raises(RunStillLiveError):
+            abandon_t3_run(ws, load_campaign(ws))
+        assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+
+    def test_a_stale_campaign_is_failed(self, tmp_path: Path) -> None:
+        ws = _running_workspace(tmp_path)
+        _strand_active_run(ws, process_group_id=None, command=None)
+        state, report = abandon_t3_run(ws, load_campaign(ws))
+        assert state.state == CampaignStateValue.FAILED
+        assert state.failed_from == CampaignStateValue.RUNNING_T3
+        assert report.liveness == RunLiveness.UNSUPERVISED
+        assert load_active_run(ws) is None
+
+    def test_the_abandoned_run_is_recorded_under_its_own_failure_code(self, tmp_path: Path) -> None:
+        """Abandoning is not the same as observing the tool fail."""
+        ws = _running_workspace(tmp_path)
+        _strand_active_run(ws, process_group_id=None, command=None)
+        abandon_t3_run(ws, load_campaign(ws))
+        records = list((ws / "runs").glob("*.json"))
+        assert len(records) == 1
+        record = RunRecord.model_validate(json.loads(records[0].read_text()))
+        assert record.status == RunStatus.FAILED
+        assert record.failure_code == FailureCode.ABANDONED
+        assert record.action_id == "act-1"
+
+    def test_a_campaign_with_no_record_at_all_is_still_recoverable(self, tmp_path: Path) -> None:
+        ws = _running_workspace(tmp_path)
+        state, report = abandon_t3_run(ws, load_campaign(ws))
+        assert state.state == CampaignStateValue.FAILED
+        assert report.liveness == RunLiveness.NO_RECORD
+        assert not list((ws / "runs").glob("*.json")), "no run was recorded, so none should be invented"
+
+    def test_an_orphaned_tool_is_stopped_before_the_run_is_called_over(self, tmp_path: Path) -> None:
+        """The defect this must not reintroduce, one layer up.
+
+        Marking the campaign FAILED while T3 and RMG keep writing into the
+        workspace is the same lie the process-tree kill exists to prevent.
+        """
+        ws = _running_workspace(tmp_path)
+        with _tool_tree() as tree:
+            _strand_active_run(ws, tree.pgid, tree.command)
+            state, report = abandon_t3_run(ws, load_campaign(ws))
+            assert report.liveness == RunLiveness.ORPHANED
+            assert state.state == CampaignStateValue.FAILED
+            assert not _is_running(tree.leader_pid)
+            assert not _is_running(tree.grandchild_pid)
+
+    def test_a_tool_that_cannot_be_stopped_leaves_the_campaign_running(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Failing to stop the tool must not be rounded down to success."""
+        ws = _running_workspace(tmp_path)
+        with _tool_tree() as tree:
+            _strand_active_run(ws, tree.pgid, tree.command)
+            monkeypatch.setattr(carmel.services.execution, "kill_process_group", lambda *a, **k: False)
+            with pytest.raises(RunStillLiveError, match="may still be running"):
+                abandon_t3_run(ws, load_campaign(ws))
+            assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+            assert load_active_run(ws) is not None, "the record must survive a failed abandon"
+            monkeypatch.undo()
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_abandoning_is_recorded_in_the_decision_log(self, tmp_path: Path) -> None:
+        ws = _running_workspace(tmp_path)
+        _strand_active_run(ws, process_group_id=None, command=None)
+        abandon_t3_run(ws, load_campaign(ws))
+        events = [e["event"] for e in read_events(ws / "decision_log.jsonl")]
+        assert "t3_run_abandoned" in events
+
+    def test_a_run_that_cannot_be_accounted_for_is_refused(self, tmp_path: Path) -> None:
+        """Refusing is the whole point: the alternative corrupts a live run.
+
+        A tool whose launcher died is unidentifiable but very much alive.
+        Abandoning it would write a terminal run record and move the
+        campaign to FAILED while T3 keeps writing into the workspace.
+        """
+        ws = _ready_workspace(tmp_path)
+        with _tool_tree() as tree:
+            _strand_active_run(ws, tree.pgid, tree.command)
+            update_state(ws, CampaignStateValue.RUNNING_T3)
+            os.kill(tree.leader_pid, signal.SIGKILL)
+            tree.proc.wait(timeout=15)
+
+            with pytest.raises(RunStillLiveError):
+                abandon_t3_run(ws, load_campaign(ws))
+
+            assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+            assert _is_running(tree.grandchild_pid), "the live tool must be untouched"
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_a_campaign_that_is_not_running_cannot_be_abandoned(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        with pytest.raises(InvalidTransitionError):
+            abandon_t3_run(ws, load_campaign(ws))
+
+
+class TestRunsAreSupervised:
+    def test_a_real_run_records_and_then_clears_its_supervision(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        seen: list[ActiveRun | None] = []
+
+        class _Observing:
+            submission_mode = SubmissionMode.SUBPROCESS
+
+            def run(
+                self,
+                workspace_root: Path,
+                campaign: Campaign,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
+            ) -> tuple[RunRecord, DiagnosticsV1 | None]:
+                assert on_process_start is not None
+                on_process_start(4242, ["conda", "run"])
+                seen.append(load_active_run(workspace_root))
+                now = datetime.now(UTC)
+                return RunRecord(
+                    run_id="observed",
+                    action_id=action.action_id,
+                    tool_name=T3_TOOL_NAME,
+                    status=RunStatus.FAILED,
+                    failure_code=FailureCode.SUBPROCESS_ERROR,
+                    started_at=now,
+                    ended_at=now,
+                    submission_mode=SubmissionMode.SUBPROCESS,
+                    error_message="nope",
+                ), None
+
+        execute_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_Observing())
+        assert seen[0] is not None, "the run must be recorded as in flight while it runs"
+        assert seen[0].process_group_id == 4242
+        assert load_active_run(ws) is None, "a finished run must leave no in-flight record"
+        assert not supervisor_is_alive(ws)
+
+    def test_the_lock_is_held_before_the_campaign_ever_reads_as_running(self, tmp_path: Path) -> None:
+        """No instant may exist where a campaign is RUNNING_T3 and unsupervised.
+
+        The transition happens in the caller's thread and the run in a
+        background one. If the lock were taken by the background thread, a
+        probe landing between the two would find a RUNNING_T3 campaign
+        with no supervisor and no in-flight record — read that as
+        NO_RECORD, conclude nothing ever started, and offer to abandon a
+        run that was about to launch.
+
+        Blocking the background thread before it does anything makes that
+        window the whole test, rather than something to race against.
+        """
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        # Stop the background thread from ever running. Whatever the
+        # caller has done by the time it returns is then the entire
+        # observable state, so this cannot pass by winning a race: if the
+        # lock were taken by the thread, it would never be taken at all.
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(threading.Thread, "start", lambda self: None)
+        try:
+            # Held, not discarded: the lock lives as long as the thread
+            # that owns the supervision does, and in production that is
+            # the thread actually running T3.
+            thread = start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+            assert thread is not None
+            assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+            report = probe_run_liveness(ws)
+            assert report.liveness == RunLiveness.SUPERVISED
+            assert not report.is_finished, "an about-to-launch run must never read as finished"
+        finally:
+            monkeypatch.undo()
+
+    def test_a_second_run_is_refused_while_the_first_holds_the_lock(self, tmp_path: Path) -> None:
+        """Two POSTs must not both get a run; the lock decides, not the state."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with supervise_run(ws, "someone-else"):
+            with pytest.raises(RunAlreadySupervisedError):
+                start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+            assert load_state(ws).state != CampaignStateValue.RUNNING_T3, (
+                "a refused run must not have moved the campaign"
+            )
+
+    def test_a_run_whose_thread_cannot_start_fails_rather_than_wedging(self, tmp_path: Path) -> None:
+        """A thread that never starts must not strand the campaign in RUNNING_T3.
+
+        By the time ``thread.start()`` runs the campaign is already
+        RUNNING_T3, and if it raises — ``can't start new thread`` on a
+        loaded box — nothing will ever run ``_finish_t3_run`` to release
+        the lock or record an outcome: the exact permanent wedge this path
+        exists to avoid, one layer up. The run must release its supervision
+        and fail, so the campaign reads as recoverable rather than forever
+        supervised.
+        """
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+
+        def _cannot_start(_self: threading.Thread) -> None:
+            raise RuntimeError("can't start new thread")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(threading.Thread, "start", _cannot_start)
+        try:
+            with pytest.raises(RuntimeError, match="can't start new thread"):
+                start_t3_action(ws, load_campaign(ws), plan.actions[0], adapter=_SuccessAdapter())
+        finally:
+            monkeypatch.undo()
+
+        assert load_state(ws).state == CampaignStateValue.FAILED
+        assert load_active_run(ws) is None, "the in-flight record must be cleared"
+        assert probe_run_liveness(ws).liveness == RunLiveness.NO_RECORD, "the run lock must be released"
+
+
+def _running_arc_workspace(tmp_path: Path) -> Path:
+    """Create a workspace sitting in RUNNING_ARC with no live supervisor."""
+    ws = _ready_workspace(tmp_path)
+    update_state(ws, CampaignStateValue.RUNNING_ARC)
+    return ws
+
+
+class TestAbandonArcRun:
+    """ARC mirror of TestAbandonT3Run.
+
+    RUNNING_ARC is a first-class long-running subprocess state, so the
+    killed-supervisor wedge the T3 abandon path recovers must be
+    recoverable for ARC through the same supervision contract.
+    """
+
+    def test_a_supervised_run_is_refused(self, tmp_path: Path) -> None:
+        ws = _running_arc_workspace(tmp_path)
+        with supervise_run(ws, "act-1"), pytest.raises(RunStillLiveError):
+            abandon_arc_run(ws, load_campaign(ws))
+        assert load_state(ws).state == CampaignStateValue.RUNNING_ARC
+
+    def test_a_stale_campaign_is_failed_under_arcs_own_name(self, tmp_path: Path) -> None:
+        ws = _running_arc_workspace(tmp_path)
+        _strand_active_run(ws, process_group_id=None, command=None)
+        state, report = abandon_arc_run(ws, load_campaign(ws))
+        assert state.state == CampaignStateValue.FAILED
+        assert state.failed_from == CampaignStateValue.RUNNING_ARC
+        assert report.liveness == RunLiveness.UNSUPERVISED
+        assert load_active_run(ws) is None
+        records = list((ws / "runs").glob("*.json"))
+        assert len(records) == 1
+        record = RunRecord.model_validate(json.loads(records[0].read_text()))
+        assert record.status == RunStatus.FAILED
+        assert record.failure_code == FailureCode.ABANDONED
+        assert record.tool_name == ARC_TOOL_NAME
+        assert record.action_id == "act-1"
+
+    def test_an_orphaned_tool_is_stopped_before_the_run_is_called_over(self, tmp_path: Path) -> None:
+        """Marking the campaign FAILED while ARC and its QM children keep
+        writing into the workspace would be the same lie the process-tree
+        kill exists to prevent."""
+        ws = _running_arc_workspace(tmp_path)
+        with _tool_tree() as tree:
+            _strand_active_run(ws, tree.pgid, tree.command)
+            state, report = abandon_arc_run(ws, load_campaign(ws))
+            assert report.liveness == RunLiveness.ORPHANED
+            assert state.state == CampaignStateValue.FAILED
+            assert not _is_running(tree.leader_pid)
+            assert not _is_running(tree.grandchild_pid)
+
+    def test_abandoning_is_recorded_in_the_decision_log(self, tmp_path: Path) -> None:
+        ws = _running_arc_workspace(tmp_path)
+        _strand_active_run(ws, process_group_id=None, command=None)
+        abandon_arc_run(ws, load_campaign(ws))
+        events = [e["event"] for e in read_events(ws / "decision_log.jsonl")]
+        assert "arc_run_abandoned" in events
+
+    def test_a_campaign_that_is_not_running_cannot_be_abandoned(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        with pytest.raises(InvalidTransitionError):
+            abandon_arc_run(ws, load_campaign(ws))
+
+    def test_the_arc_abandon_path_refuses_a_t3_run(self, tmp_path: Path) -> None:
+        """The two abandon paths must not cross: each guards its own state."""
+        ws = _running_workspace(tmp_path)
+        with pytest.raises(InvalidTransitionError):
+            abandon_arc_run(ws, load_campaign(ws))
+        assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+
+    def test_the_t3_abandon_path_refuses_an_arc_run(self, tmp_path: Path) -> None:
+        ws = _running_arc_workspace(tmp_path)
+        with pytest.raises(InvalidTransitionError):
+            abandon_t3_run(ws, load_campaign(ws))
+        assert load_state(ws).state == CampaignStateValue.RUNNING_ARC
+
+    def test_an_abandoned_arc_campaign_can_retry(self, tmp_path: Path) -> None:
+        """RECOVERY_TARGETS must map RUNNING_ARC back to APPROVED_FOR_EXECUTION."""
+        ws = _running_arc_workspace(tmp_path)
+        _strand_active_run(ws, process_group_id=None, command=None)
+        abandon_arc_run(ws, load_campaign(ws))
+        state = load_state(ws)
+        assert can_transition(state.state, CampaignStateValue.APPROVED_FOR_EXECUTION, state.failed_from)
+
+
+class TestArcRunsAreSupervised:
+    """ARC mirror of TestRunsAreSupervised: execute_arc_action owns a
+    RunSupervision exactly like the T3 path does."""
+
+    def test_a_real_run_records_and_then_clears_its_supervision(self, tmp_path: Path) -> None:
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        seen: list[ActiveRun | None] = []
+
+        class _Observing:
+            submission_mode = SubmissionMode.SUBPROCESS
+
+            def run(
+                self,
+                workspace_root: Path,
+                campaign: Campaign,
+                action: PlannedAction,
+                on_process_start: Callable[[int, list[str]], None] | None = None,
+            ) -> tuple[RunRecord, DiagnosticsV1 | None]:
+                assert on_process_start is not None
+                on_process_start(4242, ["conda", "run"])
+                seen.append(load_active_run(workspace_root))
+                now = datetime.now(UTC)
+                return RunRecord(
+                    run_id="observed",
+                    action_id=action.action_id,
+                    tool_name=ARC_TOOL_NAME,
+                    status=RunStatus.FAILED,
+                    failure_code=FailureCode.SUBPROCESS_ERROR,
+                    started_at=now,
+                    ended_at=now,
+                    submission_mode=SubmissionMode.SUBPROCESS,
+                    error_message="nope",
+                ), None
+
+        execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_Observing())
+        assert seen[0] is not None, "the run must be recorded as in flight while it runs"
+        assert seen[0].process_group_id == 4242
+        assert load_active_run(ws) is None, "a finished run must leave no in-flight record"
+        assert not supervisor_is_alive(ws)
+
+    def test_a_second_run_is_refused_while_the_lock_is_held(self, tmp_path: Path) -> None:
+        """The lock decides, not the state — same contract as T3."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        with supervise_run(ws, "someone-else"):
+            with pytest.raises(RunAlreadySupervisedError):
+                execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+            assert load_state(ws).state != CampaignStateValue.RUNNING_ARC, (
+                "a refused run must not have moved the campaign"
+            )
+
+    def test_a_refused_transition_releases_the_lock(self, tmp_path: Path) -> None:
+        """Supervision is taken before the RUNNING_ARC transition; if the
+        transition is refused, the lock must not stay held."""
+        ws = _ready_workspace(tmp_path)
+        plan = load_plan(ws)
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        with pytest.raises(InvalidTransitionError):
+            execute_arc_action(ws, load_campaign(ws), plan.actions[0], adapter=_ARCSuccessAdapter())
+        assert not supervisor_is_alive(ws), "a refused run must release its supervision"
+        assert load_active_run(ws) is None
