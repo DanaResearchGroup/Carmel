@@ -29,9 +29,9 @@ shell out to the babysit-arc Claude-Code skill — only its principles.
 from __future__ import annotations
 
 import importlib.util
-import os
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +40,7 @@ from uuid import uuid4
 
 import yaml
 
+from carmel.adapters import _launcher
 from carmel.logger import get_logger
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.diagnostics import (
@@ -136,6 +137,102 @@ DEFAULT_JOB_TYPES: dict[str, bool] = {
 
 _log = get_logger("adapters.arc")
 
+# Precedence-ordered sources for ARC's resolved interpreter/environment,
+# shared by _launcher.launch_command/conda_env_error. ARC-specific env vars
+# win when set; otherwise this falls back to T3's, since ARC and T3 share a
+# single environment (``t3_env``) under the three-env deployment model — see
+# carmel/adapters/t3.py's module docstring for that model. A conda env, if
+# set, always wins over a bare interpreter path.
+ARC_SOURCES: list[tuple[str, str]] = [
+    ("conda", "ARC_CONDA_ENV"),
+    ("python", "ARC_PYTHON"),
+    ("conda", "T3_CONDA_ENV"),
+    ("python", "T3_PYTHON"),
+]
+
+# Keeps is_arc_importable()/_arc_version()/_arc_conda_env_error() subprocess
+# probes bounded so they can never hang a CI run. See t3.py's
+# _T3_IMPORT_PROBE_TIMEOUT_S for the full cold-start rationale (conda
+# activation hooks, then ARC's own heavy dependency stack).
+_ARC_IMPORT_PROBE_TIMEOUT_S: float = 120.0
+
+# How long a timed-out process tree is given to exit on SIGTERM before it is
+# SIGKILLed. Mirrors t3.py's _KILL_GRACE_PERIOD_S.
+_KILL_GRACE_PERIOD_S: float = 10.0
+
+
+# ---------------------------------------------------------------------------
+# Subprocess execution — process-group aware. Process-tree lifecycle
+# (registry, atexit sweep, terminate, run-in-group) lives in
+# carmel.adapters._launcher, shared with the T3 adapter — see that module and
+# t3.py's own wrapper functions for the full rationale (killing only the
+# direct child orphans T3/ARC's actual work; start_new_session=True is what
+# makes killing the whole group safe).
+# ---------------------------------------------------------------------------
+
+
+def _arc_terminate_process_tree(proc: subprocess.Popen[Any], grace_period_s: float | None = None) -> None:
+    """Kill *proc* and every descendant sharing its process group, then reap it.
+
+    Thin wrapper over :func:`carmel.adapters._launcher.terminate_process_tree`
+    that supplies ARC's own grace period default and logger.
+
+    Args:
+        proc: The running child process.
+        grace_period_s: Seconds to wait between SIGTERM and SIGKILL, and
+            the bound on each subsequent attempt to reap the child.
+            Defaults to ``_KILL_GRACE_PERIOD_S``, read at call time so it
+            can be shortened for tests.
+    """
+    if grace_period_s is None:
+        grace_period_s = _KILL_GRACE_PERIOD_S
+    _launcher.terminate_process_tree(proc, grace_period_s=grace_period_s, logger=_log, tool_label="ARC")
+
+
+def _arc_run_in_process_group(
+    command: list[str],
+    *,
+    timeout: float,
+    cwd: Path | None = None,
+    stdout: Any = None,
+    stderr: Any = None,
+    text: bool = False,
+) -> subprocess.CompletedProcess[Any]:
+    """Run *command* in its own process group, killing the whole tree on timeout.
+
+    Thin wrapper over :func:`carmel.adapters._launcher.run_in_process_group`
+    that supplies ARC's own :func:`_arc_terminate_process_tree` as the kill
+    callback, so ARC's grace period/logger apply on timeout.
+
+    Args:
+        command: The argv to execute.
+        timeout: Seconds to wait before killing the tree.
+        cwd: Working directory for the child.
+        stdout: Passed through to ``Popen`` (a file object, ``PIPE``, or None).
+        stderr: Passed through to ``Popen``.
+        text: Whether to decode captured output as text.
+
+    Returns:
+        A ``CompletedProcess`` exactly as ``subprocess.run`` would return.
+
+    Raises:
+        subprocess.TimeoutExpired: If *timeout* expires. The process tree
+            has already been killed and reaped when this propagates.
+        OSError: If the child cannot be spawned at all.
+    """
+    return _launcher.run_in_process_group(
+        command,
+        timeout=timeout,
+        cwd=cwd,
+        stdout=stdout,
+        stderr=stderr,
+        text=text,
+        terminate=_arc_terminate_process_tree,
+        register=_launcher._register_live_tree,
+        forget=_launcher._forget_live_tree,
+        drain_timeout=_KILL_GRACE_PERIOD_S,
+    )
+
 
 @dataclass(frozen=True)
 class ARCGuardrails:
@@ -167,52 +264,123 @@ def is_arc_installed() -> bool:
     return importlib.util.find_spec("arc") is not None
 
 
+def _arc_python_command() -> list[str]:
+    """Resolve the argv prefix used to run a python interpreter inside ARC's environment.
+
+    See :func:`carmel.adapters.t3._t3_python_command` for the full rationale
+    (a conda environment is not reducible to its interpreter path — some
+    dependencies, e.g. openbabel, only load correctly when activation hooks
+    have run). ARC-specific env vars (``$ARC_CONDA_ENV``/``$ARC_PYTHON``) win
+    when set; otherwise this falls back to T3's (``$T3_CONDA_ENV``/
+    ``$T3_PYTHON``), since ARC and T3 share a single environment (``t3_env``)
+    under the three-env deployment model.
+
+    Returns:
+        The argv prefix to prepend to a python invocation to run it inside
+        ARC's environment.
+    """
+    return _launcher.launch_command(ARC_SOURCES, logger=_log, tool_label="ARC", which=shutil.which)
+
+
+def _arc_conda_env_error() -> str | None:
+    """Return why ARC's configured conda env cannot be used, or None if fine/unset.
+
+    See :func:`carmel.adapters.t3._t3_conda_env_error` for the full
+    rationale: :func:`_arc_python_command` is deliberately non-raising and
+    falls back silently on a misconfigured conda env, so this is the
+    explicit, callable check that :meth:`ARCAdapter.run` uses to turn a
+    broken ``$ARC_CONDA_ENV``/``$T3_CONDA_ENV`` into a clean, typed failure
+    up front instead of a silent downgrade to the wrong interpreter.
+
+    Returns:
+        None if no conda source in :data:`ARC_SOURCES` is set, or the first
+        set one is usable. Otherwise a human-readable message identifying
+        which misconfiguration was detected.
+    """
+    return _launcher.conda_env_error(
+        ARC_SOURCES,
+        probe_timeout=_ARC_IMPORT_PROBE_TIMEOUT_S,
+        runner=_arc_run_in_process_group,
+        tool_label="ARC",
+        which=shutil.which,
+    )
+
+
 def is_arc_importable() -> bool:
-    """Return True if ``arc`` can actually be imported in this interpreter."""
-    try:
-        importlib.import_module("arc")
-    except Exception:  # pragma: no cover - import-time unusable
-        return False
-    return True
+    """Return True if ``arc`` can actually be imported by ARC's own environment.
+
+    This probes the python command that will actually run ARC (see
+    :func:`_arc_python_command`) in a subprocess, never Carmel's own
+    process — see :func:`carmel.adapters.t3.is_t3_importable` for the full
+    three-env rationale, which applies identically here.
+    """
+    return _launcher.probe_importable(
+        _arc_python_command(), "arc", timeout=_ARC_IMPORT_PROBE_TIMEOUT_S, runner=_arc_run_in_process_group
+    )
 
 
 def _arc_version() -> str | None:
-    """Return ARC's version string if importable, else None."""
-    try:
-        module = importlib.import_module("arc")
-    except Exception:  # pragma: no cover - import-time unusable
-        return None
-    version = getattr(module, "__version__", None)
-    return str(version) if version is not None else None
+    """Return ARC's version string if importable via ARC's own environment, else None.
+
+    Like :func:`is_arc_importable`, this probes the resolved ARC python
+    command in a subprocess rather than importing ``arc`` into Carmel's own
+    process.
+    """
+    return _launcher.probe_version(
+        _arc_python_command(), "arc", timeout=_ARC_IMPORT_PROBE_TIMEOUT_S, runner=_arc_run_in_process_group
+    )
 
 
 def _find_arc_executable() -> list[str] | None:
     """Locate the ARC executable.
 
-    Preference order:
-    1. ``$ARC_PATH/ARC.py`` if the env var is set
-    2. ``ARC.py`` next to the importable ``arc`` package (repo root)
-    3. ``ARC.py`` discoverable on PATH via ``shutil.which``
+    Preference order when the resolved ARC python command (see
+    :func:`_arc_python_command`) equals Carmel's own ``[sys.executable]``
+    (no conda/python source in :data:`ARC_SOURCES` won, so ARC ultimately
+    launches under Carmel's own interpreter and Carmel's own environment is
+    a legitimate place to look for ARC):
+        1. ``$ARC_PATH/ARC.py`` if the env var is set
+        2. ``ARC.py`` next to the importable ``arc`` package (repo root)
+        3. ``ARC.py`` discoverable on PATH via ``shutil.which``
+
+    Otherwise — a conda source won, or a set ``$ARC_PYTHON``/``$T3_PYTHON``
+    won over an inherited ``$T3_CONDA_ENV`` — the resolved command is
+    authoritative and steps 2-3 above are skipped entirely, for the same
+    reason as :func:`carmel.adapters.t3._find_t3_executable`: Carmel must
+    never use its *own* discovery to pick a script path and then execute it
+    inside a *different* interpreter/environment. Note this is deliberately
+    NOT the same test as "no conda source is set" — a bare ``$ARC_PYTHON``
+    can win over an inherited ``$T3_CONDA_ENV``, in which case ARC still
+    launches under a non-Carmel interpreter and host discovery must stay
+    disabled.
+
+    Unlike T3, ARC has no ``-m`` invocation mode: the real
+    DanaResearchGroup/ARC repo ships no ``arc/__main__.py`` and no
+    ``console_scripts`` entry point, only ``ARC.py`` at the repo root
+    (``python ARC.py input.yml``). So the shared
+    :func:`carmel.adapters._launcher.find_executable`'s ``-m`` fallback is
+    unconditionally disabled here (``is_importable=lambda: False``): if
+    ``ARC.py`` itself cannot be found, there is no other way to invoke ARC.
+
+    Every branch launches ARC with the resolved ARC python command (see
+    :func:`_arc_python_command`), never unconditionally with a bare
+    ``"python"`` — and, when a conda source is set, via ``conda run`` rather
+    than a bare interpreter path, so that conda activation hooks actually
+    run.
     """
-    env_path = os.environ.get("ARC_PATH")
-    if env_path:
-        candidate = Path(env_path) / ARC_LAYOUT.EXECUTABLE_SCRIPT
-        if candidate.exists():
-            return ["python", str(candidate)]
-
-    spec = importlib.util.find_spec("arc")
-    if spec is not None and spec.origin is not None:
-        # spec.origin is .../arc/__init__.py; ARC.py lives at the repo root.
-        repo_root = Path(spec.origin).parent.parent
-        candidate = repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT
-        if candidate.exists():
-            return ["python", str(candidate)]
-
-    which = shutil.which(ARC_LAYOUT.EXECUTABLE_SCRIPT)
-    if which is not None:
-        return ["python", which]
-
-    return None
+    cmd = _arc_python_command()
+    host_discovery_allowed = cmd == [sys.executable]
+    return _launcher.find_executable(
+        path_env_var="ARC_PATH",
+        executable_script=ARC_LAYOUT.EXECUTABLE_SCRIPT,
+        executable_module="arc",
+        package_name="arc",
+        python_command=cmd,
+        host_discovery_allowed=host_discovery_allowed,
+        is_importable=lambda: False,
+        which=shutil.which,
+        find_spec=importlib.util.find_spec,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +814,7 @@ class ARCAdapter:
                 campaign=campaign,
                 failure_code=FailureCode.SUBPROCESS_ERROR,
                 error_message=f"Could not create run directory {run_dir}: {e}",
+                probe_version=False,
             ), None
         stdout_path = run_dir / ARC_LAYOUT.CARMEL_STDOUT_FILENAME
         stderr_path = run_dir / ARC_LAYOUT.CARMEL_STDERR_FILENAME
@@ -666,6 +835,25 @@ class ARCAdapter:
                 input_path=input_path,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
+                probe_version=False,
+            ), None
+
+        # 1.5. Reject a misconfigured $ARC_CONDA_ENV/$T3_CONDA_ENV up front,
+        # before ever trying to discover or launch anything under it — see
+        # _arc_conda_env_error for exactly what's checked.
+        conda_error = _arc_conda_env_error()
+        if conda_error is not None:
+            return self._failed_record(
+                run_id=run_id,
+                action=action,
+                started=started,
+                campaign=campaign,
+                failure_code=FailureCode.TOOL_NOT_FOUND,
+                error_message=conda_error,
+                input_path=input_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                probe_version=False,
             ), None
 
         # 2. Locate the ARC executable.
@@ -681,6 +869,7 @@ class ARCAdapter:
                 input_path=input_path,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
+                probe_version=False,
             ), None
 
         # 3. Invoke ARC. ARC derives its project_directory from the input file's
@@ -693,22 +882,27 @@ class ARCAdapter:
                 open(stdout_path, "w", encoding="utf-8") as stdout_file,
                 open(stderr_path, "w", encoding="utf-8") as stderr_file,
             ):
-                completed = subprocess.run(  # noqa: S603 -- ARC is a trusted tool
+                completed = _arc_run_in_process_group(
                     command,
                     cwd=run_dir,
                     stdout=stdout_file,
                     stderr=stderr_file,
                     timeout=timeout,
-                    check=False,
                 )
         except subprocess.TimeoutExpired as e:
+            # The process tree is already dead by the time this is caught —
+            # see _arc_terminate_process_tree. That is what makes the
+            # TIMEOUT recorded below true rather than merely reported:
+            # before this, ARC and its QM children kept running and kept
+            # writing into run_dir long after Carmel had declared the run
+            # timed out.
             return self._failed_record(
                 run_id=run_id,
                 action=action,
                 started=started,
                 campaign=campaign,
                 failure_code=FailureCode.TIMEOUT,
-                error_message=str(e),
+                error_message=f"{e}; ARC and every process it started were killed",
                 input_path=input_path,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
@@ -804,6 +998,7 @@ class ARCAdapter:
         stderr_path: Path | None = None,
         command: list[str] | None = None,
         ended: datetime | None = None,
+        probe_version: bool = True,
     ) -> RunRecord:
         """Build a typed failure RunRecord.
 
@@ -811,12 +1006,21 @@ class ARCAdapter:
         run records carry the same resolved-input estimate as timeout/success
         records, rather than the blind single-species fallback used when the
         campaign (and thus the actual species/reaction count) is unknown.
+
+        ``probe_version`` controls whether ARC's version is probed via a
+        subprocess (:func:`_arc_version`). It is skipped for failures that
+        occur *before* ARC is ever launched (run-directory/input-build errors,
+        a misconfigured ``$ARC_CONDA_ENV``, or a missing executable): probing
+        there would be a redundant, slow subprocess and — for a broken conda
+        env — would fall back through the lenient launcher to the wrong
+        interpreter, stamping a misleading ``tool_version``. This mirrors
+        :meth:`carmel.adapters.t3.T3Adapter._failed_record`.
         """
         return RunRecord(
             run_id=run_id,
             action_id=action.action_id,
             tool_name=ARC_TOOL_NAME,
-            tool_version=_arc_version(),
+            tool_version=_arc_version() if probe_version else None,
             status=RunStatus.FAILED,
             failure_code=failure_code,
             started_at=started,

@@ -10,10 +10,23 @@ The actual subprocess-execution path is exercised only when ARC is truly
 importable in the current environment (``is_arc_importable()``). That path runs
 in the heavy CI lane and is skipped locally when the upstream ARC distutils
 blocker (Python 3.12) is in effect.
+
+Discovery/launch parity with T3: ARC is now launched the same way T3 is —
+via a resolved conda-env/python command run in a *subprocess*
+(:func:`carmel.adapters.arc._arc_python_command`,
+:func:`carmel.adapters.arc._find_arc_executable`), never an in-process
+``import arc`` and never a bare ``"python"``. The precedence-order and
+conda-env-error tests below mirror ``tests/test_t3_adapter.py``'s equivalents
+exactly, extended for ARC's four-source fallback chain (``$ARC_CONDA_ENV`` /
+``$ARC_PYTHON`` falling back to ``$T3_CONDA_ENV`` / ``$T3_PYTHON``, since ARC
+and T3 may share a single environment).
 """
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +41,8 @@ from carmel.adapters.arc import (
     DEFAULT_JOB_TYPES,
     MOCK_LEVEL_OF_THEORY,
     ARCAdapter,
+    _arc_conda_env_error,
+    _arc_python_command,
     _arc_version,
     _coerce_reaction_entry,
     _coerce_species_entry,
@@ -63,16 +78,55 @@ from carmel.schemas import (
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "arc" / "sample_project"
 
+# Captured at import time, before the autouse fixture below can ever run, so
+# TestARCAdapterRealSubprocess can restore the ambient CI launcher environment
+# explicitly even though every other test in this module starts from a
+# cleared one. Mirrors tests/test_t3_adapter.py's _AMBIENT_T3_ENV.
+_AMBIENT_ARC_ENV = {
+    name: os.environ[name]
+    for name in ("ARC_CONDA_ENV", "ARC_PYTHON", "ARC_PATH", "T3_CONDA_ENV", "T3_PYTHON")
+    if name in os.environ
+}
+
 
 def _fixture_input() -> dict[str, Any]:
     """The captured ARC input the golden fixture was produced from."""
     return dict(yaml.safe_load((FIXTURE_ROOT / "input.yml").read_text()))
 
 
+# Evaluated at collection time (module import), deliberately *before* the
+# autouse fixture below can clear anything — this must keep reading the real
+# ambient environment so the skip decision matches what
+# TestARCAdapterRealSubprocess will actually see. See
+# tests/test_t3_adapter.py's requires_t3 for why this ordering matters.
 requires_arc = pytest.mark.skipif(
     not is_arc_importable(),
     reason="ARC not actually importable (likely distutils blocker on Python 3.12)",
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_ambient_arc_env(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Clear ARC/T3 launcher env vars so every test starts from a known-empty env.
+
+    Mirrors tests/test_t3_adapter.py's ``_clear_ambient_t3_env``: every test
+    in this module that deliberately breaks or monkeypatches one part of the
+    resolution chain must not have its intent overridden by ambient
+    ``$ARC_CONDA_ENV``/``$ARC_PYTHON``/``$ARC_PATH``/``$T3_CONDA_ENV``/
+    ``$T3_PYTHON`` values winning at a higher precedence step. Each test here
+    starts from a cleared environment and opts in explicitly to whatever env
+    var it needs.
+
+    ``TestARCAdapterRealSubprocess`` is exempted: it genuinely needs the
+    ambient CI launcher environment, which is why it's captured into
+    ``_AMBIENT_ARC_ENV`` at module import time (before this fixture could
+    ever clear it) and restored here explicitly for that class only.
+    """
+    for name in ("ARC_CONDA_ENV", "ARC_PYTHON", "ARC_PATH", "T3_CONDA_ENV", "T3_PYTHON"):
+        monkeypatch.delenv(name, raising=False)
+    if request.cls is not None and request.cls.__name__ == "TestARCAdapterRealSubprocess":
+        for name, value in _AMBIENT_ARC_ENV.items():
+            monkeypatch.setenv(name, value)
 
 
 def _campaign(workspace_root: Path) -> Campaign:
@@ -124,13 +178,36 @@ class TestARCDiscovery:
     def test_is_arc_importable_returns_bool(self) -> None:
         assert isinstance(is_arc_importable(), bool)
 
-    def test_importable_implies_installed(self) -> None:
-        if is_arc_importable():
-            assert is_arc_installed()
+    def test_importable_and_installed_probe_different_environments(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``is_arc_importable() => is_arc_installed()`` is not a real invariant.
+
+        Mirrors ``tests/test_t3_adapter.py``'s
+        ``test_importable_and_installed_probe_different_environments``:
+        ``is_arc_importable`` probes the *resolved ARC interpreter* (which may
+        live in a separate conda env named by ``$ARC_CONDA_ENV``/``$ARC_PYTHON``
+        or T3's), while ``is_arc_installed`` calls
+        ``importlib.util.find_spec("arc")`` in *Carmel's own process*. Under
+        the three-env deployment model these can and do diverge.
+        """
+        from carmel.adapters import arc as arc_module
+
+        # `is_arc_installed` is isolated from whatever happens to be on this
+        # machine's own crml_env sys.path (which may genuinely have `arc`
+        # installed, e.g. under the collapsed single-env deployment) so the
+        # divergence demonstrated here is deterministic either way.
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: None)
+        (tmp_path / "arc.py").write_text("__version__ = '9.9.9'\n")
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # only the *resolved* subprocess sees this
+        assert is_arc_importable() is True
+        assert is_arc_installed() is False
 
     def test_find_executable_returns_list_or_none(self) -> None:
         result = _find_arc_executable()
-        assert result is None or (isinstance(result, list) and result[0] == "python")
+        prefix = _arc_python_command()
+        assert result is None or (isinstance(result, list) and result[: len(prefix)] == prefix)
 
     def test_is_arc_installed_true_when_spec_found(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
@@ -144,40 +221,52 @@ class TestARCDiscovery:
         monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: None)
         assert is_arc_installed() is False
 
-    def test_is_arc_importable_true_when_import_succeeds(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from carmel.adapters import arc as arc_module
-
-        monkeypatch.setattr(arc_module.importlib, "import_module", lambda _name: object())
+    def test_is_arc_importable_true_when_resolved_interpreter_can_import(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (tmp_path / "arc.py").write_text("__version__ = '1.2.3'\n")
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
         assert is_arc_importable() is True
 
-    def test_is_arc_importable_false_when_import_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from carmel.adapters import arc as arc_module
-
-        def _raise(_name: str) -> None:
-            raise ImportError("no arc")
-
-        monkeypatch.setattr(arc_module.importlib, "import_module", _raise)
+    def test_is_arc_importable_false_when_resolved_interpreter_cannot_import(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # empty dir: no arc module here
         assert is_arc_importable() is False
 
-    def test_arc_version_returns_version_string(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_is_arc_importable_false_when_interpreter_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        missing = tmp_path / "no-such-interpreter"
+        monkeypatch.setenv("ARC_PYTHON", str(missing))
+        assert is_arc_importable() is False
+
+    def test_is_arc_importable_false_on_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
 
-        monkeypatch.setattr(arc_module.importlib, "import_module", lambda _name: SimpleNamespace(__version__="9.9.9"))
+        def _timeout(*args: object, **kwargs: object) -> None:
+            raise subprocess.TimeoutExpired(cmd="arc-probe", timeout=1.0)
+
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _timeout)
+        assert is_arc_importable() is False
+
+    def test_arc_version_returns_version_string(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "arc.py").write_text("__version__ = '9.9.9'\n")
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
         assert _arc_version() == "9.9.9"
 
-    def test_arc_version_none_when_module_has_no_version(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from carmel.adapters import arc as arc_module
-
-        monkeypatch.setattr(arc_module.importlib, "import_module", lambda _name: SimpleNamespace())
+    def test_arc_version_none_when_module_has_no_version(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        (tmp_path / "arc.py").write_text("# no __version__ attribute\n")
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))
         assert _arc_version() is None
 
-    def test_arc_version_none_when_import_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from carmel.adapters import arc as arc_module
-
-        def _raise(_name: str) -> None:
-            raise ImportError("no arc")
-
-        monkeypatch.setattr(arc_module.importlib, "import_module", _raise)
+    def test_arc_version_none_when_import_raises(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # empty dir: no arc module here
         assert _arc_version() is None
 
 
@@ -195,7 +284,7 @@ class TestFindARCExecutable:
     def test_env_path_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         (tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# ARC")
         monkeypatch.setenv("ARC_PATH", str(tmp_path))
-        assert _find_arc_executable() == ["python", str(tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
+        assert _find_arc_executable() == [sys.executable, str(tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
 
     def test_env_path_ignored_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("ARC_PATH", str(tmp_path))
@@ -210,7 +299,7 @@ class TestFindARCExecutable:
         (repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# ARC")
         spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
         monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: spec)
-        assert _find_arc_executable() == ["python", str(repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
+        assert _find_arc_executable() == [sys.executable, str(repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
 
     def test_package_sibling_skipped_when_script_absent(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
@@ -225,9 +314,236 @@ class TestFindARCExecutable:
         from carmel.adapters import arc as arc_module
 
         monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/local/bin/ARC.py")
-        assert _find_arc_executable() == ["python", "/usr/local/bin/ARC.py"]
+        assert _find_arc_executable() == [sys.executable, "/usr/local/bin/ARC.py"]
 
     def test_returns_none_when_nothing_found(self) -> None:
+        assert _find_arc_executable() is None
+
+    def test_no_module_fallback_even_when_arc_is_importable(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression test: unlike T3, ARC has no ``-m`` invocation mode (no
+        ``arc/__main__.py``, no console_scripts entry point) — the real
+        DanaResearchGroup/ARC repo ships only ``ARC.py`` at the repo root.
+        ``_find_arc_executable`` must therefore return ``None`` when nothing
+        else is found, *regardless* of what ``is_arc_importable()`` reports —
+        never fabricate a phantom ``python -m arc`` command.
+        """
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "is_arc_importable", lambda: True)
+        assert _find_arc_executable() is None
+
+    def test_env_path_carries_conda_run_prefix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# ARC")
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(
+            arc_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_arc_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "arc_env",
+            "--no-capture-output",
+            "python",
+            str(script),
+        ]
+
+    def test_conda_env_set_ignores_carmel_own_package_sibling_script(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression test: with $ARC_CONDA_ENV set, Carmel must not discover
+        an ARC.py sitting next to *Carmel's own* importable ``arc`` package
+        and then execute that script inside the named conda environment — the
+        two may be entirely different checkouts. Since ARC has no ``-m``
+        fallback, the named conda env being authoritative here means
+        discovery correctly comes up empty (``None``), not a wrong-checkout
+        script.
+        """
+        from carmel.adapters import arc as arc_module
+
+        repo_root = tmp_path / "carmel_side_ARC"
+        pkg = repo_root / "arc"
+        pkg.mkdir(parents=True)
+        (repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# wrong-checkout ARC")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: spec)
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(
+            arc_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_arc_executable() is None
+
+    def test_conda_env_set_ignores_carmel_own_which_script(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Companion regression test to the one above, for the
+        ``shutil.which(ARC.py)`` discovery step rather than the
+        ``importlib.util.find_spec`` one.
+        """
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(
+            arc_module.shutil,
+            "which",
+            lambda name: (
+                "/opt/conda/bin/conda"
+                if name == "conda"
+                else ("/usr/local/bin/ARC.py" if name == ARC_LAYOUT.EXECUTABLE_SCRIPT else None)
+            ),
+        )
+        assert _find_arc_executable() is None
+
+    def test_t3_conda_env_fallback_used_when_arc_conda_env_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """ARC_SOURCES falls back to $T3_CONDA_ENV when $ARC_CONDA_ENV is
+        unset, since ARC and T3 may share a single environment."""
+        from carmel.adapters import arc as arc_module
+
+        script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# ARC")
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
+        monkeypatch.setattr(
+            arc_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_arc_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "shared_env",
+            "--no-capture-output",
+            "python",
+            str(script),
+        ]
+
+    def test_arc_conda_env_wins_over_t3_conda_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When both are set, $ARC_CONDA_ENV takes precedence over
+        $T3_CONDA_ENV — ARC-specific configuration wins over the shared
+        fallback."""
+        from carmel.adapters import arc as arc_module
+
+        script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# ARC")
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
+        monkeypatch.setattr(
+            arc_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        assert _find_arc_executable() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "arc_env",
+            "--no-capture-output",
+            "python",
+            str(script),
+        ]
+
+    def test_arc_python_wins_over_t3_python(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When both are set (and valid), $ARC_PYTHON takes precedence over $T3_PYTHON."""
+        script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# ARC")
+        arc_python = tmp_path / "arc-python3"
+        arc_python.write_text("#!/bin/sh\n")
+        arc_python.chmod(0o755)
+        t3_python = tmp_path / "t3-python3"
+        t3_python.write_text("#!/bin/sh\n")
+        t3_python.chmod(0o755)
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        monkeypatch.setenv("ARC_PYTHON", str(arc_python))
+        monkeypatch.setenv("T3_PYTHON", str(t3_python))
+        assert _find_arc_executable() == [str(arc_python), str(script)]
+
+    def test_t3_python_used_as_fallback(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """$T3_PYTHON is used when none of the ARC-specific/conda sources are set."""
+        script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# ARC")
+        t3_python = tmp_path / "t3-python3"
+        t3_python.write_text("#!/bin/sh\n")
+        t3_python.chmod(0o755)
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        monkeypatch.setenv("T3_PYTHON", str(t3_python))
+        assert _find_arc_executable() == [str(t3_python), str(script)]
+
+    def test_arc_python_invalid_falls_through_to_valid_t3_python(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A set-but-invalid $ARC_PYTHON is skipped in favor of a valid $T3_PYTHON.
+
+        Regression test for the P1-a/b fix: ``launch_command`` used to
+        return a set ``"python"``-kind source unconditionally, with no
+        isfile/X_OK check, so a broken $ARC_PYTHON would be selected and
+        handed straight to the caller instead of falling through.
+        """
+        script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
+        script.write_text("# ARC")
+        t3_python = tmp_path / "t3-python3"
+        t3_python.write_text("#!/bin/sh\n")
+        t3_python.chmod(0o755)
+        monkeypatch.setenv("ARC_PATH", str(tmp_path))
+        monkeypatch.setenv("ARC_PYTHON", str(tmp_path / "no-such-arc-python"))
+        monkeypatch.setenv("T3_PYTHON", str(t3_python))
+        assert _find_arc_executable() == [str(t3_python), str(script)]
+
+    def test_host_discovery_allowed_when_no_overrides_set(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1-c: with no python/conda overrides, the resolved command is
+        ``[sys.executable]`` so Carmel's own ``find_spec``/``which``
+        discovery is allowed to run and can find a script.
+        """
+        from carmel.adapters import arc as arc_module
+
+        repo_root = tmp_path / "ARC"
+        pkg = repo_root / "arc"
+        pkg.mkdir(parents=True)
+        (repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# ARC")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: spec)
+        assert _arc_python_command() == [sys.executable]
+        assert _find_arc_executable() == [sys.executable, str(repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT)]
+
+    def test_host_discovery_disabled_when_arc_python_resolves_elsewhere(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1-c: a resolved command other than ``[sys.executable]`` disables
+        Carmel's own host discovery, even though no ``ARC_PATH`` override is
+        set and ``$T3_CONDA_ENV`` is *also* set (i.e. this is NOT merely
+        "no conda var set" — a set-and-valid ``$ARC_PYTHON`` winning over an
+        inherited ``$T3_CONDA_ENV`` must still disable host discovery, since
+        ARC launches under a non-Carmel interpreter either way).
+        """
+        from carmel.adapters import arc as arc_module
+
+        repo_root = tmp_path / "ARC"
+        pkg = repo_root / "arc"
+        pkg.mkdir(parents=True)
+        (repo_root / ARC_LAYOUT.EXECUTABLE_SCRIPT).write_text("# ARC")
+        spec = SimpleNamespace(origin=str(pkg / "__init__.py"))
+        monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: spec)
+        other_python = tmp_path / "other-python3"
+        other_python.write_text("#!/bin/sh\n")
+        other_python.chmod(0o755)
+        monkeypatch.setenv("ARC_PYTHON", str(other_python))
+        monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
+        assert _arc_python_command() == [str(other_python)]
+        assert _arc_python_command() != [sys.executable]
+        # Host discovery would otherwise find the sibling script above; it
+        # must be skipped entirely, and ARC has no "-m" fallback, so the
+        # result is None rather than a wrong-interpreter script invocation.
         assert _find_arc_executable() is None
 
 
@@ -596,6 +912,246 @@ class TestNormalizeArcOutputsInline:
 # ---------------------------------------------------------------------------
 
 
+class TestARCCondaEnvError:
+    """Unit tests for ``_arc_conda_env_error()`` in isolation.
+
+    Mirrors ``tests/test_t3_adapter.py``'s ``TestT3CondaEnvError`` exactly,
+    for ``$ARC_CONDA_ENV`` (falling back to ``$T3_CONDA_ENV``, since ARC and
+    T3 may share a single environment).
+    """
+
+    def test_env_var_unset_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("ARC_CONDA_ENV", raising=False)
+        monkeypatch.delenv("T3_CONDA_ENV", raising=False)
+        assert _arc_conda_env_error() is None
+
+    def test_conda_missing_from_path_returns_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+        error = _arc_conda_env_error()
+        assert error is not None
+        assert "ARC_CONDA_ENV" in error
+        assert "conda" in error.lower()
+
+    def test_named_env_does_not_exist_returns_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "no_such_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/bin/conda")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="EnvironmentLocationNotFound: could not find environment"
+        )
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", lambda *a, **k: completed)
+        error = _arc_conda_env_error()
+        assert error is not None
+        assert "no_such_env" in error
+        assert "EnvironmentLocationNotFound" in error
+
+    def test_conda_run_raises_oserror_returns_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/bin/conda")
+
+        def _raise(*args: object, **kwargs: object) -> None:
+            raise OSError("boom")
+
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _raise)
+        error = _arc_conda_env_error()
+        assert error is not None
+        assert "arc_env" in error
+
+    def test_env_usable_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/bin/conda")
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", lambda *a, **k: completed)
+        assert _arc_conda_env_error() is None
+
+    def test_python_source_valid_file_short_circuits_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A set, executable ``$ARC_PYTHON`` (no conda source set) is accepted outright.
+
+        Exercises the ``"python"``-kind branch of the shared
+        ``_launcher.conda_env_error`` (unlike ``"conda"``-kind sources, a
+        python-kind source is never probed by running anything — only
+        checked for existence and the execute bit).
+        """
+        monkeypatch.setenv("ARC_PYTHON", sys.executable)
+        assert _arc_conda_env_error() is None
+
+    def test_invalid_python_source_falls_through_to_next_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A set-but-invalid ``$ARC_PYTHON`` is not fatal; resolution keeps walking sources.
+
+        Unlike a broken ``"conda"``-kind source, a broken ``"python"``-kind
+        source does not short-circuit with an error — it merely fails to
+        short-circuit with success, and the walk continues to the next
+        source in precedence order (here, ``$T3_CONDA_ENV``).
+        """
+        monkeypatch.setenv("ARC_PYTHON", "/nonexistent/carmel-not-a-binary")
+        monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+        error = _arc_conda_env_error()
+        assert error is not None
+        assert "T3_CONDA_ENV" in error
+
+    def test_t3_conda_env_used_as_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """$T3_CONDA_ENV is consulted when $ARC_CONDA_ENV is unset."""
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.delenv("ARC_CONDA_ENV", raising=False)
+        monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+        error = _arc_conda_env_error()
+        assert error is not None
+        assert "T3_CONDA_ENV" in error
+
+    def test_conda_missing_message_names_arc(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P2-a: the ``tool_label`` wired into ``_arc_conda_env_error`` is
+        ``"ARC"`` (not the shared-launcher-generic "the tool"), so the
+        "refusing to silently launch" message reads naturally for ARC.
+        """
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+        error = _arc_conda_env_error()
+        assert error is not None
+        assert "refusing to silently launch ARC under a different interpreter" in error
+
+    def test_launch_command_conda_missing_with_no_next_source_names_tool_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Neither T3_SOURCES nor ARC_SOURCES ever end on a "conda" entry
+        (both end on a "python" entry), so the ``next_var is None`` branch
+        of ``launch_command`` — a broken conda source with nothing after it
+        in *sources* — is only reachable by calling the shared launcher
+        directly with a custom sources list. Covers the "trying the next
+        %s source" (tool_label) wording used when there is no more specific
+        env-var hint available.
+        """
+        from carmel.adapters import _launcher
+
+        monkeypatch.setenv("SOME_CONDA_ENV", "an_env")
+        result = _launcher.launch_command(
+            [("conda", "SOME_CONDA_ENV")],
+            logger=_launcher._log,
+            tool_label="ARC",
+            which=lambda _name: None,
+        )
+        assert result == [sys.executable]
+
+    def test_invalid_arc_python_agrees_with_launch_command_selection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """P1-a/b: ``_arc_conda_env_error`` and ``_arc_python_command`` must
+        agree on which source is selected when a set ``$ARC_PYTHON`` is
+        invalid and ``$T3_CONDA_ENV`` is a valid fallback — both walk past
+        the broken python source to the same conda source.
+        """
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_PYTHON", "/nonexistent/carmel-not-a-binary")
+        monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
+        monkeypatch.setattr(
+            arc_module.shutil,
+            "which",
+            lambda name: "/opt/conda/bin/conda" if name == "conda" else None,
+        )
+        completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", lambda *a, **k: completed)
+
+        # conda_env_error walks past the invalid ARC_PYTHON and finds the
+        # T3_CONDA_ENV conda source usable -> None (no error).
+        assert _arc_conda_env_error() is None
+        # launch_command must select that same T3_CONDA_ENV conda source,
+        # not the invalid ARC_PYTHON, and not silently fall through further
+        # than conda_env_error agrees is safe.
+        assert _arc_python_command() == [
+            "/opt/conda/bin/conda",
+            "run",
+            "-n",
+            "shared_env",
+            "--no-capture-output",
+            "python",
+        ]
+
+
+class TestARCAdapterCondaEnvFailures:
+    """Adapter-level behavior when ``$ARC_CONDA_ENV`` is set but unusable.
+
+    Mirrors ``tests/test_t3_adapter.py``'s ``TestT3AdapterCondaEnvFailures``:
+    both scenarios must be a clean, typed ``FailureCode.TOOL_NOT_FOUND``
+    failure rather than a silent fallback onto Carmel's own interpreter.
+    """
+
+    def test_conda_missing_from_path_records_tool_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TOOL_NOT_FOUND
+        assert diagnostics is None
+        assert run.input_path is not None
+        assert run.input_path.exists()
+        assert "ARC_CONDA_ENV" in (run.error_message or "")
+        assert "conda" in (run.error_message or "").lower()
+
+    def test_named_env_does_not_exist_records_tool_not_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "no_such_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/bin/conda")
+        completed = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr="EnvironmentLocationNotFound: could not find environment"
+        )
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", lambda *a, **k: completed)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TOOL_NOT_FOUND
+        assert diagnostics is None
+        assert "no_such_env" in (run.error_message or "")
+
+    def test_conda_preflight_failure_does_not_probe_version(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A prelaunch conda-env failure must NOT probe ARC's version.
+
+        Probing there would fall back through the lenient launcher to the
+        wrong interpreter (stamping a misleading ``tool_version``) and add a
+        redundant, potentially 120s subprocess to an already-decided
+        prelaunch failure. Mirrors T3's ``probe_version=False`` guard.
+        """
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
+        monkeypatch.setattr(arc_module.shutil, "which", lambda _name: None)
+
+        def _boom() -> str:
+            raise AssertionError("_arc_version must not be probed for a prelaunch failure")
+
+        monkeypatch.setattr(arc_module, "_arc_version", _boom)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, _diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.TOOL_NOT_FOUND
+        assert run.tool_version is None
+
+
 class TestARCAdapterFailures:
     def test_tool_not_found(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
@@ -674,7 +1230,7 @@ class TestARCAdapterFailures:
         def _raise_os_error(*_a: object, **_k: object) -> None:
             raise OSError("no such executable")
 
-        monkeypatch.setattr(arc_module.subprocess, "run", _raise_os_error)
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _raise_os_error)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
@@ -716,7 +1272,7 @@ class TestARCAdapterFailures:
         def _raise_timeout(*a: object, **k: object) -> None:
             raise subprocess.TimeoutExpired(cmd="arc", timeout=1)
 
-        monkeypatch.setattr(arc_module.subprocess, "run", _raise_timeout)
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _raise_timeout)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
@@ -735,7 +1291,16 @@ class TestARCAdapterFailures:
         class _Completed:
             returncode = 0
 
-        def _fake_run(command: list[str], cwd: Path, **kwargs: object) -> _Completed:
+        class _ProbeCompleted:
+            returncode = 1  # non-zero: _arc_version's probe call returns None, never touching .stdout
+
+        def _fake_run(command: list[str], cwd: Path | None = None, **kwargs: object) -> object:
+            # The same monkeypatched symbol also backs the version-probe call
+            # inside _failed_record/_arc_version, which never passes `cwd`
+            # (see _launcher.probe_version) — treat that as a harmless no-op
+            # rather than the real ARC invocation.
+            if cwd is None:
+                return _ProbeCompleted()
             # ARC writes its output tree into the run dir (cwd); mirror the golden
             # fixture. Crucially, name the info file the way real ARC does — from
             # the project in the input Carmel just wrote — rather than hardcoding
@@ -748,7 +1313,7 @@ class TestARCAdapterFailures:
             shutil.copy(FIXTURE_ROOT / "output" / "output.yml", run_dir / "output" / "output.yml")
             return _Completed()
 
-        monkeypatch.setattr(arc_module.subprocess, "run", _fake_run)
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _fake_run)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = ARCAdapter().run(
@@ -772,13 +1337,18 @@ class TestARCAdapterFailures:
         class _Completed:
             returncode = 0
 
-        def _fake_run(command: list[str], cwd: Path, **kwargs: object) -> _Completed:
+        class _ProbeCompleted:
+            returncode = 1  # non-zero: _arc_version's probe call returns None, never touching .stdout
+
+        def _fake_run(command: list[str], cwd: Path | None = None, **kwargs: object) -> object:
+            if cwd is None:  # version-probe call inside _failed_record; see above
+                return _ProbeCompleted()
             run_dir = Path(cwd)
             payload = yaml.safe_load((run_dir / "input.yml").read_text())
             (run_dir / arc_info_filename(payload)).write_text("species: [unterminated\n")
             return _Completed()
 
-        monkeypatch.setattr(arc_module.subprocess, "run", _fake_run)
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _fake_run)
         ws = tmp_path / "ws"
         ws.mkdir()
         run, diagnostics = ARCAdapter().run(workspace_root=ws, campaign=_campaign(ws), action=_action())
@@ -825,11 +1395,13 @@ class TestARCAdapterFailures:
         class _Completed:
             returncode = 1
 
-        def _fake_run(command: list[str], cwd: Path, **kwargs: object) -> _Completed:
+        def _fake_run(command: list[str], cwd: Path | None = None, **kwargs: object) -> _Completed:
+            if cwd is None:  # version-probe call inside _failed_record; see above
+                return _Completed()
             captured.update(kwargs)
             return _Completed()
 
-        monkeypatch.setattr(arc_module.subprocess, "run", _fake_run)
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _fake_run)
         ws = tmp_path / "ws"
         ws.mkdir()
         action = _action().model_copy(update={"estimated_cpu_hours": 0.0})
@@ -849,7 +1421,7 @@ class TestARCAdapterFailures:
         class _Completed:
             returncode = 1
 
-        monkeypatch.setattr(arc_module.subprocess, "run", lambda *a, **k: _Completed())
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", lambda *a, **k: _Completed())
         ws = tmp_path / "ws"
         ws.mkdir()
         action = _action().model_copy(update={"estimated_cpu_hours": 0.0})
@@ -859,6 +1431,35 @@ class TestARCAdapterFailures:
         # 2 mixture species (OH + CH3) resolved via the campaign, not the blind
         # single-species floor that ignores the campaign entirely.
         assert run.estimated_cpu_hours == 2.0
+
+
+class TestArcTerminateProcessTree:
+    """``_arc_terminate_process_tree``'s call-time default grace period.
+
+    Mirrors ``tests/test_t3_adapter.py``'s real-subprocess timeout coverage:
+    ``_launcher.run_in_process_group`` invokes its ``terminate`` callback
+    with just the process (no ``grace_period_s``) on a real timeout, which
+    is the only way to exercise ``_arc_terminate_process_tree``'s
+    ``if grace_period_s is None: grace_period_s = _KILL_GRACE_PERIOD_S``
+    branch — every other test in this module drives ARC's subprocess layer
+    through a monkeypatched ``_arc_run_in_process_group``, which never
+    reaches the real termination path at all.
+    """
+
+    def test_real_timeout_uses_module_level_grace_period(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_KILL_GRACE_PERIOD_S", 0.2)
+        with pytest.raises(subprocess.TimeoutExpired):
+            arc_module._arc_run_in_process_group([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.5)
+
+    def test_explicit_grace_period_is_not_overridden_by_the_default(self) -> None:
+        """The ``grace_period_s is not None`` branch: an explicit caller value wins."""
+        from carmel.adapters import arc as arc_module
+
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
+        proc.wait()
+        arc_module._arc_terminate_process_tree(proc, grace_period_s=0.01)
 
 
 class TestARCAdapterRealSubprocess:
