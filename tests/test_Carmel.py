@@ -2,6 +2,7 @@
 
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -248,8 +249,6 @@ class TestLiteratureCommand:
         assert "agent config" in capsys.readouterr().err.lower()
 
     def test_unknown_campaign_exits_one(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-        import yaml
-
         from Carmel import main
 
         config_file = tmp_path / "config.yaml"
@@ -354,6 +353,99 @@ class TestLiteratureCommand:
         assert code == 0
         assert "outcome" in capsys.readouterr().out
         assert load_state(workspaces / "cli-lit").state == CampaignStateValue.LITERATURE_READY
+
+
+class TestLiteratureSkipDiagnostics:
+    """When a literature run does NOT start, the CLI must say why -- accurately.
+
+    The message used to name three candidate causes it had never checked ("the config
+    toggle is off, the plan requires approval, or the campaign state does not allow
+    it"). A run that started and died on a provider 503 was reported that way, with all
+    three statements false, sending the operator to look at configuration that was fine.
+    A wrong diagnosis costs more than no diagnosis.
+    """
+
+    @staticmethod
+    def _campaign(workspaces: Path) -> Any:
+        from carmel.schemas import (
+            Budgets,
+            CampaignInput,
+            InitialMixture,
+            MixtureComponent,
+            ReactorSystem,
+            ReactorType,
+            TargetObservable,
+        )
+        from carmel.services.campaigns import create_campaign
+
+        return create_campaign(
+            workspaces / "cli-skip",
+            CampaignInput(
+                workspace_name="cli-skip",
+                initial_mixture=InitialMixture(components=[MixtureComponent(species="O2", mole_fraction=1.0)]),
+                target_observables=[TargetObservable(name="ignition_delay")],
+                target_reactor_systems=[
+                    ReactorSystem(
+                        reactor_type=ReactorType.JSR,
+                        temperature_range_K=(800.0, 1200.0),
+                        pressure_range_bar=(1.0, 5.0),
+                    )
+                ],
+                budgets=Budgets(cpu_hours=20.0, experiment_budget=0.0),
+            ),
+        )
+
+    def test_toggle_off_is_named_and_nothing_else_is_blamed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import yaml
+
+        from Carmel import main
+
+        workspaces = tmp_path / "workspaces"
+        campaign = self._campaign(workspaces)
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            yaml.dump(
+                {
+                    "workspace_name": "cli-skip",
+                    "workspace_root": str(workspaces / "cli-skip"),
+                    "agents": {
+                        "tier": "test",
+                        "provider": "mock",
+                        "literature_at_campaign_start": False,
+                    },
+                }
+            )
+        )
+
+        code = main(
+            [
+                "literature",
+                "--campaign",
+                campaign.campaign_id,
+                "--workspaces",
+                str(workspaces),
+                "--config",
+                str(config_file),
+            ]
+        )
+        err = capsys.readouterr().err
+
+        assert code == 1
+        assert "literature_at_campaign_start" in err
+        # The two causes that were NOT the problem must not be asserted.
+        assert "requires approval" not in err
+        assert "campaign state" not in err
+
+    def test_every_skip_reason_has_an_operator_facing_explanation(self) -> None:
+        # A reason added without an explanation would fall back to a bare enum name --
+        # i.e. straight back to a diagnostic that tells the operator nothing.
+        from carmel.services.campaigns import LITERATURE_SKIP_EXPLANATIONS, LiteratureStartSkipped
+
+        assert set(LITERATURE_SKIP_EXPLANATIONS) == set(LiteratureStartSkipped)
+        for text in LITERATURE_SKIP_EXPLANATIONS.values():
+            assert len(text) > 40
 
 
 class TestServeConfigOption:

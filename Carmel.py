@@ -121,13 +121,13 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     """Run the literature-search step for an existing campaign.
 
     Uses the same single-owner service hook as campaign creation
-    (:func:`carmel.services.campaigns.maybe_start_literature_at_creation`);
+    (:func:`carmel.services.campaigns.start_literature_at_creation`);
     the CLI never owns its own copy of the auto-run logic.
     """
     from carmel.services.campaigns import (
         find_campaign_workspace,
         load_campaign,
-        maybe_start_literature_at_creation,
+        start_literature_at_creation,
     )
     from carmel.ui.app import _resolve_workspaces_root
 
@@ -154,17 +154,17 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     from carmel.agents.bridge import AgentBridgeError
 
     try:
-        result = maybe_start_literature_at_creation(ws, campaign, agent_config)  # type: ignore[arg-type]
+        outcome = start_literature_at_creation(ws, campaign, agent_config)  # type: ignore[arg-type]
     except AgentBridgeError as e:
         print(f"Literature run unavailable (consent/API key): {e}", file=sys.stderr)
         return 1
-    if result is None:
-        print(
-            "Literature run did not start: the config toggle is off, the plan requires "
-            "approval, or the campaign state does not allow it.",
-            file=sys.stderr,
-        )
+    if outcome.result is None:
+        # Report the reason the service actually determined. This used to list three
+        # candidate causes it had not checked, which meant a run that started and died
+        # on a provider outage was reported as a configuration problem.
+        print(f"Literature run did not start: {outcome.explain()}.", file=sys.stderr)
         return 1
+    result = outcome.result
     print(f"Literature action {result.action_id} finished with outcome {result.outcome.value}")
     return 0
 

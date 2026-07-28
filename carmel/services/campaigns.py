@@ -3,7 +3,11 @@
 
 """Campaign lifecycle services: creation, loading, listing."""
 
+from __future__ import annotations
+
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -92,12 +96,94 @@ def create_campaign(
     return campaign
 
 
+class LiteratureStartSkipped(StrEnum):
+    """Why :func:`start_literature_at_creation` did not run a literature action.
+
+    Exists because the bare ``None`` this used to return collapsed six distinct
+    conditions into one, and the CLI could then only GUESS at the cause. It guessed
+    wrong in the most confusing way possible: a run that started and died on a provider
+    503 was reported as "the config toggle is off, the plan requires approval, or the
+    campaign state does not allow it" -- three statements that were all false. A
+    diagnostic that names causes it has not checked is worse than one that admits it
+    does not know.
+    """
+
+    DISABLED_IN_CONFIG = "disabled_in_config"
+    CAMPAIGN_STATE_NOT_READY = "campaign_state_not_ready"
+    PLAN_REQUIRES_APPROVAL = "plan_requires_approval"
+    NEXT_ACTION_IS_NOT_LITERATURE = "next_action_is_not_literature"
+    NO_ACTION_DISPATCHED = "no_action_dispatched"
+
+
+#: Operator-facing explanation per skip reason. Each says what happened and what to do.
+LITERATURE_SKIP_EXPLANATIONS: dict[LiteratureStartSkipped, str] = {
+    LiteratureStartSkipped.DISABLED_IN_CONFIG: (
+        "the agents config has literature_at_campaign_start=false (or no agents section "
+        "was supplied), so no literature run was attempted"
+    ),
+    LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY: (
+        "the campaign is not in a state a literature run can start from -- most often "
+        "because this workspace already holds a plan from an earlier campaign; use one "
+        "campaign per workspace directory"
+    ),
+    LiteratureStartSkipped.PLAN_REQUIRES_APPROVAL: (
+        "the generated plan requires human approval, and nothing is allowed to spend "
+        "money before that approval is given -- approve the plan, then re-run"
+    ),
+    LiteratureStartSkipped.NEXT_ACTION_IS_NOT_LITERATURE: (
+        "the next action in the plan is not a literature search, so there was nothing "
+        "to run -- the literature step has most likely already completed"
+    ),
+    LiteratureStartSkipped.NO_ACTION_DISPATCHED: (
+        "the dispatcher declined to start the action; see the campaign decision log for the action-level reason"
+    ),
+}
+
+
+@dataclass(frozen=True)
+class LiteratureStartOutcome:
+    """Either a completed literature action, or a NAMED reason there wasn't one."""
+
+    result: ActionResult | None = None
+    skip_reason: LiteratureStartSkipped | None = None
+
+    def explain(self) -> str:
+        """Return an operator-facing sentence for a skipped start."""
+        if self.skip_reason is None:
+            return "the literature action ran"
+        return LITERATURE_SKIP_EXPLANATIONS[self.skip_reason]
+
+
 def maybe_start_literature_at_creation(
     workspace_root: Path,
     campaign: Campaign,
     config: AgentConfig | None,
     deps: LiteratureDeps | None = None,
 ) -> ActionResult | None:
+    """Run the literature-at-creation step, returning only its ActionResult.
+
+    Thin wrapper over :func:`start_literature_at_creation` for callers that do not need
+    to know WHY a run was skipped. Callers that report to a human should use that
+    function instead and say what actually happened.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        campaign: The campaign to run literature for.
+        config: The agentic-layer configuration, or None for no auto-run.
+        deps: Optional injected literature dependencies (tests).
+
+    Returns:
+        The dispatcher's ActionResult for the literature action, or None.
+    """
+    return start_literature_at_creation(workspace_root, campaign, config, deps).result
+
+
+def start_literature_at_creation(
+    workspace_root: Path,
+    campaign: Campaign,
+    config: AgentConfig | None,
+    deps: LiteratureDeps | None = None,
+) -> LiteratureStartOutcome:
     """Single owner of the literature-at-creation auto-run.
 
     Invoked from campaign creation (and from ``carmel literature``, which
@@ -123,10 +209,11 @@ def maybe_start_literature_at_creation(
         deps: Optional injected literature dependencies (tests).
 
     Returns:
-        The dispatcher's ActionResult for the literature action, or None.
+        A :class:`LiteratureStartOutcome` carrying either the dispatcher's ActionResult
+        or a named :class:`LiteratureStartSkipped` reason -- never an unexplained None.
     """
     if config is None or not config.literature_at_campaign_start:
-        return None
+        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.DISABLED_IN_CONFIG)
 
     # Heavy imports stay function-level: campaign creation without an agent
     # config must not touch the dispatcher/agents stack at import time.
@@ -145,12 +232,12 @@ def maybe_start_literature_at_creation(
     if not (workspace_root / PLAN_JSON_NAME).exists():
         if state != CampaignStateValue.READY_FOR_PLANNING:
             _log.warning("cannot start literature from state %s without a plan", state.value)
-            return None
+            return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY)
         plan = plan_and_save(workspace_root, campaign, include_literature=True)
         state = update_state(workspace_root, CampaignStateValue.PLAN_PENDING_APPROVAL).state
         if plan.requires_approval:
             _log.info("literature-at-creation deferred: plan requires human approval")
-            return None
+            return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.PLAN_REQUIRES_APPROVAL)
         for action in plan.actions:
             record_decision(workspace_root, action.action_id, ApprovalStatus.AUTO_APPROVED, decided_by="auto")
         state = update_state(workspace_root, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="auto-approved").state
@@ -159,23 +246,23 @@ def maybe_start_literature_at_creation(
 
     if state != CampaignStateValue.APPROVED_FOR_EXECUTION:
         _log.warning("cannot start literature from state %s", state.value)
-        return None
+        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY)
 
     progress = load_or_init_progress(workspace_root, plan)
     next_id = progress.next_action_id()
     next_action = next((a for a in plan.actions if a.action_id == next_id), None)
     if next_action is None or next_action.kind != ActionKind.LITERATURE_SEARCH:
         _log.info("next plan action is not a literature search; nothing to auto-run")
-        return None
+        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.NEXT_ACTION_IS_NOT_LITERATURE)
 
     handlers = default_handlers(agent_config=config, literature_deps=deps)
     ticket = execute_next_action(workspace_root, campaign, handlers=handlers)
     if ticket is None:
-        return None
+        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.NO_ACTION_DISPATCHED)
     # The dispatcher starts the action on a background thread; this hook is a
     # synchronous convenience for campaign creation and the CLI, so wait for
     # the run to finish and return its persisted result.
-    return ticket.wait()
+    return LiteratureStartOutcome(result=ticket.wait())
 
 
 def load_campaign(workspace_root: Path) -> Campaign:
