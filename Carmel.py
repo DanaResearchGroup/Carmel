@@ -199,3 +199,12 @@ def main(argv: list[str] | None = None) -> int:
 def cli() -> None:
     """Console script entrypoint."""
     sys.exit(main())
+
+
+if __name__ == "__main__":
+    # Without this, `python Carmel.py literature ...` (and `python -m Carmel`) parse
+    # nothing, run nothing, print nothing, and exit 0 -- indistinguishable from a
+    # successful run that happened to produce no output. Only the installed `carmel`
+    # console script worked, so the most obvious way to invoke a checkout was also the
+    # most quietly misleading.
+    cli()

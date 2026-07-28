@@ -438,6 +438,40 @@ class TestLiteratureSkipDiagnostics:
         assert "requires approval" not in err
         assert "campaign state" not in err
 
+    def test_running_the_module_as_a_script_actually_runs_it(self) -> None:
+        """`python Carmel.py ...` must DO something.
+
+        Carmel.py had no ``if __name__ == "__main__"`` block, so running it directly
+        parsed nothing, ran nothing, printed nothing, and exited 0 -- indistinguishable
+        from a successful run that produced no output. Only the installed console script
+        worked, which made the most obvious way to invoke a checkout also the most
+        quietly misleading one.
+        """
+        import subprocess
+
+        root = Path(__file__).resolve().parent.parent
+        completed = subprocess.run(
+            [sys.executable, str(root / "Carmel.py"), "version"],
+            capture_output=True,
+            text=True,
+            cwd=root,
+            check=False,
+        )
+
+        assert completed.returncode == 0
+        assert completed.stdout.strip(), "running Carmel.py directly produced no output at all"
+
+    def test_state_skip_reports_the_observed_state_not_a_likely_story(self) -> None:
+        from carmel.services.campaigns import LiteratureStartOutcome, LiteratureStartSkipped
+
+        outcome = LiteratureStartOutcome(
+            skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY,
+            detail="campaign state is 'literature_ready'",
+        )
+
+        # The observed fact has to appear, or the operator is again reading a guess.
+        assert "literature_ready" in outcome.explain()
+
     def test_every_skip_reason_has_an_operator_facing_explanation(self) -> None:
         # A reason added without an explanation would fall back to a bare enum name --
         # i.e. straight back to a diagnostic that tells the operator nothing.

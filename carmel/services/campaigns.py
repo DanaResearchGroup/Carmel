@@ -122,9 +122,9 @@ LITERATURE_SKIP_EXPLANATIONS: dict[LiteratureStartSkipped, str] = {
         "was supplied), so no literature run was attempted"
     ),
     LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY: (
-        "the campaign is not in a state a literature run can start from -- most often "
-        "because this workspace already holds a plan from an earlier campaign; use one "
-        "campaign per workspace directory"
+        "the campaign is not in a state a literature run can start from (a completed "
+        "literature step leaves it in literature_ready; a workspace reused across two "
+        "campaigns leaves a plan from the earlier one)"
     ),
     LiteratureStartSkipped.PLAN_REQUIRES_APPROVAL: (
         "the generated plan requires human approval, and nothing is allowed to spend "
@@ -146,12 +146,20 @@ class LiteratureStartOutcome:
 
     result: ActionResult | None = None
     skip_reason: LiteratureStartSkipped | None = None
+    detail: str | None = None
+    """The specific observed value behind the reason (e.g. the actual campaign state).
+
+    Carried separately from the generic explanation so the message can state a FACT the
+    code checked, rather than the most likely story. Naming a plausible cause as though
+    it were the observed one is the exact habit this whole change exists to remove.
+    """
 
     def explain(self) -> str:
         """Return an operator-facing sentence for a skipped start."""
         if self.skip_reason is None:
             return "the literature action ran"
-        return LITERATURE_SKIP_EXPLANATIONS[self.skip_reason]
+        explanation = LITERATURE_SKIP_EXPLANATIONS[self.skip_reason]
+        return f"{explanation} [{self.detail}]" if self.detail else explanation
 
 
 def maybe_start_literature_at_creation(
@@ -232,7 +240,10 @@ def start_literature_at_creation(
     if not (workspace_root / PLAN_JSON_NAME).exists():
         if state != CampaignStateValue.READY_FOR_PLANNING:
             _log.warning("cannot start literature from state %s without a plan", state.value)
-            return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY)
+            return LiteratureStartOutcome(
+                skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY,
+                detail=f"campaign state is {state.value!r} and the workspace has no plan",
+            )
         plan = plan_and_save(workspace_root, campaign, include_literature=True)
         state = update_state(workspace_root, CampaignStateValue.PLAN_PENDING_APPROVAL).state
         if plan.requires_approval:
@@ -246,14 +257,20 @@ def start_literature_at_creation(
 
     if state != CampaignStateValue.APPROVED_FOR_EXECUTION:
         _log.warning("cannot start literature from state %s", state.value)
-        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY)
+        return LiteratureStartOutcome(
+            skip_reason=LiteratureStartSkipped.CAMPAIGN_STATE_NOT_READY,
+            detail=f"campaign state is {state.value!r}",
+        )
 
     progress = load_or_init_progress(workspace_root, plan)
     next_id = progress.next_action_id()
     next_action = next((a for a in plan.actions if a.action_id == next_id), None)
     if next_action is None or next_action.kind != ActionKind.LITERATURE_SEARCH:
         _log.info("next plan action is not a literature search; nothing to auto-run")
-        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.NEXT_ACTION_IS_NOT_LITERATURE)
+        detail = (
+            "the plan has no further actions" if next_action is None else f"next action is {next_action.kind.value!r}"
+        )
+        return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.NEXT_ACTION_IS_NOT_LITERATURE, detail=detail)
 
     handlers = default_handlers(agent_config=config, literature_deps=deps)
     ticket = execute_next_action(workspace_root, campaign, handlers=handlers)
