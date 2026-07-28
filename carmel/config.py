@@ -3,11 +3,15 @@
 
 """Configuration loading and validation for Carmel."""
 
+from __future__ import annotations
+
+import re
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, ConfigDict, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 
 class BudgetsConfig(BaseModel):
@@ -37,6 +41,7 @@ class CarmelConfig(BaseModel):
     logging_level: str = "INFO"
     budgets: BudgetsConfig | None = None
     metadata: dict[str, Any] | None = None
+    agents: AgentConfig | None = None
 
     @field_validator("workspace_name")
     @classmethod
@@ -108,3 +113,99 @@ def validate_config_file(path: Path | str) -> list[str]:
         return [f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}" for err in e.errors()]
     except (ValueError, yaml.YAMLError) as e:
         return [str(e)]
+
+
+class ModelTier(StrEnum):
+    """Which model tier a run uses."""
+
+    TEST = "test"  # MockModel, no network, used by CI
+    DEV = "dev"  # free tier
+    PROD = "prod"
+
+
+class AgentProvider(StrEnum):
+    """Which LLM provider backs a run."""
+
+    MOCK = "mock"
+    GOOGLE = "google"
+    OPENAI = "openai"
+    DEEPSEEK = "deepseek"
+
+
+DEFAULT_TIER_MODELS: dict[ModelTier, str] = {
+    ModelTier.TEST: "mock",
+    ModelTier.DEV: "gemini-3.5-flash",
+    ModelTier.PROD: "gemini-pro-latest",
+}
+
+
+class AgentBudgetConfig(BaseModel):
+    """Hard, non-LLM ceilings.
+
+    Defaults are deliberately LOOSE: they trip only on a genuine runaway,
+    never on normal operation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_model_calls: int = Field(default=40, gt=0)
+    max_tokens: int = Field(default=400_000, gt=0)
+    max_fetches: int = Field(default=60, gt=0)
+    max_fetch_bytes: int = Field(default=200_000_000, gt=0)  # total across run
+    max_artifact_bytes: int = Field(default=25_000_000, gt=0)  # single artifact cap
+    max_wall_clock_s: float = Field(default=1800.0, gt=0)
+    max_cost_usd: float = Field(default=5.0, gt=0)
+    session_max_cost_usd: float = Field(default=20.0, gt=0)  # process-wide, all runs
+    daily_max_cost_usd: float = Field(default=50.0, gt=0)  # persisted, all campaigns
+    max_concurrent_runs: int = Field(default=2, gt=0)
+
+
+class AgentConfig(BaseModel):
+    """Configuration for the agentic literature/model layer.
+
+    Fail-closed by construction: see :meth:`tier_provider_consistency`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    tier: ModelTier = ModelTier.TEST
+    provider: AgentProvider = AgentProvider.MOCK
+    model_name: str | None = None  # None -> DEFAULT_TIER_MODELS[tier]
+    api_key_env: str | None = None  # env var holding the key; never the key itself
+    search_endpoint: str | None = None
+    search_api_key_env: str | None = None
+    external_provider_consent: bool = False
+    literature_at_campaign_start: bool = True
+    budget: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
+
+    @field_validator("api_key_env", "search_api_key_env")
+    @classmethod
+    def _validate_env_var_name(cls, v: str | None) -> str | None:
+        """Reject anything that isn't a plausible env-var NAME.
+
+        This field holds the NAME of an environment variable, never a literal
+        secret. Must match ``^[A-Z][A-Z0-9_]*$`` if set.
+        """
+        if v is None:
+            return v
+        if not re.match(r"^[A-Z][A-Z0-9_]*$", v):
+            raise ValueError(
+                f"{v!r} does not look like an environment variable name "
+                "(expected ^[A-Z][A-Z0-9_]*$); never pass a literal secret here"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def tier_provider_consistency(self) -> AgentConfig:
+        """Fail closed: TEST<->MOCK must match 1:1, and any real provider needs a key env."""
+        if self.tier == ModelTier.TEST and self.provider != AgentProvider.MOCK:
+            raise ValueError("tier TEST requires provider MOCK")
+        if self.provider == AgentProvider.MOCK and self.tier != ModelTier.TEST:
+            raise ValueError("provider MOCK requires tier TEST")
+        if self.provider != AgentProvider.MOCK and not self.api_key_env:
+            raise ValueError(f"provider {self.provider} requires api_key_env to be set")
+        return self
+
+    def resolved_model_name(self) -> str:
+        """Return model_name if set, else the tier's default model."""
+        return self.model_name or DEFAULT_TIER_MODELS[self.tier]

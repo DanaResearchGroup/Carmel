@@ -17,6 +17,8 @@ class CampaignStateValue(StrEnum):
     READY_FOR_PLANNING = "ready_for_planning"
     PLAN_PENDING_APPROVAL = "plan_pending_approval"
     APPROVED_FOR_EXECUTION = "approved_for_execution"
+    RUNNING_LITERATURE = "running_literature"
+    LITERATURE_READY = "literature_ready"
     RUNNING_T3 = "running_t3"
     RUNNING_ARC = "running_arc"
     DIAGNOSTICS_READY = "diagnostics_ready"

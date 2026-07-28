@@ -1,0 +1,632 @@
+"""Text extraction from fetched documents, with offset-preserving section labels.
+
+``extract_text`` is the single entry point: it dispatches on ``content_type`` to a
+PDF extractor (optional ``pypdf`` dependency, lazily imported), a stdlib-only HTML tag
+stripper, or a verbatim passthrough for ``text/*``. All offsets recorded on
+:class:`TextSection` (and, downstream, on ``QuoteMatch`` in
+``carmel.services.grounding``) are indices into :attr:`ExtractedText.text` — the RAW
+extracted text — never into :attr:`ExtractedText.normalized`. ``normalize_for_match``
+is not offset-preserving (ligature expansion and hyphen-joining change the length), so
+any code that locates a match in ``normalized`` must map the match back onto ``text``
+before recording an offset.
+"""
+
+from __future__ import annotations
+
+import io
+import re
+import unicodedata
+from collections.abc import Callable
+from html.parser import HTMLParser
+
+from pydantic import BaseModel, ConfigDict
+
+# Compatibility-decomposition already folds these under NFKC, but they are expanded
+# explicitly too so the behaviour does not depend on a particular unicodedata version.
+_LIGATURES: dict[str, str] = {
+    "ﬀ": "ff",
+    "ﬁ": "fi",
+    "ﬂ": "fl",
+    "ﬃ": "ffi",
+    "ﬄ": "ffl",
+}
+
+# A hyphen at the end of a line, followed by (optional blank) whitespace and a
+# continuation word: "combus-\ntion" -> "combustion". Only fires between word
+# characters so a real end-of-sentence hyphen followed by a new paragraph is untouched.
+_HYPHEN_LINEBREAK_RE = re.compile(r"(\w)-\s*\n\s*(\w)")
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+# A references/bibliography heading, tolerant of two lossy-extraction artifacts:
+#   - a leading section number ("8. References", "VI REFERENCES", "3) Bibliography"),
+#     matched by the optional (?:(?:\d+|[ivxlcdm]+)[.\)]?[ \t]+)? prefix group; and
+#   - the heading running directly into the following body/citation text on the same
+#     line ("References Smith, J. ...") instead of occupying its own line, because
+#     some PDF extractors drop the line break after a heading.
+# For the "runs into following text" case we still require *some* signal that we are
+# looking at a heading rather than a body sentence that happens to start with one of
+# these words ("References to prior work suggest..."): the heading word (+ optional
+# colon/whitespace) must be followed by either end-of-line or an uppercase letter,
+# which is the overwhelmingly common shape of a citation-list entry start ("Smith,
+# J...") and essentially never how a body sentence continues in lowercase prose.
+_REFERENCES_HEADING_RE = re.compile(
+    r"(?im)^[ \t]*(?:(?:\d+|[ivxlcdm]+)[.\)]?[ \t]+)?"
+    r"(references|bibliography|works cited|literature cited)[ \t]*:?[ \t]*(?=$|[A-Z])"
+)
+_ABSTRACT_HEADING_RE = re.compile(r"(?im)^[ \t]*abstract[ \t]*:?[ \t]*$")
+
+# Only treat a references/bibliography heading as the trailing section when it starts
+# at or past this fraction of the document; a heading that appears earlier is more
+# likely a body subsection (e.g. a "prior literature" discussion) than the closing list.
+_REFERENCES_MIN_FRACTION = 0.3
+
+# --- Structural (headingless) bibliography-region detection --------------------
+#
+# Heading-based detection above is fail-open: it does nothing at all when a lossy
+# extraction drops or garbles the heading entirely. Bibliography entries have a
+# distinctive lexical signature independent of any heading — author-initial patterns
+# ("Smith, J."), a parenthesized year, "et al.", volume:page ranges, and "doi:"
+# strings — that ordinary prose essentially never reproduces at this density. A run
+# of lines dense in these patterns is therefore treated as "bibliography-like" even
+# with no heading at all; see :func:`find_bibliography_like_regions`.
+_BIB_AUTHOR_INITIAL_RE = re.compile(r"[A-Z][A-Za-z'-]+,\s*[A-Z]\.")
+_BIB_YEAR_PAREN_RE = re.compile(r"\(\d{4}[a-z]?\)")
+_BIB_ET_AL_RE = re.compile(r"\bet al\.?\b", re.IGNORECASE)
+_BIB_VOLUME_PAGE_RE = re.compile(r"\b\d{1,4}\s*[:,]\s*\d{1,5}(?:[-–]\d{1,5})?\b")
+_BIB_DOI_RE = re.compile(r"\bdoi\s*:?\s*10\.\d{4,9}/", re.IGNORECASE)
+_BIB_LINE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    _BIB_AUTHOR_INITIAL_RE,
+    _BIB_YEAR_PAREN_RE,
+    _BIB_ET_AL_RE,
+    _BIB_VOLUME_PAGE_RE,
+    _BIB_DOI_RE,
+)
+
+#: Sliding-window size (in non-blank lines) used to find dense citation runs.
+_BIB_WINDOW_LINES = 5
+#: Minimum fraction of citation-pattern lines within a window to call it "dense".
+_BIB_WINDOW_DENSITY = 0.6
+#: A dense run at least this many lines long, at this density, is "confident"
+#: enough to be treated the same as an explicit references section rather than
+#: merely producing a warning.
+_BIB_CONFIDENT_LINES = 8
+_BIB_CONFIDENT_DENSITY = 0.7
+_ABSTRACT_SEARCH_WINDOW = 8000
+_ABSTRACT_MAX_LEN = 2000
+
+#: Hard cap on extracted-text length, in characters, applied uniformly across every
+#: extractor path (PDF, HTML, plain text) before normalization or section-labeling.
+#: Real papers in this corpus run roughly 16k-50k characters; the largest legitimate
+#: documents are supplementary-information PDFs, which we've seen run up to the
+#: low hundreds of thousands of characters. 500k gives generous headroom over that
+#: while staying far below the multi-gigabyte-RSS blowup an attacker-controlled
+#: document (e.g. a PDF compression bomb, or simply the largest byte payload the
+#: 25 MB fetch cap allows through) would otherwise force through
+#: ``normalize_with_map``, which allocates several per-character lists per call and
+#: was measured to peak at ~381 MB RSS (76x) for a 5.0 MB input.
+MAX_EXTRACTED_TEXT_CHARS = 500_000
+
+
+class TextSection(BaseModel):
+    """A labeled span of :class:`ExtractedText.text`.
+
+    Attributes:
+        label: One of "body", "references", "abstract", "caption", "table".
+        start: Start offset into ``ExtractedText.text`` (inclusive).
+        end: End offset into ``ExtractedText.text`` (exclusive).
+        page: 1-indexed PDF page number, or None for non-paginated sources.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+    start: int
+    end: int
+    page: int | None = None
+
+
+class ExtractedText(BaseModel):
+    """The result of extracting text from a fetched document.
+
+    Attributes:
+        text: Raw extracted text. All offsets elsewhere (``TextSection``, and
+            downstream ``QuoteMatch``) index into THIS string.
+        normalized: ``normalize_for_match(text)``. Not offset-aligned with ``text``:
+            ligature expansion and hyphen-joining change string length, so no
+            position in ``normalized`` may be assumed to correspond to the same
+            position in ``text``. The raw-index map that produced this string
+            (see :func:`normalize_with_map`) is deliberately NOT persisted here —
+            it would bloat every stored artifact — and must be recomputed on
+            demand via ``normalize_with_map(text)`` wherever it's needed.
+        sections: Labeled spans covering (not necessarily contiguously) ``text``.
+        page_count: Number of PDF pages, or None for non-paginated sources.
+        extractor: Which extractor produced this: "pdf:pypdf", "pdf:unavailable",
+            "html", "text", or "unknown".
+        lossy: True when extraction is known to have dropped or approximated content
+            (missing optional dependency, unsupported content type, or a parse error).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    text: str
+    normalized: str
+    sections: list[TextSection]
+    page_count: int | None = None
+    extractor: str
+    lossy: bool = False
+
+
+def normalize_for_match(s: str) -> str:
+    """Normalize text for robust substring/fuzzy matching.
+
+    Steps, in order (order matters: de-hyphenation must run before whitespace
+    collapse, or the line break that identifies a hyphenated word-split is gone and a
+    genuine mid-sentence hyphen becomes indistinguishable from one introduced by line
+    wrapping):
+
+    1. NFKC-normalize.
+    2. Expand common PDF ligatures (fi, fl, ff, ffi, ffl) to their plain letters.
+    3. Join words that were hyphen-split across a line break (``combus-\\ntion`` ->
+       ``combustion``).
+    4. Collapse every run of whitespace to a single space.
+    5. Casefold.
+    6. Strip leading/trailing whitespace.
+
+    Args:
+        s: Raw text to normalize.
+
+    Returns:
+        The normalized string, suitable for exact or fuzzy substring matching.
+    """
+    return normalize_with_map(s)[0]
+
+
+def _char_map_transform(
+    chars: list[str], idx_map: list[int], transform: Callable[[str], str]
+) -> tuple[list[str], list[int]]:
+    """Apply a per-character string transform while carrying a raw-index map."""
+    out_chars: list[str] = []
+    out_map: list[int] = []
+    for ch, ridx in zip(chars, idx_map, strict=True):
+        for out_ch in transform(ch):
+            out_chars.append(out_ch)
+            out_map.append(ridx)
+    return out_chars, out_map
+
+
+def _regex_sub_with_map(
+    pattern: re.Pattern[str],
+    repl_fn: Callable[[re.Match[str], list[int]], tuple[str, list[int]]],
+    s: str,
+    idx_map: list[int],
+) -> tuple[str, list[int]]:
+    """Regex-substitute over ``s`` while carrying ``idx_map`` through the rewrite."""
+    out_chars: list[str] = []
+    out_map: list[int] = []
+    pos = 0
+    for m in pattern.finditer(s):
+        out_chars.append(s[pos : m.start()])
+        out_map.extend(idx_map[pos : m.start()])
+        rep_str, rep_map = repl_fn(m, idx_map)
+        out_chars.append(rep_str)
+        out_map.extend(rep_map)
+        pos = m.end()
+    out_chars.append(s[pos:])
+    out_map.extend(idx_map[pos:])
+    return "".join(out_chars), out_map
+
+
+def _hyphen_repl(m: re.Match[str], idx_map: list[int]) -> tuple[str, list[int]]:
+    rep = m.group(1) + m.group(2)
+    rep_map = [idx_map[m.start(1)], idx_map[m.start(2)]]
+    return rep, rep_map
+
+
+def _whitespace_repl(m: re.Match[str], idx_map: list[int]) -> tuple[str, list[int]]:
+    return " ", [idx_map[m.start()]]
+
+
+def normalize_with_map(s: str) -> tuple[str, list[int]]:
+    """Like :func:`normalize_for_match`, but also returns a raw-index map.
+
+    Threads an index array through every transform step (NFKC per-character,
+    ligature replacement, hyphen-linebreak join, whitespace collapse, casefold,
+    strip), so the result is the same normalized string ``normalize_for_match``
+    produces, plus a same-length ``index_map`` where ``index_map[i]`` is the
+    index into the ORIGINAL string ``s`` that produced normalized character
+    ``i`` (best-effort for many-to-one collapses: a whitespace run or a
+    hyphen-linebreak join maps its single output character to the LEFT/first
+    source character it came from).
+
+    This is the single source of truth for the normalization algorithm;
+    :func:`normalize_for_match` is defined in terms of this function's first
+    return value, so the two can never diverge. Callers needing to translate a
+    span of ``normalize_for_match(s)`` back into raw ``s``-space should use this
+    function together with :func:`raw_span`.
+
+    Note: this map is deliberately not persisted anywhere (e.g. on
+    ``ExtractedText``) — it must be recomputed on demand from the raw text.
+
+    Args:
+        s: Raw text to normalize.
+
+    Returns:
+        A ``(normalized, index_map)`` pair, where ``len(index_map) ==
+        len(normalized)``.
+    """
+    chars = list(s)
+    idx_map = list(range(len(s)))
+
+    chars, idx_map = _char_map_transform(chars, idx_map, lambda ch: unicodedata.normalize("NFKC", ch))
+    chars, idx_map = _char_map_transform(chars, idx_map, lambda ch: _LIGATURES.get(ch, ch))
+
+    result = "".join(chars)
+    result, idx_map = _regex_sub_with_map(_HYPHEN_LINEBREAK_RE, _hyphen_repl, result, idx_map)
+    result, idx_map = _regex_sub_with_map(_WHITESPACE_RUN_RE, _whitespace_repl, result, idx_map)
+
+    chars, idx_map = _char_map_transform(list(result), idx_map, lambda ch: ch.casefold())
+    result = "".join(chars)
+
+    lstrip_n = len(result) - len(result.lstrip())
+    rstrip_n = len(result) - len(result.rstrip())
+    end = len(result) - rstrip_n
+    result = result[lstrip_n:end]
+    idx_map = idx_map[lstrip_n:end]
+    return result, idx_map
+
+
+def raw_span(index_map: list[int], start: int, end: int, raw_len: int) -> tuple[int, int]:
+    """Map a ``[start, end)`` span in normalized-space back to raw-space.
+
+    Args:
+        index_map: The index map returned by :func:`normalize_with_map` for the
+            same raw string whose length is ``raw_len``.
+        start: Start offset into the normalized string (inclusive).
+        end: End offset into the normalized string (exclusive).
+        raw_len: ``len`` of the original raw string that produced ``index_map``
+            (needed because ``end`` may equal ``len(index_map)``, past the last
+            mapped entry, and the raw end-of-text position isn't otherwise
+            recoverable from the map alone).
+
+    Returns:
+        The corresponding ``(raw_start, raw_end)`` span into the raw string.
+
+    This is an approximation by nature wherever the normalized span's edges
+    fall on a character produced by a many-to-one collapse (a whitespace run
+    collapsed to one space, or a hyphen-linebreak join): ``index_map`` only
+    records the LEFT/first source character for such a collapsed output
+    character. Concretely:
+
+    - ``start``: resolved to ``index_map[start]`` — the left edge of whatever
+      raw span produced normalized character ``start``. For a span starting on
+      a collapsed whitespace run, this lands at the first character of that
+      run, not the exact raw offset "equivalent" to the single collapsed space.
+    - ``end``: resolved to ``index_map[end - 1] + 1`` — one past the raw source
+      of the LAST normalized character in the span (i.e. the right edge of that
+      character's raw span, again the left/first source character's position
+      plus one for a collapsed run). If ``end == len(index_map)`` (the span
+      runs to the end of the normalized string), ``raw_end`` is ``raw_len``
+      instead, since there is no ``index_map[end]`` entry to consult.
+
+    Empty spans (``start == end``) return ``(raw_start, raw_start)`` with
+    ``raw_start`` resolved as above (or ``raw_len`` if ``start == len(index_map)``).
+    """
+    n = len(index_map)
+    raw_start = raw_len if start >= n else index_map[max(start, 0)]
+
+    if end <= start:
+        return raw_start, raw_start
+
+    raw_end = raw_len if end >= n else index_map[end - 1] + 1
+
+    return raw_start, raw_end
+
+
+def _find_abstract_region(text: str) -> tuple[int, int] | None:
+    """Locate a leading "Abstract" heading and the paragraph that follows it."""
+    m = _ABSTRACT_HEADING_RE.search(text[:_ABSTRACT_SEARCH_WINDOW])
+    if not m:
+        return None
+    start = m.end()
+    while start < len(text) and text[start] in "\n\r \t":
+        start += 1
+    window_end = min(start + _ABSTRACT_MAX_LEN, len(text))
+    blank = re.search(r"\n\s*\n", text[start:window_end])
+    end = start + blank.start() if blank else window_end
+    if end <= start:
+        return None
+    return start, end
+
+
+def _is_citation_line(line: str) -> bool:
+    """True if ``line`` matches at least one citation-pattern regex."""
+    return any(pattern.search(line) for pattern in _BIB_LINE_PATTERNS)
+
+
+def find_bibliography_like_regions(text: str) -> list[tuple[int, int, bool]]:
+    """Find runs of ``text`` that look structurally like a bibliography, whether or
+    not they sit under a recognized "References" heading.
+
+    Bibliography entries have a distinctive lexical signature independent of any
+    heading: author-initial patterns ("Smith, J."), a parenthesized year, "et al.",
+    volume:page ranges, and "doi:" strings, all packed at high density line after
+    line — a density ordinary prose essentially never reaches. This scans
+    non-blank lines with a sliding window (:data:`_BIB_WINDOW_LINES`), flags a line
+    as part of a dense run when at least :data:`_BIB_WINDOW_DENSITY` of the lines in
+    its window match a citation pattern, and merges contiguous flagged lines into
+    regions.
+
+    Args:
+        text: Raw document text (same string ``TextSection`` offsets index into).
+
+    Returns:
+        A list of ``(start, end, confident)`` tuples (raw offsets into ``text``,
+        ``end`` exclusive), one per detected region, in document order.
+        ``confident`` is True when the run is long and dense enough
+        (:data:`_BIB_CONFIDENT_LINES`, :data:`_BIB_CONFIDENT_DENSITY`) to be treated
+        with the same weight as an explicit references heading; otherwise it is
+        merely suggestive and callers should attach a warning rather than an outright
+        rejection.
+    """
+    # Build a list of (line_start_offset, line_end_offset, is_citation_line) for
+    # every non-blank line, skipping blank lines entirely so they don't dilute the
+    # density of an otherwise-dense run that happens to have blank-line spacing.
+    lines: list[tuple[int, int, bool]] = []
+    pos = 0
+    for line in text.splitlines(keepends=True):
+        stripped = line.strip()
+        line_start = pos
+        line_end = pos + len(line.rstrip("\r\n"))
+        pos += len(line)
+        if not stripped:
+            continue
+        lines.append((line_start, line_end, _is_citation_line(stripped)))
+
+    n = len(lines)
+    if n == 0:
+        return []
+
+    is_dense = [False] * n
+    for i in range(n):
+        lo = max(0, i - _BIB_WINDOW_LINES + 1)
+        window = lines[lo : i + 1]
+        hits = sum(1 for _, _, is_cite in window if is_cite)
+        if hits / len(window) >= _BIB_WINDOW_DENSITY:
+            is_dense[i] = True
+
+    regions: list[tuple[int, int, bool]] = []
+    i = 0
+    while i < n:
+        if not is_dense[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and is_dense[j]:
+            j += 1
+        run = lines[i:j]
+        run_start = run[0][0]
+        run_end = run[-1][1]
+        run_hits = sum(1 for _, _, is_cite in run if is_cite)
+        run_density = run_hits / len(run)
+        confident = len(run) >= _BIB_CONFIDENT_LINES and run_density >= _BIB_CONFIDENT_DENSITY
+        regions.append((run_start, run_end, confident))
+        i = j
+    return regions
+
+
+def _find_references_region(text: str) -> tuple[int, int] | None:
+    """Locate the LAST references/bibliography heading, if it starts late enough in
+    the document to plausibly be the closing reference list rather than a body
+    subsection."""
+    matches = list(_REFERENCES_HEADING_RE.finditer(text))
+    if not matches:
+        return None
+    m = matches[-1]
+    if len(text) > 0 and m.start() < len(text) * _REFERENCES_MIN_FRACTION:
+        return None
+    return m.start(), len(text)
+
+
+def _overlay_region(
+    pieces: list[tuple[int, int, str]], region: tuple[int, int], label: str
+) -> list[tuple[int, int, str]]:
+    """Relabel the portion of ``pieces`` (currently labeled "body") that overlaps
+    ``region`` as ``label``, splitting pieces at the region boundary as needed."""
+    region_start, region_end = region
+    new_pieces: list[tuple[int, int, str]] = []
+    for start, end, existing_label in pieces:
+        if existing_label != "body":
+            new_pieces.append((start, end, existing_label))
+            continue
+        overlap_start, overlap_end = max(start, region_start), min(end, region_end)
+        if overlap_start >= overlap_end:
+            new_pieces.append((start, end, existing_label))
+            continue
+        if start < overlap_start:
+            new_pieces.append((start, overlap_start, existing_label))
+        new_pieces.append((overlap_start, overlap_end, label))
+        if overlap_end < end:
+            new_pieces.append((overlap_end, end, existing_label))
+    return new_pieces
+
+
+def _label_special_sections(text: str, sections: list[TextSection]) -> list[TextSection]:
+    """Overlay abstract/references regions onto an initial list of "body" sections.
+
+    Each input section (e.g. one per PDF page) is split as needed so the abstract
+    and/or trailing references region is carved out as its own section while the
+    remainder keeps its original page number and "body" label.
+    """
+    abstract_region = _find_abstract_region(text)
+    references_region = _find_references_region(text)
+    if abstract_region is None and references_region is None:
+        return sections
+
+    result: list[TextSection] = []
+    for section in sections:
+        pieces: list[tuple[int, int, str]] = [(section.start, section.end, "body")]
+        if abstract_region is not None:
+            pieces = _overlay_region(pieces, abstract_region, "abstract")
+        if references_region is not None:
+            pieces = _overlay_region(pieces, references_region, "references")
+        for start, end, label in pieces:
+            if start < end:
+                result.append(TextSection(label=label, start=start, end=end, page=section.page))
+    return result
+
+
+def _cap_text(text: str, sections: list[TextSection]) -> tuple[str, list[TextSection], bool]:
+    """Truncate ``text`` to :data:`MAX_EXTRACTED_TEXT_CHARS` characters if needed.
+
+    Applied uniformly by every extractor path (PDF, HTML, plain text) before any
+    normalization or special-section labeling runs, so no downstream step ever
+    processes more than the cap's worth of text and no returned section can point
+    past the (possibly truncated) end of ``text``.
+
+    Args:
+        text: Raw extracted text, prior to normalization or special-section
+            labeling.
+        sections: Sections already computed against the untruncated ``text``
+            (e.g. one per PDF page).
+
+    Returns:
+        A ``(text, sections, truncated)`` triple: ``text`` truncated to the cap
+        (identical to the input when already within it), ``sections`` clipped to
+        the truncated length (a section entirely past the cap is dropped; a
+        section straddling the cap has its ``end`` clipped to it), and
+        ``truncated`` is True iff truncation actually occurred.
+    """
+    if len(text) <= MAX_EXTRACTED_TEXT_CHARS:
+        return text, sections, False
+    capped = text[:MAX_EXTRACTED_TEXT_CHARS]
+    clipped_sections: list[TextSection] = []
+    for section in sections:
+        if section.start >= MAX_EXTRACTED_TEXT_CHARS:
+            continue
+        end = min(section.end, MAX_EXTRACTED_TEXT_CHARS)
+        if section.start >= end:
+            continue
+        clipped_sections.append(TextSection(label=section.label, start=section.start, end=end, page=section.page))
+    return capped, clipped_sections, True
+
+
+def _extract_pdf(data: bytes) -> ExtractedText:
+    """Extract text from a PDF via the optional ``pypdf`` dependency.
+
+    ``pypdf`` is imported lazily so importing this module never fails when the
+    optional dependency is absent. When it is absent, or the bytes fail to parse,
+    this falls back to an empty, ``lossy=True`` result rather than raising.
+    """
+    try:
+        import pypdf  # type: ignore[import-not-found]
+    except ImportError:
+        return ExtractedText(text="", normalized="", sections=[], extractor="pdf:unavailable", lossy=True)
+
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        page_texts = [(page.extract_text() or "") for page in reader.pages]
+    except Exception:
+        return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
+
+    parts: list[str] = []
+    sections: list[TextSection] = []
+    cursor = 0
+    separator = "\n\n"
+    for i, page_text in enumerate(page_texts):
+        start = cursor
+        parts.append(page_text)
+        cursor += len(page_text)
+        sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
+        if i < len(page_texts) - 1:
+            parts.append(separator)
+            cursor += len(separator)
+
+    text = "".join(parts)
+    text, sections, truncated = _cap_text(text, sections)
+    sections = _label_special_sections(text, sections)
+    return ExtractedText(
+        text=text,
+        normalized=normalize_for_match(text),
+        sections=sections,
+        page_count=len(page_texts),
+        extractor="pdf:pypdf",
+        lossy=truncated,
+    )
+
+
+class _HTMLTextExtractor(HTMLParser):
+    """Collects text data, dropping the content of ``<script>``/``<style>`` tags."""
+
+    _STRIPPED_TAGS = frozenset({"script", "style"})
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._skip_depth = 0
+        self.parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in self._STRIPPED_TAGS:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._STRIPPED_TAGS and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self.parts.append(data)
+
+
+def _decode_bytes(data: bytes) -> str:
+    """Decode bytes as UTF-8, replacing undecodable bytes rather than raising."""
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return data.decode("utf-8", errors="replace")
+
+
+def _extract_html(data: bytes) -> ExtractedText:
+    """Extract text from HTML using only the stdlib parser; script/style are dropped."""
+    parser = _HTMLTextExtractor()
+    parser.feed(_decode_bytes(data))
+    parser.close()
+    text = "".join(parser.parts)
+    text, sections, truncated = _cap_text(text, [TextSection(label="body", start=0, end=len(text))])
+    sections = _label_special_sections(text, sections)
+    return ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=sections, extractor="html", lossy=truncated
+    )
+
+
+def _extract_plain_text(data: bytes) -> ExtractedText:
+    """Take ``text/*`` content verbatim (still section-labeled for references/abstract)."""
+    text = _decode_bytes(data)
+    text, sections, truncated = _cap_text(text, [TextSection(label="body", start=0, end=len(text))])
+    sections = _label_special_sections(text, sections)
+    return ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=sections, extractor="text", lossy=truncated
+    )
+
+
+def extract_text(data: bytes, content_type: str) -> ExtractedText:
+    """Extract text and section labels from a fetched document's raw bytes.
+
+    Args:
+        data: Raw document bytes.
+        content_type: Sniffed MIME type, e.g. "application/pdf", "text/html",
+            "text/plain".
+
+    Returns:
+        An :class:`ExtractedText`. PDF extraction is via the optional ``pypdf``
+        dependency (``lossy=True`` and ``extractor="pdf:unavailable"`` when it is not
+        installed). HTML is stripped of ``<script>``/``<style>`` content using only the
+        stdlib. Any other ``text/*`` type is taken verbatim. An unrecognized content
+        type yields empty text with ``lossy=True``.
+    """
+    if content_type == "application/pdf":
+        return _extract_pdf(data)
+    if content_type == "text/html":
+        return _extract_html(data)
+    if content_type.startswith("text/"):
+        return _extract_plain_text(data)
+    return ExtractedText(text="", normalized="", sections=[], extractor="unknown", lossy=True)

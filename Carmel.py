@@ -33,8 +33,33 @@ def create_parser() -> argparse.ArgumentParser:
     serve.add_argument("--host", type=str, default="127.0.0.1", help="Bind host")
     serve.add_argument("--port", type=int, default=5000, help="Bind port")
     serve.add_argument("--debug", action="store_true", help="Enable Flask debug mode")
+    serve.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Carmel config file whose 'agents' section enables the literature auto-run",
+    )
+
+    literature = subparsers.add_parser("literature", help="Run the literature-search step for an existing campaign")
+    literature.add_argument("--campaign", type=str, required=True, help="Campaign ID")
+    literature.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    literature.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Carmel config file with an 'agents' section (required for a real run)",
+    )
 
     return parser
+
+
+def _load_agent_config(config_file: Path | None) -> object | None:
+    """Load the ``agents`` section of a Carmel config file, if any."""
+    if config_file is None:
+        return None
+    from carmel.config import load_config
+
+    return load_config(config_file).agents
 
 
 def _cmd_version() -> int:
@@ -69,7 +94,7 @@ def _cmd_init_workspace(directory: Path) -> int:
 LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
-def _cmd_serve(workspaces: Path | None, host: str, port: int, debug: bool) -> int:
+def _cmd_serve(workspaces: Path | None, host: str, port: int, debug: bool, config: Path | None) -> int:
     """Launch the local Flask UI."""
     if debug and host not in LOOPBACK_HOSTS:
         print(
@@ -81,9 +106,66 @@ def _cmd_serve(workspaces: Path | None, host: str, port: int, debug: bool) -> in
         return 1
     from carmel.ui import create_app
 
-    app = create_app(workspaces_root=workspaces)
+    try:
+        agent_config = _load_agent_config(config)
+    except (OSError, ValueError) as e:
+        print(f"Failed to load config: {e}", file=sys.stderr)
+        return 1
+    app = create_app(workspaces_root=workspaces, agent_config=agent_config)  # type: ignore[arg-type]
     print(f"Carmel UI listening on http://{host}:{port}")
     app.run(host=host, port=port, debug=debug)
+    return 0
+
+
+def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | None) -> int:
+    """Run the literature-search step for an existing campaign.
+
+    Uses the same single-owner service hook as campaign creation
+    (:func:`carmel.services.campaigns.maybe_start_literature_at_creation`);
+    the CLI never owns its own copy of the auto-run logic.
+    """
+    from carmel.services.campaigns import (
+        find_campaign_workspace,
+        load_campaign,
+        maybe_start_literature_at_creation,
+    )
+    from carmel.ui.app import _resolve_workspaces_root
+
+    try:
+        agent_config = _load_agent_config(config)
+    except (OSError, ValueError) as e:
+        print(f"Failed to load config: {e}", file=sys.stderr)
+        return 1
+    if agent_config is None:
+        print(
+            "No agent config available: pass --config FILE whose 'agents' section "
+            "sets provider, consent and API key env vars.",
+            file=sys.stderr,
+        )
+        return 1
+
+    workspaces_root = _resolve_workspaces_root(workspaces)
+    ws = find_campaign_workspace(workspaces_root, campaign_id)
+    if ws is None:
+        print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
+        return 1
+    campaign = load_campaign(ws)
+
+    from carmel.agents.bridge import AgentBridgeError
+
+    try:
+        result = maybe_start_literature_at_creation(ws, campaign, agent_config)  # type: ignore[arg-type]
+    except AgentBridgeError as e:
+        print(f"Literature run unavailable (consent/API key): {e}", file=sys.stderr)
+        return 1
+    if result is None:
+        print(
+            "Literature run did not start: the config toggle is off, the plan requires "
+            "approval, or the campaign state does not allow it.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Literature action {result.action_id} finished with outcome {result.outcome.value}")
     return 0
 
 
@@ -106,7 +188,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "init-workspace":
         return _cmd_init_workspace(args.directory)
     if args.command == "serve":
-        return _cmd_serve(args.workspaces, args.host, args.port, args.debug)
+        return _cmd_serve(args.workspaces, args.host, args.port, args.debug, args.config)
+    if args.command == "literature":
+        return _cmd_literature(args.campaign, args.workspaces, args.config)
 
     parser.print_help()
     return 1

@@ -1,10 +1,11 @@
 """Tests for the Carmel Flask UI."""
 
+import logging
 import os
 import signal
 import threading
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -356,16 +357,20 @@ class TestCampaignRun:
 
         called: dict[str, object] = {}
 
-        def _fake_execute(ws: Path, campaign: object, action: object) -> None:
-            called["action_id"] = getattr(action, "action_id", None)
+        # The run route dispatches through execute_next_action now (the
+        # dispatcher drives the same background T3 lifecycle start_t3_action
+        # exposes); the observable contract is unchanged: dispatch, redirect.
+        def _fake_execute(ws: Path, campaign: object, **kwargs: object) -> None:
+            called["campaign_id"] = getattr(campaign, "campaign_id", None)
+            return None
 
-        monkeypatch.setattr(ui_app, "start_t3_action", _fake_execute)
+        monkeypatch.setattr(ui_app, "execute_next_action", _fake_execute)
         cid = _create_via_form(client)
         _post(client, f"/campaigns/{cid}/plan")
         response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
         assert response.status_code == 302
         assert response.headers["Location"].endswith(cid)
-        assert called["action_id"] is not None
+        assert called["campaign_id"] == cid
 
     def test_run_without_plan_actions_returns_400(
         self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
@@ -574,10 +579,11 @@ class TestApprovalAuditIntegrity:
 
         executed: dict[str, object] = {}
 
-        def _fake_execute(ws: Path, campaign: object, action: object) -> None:
-            executed["action_id"] = getattr(action, "action_id", None)
+        def _fake_execute(ws: Path, campaign: object, **kwargs: object) -> None:
+            executed["campaign_id"] = getattr(campaign, "campaign_id", None)
+            return None
 
-        monkeypatch.setattr(ui_app, "start_t3_action", _fake_execute)
+        monkeypatch.setattr(ui_app, "execute_next_action", _fake_execute)
         cid, ws = _plan_pending_approval(client, workspaces_root)
         assert _post(client, f"/campaigns/{cid}/reject").status_code == 302
         assert _post(client, f"/campaigns/{cid}/approve").status_code == 409
@@ -598,10 +604,11 @@ class TestRunApprovalGate:
 
         executed: dict[str, object] = {}
 
-        def _fake_execute(ws: Path, campaign: object, action: object) -> None:
-            executed["action_id"] = getattr(action, "action_id", None)
+        def _fake_execute(ws: Path, campaign: object, **kwargs: object) -> None:
+            executed["campaign_id"] = getattr(campaign, "campaign_id", None)
+            return None
 
-        monkeypatch.setattr(ui_app, "start_t3_action", _fake_execute)
+        monkeypatch.setattr(ui_app, "execute_next_action", _fake_execute)
         cid, ws = _plan_pending_approval(client, workspaces_root)
         assert _post(client, f"/campaigns/{cid}/run").status_code == 409
         assert executed == {}
@@ -670,13 +677,15 @@ class TestCsrfFieldRendered:
     def test_dashboard_pending_approval(self, client: FlaskClient, workspaces_root: Path) -> None:
         cid, _ = _plan_pending_approval(client, workspaces_root, "render-pending")
         html = client.get(f"/campaigns/{cid}").data.decode()
-        self._assert_every_post_form_has_token(html, expected_forms=3)  # approve + reject + free-text
+        # per-action approve + per-action reject + approve all + reject all + free-text
+        self._assert_every_post_form_has_token(html, expected_forms=5)
 
     def test_dashboard_approved(self, client: FlaskClient) -> None:
         cid = _create_via_form(client, "render-approved")
         assert _post(client, f"/campaigns/{cid}/plan").status_code == 302
         html = client.get(f"/campaigns/{cid}").data.decode()
-        self._assert_every_post_form_has_token(html, expected_forms=2)  # run + free-text
+        # per-action reject + run + free-text
+        self._assert_every_post_form_has_token(html, expected_forms=3)
 
 
 class TestSecretKey:
@@ -747,15 +756,19 @@ class TestRunIsAsynchronous:
         adapter = self._BlockingAdapter()
         monkeypatch.setattr(execution_module, "_default_adapter", lambda: adapter)
 
+        # The run route dispatches through execute_next_action, which starts
+        # the same background T3 lifecycle start_t3_action exposes; capture
+        # the background threads via the returned tickets.
         threads: list[threading.Thread] = []
-        real_start = ui_app.start_t3_action
+        real_execute = ui_app.execute_next_action
 
-        def _capture(ws: Path, campaign: Any, action: Any) -> threading.Thread:
-            thread = real_start(ws, campaign, action)
-            threads.append(thread)
-            return thread
+        def _capture(ws: Path, campaign: Any, **kwargs: Any) -> Any:
+            ticket = real_execute(ws, campaign, **kwargs)
+            if ticket is not None and ticket.thread is not None:
+                threads.append(ticket.thread)
+            return ticket
 
-        monkeypatch.setattr(ui_app, "start_t3_action", _capture)
+        monkeypatch.setattr(ui_app, "execute_next_action", _capture)
         cid = _create_via_form(client)
         _post(client, f"/campaigns/{cid}/plan")
         return cid, adapter, threads
@@ -819,16 +832,16 @@ class TestRunIsAsynchronous:
         """The preflight is a read, so it cannot be authoritative.
 
         Two POSTs can both pass `can_transition` and then race the locked
-        transition inside `start_t3_action`. The loser must see a conflict,
+        pre-transition inside the dispatcher. The loser must see a conflict,
         not a traceback.
         """
         from carmel.services.state_machine import InvalidTransitionError
         from carmel.ui import app as ui_app
 
-        def _lost_the_race(ws: Path, campaign: Any, action: Any) -> threading.Thread:
+        def _lost_the_race(ws: Path, campaign: Any, **kwargs: Any) -> Any:
             raise InvalidTransitionError("approved_for_execution -> running_t3 is not permitted")
 
-        monkeypatch.setattr(ui_app, "start_t3_action", _lost_the_race)
+        monkeypatch.setattr(ui_app, "execute_next_action", _lost_the_race)
         cid = _create_via_form(client)
         _post(client, f"/campaigns/{cid}/plan")
         assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
@@ -1512,18 +1525,26 @@ class TestRunDispatchesOnActionKind:
 
     @staticmethod
     def _recorders(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+        """Record which execution path the /run route took.
+
+        Records ``arc`` (the single-action path) and ``dispatch`` (the multi-action
+        dispatcher) rather than the old ``t3``/``arc`` pair: the route no longer calls
+        ``start_t3_action`` at all, so patching that symbol would only ever record an
+        empty list and every "did not start T3" assertion would pass vacuously.
+        """
         from carmel.ui import app as ui_app
 
-        started: dict[str, list[str]] = {"t3": [], "arc": []}
-
-        def _fake_t3(ws: Path, campaign: Any, action: Any) -> None:
-            started["t3"].append(action.action_id)
+        started: dict[str, list[str]] = {"dispatch": [], "arc": []}
 
         def _fake_arc(ws: Path, campaign: Any, action: Any) -> None:
             started["arc"].append(action.action_id)
 
-        monkeypatch.setattr(ui_app, "start_t3_action", _fake_t3)
+        def _fake_dispatch(ws: Path, campaign: Any, **kwargs: Any) -> None:
+            started["dispatch"].append(str(ws))
+            return None
+
         monkeypatch.setattr(ui_app, "start_arc_action", _fake_arc)
+        monkeypatch.setattr(ui_app, "execute_next_action", _fake_dispatch)
         return started
 
     def test_an_arc_plan_starts_arc_not_t3(
@@ -1533,18 +1554,25 @@ class TestRunDispatchesOnActionKind:
         cid, ws = _arc_planned(client, workspaces_root, name="dispatch-arc")
         assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 302
         assert started["arc"] == [load_plan(ws).actions[0].action_id]
-        assert started["t3"] == []
+        # An ARC plan must never be handed to the multi-action dispatcher, which has no
+        # handler for it.
+        assert started["dispatch"] == []
 
-    def test_a_t3_plan_starts_t3_not_arc(
+    def test_a_t3_plan_runs_through_the_dispatcher_and_never_starts_arc(
         self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # T3 no longer reaches `start_t3_action` from this route: the agentic layer
+        # moved it onto the multi-action dispatcher, which drives the SAME underlying
+        # finish path (`execution._finish_t3_run`). What must still hold -- and is the
+        # actual point of this test -- is that a T3 plan never starts ARC.
         started = self._recorders(monkeypatch)
+
         cid = _create_via_form(client, "dispatch-t3")
         _post(client, f"/campaigns/{cid}/plan")
         ws = find_campaign_workspace(workspaces_root, cid)
         assert ws is not None
         assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 302
-        assert started["t3"] == [load_plan(ws).actions[0].action_id]
+        assert started["dispatch"], "the T3 plan did not reach the dispatcher"
         assert started["arc"] == []
 
     def test_rerunning_a_running_arc_campaign_is_a_conflict(
@@ -1555,21 +1583,29 @@ class TestRunDispatchesOnActionKind:
         cid, ws = _arc_planned(client, workspaces_root, name="arc-conflict")
         update_state(ws, CampaignStateValue.RUNNING_ARC)
         assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
-        assert started == {"t3": [], "arc": []}
+        assert started == {"dispatch": [], "arc": []}
 
-    def test_a_kind_no_tool_runs_is_a_conflict_not_a_misdispatch(
+    def test_a_kind_no_tool_runs_can_never_even_be_persisted(
         self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An approved plan holding a non-runnable kind must start nothing."""
+        """A plan holding a non-runnable kind must start nothing.
+
+        The defence moved EARLIER than this test originally assumed: `save_plan` now
+        validates plan shape, so an EXPERIMENT action cannot reach disk at all and the
+        run route never gets the chance to mis-dispatch it. Asserting the refusal at the
+        write is strictly stronger than asserting a 409 at the run.
+        """
         from carmel.services.planner import save_plan
 
         started = self._recorders(monkeypatch)
-        cid, ws = _arc_planned(client, workspaces_root, name="odd-kind")
+        _cid, ws = _arc_planned(client, workspaces_root, name="odd-kind")
         plan = load_plan(ws)
         action = plan.actions[0].model_copy(update={"kind": ActionKind.EXPERIMENT})
-        save_plan(ws, plan.model_copy(update={"actions": [action]}))
-        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
-        assert started == {"t3": [], "arc": []}
+
+        with pytest.raises(ValueError, match="nothing can execute"):
+            save_plan(ws, plan.model_copy(update={"actions": [action]}))
+
+        assert started == {"dispatch": [], "arc": []}
 
 
 class TestArcSvgRoute:
@@ -1853,3 +1889,554 @@ class TestMockterThroughCarmelEndToEnd:
         assert svg.status_code == 200
         assert b"<svg" in svg.data
         assert b"no diagnostics yet" not in svg.data
+
+
+# --------------------- multi-action dispatch via the UI ---------------------
+
+
+def _fake_handlers_factory(outcome_by_kind=None, calls=None):
+    """Build a stand-in for carmel.ui.app.default_handlers using fake handlers."""
+    from datetime import datetime
+    from uuid import uuid4
+
+    from carmel.schemas import (
+        ActionKind,
+        ActionOutcome,
+        FailureCode,
+        RunRecord,
+        RunStatus,
+        SubmissionMode,
+    )
+    from carmel.services.dispatcher import ActionResult
+
+    outcome_by_kind = outcome_by_kind or {}
+    calls = calls if calls is not None else []
+
+    def handler(workspace_root, campaign, action):
+        calls.append(action.action_id)
+        outcome = outcome_by_kind.get(action.kind, ActionOutcome.SUCCEEDED)
+        status = (
+            RunStatus.SUCCEEDED
+            if outcome in (ActionOutcome.SUCCEEDED, ActionOutcome.NO_GROUNDED_FINDINGS)
+            else RunStatus.FAILED
+        )
+        now = datetime.now(UTC)
+        record = RunRecord(
+            run_id=uuid4().hex,
+            action_id=action.action_id,
+            tool_name="fake",
+            status=status,
+            failure_code=FailureCode.NONE if status == RunStatus.SUCCEEDED else FailureCode.UNKNOWN,
+            started_at=now,
+            ended_at=now,
+            submission_mode=SubmissionMode.LOCAL,
+        )
+        return ActionResult(action_id=action.action_id, kind=action.kind, run_record=record, outcome=outcome)
+
+    def factory(**kwargs):
+        return {ActionKind.T3_RUN: handler, ActionKind.LITERATURE_SEARCH: handler}
+
+    return factory, calls
+
+
+def _join_background(ws: Path, timeout: float = 60.0) -> None:
+    """Wait for the background half of a dispatch to finish.
+
+    The dispatcher holds the workspace dispatch lease until its background
+    thread completes the bookkeeping, so the lease vanishing is the
+    "run finished" signal a UI test can await deterministically.
+    """
+    import time
+
+    from carmel.services.plan_progress import DISPATCH_LOCK_DIR_NAME
+
+    lease = ws / DISPATCH_LOCK_DIR_NAME
+    deadline = time.monotonic() + timeout
+    while lease.exists():
+        assert time.monotonic() < deadline, "background dispatch did not finish in time"
+        time.sleep(0.01)
+
+
+class TestRunRoute:
+    def test_run_executes_next_action_to_completion(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import carmel.ui.app as app_module
+        from carmel.services.campaigns import find_campaign_workspace
+        from carmel.services.state_machine import load_state
+
+        factory, calls = _fake_handlers_factory()
+        monkeypatch.setattr(app_module, "default_handlers", factory)
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")  # auto-approved under default policy
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code == 302
+        _join_background(ws)
+        assert calls  # the dispatcher ran the T3 action through the fake handler
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_run_with_literature_plan_runs_both_steps(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import carmel.ui.app as app_module
+        from carmel.services.campaigns import find_campaign_workspace, load_campaign
+        from carmel.services.planner import plan_and_save
+        from carmel.services.state_machine import load_state, update_state
+
+        factory, calls = _fake_handlers_factory()
+        monkeypatch.setattr(app_module, "default_handlers", factory)
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        plan = plan_and_save(ws, load_campaign(ws), include_literature=True)
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="auto-approved")
+        # /run refuses an action with no recorded approval decision (main's
+        # HITL guard), so record the auto-approvals the plan route would have.
+        from carmel.schemas.approval import ApprovalStatus
+        from carmel.services.approvals import record_decision
+
+        for action in plan.actions:
+            record_decision(ws, action.action_id, ApprovalStatus.AUTO_APPROVED, decided_by="auto")
+
+        _post(client, f"/campaigns/{cid}/run")
+        _join_background(ws)
+        assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+        _post(client, f"/campaigns/{cid}/run")
+        _join_background(ws)
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+        assert len(calls) == 2
+
+    def test_run_without_approved_action_is_a_conflict(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unapproved next action must 409, per main's /run approval guard.
+
+        (Previously this flashed an info message; main's stricter recorded-
+        decision guard supersedes that and refuses outright.)
+        """
+        import carmel.ui.app as app_module
+        from carmel.schemas.approval import ApprovalPolicy
+        from carmel.services.approvals import save_policy
+        from carmel.services.campaigns import find_campaign_workspace
+        from carmel.services.state_machine import load_state
+
+        factory, calls = _fake_handlers_factory()
+        monkeypatch.setattr(app_module, "default_handlers", factory)
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        # Plan requires approval, so /run has nothing approved to execute.
+        save_policy(ws, ApprovalPolicy(auto_approve_t3_under_cpu_hours=0.1))
+        _post(client, f"/campaigns/{cid}/plan")
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code == 409
+        assert calls == []
+        assert load_state(ws).state == CampaignStateValue.PLAN_PENDING_APPROVAL
+
+    def test_run_when_plan_complete_flashes_info(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import carmel.ui.app as app_module
+        from carmel.services.campaigns import find_campaign_workspace
+        from carmel.services.state_machine import load_state
+
+        factory, calls = _fake_handlers_factory()
+        monkeypatch.setattr(app_module, "default_handlers", factory)
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")  # auto-approved under default policy
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/run")
+        _join_background(ws)
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+        runs_so_far = len(calls)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=True)
+
+        assert response.status_code == 200
+        assert b"Nothing to run" in response.data
+        assert len(calls) == runs_so_far
+
+    def test_run_unknown_campaign_404(self, client: FlaskClient) -> None:
+        response = _post(client, "/campaigns/unknown/run")
+        assert response.status_code == 404
+
+
+class TestPerActionApproval:
+    def _pending_two_action_plan(self, client: FlaskClient, workspaces_root: Path):
+        from carmel.schemas.approval import ApprovalPolicy
+        from carmel.services.approvals import save_policy
+        from carmel.services.campaigns import find_campaign_workspace, load_campaign
+        from carmel.services.planner import plan_and_save
+        from carmel.services.state_machine import update_state
+
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        save_policy(
+            ws,
+            ApprovalPolicy(auto_approve_t3_under_cpu_hours=0.1, require_approval_for_literature=True),
+        )
+        plan = plan_and_save(ws, load_campaign(ws), include_literature=True)
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        return cid, ws, plan
+
+    def test_approve_single_action(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.schemas import ApprovalStatus
+        from carmel.services.plan_progress import load_progress
+
+        cid, ws, plan = self._pending_two_action_plan(client, workspaces_root)
+        t3_id = plan.actions[1].action_id
+
+        response = _post(client, f"/campaigns/{cid}/approve", data={"action_id": t3_id}, follow_redirects=False)
+
+        assert response.status_code == 302
+        progress = load_progress(ws)
+        assert progress.actions[1].approval_status == ApprovalStatus.APPROVED
+        assert progress.actions[0].approval_status == ApprovalStatus.PENDING  # untouched
+
+    def test_reject_one_action_does_not_blanket_block(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.schemas import ApprovalStatus
+        from carmel.services.plan_progress import load_progress
+        from carmel.services.state_machine import load_state
+
+        cid, ws, plan = self._pending_two_action_plan(client, workspaces_root)
+        lit_id = plan.actions[0].action_id
+
+        _post(client, f"/campaigns/{cid}/reject", data={"action_id": lit_id})
+
+        progress = load_progress(ws)
+        assert progress.actions[0].approval_status == ApprovalStatus.REJECTED
+        assert progress.has_executable_remaining()
+        assert load_state(ws).state != CampaignStateValue.BLOCKED
+
+    def test_reject_all_blocks(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.services.state_machine import load_state
+
+        cid, ws, _plan = self._pending_two_action_plan(client, workspaces_root)
+        _post(client, f"/campaigns/{cid}/reject")
+        assert load_state(ws).state == CampaignStateValue.BLOCKED
+
+    def test_approve_unknown_action_404(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, _ws, _plan = self._pending_two_action_plan(client, workspaces_root)
+        response = _post(client, f"/campaigns/{cid}/approve", data={"action_id": "nope"})
+        assert response.status_code == 404
+
+
+class TestDashboardAgenticCards:
+    def test_dashboard_shows_literature_report(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from datetime import datetime
+
+        from carmel.agents.budget import BudgetUsage
+        from carmel.schemas.literature import LiteratureReport, StopReason
+        from carmel.services.campaigns import find_campaign_workspace
+
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        report = LiteratureReport(
+            report_id="rep1",
+            campaign_id=cid,
+            action_id="lit1",
+            run_id="run1",
+            created_at=datetime.now(UTC),
+            stop_reason=StopReason.SELF_TERMINATED,
+            usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+        )
+        (ws / "literature_report.json").write_text(report.model_dump_json())
+
+        response = client.get(f"/campaigns/{cid}")
+
+        assert response.status_code == 200
+        assert b"Literature report" in response.data
+        assert b"self_terminated" in response.data
+
+    def test_dashboard_shows_progress_state_mismatch_warning(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.schemas import ActionExecutionStatus, ActionOutcome
+        from carmel.services.campaigns import find_campaign_workspace, load_campaign
+        from carmel.services.plan_progress import advance_cursor, mark_finished
+        from carmel.services.planner import plan_and_save
+
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        plan = plan_and_save(ws, load_campaign(ws))
+        # Progress says the plan completed, but the campaign state was never
+        # finalised (still ready_for_planning): the dashboard must surface it.
+        mark_finished(
+            ws,
+            plan.actions[0].action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+        advance_cursor(ws)
+
+        response = client.get(f"/campaigns/{cid}")
+
+        assert response.status_code == 200
+        assert b"mismatch" in response.data
+        assert b"completed_phase1" in response.data
+
+    def test_dashboard_shows_per_action_progress(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")
+        response = client.get(f"/campaigns/{cid}")
+        assert response.status_code == 200
+        assert b"auto_approved" in response.data
+
+
+class TestCreateAppWithAgentConfig:
+    def test_campaign_creation_auto_runs_literature(self, tmp_path: Path) -> None:
+        """create_app(agent_config=...) wires the literature auto-run; the
+        TEST-tier MockModel path never touches the network."""
+        from carmel.config import AgentConfig
+
+        app = create_app(workspaces_root=tmp_path, agent_config=AgentConfig())
+        app.config["TESTING"] = True
+        client = app.test_client()
+
+        cid = _create_via_form(client, name="auto-lit")
+
+        from carmel.services.campaigns import find_campaign_workspace
+        from carmel.services.state_machine import load_state
+
+        ws = find_campaign_workspace(tmp_path, cid)
+        assert ws is not None
+        assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+        assert (ws / "literature_report.json").exists()
+        dashboard = client.get(f"/campaigns/{cid}").data
+        assert b"Literature report" in dashboard
+
+    def test_no_agent_config_means_no_auto_run(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.services.campaigns import find_campaign_workspace
+
+        cid = _create_via_form(client, name="no-auto")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert not (ws / "literature_report.json").exists()
+        from carmel.services.state_machine import load_state
+
+        assert load_state(ws).state == CampaignStateValue.READY_FOR_PLANNING
+
+
+class TestLiteratureCrashRecovery:
+    """Finding 1: a crash mid literature-run must not wedge the campaign.
+
+    Every UI route refuses while the campaign reads ``RUNNING_*`` (there is
+    no ``RUNNING_LITERATURE -> RUNNING_LITERATURE`` self-edge), so without a
+    recovery path a crashed literature action could only be fixed by
+    hand-editing ``plan_progress.json``. ``/run`` now calls ``reconcile()``
+    ahead of its preflight (self-heal) and ``/abandon`` now handles
+    ``RUNNING_LITERATURE`` explicitly (manual escape hatch) instead of only
+    ``RUNNING_T3``.
+    """
+
+    @staticmethod
+    def _wedged_literature(
+        client: FlaskClient, workspaces_root: Path, name: str = "wedged-lit", *, stale: bool
+    ) -> tuple[str, Path, str]:
+        """A campaign at RUNNING_LITERATURE with a RUNNING literature action.
+
+        ``stale=True`` backdates the action's lease past
+        ``DEFAULT_STALE_AFTER_S`` so ``reconcile`` treats it as no longer
+        live (no lock, and the lease-age fallback used when
+        ``in_dispatch_lock=False`` no longer vouches for it) — modelling a
+        crash. ``stale=False`` leaves the lease fresh, modelling a run that
+        is still genuinely in progress.
+        """
+        from carmel.services.campaigns import load_campaign
+        from carmel.services.plan_progress import DEFAULT_STALE_AFTER_S, load_progress, mark_running, save_progress
+        from carmel.services.planner import plan_and_save
+
+        cid = _create_via_form(client, name)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        plan = plan_and_save(ws, load_campaign(ws), include_literature=True)
+        lit_id = plan.actions[0].action_id
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        update_state(ws, CampaignStateValue.RUNNING_LITERATURE)
+        mark_running(ws, lit_id, "attempt-1")
+        if stale:
+            progress = load_progress(ws)
+            idx = next(i for i, a in enumerate(progress.actions) if a.action_id == lit_id)
+            stale_time = datetime.now(UTC) - timedelta(seconds=DEFAULT_STALE_AFTER_S + 1)
+            progress.actions[idx] = progress.actions[idx].model_copy(update={"updated_at": stale_time})
+            save_progress(ws, progress)
+        return cid, ws, lit_id
+
+    def test_a_stale_running_literature_action_self_heals_on_run(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        from carmel.schemas import ActionExecutionStatus
+        from carmel.services.plan_progress import load_progress
+
+        cid, ws, lit_id = self._wedged_literature(client, workspaces_root, stale=True)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        # Not a 409: the stale RUNNING lease was reconciled away before the
+        # preflight ever looked at campaign state, so the campaign is no
+        # longer wedged.
+        assert response.status_code == 302
+        progress = load_progress(ws)
+        lit_state = next(a for a in progress.actions if a.action_id == lit_id)
+        assert lit_state.execution_status != ActionExecutionStatus.RUNNING
+        assert load_state(ws).state != CampaignStateValue.RUNNING_LITERATURE
+
+    def test_a_live_running_literature_action_is_left_alone_by_run(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """A genuinely in-progress attempt must not be reconciled away."""
+        from carmel.schemas import ActionExecutionStatus
+
+        cid, ws, _lit_id = self._wedged_literature(client, workspaces_root, stale=False)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code == 409
+        assert load_state(ws).state == CampaignStateValue.RUNNING_LITERATURE
+        from carmel.services.plan_progress import load_progress
+
+        progress = load_progress(ws)
+        assert progress.actions[0].execution_status == ActionExecutionStatus.RUNNING
+
+    def test_a_stale_running_literature_action_can_be_abandoned(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid, ws, _lit_id = self._wedged_literature(client, workspaces_root, stale=True)
+
+        response = _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert load_state(ws).state != CampaignStateValue.RUNNING_LITERATURE
+
+    def test_a_live_running_literature_action_refuses_abandon(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws, _lit_id = self._wedged_literature(client, workspaces_root, stale=False)
+
+        response = _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False)
+
+        assert response.status_code == 409
+        assert load_state(ws).state == CampaignStateValue.RUNNING_LITERATURE
+
+
+class TestLiteratureReportLoading:
+    """Finding 24: the dashboard uses ``load_literature_report``, not a
+    mirrored literal + hand-rolled read, and logs a distinct signal for a
+    corrupt report versus an absent one.
+    """
+
+    def test_dashboard_degrades_gracefully_with_no_report(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "no-lit-report")
+        response = client.get(f"/campaigns/{cid}")
+        assert response.status_code == 200
+        assert b"No literature report yet." in response.data
+
+    def test_a_corrupt_report_logs_a_distinct_warning_and_still_degrades(
+        self, client: FlaskClient, workspaces_root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cid = _create_via_form(client, "corrupt-lit-report")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        (ws / "literature_report.json").write_text("{not valid json")
+
+        # carmel.logger.configure_logging() sets propagate=False on the "carmel"
+        # logger, so once any earlier test has configured logging, records never
+        # reach caplog's root handler. Restore propagation for this assertion only,
+        # otherwise the test passes alone and fails in a full-suite run.
+        carmel_logger = logging.getLogger("carmel")
+        previous_propagate = carmel_logger.propagate
+        carmel_logger.propagate = True
+        try:
+            with caplog.at_level(logging.WARNING, logger="carmel.ui"):
+                response = client.get(f"/campaigns/{cid}")
+        finally:
+            carmel_logger.propagate = previous_propagate
+
+        assert response.status_code == 200
+        assert b"No literature report yet." in response.data
+        # getMessage(), not .message: the latter is only populated once a Formatter
+        # has run, and these records are logged with lazy %-style interpolation.
+        assert any("corrupt" in record.getMessage() for record in caplog.records)
+
+
+class TestRunApprovalIsProgressBased:
+    """Finding 18: ``/run``'s preflight authorizes off ``plan_progress.json``,
+    not the append-only decision log — the log stays an audit trail only.
+    """
+
+    def test_run_succeeds_purely_from_progress_approval_with_an_empty_decision_log(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        from carmel.services.campaigns import find_campaign_workspace, load_campaign
+        from carmel.services.planner import plan_and_save
+
+        cid = _create_via_form(client, "progress-authorized")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        plan = plan_and_save(ws, load_campaign(ws))  # single auto-approved T3 action
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        # No APPROVAL decision was ever logged for the action -- authorization comes
+        # purely from plan_progress.json's AUTO_APPROVED seeding.
+        #
+        # Checks `approval_decision` specifically rather than "any event mentioning this
+        # action": planning now also records an `execution_envelope_authorization` audit
+        # entry for the action, which is exactly the sort of log record this test exists
+        # to prove is NOT what authorizes the run.
+        events = read_events(ws / "decision_log.jsonl")
+        assert not any(
+            e.get("event") == "approval_decision" and e.get("action_id") == plan.actions[0].action_id for e in events
+        )
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code == 302
+        assert plan.actions  # sanity: there was something to authorize
+
+    def test_run_refuses_when_progress_disagrees_with_a_stale_decision_log_entry(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """A decision-log entry claiming approval must not override progress.
+
+        Simulates the two sources of truth disagreeing (the scenario Finding
+        18 flags as reachable under a concurrent approve/reject): the log
+        says APPROVED, but ``plan_progress.json`` — the single source of
+        truth for authorization — still says PENDING.
+        """
+        from carmel.schemas import ApprovalStatus
+        from carmel.services.campaigns import find_campaign_workspace, load_campaign
+        from carmel.services.decision_log import append_event
+        from carmel.services.planner import plan_and_save
+
+        cid = _create_via_form(client, "log-disagrees")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        plan = plan_and_save(ws, load_campaign(ws), include_literature=True)
+        update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        lit_id = plan.actions[0].action_id
+        append_event(
+            ws / "decision_log.jsonl",
+            {"event": "decision", "action_id": lit_id, "status": ApprovalStatus.APPROVED.value},
+        )
+        # plan_progress.json itself was never updated to APPROVED for lit_id
+        # (its requirement seeded it PENDING/AUTO_APPROVED via the policy;
+        # force it to PENDING to make the disagreement explicit).
+        from carmel.services.plan_progress import load_progress, save_progress
+
+        progress = load_progress(ws)
+        idx = next(i for i, a in enumerate(progress.actions) if a.action_id == lit_id)
+        progress.actions[idx] = progress.actions[idx].model_copy(update={"approval_status": ApprovalStatus.PENDING})
+        save_progress(ws, progress)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code == 409

@@ -5,7 +5,11 @@
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
+
+if TYPE_CHECKING:
+    from carmel.schemas.action_state import PlanProgress
 
 from carmel.schemas.approval import (
     ActionKind,
@@ -87,6 +91,8 @@ def evaluate_action(
         return ApprovalRequirement.AUTO_APPROVED
     if action.kind == ActionKind.LITERATURE_SEARCH:
         if policy.require_approval_for_literature:
+            return ApprovalRequirement.REQUIRES_APPROVAL
+        if action.estimated_spend_usd > policy.auto_approve_literature_under_usd:
             return ApprovalRequirement.REQUIRES_APPROVAL
         return ApprovalRequirement.AUTO_APPROVED
     return ApprovalRequirement.REQUIRES_APPROVAL
@@ -198,3 +204,27 @@ def record_decision(
         },
     )
     return decision
+
+
+def record_action_decision(
+    workspace_root: Path,
+    action_id: str,
+    status: ApprovalStatus,
+    decided_by: str,
+    rationale: str | None = None,
+) -> tuple[ApprovalDecision, PlanProgress]:
+    """Record an approval decision AND apply it to the persisted plan progress.
+
+    This is :func:`record_decision` plus
+    :func:`carmel.services.plan_progress.set_approval` — the per-action
+    entry point for multi-action plans (approving a previously-rejected
+    action also un-skips it and rewinds the cursor; see ``set_approval``).
+
+    Returns:
+        Tuple of (recorded decision, updated PlanProgress).
+    """
+    from carmel.services.plan_progress import set_approval
+
+    decision = record_decision(workspace_root, action_id, status, decided_by, rationale)
+    progress = set_approval(workspace_root, action_id, status)
+    return decision, progress

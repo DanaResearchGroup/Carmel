@@ -7,7 +7,10 @@
   {# Auto-refresh only while a run is genuinely being supervised. Refreshing
      on a run whose supervisor died reloads a stale promise every 5 seconds
      forever, and hides the recovery this page is offering. #}
-  {% if state.state.value in ('running_t3', 'running_arc') and liveness and liveness.liveness.value == 'supervised' %}
+  {# running_literature refreshes unconditionally: it has no supervisor to probe,
+     so there is no liveness verdict to gate on. #}
+  {% if (state.state.value in ('running_t3', 'running_arc') and liveness and liveness.liveness.value == 'supervised')
+        or state.state.value == 'running_literature' %}
     <meta http-equiv="refresh" content="5">
   {% endif %}
 {% endblock %}
@@ -17,6 +20,15 @@
   <h1>{{ campaign.input.workspace_name }}</h1>
   {{ state_pill(state.state.value) }}
 </div>
+
+{% if state_mismatch %}
+  <div class="flash error">
+    ⚠ Progress/state mismatch: the plan progress projects
+    <strong>{{ state_mismatch }}</strong> but the persisted campaign state is
+    <strong>{{ state.state.value }}</strong>. The campaign may be partially
+    reconciled — the next run attempt will repair it if a legal transition exists.
+  </div>
+{% endif %}
 
 <div class="statusbar">
   <div class="sb-group">
@@ -61,11 +73,41 @@
       <p class="muted" style="margin-top:0">{{ plan.rationale }}</p>
       <ul style="padding-left:1.1rem; margin:0.5rem 0">
         {% for action in plan.actions %}
+          {% set astate = progress_by_action.get(action.action_id) %}
           <li>
             <strong>{{ action.kind.value }}</strong> — {{ action.description }}<br>
             <small class="mono muted">
               {{ "%.1f"|format(action.estimated_cpu_hours) }} CPU·h · {{ action.approval_requirement.value }}
+              {%- if astate %} · {{ astate.approval_status.value }} · {{ astate.execution_status.value }}
+                {%- if astate.outcome.value != 'none' %} ({{ astate.outcome.value }}){% endif %}
+              {%- endif %}
             </small>
+            {% if astate and astate.execution_status.value in ('pending',) %}
+              <div class="actions" style="margin:0.25rem 0">
+                {% if astate.approval_status.value in ('pending', 'rejected') %}
+                  <form method="POST" action="{{ url_for('campaign_approve', campaign_id=campaign.campaign_id) }}" style="display:inline">
+                    <input type="hidden" name="action_id" value="{{ action.action_id }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="success">Approve action</button>
+                  </form>
+                {% endif %}
+                {% if astate.approval_status.value != 'rejected' %}
+                  <form method="POST" action="{{ url_for('campaign_reject', campaign_id=campaign.campaign_id) }}" style="display:inline">
+                    <input type="hidden" name="action_id" value="{{ action.action_id }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button class="danger">Reject action</button>
+                  </form>
+                {% endif %}
+              </div>
+            {% elif astate and astate.execution_status.value == 'skipped' and astate.approval_status.value == 'rejected' %}
+              <div class="actions" style="margin:0.25rem 0">
+                <form method="POST" action="{{ url_for('campaign_approve', campaign_id=campaign.campaign_id) }}" style="display:inline">
+                  <input type="hidden" name="action_id" value="{{ action.action_id }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button class="success">Approve action (un-skip)</button>
+                </form>
+              </div>
+            {% endif %}
           </li>
         {% endfor %}
       </ul>
@@ -73,17 +115,24 @@
         <div class="actions">
           <form method="POST" action="{{ url_for('campaign_approve', campaign_id=campaign.campaign_id) }}" style="display:inline">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button class="success">Approve &amp; execute</button>
+            <button class="success">Approve all &amp; execute</button>
           </form>
           <form method="POST" action="{{ url_for('campaign_reject', campaign_id=campaign.campaign_id) }}" style="display:inline">
             <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-            <button class="danger">Reject</button>
+            <button class="danger">Reject all</button>
           </form>
         </div>
-      {% elif state.state.value == 'approved_for_execution' %}
+      {% elif state.state.value in ('approved_for_execution', 'literature_ready') %}
         <form method="POST" action="{{ url_for('campaign_run', campaign_id=campaign.campaign_id) }}">
           <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-          <button class="primary">Run {{ 'ARC' if plan_tool == 'arc' else 'T3' }}</button>
+          {# Name the tool only when the plan holds exactly one action. A multi-action
+             plan (the agentic layer's literature-then-T3 shape) has no single tool to
+             name, and labelling it "Run T3" would describe the wrong action. #}
+          {% if plan.actions | length == 1 and plan_tool %}
+            <button class="primary">Run {{ 'ARC' if plan_tool == 'arc' else 'T3' }}</button>
+          {% else %}
+            <button class="primary">Run next action</button>
+          {% endif %}
         </form>
       {% endif %}
     {% else %}
@@ -107,9 +156,9 @@
   {# ---------------- Run status ---------------- #}
   {% set supervised = liveness and liveness.liveness.value == 'supervised' %}
   <article class="card
-    {%- if state.state.value in ('running_t3', 'running_arc') %}{{ ' active-running' if supervised else ' needs-recovery' }}{% endif %}">
+    {%- if state.state.value in ('running_t3', 'running_arc') %}{{ ' active-running' if supervised else ' needs-recovery' }}{%- elif state.state.value == 'running_literature' %} active-running{% endif %}">
     <div class="card-head"><h2>Run status</h2></div>
-    {% if state.state.value in ('running_t3', 'running_arc') and supervised %}
+    {% if (state.state.value in ('running_t3', 'running_arc') and supervised) or state.state.value == 'running_literature' %}
       <p>Run in progress. Page auto-refreshes every 5 seconds.</p>
       {% if liveness.active_run %}
         <dl>
@@ -198,6 +247,37 @@
   </article>
   {% endif %}
 
+  {# ---------------- Literature report (read-only) ---------------- #}
+  <article class="card">
+    <div class="card-head"><h2>Literature report</h2></div>
+    {% if literature_report %}
+      <dl>
+        <dt>Run ID</dt><dd><code>{{ literature_report.run_id }}</code></dd>
+        <dt>Created</dt><dd>{{ literature_report.created_at | format_datetime }}</dd>
+        <dt>Stop reason</dt><dd>{{ literature_report.stop_reason.value }}</dd>
+        <dt>Findings</dt><dd>{{ literature_report.findings | length }} grounded · {{ literature_report.rejected | length }} rejected</dd>
+        <dt>Queries</dt><dd>{{ literature_report.queries | length }}</dd>
+      </dl>
+      {% if literature_report.findings %}
+        <ul style="padding-left:1.1rem; margin:0.5rem 0">
+          {% for finding in literature_report.findings[:5] %}
+            <li>
+              <small>
+                <strong>{{ finding.payload.category.value }}</strong> — {{ finding.citation.title }}
+                {% if finding.credence %}· credence {{ "%.2f"|format(finding.credence.credence) }}{% endif %}
+              </small>
+            </li>
+          {% endfor %}
+        </ul>
+      {% endif %}
+      {% if literature_report.warnings %}
+        <p class="muted"><small>{{ literature_report.warnings | length }} warning(s): {{ literature_report.warnings[0] }}</small></p>
+      {% endif %}
+    {% else %}
+      <p class="empty">No literature report yet.</p>
+    {% endif %}
+  </article>
+
   {# ---------------- Diagnostics ----------------
      The view passes at most one of diagnostics / arc_diagnostics — the one
      belonging to the tool that produced the campaign's current state — so a
@@ -279,6 +359,14 @@
       <li>
         <span class="file-name">plan.json</span>
         <span class="file-state {% if plan %}present{% endif %}">{{ 'present' if plan else 'pending' }}</span>
+      </li>
+      <li>
+        <span class="file-name">plan_progress.json</span>
+        <span class="file-state {% if progress %}present{% endif %}">{{ 'present' if progress else 'pending' }}</span>
+      </li>
+      <li>
+        <span class="file-name">literature_report.json</span>
+        <span class="file-state {% if literature_report %}present{% endif %}">{{ 'present' if literature_report else 'pending' }}</span>
       </li>
       <li>
         <span class="file-name">diagnostics.json</span>

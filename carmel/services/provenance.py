@@ -3,6 +3,7 @@
 
 """Provenance recording for Carmel actions."""
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -10,6 +11,105 @@ from typing import Any
 from carmel.services.artifacts import write_json
 
 PROVENANCE_DIR_NAME = "provenance"
+
+AGENT_PROVENANCE_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "action_id",
+        "run_id",
+        "campaign_id",
+        "report_id",
+        "model_name",
+        "provider",
+        "tier",
+        "queries",
+        "artifacts",
+        "usage",
+        "stop_reason",
+        "n_findings",
+        "n_rejected",
+        "grounding_summary",
+        "created_at",
+    }
+)
+
+# Key names whose values are always treated as secrets, regardless of shape.
+_SECRET_KEY_RE = re.compile(r"key|token|secret|password|authorization|credential", re.IGNORECASE)
+
+# Recognizable secret/token value prefixes (bearer/API-key-shaped strings).
+_SECRET_PREFIX_RE = re.compile(r"(sk-|AIza|ghp_|gho_|ghu_|ghs_|ghr_|xox[a-z]-)[A-Za-z0-9_\-]{6,}")
+
+# A long, mixed-case-and-digit alphanumeric run: the generic "looks like a
+# high-entropy token" fallback for secrets that do not match a known prefix.
+_HIGH_ENTROPY_RE = re.compile(r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)[A-Za-z0-9_\-]{20,}$")
+
+_REDACTED = "[REDACTED]"
+
+
+def _is_secret_key(key: str) -> bool:
+    """Return True if a key name looks like it holds a secret value."""
+    return bool(_SECRET_KEY_RE.search(key))
+
+
+def _is_secret_string(value: str) -> bool:
+    """Return True if a string value looks like a bearer token / API key."""
+    return bool(_SECRET_PREFIX_RE.search(value)) or bool(_HIGH_ENTROPY_RE.match(value))
+
+
+def redact(value: Any) -> Any:
+    """Recursively scrub secret-looking values out of a JSON-ish structure.
+
+    Dicts, lists, and tuples are walked recursively. A dict value is replaced
+    with ``"[REDACTED]"`` wholesale when its key name looks like it holds a
+    secret (contains "key", "token", "secret", "password", "authorization", or
+    "credential", case-insensitive) — this catches secrets regardless of their
+    shape. Otherwise, string values that look like a bearer/API token (a
+    recognized prefix such as ``sk-``/``AIza``/``ghp_``, or a long
+    high-entropy alphanumeric run) are replaced the same way. All other values
+    pass through unchanged.
+
+    Args:
+        value: Any JSON-serializable value (or nested structure thereof).
+
+    Returns:
+        The same structure with secret-looking values replaced by
+        ``"[REDACTED]"``.
+    """
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for k, v in value.items():
+            if _is_secret_key(str(k)):
+                result[k] = _REDACTED
+            else:
+                result[k] = redact(v)
+        return result
+    if isinstance(value, list | tuple):
+        return [redact(v) for v in value]
+    if isinstance(value, str) and _is_secret_string(value):
+        return _REDACTED
+    return value
+
+
+def record_agent_provenance(workspace_root: Path, name: str, payload: dict[str, Any]) -> Path:
+    """Write an allowlist-filtered, redacted provenance record for an agent run.
+
+    Keys outside :data:`AGENT_PROVENANCE_ALLOWLIST` are DROPPED entirely (not
+    redacted in place) — this is the mechanism that stops prompt text and API
+    keys from ever reaching disk, so it must be a whitelist, never a
+    blacklist. Surviving values are additionally scrubbed recursively via
+    :func:`redact`, since even an allowlisted field could carry a
+    secret-shaped string it should not.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        name: A short name for the record (used in the filename).
+        payload: The candidate record contents; only allowlisted keys survive.
+
+    Returns:
+        The path of the written record.
+    """
+    filtered = {k: v for k, v in payload.items() if k in AGENT_PROVENANCE_ALLOWLIST}
+    scrubbed = redact(filtered)
+    return record(workspace_root, name, scrubbed)
 
 
 def record(workspace_root: Path, name: str, payload: dict[str, Any]) -> Path:

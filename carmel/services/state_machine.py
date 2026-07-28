@@ -76,10 +76,38 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
             CampaignStateValue.FAILED,
         }
     ),
+    # NOTE (spar round 3, P1-10): there is deliberately NO
+    # APPROVED_FOR_EXECUTION -> COMPLETED_PHASE1 edge — at least one action
+    # must actually run, so terminal success is only reachable through a
+    # RUNNING_* state.
     CampaignStateValue.APPROVED_FOR_EXECUTION: frozenset(
         {
             CampaignStateValue.RUNNING_T3,
             CampaignStateValue.RUNNING_ARC,
+            CampaignStateValue.RUNNING_LITERATURE,
+            CampaignStateValue.BLOCKED,
+            CampaignStateValue.FAILED,
+        }
+    ),
+    CampaignStateValue.RUNNING_LITERATURE: frozenset(
+        {
+            CampaignStateValue.LITERATURE_READY,
+            CampaignStateValue.FAILED,
+            CampaignStateValue.BLOCKED,
+        }
+    ),
+    # NOTE (spar round 3, P1-9): deliberately NO
+    # LITERATURE_READY -> APPROVED_FOR_EXECUTION edge — that cycle would
+    # re-dispatch literature forever. The only cycle the literature edges
+    # create is DIAGNOSTICS_READY -> RUNNING_LITERATURE -> LITERATURE_READY
+    # -> RUNNING_T3 (a second T3 after literature), which increment 1
+    # rejects in `validate_plan_shape`, not here: the edges stay general for
+    # a future Revision Agent.
+    CampaignStateValue.LITERATURE_READY: frozenset(
+        {
+            CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.COMPLETED_PHASE1,
+            CampaignStateValue.BLOCKED,
             CampaignStateValue.FAILED,
         }
     ),
@@ -98,6 +126,7 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
     CampaignStateValue.DIAGNOSTICS_READY: frozenset(
         {
             CampaignStateValue.COMPLETED_PHASE1,
+            CampaignStateValue.RUNNING_LITERATURE,
             CampaignStateValue.FAILED,
         }
     ),

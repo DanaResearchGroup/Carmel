@@ -216,3 +216,150 @@ class TestNoCommand:
         main([])
         captured = capsys.readouterr()
         assert "carmel" in captured.out.lower()
+
+
+class TestLiteratureCommand:
+    """Tests for the `carmel literature` subcommand."""
+
+    def test_no_config_exits_one_with_message(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from Carmel import main
+
+        code = main(["literature", "--campaign", "some-id", "--workspaces", str(tmp_path)])
+        assert code == 1
+        assert "agent config" in capsys.readouterr().err.lower()
+
+    def test_config_without_agents_section_exits_one(
+        self, tmp_path: Path, valid_config_file: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from Carmel import main
+
+        code = main(
+            [
+                "literature",
+                "--campaign",
+                "some-id",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(valid_config_file),
+            ]
+        )
+        assert code == 1
+        assert "agent config" in capsys.readouterr().err.lower()
+
+    def test_unknown_campaign_exits_one(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        import yaml
+
+        from Carmel import main
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            yaml.dump(
+                {
+                    "workspace_name": "lit-cli",
+                    "workspace_root": str(tmp_path / "root"),
+                    "agents": {"tier": "test", "provider": "mock"},
+                }
+            )
+        )
+        code = main(
+            [
+                "literature",
+                "--campaign",
+                "missing-id",
+                "--workspaces",
+                str(tmp_path / "workspaces"),
+                "--config",
+                str(config_file),
+            ]
+        )
+        assert code == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_invalid_config_exits_one(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from Carmel import main
+
+        code = main(
+            [
+                "literature",
+                "--campaign",
+                "x",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(tmp_path / "missing.yaml"),
+            ]
+        )
+        assert code == 1
+        assert "Failed to load config" in capsys.readouterr().err
+
+    def test_runs_literature_for_existing_campaign(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Mock-tier end-to-end: the CLI drives the same service hook."""
+        import yaml
+
+        from Carmel import main
+        from carmel.schemas import (
+            Budgets,
+            CampaignInput,
+            CampaignStateValue,
+            InitialMixture,
+            MixtureComponent,
+            ReactorSystem,
+            ReactorType,
+            TargetObservable,
+        )
+        from carmel.services.campaigns import create_campaign
+        from carmel.services.state_machine import load_state
+
+        workspaces = tmp_path / "workspaces"
+        campaign = create_campaign(
+            workspaces / "cli-lit",
+            CampaignInput(
+                workspace_name="cli-lit",
+                initial_mixture=InitialMixture(components=[MixtureComponent(species="O2", mole_fraction=1.0)]),
+                target_observables=[TargetObservable(name="ignition_delay")],
+                target_reactor_systems=[
+                    ReactorSystem(
+                        reactor_type=ReactorType.JSR,
+                        temperature_range_K=(800.0, 1200.0),
+                        pressure_range_bar=(1.0, 5.0),
+                    )
+                ],
+                budgets=Budgets(cpu_hours=20.0, experiment_budget=0.0),
+            ),
+        )
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            yaml.dump(
+                {
+                    "workspace_name": "cli-lit",
+                    "workspace_root": str(workspaces / "cli-lit"),
+                    "agents": {"tier": "test", "provider": "mock"},
+                }
+            )
+        )
+
+        code = main(
+            [
+                "literature",
+                "--campaign",
+                campaign.campaign_id,
+                "--workspaces",
+                str(workspaces),
+                "--config",
+                str(config_file),
+            ]
+        )
+
+        assert code == 0
+        assert "outcome" in capsys.readouterr().out
+        assert load_state(workspaces / "cli-lit").state == CampaignStateValue.LITERATURE_READY
+
+
+class TestServeConfigOption:
+    def test_serve_invalid_config_exits_one(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from Carmel import main
+
+        code = main(["serve", "--config", str(tmp_path / "missing.yaml")])
+        assert code == 1
+        assert "Failed to load config" in capsys.readouterr().err
