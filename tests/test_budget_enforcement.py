@@ -13,6 +13,7 @@ approval cannot spend budget that has since run out.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -217,6 +218,46 @@ class TestComputeSpend:
         save_run_record(tmp_path, _run_record(actual=1.5))
         assert compute_spend(tmp_path).consumed_cpu_hours == 1.5
 
+    def test_malformed_actual_with_valid_estimate_charges_the_estimate(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A record whose JSON is valid but fails schema validation must still
+        charge its estimate — not zero, which would restore budget really spent."""
+        path = save_run_record(tmp_path, _run_record(actual=1.0, estimated=5.0))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["actual_cpu_hours"] = "oops"
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        with caplog.at_level(logging.ERROR):
+            spend = compute_spend(tmp_path)
+        assert spend.consumed_cpu_hours == 5.0
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_fully_corrupt_json_is_skipped_with_error_log(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        runs_dir = tmp_path / RUNS_DIR_NAME
+        runs_dir.mkdir()
+        (runs_dir / "corrupt.json").write_text("{not json", encoding="utf-8")
+
+        with caplog.at_level(logging.ERROR):
+            spend = compute_spend(tmp_path)
+        assert spend.consumed_cpu_hours == 0.0
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
+    def test_wrong_shape_with_no_estimate_is_skipped_with_error_log(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Valid JSON, fails validation, and no recoverable estimate at all."""
+        runs_dir = tmp_path / RUNS_DIR_NAME
+        runs_dir.mkdir()
+        (runs_dir / "wrong-shape.json").write_text(json.dumps({"run_id": "x"}), encoding="utf-8")
+
+        with caplog.at_level(logging.ERROR):
+            spend = compute_spend(tmp_path)
+        assert spend.consumed_cpu_hours == 0.0
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
     def test_retries_are_not_deduplicated_by_action_id(self, tmp_path: Path) -> None:
         # Two attempts of the same action each spent compute; both count.
         for _ in range(2):
@@ -360,6 +401,39 @@ class TestLaunchRecheck:
 
         with pytest.raises(BudgetExceededError):
             execute_t3_action(ws, load_campaign(ws), action, adapter=_SuccessAdapter())
+
+    def test_rejected_auto_approvable_action_is_refused_at_service_boundary(self, tmp_path: Path) -> None:
+        """A human REJECTED decision overrides the live gate's auto-approval.
+
+        The action here is well within budget, so the live gate alone would
+        auto-approve it; a direct service caller (bypassing the UI's own
+        decision-log check) must still be refused because a human rejected
+        this action, and nothing about the budget re-check should override
+        that rejection.
+        """
+        ws = _approved_t3_workspace(tmp_path)
+        action = load_plan(ws).actions[0]
+        record_decision(ws, action.action_id, ApprovalStatus.REJECTED, decided_by="alon")
+
+        with pytest.raises(BudgetExceededError):
+            execute_t3_action(ws, load_campaign(ws), action, adapter=_SuccessAdapter())
+
+        # Nothing was taken: state untouched, no in-flight record, lock free.
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert load_active_run(ws) is None
+        with supervise_run(ws, "prove-the-lock-is-free"):
+            pass
+
+    def test_rejected_then_approved_still_launches(self, tmp_path: Path) -> None:
+        """A later human APPROVED decision supersedes an earlier REJECTED one."""
+        ws = _approved_t3_workspace(tmp_path)
+        action = load_plan(ws).actions[0]
+        record_decision(ws, action.action_id, ApprovalStatus.REJECTED, decided_by="alon")
+        record_decision(ws, action.action_id, ApprovalStatus.APPROVED, decided_by="alon")
+
+        run_record, _ = execute_t3_action(ws, load_campaign(ws), action, adapter=_SuccessAdapter())
+        assert run_record.status == RunStatus.SUCCEEDED
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
 
     def test_within_budget_auto_launch_needs_no_recorded_decision(self, tmp_path: Path) -> None:
         """Direct service callers with a live-auto action are not interrupted.

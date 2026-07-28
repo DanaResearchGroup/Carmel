@@ -13,9 +13,14 @@ in-flight ``active_run.json`` reservation *are* the ledger.
 
 The reader **fails closed**: no unreadable, corrupt, or implausible
 record may ever *increase* the remaining budget. A corrupt
-``actual_cpu_hours`` falls back to the record's ``estimated_cpu_hours``
-(which the schema guarantees is >= 0); a wholly unparseable file is
-skipped with a warning (it cannot be costed, but it never credits).
+``actual_cpu_hours`` on an otherwise-valid record falls back to the
+record's ``estimated_cpu_hours`` (which the schema guarantees is >= 0). A
+record that fails schema validation entirely is not skipped either: its
+raw ``estimated_cpu_hours`` is recovered and charged if plausible (see
+:func:`_recover_estimate`); only a file with no recoverable estimate at
+all — wholly unparseable JSON, or a missing/implausible
+``estimated_cpu_hours`` — is skipped, and that is logged at ERROR,
+loudly, naming the file (it cannot be costed, but it never credits).
 """
 
 from __future__ import annotations
@@ -83,6 +88,36 @@ def _record_cost(record: RunRecord) -> float:
     return record.estimated_cpu_hours
 
 
+def _recover_estimate(raw: object) -> float | None:
+    """Best-effort recovery of ``estimated_cpu_hours`` from a run record that
+    failed schema validation.
+
+    A record whose JSON is well-formed but whose fields are malformed
+    (e.g. ``actual_cpu_hours: "oops"``) must still be charged *something*
+    — a spent run charges at least its estimate — rather than silently
+    contributing zero to consumed, which would restore budget that was
+    really spent. This reads the already-parsed raw JSON directly
+    (bypassing the schema that just rejected it) and pulls out
+    ``estimated_cpu_hours`` if it is present and itself plausible.
+
+    Args:
+        raw: The parsed JSON of a run record that failed
+            :meth:`RunRecord.model_validate`.
+
+    Returns:
+        The recovered estimate, or ``None`` if ``raw`` isn't an object or
+        its ``estimated_cpu_hours`` is missing or implausible.
+    """
+    if not isinstance(raw, dict):
+        return None
+    estimate = raw.get("estimated_cpu_hours")
+    if isinstance(estimate, bool) or not isinstance(estimate, int | float):
+        return None
+    if not math.isfinite(estimate) or estimate < 0:
+        return None
+    return float(estimate)
+
+
 def compute_spend(workspace_root: Path) -> Spend:
     """Aggregate a campaign's CPU-hour spend from its workspace.
 
@@ -90,6 +125,15 @@ def compute_spend(workspace_root: Path) -> Spend:
     deduplicating by ``action_id``, because retries are legitimately
     separate attempts that each spent compute — plus the in-flight
     reservation carried by ``active_run.json``.
+
+    A record that fails :meth:`RunRecord.model_validate` is not silently
+    skipped: skipping it would contribute zero to consumed and *restore*
+    budget that was really spent, the exact fail-open failure this ledger
+    exists to prevent. Instead its raw ``estimated_cpu_hours`` is recovered
+    and charged (see :func:`_recover_estimate`); only a file with no
+    recoverable estimate at all — unparseable JSON, or a missing/implausible
+    ``estimated_cpu_hours`` — is skipped, and that is logged at ERROR
+    (naming the file) rather than warned about quietly.
 
     Args:
         workspace_root: The campaign workspace root.
@@ -102,11 +146,29 @@ def compute_spend(workspace_root: Path) -> Spend:
     if runs_dir.exists():
         for path in sorted(runs_dir.glob("*.json")):
             try:
-                record = RunRecord.model_validate(read_json(path))
+                raw = read_json(path)
             except (OSError, ValueError) as e:
-                # Unreadable records cannot be costed, but skipping one never
-                # *credits* budget — consumed only ever grows.
-                _log.warning("Skipping unreadable run record %s while computing spend: %s", path, e)
+                _log.error("Skipping unreadable run record %s while computing spend: %s", path, e)
+                continue
+            try:
+                record = RunRecord.model_validate(raw)
+            except ValueError as e:
+                estimate = _recover_estimate(raw)
+                if estimate is None:
+                    _log.error(
+                        "Skipping unrecoverable run record %s while computing spend "
+                        "(failed validation and no usable estimated_cpu_hours): %s",
+                        path,
+                        e,
+                    )
+                    continue
+                _log.error(
+                    "Run record %s failed validation (%s); charging its recorded estimate (%.3f) instead of skipping",
+                    path,
+                    e,
+                    estimate,
+                )
+                consumed += estimate
                 continue
             consumed += _record_cost(record)
 

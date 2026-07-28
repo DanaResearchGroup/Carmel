@@ -13,9 +13,9 @@ from flask.testing import FlaskClient
 from werkzeug.test import TestResponse
 
 from carmel.schemas import CampaignStateValue, DiagnosticsV1
-from carmel.schemas.approval import ActionKind, ApprovalPolicy
+from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalStatus
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
-from carmel.services.approvals import save_policy
+from carmel.services.approvals import record_decision, save_policy
 from carmel.services.campaigns import find_campaign_workspace
 from carmel.services.decision_log import read_events
 from carmel.services.execution import (
@@ -1354,6 +1354,26 @@ class TestBudgetGateOnRunRoute:
         _post(client, f"/campaigns/{cid}/plan")
         assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
         self._spent(ws, 19.0)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+        assert response.status_code == 409
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_running_a_rejected_action_is_a_409(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """A human REJECTED decision must refuse the launch, even well within budget.
+
+        The plan auto-approves (budget is untouched), so the live gate alone
+        would launch this — but a human explicitly rejected the action, and
+        that must surface as the same 409 a budget conflict would, not a
+        silent launch.
+        """
+        cid = _create_via_form(client, "budget-gate-rejected")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        action = load_plan(ws).actions[0]
+        record_decision(ws, action.action_id, ApprovalStatus.REJECTED, decided_by="alon")
 
         response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
         assert response.status_code == 409

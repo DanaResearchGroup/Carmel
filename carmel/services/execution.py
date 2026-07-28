@@ -31,7 +31,11 @@ from carmel.schemas.diagnostics import DiagnosticsV1
 from carmel.schemas.plan import PlannedAction
 from carmel.schemas.run import ActiveRun, FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.schemas.state import CampaignState, CampaignStateValue
-from carmel.services.approvals import has_effective_human_approval, load_policy
+from carmel.services.approvals import (
+    has_effective_human_approval,
+    has_effective_human_rejection,
+    load_policy,
+)
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.authorization import BudgetExceededError, decide_requirement
 from carmel.services.decision_log import append_event
@@ -208,14 +212,23 @@ def _require_launch_authorization(workspace_root: Path, campaign: Campaign, acti
     yet reserved in ``active_run.json`` and is never counted against
     itself, and a refusal changes nothing and can wedge nothing.
 
-    If the live gate still auto-approves, the launch proceeds (this is
-    what keeps auto-approved runs — including retries after pre-launch
-    failures, which consume nothing — uninterrupted). If it escalates, a
-    recorded *effective* human approval for this action authorizes the
-    launch anyway (a human who approved is an override that survives
-    stale-over-budget retries); an ``AUTO_APPROVED``-only record does not,
-    because an auto-approval is only valid while the gate still
-    auto-approves.
+    Even before consulting the live gate, a recorded *effective* human
+    ``REJECTED`` decision for this action refuses the launch outright — a
+    human who rejected an action overrides any auto-approval the live gate
+    would otherwise grant, so an auto-approvable retry of a rejected action
+    can never slip through this boundary. A later ``APPROVED`` decision for
+    the same action supersedes an earlier ``REJECTED`` one (see
+    :func:`~carmel.services.approvals.has_effective_human_rejection`), so a
+    reject-then-approve sequence still launches normally.
+
+    If the live gate still auto-approves (and no rejection stands), the
+    launch proceeds (this is what keeps auto-approved runs — including
+    retries after pre-launch failures, which consume nothing —
+    uninterrupted). If it escalates, a recorded *effective* human approval
+    for this action authorizes the launch anyway (a human who approved is
+    an override that survives stale-over-budget retries); an
+    ``AUTO_APPROVED``-only record does not, because an auto-approval is
+    only valid while the gate still auto-approves.
 
     This is the service-boundary twin of the UI ``/run`` route's
     decision-log check, so direct service callers cannot bypass the
@@ -223,10 +236,13 @@ def _require_launch_authorization(workspace_root: Path, campaign: Campaign, acti
     never pass through here.
 
     Raises:
-        BudgetExceededError: If the live gate requires approval and no
-            effective human approval is recorded for the action. Raised
-            before any supervision or state change.
+        BudgetExceededError: If a human has effectively rejected the
+            action, or if the live gate requires approval and no effective
+            human approval is recorded for the action. Raised before any
+            supervision or state change.
     """
+    if has_effective_human_rejection(workspace_root, action.action_id):
+        raise BudgetExceededError(f"Launch of action {action.action_id} refused: a human has rejected this action.")
     try:
         policy = load_policy(workspace_root)
     except FileNotFoundError:
