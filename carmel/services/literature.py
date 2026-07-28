@@ -27,7 +27,7 @@ import os
 import shutil
 import socket
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -41,11 +41,13 @@ from carmel.agents.budget import (
 from carmel.agents.literature_agent import (
     LiteratureProposal,
     ProposedFinding,
+    RequestedPaper,
     VerifierAssessment,
     build_literature_agent,
     build_verifier_agent,
 )
 from carmel.agents.models import build_model
+from carmel.agents.tools.academic import CrossrefSearchTool, OpenAlexSearchTool, normalize_doi
 from carmel.agents.tools.extract import ExtractedText, extract_text, normalize_for_match
 from carmel.agents.tools.fetch import (
     FetchError,
@@ -59,14 +61,21 @@ from carmel.agents.tools.search import (
     SearchResult,
     SearchToolProtocol,
 )
-from carmel.config import AgentConfig, AgentProvider
+from carmel.config import (
+    KEYLESS_SEARCH_PROVIDERS,
+    AgentConfig,
+    AgentProvider,
+    SearchProvider,
+)
 from carmel.logger import get_logger
+from carmel.schemas.acquisition import AcquisitionReason
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
     STOP_REASON_FOR_DIMENSION,
     CredenceVerdict,
     EvidenceRef,
     GroundingStatus,
+    GroundingVerdict,
     LiteratureFinding,
     LiteratureReport,
     RejectedFinding,
@@ -77,6 +86,7 @@ from carmel.schemas.literature import (
 from carmel.schemas.plan import PlannedAction
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services import chem
+from carmel.services.acquisition import record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
 from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
@@ -243,6 +253,50 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
             ledger=ledger,
         )
 
+    # Built BEFORE the models: this is pure local-config validation, so a campaign
+    # misconfigured for search must fail on that, not on whichever error a later
+    # model construction happens to raise first.
+    search = _build_search_tool(config, ledger)
+
+    return LiteratureDeps(
+        config=config,
+        model=build_model(config),
+        verifier_model=build_model(config),
+        search=search,
+        fetch=HttpFetchTool(ledger=ledger, max_artifact_bytes=config.budget.max_artifact_bytes),
+        ledger=ledger,
+    )
+
+
+def _build_search_tool(config: AgentConfig, ledger: BudgetLedger) -> SearchToolProtocol:
+    """Build the configured search backend, failing closed on missing credentials.
+
+    Only ``SearchProvider.HTTP_JSON`` needs an operator-supplied endpoint and key; the
+    scholarly indices are keyless by design and requiring credentials for them made
+    them impossible to configure at all.
+
+    Args:
+        config: The agent configuration.
+        ledger: Budget ledger shared with the rest of the run's tools.
+
+    Returns:
+        A search tool satisfying :class:`SearchToolProtocol`.
+
+    Raises:
+        AgentBridgeError: If ``HTTP_JSON`` is selected without an endpoint, without a
+            key env var name, or with that env var unset/empty.
+    """
+    if config.search_provider == SearchProvider.OPENALEX:
+        return OpenAlexSearchTool(ledger=ledger, contact_email=config.search_contact_email)
+    if config.search_provider == SearchProvider.CROSSREF:
+        return CrossrefSearchTool(ledger=ledger, contact_email=config.search_contact_email)
+    if config.search_provider in KEYLESS_SEARCH_PROVIDERS:  # pragma: no cover - defensive
+        raise AgentBridgeError(
+            f"search provider {config.search_provider!r} is declared keyless but has no "
+            "backend wired here; add it above rather than falling through to the "
+            "keyed HTTP path, which would demand credentials it does not use"
+        )
+
     if not config.search_endpoint:
         raise AgentBridgeError(f"provider {config.provider!r} requires search_endpoint to be set")
     env_var = config.search_api_key_env
@@ -251,15 +305,7 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
     api_key = os.environ.get(env_var, "")
     if not api_key:
         raise AgentBridgeError(f"environment variable {env_var!r} (search_api_key_env) is not set or empty")
-
-    return LiteratureDeps(
-        config=config,
-        model=build_model(config),
-        verifier_model=build_model(config),
-        search=HttpSearchTool(endpoint=config.search_endpoint, api_key=api_key, ledger=ledger),
-        fetch=HttpFetchTool(ledger=ledger, max_artifact_bytes=config.budget.max_artifact_bytes),
-        ledger=ledger,
-    )
+    return HttpSearchTool(endpoint=config.search_endpoint, api_key=api_key, ledger=ledger)
 
 
 # --------------------------- run lock -----------------------------------------
@@ -426,10 +472,19 @@ def _literature_prompt(
     """Build the Literature Agent's user prompt for one round."""
     parts = [_campaign_context(campaign), f"Round: {round_index}"]
     if search_results:
-        lines = ["Search results from your previous queries:"]
+        lines = [
+            "Search results from your previous queries. FULL TEXT says whether a "
+            "readable copy is available: when it says no, you cannot quote the paper, so "
+            "put it under `wanted` if it is relevant rather than inventing a quote."
+        ]
         for query, results in search_results.items():
             lines.append(f"- query: {query}")
-            lines.extend(f"  * {r.title} | {r.url} | {r.snippet}" for r in results)
+            for r in results:
+                availability = "FULL TEXT: yes" if r.pdf_url else "FULL TEXT: no"
+                identifier = f"doi:{r.doi}" if r.doi else r.url
+                lines.append(f"  * {r.title} | {identifier} | {availability}")
+                if r.snippet:
+                    lines.append(f"    {r.snippet}")
         parts.append("\n".join(lines))
     if reported_keys:
         parts.append(
@@ -511,6 +566,12 @@ class _RunState:
     rejected: list[RejectedFinding]
     warnings: list[str]
     stop_reason: StopReason = StopReason.SELF_TERMINATED
+    fetch_failures: dict[str, tuple[AcquisitionReason, str]] = field(default_factory=dict)
+    """URL -> (why acquisition failed, detail), so :func:`_process_finding` can queue the
+    paper for manual acquisition with an accurate reason instead of re-deriving one by
+    parsing warning text."""
+    acquisition_slugs: list[str] = field(default_factory=list)
+    """Slugs queued for manual acquisition during this run, for the run summary."""
 
 
 def _process_finding(
@@ -548,6 +609,7 @@ def _process_finding(
     )
     if not verdict.grounded or stored is None or extracted is None:
         reason = "; ".join(verdict.reasons) or f"grounding failed with status {verdict.status.value}"
+        _maybe_queue_acquisition(workspace_root, proposed, verdict=verdict, state=state)
         state.rejected.append(
             RejectedFinding(
                 finding_id=finding_id,
@@ -631,6 +693,103 @@ def _process_finding(
     )
 
 
+def _queue_wanted_paper(
+    workspace_root: Path,
+    paper: RequestedPaper,
+    *,
+    state: _RunState,
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+) -> None:
+    """Queue a paper the agent asked a human to obtain.
+
+    Note what is NOT checked here: the agent's claim that this paper is relevant, or even
+    that it exists. Nothing in the queue is evidence -- a queued paper makes no assertion
+    about combustion chemistry, it only asks a person to look something up, and that
+    person can see the title, DOI and stated reason before spending any effort. The
+    evidentiary checks all still apply later, unchanged, to whatever they drop in.
+    """
+    doi = normalize_doi(paper.doi)
+    landing_url = paper.landing_url or (f"https://doi.org/{doi}" if doi else None)
+    if landing_url is None:
+        state.warnings.append(f"ignored a requested paper with neither a DOI nor a URL: {paper.title!r}")
+        return
+
+    request = record_request(
+        workspace_root,
+        title=paper.title,
+        doi=doi,
+        landing_url=landing_url,
+        reason=AcquisitionReason.PAYWALLED,
+        detail=paper.relevance,
+    )
+    if request.slug in state.acquisition_slugs:
+        return
+    state.acquisition_slugs.append(request.slug)
+    append_typed_event(
+        log_path,
+        event="literature.paper_requested",
+        action_id=action_id,
+        run_id=run_id,
+        payload={"slug": request.slug, "doi": doi, "title": paper.title},
+    )
+
+
+def _maybe_queue_acquisition(
+    workspace_root: Path,
+    proposed: ProposedFinding,
+    *,
+    verdict: GroundingVerdict,
+    state: _RunState,
+) -> None:
+    """Queue a paper for manual acquisition when — and only when — the EVIDENCE was
+    unobtainable.
+
+    The distinction this function draws is the important one. A finding can fail
+    grounding for two very different reasons:
+
+    - Carmel could not obtain or read the document (paywall, dead link, image-only
+      scan). The claim is untested, and a human with a subscription could settle it.
+      That is what the acquisition queue is for.
+    - Carmel read the document fine and the claimed quote was not in it
+      (``QUOTE_NOT_FOUND``). That is the fabrication signal the whole grounding gate
+      exists to raise.
+
+    Only the first is queued. Queueing the second would convert "this agent may have
+    invented a quote" into "we are waiting on a human", quietly retiring the strongest
+    rejection the system can produce -- so ``QUOTE_NOT_FOUND`` deliberately falls
+    through to a plain rejection here and is never given a second chance.
+    """
+    url = proposed.source_url
+    failure = state.fetch_failures.get(url)
+
+    if failure is not None:
+        acquisition_reason, detail = failure
+    elif verdict.status == GroundingStatus.ARTIFACT_UNREADABLE:
+        acquisition_reason = AcquisitionReason.UNREADABLE
+        detail = "; ".join(verdict.reasons)
+    else:
+        return
+
+    citation = proposed.citation
+    landing_url = f"https://doi.org/{citation.doi}" if citation.doi else (citation.url or url)
+    request = record_request(
+        workspace_root,
+        title=citation.title,
+        doi=citation.doi,
+        landing_url=landing_url,
+        reason=acquisition_reason,
+        detail=detail,
+    )
+    if request.slug not in state.acquisition_slugs:
+        state.acquisition_slugs.append(request.slug)
+        state.warnings.append(
+            f"queued for manual acquisition ({acquisition_reason.value}): "
+            f"{citation.title!r} -> literature_requests/inbox/{request.slug}.pdf"
+        )
+
+
 def _fetch_and_store(
     workspace_root: Path,
     url: str,
@@ -649,6 +808,17 @@ def _fetch_and_store(
         artifact, data = deps.fetch.fetch(url)
     except FetchError as exc:
         state.warnings.append(f"fetch failed for {url}: {exc}")
+        # Every fetch failure is worth a manual request, because the failure describes
+        # this URL, not the paper: a repository link that 404s, a host that will not
+        # resolve, and a publisher refusing an unsubscribed client all leave a real,
+        # citable paper that a human with a subscription can still obtain. The status
+        # only decides which REASON the operator is shown -- 401/402/403 is a paywall
+        # they can act on directly, anything else is a broken retrieval path.
+        paywalled = exc.status in (401, 402, 403)
+        state.fetch_failures[url] = (
+            AcquisitionReason.PAYWALLED if paywalled else AcquisitionReason.FETCH_FAILED,
+            f"HTTP {exc.status}" if exc.status else str(exc),
+        )
         return None
     extracted = extract_text(data, artifact.content_type)
     try:
@@ -728,6 +898,11 @@ def _research_loop(
                     "executed": executed_queries,
                     "dropped": dropped_queries,
                 },
+            )
+
+        for paper in proposal.wanted:
+            _queue_wanted_paper(
+                workspace_root, paper, state=state, log_path=log_path, action_id=action_id, run_id=run_id
             )
 
         new_findings = []

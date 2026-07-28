@@ -2440,3 +2440,36 @@ class TestRunApprovalIsProgressBased:
         response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
 
         assert response.status_code == 409
+
+
+class TestAcquisitionQueuePanel:
+    """The acquisition queue is the only part of a literature run that asks the USER to
+    act, so it has to be visible on the dashboard. Most combustion papers cannot be
+    fetched, so a run that queues several and grounds none is the normal outcome -- and
+    without this panel it would read on screen as "the agent found nothing"."""
+
+    def test_pending_papers_are_shown_with_the_exact_filename_to_use(self, client: FlaskClient, tmp_path: Path) -> None:
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import record_request
+
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(tmp_path, cid)
+        record_request(
+            ws,
+            title="High pressure shock tube ignition delay measurements",
+            doi="10.1115/1.4036254",
+            landing_url="https://doi.org/10.1115/1.4036254",
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+
+        body = client.get(f"/campaigns/{cid}").data.decode()
+
+        assert "Papers Carmel needs you to obtain" in body
+        assert "10.1115-1.4036254.pdf" in body
+        assert "High pressure shock tube ignition delay measurements" in body
+
+    def test_no_panel_is_rendered_when_nothing_is_queued(self, client: FlaskClient) -> None:
+        cid = _create_via_form(client)
+        body = client.get(f"/campaigns/{cid}").data.decode()
+        assert "Papers Carmel needs you to obtain" not in body

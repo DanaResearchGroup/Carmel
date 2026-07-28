@@ -247,6 +247,42 @@
   </article>
   {% endif %}
 
+  {# ------- Papers awaiting the operator (the one action asked of the user) ------- #}
+  {% if pending_papers or rejected_papers %}
+  <article class="card">
+    <div class="card-head"><h2>Papers Carmel needs you to obtain</h2></div>
+    {% if pending_papers %}
+      <p>
+        These {{ pending_papers | length }} paper(s) could not be retrieved automatically —
+        most combustion-kinetics papers are behind a publisher paywall. Download each one
+        and save it into <code>{{ inbox_path }}</code> using exactly the filename shown.
+        Carmel verifies that the file really is the paper requested before using it as
+        evidence.
+      </p>
+      <ul class="paper-list">
+        {% for paper in pending_papers %}
+          <li>
+            <strong>{{ paper.title }}</strong><br>
+            Save as <code>{{ paper.slug }}.pdf</code>
+            {% if paper.doi %} · DOI <code>{{ paper.doi }}</code>{% endif %}
+            · <a href="{{ paper.landing_url }}" rel="noopener noreferrer" target="_blank">obtain</a>
+            <br><small>{{ paper.reason.value }}{% if paper.detail %} — {{ paper.detail }}{% endif %}</small>
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+    {% if rejected_papers %}
+      <p><strong>Needs attention:</strong> a file was dropped for these, but it did not
+      pass the identity check and was not used as evidence.</p>
+      <ul class="paper-list">
+        {% for paper in rejected_papers %}
+          <li><code>{{ paper.slug }}.pdf</code> — {{ paper.identity_note }}</li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+  </article>
+  {% endif %}
+
   {# ---------------- Literature report (read-only) ---------------- #}
   <article class="card">
     <div class="card-head"><h2>Literature report</h2></div>

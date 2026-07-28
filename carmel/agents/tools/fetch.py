@@ -36,6 +36,21 @@ _ALLOWED_SCHEMES = frozenset({"http", "https"})
 class FetchError(RuntimeError):
     """Raised for any fetch failure: unsafe URL, redirect loop, size cap, transport error."""
 
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        """Construct the error.
+
+        Args:
+            message: Human-readable description.
+            status: HTTP status code, when the failure was an HTTP response rather than
+                a transport or policy failure. Callers use this to tell a paywall
+                (401/403) from a broken link, which decides whether the paper goes to
+                the manual-acquisition queue or is merely reported as unreachable.
+                Parsing this back out of ``message`` would be brittle, so it is carried
+                explicitly.
+        """
+        super().__init__(message)
+        self.status = status
+
 
 class FetchedArtifact(BaseModel):
     """Metadata describing a successfully fetched document."""
@@ -334,7 +349,10 @@ class HttpFetchTool:
                     try:
                         response = self._opener(current, timeout_s=self._timeout_s)
                     except Exception as exc:  # noqa: BLE001 - normalize all transport errors
-                        raise FetchError(f"fetch failed for {current!r}: {exc}") from exc
+                        raise FetchError(
+                            f"fetch failed for {current!r}: {exc}",
+                            status=getattr(exc, "code", None),
+                        ) from exc
 
                     try:
                         status = getattr(response, "status", None)

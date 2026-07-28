@@ -48,7 +48,7 @@ from carmel.agents.tools.extract import ExtractedText
 from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.logger import get_logger
 from carmel.paths import normalize_path
-from carmel.schemas.literature import StoredArtifact
+from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.artifacts import read_bytes, read_json, write_bytes, write_json, write_text
 
 __all__ = [
@@ -118,6 +118,7 @@ def store_artifact(
     artifact: FetchedArtifact,
     extracted: ExtractedText,
     license_note: str | None = None,
+    provenance: ArtifactProvenance = ArtifactProvenance.FETCHED,
     max_bytes: int,
 ) -> StoredArtifact:
     """Content-address and persist a fetched artifact inside the workspace.
@@ -141,6 +142,9 @@ def store_artifact(
         artifact: Fetch metadata (URL, claimed sha256, content type, etc.).
         extracted: The extracted text to persist alongside the raw bytes.
         license_note: Optional free-text license/usage note.
+        provenance: How these bytes reached the workspace. Defaults to ``FETCHED``;
+            manual acquisition passes ``MANUAL`` so a reader of the evidence chain can
+            tell a machine-verified retrieval from a human-supplied file.
         max_bytes: Hard cap on artifact size.
 
     Returns:
@@ -179,11 +183,31 @@ def store_artifact(
             digest,
         )
         return _write_all(
-            dest_dir, raw_path, text_path, meta_path, extracted_path, data, artifact, extracted, digest, license_note
+            dest_dir,
+            raw_path,
+            text_path,
+            meta_path,
+            extracted_path,
+            data,
+            artifact,
+            extracted,
+            digest,
+            license_note,
+            provenance,
         )
 
     return _write_all(
-        dest_dir, raw_path, text_path, meta_path, extracted_path, data, artifact, extracted, digest, license_note
+        dest_dir,
+        raw_path,
+        text_path,
+        meta_path,
+        extracted_path,
+        data,
+        artifact,
+        extracted,
+        digest,
+        license_note,
+        provenance,
     )
 
 
@@ -242,6 +266,7 @@ def _write_all(
     extracted: ExtractedText,
     digest: str,
     license_note: str | None,
+    provenance: ArtifactProvenance,
 ) -> StoredArtifact:
     """Write raw.bin, text.txt, extracted.json, and meta.json for a (new or repaired) artifact."""
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -258,6 +283,7 @@ def _write_all(
         extractor=extracted.extractor,
         lossy=extracted.lossy,
         license_note=license_note,
+        provenance=provenance,
     )
     write_json(meta_path, stored)
     return stored

@@ -386,6 +386,18 @@ def create_app(
             # corrupt/unparseable, which is worth its own log signal rather
             # than degrading silently to the same "no report" UI state.
             _log.warning("literature report for %s is present but corrupt: %s", ws, e)
+        # Papers awaiting the operator. This is the ONE part of a literature run that
+        # asks the user to do something, so it must be visible on the dashboard rather
+        # than only in a README on disk: most papers in this field cannot be fetched, so
+        # an empty-looking report with a full acquisition queue is the normal outcome and
+        # would otherwise read as "the agent found nothing".
+        from carmel.schemas.acquisition import AcquisitionStatus
+        from carmel.services.acquisition import inbox_dir, load_manifest
+
+        acquisition = load_manifest(ws)
+        pending_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REQUESTED]
+        rejected_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REJECTED]
+
         return render_template(
             "campaign_dashboard.html",
             campaign=campaign,
@@ -397,6 +409,9 @@ def create_app(
             progress_by_action=progress_by_action,
             state_mismatch=state_mismatch,
             literature_report=literature_report,
+            pending_papers=pending_papers,
+            rejected_papers=rejected_papers,
+            inbox_path=str(inbox_dir(ws)),
             diagnostics=diagnostics,
             arc_diagnostics=arc_diagnostics,
             diagnostics_on_disk=(ws / DIAGNOSTICS_FILE_NAME).exists(),

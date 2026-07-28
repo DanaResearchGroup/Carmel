@@ -40,6 +40,21 @@ class SearchResult(BaseModel):
     snippet: str = ""
     source: str = ""
 
+    doi: str | None = None
+    """Normalized bare DOI (``10.xxxx/yyy``), when the backend supplied one."""
+    pdf_url: str | None = None
+    """A directly-fetchable full-text URL the backend ADVERTISES, if any.
+
+    Advertised, not verified: a live probe of OpenAlex found that 5 of 11
+    repository-hosted ``pdf_url`` values actually served an HTML landing page. Callers
+    must confirm the bytes really are a PDF rather than trusting this field.
+    """
+    is_open_access: bool = False
+    """The backend's OA claim. Also advisory: the same probe saw 48% of works flagged
+    open-access while only 18% carried any fetchable full-text URL at all."""
+    repository: str = ""
+    """Display name of the host holding ``pdf_url`` (e.g. ``OSTI``, ``arXiv``)."""
+
 
 class SearchToolProtocol(Protocol):
     """Structural type for anything that can run a web search."""
@@ -47,7 +62,7 @@ class SearchToolProtocol(Protocol):
     def search(self, query: str, *, limit: int = 10) -> list[SearchResult]: ...
 
 
-def _default_opener(url: str, *, headers: dict[str, str], timeout_s: float) -> Any:
+def default_opener(url: str, *, headers: dict[str, str], timeout_s: float) -> Any:
     """Perform a real HTTP GET, returning a file-like response object.
 
     Args:
@@ -98,7 +113,7 @@ class HttpSearchTool:
         self._endpoint = endpoint
         self._api_key = api_key
         self._ledger = ledger
-        self._opener = opener if opener is not None else _default_opener
+        self._opener = opener if opener is not None else default_opener
         self._timeout_s = timeout_s
 
     def search(self, query: str, *, limit: int = 10) -> list[SearchResult]:
@@ -116,40 +131,80 @@ class HttpSearchTool:
         url = f"{self._endpoint}?{query_string}"
         headers = {"Authorization": f"Bearer {self._api_key}"}
 
-        with self._ledger.fetch_call(estimated_bytes=_ESTIMATED_SEARCH_BYTES) as reservation:
-            # Finding 10: a failed search attempt still consumed a real outbound
-            # request and whatever bytes actually crossed the wire before it failed.
-            # ``total`` tracks the true transferred count; on any failure it is
-            # recorded on the reservation BEFORE the exception propagates, so
-            # ``BudgetLedger.abandon`` settles against the real egress instead of
-            # falling back to the full worst-case ``reserved_bytes`` charge.
-            total = 0
-            try:
-                response = self._opener(url, headers=headers, timeout_s=self._timeout_s)
-                try:
-                    chunks: list[bytes] = []
-                    while True:
-                        chunk = response.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
-                        total += len(chunk)
-                        self._ledger.check_stream_bytes(total)
-                        chunks.append(chunk)
-                    raw = b"".join(chunks)
-                finally:
-                    response.close()
-            except BaseException:
-                reservation.observed_bytes = total
-                raise
-            self._ledger.settle_fetch(reservation, actual_bytes=len(raw))
-
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError, TypeError, UnicodeDecodeError:
-            logger.warning("search response was not valid JSON; returning empty results")
+        payload = budgeted_get_json(
+            url,
+            headers=headers,
+            ledger=self._ledger,
+            opener=self._opener,
+            timeout_s=self._timeout_s,
+        )
+        if payload is None:
             return []
-
         return _parse_results(payload)[:limit]
+
+
+def budgeted_get_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    ledger: BudgetLedger,
+    opener: Callable[..., Any],
+    timeout_s: float,
+) -> Any | None:
+    """GET ``url`` under full budget discipline and parse it as JSON.
+
+    This is the single implementation of the ledger/streaming contract shared by every
+    search backend (generic ``HttpSearchTool`` and the keyless scholarly adapters in
+    :mod:`carmel.agents.tools.academic`). It is deliberately ONE function: the
+    reserve/settle and mid-stream size-check behaviour below is budget-enforcement
+    code, and a second hand-rolled copy in another backend is exactly how one backend
+    ends up quietly unmetered.
+
+    Args:
+        url: Fully-formed request URL (must never carry an API key in its query).
+        headers: Request headers, including any API-key header.
+        ledger: Budget ledger; the call is reserved and settled through it.
+        opener: ``(url, headers=..., timeout_s=...) -> response`` opener.
+        timeout_s: Per-request socket timeout.
+
+    Returns:
+        The parsed JSON payload, or ``None`` when the body was not valid JSON.
+
+    Raises:
+        BudgetExceededError: Propagated from the reservation or the mid-stream check.
+    """
+    with ledger.fetch_call(estimated_bytes=_ESTIMATED_SEARCH_BYTES) as reservation:
+        # Finding 10: a failed search attempt still consumed a real outbound request
+        # and whatever bytes actually crossed the wire before it failed. ``total``
+        # tracks the true transferred count; on any failure it is recorded on the
+        # reservation BEFORE the exception propagates, so ``BudgetLedger.abandon``
+        # settles against the real egress instead of falling back to the full
+        # worst-case ``reserved_bytes`` charge.
+        total = 0
+        try:
+            response = opener(url, headers=headers, timeout_s=timeout_s)
+            try:
+                chunks: list[bytes] = []
+                while True:
+                    chunk = response.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    ledger.check_stream_bytes(total)
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+            finally:
+                response.close()
+        except BaseException:
+            reservation.observed_bytes = total
+            raise
+        ledger.settle_fetch(reservation, actual_bytes=len(raw))
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError, TypeError, UnicodeDecodeError:
+        logger.warning("search response was not valid JSON; returning empty results")
+        return None
 
 
 def _parse_results(payload: Any) -> list[SearchResult]:

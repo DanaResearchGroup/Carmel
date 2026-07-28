@@ -24,7 +24,7 @@ from carmel.agents.literature_agent import (
     VerifierAssessment,
 )
 from carmel.agents.models import AgentBridgeError, MockModel
-from carmel.agents.tools.fetch import MockFetchTool
+from carmel.agents.tools.fetch import FetchError, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchResult
 from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
 from carmel.schemas import (
@@ -41,9 +41,11 @@ from carmel.schemas import (
     RunStatus,
     TargetObservable,
 )
+from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import GroundingStatus, LiteratureReport, StopReason
 from carmel.services import chem
+from carmel.services.acquisition import load_manifest
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
 from carmel.services.evidence import EVIDENCE_LITERATURE_DIR
@@ -813,3 +815,115 @@ class TestSchemas:
         assert proposal.findings[0].citation.doi == DOI
         assessment = VerifierAssessment.model_validate(_assessment())
         assert assessment.credence == pytest.approx(0.9)
+
+
+class _StatusFetchTool:
+    """Fetch tool that fails every URL with a chosen HTTP status.
+
+    ``MockFetchTool`` raises a status-less :class:`FetchError`, which cannot express the
+    difference between "the publisher wants a subscription" and "the link is broken" --
+    the very distinction the acquisition triage turns on.
+    """
+
+    def __init__(self, status: int | None) -> None:
+        self._status = status
+
+    def fetch(self, url: str) -> tuple[Any, bytes]:
+        raise FetchError(f"simulated failure for {url!r}", status=self._status)
+
+
+class TestAcquisitionTriage:
+    """A finding that fails grounding is queued for a human ONLY when the EVIDENCE was
+    unobtainable -- never when the document was read and the quote simply was not in it."""
+
+    def test_a_paywalled_paper_is_queued_for_manual_acquisition(self, campaign: Campaign) -> None:
+        deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
+        deps.fetch = _StatusFetchTool(403)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        manifest = load_manifest(campaign.workspace_root)
+        assert len(manifest.requests) == 1
+        request = manifest.requests[0]
+        assert request.reason == AcquisitionReason.PAYWALLED
+        assert request.doi == DOI
+        assert request.status == AcquisitionStatus.REQUESTED
+
+    def test_a_broken_link_is_queued_but_distinguished_from_a_paywall(self, campaign: Campaign) -> None:
+        """The paper is still real and still obtainable by a human; only the REASON
+        shown to the operator differs."""
+        deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
+        deps.fetch = _StatusFetchTool(404)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.FETCH_FAILED]
+
+    def test_a_fabricated_quote_is_never_queued_for_acquisition(self, campaign: Campaign) -> None:
+        """THE load-bearing case. The document was fetched and read perfectly; the quote
+        simply is not in it. That is the fabrication signal the grounding gate exists to
+        raise. Queueing it would convert "this agent may have invented a quote" into
+        "we are waiting on a human", quietly retiring the strongest rejection the system
+        can produce -- and a later drop of the genuine paper would then hand that same
+        fabricated claim a second chance at being accepted."""
+        fabricated = _finding_dict(
+            quote="This sentence appears nowhere in the fetched document whatsoever.",
+        )
+        deps, _, config = _make_deps([_proposal(findings=[fabricated]), _assessment()])
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.status == GroundingStatus.QUOTE_NOT_FOUND
+        assert load_manifest(campaign.workspace_root).requests == []
+
+    def test_the_same_unreachable_paper_proposed_twice_is_queued_once(self, campaign: Campaign) -> None:
+        deps, _, config = _make_deps(
+            [
+                _proposal(findings=[_finding_dict()], done=False),
+                _proposal(findings=[_finding_dict(quote=QUOTE + " Repeated.")], done=True),
+                _assessment(),
+                _assessment(),
+            ]
+        )
+        deps.fetch = _StatusFetchTool(403)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(load_manifest(campaign.workspace_root).requests) == 1
+
+    def test_a_paper_the_agent_cannot_read_is_queued_via_the_wanted_channel(self, campaign: Campaign) -> None:
+        """The structural case: a paywalled paper can never be a finding (a finding needs
+        a verbatim quote, which needs the document), so without this channel the papers
+        most worth having would vanish silently."""
+        proposal = _proposal(findings=[])
+        proposal["wanted"] = [
+            {
+                "title": "High pressure shock tube ignition delay of oxy-methane",
+                "doi": "10.1115/1.4036254",
+                "relevance": "direct IDT benchmark at the campaign's conditions",
+            }
+        ]
+        deps, _, config = _make_deps([proposal])
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert len(requests) == 1
+        assert requests[0].doi == "10.1115/1.4036254"
+        assert requests[0].landing_url == "https://doi.org/10.1115/1.4036254"
+        assert "direct IDT benchmark" in requests[0].detail
+
+    def test_a_wanted_paper_with_no_identifier_is_dropped_with_a_warning(self, campaign: Campaign) -> None:
+        """Without a DOI or URL there is nothing a human could act on, so it must not
+        become a request that cannot be fulfilled."""
+        proposal = _proposal(findings=[])
+        proposal["wanted"] = [{"title": "Some paper with no identifier at all"}]
+        deps, _, config = _make_deps([proposal])
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert load_manifest(campaign.workspace_root).requests == []
+        assert any("neither a DOI nor a URL" in w for w in report.warnings)

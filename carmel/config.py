@@ -132,6 +132,28 @@ class AgentProvider(StrEnum):
     DEEPSEEK = "deepseek"
 
 
+class SearchProvider(StrEnum):
+    """Which literature-search backend a run uses.
+
+    Deliberately a SEPARATE axis from :class:`AgentProvider`: which LLM writes the
+    queries and which index answers them are independent choices. A run may use a
+    Google LLM against the keyless OpenAlex index, and the fail-closed key checks
+    differ per backend — ``HTTP_JSON`` needs an operator-supplied endpoint and key,
+    while the scholarly indices below are keyless and must NOT be forced to invent
+    one (that requirement is what previously made them unconfigurable).
+    """
+
+    HTTP_JSON = "http_json"  # generic operator-configured JSON endpoint + bearer key
+    OPENALEX = "openalex"  # keyless; api.openalex.org
+    CROSSREF = "crossref"  # keyless; api.crossref.org
+
+
+#: Search backends that take no API key. Keeping this as data (rather than an ``in``
+#: check spelled out at each call site) means adding a backend cannot silently miss
+#: one of the fail-closed branches in ``carmel.services.literature.build_deps``.
+KEYLESS_SEARCH_PROVIDERS: frozenset[SearchProvider] = frozenset({SearchProvider.OPENALEX, SearchProvider.CROSSREF})
+
+
 DEFAULT_TIER_MODELS: dict[ModelTier, str] = {
     ModelTier.TEST: "mock",
     ModelTier.DEV: "gemini-3.5-flash",
@@ -172,8 +194,15 @@ class AgentConfig(BaseModel):
     provider: AgentProvider = AgentProvider.MOCK
     model_name: str | None = None  # None -> DEFAULT_TIER_MODELS[tier]
     api_key_env: str | None = None  # env var holding the key; never the key itself
-    search_endpoint: str | None = None
+    search_provider: SearchProvider = SearchProvider.HTTP_JSON
+    search_endpoint: str | None = None  # HTTP_JSON only; keyless backends know their own
     search_api_key_env: str | None = None
+    search_contact_email: str | None = None
+    """Contact address sent to keyless scholarly APIs (OpenAlex/Crossref "polite pool").
+
+    Optional: both APIs answer without it, but at a much lower rate limit and with no
+    way for the operator to be told about a misbehaving client before being blocked.
+    """
     external_provider_consent: bool = False
     literature_at_campaign_start: bool = True
     budget: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)

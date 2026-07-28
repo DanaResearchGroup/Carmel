@@ -66,6 +66,31 @@ class ProposedFinding(BaseModel):
     """Where the orchestrator must fetch the evidence from. Untrusted until fetched."""
 
 
+class RequestedPaper(BaseModel):
+    """A paper the agent judges relevant but cannot read for itself.
+
+    This channel exists because of a structural gap: a finding REQUIRES a verbatim quote,
+    which requires having read the document. A paywalled paper can therefore never be
+    reported as a finding, however obviously relevant it is -- so without a separate way
+    to say "I need this one", the papers most worth having would be exactly the ones that
+    vanish silently. A live probe put the share of combustion-kinetics papers Carmel can
+    read unaided at 3.3%, which makes that gap the normal case rather than a corner.
+
+    Nothing here is evidence. It is a request for a human to obtain the document, after
+    which the ordinary fetch/ground/verify path applies to it unchanged.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1)
+    doi: str | None = None
+    landing_url: str | None = None
+    """Where the paper can be obtained, if the search result gave one."""
+    relevance: str = Field(default="", max_length=500)
+    """Why this paper is worth a human's effort -- shown to the operator, who is being
+    asked to spend real time on it and deserves to know what it is for."""
+
+
 class LiteratureProposal(BaseModel):
     """The Literature Agent's structured output for one loop round."""
 
@@ -74,6 +99,8 @@ class LiteratureProposal(BaseModel):
     queries: list[str] = Field(default_factory=list)
     """Search queries the agent wants run (results are fed back next round)."""
     findings: list[ProposedFinding] = Field(default_factory=list)
+    wanted: list[RequestedPaper] = Field(default_factory=list)
+    """Relevant papers the agent could not read; queued for manual acquisition."""
     done: bool = False
     """The agent's self-stop signal: True means it believes the search is complete."""
 
@@ -118,10 +145,18 @@ deterministic grounding gate that checks your claims against the actual fetched 
 4. `source_url` must point at the document that actually contains the quote — the
    grounding gate fetches that URL and searches for your quote in its text.
 
+Most papers in this field are behind a paywall and you will NOT be able to read them.
+That is expected, and it is not a failure. When a search result is clearly relevant but
+you cannot obtain its full text, do not guess at its contents and never invent a quote
+for it: list it under `wanted` instead, with its title, DOI, and a one-line reason it
+matters. A human will obtain it and it will be analysed properly on a later run. A
+fabricated quote is far worse than an unread paper.
+
 Loop protocol: each round, return `queries` you want searched (results come back next
-round), `findings` you can already support with a verbatim quote, and `done`. Set
-`done=true` when further searching is unlikely to surface new relevant findings. Do not
-re-report findings you have already reported in a previous round.
+round), `findings` you can already support with a verbatim quote, `wanted` papers you
+need a human to obtain, and `done`. Set `done=true` when further searching is unlikely to
+surface new relevant findings. Do not re-report findings or re-request papers you have
+already listed in a previous round.
 """
 
 VERIFIER_SYSTEM_PROMPT = """\

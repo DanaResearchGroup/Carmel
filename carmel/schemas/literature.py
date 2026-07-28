@@ -321,6 +321,22 @@ STOP_REASON_FOR_DIMENSION: dict[BudgetDimension, StopReason] = {
 }
 
 
+class ArtifactProvenance(StrEnum):
+    """How the bytes of an artifact came to be in the workspace.
+
+    This distinction is evidentiary, not cosmetic. A ``FETCHED`` artifact was retrieved
+    by Carmel from a URL it can name, so the chain from claim to bytes is machine-checked
+    end to end. A ``MANUAL`` artifact was supplied by a human out of band (typically a
+    paywalled paper the operator downloaded through an institutional subscription), so
+    the link between the requested paper and the supplied bytes rests on an identity
+    check against the document's own text rather than on the transport. Recording which
+    one applies keeps a reader of the report from over-trusting the second kind.
+    """
+
+    FETCHED = "fetched"
+    MANUAL = "manual"
+
+
 class StoredArtifact(BaseModel):
     """Metadata for a content-addressed stored literature artifact."""
 
@@ -335,6 +351,9 @@ class StoredArtifact(BaseModel):
     extractor: str = Field(min_length=1)
     lossy: bool
     license_note: str | None = None
+    provenance: ArtifactProvenance = ArtifactProvenance.FETCHED
+    """Defaults to ``FETCHED`` so artifacts stored before this field existed keep
+    their (correct) meaning: at that time fetching was the only way in."""
 
 
 class LiteratureReport(BaseModel):

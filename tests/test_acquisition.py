@@ -1,0 +1,246 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for the manual paper-acquisition queue.
+
+The load-bearing behaviour here is :func:`check_identity`. Matching a dropped file to a
+request by filename alone is an unchecked human assertion; a mis-drop would bind one
+paper's bytes to another paper's citation, and the quote-grounding gate could not catch
+it because that gate only asks whether the quote is present in the supplied bytes, never
+whether those bytes are the right paper.
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from carmel.agents.tools.extract import ExtractedText, normalize_for_match
+from carmel.schemas.acquisition import (
+    AcquisitionReason,
+    AcquisitionRequest,
+    AcquisitionStatus,
+)
+from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
+from carmel.services.acquisition import (
+    check_identity,
+    collect_inbox,
+    inbox_dir,
+    load_manifest,
+    record_request,
+    requests_dir,
+    slug_for,
+)
+from carmel.services.evidence import artifact_dir
+
+TITLE = "Shock tube study of ignition delay times in methane oxygen argon mixtures"
+DOI = "10.1016/0010-2180(76)90042-0"
+
+
+def _request(*, doi: str | None = DOI, title: str = TITLE) -> AcquisitionRequest:
+    return AcquisitionRequest(
+        slug=slug_for(doi, title),
+        title=title,
+        doi=doi,
+        landing_url="https://doi.org/10.1/x",
+        reason=AcquisitionReason.PAYWALLED,
+        requested_at=datetime.now(UTC),
+    )
+
+
+def _extracted(text: str) -> ExtractedText:
+    return ExtractedText(
+        text=text,
+        normalized=normalize_for_match(text),
+        sections=[],
+        extractor="test",
+        lossy=False,
+        page_count=1,
+    )
+
+
+class TestSlugFor:
+    def test_doi_slug_is_stable_and_path_safe(self) -> None:
+        assert slug_for("10.1016/j.combustflame.2015.11.011", "x") == "10.1016-j.combustflame.2015.11.011"
+
+    @pytest.mark.parametrize("doi", ["../../etc/passwd", "....//....//x", "/absolute/path", "a/../../b"])
+    def test_traversal_attempts_never_produce_a_path_separator(self, doi: str) -> None:
+        """The slug becomes a filename in the inbox; a separator would let a crafted DOI
+        address a location outside it."""
+        slug = slug_for(doi, "title")
+        assert "/" not in slug
+        assert "\\" not in slug
+        assert not slug.startswith(".")
+
+    def test_titles_without_a_doi_get_a_digest_so_same_titled_papers_do_not_collide(self) -> None:
+        first = slug_for(None, "Ignition delay")
+        second = slug_for(None, "Ignition delay measurements")
+        assert first != second
+
+    def test_degenerate_input_still_yields_a_usable_slug(self) -> None:
+        assert slug_for("", "") == "paper-e3b0c442"
+
+
+class TestCheckIdentity:
+    def test_doi_in_the_front_matter_is_conclusive(self) -> None:
+        ok, note = check_identity(_extracted(f"Some Journal\nDOI: {DOI}\nAbstract..."), _request())
+        assert ok is True
+        assert DOI in note
+
+    def test_doi_split_across_whitespace_still_matches(self) -> None:
+        """PDF extraction routinely injects line breaks mid-identifier."""
+        ok, _ = check_identity(_extracted(f"DOI: {DOI[:12]}\n{DOI[12:]}\n"), _request())
+        assert ok is True
+
+    def test_matching_title_without_a_doi_passes(self) -> None:
+        ok, note = check_identity(_extracted(TITLE + "\n\nAbstract: we measured..."), _request(doi=None))
+        assert ok is True
+        assert "title matched" in note
+
+    def test_a_different_paper_on_the_same_topic_is_rejected(self) -> None:
+        """The realistic mis-drop: a topically adjacent paper. It shares subject words
+        but not the title, and it does not carry the requested DOI."""
+        wrong = "Laminar burning velocities of ammonia hydrogen blends at elevated pressure"
+        ok, note = check_identity(_extracted(wrong), _request())
+        assert ok is False
+        assert "does not look like this paper" in note
+
+    def test_empty_text_is_rejected_and_named_as_unreadable_not_as_the_wrong_paper(self) -> None:
+        """An image-only scan must be diagnosed accurately: telling the operator "wrong
+        paper" when they dropped the right one, badly scanned, sends them chasing the
+        wrong problem."""
+        ok, note = check_identity(_extracted("   \n  "), _request())
+        assert ok is False
+        assert "no extractable text" in note
+
+    def test_a_citation_of_the_paper_deep_in_another_document_does_not_match(self) -> None:
+        """A reference list mentioning the requested paper must not make a different
+        document pass as that paper."""
+        filler = "Unrelated combustion modelling discussion. " * 400
+        text = filler + f"\n[42] Author et al. {TITLE}. doi:{DOI}\n"
+        assert len(filler) > 6000
+        ok, _ = check_identity(_extracted(text), _request())
+        assert ok is False
+
+
+class TestRecordRequest:
+    def test_request_is_persisted_with_operator_instructions(self, tmp_path: Path) -> None:
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+
+        manifest = load_manifest(tmp_path)
+        assert len(manifest.requests) == 1
+        assert manifest.requests[0].status == AcquisitionStatus.REQUESTED
+
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+        assert TITLE in readme
+        assert f"inbox/{slug_for(DOI, TITLE)}.pdf" in readme
+        assert inbox_dir(tmp_path).is_dir()
+
+    def test_requesting_the_same_paper_twice_does_not_duplicate_it(self, tmp_path: Path) -> None:
+        for _ in range(3):
+            record_request(
+                tmp_path,
+                title=TITLE,
+                doi=DOI,
+                landing_url="https://doi.org/" + DOI,
+                reason=AcquisitionReason.PAYWALLED,
+            )
+        assert len(load_manifest(tmp_path).requests) == 1
+
+    def test_a_corrupt_manifest_does_not_break_the_run(self, tmp_path: Path) -> None:
+        requests_dir(tmp_path).mkdir(parents=True)
+        (requests_dir(tmp_path) / "manifest.json").write_text("{not json", encoding="utf-8")
+
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/x",
+            reason=AcquisitionReason.UNREADABLE,
+        )
+        assert len(load_manifest(tmp_path).requests) == 1
+
+
+def _drop(tmp_path: Path, slug: str, body: str) -> Path:
+    """Write a minimal text file into the inbox under ``slug``."""
+    path = inbox_dir(tmp_path) / f"{slug}.txt"
+    path.write_bytes(body.encode("utf-8"))
+    return path
+
+
+class TestCollectInbox:
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_a_matching_drop_is_admitted_with_manual_provenance(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
+        assert changed[0].fulfilled_sha256
+
+        meta = StoredArtifact.model_validate(
+            json.loads((artifact_dir(tmp_path, changed[0].fulfilled_sha256) / "meta.json").read_text())
+        )
+        assert meta.provenance == ArtifactProvenance.MANUAL
+
+    def test_a_mismatched_drop_is_rejected_and_never_stored(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """The whole point of the identity check: wrong bytes must not enter the
+        evidence store under the right paper's name."""
+        _drop(tmp_path, queued.slug, "An entirely different paper about catalytic converters.")
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert changed[0].fulfilled_sha256 is None
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_rejection_reason_is_surfaced_to_the_operator(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        _drop(tmp_path, queued.slug, "Unrelated document text.")
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+        assert "Needs attention" in readme
+
+    def test_a_file_matching_no_request_is_left_alone(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        _drop(tmp_path, "some-unrelated-file", "content")
+        assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
+
+    def test_an_oversized_drop_is_rejected(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        _drop(tmp_path, queued.slug, f"{TITLE} DOI: {DOI} " + "x" * 5000)
+
+        changed = collect_inbox(tmp_path, max_bytes=100)
+
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert "over the" in changed[0].identity_note
+
+    def test_an_already_fulfilled_request_is_not_reprocessed(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\n")
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
+
+    def test_no_inbox_directory_is_not_an_error(self, tmp_path: Path) -> None:
+        assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
