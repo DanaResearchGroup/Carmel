@@ -14,12 +14,14 @@ a mock. A caller who wants MockModel must ask for it explicitly via
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
 from carmel.agents.bridge import AgentBridgeError, AgentTool, ModelResponse
+from carmel.agents.model_catalog import resolve_model_ladder
 from carmel.config import AgentConfig, AgentProvider
 from carmel.logger import get_logger
 
@@ -40,16 +42,45 @@ __all__ = ["AgentBridgeError", "MockModel", "PydanticAIModel", "build_model", "c
 _MODEL_PRICING_USD_PER_1M_TOKENS: dict[str, dict[str, float]] = {
     "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-3.5-flash": {"input": 1.50, "output": 9.00},
-    "gemini-3.1-pro-preview": {"input": 2.00, "output": 12.00},
+    # The Gemini pro rates below are the LONG-CONTEXT tier, deliberately.
+    #
+    # Google prices pro models in two context tiers -- 2.00/12.00 up to a 200k-token
+    # request, 4.00/18.00 above it (verified against genai_prices on 2026-07-28 by
+    # pricing the same model at 199k and 250k tokens). This flat table cannot express a
+    # tier boundary, so it has to pick one, and the fail-closed direction is the higher:
+    # over-charging a short call is a recoverable annoyance, while under-charging a long
+    # one lets a run exceed a budget the operator thought was binding. `genai_prices`
+    # applies the real tiered rate whenever it can price the model, so this approximation
+    # only ever applies to the alias below and to models it does not know.
+    "gemini-3.1-pro-preview": {"input": 4.00, "output": 18.00},
     # gemini-pro-latest is a moving alias (not in genai_prices); currently aliases the
-    # Gemini 3 Pro family, priced the same as gemini-3.1-pro-preview.
-    "gemini-pro-latest": {"input": 2.00, "output": 12.00},
+    # Gemini 3 Pro family, priced the same as gemini-3.1-pro-preview. Being unpriceable
+    # by genai_prices is exactly why `auto:` family resolution
+    # (carmel.agents.model_catalog) is preferred over this alias: it lands on concrete
+    # model ids that genai_prices DOES know, and so gets the tiered rate rather than this
+    # deliberate over-estimate.
+    "gemini-pro-latest": {"input": 4.00, "output": 18.00},
 }
 
+# Family-level fallbacks, applied when a model has no exact entry above. A brand-new
+# `gemini-3.7-flash` is not "unknown" in any useful sense -- we know which family it is
+# in, and therefore its order of magnitude -- so charging it the same as a genuinely
+# unrecognizable name would make every budget in a flash-tier run meaningless.
+#
+# Each rate is set at roughly 2x the most expensive member of its family known today
+# (flash: 1.50/9.00; pro: 4.00/18.00), so the estimate stays an OVER-charge even if the
+# provider raises prices, while remaining close enough that a real budget still bounds a
+# real run. Matched in order, so a name containing both words takes the cheaper reading
+# only if "flash" appears -- deliberate: flash-class models are the ones that proliferate.
+_FAMILY_FALLBACK_RATES: tuple[tuple[re.Pattern[str], dict[str, float]], ...] = (
+    (re.compile(r"flash"), {"input": 3.00, "output": 18.00}),
+    (re.compile(r"pro"), {"input": 8.00, "output": 36.00}),
+)
+
 # Deliberately set well ABOVE every priced model's rate above. Used whenever `self.name`
-# has no entry in the pricing table. An unpriced model must OVER-charge against the
-# ledger, never escape it at cost 0.0 -- silently free real-provider calls would defeat
-# the entire point of the budget ledger.
+# matches neither the pricing table nor any known family. An unpriced model must
+# OVER-charge against the ledger, never escape it at cost 0.0 -- silently free
+# real-provider calls would defeat the entire point of the budget ledger.
 _FALLBACK_UNKNOWN_MODEL_RATE: dict[str, float] = {"input": 50.0, "output": 150.0}
 
 # Conservative flat worst-case charge applied when a provider reports no usable token
@@ -77,15 +108,38 @@ def _read_usage_token_count(usage: Any, *, new_attr: str, old_attr: str) -> int 
     return value
 
 
+def _family_fallback_rates(model_name: str) -> dict[str, float] | None:
+    """Return the family-level rate for ``model_name``, or None if no family matches.
+
+    Keeps a newly-released member of a known family bounded by a plausible over-estimate
+    rather than by the deliberately-absurd unknown-model rate, which would stop any
+    realistic budget on the first call.
+    """
+    for pattern, rates in _FAMILY_FALLBACK_RATES:
+        if pattern.search(model_name):
+            logger.warning(
+                "no exact pricing entry for model %r; charging the family fallback rate "
+                "($%.2f/$%.2f per 1M input/output tokens), which deliberately over-estimates "
+                "-- add a verified rate to _MODEL_PRICING_USD_PER_1M_TOKENS for exact costs",
+                model_name,
+                rates["input"],
+                rates["output"],
+            )
+            return rates
+    return None
+
+
 def _table_cost_usd(model_name: str, input_tokens: int, output_tokens: int) -> float:
     """Compute cost from the hand-maintained pricing table (or its high fallback rate)."""
     rates = _MODEL_PRICING_USD_PER_1M_TOKENS.get(model_name)
     if rates is None:
+        rates = _family_fallback_rates(model_name)
+    if rates is None:
         logger.warning(
-            "no pricing table entry for model %r; charging fallback high rate "
-            "($%.2f/$%.2f per 1M input/output tokens) so this call cannot escape the "
-            "budget ledger at zero cost -- add %r to _MODEL_PRICING_USD_PER_1M_TOKENS "
-            "with a verified rate to stop over-charging it",
+            "no pricing table entry and no known family for model %r; charging fallback "
+            "high rate ($%.2f/$%.2f per 1M input/output tokens) so this call cannot "
+            "escape the budget ledger at zero cost -- add %r to "
+            "_MODEL_PRICING_USD_PER_1M_TOKENS with a verified rate to stop over-charging it",
             model_name,
             _FALLBACK_UNKNOWN_MODEL_RATE["input"],
             _FALLBACK_UNKNOWN_MODEL_RATE["output"],
@@ -228,6 +282,26 @@ class MockModel:
         return f"MockModel(name={self.name!r})"
 
 
+#: HTTP statuses that mean "this model cannot serve you", as opposed to "your request
+#: was wrong". 404 is a retirement (observed: ``gemini-2.5-flash`` -> *"no longer
+#: available to new users"``), 503 is transient load (observed: ``gemini-3.5-flash`` ->
+#: *"currently experiencing high demand"*, and ``gemini-3.1-pro-preview`` failing then
+#: succeeding ninety seconds later). Both are answered by trying the next model down.
+_UNAVAILABLE_STATUS_CODES = frozenset({404, 503})
+
+
+def _is_model_unavailable(exc: BaseException) -> bool:
+    """Return True if ``exc`` means the model itself is unavailable.
+
+    Reads the structured ``status_code`` that pydantic-ai's ``ModelHTTPError`` carries
+    rather than pattern-matching the message text: a substring check would be at the
+    mercy of provider prose, and a false positive here would silently downgrade a run to
+    a weaker model instead of surfacing a real error.
+    """
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in _UNAVAILABLE_STATUS_CODES
+
+
 class PydanticAIModel:
     """Production model backed by pydantic-ai; implements :class:`ModelProtocol`.
 
@@ -237,18 +311,29 @@ class PydanticAIModel:
     failure surfaces only when a real completion is actually attempted.
     """
 
-    def __init__(self, *, model_name: str, provider: AgentProvider, api_key: str) -> None:
+    def __init__(
+        self,
+        *,
+        model_name: str,
+        provider: AgentProvider,
+        api_key: str,
+        fallback_model_names: Sequence[str] = (),
+    ) -> None:
         """Construct a pydantic-ai-backed model.
 
         Args:
-            model_name: The provider's model identifier.
+            model_name: The provider's model identifier; the first choice.
             provider: Which LLM provider this model calls.
             api_key: The secret API key value (never stored publicly, never logged).
+            fallback_model_names: Further models to try, in order, ONLY when a call fails
+                because the preferred model is unavailable (see :func:`_is_model_unavailable`).
+                Empty by default, so an explicitly-named model is never silently swapped.
 
         Raises:
             AgentBridgeError: If pydantic-ai is not installed.
         """
         self.name = model_name
+        self._ladder: tuple[str, ...] = (model_name, *fallback_model_names)
         self._provider = provider
         self._api_key = api_key
         self._agent = self._build_agent()
@@ -309,7 +394,50 @@ class PydanticAIModel:
         output_schema: type[BaseModel],
         tools: Sequence[AgentTool],
     ) -> ModelResponse:
-        """Run a structured completion via pydantic-ai.
+        """Run a structured completion, walking down the model ladder if need be.
+
+        Only an *availability* failure advances to the next model: a 404 (retired) or a
+        503 (transient capacity). Every other error -- a bad request, an auth failure, a
+        schema violation -- propagates immediately, because retrying it on a different
+        model would convert one clear error into several confusing ones.
+
+        A failed attempt generated no tokens, so it costs nothing and settles nothing;
+        the caller's single budget reservation still covers the one call that succeeds.
+
+        Raises:
+            AgentBridgeError: If pydantic-ai is not installed.
+        """
+        last_index = len(self._ladder) - 1
+        for index, candidate in enumerate(self._ladder):
+            self.name = candidate
+            try:
+                return self._complete_once(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    output_schema=output_schema,
+                    tools=tools,
+                )
+            except Exception as exc:
+                if index == last_index or not _is_model_unavailable(exc):
+                    raise
+                logger.warning(
+                    "model %r is unavailable (%s); falling back to %r",
+                    candidate,
+                    type(exc).__name__,
+                    self._ladder[index + 1],
+                )
+        # Unreachable: the final iteration either returns or re-raises.
+        raise AgentBridgeError(f"no model in the ladder {self._ladder!r} could be called")
+
+    def _complete_once(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        output_schema: type[BaseModel],
+        tools: Sequence[AgentTool],
+    ) -> ModelResponse:
+        """Run a single structured completion against ``self.name``.
 
         Raises:
             AgentBridgeError: If pydantic-ai is not installed.
@@ -402,4 +530,16 @@ def build_model(config: AgentConfig) -> ModelProtocol:
     if not api_key:
         raise AgentBridgeError(f"environment variable {env_var!r} (api_key_env) is set but empty")
 
-    return PydanticAIModel(model_name=config.resolved_model_name(), provider=config.provider, api_key=api_key)
+    # Resolve `auto:<family>` to concrete provider model ids, newest first. A model named
+    # explicitly resolves to itself alone, so this cannot swap out an operator's choice.
+    try:
+        ladder = resolve_model_ladder(config.resolved_model_name(), config.provider, api_key)
+    except ValueError as exc:
+        raise AgentBridgeError(str(exc)) from exc
+
+    return PydanticAIModel(
+        model_name=ladder[0],
+        provider=config.provider,
+        api_key=api_key,
+        fallback_model_names=ladder[1:],
+    )

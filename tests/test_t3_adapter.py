@@ -14,6 +14,7 @@ upstream ARC distutils blocker is in effect.
 from __future__ import annotations
 
 import contextlib
+import importlib
 import logging
 import os
 import signal
@@ -194,6 +195,25 @@ class TestT3Discovery:
         (tmp_path / "t3.py").write_text("__version__ = '9.9.9'\n")
         monkeypatch.setenv("T3_PYTHON", sys.executable)
         monkeypatch.setenv("PYTHONPATH", str(tmp_path))  # only the *resolved* subprocess sees this
+
+        # `is_t3_installed` inspects THIS interpreter's `sys.path`, which `PYTHONPATH`
+        # above cannot affect (that env var is read at interpreter startup, and here it
+        # is set for the subprocess `is_t3_importable` spawns). So the "absent from
+        # Carmel's env" half of this test only held by accident: it passed wherever T3
+        # happened not to be on the path, and failed on any developer machine that has a
+        # T3 checkout exported on PYTHONPATH -- which is the normal T3 developer setup,
+        # and exactly why this failed locally while passing in CI.
+        #
+        # Make the precondition real instead of assumed: strip any entry that actually
+        # provides `t3` from this process's path, then invalidate the finder caches so
+        # `find_spec` re-resolves rather than serving a cached hit.
+        monkeypatch.setattr(
+            sys,
+            "path",
+            [p for p in sys.path if not (Path(p) / "t3" / "__init__.py").exists() and not (Path(p) / "t3.py").exists()],
+        )
+        importlib.invalidate_caches()
+
         assert is_t3_importable() is True
         assert is_t3_installed() is False
 

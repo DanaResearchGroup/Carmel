@@ -154,10 +154,22 @@ class SearchProvider(StrEnum):
 KEYLESS_SEARCH_PROVIDERS: frozenset[SearchProvider] = frozenset({SearchProvider.OPENALEX, SearchProvider.CROSSREF})
 
 
+#: Model each tier uses when the operator does not name one.
+#:
+#: DEV and PROD name a FAMILY, not a model. ``carmel.agents.model_catalog`` resolves each
+#: to the highest-versioned member the provider actually serves at build time. Exact pins
+#: were tried first and rotted within months -- ``gemini-2.5-flash`` now answers 404
+#: ("no longer available to new users") -- while the moving alias that replaced one of
+#: them (``gemini-pro-latest``) was the single model ``genai_prices`` cannot price, and so
+#: silently under-charged the budget ledger by 2x. Naming the family keeps the tier on a
+#: current, concretely-priced model without a human editing this dict every quarter.
+#:
+#: TEST stays literal: it must resolve to the in-process MockModel and never reach a
+#: network at all.
 DEFAULT_TIER_MODELS: dict[ModelTier, str] = {
     ModelTier.TEST: "mock",
-    ModelTier.DEV: "gemini-3.5-flash",
-    ModelTier.PROD: "gemini-pro-latest",
+    ModelTier.DEV: "auto:gemini-flash",
+    ModelTier.PROD: "auto:gemini-pro",
 }
 
 

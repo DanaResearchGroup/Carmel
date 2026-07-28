@@ -456,6 +456,205 @@ class TestPydanticAIModelCompleteUsage:
         assert response.cost_usd == pytest.approx(5.0)
 
 
+class TestModelLadderFallback:
+    """A model that is UNAVAILABLE must fall through to the next model down; any other
+    error must not.
+
+    Both unavailability modes were observed live on 2026-07-28 against the real API:
+    ``gemini-2.5-flash`` answers 404 ("no longer available to new users"), and
+    ``gemini-3.1-pro-preview`` answered 503 ("high demand ... usually temporary") and
+    then served normally ninety seconds later. Before this, either one stopped a
+    literature run outright.
+    """
+
+    @staticmethod
+    def _install_agent_failing_for(monkeypatch: pytest.MonkeyPatch, failures: dict[str, Exception]) -> list[str]:
+        """Fake pydantic_ai.Agent so named models raise; records models actually called."""
+        import pydantic_ai
+
+        attempted: list[str] = []
+
+        class _Usage:
+            input_tokens = 10
+            output_tokens = 5
+
+        class _FakeResult:
+            usage = _Usage()
+            output = _Output(answer="ok", confidence=1.0)
+
+        class _FakeAgent:
+            def __init__(self, model: Any, *, output_type: Any, system_prompt: str) -> None:
+                # `model` is a real pydantic-ai model object; its name identifies which
+                # rung of the ladder we are on.
+                self._model_name = getattr(model, "model_name", str(model))
+
+            def tool_plain(self, fn: Any, *, name: str, description: str) -> None:
+                pass
+
+            def run_sync(self, prompt: str) -> Any:
+                attempted.append(self._model_name)
+                failure = failures.get(self._model_name)
+                if failure is not None:
+                    raise failure
+                return _FakeResult()
+
+        monkeypatch.setattr(pydantic_ai, "Agent", _FakeAgent)
+        return attempted
+
+    def test_503_on_the_preferred_model_falls_through_to_the_next(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.5-flash": ModelHTTPError(503, "gemini-3.5-flash", "high demand")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.5-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3-flash-preview"],
+        )
+
+        response = model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.5-flash", "gemini-3-flash-preview"]
+        # The cost must be attributed to the model that actually ran, not the one asked for.
+        assert response.model_name == "gemini-3-flash-preview"
+
+    def test_404_retirement_falls_through_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-2.5-flash": ModelHTTPError(404, "gemini-2.5-flash", "no longer available to new users")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-2.5-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.6-flash"],
+        )
+
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-2.5-flash", "gemini-3.6-flash"]
+
+    def test_a_non_availability_error_is_never_retried_on_another_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        # 401 is an operator problem (bad key). Retrying it down the ladder would turn one
+        # clear error into several confusing ones and burn a call per rung.
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(401, "gemini-3.6-flash", "invalid api key")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        with pytest.raises(ModelHTTPError):
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.6-flash"]
+
+    def test_the_last_rung_raises_rather_than_silently_returning_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {
+                "gemini-3.6-flash": ModelHTTPError(503, "gemini-3.6-flash", "busy"),
+                "gemini-3.5-flash": ModelHTTPError(503, "gemini-3.5-flash", "busy"),
+            },
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        with pytest.raises(ModelHTTPError):
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.6-flash", "gemini-3.5-flash"]
+
+    def test_no_fallbacks_means_no_substitution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(503, "gemini-3.6-flash", "busy")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash", provider=AgentProvider.GOOGLE, api_key="placeholder-not-a-real-key"
+        )
+
+        with pytest.raises(ModelHTTPError):
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.6-flash"]
+
+
+class TestFamilyFallbackPricing:
+    """An unpriced model in a KNOWN family must be charged a plausible over-estimate,
+    not the deliberately-absurd unknown-model rate.
+
+    Family resolution means a tier can land on a model released after this code was
+    written, so "unpriced" stops being an exotic case. Charging such a model $50/$150 per
+    1M tokens would stop every realistic budget on the first call -- the fail-closed
+    design turning into a denial of service against its own operator.
+    """
+
+    @staticmethod
+    def _cost(model_name: str) -> float:
+        return compute_cost_usd(model_name, input_tokens=1_000_000, output_tokens=1_000_000, tokens_available=True)
+
+    def test_unknown_flash_model_uses_the_cheap_family_rate(self) -> None:
+        cost = self._cost("gemini-9.9-flash")
+
+        # Bounded well below the unknown-model rate, so a real budget still funds a run...
+        assert cost < self._cost("some-brand-new-unpriced-model")
+        # ...but above the most expensive flash model we actually know the price of, so
+        # the estimate can never under-charge the ledger.
+        assert cost > self._cost("gemini-3.5-flash")
+
+    def test_unknown_pro_model_uses_the_expensive_family_rate(self) -> None:
+        cost = self._cost("gemini-9.9-pro-preview")
+
+        assert cost < self._cost("some-brand-new-unpriced-model")
+        assert cost > self._cost("gemini-3.1-pro-preview")
+
+    def test_pro_family_is_charged_more_than_flash_family(self) -> None:
+        assert self._cost("gemini-9.9-pro-preview") > self._cost("gemini-9.9-flash")
+
+    def test_a_genuinely_unrecognizable_name_still_gets_the_absurd_rate(self) -> None:
+        # No family word anywhere: nothing is known about it, so over-charge hard.
+        assert self._cost("llama-42-ultra") == pytest.approx(50.0 + 150.0)
+
+    def test_exact_table_entries_still_win_over_family_fallback(self) -> None:
+        # gemini-2.5-flash has a verified rate; it must not be re-priced at the family rate.
+        assert self._cost("gemini-2.5-flash") == pytest.approx(0.30 + 2.50)
+
+    def test_pro_latest_alias_is_priced_like_the_family_it_aliases(self) -> None:
+        assert self._cost("gemini-pro-latest") == pytest.approx(self._cost("gemini-3.1-pro-preview"))
+
+    def test_flat_pro_rate_is_the_long_context_tier_not_the_cheaper_one(self) -> None:
+        # Google prices pro models in two context tiers (2.00/12.00 below ~200k tokens,
+        # 4.00/18.00 above). A flat table cannot express that, so it must round toward the
+        # expensive tier: over-charging a short call is recoverable, but under-charging a
+        # long one lets a run quietly exceed a budget the operator thought was binding.
+        assert self._cost("gemini-3.1-pro-preview") == pytest.approx(4.00 + 18.00)
+
+
 class TestPydanticAIModelApiKeyThreading:
     """The explicit api_key passed to PydanticAIModel must reach the provider directly
     -- never fall back to an ambient environment variable. This is the root-cause fix
