@@ -1408,6 +1408,45 @@ class TestT3AdapterSubprocessErrors:
         assert run.command is not None
         assert diagnostics is None
 
+    def test_the_adapter_passes_the_recorder_through_to_the_launch(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The adapter must actually forward ``on_process_start``, not accept it.
+
+        Tested here, at :meth:`T3Adapter.run`, rather than only against
+        ``_run_in_process_group``: a test of the helper alone passes
+        happily when the adapter takes the argument and drops it on the
+        floor. Every real run would then launch T3 with no recorded
+        process group, and every service-level test would still be green,
+        because those use adapter doubles that call the recorder
+        themselves.
+        """
+        from carmel.adapters import t3 as t3_module
+
+        seen: list[object] = []
+
+        def _capture(*_args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            seen.append(kwargs.get("on_process_start"))
+            raise OSError("stop here, the launch is all this checks")
+
+        monkeypatch.setattr(t3_module, "_find_t3_executable", lambda: ["true"])
+        monkeypatch.setattr(t3_module, "_run_in_process_group", _capture)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+
+        def _recorder(_pgid: int, _argv: list[str]) -> None:  # pragma: no cover -- never invoked
+            raise AssertionError("the stub never launches anything")
+
+        T3Adapter().run(
+            workspace_root=ws,
+            campaign=_campaign(ws),
+            action=_action(),
+            on_process_start=_recorder,
+        )
+        # Later entries are the version probe, which is a separate launch
+        # and deliberately unrecorded; the first is T3 itself.
+        assert seen[0] is _recorder, "the adapter dropped the recorder instead of forwarding it"
+
     def test_oserror_records_subprocess_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
 
@@ -1752,6 +1791,75 @@ class TestProcessTreeTermination:
         time.sleep(1.0)
         after = heartbeat.read_text() if heartbeat.exists() else ""
         assert before == after, "the grandchild was still writing after the tree was killed"
+
+    def test_the_launched_process_group_is_reported(self) -> None:
+        """A supervisor needs the pgid to reap the tree if it is killed itself."""
+        seen: list[tuple[int, list[str]]] = []
+        command = [sys.executable, "-c", "print('ok')"]
+        completed = _run_in_process_group(
+            command,
+            timeout=60.0,
+            stdout=subprocess.PIPE,
+            text=True,
+            on_process_start=lambda pgid, argv: seen.append((pgid, argv)),
+        )
+        assert completed.returncode == 0
+        assert len(seen) == 1
+        pgid, argv = seen[0]
+        assert argv == command
+        assert pgid > 0
+
+    def test_a_failing_recorder_stops_the_tree_it_could_not_record(self) -> None:
+        """An untrackable tree is stopped, not left running unrecorded.
+
+        This assertion was once the opposite, on the reasoning that a
+        hypothetical future recovery should not cost a certain present
+        run. It inverts once that recovery exists: a tree whose process
+        group went unrecorded reads afterwards exactly like a run that
+        never launched, so recovery offers to abandon a campaign whose T3
+        is still writing into it.
+        """
+        seen_pid = 0
+
+        def _explode(pgid: int, _argv: list[str]) -> None:
+            nonlocal seen_pid
+            seen_pid = pgid
+            raise RuntimeError("could not record")
+
+        with pytest.raises(RuntimeError, match="could not record"):
+            _run_in_process_group(
+                [sys.executable, "-c", "import time; time.sleep(300)"],
+                timeout=60.0,
+                stdout=subprocess.PIPE,
+                text=True,
+                on_process_start=_explode,
+            )
+
+        assert seen_pid > 0
+        assert self._died_within(seen_pid), "the tree outlived the recorder that could not track it"
+
+    def test_a_registered_tree_is_forgotten_even_when_recording_fails(self) -> None:
+        """The early exit must not leak an entry into ``_LIVE_TREES``.
+
+        Shutdown walks that set to kill whatever is still running, so a
+        stale entry has it signalling a pid it no longer owns.
+        """
+
+        from carmel.adapters import t3 as t3_module
+
+        def _explode(_pgid: int, _argv: list[str]) -> None:
+            raise RuntimeError("could not record")
+
+        before = set(t3_module._LIVE_TREES)
+        with pytest.raises(RuntimeError, match="could not record"):
+            _run_in_process_group(
+                [sys.executable, "-c", "import time; time.sleep(300)"],
+                timeout=60.0,
+                stdout=subprocess.PIPE,
+                text=True,
+                on_process_start=_explode,
+            )
+        assert set(t3_module._LIVE_TREES) == before
 
     def test_normal_completion_is_unaffected(self, tmp_path: Path) -> None:
         completed = _run_in_process_group(

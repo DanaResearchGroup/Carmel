@@ -41,6 +41,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -302,6 +303,7 @@ def _run_in_process_group(
     stdout: Any = None,
     stderr: Any = None,
     text: bool = False,
+    on_process_start: Callable[[int, list[str]], None] | None = None,
 ) -> subprocess.CompletedProcess[Any]:
     """Run *command* in its own process group, killing the whole tree on timeout.
 
@@ -318,6 +320,11 @@ def _run_in_process_group(
         stdout: Passed through to ``Popen`` (a file object, ``PIPE``, or None).
         stderr: Passed through to ``Popen``.
         text: Whether to decode captured output as text.
+        on_process_start: Optional callback invoked with the new process
+            group id and *command* as soon as the tool is running, so a
+            supervisor can persist what to reap if it is killed before the
+            run ends. ``start_new_session`` makes the child a group
+            leader, so its pid is the group id.
 
     Returns:
         A ``CompletedProcess`` exactly as ``subprocess.run`` would return.
@@ -337,18 +344,35 @@ def _run_in_process_group(
     )
     _register_live_tree(proc)
     try:
-        captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
-    except BaseException:
-        # Covers TimeoutExpired and anything that interrupts the wait
-        # (KeyboardInterrupt, a thread being torn down): in every case the
-        # tree must not outlive the call that started it.
-        _terminate_process_tree(proc)
-        # Drain and close the pipes. communicate() abandoned them when it
-        # raised, and the tree is dead now, so this returns immediately —
-        # without it the read ends stay open until the Popen is collected.
-        with contextlib.suppress(Exception):
-            proc.communicate(timeout=_KILL_GRACE_PERIOD_S)
-        raise
+        if on_process_start is not None:
+            try:
+                on_process_start(proc.pid, command)
+            except BaseException:
+                # A tree nothing can identify is worse than no tree at
+                # all. It would outlive this process unrecorded, and a
+                # later recovery reads such a run exactly like one that
+                # never launched — so it would offer to abandon a campaign
+                # whose tool is still writing into it. Stop what was just
+                # started rather than run it blind.
+                _log.error("Could not record the process group of pid %s; stopping it", proc.pid)
+                _terminate_process_tree(proc)
+                with contextlib.suppress(Exception):
+                    proc.communicate(timeout=_KILL_GRACE_PERIOD_S)
+                raise
+        try:
+            captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
+        except BaseException:
+            # Covers TimeoutExpired and anything that interrupts the wait
+            # (KeyboardInterrupt, a thread being torn down): in every case
+            # the tree must not outlive the call that started it.
+            _terminate_process_tree(proc)
+            # Drain and close the pipes. communicate() abandoned them when
+            # it raised, and the tree is dead now, so this returns
+            # immediately — without it the read ends stay open until the
+            # Popen is collected.
+            with contextlib.suppress(Exception):
+                proc.communicate(timeout=_KILL_GRACE_PERIOD_S)
+            raise
     finally:
         _forget_live_tree(proc)
     return subprocess.CompletedProcess(command, proc.returncode, captured_stdout, captured_stderr)
@@ -1090,6 +1114,7 @@ class T3Adapter:
         workspace_root: Path,
         campaign: Campaign,
         action: PlannedAction,
+        on_process_start: Callable[[int, list[str]], None] | None = None,
     ) -> tuple[RunRecord, DiagnosticsV1 | None]:
         """Execute T3 end-to-end and return a RunRecord plus diagnostics.
 
@@ -1100,6 +1125,11 @@ class T3Adapter:
             workspace_root: The campaign workspace root.
             campaign: The campaign being run.
             action: The planned T3 action.
+            on_process_start: Optional callback invoked with T3's process
+                group id and argv once it is running. Lets the caller
+                persist what to reap should Carmel be killed mid-run —
+                without it, a run that outlives its supervisor cannot be
+                found again.
 
         Returns:
             Tuple of (RunRecord, DiagnosticsV1 or None on failure).
@@ -1177,6 +1207,7 @@ class T3Adapter:
                     stdout=stdout_file,
                     stderr=stderr_file,
                     timeout=action.estimated_cpu_hours * _SECONDS_PER_HOUR + _RUN_TIMEOUT_BUFFER_S,
+                    on_process_start=on_process_start,
                 )
         except subprocess.TimeoutExpired as e:
             # The process tree is already dead by the time this is caught —

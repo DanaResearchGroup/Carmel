@@ -1,6 +1,9 @@
 """Tests for the Carmel Flask UI."""
 
+import os
+import signal
 import threading
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -9,7 +12,7 @@ import pytest
 from flask.testing import FlaskClient
 from werkzeug.test import TestResponse
 
-from carmel.schemas import CampaignStateValue
+from carmel.schemas import CampaignStateValue, DiagnosticsV1
 from carmel.schemas.approval import ApprovalPolicy
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services.approvals import save_policy
@@ -17,9 +20,11 @@ from carmel.services.campaigns import find_campaign_workspace
 from carmel.services.decision_log import read_events
 from carmel.services.execution import save_diagnostics
 from carmel.services.planner import load_plan
-from carmel.services.state_machine import load_state
+from carmel.services.recovery import supervise_run
+from carmel.services.state_machine import load_state, update_state
 from carmel.ui import create_app
 from carmel.ui.app import _resolve_workspaces_root
+from tests.helpers import _strand_active_run, _tool_tree
 
 
 @pytest.fixture
@@ -705,7 +710,13 @@ class TestRunIsAsynchronous:
             self.entered = threading.Event()
             self.release = threading.Event()
 
-        def run(self, workspace_root: Path, campaign: Any, action: Any) -> tuple[RunRecord, None]:
+        def run(
+            self,
+            workspace_root: Path,
+            campaign: Any,
+            action: Any,
+            on_process_start: Callable[[int, list[str]], None] | None = None,
+        ) -> tuple[RunRecord, None]:
             self.entered.set()
             assert self.release.wait(timeout=60), "the test never released the adapter"
             return RunRecord(
@@ -814,3 +825,407 @@ class TestRunIsAsynchronous:
         cid = _create_via_form(client)
         _post(client, f"/campaigns/{cid}/plan")
         assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
+
+    def test_a_run_lost_to_a_live_lock_is_a_409_not_a_500(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """The real lock-first ordering, not a monkeypatched stand-in.
+
+        Since supervision is taken before the transition, the loser of two
+        racing runs trips the *run lock*, not ``can_transition`` —
+        ``RunAlreadySupervisedError``, a different type than the state race
+        raises. Holding the real lock proves the route treats it as a
+        conflict rather than 500-ing on an unhandled exception.
+        """
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        with supervise_run(ws, "act-holds-the-lock"):
+            assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
+
+    def test_a_run_whose_lock_state_is_unknowable_is_a_503(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workspace whose filesystem cannot ``flock`` is a 503, not a 500.
+
+        No working lock is an environment fault the operator can act on, not
+        a crash. It must not surface as an opaque server error, and must not
+        be mistaken for the 409 a genuine concurrent run gets.
+        """
+        import errno
+
+        from carmel.services import recovery
+
+        def _no_locks(*_args: object, **_kwargs: object) -> None:
+            raise OSError(errno.ENOLCK, "no locks available")
+
+        cid = _create_via_form(client)
+        _post(client, f"/campaigns/{cid}/plan")
+        monkeypatch.setattr(recovery.fcntl, "flock", _no_locks)
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 503
+
+
+def _failed_campaign(
+    client: FlaskClient,
+    workspaces_root: Path,
+    failed_from: CampaignStateValue,
+    name: str = "wedged",
+) -> tuple[str, Path]:
+    """Drive a campaign into FAILED from a chosen origin.
+
+    Every step goes through ``update_state`` rather than writing the state
+    file, so ``failed_from`` is recorded the way a real failure records it.
+    """
+    cid = _create_via_form(client, name)
+    ws = find_campaign_workspace(workspaces_root, cid)
+    assert ws is not None
+    route = {
+        CampaignStateValue.READY_FOR_PLANNING: [],
+        CampaignStateValue.PLAN_PENDING_APPROVAL: [CampaignStateValue.PLAN_PENDING_APPROVAL],
+        CampaignStateValue.APPROVED_FOR_EXECUTION: [
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+        ],
+        CampaignStateValue.RUNNING_T3: [
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+        ],
+        CampaignStateValue.DIAGNOSTICS_READY: [
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.DIAGNOSTICS_READY,
+        ],
+    }[failed_from]
+    for step in route:
+        update_state(ws, step)
+    update_state(ws, CampaignStateValue.FAILED, notes="something went wrong")
+    assert load_state(ws).failed_from == failed_from
+    return cid, ws
+
+
+class TestReplanRoute:
+    def test_a_failed_campaign_returns_to_planning(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.READY_FOR_PLANNING)
+        assert _post(client, f"/campaigns/{cid}/replan", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.READY_FOR_PLANNING
+
+    def test_it_works_from_every_origin_a_campaign_can_fail_from(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """The wedge, exercised end-to-end through the UI.
+
+        Before recovery edges existed each of these returned 500 from
+        every button the dashboard offered.
+        """
+        origins = [
+            CampaignStateValue.READY_FOR_PLANNING,
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.DIAGNOSTICS_READY,
+        ]
+        for index, origin in enumerate(origins):
+            cid, ws = _failed_campaign(client, workspaces_root, origin, name=f"wedged-{index}")
+            assert _post(client, f"/campaigns/{cid}/replan", follow_redirects=False).status_code == 302
+            assert load_state(ws).state == CampaignStateValue.READY_FOR_PLANNING
+
+    def test_a_rejected_plan_can_be_re_planned(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = _plan_pending_approval(client, workspaces_root, "rejected")
+        assert _post(client, f"/campaigns/{cid}/reject").status_code == 302
+        assert load_state(ws).state == CampaignStateValue.BLOCKED
+        assert _post(client, f"/campaigns/{cid}/replan", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.READY_FOR_PLANNING
+
+    def test_a_running_campaign_cannot_be_re_planned(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "busy")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        assert _post(client, f"/campaigns/{cid}/replan", follow_redirects=False).status_code == 409
+
+    def test_an_unknown_campaign_is_a_404(self, client: FlaskClient) -> None:
+        assert _post(client, "/campaigns/nope/replan", follow_redirects=False).status_code == 404
+
+
+class TestRetryRoute:
+    def test_a_failed_run_can_be_retried(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_T3)
+        assert _post(client, f"/campaigns/{cid}/retry", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_a_run_that_failed_before_launching_can_be_retried(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """A run that never reached RUNNING_T3 keeps the approval it holds.
+
+        A campaign failed from ``approved_for_execution`` — its runner
+        thread never started, say — already carries an approval for this
+        exact plan, so retry returns it there rather than discarding the
+        approval through re-planning.
+        """
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        assert _post(client, f"/campaigns/{cid}/retry", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_a_failure_before_approval_cannot_be_retried(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """Retrying from an unapproved failure would skip the HITL gate."""
+        for index, origin in enumerate(
+            [
+                CampaignStateValue.READY_FOR_PLANNING,
+                CampaignStateValue.PLAN_PENDING_APPROVAL,
+                CampaignStateValue.DIAGNOSTICS_READY,
+            ]
+        ):
+            cid, ws = _failed_campaign(client, workspaces_root, origin, name=f"unapproved-{index}")
+            assert _post(client, f"/campaigns/{cid}/retry", follow_redirects=False).status_code == 409
+            assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_an_unknown_campaign_is_a_404(self, client: FlaskClient) -> None:
+        assert _post(client, "/campaigns/nope/retry", follow_redirects=False).status_code == 404
+
+
+class TestFinalizeRoute:
+    @staticmethod
+    def _with_diagnostics(ws: Path) -> None:
+        save_diagnostics(
+            ws,
+            DiagnosticsV1(
+                run_id="recovered-run",
+                campaign_id="c",
+                generated_at=datetime.now(UTC),
+                species_to_compute=[],
+                reactions_to_compute=[],
+                pdep_networks_to_compute=[],
+            ),
+        )
+
+    def test_a_campaign_that_failed_while_finalizing_can_adopt_its_diagnostics(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.DIAGNOSTICS_READY)
+        self._with_diagnostics(ws)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_completing_without_diagnostics_is_refused(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """Nothing may claim a phase is complete on output that is not there."""
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.DIAGNOSTICS_READY)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 409
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_a_campaign_with_diagnostics_ready_can_be_completed(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid = _create_via_form(client, "diag-ready")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        for step in [CampaignStateValue.RUNNING_T3, CampaignStateValue.DIAGNOSTICS_READY]:
+            update_state(ws, step)
+        self._with_diagnostics(ws)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_a_failure_from_anywhere_else_cannot_be_finalized(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_T3)
+        self._with_diagnostics(ws)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 409
+
+    def test_an_unknown_campaign_is_a_404(self, client: FlaskClient) -> None:
+        assert _post(client, "/campaigns/nope/finalize", follow_redirects=False).status_code == 404
+
+
+class TestAbandonRoute:
+    @staticmethod
+    def _wedged(client: FlaskClient, workspaces_root: Path, name: str = "orphaned") -> tuple[str, Path]:
+        cid = _create_via_form(client, name)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        return cid, ws
+
+    def test_a_run_nobody_is_supervising_can_be_abandoned(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = self._wedged(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_a_run_still_in_progress_is_refused(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """Abandoning a live run would race the supervisor's own ending."""
+        cid, ws = self._wedged(client, workspaces_root, "live")
+        with supervise_run(ws, "act-1"):
+            assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 409
+        assert load_state(ws).state == CampaignStateValue.RUNNING_T3
+
+    def test_a_campaign_that_is_not_running_is_refused(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "not-running")
+        assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 409
+
+    def test_an_unknown_campaign_is_a_404(self, client: FlaskClient) -> None:
+        assert _post(client, "/campaigns/nope/abandon", follow_redirects=False).status_code == 404
+
+
+class TestRecoveryIsVisibleOnTheDashboard:
+    """The `failed_from` mechanism had no UI at all: retrying meant hand-editing JSON."""
+
+    def test_a_failed_run_offers_a_retry(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, _ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_T3)
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert f"/campaigns/{cid}/retry" in html
+        assert f"/campaigns/{cid}/replan" in html
+
+    def test_a_run_that_failed_before_launching_offers_a_retry(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """The retry edge the state machine allows must have a button too.
+
+        A campaign failed from ``approved_for_execution`` can retry — the
+        route accepts it and the approval is still valid — so the dashboard
+        must offer it, or the only exit is a re-plan that throws the
+        approval away.
+        """
+        cid, _ws = _failed_campaign(client, workspaces_root, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert f"/campaigns/{cid}/retry" in html
+        assert f"/campaigns/{cid}/replan" in html
+
+    def test_a_failure_before_approval_offers_only_re_planning(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """The dashboard must not offer a button the state machine refuses."""
+        cid, _ws = _failed_campaign(client, workspaces_root, CampaignStateValue.PLAN_PENDING_APPROVAL)
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert f"/campaigns/{cid}/retry" not in html
+        assert f"/campaigns/{cid}/replan" in html
+
+    def test_a_rejected_plan_offers_re_planning(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, _ws = _plan_pending_approval(client, workspaces_root, "blocked-ui")
+        _post(client, f"/campaigns/{cid}/reject")
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert f"/campaigns/{cid}/replan" in html
+        assert "rejected" in html.lower()
+
+    def test_the_failure_reason_is_shown(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, _ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_T3)
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert "something went wrong" in html
+
+    def test_a_healthy_campaign_shows_no_recovery_card(self, client: FlaskClient) -> None:
+        cid = _create_via_form(client, "healthy")
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert "Recovery" not in html
+
+
+class TestTheDashboardTellsTheTruthAboutRunningCampaigns:
+    def test_a_dead_run_stops_promising_progress_and_offers_a_way_out(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """The forever-refreshing page was the whole user-visible symptom.
+
+        Auto-refresh on a run whose supervisor died reloads a stale promise
+        every five seconds and never offers anything else.
+        """
+        cid = _create_via_form(client, "dead-run")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert 'http-equiv="refresh"' not in html
+        assert "not being supervised" in html
+        assert f"/campaigns/{cid}/abandon" in html
+
+    def test_a_live_run_still_refreshes_and_offers_no_escape_hatch(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid = _create_via_form(client, "live-run")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        with supervise_run(ws, "act-1"):
+            html = client.get(f"/campaigns/{cid}").data.decode()
+        assert 'http-equiv="refresh"' in html
+        assert "Run in progress" in html
+        assert f"/campaigns/{cid}/abandon" not in html
+
+    def test_an_unaccountable_tool_is_reported_without_an_abandon_button(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """Offering an action that can only ever 409 is worse than offering none.
+
+        A tool that outlived its launcher cannot be identified, so
+        abandoning is refused by the service. The dashboard has to say so
+        and point at the process group, rather than render a button whose
+        only possible outcome is an error.
+        """
+        cid = _create_via_form(client, "unaccountable-run")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        with _tool_tree() as tree:
+            _strand_active_run(ws, tree.pgid, tree.command)
+            os.kill(tree.leader_pid, signal.SIGKILL)
+            tree.proc.wait(timeout=15)
+
+            html = client.get(f"/campaigns/{cid}").data.decode()
+            assert 'http-equiv="refresh"' not in html
+            assert "not being supervised" in html
+            assert str(tree.pgid) in html
+            assert f"/campaigns/{cid}/abandon" not in html, (
+                "the dashboard must not offer an abandon the service will refuse"
+            )
+
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+    def test_an_orphaned_tool_is_named_on_the_dashboard(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """The identifiable case still gets the button, and names the tree."""
+        cid = _create_via_form(client, "orphaned-run")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        with _tool_tree() as tree:
+            _strand_active_run(ws, tree.pgid, tree.command)
+            html = client.get(f"/campaigns/{cid}").data.decode()
+            assert "not being supervised" in html
+            assert str(tree.pgid) in html
+            assert f"/campaigns/{cid}/abandon" in html
+            os.killpg(tree.pgid, signal.SIGKILL)
+
+
+class TestRecoveryRoutesRequireCsrf:
+    @pytest.mark.parametrize("route", ["replan", "retry", "finalize", "abandon"])
+    def test_a_post_without_a_token_is_rejected(self, client: FlaskClient, workspaces_root: Path, route: str) -> None:
+        cid, _ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_T3, name=f"csrf-{route}")
+        response = client.post(f"/campaigns/{cid}/{route}", data={})
+        assert response.status_code == 400
+
+
+class TestRecoveryRouteEdgeCases:
+    def test_a_campaign_mid_flow_cannot_be_finalized(self, client: FlaskClient) -> None:
+        """Neither failed nor holding diagnostics: there is nothing to adopt."""
+        cid = _create_via_form(client, "mid-flow")
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 409
+
+    def test_losing_a_race_while_abandoning_is_a_409_not_a_500(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The state can change between the route's read and the transition."""
+        from carmel.services.state_machine import InvalidTransitionError
+        from carmel.ui import app as ui_app
+
+        cid = _create_via_form(client, "abandon-race")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+
+        def _lost_the_race(_ws: Path, _campaign: Any) -> None:
+            raise InvalidTransitionError("running_t3 -> failed is not permitted")
+
+        monkeypatch.setattr(ui_app, "abandon_t3_run", _lost_the_race)
+        assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 409
