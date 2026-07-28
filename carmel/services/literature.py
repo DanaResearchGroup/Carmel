@@ -32,6 +32,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from pydantic import ValidationError
+
 from carmel.agents.bridge import AgentBridgeError, ModelProtocol
 from carmel.agents.budget import (
     BudgetExceededError,
@@ -86,7 +88,7 @@ from carmel.schemas.literature import (
 from carmel.schemas.plan import PlannedAction
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services import chem
-from carmel.services.acquisition import record_request
+from carmel.services.acquisition import collect_inbox, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
 from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
@@ -950,6 +952,56 @@ def _research_loop(
             return
 
 
+def _collect_manual_acquisitions(
+    workspace_root: Path,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+) -> None:
+    """Admit any papers a human dropped in the inbox since the last run.
+
+    Runs BEFORE the research loop and inside the run lock, so the manifest cannot be
+    mutated by two runs at once and the report reflects the workspace as it is at the
+    moment the run starts. Every admission is identity-checked in
+    :func:`~carmel.services.acquisition.collect_inbox`: a file whose text does not match
+    the request it was dropped against is REJECTED rather than stored, because a
+    mis-filed PDF would otherwise attach one paper's bytes to another paper's citation
+    and quietly corrupt the evidence chain.
+
+    NOTE: admission makes the document available in the evidence store with
+    :attr:`ArtifactProvenance.MANUAL`; it does not yet re-run grounding to extract
+    findings from it. That further step is not wired, and the operator-visible warning
+    below deliberately says only what actually happened.
+
+    A failure here must never take down the run: an unreadable inbox is an operator
+    problem to be reported, not a reason to lose a literature search.
+    """
+    try:
+        admitted = collect_inbox(workspace_root, max_bytes=config.budget.max_artifact_bytes)
+    except (OSError, ValueError, ValidationError) as exc:
+        state.warnings.append(f"could not read the manual-acquisition inbox: {exc}")
+        logger.warning("literature run %s could not collect the acquisition inbox: %s", run_id, exc)
+        return
+
+    if not admitted:
+        return
+
+    slugs = [request.slug for request in admitted]
+    state.warnings.append(
+        f"admitted {len(slugs)} manually-supplied paper(s) into the evidence store: {', '.join(slugs)}"
+    )
+    append_typed_event(
+        log_path,
+        event="literature.manual_acquisitions_admitted",
+        action_id=action_id,
+        run_id=run_id,
+        payload={"slugs": slugs},
+    )
+
+
 def run_literature_research(
     workspace_root: Path,
     campaign: Campaign,
@@ -991,6 +1043,10 @@ def run_literature_research(
             run_id=run_id,
             payload={"campaign_id": campaign.campaign_id, "model_name": deps.model.name},
         )
+        _collect_manual_acquisitions(
+            workspace_root, config=config, state=state, log_path=log_path, action_id=action.action_id, run_id=run_id
+        )
+
         slot_acquired = False
         try:
             session_budget().acquire_run_slot(config.budget.max_concurrent_runs)

@@ -45,7 +45,8 @@ from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import GroundingStatus, LiteratureReport, StopReason
 from carmel.services import chem
-from carmel.services.acquisition import load_manifest
+from carmel.services import literature as literature_module
+from carmel.services.acquisition import inbox_dir, load_manifest, record_request
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
 from carmel.services.evidence import EVIDENCE_LITERATURE_DIR
@@ -64,6 +65,10 @@ from carmel.services.literature import (
 
 DOI = "10.1000/test.doi"
 SOURCE_URL = "https://example.com/papers/secret-paper-url"
+
+#: Title used for manual-acquisition drops; long enough that the identity check has
+#: real signal to match on rather than a couple of common words.
+TITLE_FOR_DROP = "Ignition delay times in methane oxygen argon mixtures behind reflected shock waves"
 QUOTE = "The ignition delay time of O2 was measured to be 1.25 ms at 1100 K in the shock tube."
 DOC = (
     "A shock tube study of oxygen ignition\n"
@@ -833,6 +838,76 @@ class _StatusFetchTool:
 
     def fetch(self, url: str) -> tuple[Any, bytes]:
         raise FetchError(f"simulated failure for {url!r}", status=self._status)
+
+
+class TestManualAcquisitionsAreCollectedByARun:
+    """A paper a human obtained and dropped in the inbox must be admitted by the next
+    run.
+
+    Without this the manual-acquisition loop is open-ended: Carmel asks for a paper,
+    the operator supplies it, and nothing in the product ever picks it up. `collect_inbox`
+    was fully unit-tested but had NO caller, so the feature was complete everywhere
+    except at the point where it would have been used.
+    """
+
+    @staticmethod
+    def _queue_and_drop(workspace_root: Path, body: str) -> str:
+        """Queue a request the way a run would, then drop a matching file for it."""
+        request = record_request(
+            workspace_root,
+            title=TITLE_FOR_DROP,
+            doi=DOI,
+            landing_url=f"https://doi.org/{DOI}",
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        (inbox_dir(workspace_root) / f"{request.slug}.txt").write_bytes(body.encode("utf-8"))
+        return request.slug
+
+    def test_a_dropped_paper_is_admitted_at_the_start_of_the_next_run(self, campaign: Campaign) -> None:
+        slug = self._queue_and_drop(
+            campaign.workspace_root, f"{TITLE_FOR_DROP}\nDOI: {DOI}\nAbstract: measurements follow."
+        )
+        deps, _, config = _make_deps([_proposal(done=True)])
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        request = next(r for r in load_manifest(campaign.workspace_root).requests if r.slug == slug)
+        assert request.status == AcquisitionStatus.FULFILLED
+        assert request.fulfilled_sha256
+        # The operator has to be told, or an admission is invisible until someone
+        # goes looking in the manifest.
+        assert any(slug in warning for warning in report.warnings)
+
+    def test_a_wrong_paper_is_rejected_and_never_admitted(self, campaign: Campaign) -> None:
+        # The negative case is the one that matters: a mis-filed PDF would otherwise
+        # attach one paper's bytes to another paper's citation and silently corrupt the
+        # evidence chain -- a human handing Carmel a file is not automatically trustworthy.
+        slug = self._queue_and_drop(
+            campaign.workspace_root, "Laminar flame speeds of hydrogen air mixtures at elevated pressure."
+        )
+        deps, _, config = _make_deps([_proposal(done=True)])
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        request = next(r for r in load_manifest(campaign.workspace_root).requests if r.slug == slug)
+        assert request.status == AcquisitionStatus.REJECTED
+        assert not request.fulfilled_sha256
+
+    def test_an_unreadable_inbox_never_takes_down_the_run(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def _boom(workspace_root: Path, *, max_bytes: int) -> list[Any]:
+            raise OSError("inbox is on a dead mount")
+
+        monkeypatch.setattr(literature_module, "collect_inbox", _boom)
+        deps, _, config = _make_deps([_proposal(done=True)])
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        # Reported, not fatal: losing a literature search over an inbox problem would be
+        # a far worse trade than running without the drop.
+        assert report.stop_reason != StopReason.ERROR
+        assert any("inbox" in warning for warning in report.warnings)
 
 
 class TestAcquisitionTriage:
