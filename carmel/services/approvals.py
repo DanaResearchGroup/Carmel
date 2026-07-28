@@ -17,7 +17,7 @@ from carmel.schemas.approval import (
 from carmel.schemas.campaign import Budgets
 from carmel.schemas.plan import PlannedAction
 from carmel.services.artifacts import read_yaml, write_yaml
-from carmel.services.decision_log import append_event
+from carmel.services.decision_log import append_event, read_events
 
 POLICY_FILE_NAME = "approval_policy.yaml"
 
@@ -90,6 +90,40 @@ def evaluate_action(
             return ApprovalRequirement.REQUIRES_APPROVAL
         return ApprovalRequirement.AUTO_APPROVED
     return ApprovalRequirement.REQUIRES_APPROVAL
+
+
+def has_effective_human_approval(workspace_root: Path, action_id: str) -> bool:
+    """Report whether a human's standing approval authorizes this action.
+
+    Effective means: the *latest* human decision (``APPROVED`` or
+    ``REJECTED``) recorded for the action is ``APPROVED``. Non-human
+    statuses are deliberately ignored on both sides:
+
+    * ``AUTO_APPROVED`` records do not count — an auto-approval is only
+      valid while the live gate still auto-approves, so it can never
+      authorize a launch the live gate escalates (e.g. a stale
+      auto-approval from before the budget ran out).
+    * ``PENDING`` records (written when a budget violation is detected at
+      planning time) do not revoke a human's explicit approval — a human
+      who approved an over-budget action has overridden the budget, and a
+      retry of that action must still launch.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        action_id: The action being launched.
+
+    Returns:
+        True if the latest human decision for the action is ``APPROVED``.
+    """
+    human_statuses = {ApprovalStatus.APPROVED.value, ApprovalStatus.REJECTED.value}
+    last_human: str | None = None
+    for event in read_events(workspace_root / "decision_log.jsonl"):
+        if event.get("event") != "approval_decision" or event.get("action_id") != action_id:
+            continue
+        status = event.get("status")
+        if status in human_statuses:
+            last_human = str(status)
+    return last_human == ApprovalStatus.APPROVED.value
 
 
 def record_decision(

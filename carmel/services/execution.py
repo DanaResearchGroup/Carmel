@@ -25,12 +25,15 @@ from typing import Protocol
 from uuid import uuid4
 
 from carmel.logger import get_logger
+from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.diagnostics import DiagnosticsV1
 from carmel.schemas.plan import PlannedAction
 from carmel.schemas.run import ActiveRun, FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.schemas.state import CampaignState, CampaignStateValue
+from carmel.services.approvals import has_effective_human_approval, load_policy
 from carmel.services.artifacts import read_json, write_json
+from carmel.services.authorization import BudgetExceededError, decide_requirement
 from carmel.services.decision_log import append_event
 from carmel.services.drawing import SELECTION_SVG_FILENAMES, write_selection_svgs
 from carmel.services.processes import kill_process_group
@@ -43,11 +46,11 @@ from carmel.services.recovery import (
     probe_run_liveness,
     start_supervision,
 )
+from carmel.services.spend import RUNS_DIR_NAME, compute_spend
 from carmel.services.state_machine import InvalidTransitionError, can_transition, load_state, update_state
 
 DIAGNOSTICS_FILE_NAME = "diagnostics.json"
 ARC_DIAGNOSTICS_FILE_NAME = "arc_diagnostics.json"
-RUNS_DIR_NAME = "runs"
 MODELS_DIR_NAME = "models"
 ARC_MODELS_SUBDIR_NAME = "arc"
 
@@ -193,6 +196,60 @@ def _arc_tool_name() -> str:
     return ARC_TOOL_NAME
 
 
+def _require_launch_authorization(workspace_root: Path, campaign: Campaign, action: PlannedAction) -> None:
+    """Refuse a launch the live gate escalates and no human has approved.
+
+    The plan-time approval requirement is a snapshot: budget can have been
+    consumed since (earlier runs, a retry's failed attempt), so every
+    launch path re-runs the combined gate
+    (:func:`carmel.services.authorization.decide_requirement`) against the
+    campaign's *current* remaining budget. This runs BEFORE
+    ``start_supervision`` and any state transition — so the action is not
+    yet reserved in ``active_run.json`` and is never counted against
+    itself, and a refusal changes nothing and can wedge nothing.
+
+    If the live gate still auto-approves, the launch proceeds (this is
+    what keeps auto-approved runs — including retries after pre-launch
+    failures, which consume nothing — uninterrupted). If it escalates, a
+    recorded *effective* human approval for this action authorizes the
+    launch anyway (a human who approved is an override that survives
+    stale-over-budget retries); an ``AUTO_APPROVED``-only record does not,
+    because an auto-approval is only valid while the gate still
+    auto-approves.
+
+    This is the service-boundary twin of the UI ``/run`` route's
+    decision-log check, so direct service callers cannot bypass the
+    budget. Launch only: finalize, retry re-arming, re-plan, and abandon
+    never pass through here.
+
+    Raises:
+        BudgetExceededError: If the live gate requires approval and no
+            effective human approval is recorded for the action. Raised
+            before any supervision or state change.
+    """
+    try:
+        policy = load_policy(workspace_root)
+    except FileNotFoundError:
+        # No persisted policy (a bare workspace): gate under the default,
+        # conservative policy rather than refusing to gate at all.
+        policy = ApprovalPolicy()
+    remaining = compute_spend(workspace_root).remaining(campaign.input.budgets.cpu_hours)
+    requirement, rationale = decide_requirement(
+        action,
+        policy=policy,
+        remaining_cpu_hours=remaining,
+        budgets=campaign.input.budgets,
+    )
+    if requirement == ApprovalRequirement.AUTO_APPROVED:
+        return
+    if has_effective_human_approval(workspace_root, action.action_id):
+        return
+    raise BudgetExceededError(
+        f"Launch of action {action.action_id} refused ({rationale}); "
+        f"a recorded human approval for this action is required before it may run."
+    )
+
+
 def execute_t3_action(
     workspace_root: Path,
     campaign: Campaign,
@@ -219,10 +276,14 @@ def execute_t3_action(
     Raises:
         RunAlreadySupervisedError: If a live process already holds this
             campaign's run lock.
+        BudgetExceededError: If the live authorization re-check refuses
+            the launch — see :func:`_require_launch_authorization`. Raised
+            before supervision or any state change.
     """
     if adapter is None:
         adapter = _default_adapter()
-    supervision = start_supervision(workspace_root, action.action_id)
+    _require_launch_authorization(workspace_root, campaign, action)
+    supervision = start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
     try:
         started = begin_t3_run(workspace_root, action)
     except BaseException:
@@ -301,10 +362,14 @@ def start_t3_action(
         RunAlreadySupervisedError: If a live process already holds this
             campaign's run lock. Raised before the transition, so the
             campaign is left to the run that already owns it.
+        BudgetExceededError: If the live authorization re-check refuses
+            the launch — see :func:`_require_launch_authorization`. Raised
+            synchronously, before supervision or any state change.
     """
     if adapter is None:
         adapter = _default_adapter()
-    supervision = start_supervision(workspace_root, action.action_id)
+    _require_launch_authorization(workspace_root, campaign, action)
+    supervision = start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
     try:
         started = begin_t3_run(workspace_root, action)
     except BaseException:
@@ -647,6 +712,7 @@ def _abandoned_run_record(active: ActiveRun, detail: str, tool_name: str) -> Run
         failure_code=FailureCode.ABANDONED,
         started_at=active.started_at,
         ended_at=datetime.now(UTC),
+        estimated_cpu_hours=active.estimated_cpu_hours,
         submission_mode=SubmissionMode.SUBPROCESS,
         error_message=detail,
     )
@@ -805,10 +871,14 @@ def execute_arc_action(
             ``RUNNING_ARC``. The workspace is left untouched.
         RunAlreadySupervisedError: If a live process already holds this
             campaign's run lock.
+        BudgetExceededError: If the live authorization re-check refuses
+            the launch — see :func:`_require_launch_authorization`. Raised
+            before supervision or any state change.
     """
     if adapter is None:
         adapter = _default_arc_adapter()
-    supervision = start_supervision(workspace_root, action.action_id)
+    _require_launch_authorization(workspace_root, campaign, action)
+    supervision = start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
     try:
         update_state(workspace_root, CampaignStateValue.RUNNING_ARC, notes=f"action={action.action_id}")
     except BaseException:

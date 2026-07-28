@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from carmel.schemas import ActionKind, ApprovalRequirement, PlannedAction
+from carmel.schemas.approval import ApprovalPolicy
+from carmel.schemas.campaign import Budgets
 from carmel.services.authorization import (
     DEFAULT_ARC_ENVELOPE,
     DEFAULT_ENVELOPES,
@@ -12,6 +14,7 @@ from carmel.services.authorization import (
     ExecutionEnvelope,
     authorize,
     authorize_action,
+    decide_requirement,
     envelope_for,
     record_authorization,
 )
@@ -125,6 +128,102 @@ class TestAuthorizeAction:
         result = authorize_action(_action(ActionKind.EXPERIMENT, 1.0), remaining_cpu_hours=10.0)
         assert result.requirement == ApprovalRequirement.REQUIRES_APPROVAL
         assert result.adapter == "unknown"
+
+
+class TestDecideRequirement:
+    """The ONE combined gate: policy AND envelope+budget must both clear."""
+
+    def test_auto_only_when_both_paths_auto_approve(self) -> None:
+        requirement, rationale = decide_requirement(
+            _action(ActionKind.ARC_RUN, 3.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=10.0,
+        )
+        assert requirement == ApprovalRequirement.AUTO_APPROVED
+        assert "auto-approved" in rationale
+
+    def test_policy_only_escalation_forces_approval(self) -> None:
+        # 12 cpu-h: within the T3 envelope (24) and budget (100), but over the
+        # policy threshold (10) — the envelope path alone would auto-approve.
+        requirement, rationale = decide_requirement(
+            _action(ActionKind.T3_RUN, 12.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=100.0,
+        )
+        assert requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        assert "approval policy" in rationale
+
+    def test_envelope_only_escalation_forces_approval(self) -> None:
+        # 4.5 cpu-h: under the ARC policy threshold (5) but over the ARC
+        # envelope cap (4) — the policy path alone would auto-approve.
+        requirement, rationale = decide_requirement(
+            _action(ActionKind.ARC_RUN, 4.5),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=100.0,
+        )
+        assert requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        assert "envelope cap" in rationale
+
+    def test_remaining_budget_escalation_forces_approval(self) -> None:
+        # 3 cpu-h clears both thresholds but not the remaining budget (1).
+        requirement, rationale = decide_requirement(
+            _action(ActionKind.ARC_RUN, 3.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=1.0,
+        )
+        assert requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        assert "remaining budget" in rationale
+
+    def test_both_escalations_are_reported_together(self) -> None:
+        requirement, rationale = decide_requirement(
+            _action(ActionKind.ARC_RUN, 8.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=1.0,
+        )
+        assert requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        assert "envelope cap" in rationale
+        assert "approval policy also requires approval" in rationale
+
+    def test_declared_budget_flows_to_the_policy_path(self, tmp_path: Path) -> None:
+        # Over the declared budget: the policy path escalates and records the
+        # violation, even though remaining_cpu_hours alone would not bind.
+        requirement, _rationale = decide_requirement(
+            _action(ActionKind.ARC_RUN, 3.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=3.0,
+            budgets=Budgets(cpu_hours=2.0, experiment_budget=0.0),
+            workspace_root=tmp_path,
+        )
+        assert requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        events = read_events(tmp_path / "decision_log.jsonl")
+        assert any("budget exceeded" in str(e.get("rationale", "")) for e in events)
+
+    def test_workspace_records_the_envelope_authorization(self, tmp_path: Path) -> None:
+        decide_requirement(
+            _action(ActionKind.ARC_RUN, 3.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=10.0,
+            workspace_root=tmp_path,
+        )
+        events = read_events(tmp_path / "decision_log.jsonl")
+        assert [e["event"] for e in events] == ["execution_envelope_authorization"]
+
+    def test_custom_envelopes_are_honored(self) -> None:
+        tight = {
+            ActionKind.ARC_RUN: ExecutionEnvelope(
+                adapter="arc",
+                cpu_hours_per_action=0.5,
+                max_concurrent_jobs=1,
+                allowed_action_kinds=[ActionKind.ARC_RUN],
+            )
+        }
+        requirement, _rationale = decide_requirement(
+            _action(ActionKind.ARC_RUN, 1.0),
+            policy=ApprovalPolicy(),
+            remaining_cpu_hours=10.0,
+            envelopes=tight,
+        )
+        assert requirement == ApprovalRequirement.REQUIRES_APPROVAL
 
 
 class TestRecordAuthorization:

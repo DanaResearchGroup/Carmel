@@ -32,9 +32,23 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from carmel.schemas.approval import ActionKind, ApprovalRequirement
+from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
+from carmel.schemas.campaign import Budgets
 from carmel.schemas.plan import PlannedAction
+from carmel.services.approvals import evaluate_action
 from carmel.services.decision_log import append_event
+
+
+class BudgetExceededError(RuntimeError):
+    """Raised when a launch is refused by the live authorization re-check.
+
+    Raised *before* any supervision or state transition, so nothing is
+    taken and nothing can wedge. The launch paths raise it when the live
+    combined gate (:func:`decide_requirement`, re-evaluated against the
+    campaign's *remaining* budget at launch time) escalates to
+    ``REQUIRES_APPROVAL`` and no effective human approval is recorded for
+    the action.
+    """
 
 
 class ExecutionEnvelope(BaseModel):
@@ -189,6 +203,68 @@ def authorize_action(
             rationale=f"escalate to user: no execution envelope registered for kind {action.kind.value}",
         )
     return authorize(action, envelope, remaining_cpu_hours)
+
+
+def decide_requirement(
+    action: PlannedAction,
+    *,
+    policy: ApprovalPolicy,
+    remaining_cpu_hours: float,
+    budgets: Budgets | None = None,
+    envelopes: dict[ActionKind, ExecutionEnvelope] | None = None,
+    workspace_root: Path | None = None,
+) -> tuple[ApprovalRequirement, str]:
+    """Run the ONE authoritative approval gate for a planned action.
+
+    Combines the two previously-split approval systems so they can no
+    longer stamp conflicting truth:
+
+    * the **policy** path (:func:`carmel.services.approvals.evaluate_action`
+      — per-kind thresholds such as ``auto_approve_arc_under_cpu_hours``,
+      plus the declared-budget check), and
+    * the **envelope + remaining budget** path (:func:`authorize_action`
+      — per-adapter envelope caps and the campaign's *remaining*
+      ``cpu_hours``, i.e. budget minus consumed minus reserved spend).
+
+    The action is ``AUTO_APPROVED`` only if **both** paths auto-approve;
+    if either escalates, the result is ``REQUIRES_APPROVAL``.
+
+    Args:
+        action: The planned action to gate.
+        policy: The active approval policy.
+        remaining_cpu_hours: The campaign's remaining CPU-hour budget
+            (declared budget minus :class:`carmel.services.spend.Spend`).
+        budgets: The campaign's declared budgets, forwarded to the policy
+            path's declared-budget check.
+        envelopes: Optional per-adapter envelope override.
+        workspace_root: When given, the envelope authorization (and any
+            policy budget violation) is recorded to that workspace's
+            decision log, making the gate auditable.
+
+    Returns:
+        Tuple of (the combined requirement, a human-readable rationale).
+    """
+    policy_requirement = evaluate_action(action, policy, budgets=budgets, workspace_root=workspace_root)
+    result = authorize_action(action, remaining_cpu_hours, envelopes)
+    if workspace_root is not None:
+        record_authorization(workspace_root, action, result)
+
+    if (
+        policy_requirement == ApprovalRequirement.AUTO_APPROVED
+        and result.requirement == ApprovalRequirement.AUTO_APPROVED
+    ):
+        return ApprovalRequirement.AUTO_APPROVED, result.rationale
+
+    if result.requirement == ApprovalRequirement.REQUIRES_APPROVAL:
+        rationale = result.rationale
+        if policy_requirement == ApprovalRequirement.REQUIRES_APPROVAL:
+            rationale += "; the approval policy also requires approval"
+    else:
+        rationale = (
+            f"escalate to user: the approval policy requires approval for "
+            f"{action.kind.value} at {float(action.estimated_cpu_hours):.1f} cpu-h"
+        )
+    return ApprovalRequirement.REQUIRES_APPROVAL, rationale
 
 
 def record_authorization(

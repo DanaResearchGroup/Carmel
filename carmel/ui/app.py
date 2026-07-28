@@ -36,6 +36,7 @@ from carmel.schemas.state import CampaignStateValue
 from carmel.services.approvals import (
     record_decision,
 )
+from carmel.services.authorization import BudgetExceededError
 from carmel.services.campaigns import (
     create_campaign,
     find_campaign_workspace,
@@ -325,6 +326,12 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
             abort(409, description=f"Cannot start a run for a campaign in state {current.value!r}.")
         try:
             start_t3_action(ws, campaign, action)
+        except BudgetExceededError as e:
+            # The launch-time re-check found the campaign's remaining budget
+            # (or the live gate generally) no longer covers this action and
+            # no human approval stands for it. Nothing was started; the
+            # dashboard state is unchanged — a conflict, not a crash.
+            abort(409, description=str(e))
         except InvalidTransitionError, RunAlreadySupervisedError:
             # The preflight above is a read, so it cannot be authoritative:
             # a concurrent POST can win the race between it and the locked

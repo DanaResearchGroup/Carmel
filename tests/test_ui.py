@@ -18,7 +18,7 @@ from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services.approvals import save_policy
 from carmel.services.campaigns import find_campaign_workspace
 from carmel.services.decision_log import read_events
-from carmel.services.execution import save_arc_diagnostics, save_diagnostics
+from carmel.services.execution import save_arc_diagnostics, save_diagnostics, save_run_record
 from carmel.services.planner import load_plan
 from carmel.services.recovery import supervise_run
 from carmel.services.state_machine import load_state, update_state
@@ -1310,6 +1310,64 @@ class TestTheDashboardTellsTheTruthAboutRunningCampaigns:
             assert str(tree.pgid) in html
             assert f"/campaigns/{cid}/abandon" in html
             os.killpg(tree.pgid, signal.SIGKILL)
+
+
+class TestBudgetGateOnRunRoute:
+    """The launch-time budget re-check surfaces as a 409, and only on /run."""
+
+    @staticmethod
+    def _spent(ws: Path, cpu_hours: float) -> None:
+        save_run_record(
+            ws,
+            RunRecord(
+                run_id=f"spent-{cpu_hours}",
+                action_id="earlier-action",
+                tool_name="t3",
+                status=RunStatus.SUCCEEDED,
+                started_at=datetime.now(UTC),
+                ended_at=datetime.now(UTC),
+                estimated_cpu_hours=cpu_hours,
+                actual_cpu_hours=cpu_hours,
+                submission_mode=SubmissionMode.SUBPROCESS,
+            ),
+        )
+
+    def test_running_an_action_the_budget_no_longer_covers_is_a_409(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """An auto-approved plan gone stale must read as a conflict, not a 500.
+
+        The plan auto-approved when the budget (20) was untouched; by run
+        time earlier runs have consumed 19 of it, so the live re-check
+        escalates and no human approval stands.
+        """
+        cid = _create_via_form(client, "budget-gate")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        self._spent(ws, 19.0)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+        assert response.status_code == 409
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_finalize_is_never_budget_blocked(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """Adopting already-persisted diagnostics spends nothing new."""
+        cid = _create_via_form(client, "budget-finalize")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        for step in [CampaignStateValue.RUNNING_T3, CampaignStateValue.DIAGNOSTICS_READY]:
+            update_state(ws, step)
+        save_diagnostics(
+            ws,
+            DiagnosticsV1(run_id="r", campaign_id="c", generated_at=datetime.now(UTC)),
+        )
+        self._spent(ws, 100.0)  # far over budget
+
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
 
 
 class TestRecoveryRoutesRequireCsrf:

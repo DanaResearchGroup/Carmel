@@ -11,9 +11,10 @@ from uuid import uuid4
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.plan import Plan, PlannedAction
-from carmel.services.approvals import evaluate_action, load_policy
+from carmel.services.approvals import load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
-from carmel.services.authorization import ExecutionEnvelope, authorize_action, record_authorization
+from carmel.services.authorization import ExecutionEnvelope, decide_requirement
+from carmel.services.spend import compute_spend
 
 PLAN_JSON_NAME = "plan.json"
 PLAN_MD_NAME = "plan.md"
@@ -37,6 +38,20 @@ def estimate_t3_cpu_hours(campaign: Campaign) -> float:
     return float(2 * n_reactors + n_observables)
 
 
+def _remaining_cpu_hours(campaign: Campaign, workspace_root: Path | None) -> float:
+    """Return the campaign's remaining CPU-hour budget for the gate.
+
+    With a workspace, remaining is the declared budget minus consumed and
+    reserved spend, so the campaign *total* binds cumulatively rather
+    than every action being compared to the full declared budget. Without
+    one (pure unit construction, nothing can have been spent), the full
+    declared budget is used.
+    """
+    if workspace_root is None:
+        return campaign.input.budgets.cpu_hours
+    return compute_spend(workspace_root).remaining(campaign.input.budgets.cpu_hours)
+
+
 def generate_initial_plan(
     campaign: Campaign,
     policy: ApprovalPolicy,
@@ -47,18 +62,21 @@ def generate_initial_plan(
     The Phase 1 initial plan always contains exactly one action: a T3
     handshake to produce a baseline mechanism and diagnostics.
 
-    The campaign's declared budgets are always passed to the approval
-    evaluation. Without that, ``Budgets`` would have no read site anywhere
-    in the codebase and a user declaring a 0.5 CPU-hour budget would still
-    have a 3 CPU-hour action auto-approved with no human in the loop —
-    silently violating the "all expensive actions gated by budget checks"
-    invariant.
+    The action is gated by the single combined gate
+    (:func:`carmel.services.authorization.decide_requirement`): the policy
+    thresholds, the declared budget, the per-adapter execution envelope,
+    and the campaign's *remaining* budget (declared minus spend already
+    consumed or reserved in this workspace) must all clear for the action
+    to be auto-approved. Without the remaining-budget term, ``Budgets``
+    would only ever bind per action and a 20 CPU-hour campaign could
+    auto-approve ten 4-hour actions one by one.
 
     Args:
         campaign: The campaign to plan for.
         policy: The active approval policy.
-        workspace_root: The campaign workspace root. When given, a budget
-            violation is recorded to the decision log as it is detected.
+        workspace_root: The campaign workspace root. When given, spend
+            already recorded there reduces the remaining budget, and the
+            gate's decisions are recorded to the decision log.
 
     Returns:
         A Plan with a single T3-handshake action.
@@ -77,9 +95,10 @@ def generate_initial_plan(
         approval_requirement=ApprovalRequirement.AUTO_APPROVED,
         parameters={},
     )
-    requirement = evaluate_action(
+    requirement, _rationale = decide_requirement(
         action,
-        policy,
+        policy=policy,
+        remaining_cpu_hours=_remaining_cpu_hours(campaign, workspace_root),
         budgets=campaign.input.budgets,
         workspace_root=workspace_root,
     )
@@ -113,14 +132,17 @@ def generate_arc_plan(
     job_types: dict[str, bool] | None = None,
     envelopes: dict[ActionKind, ExecutionEnvelope] | None = None,
     workspace_root: Path | None = None,
+    policy: ApprovalPolicy | None = None,
 ) -> Plan:
-    """Generate a single-action ``run_arc`` plan, gated by the execution envelope.
+    """Generate a single-action ``run_arc`` plan, gated by the combined gate.
 
     Peer to :func:`generate_initial_plan`. The action's approval requirement is
-    set by the shared, adapter-agnostic
-    :func:`carmel.services.authorization.authorize_action` against the ARC
-    envelope **and** the campaign's remaining ``cpu_hours`` — the same symmetric
-    gate applied to T3.
+    set by the single combined gate
+    (:func:`carmel.services.authorization.decide_requirement`) against the
+    approval policy (``auto_approve_arc_under_cpu_hours``), the ARC envelope,
+    **and** the campaign's remaining ``cpu_hours`` (declared budget minus spend
+    consumed or reserved in the workspace) — the same symmetric gate applied
+    to T3.
 
     Args:
         campaign: The campaign to plan for.
@@ -132,9 +154,13 @@ def generate_arc_plan(
         job_types: Optional ARC job-type profile.
         envelopes: Optional envelope override (defaults to the conservative
             per-adapter defaults).
-        workspace_root: Optional campaign workspace. When given, the envelope
-            authorization decision is appended to that workspace's decision log,
-            so the gate that set ``approval_requirement`` is auditable.
+        workspace_root: Optional campaign workspace. When given, spend already
+            recorded there reduces the remaining budget, and the gate's
+            decisions are appended to that workspace's decision log, so the
+            gate that set ``approval_requirement`` is auditable.
+        policy: Optional approval policy. Defaults to the workspace's
+            persisted policy when a workspace is given, else to the default
+            :class:`~carmel.schemas.approval.ApprovalPolicy`.
 
     Returns:
         A Plan with a single ``run_arc`` action.
@@ -169,18 +195,25 @@ def generate_arc_plan(
         parameters=parameters,
     )
 
-    result = authorize_action(action, campaign.input.budgets.cpu_hours, envelopes)
-    action = action.model_copy(update={"approval_requirement": result.requirement})
-    if workspace_root is not None:
-        record_authorization(workspace_root, action, result)
+    if policy is None:
+        policy = load_policy(workspace_root) if workspace_root is not None else ApprovalPolicy()
+    requirement, rationale = decide_requirement(
+        action,
+        policy=policy,
+        remaining_cpu_hours=_remaining_cpu_hours(campaign, workspace_root),
+        budgets=campaign.input.budgets,
+        envelopes=envelopes,
+        workspace_root=workspace_root,
+    )
+    action = action.model_copy(update={"approval_requirement": requirement})
     return Plan(
         plan_id=str(uuid4()),
         campaign_id=campaign.campaign_id,
         created_at=datetime.now(UTC),
         actions=[action],
-        rationale=f"ARC standalone plan ({result.rationale})",
+        rationale=f"ARC standalone plan ({rationale})",
         total_estimated_cpu_hours=estimated,
-        requires_approval=result.requirement == ApprovalRequirement.REQUIRES_APPROVAL,
+        requires_approval=requirement == ApprovalRequirement.REQUIRES_APPROVAL,
     )
 
 
