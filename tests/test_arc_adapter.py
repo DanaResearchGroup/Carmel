@@ -1475,7 +1475,25 @@ class TestARCAdapterRealSubprocess:
             campaign=_campaign(ws),
             action=_action(level_of_theory=MOCK_LEVEL_OF_THEORY),
         )
+        # A no-op run also "does not crash", and the tools lane's gate only
+        # knows this test was not skipped -- so assert concrete evidence that
+        # ARC was actually launched as a subprocess, not just a plausible
+        # status. TOOL_NOT_FOUND means discovery failed *before* launch (e.g.
+        # the environment did not put ARC on ARC_PATH), which is exactly the
+        # silent "green gate, zero ARC executed" this lane exists to prevent.
         assert run.status in (RunStatus.SUCCEEDED, RunStatus.FAILED)
+        assert run.failure_code != FailureCode.TOOL_NOT_FOUND, (
+            f"ARC was never launched (failure_code={run.failure_code}, "
+            f"error={run.error_message!r}); is ARC on ARC_PATH in this environment?"
+        )
+        assert run.input_path is not None
+        assert run.input_path.exists()
+        # The stdout/stderr capture files are opened immediately before the
+        # subprocess is spawned, so their presence is on-disk proof ARC really
+        # ran as a subprocess (they do not exist on a prelaunch failure).
+        run_dir = ws / run.run_id
+        assert (run_dir / ARC_LAYOUT.CARMEL_STDOUT_FILENAME).exists()
+        assert (run_dir / ARC_LAYOUT.CARMEL_STDERR_FILENAME).exists()
         if run.status == RunStatus.SUCCEEDED:
             assert diagnostics is not None
             assert diagnostics.run_id == run.run_id

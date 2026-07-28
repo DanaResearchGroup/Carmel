@@ -63,6 +63,15 @@ if [[ -d "$T3_PATH" ]]; then
 EOF
         printf 'export T3_CONDA_ENV=%q\n' "$T3_CONDA_ENV"
         printf 'export T3_PATH=%q\n' "$T3_PATH"
+        # Carmel launches ARC as 'python ARC.py' (ARC has no 'python -m arc'
+        # entrypoint), and it does so through 'conda run -n <t3_env>' where the
+        # Carmel-process's own module discovery does not apply, so it needs the
+        # ARC checkout on ARC_PATH to find the script. Importability alone (ARC
+        # shares t3_env with T3) is NOT enough. Only export when the checkout is
+        # present, matching this file's rule against exporting dead paths.
+        if [[ -d "$ARC_PATH" ]]; then
+            printf 'export ARC_PATH=%q\n' "$ARC_PATH"
+        fi
         echo "# Read by ARC's settings module, which is where T3 gets the database path from."
         printf 'export RMG_PATH=%q\n' "$RMG_PATH"
         printf 'export RMG_DB_PATH=%q\n' "$RMG_DB_PATH"

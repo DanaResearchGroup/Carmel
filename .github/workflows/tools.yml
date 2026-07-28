@@ -237,6 +237,12 @@ jobs:
           {
             echo "T3_CONDA_ENV=$T3_CONDA_ENV"
             echo "T3_PATH=$T3_PATH"
+            # ARC is launched as `python ARC.py` under conda run, so the ARC
+            # adapter needs ARC_PATH to find the script (importability alone is
+            # not enough). Without this the real ARC execution test hits
+            # TOOL_NOT_FOUND before launch and the gate below would pass having
+            # run zero ARC. The activate hook exports it when $HOME/ARC exists.
+            echo "ARC_PATH=$ARC_PATH"
             echo "RMG_PATH=$RMG_PATH"
             echo "RMG_DB_PATH=$RMG_DB_PATH"
             echo "rmgpy_path=$RMG_PATH"
@@ -337,14 +343,57 @@ jobs:
 
       # ARC shares t3_env (see the lane header): T3 imports ARC in-process, so
       # ARC is importable wherever T3 is. The ARC adapter's pure-Python and
-      # mocked tests run here for parity; the real ARC subprocess test
-      # (@requires_arc) becomes a strict "must not skip" gate — like the T3 one
-      # above — once the ARC adapter launches ARC through its conda env the way
-      # the T3 adapter now does (bare `python ARC.py` runs under crml_env, where
-      # arc is not importable). Until then this step relies on the job-level
-      # continue-on-error and does not assert the real test ran.
+      # mocked tests run here for parity, and the real ARC subprocess test
+      # (@requires_arc) is now a strict "must not skip" gate — like the T3 one
+      # above — because the ARC adapter launches ARC through its conda env the
+      # way the T3 adapter does (a bare `python ARC.py` would run under
+      # crml_env, where arc is not importable). The gate is the step after this.
       - name: Run ARC-dependent tests
         if: always()
         run: |
           conda activate crml_env
           pytest tests/test_arc_adapter.py -v --junitxml=arc-report.xml
+
+      # The whole point of this lane is the real ARC path, so a skipped
+      # real-execution test is a failure here — not a fact to report and move
+      # on from. Without this, @requires_arc skips the only test that launches
+      # ARC as a subprocess, the pytest step passes, and the lane goes green
+      # having proved nothing about real ARC integration.
+      #
+      # This asserts on the JUnit report rather than re-probing importability,
+      # because "ARC imports" and "the real test ran" are different claims and
+      # only the second one is what this lane exists to establish. Renaming,
+      # deselecting or losing the test therefore fails here too.
+      #
+      # Last, and `if: always()`, so the diagnostics and the test results are
+      # both in the log before it fires.
+      - name: Require that the real ARC execution test actually ran
+        if: always()
+        run: |
+          conda activate crml_env
+          python - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          report = pathlib.Path("arc-report.xml")
+          if not report.is_file():
+              raise SystemExit("::error::no pytest report; the ARC test step never ran.")
+
+          cases = [
+              case
+              for case in ET.parse(report).getroot().iter("testcase")
+              if "TestARCAdapterRealSubprocess" in case.get("classname", "")
+          ]
+          if not cases:
+              raise SystemExit(
+                  "::error::the real ARC execution test is missing from this run. "
+                  "If it was renamed, update this step with it."
+              )
+          skipped = [case for case in cases if case.find("skipped") is not None]
+          if skipped:
+              raise SystemExit(
+                  "::error::the real ARC execution test SKIPPED, so this lane proved "
+                  "nothing about real ARC integration. See the import diagnostic above."
+              )
+          print(f"real ARC execution tests that ran: {len(cases)}")
+          PY

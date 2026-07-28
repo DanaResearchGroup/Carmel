@@ -222,7 +222,7 @@ class TestTheActivationHook:
         """A path with a space would truncate a variable; one with $(...) would run."""
         script = (DEVTOOLS / "install_carmel.sh").read_text()
         exports = re.findall(r"^\s*(?:printf|echo).*export (\w+)", script, flags=re.MULTILINE)
-        assert set(exports) == {"T3_CONDA_ENV", "T3_PATH", "RMG_PATH", "RMG_DB_PATH"}
+        assert set(exports) == {"T3_CONDA_ENV", "T3_PATH", "ARC_PATH", "RMG_PATH", "RMG_DB_PATH"}
         assert "%q" in script
 
 
@@ -290,6 +290,19 @@ class TestTheLaneProvesSomething:
         suite = (REPO_ROOT / "tests" / "test_t3_adapter.py").read_text()
         assert "class TestT3AdapterRealSubprocess" in suite, (
             "the tools lane asserts on TestT3AdapterRealSubprocess; renaming it silently turns that gate into a no-op"
+        )
+
+    def test_the_lane_asserts_the_real_arc_test_ran(self) -> None:
+        workflow = yaml.safe_load(TOOLS_WORKFLOW.read_text())
+        steps = workflow["jobs"]["tools"]["steps"]
+        assert any("TestARCAdapterRealSubprocess" in str(step.get("run", "")) for step in steps), (
+            "no step asserts that the real ARC execution test ran"
+        )
+
+    def test_the_arc_test_class_the_lane_names_still_exists(self) -> None:
+        suite = (REPO_ROOT / "tests" / "test_arc_adapter.py").read_text()
+        assert "class TestARCAdapterRealSubprocess" in suite, (
+            "the tools lane asserts on TestARCAdapterRealSubprocess; renaming it silently turns that gate into a no-op"
         )
 
 
