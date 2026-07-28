@@ -21,7 +21,7 @@ from flask import Flask, abort, flash, redirect, render_template, request, url_f
 from werkzeug.wrappers.response import Response
 
 from carmel.logger import get_logger
-from carmel.schemas.approval import ApprovalStatus
+from carmel.schemas.approval import ActionKind, ApprovalStatus
 from carmel.schemas.campaign import (
     Budgets,
     CampaignInput,
@@ -32,10 +32,12 @@ from carmel.schemas.campaign import (
     ReactorType,
     TargetObservable,
 )
-from carmel.schemas.state import CampaignStateValue
+from carmel.schemas.plan import Plan
+from carmel.schemas.state import CampaignState, CampaignStateValue
 from carmel.services.approvals import (
     record_decision,
 )
+from carmel.services.authorization import BudgetExceededError
 from carmel.services.campaigns import (
     create_campaign,
     find_campaign_workspace,
@@ -44,13 +46,20 @@ from carmel.services.campaigns import (
 )
 from carmel.services.decision_log import append_event, read_events
 from carmel.services.execution import (
+    ARC_DIAGNOSTICS_FILE_NAME,
+    ARC_MODELS_SUBDIR_NAME,
+    DIAGNOSTICS_FILE_NAME,
+    MODELS_DIR_NAME,
     RunStillLiveError,
+    abandon_arc_run,
     abandon_t3_run,
+    load_arc_diagnostics,
     load_diagnostics,
+    start_arc_action,
     start_t3_action,
 )
 from carmel.services.intake import StubIntakeParser, write_intake_review
-from carmel.services.planner import load_plan, plan_and_save
+from carmel.services.planner import load_plan, plan_and_save, plan_and_save_arc
 from carmel.services.recovery import (
     LockStateUnknownError,
     RunAlreadySupervisedError,
@@ -154,6 +163,58 @@ def _build_input_from_form(form: dict[str, Any]) -> CampaignInput:
     )
 
 
+def _plan_tool(plan: Plan | None) -> str | None:
+    """Name the tool the current plan's action runs: ``"t3"``, ``"arc"``, or None.
+
+    Used for tool-correct button labels and flashes. A plan is Phase 1
+    single-action, so the first action's kind is the plan's tool.
+    """
+    if plan is None or not plan.actions:
+        return None
+    return "arc" if plan.actions[0].kind == ActionKind.ARC_RUN else "t3"
+
+
+_ARC_RESULT_STATES = frozenset({CampaignStateValue.RUNNING_ARC, CampaignStateValue.RESULTS_READY})
+_T3_RESULT_STATES = frozenset({CampaignStateValue.RUNNING_T3, CampaignStateValue.DIAGNOSTICS_READY})
+
+
+def _results_tool(state: CampaignState, plan: Plan | None) -> str | None:
+    """Name the tool whose results the campaign's *current* state came from.
+
+    Both tools persist diagnostics under their own file (``diagnostics.json``
+    for T3, ``arc_diagnostics.json`` for ARC), and a workspace can hold both
+    at once — a campaign that failed out of a T3 flow and was re-planned
+    through ARC keeps the stale T3 file on disk. The dashboard must show the
+    diagnostics belonging to the tool that actually produced the state it is
+    describing, so the choice is keyed on the state (and ``failed_from``
+    when FAILED), never on which file happens to exist:
+
+    * ``RUNNING_ARC`` / ``RESULTS_READY`` → ``"arc"``; ``RUNNING_T3`` /
+      ``DIAGNOSTICS_READY`` → ``"t3"``.
+    * ``FAILED`` → decided by ``failed_from`` the same way. A campaign that
+      failed before any run (or from an unrecorded origin) has no results
+      tool.
+    * ``COMPLETED_PHASE1`` → the state alone cannot say which tool finished
+      the phase, so it falls back to the plan that ran (terminal state, so
+      the plan cannot change from under it).
+    * Any earlier state → None: nothing this campaign's current life has
+      produced results yet.
+    """
+    if state.state in _ARC_RESULT_STATES:
+        return "arc"
+    if state.state in _T3_RESULT_STATES:
+        return "t3"
+    if state.state == CampaignStateValue.FAILED:
+        if state.failed_from in _ARC_RESULT_STATES:
+            return "arc"
+        if state.failed_from in _T3_RESULT_STATES:
+            return "t3"
+        return None
+    if state.state == CampaignStateValue.COMPLETED_PHASE1:
+        return _plan_tool(plan)
+    return None
+
+
 def create_app(workspaces_root: Path | None = None) -> Flask:
     """Create and configure the Carmel Flask application.
 
@@ -214,7 +275,15 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         state = load_state(ws)
         plan_path = ws / "plan.json"
         plan = load_plan(ws) if plan_path.exists() else None
-        diagnostics = load_diagnostics(ws)
+        # Diagnostics are keyed on the tool that produced the current state
+        # (see _results_tool), never loaded unconditionally: a workspace can
+        # hold a stale diagnostics.json from an earlier T3 life next to the
+        # arc_diagnostics.json of the ARC run that owns the current state,
+        # and showing the leftover file would attribute one tool's results
+        # to the other.
+        results_tool = _results_tool(state, plan)
+        diagnostics = load_diagnostics(ws) if results_tool == "t3" else None
+        arc_diagnostics = load_arc_diagnostics(ws) if results_tool == "arc" else None
         events = read_events(ws / "decision_log.jsonl")
         latest_run_path = None
         runs_dir = ws / "runs"
@@ -224,13 +293,19 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         # Only probed while the campaign claims to be running: it is the
         # one state whose truth cannot be read off disk, and the answer
         # decides whether the page shows progress or a way out.
-        liveness = probe_run_liveness(ws) if state.state == CampaignStateValue.RUNNING_T3 else None
+        running_states = (CampaignStateValue.RUNNING_T3, CampaignStateValue.RUNNING_ARC)
+        liveness = probe_run_liveness(ws) if state.state in running_states else None
         return render_template(
             "campaign_dashboard.html",
             campaign=campaign,
             state=state,
             plan=plan,
+            plan_tool=_plan_tool(plan),
+            results_tool=results_tool,
             diagnostics=diagnostics,
+            arc_diagnostics=arc_diagnostics,
+            diagnostics_on_disk=(ws / DIAGNOSTICS_FILE_NAME).exists(),
+            arc_diagnostics_on_disk=(ws / ARC_DIAGNOSTICS_FILE_NAME).exists(),
             events=events[-20:],
             latest_run_path=latest_run_path.name if latest_run_path else None,
             workspace_root=str(ws),
@@ -246,7 +321,13 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         if not can_transition(state.state, CampaignStateValue.PLAN_PENDING_APPROVAL, state.failed_from):
             abort(409, description=f"Cannot plan a campaign in state {state.state.value!r}.")
         campaign = load_campaign(ws)
-        plan = plan_and_save(ws, campaign)
+        tool = request.form.get("tool", "t3")
+        if tool == "t3":
+            plan = plan_and_save(ws, campaign)
+        elif tool == "arc":
+            plan = plan_and_save_arc(ws, campaign, level_of_theory=request.form.get("level_of_theory") or None)
+        else:
+            abort(400, description=f"Unknown planning tool {tool!r}; expected 't3' or 'arc'.")
         update_state(ws, CampaignStateValue.PLAN_PENDING_APPROVAL)
         if not plan.requires_approval:
             update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="auto-approved")
@@ -312,19 +393,37 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         approved = {ApprovalStatus.APPROVED.value, ApprovalStatus.AUTO_APPROVED.value}
         if not decisions or decisions[-1].get("status") not in approved:
             abort(409, description="Action has no recorded approval decision.")
+        # The plan decides the tool: an approved run_arc action must start
+        # ARC, never T3. Both branches share the guards below — approval
+        # check above, transition preflight, and the identical launch-time
+        # error mapping — so neither tool path is softer than the other.
+        if action.kind == ActionKind.ARC_RUN:
+            running_state = CampaignStateValue.RUNNING_ARC
+            start_action = start_arc_action
+        elif action.kind == ActionKind.T3_RUN:
+            running_state = CampaignStateValue.RUNNING_T3
+            start_action = start_t3_action
+        else:
+            abort(409, description=f"Action kind {action.kind.value!r} is not executable from the UI.")
         # Preflight the transition rather than letting it raise out of the
         # service layer as a 500. Re-clicking Run — which the auto-refreshing
         # running dashboard now makes easy to do — must read as a conflict,
         # not a crash.
         current = load_state(ws).state
-        if not can_transition(current, CampaignStateValue.RUNNING_T3):
+        if not can_transition(current, running_state):
             abort(409, description=f"Cannot start a run for a campaign in state {current.value!r}.")
         try:
-            start_t3_action(ws, campaign, action)
+            start_action(ws, campaign, action)
+        except BudgetExceededError as e:
+            # The launch-time re-check found the campaign's remaining budget
+            # (or the live gate generally) no longer covers this action and
+            # no human approval stands for it. Nothing was started; the
+            # dashboard state is unchanged — a conflict, not a crash.
+            abort(409, description=str(e))
         except InvalidTransitionError, RunAlreadySupervisedError:
             # The preflight above is a read, so it cannot be authoritative:
             # a concurrent POST can win the race between it and the locked
-            # transition inside start_t3_action. Whether the loser trips the
+            # transition inside the start call. Whether the loser trips the
             # state check or the run lock first depends only on timing, so
             # both must read as a conflict rather than a 500.
             abort(409, description="A run for this campaign was started concurrently.")
@@ -380,7 +479,11 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
             ws / "decision_log.jsonl",
             {"event": "campaign_recovered", "recovery": "retry", "from_state": state.state.value},
         )
-        flash("Run re-armed. Use Run T3 to start it again.", "info")
+        # The re-armed plan may be an ARC one; naming the wrong tool here
+        # would tell the user to press a button the dashboard does not show.
+        plan = load_plan(ws) if (ws / "plan.json").exists() else None
+        tool_label = "ARC" if _plan_tool(plan) == "arc" else "T3"
+        flash(f"Run re-armed. Use Run {tool_label} to start it again.", "info")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/finalize", methods=["POST"])
@@ -388,9 +491,12 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         """Complete a campaign from diagnostics already persisted on disk.
 
         Covers the run that produced real diagnostics and then failed
-        while being recorded as complete. Re-running a multi-hour T3 job
-        to recover output already sitting in the workspace would be
-        absurd, so this adopts it instead.
+        while being recorded as complete. Re-running a multi-hour T3 or
+        ARC job to recover output already sitting in the workspace would
+        be absurd, so this adopts it instead. The state resumed through —
+        ``DIAGNOSTICS_READY`` (T3) or ``RESULTS_READY`` (ARC) — is decided
+        by where the campaign failed from, and each is gated on its own
+        tool's persisted diagnostics.
         """
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
@@ -398,14 +504,21 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         state = load_state(ws)
         resuming = state.state == CampaignStateValue.FAILED
         if resuming:
-            if not can_transition(state.state, CampaignStateValue.DIAGNOSTICS_READY, state.failed_from):
+            if can_transition(state.state, CampaignStateValue.DIAGNOSTICS_READY, state.failed_from):
+                ready_state = CampaignStateValue.DIAGNOSTICS_READY
+            elif can_transition(state.state, CampaignStateValue.RESULTS_READY, state.failed_from):
+                ready_state = CampaignStateValue.RESULTS_READY
+            else:
                 abort(409, description=f"Cannot complete a campaign in state {state.state.value!r}.")
-        elif state.state != CampaignStateValue.DIAGNOSTICS_READY:
+        elif state.state in (CampaignStateValue.DIAGNOSTICS_READY, CampaignStateValue.RESULTS_READY):
+            ready_state = state.state
+        else:
             abort(409, description=f"Cannot complete a campaign in state {state.state.value!r}.")
-        if load_diagnostics(ws) is None:
+        load_persisted = load_arc_diagnostics if ready_state == CampaignStateValue.RESULTS_READY else load_diagnostics
+        if load_persisted(ws) is None:
             abort(409, description="There are no persisted diagnostics to complete this campaign from.")
         if resuming:
-            update_state(ws, CampaignStateValue.DIAGNOSTICS_READY, notes="recovered: adopting persisted diagnostics")
+            update_state(ws, ready_state, notes="recovered: adopting persisted diagnostics")
         update_state(ws, CampaignStateValue.COMPLETED_PHASE1, notes="recovered: completed from persisted diagnostics")
         append_event(
             ws / "decision_log.jsonl",
@@ -419,18 +532,23 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         """End a run whose supervising Carmel process died.
 
         Refuses while anything is still executing — see
-        :func:`~carmel.services.execution.abandon_t3_run`, which stops an
-        orphaned tool tree before it lets the campaign be called failed.
+        :func:`~carmel.services.execution.abandon_t3_run` /
+        :func:`~carmel.services.execution.abandon_arc_run`, which stop an
+        orphaned tool tree before they let the campaign be called failed.
         """
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
         campaign = load_campaign(ws)
         state = load_state(ws)
-        if state.state != CampaignStateValue.RUNNING_T3:
+        if state.state == CampaignStateValue.RUNNING_T3:
+            abandon_run = abandon_t3_run
+        elif state.state == CampaignStateValue.RUNNING_ARC:
+            abandon_run = abandon_arc_run
+        else:
             abort(409, description=f"Cannot abandon a run for a campaign in state {state.state.value!r}.")
         try:
-            _, report = abandon_t3_run(ws, campaign)
+            _, report = abandon_run(ws, campaign)
         except RunStillLiveError as e:
             abort(409, description=str(e))
         except InvalidTransitionError:
@@ -452,14 +570,28 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
 
     @app.route("/campaigns/<campaign_id>/svg/<artifact>")
     def campaign_svg(campaign_id: str, artifact: str) -> str | tuple[str, int]:
-        """Serve a persisted SVG artifact for the dashboard graphical view."""
+        """Serve a persisted SVG artifact for the dashboard graphical view.
+
+        ``?tool=arc`` serves the ARC run's selection SVGs from
+        ``models/arc/``; the default (``t3``) keeps serving T3's from
+        ``models/``. The two trees are separate on disk for the same reason
+        the diagnostics files are: one tool's artifacts must never be
+        presented as the other's.
+        """
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
         allowed = {"species_selection.svg", "reactions_selection.svg", "pdep_networks_selection.svg"}
         if artifact not in allowed:
             abort(404)
-        path = ws / "models" / artifact
+        tool = request.args.get("tool", "t3")
+        if tool == "t3":
+            models_dir = ws / MODELS_DIR_NAME
+        elif tool == "arc":
+            models_dir = ws / MODELS_DIR_NAME / ARC_MODELS_SUBDIR_NAME
+        else:
+            abort(404)
+        path = models_dir / artifact
         if not path.exists():
             return (
                 '<svg xmlns="http://www.w3.org/2000/svg" width="200" height="40">'

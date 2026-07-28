@@ -13,7 +13,7 @@ class ActionKind(StrEnum):
     """Categories of actions that may require approval."""
 
     T3_RUN = "t3_run"
-    ARC_RUN = "arc_run"  # reserved for future
+    ARC_RUN = "arc_run"
     EXPERIMENT = "experiment"  # reserved for future
     LITERATURE_SEARCH = "literature_search"  # reserved for future
 
@@ -37,8 +37,9 @@ class ApprovalStatus(StrEnum):
 class ApprovalPolicy(BaseModel):
     """Thresholds and rules for auto-approval vs human approval.
 
-    Phase 1 only enforces compute-side T3 thresholds. Other action kinds
-    are scaffolded for future expansion.
+    The compute-side T3 and ARC thresholds are both enforced (see
+    ``carmel.services.approvals.evaluate_action``). Experiment and
+    literature actions are scaffolded for future expansion.
     """
 
     model_config = ConfigDict(extra="forbid")

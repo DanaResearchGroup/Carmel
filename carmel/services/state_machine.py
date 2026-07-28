@@ -79,6 +79,7 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
     CampaignStateValue.APPROVED_FOR_EXECUTION: frozenset(
         {
             CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.RUNNING_ARC,
             CampaignStateValue.FAILED,
         }
     ),
@@ -88,7 +89,19 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
             CampaignStateValue.FAILED,
         }
     ),
+    CampaignStateValue.RUNNING_ARC: frozenset(
+        {
+            CampaignStateValue.RESULTS_READY,
+            CampaignStateValue.FAILED,
+        }
+    ),
     CampaignStateValue.DIAGNOSTICS_READY: frozenset(
+        {
+            CampaignStateValue.COMPLETED_PHASE1,
+            CampaignStateValue.FAILED,
+        }
+    ),
+    CampaignStateValue.RESULTS_READY: frozenset(
         {
             CampaignStateValue.COMPLETED_PHASE1,
             CampaignStateValue.FAILED,
@@ -106,6 +119,7 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
             CampaignStateValue.READY_FOR_PLANNING,
             CampaignStateValue.APPROVED_FOR_EXECUTION,
             CampaignStateValue.DIAGNOSTICS_READY,
+            CampaignStateValue.RESULTS_READY,
         }
     ),
 }
@@ -113,8 +127,10 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
 
 RECOVERY_TARGETS: dict[CampaignStateValue, CampaignStateValue] = {
     CampaignStateValue.RUNNING_T3: CampaignStateValue.APPROVED_FOR_EXECUTION,
+    CampaignStateValue.RUNNING_ARC: CampaignStateValue.APPROVED_FOR_EXECUTION,
     CampaignStateValue.APPROVED_FOR_EXECUTION: CampaignStateValue.APPROVED_FOR_EXECUTION,
     CampaignStateValue.DIAGNOSTICS_READY: CampaignStateValue.DIAGNOSTICS_READY,
+    CampaignStateValue.RESULTS_READY: CampaignStateValue.RESULTS_READY,
 }
 """Where a campaign that failed from a given state may resume *directly*.
 
@@ -155,13 +171,15 @@ def can_transition(
             ``FAILED``. Required to permit the direct resumes:
             ``APPROVED_FOR_EXECUTION`` (retry a tool run of an
             already-approved plan) is allowed only when the campaign failed
-            from ``RUNNING_T3``, and ``DIAGNOSTICS_READY`` (adopt
-            diagnostics already on disk) only when it failed from
-            ``DIAGNOSTICS_READY``. A campaign that failed before planning
-            or approval — from ``DRAFT``, ``VALIDATED``,
-            ``READY_FOR_PLANNING``, ``PLAN_PENDING_APPROVAL``, or
-            ``BLOCKED`` — must go back through the approval gate, and does
-            so via ``READY_FOR_PLANNING``.
+            from ``RUNNING_T3`` or ``RUNNING_ARC``, ``DIAGNOSTICS_READY``
+            (adopt diagnostics already on disk) only when it failed from
+            ``DIAGNOSTICS_READY``, and ``RESULTS_READY`` (adopt ARC results
+            already on disk) only when it failed from ``RESULTS_READY``. A
+            campaign that failed before planning or approval — from
+            ``DRAFT``, ``VALIDATED``, ``READY_FOR_PLANNING``,
+            ``PLAN_PENDING_APPROVAL``, or ``BLOCKED`` — must go back
+            through the approval gate, and does so via
+            ``READY_FOR_PLANNING``.
 
     Returns:
         True if the transition is allowed.

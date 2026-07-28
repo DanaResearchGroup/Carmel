@@ -13,18 +13,25 @@ from flask.testing import FlaskClient
 from werkzeug.test import TestResponse
 
 from carmel.schemas import CampaignStateValue, DiagnosticsV1
-from carmel.schemas.approval import ApprovalPolicy
+from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalStatus
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
-from carmel.services.approvals import save_policy
+from carmel.services.approvals import record_decision, save_policy
 from carmel.services.campaigns import find_campaign_workspace
 from carmel.services.decision_log import read_events
-from carmel.services.execution import save_diagnostics
+from carmel.services.execution import (
+    load_arc_diagnostics,
+    save_arc_diagnostics,
+    save_diagnostics,
+    save_run_record,
+)
 from carmel.services.planner import load_plan
-from carmel.services.recovery import supervise_run
+from carmel.services.recovery import load_active_run, supervise_run
 from carmel.services.state_machine import load_state, update_state
 from carmel.ui import create_app
 from carmel.ui.app import _resolve_workspaces_root
 from tests.helpers import _strand_active_run, _tool_tree
+
+ARC_FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "arc" / "sample_project"
 
 
 @pytest.fixture
@@ -658,7 +665,7 @@ class TestCsrfFieldRendered:
     def test_dashboard_ready_for_planning(self, client: FlaskClient) -> None:
         cid = _create_via_form(client, "render-ready")
         html = client.get(f"/campaigns/{cid}").data.decode()
-        self._assert_every_post_form_has_token(html, expected_forms=2)  # plan + free-text
+        self._assert_every_post_form_has_token(html, expected_forms=3)  # plan (T3) + plan (ARC) + free-text
 
     def test_dashboard_pending_approval(self, client: FlaskClient, workspaces_root: Path) -> None:
         cid, _ = _plan_pending_approval(client, workspaces_root, "render-pending")
@@ -896,6 +903,17 @@ def _failed_campaign(
             CampaignStateValue.RUNNING_T3,
             CampaignStateValue.DIAGNOSTICS_READY,
         ],
+        CampaignStateValue.RUNNING_ARC: [
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_ARC,
+        ],
+        CampaignStateValue.RESULTS_READY: [
+            CampaignStateValue.PLAN_PENDING_APPROVAL,
+            CampaignStateValue.APPROVED_FOR_EXECUTION,
+            CampaignStateValue.RUNNING_ARC,
+            CampaignStateValue.RESULTS_READY,
+        ],
     }[failed_from]
     for step in route:
         update_state(ws, step)
@@ -924,6 +942,8 @@ class TestReplanRoute:
             CampaignStateValue.APPROVED_FOR_EXECUTION,
             CampaignStateValue.RUNNING_T3,
             CampaignStateValue.DIAGNOSTICS_READY,
+            CampaignStateValue.RUNNING_ARC,
+            CampaignStateValue.RESULTS_READY,
         ]
         for index, origin in enumerate(origins):
             cid, ws = _failed_campaign(client, workspaces_root, origin, name=f"wedged-{index}")
@@ -966,6 +986,12 @@ class TestRetryRoute:
         approval through re-planning.
         """
         cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        assert _post(client, f"/campaigns/{cid}/retry", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_a_failed_arc_run_can_be_retried(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """RUNNING_ARC is a first-class running state: retry works for it too."""
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_ARC)
         assert _post(client, f"/campaigns/{cid}/retry", follow_redirects=False).status_code == 302
         assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
 
@@ -1028,6 +1054,49 @@ class TestFinalizeRoute:
         assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
         assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
 
+    @staticmethod
+    def _with_arc_diagnostics(ws: Path) -> None:
+        save_arc_diagnostics(
+            ws,
+            DiagnosticsV1(
+                run_id="recovered-arc-run",
+                campaign_id="c",
+                generated_at=datetime.now(UTC),
+                species_to_compute=[],
+                reactions_to_compute=[],
+                pdep_networks_to_compute=[],
+            ),
+        )
+
+    def test_a_campaign_that_failed_while_finalizing_arc_results_can_adopt_them(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """ARC mirror: FAILED-from-RESULTS_READY finalizes via RESULTS_READY."""
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RESULTS_READY)
+        self._with_arc_diagnostics(ws)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_completing_arc_results_without_arc_diagnostics_is_refused(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """T3 diagnostics must not stand in for ARC's: each path gates on its own."""
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RESULTS_READY)
+        self._with_diagnostics(ws)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 409
+        assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_a_campaign_with_results_ready_can_be_completed(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "results-ready")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        for step in [CampaignStateValue.RUNNING_ARC, CampaignStateValue.RESULTS_READY]:
+            update_state(ws, step)
+        self._with_arc_diagnostics(ws)
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
     def test_a_failure_from_anywhere_else_cannot_be_finalized(self, client: FlaskClient, workspaces_root: Path) -> None:
         cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RUNNING_T3)
         self._with_diagnostics(ws)
@@ -1047,10 +1116,35 @@ class TestAbandonRoute:
         update_state(ws, CampaignStateValue.RUNNING_T3)
         return cid, ws
 
+    @staticmethod
+    def _wedged_arc(client: FlaskClient, workspaces_root: Path, name: str = "orphaned-arc") -> tuple[str, Path]:
+        cid = _create_via_form(client, name)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        return cid, ws
+
     def test_a_run_nobody_is_supervising_can_be_abandoned(self, client: FlaskClient, workspaces_root: Path) -> None:
         cid, ws = self._wedged(client, workspaces_root)
         assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 302
         assert load_state(ws).state == CampaignStateValue.FAILED
+
+    def test_an_arc_run_nobody_is_supervising_can_be_abandoned(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """The abandon route dispatches on the running state, T3 or ARC."""
+        cid, ws = self._wedged_arc(client, workspaces_root)
+        assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 302
+        state = load_state(ws)
+        assert state.state == CampaignStateValue.FAILED
+        assert state.failed_from == CampaignStateValue.RUNNING_ARC
+
+    def test_an_arc_run_still_in_progress_is_refused(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = self._wedged_arc(client, workspaces_root, "live-arc")
+        with supervise_run(ws, "act-1"):
+            assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 409
+        assert load_state(ws).state == CampaignStateValue.RUNNING_ARC
 
     def test_a_run_still_in_progress_is_refused(self, client: FlaskClient, workspaces_root: Path) -> None:
         """Abandoning a live run would race the supervisor's own ending."""
@@ -1137,6 +1231,34 @@ class TestTheDashboardTellsTheTruthAboutRunningCampaigns:
         assert "not being supervised" in html
         assert f"/campaigns/{cid}/abandon" in html
 
+    def test_a_dead_arc_run_stops_promising_progress_and_offers_a_way_out(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """RUNNING_ARC gets the same liveness probe and abandon affordance."""
+        cid = _create_via_form(client, "dead-arc-run")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        html = client.get(f"/campaigns/{cid}").data.decode()
+        assert 'http-equiv="refresh"' not in html
+        assert "not being supervised" in html
+        assert f"/campaigns/{cid}/abandon" in html
+
+    def test_a_live_arc_run_still_refreshes_and_offers_no_escape_hatch(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid = _create_via_form(client, "live-arc-run")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        with supervise_run(ws, "act-1"):
+            html = client.get(f"/campaigns/{cid}").data.decode()
+        assert 'http-equiv="refresh"' in html
+        assert "Run in progress" in html
+        assert f"/campaigns/{cid}/abandon" not in html
+
     def test_a_live_run_still_refreshes_and_offers_no_escape_hatch(
         self, client: FlaskClient, workspaces_root: Path
     ) -> None:
@@ -1197,6 +1319,84 @@ class TestTheDashboardTellsTheTruthAboutRunningCampaigns:
             os.killpg(tree.pgid, signal.SIGKILL)
 
 
+class TestBudgetGateOnRunRoute:
+    """The launch-time budget re-check surfaces as a 409, and only on /run."""
+
+    @staticmethod
+    def _spent(ws: Path, cpu_hours: float) -> None:
+        save_run_record(
+            ws,
+            RunRecord(
+                run_id=f"spent-{cpu_hours}",
+                action_id="earlier-action",
+                tool_name="t3",
+                status=RunStatus.SUCCEEDED,
+                started_at=datetime.now(UTC),
+                ended_at=datetime.now(UTC),
+                estimated_cpu_hours=cpu_hours,
+                actual_cpu_hours=cpu_hours,
+                submission_mode=SubmissionMode.SUBPROCESS,
+            ),
+        )
+
+    def test_running_an_action_the_budget_no_longer_covers_is_a_409(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """An auto-approved plan gone stale must read as a conflict, not a 500.
+
+        The plan auto-approved when the budget (20) was untouched; by run
+        time earlier runs have consumed 19 of it, so the live re-check
+        escalates and no human approval stands.
+        """
+        cid = _create_via_form(client, "budget-gate")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        self._spent(ws, 19.0)
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+        assert response.status_code == 409
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_running_a_rejected_action_is_a_409(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """A human REJECTED decision must refuse the launch, even well within budget.
+
+        The plan auto-approves (budget is untouched), so the live gate alone
+        would launch this — but a human explicitly rejected the action, and
+        that must surface as the same 409 a budget conflict would, not a
+        silent launch.
+        """
+        cid = _create_via_form(client, "budget-gate-rejected")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        action = load_plan(ws).actions[0]
+        record_decision(ws, action.action_id, ApprovalStatus.REJECTED, decided_by="alon")
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+        assert response.status_code == 409
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_finalize_is_never_budget_blocked(self, client: FlaskClient, workspaces_root: Path) -> None:
+        """Adopting already-persisted diagnostics spends nothing new."""
+        cid = _create_via_form(client, "budget-finalize")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        for step in [CampaignStateValue.RUNNING_T3, CampaignStateValue.DIAGNOSTICS_READY]:
+            update_state(ws, step)
+        save_diagnostics(
+            ws,
+            DiagnosticsV1(run_id="r", campaign_id="c", generated_at=datetime.now(UTC)),
+        )
+        self._spent(ws, 100.0)  # far over budget
+
+        assert _post(client, f"/campaigns/{cid}/finalize", follow_redirects=False).status_code == 302
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+
 class TestRecoveryRoutesRequireCsrf:
     @pytest.mark.parametrize("route", ["replan", "retry", "finalize", "abandon"])
     def test_a_post_without_a_token_is_rejected(self, client: FlaskClient, workspaces_root: Path, route: str) -> None:
@@ -1229,3 +1429,427 @@ class TestRecoveryRouteEdgeCases:
 
         monkeypatch.setattr(ui_app, "abandon_t3_run", _lost_the_race)
         assert _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False).status_code == 409
+
+
+# ---------------------------------------------------------------------------
+# ARC through the UI (M8 / issue #12)
+# ---------------------------------------------------------------------------
+
+
+def _create_arc_campaign_via_form(client: FlaskClient, name: str = "arc-e2e") -> str:
+    """Create a campaign whose mixture matches the golden ARC fixture (OH + CH3)."""
+    response = _post(
+        client,
+        "/campaigns/new",
+        data={
+            "workspace_name": name,
+            "mixture_components": "OH,0.05,[OH]\nCH3,0.20,[CH3]",
+            "observables": "ignition_delay",
+            "reactors": "jsr,800,1200,1.0,5.0,1.0",
+            "cpu_hours": "20",
+            "experiment_budget": "0",
+        },
+        follow_redirects=False,
+    )
+    assert response.status_code == 302
+    return response.headers["Location"].rsplit("/", 1)[-1]
+
+
+def _arc_planned(
+    client: FlaskClient,
+    workspaces_root: Path,
+    name: str = "arc-plan",
+    level_of_theory: str | None = None,
+) -> tuple[str, Path]:
+    """Create an ARC campaign and generate its auto-approved run_arc plan."""
+    cid = _create_arc_campaign_via_form(client, name)
+    data = {"tool": "arc"}
+    if level_of_theory:
+        data["level_of_theory"] = level_of_theory
+    assert _post(client, f"/campaigns/{cid}/plan", data=data).status_code == 302
+    ws = find_campaign_workspace(workspaces_root, cid)
+    assert ws is not None
+    return cid, ws
+
+
+class TestArcPlanRoute:
+    """POST /plan with tool=arc is the production caller of generate_arc_plan."""
+
+    def test_tool_arc_generates_a_run_arc_plan(self, client: FlaskClient, workspaces_root: Path) -> None:
+        _cid, ws = _arc_planned(client, workspaces_root)
+        plan = load_plan(ws)
+        assert len(plan.actions) == 1
+        assert plan.actions[0].kind == ActionKind.ARC_RUN
+        # 2 mixture species -> 2 cpu-h: inside the ARC envelope and budget,
+        # so the small action stays auto-approved and immediately runnable.
+        assert not plan.requires_approval
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+    def test_level_of_theory_reaches_the_plan_parameters(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.adapters.arc import MOCK_LEVEL_OF_THEORY
+
+        _cid, ws = _arc_planned(client, workspaces_root, level_of_theory=MOCK_LEVEL_OF_THEORY)
+        assert load_plan(ws).actions[0].parameters["level_of_theory"] == MOCK_LEVEL_OF_THEORY
+
+    def test_the_default_tool_is_still_t3(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "default-t3")
+        assert _post(client, f"/campaigns/{cid}/plan").status_code == 302
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert load_plan(ws).actions[0].kind == ActionKind.T3_RUN
+
+    def test_an_unknown_tool_is_a_400_and_writes_no_plan(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "bad-tool")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert _post(client, f"/campaigns/{cid}/plan", data={"tool": "quantum"}).status_code == 400
+        assert not (ws / "plan.json").exists()
+        assert load_state(ws).state == CampaignStateValue.READY_FOR_PLANNING
+
+
+class TestRunDispatchesOnActionKind:
+    """/run must start the tool the approved plan names — never the other one."""
+
+    @staticmethod
+    def _recorders(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[str]]:
+        from carmel.ui import app as ui_app
+
+        started: dict[str, list[str]] = {"t3": [], "arc": []}
+
+        def _fake_t3(ws: Path, campaign: Any, action: Any) -> None:
+            started["t3"].append(action.action_id)
+
+        def _fake_arc(ws: Path, campaign: Any, action: Any) -> None:
+            started["arc"].append(action.action_id)
+
+        monkeypatch.setattr(ui_app, "start_t3_action", _fake_t3)
+        monkeypatch.setattr(ui_app, "start_arc_action", _fake_arc)
+        return started
+
+    def test_an_arc_plan_starts_arc_not_t3(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started = self._recorders(monkeypatch)
+        cid, ws = _arc_planned(client, workspaces_root, name="dispatch-arc")
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 302
+        assert started["arc"] == [load_plan(ws).actions[0].action_id]
+        assert started["t3"] == []
+
+    def test_a_t3_plan_starts_t3_not_arc(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        started = self._recorders(monkeypatch)
+        cid = _create_via_form(client, "dispatch-t3")
+        _post(client, f"/campaigns/{cid}/plan")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 302
+        assert started["t3"] == [load_plan(ws).actions[0].action_id]
+        assert started["arc"] == []
+
+    def test_rerunning_a_running_arc_campaign_is_a_conflict(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The preflight must check RUNNING_ARC for an ARC plan, not RUNNING_T3."""
+        started = self._recorders(monkeypatch)
+        cid, ws = _arc_planned(client, workspaces_root, name="arc-conflict")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
+        assert started == {"t3": [], "arc": []}
+
+    def test_a_kind_no_tool_runs_is_a_conflict_not_a_misdispatch(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An approved plan holding a non-runnable kind must start nothing."""
+        from carmel.services.planner import save_plan
+
+        started = self._recorders(monkeypatch)
+        cid, ws = _arc_planned(client, workspaces_root, name="odd-kind")
+        plan = load_plan(ws)
+        action = plan.actions[0].model_copy(update={"kind": ActionKind.EXPERIMENT})
+        save_plan(ws, plan.model_copy(update={"actions": [action]}))
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 409
+        assert started == {"t3": [], "arc": []}
+
+
+class TestArcSvgRoute:
+    """?tool=arc serves the ARC run's SVGs from models/arc/, never T3's."""
+
+    def test_each_tool_gets_its_own_svg_tree(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "svg-trees")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        (ws / "models").mkdir(parents=True, exist_ok=True)
+        (ws / "models" / "species_selection.svg").write_text("<svg>from-t3</svg>", encoding="utf-8")
+        (ws / "models" / "arc").mkdir(parents=True, exist_ok=True)
+        (ws / "models" / "arc" / "species_selection.svg").write_text("<svg>from-arc</svg>", encoding="utf-8")
+
+        arc = client.get(f"/campaigns/{cid}/svg/species_selection.svg?tool=arc")
+        assert arc.status_code == 200
+        assert b"from-arc" in arc.data
+        assert b"from-t3" not in arc.data
+
+        t3 = client.get(f"/campaigns/{cid}/svg/species_selection.svg")
+        assert b"from-t3" in t3.data
+
+    def test_a_missing_arc_svg_returns_the_placeholder(self, client: FlaskClient) -> None:
+        cid = _create_via_form(client, "svg-missing")
+        response = client.get(f"/campaigns/{cid}/svg/species_selection.svg?tool=arc")
+        assert response.status_code == 200
+        assert b"no diagnostics yet" in response.data
+
+    def test_an_unknown_tool_is_a_404(self, client: FlaskClient) -> None:
+        cid = _create_via_form(client, "svg-bad-tool")
+        assert client.get(f"/campaigns/{cid}/svg/species_selection.svg?tool=rmg").status_code == 404
+
+
+def _diagnostics(run_id: str) -> DiagnosticsV1:
+    return DiagnosticsV1(
+        run_id=run_id,
+        campaign_id="c",
+        generated_at=datetime.now(UTC),
+        species_to_compute=[],
+        reactions_to_compute=[],
+        pdep_networks_to_compute=[],
+    )
+
+
+class TestDashboardArcResults:
+    """The dashboard attributes results to the tool that produced them."""
+
+    def test_arc_results_show_arc_diagnostics_and_hide_stale_t3_ones(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """A workspace can hold both files; only the state-owning tool's shows.
+
+        This is the stale-diagnostics cross-contamination case: a campaign
+        whose earlier life left a T3 diagnostics.json behind and whose
+        current state came from ARC must not present the T3 file.
+        """
+        cid, ws = _arc_planned(client, workspaces_root, name="arc-results")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        update_state(ws, CampaignStateValue.RESULTS_READY)
+        save_arc_diagnostics(ws, _diagnostics("arc-run-live"))
+        save_diagnostics(ws, _diagnostics("t3-run-stale"))
+
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"arc-run-live" in page
+        assert b"t3-run-stale" not in page
+        assert "Diagnostics · ARC".encode() in page
+
+    def test_the_finalize_button_is_offered_at_results_ready(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = _arc_planned(client, workspaces_root, name="arc-finalize")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        update_state(ws, CampaignStateValue.RESULTS_READY)
+        save_arc_diagnostics(ws, _diagnostics("arc-run-ready"))
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"Complete phase 1" in page
+
+    def test_t3_results_hide_stale_arc_diagnostics(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid = _create_via_form(client, "t3-results")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        _post(client, f"/campaigns/{cid}/plan")
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        update_state(ws, CampaignStateValue.DIAGNOSTICS_READY)
+        save_diagnostics(ws, _diagnostics("t3-run-live"))
+        save_arc_diagnostics(ws, _diagnostics("arc-run-stale"))
+
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"t3-run-live" in page
+        assert b"arc-run-stale" not in page
+        assert "Diagnostics · T3".encode() in page
+
+    def test_a_campaign_with_no_results_shows_neither_tools_leftovers(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """Before any run, files on disk (however they got there) stay unattributed."""
+        cid = _create_via_form(client, "no-results")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        save_diagnostics(ws, _diagnostics("t3-run-old"))
+        save_arc_diagnostics(ws, _diagnostics("arc-run-old"))
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"t3-run-old" not in page
+        assert b"arc-run-old" not in page
+        assert b"No diagnostics yet" in page
+
+    def test_a_campaign_that_failed_from_arc_results_still_shows_its_arc_diagnostics(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """FAILED-from-RESULTS_READY is an ARC outcome: the dashboard shows the
+        persisted ARC diagnostics (and the recovery card offers to complete
+        from them), not a stale T3 file."""
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.RESULTS_READY, name="failed-arc")
+        save_arc_diagnostics(ws, _diagnostics("arc-run-failed-late"))
+        save_diagnostics(ws, _diagnostics("t3-run-stale"))
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"arc-run-failed-late" in page
+        assert b"t3-run-stale" not in page
+        assert b"Complete from persisted diagnostics" in page
+
+    def test_a_campaign_that_failed_before_running_shows_neither_tools_leftovers(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """FAILED from a pre-run origin has no results tool to attribute to."""
+        cid, ws = _failed_campaign(client, workspaces_root, CampaignStateValue.READY_FOR_PLANNING, name="failed-early")
+        save_diagnostics(ws, _diagnostics("t3-run-old"))
+        save_arc_diagnostics(ws, _diagnostics("arc-run-old"))
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"t3-run-old" not in page
+        assert b"arc-run-old" not in page
+
+    def test_the_run_button_names_the_planned_tool(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, _ws = _arc_planned(client, workspaces_root, name="arc-button")
+        assert b"Run ARC" in client.get(f"/campaigns/{cid}").data
+
+        t3_cid = _create_via_form(client, "t3-button")
+        _post(client, f"/campaigns/{t3_cid}/plan")
+        assert b"Run T3" in client.get(f"/campaigns/{t3_cid}").data
+
+    def test_the_retry_flash_names_the_planned_tool(self, client: FlaskClient, workspaces_root: Path) -> None:
+        cid, ws = _arc_planned(client, workspaces_root, name="arc-retry")
+        update_state(ws, CampaignStateValue.RUNNING_ARC)
+        update_state(ws, CampaignStateValue.FAILED, notes="arc run failed")
+        response = _post(client, f"/campaigns/{cid}/retry", follow_redirects=True)
+        assert b"Use Run ARC" in response.data
+
+
+class TestBudgetGateOnArcRunRoute:
+    """The M9 launch-time re-check guards the ARC path exactly like T3's."""
+
+    def test_an_over_budget_arc_launch_is_a_409_and_wedges_nothing(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        cid, ws = _arc_planned(client, workspaces_root, name="arc-budget")
+        # The plan auto-approved against an untouched budget of 20; by run
+        # time 19 are consumed, so remaining (1) < the action's estimate (2).
+        save_run_record(
+            ws,
+            RunRecord(
+                run_id="spent-earlier",
+                action_id="earlier-action",
+                tool_name="t3",
+                status=RunStatus.SUCCEEDED,
+                started_at=datetime.now(UTC),
+                ended_at=datetime.now(UTC),
+                estimated_cpu_hours=19.0,
+                actual_cpu_hours=19.0,
+                submission_mode=SubmissionMode.SUBPROCESS,
+            ),
+        )
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+        assert response.status_code == 409
+        # Nothing was taken: state untouched, no in-flight record, lock free.
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert load_active_run(ws) is None
+        with supervise_run(ws, "prove-the-lock-is-free"):
+            pass
+
+
+class TestMockterThroughCarmelEndToEnd:
+    """ARC driven through the full Carmel stack via the Mockter level of theory.
+
+    The user-visible arc, exercised through the same Flask routes a browser
+    hits: create → plan (run_arc, Mockter) → auto-approve → /run →
+    RESULTS_READY → COMPLETED_PHASE1 → dashboard shows ARC diagnostics.
+
+    This fast variant replays the golden Mockter fixture
+    (tests/fixtures/arc/sample_project/, captured from a real Mockter run)
+    through the REAL ARCAdapter — only the subprocess boundary is stubbed —
+    so input building, output normalization, run-record persistence, the
+    background execution service, and the UI wiring are all real. The
+    @requires_arc peer that launches the real Mockter subprocess lives in
+    tests/test_arc_adapter.py::TestARCAdapterRealSubprocess, where the CI
+    tools lane refuses to let it skip.
+    """
+
+    @staticmethod
+    def _replay_fixture(monkeypatch: pytest.MonkeyPatch) -> None:
+        import shutil
+
+        import yaml
+
+        from carmel.adapters import arc as arc_module
+        from carmel.adapters.arc import arc_info_filename
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+
+        class _Completed:
+            returncode = 0
+
+        class _ProbeCompleted:
+            returncode = 1  # the version probe (cwd=None) returns None harmlessly
+
+        def _fake_run(command: list[str], cwd: Path | None = None, **kwargs: object) -> object:
+            if cwd is None:
+                return _ProbeCompleted()
+            run_dir = Path(cwd)
+            payload = yaml.safe_load((run_dir / "input.yml").read_text())
+            shutil.copy(ARC_FIXTURE_ROOT / "carmel_mock_opt_info.yml", run_dir / arc_info_filename(payload))
+            (run_dir / "output").mkdir(exist_ok=True)
+            shutil.copy(ARC_FIXTURE_ROOT / "output" / "output.yml", run_dir / "output" / "output.yml")
+            return _Completed()
+
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _fake_run)
+
+    @staticmethod
+    def _capture_arc_threads(monkeypatch: pytest.MonkeyPatch) -> list[threading.Thread]:
+        from carmel.ui import app as ui_app
+
+        threads: list[threading.Thread] = []
+        real_start = ui_app.start_arc_action
+
+        def _capture(ws: Path, campaign: Any, action: Any) -> threading.Thread:
+            thread = real_start(ws, campaign, action)
+            threads.append(thread)
+            return thread
+
+        monkeypatch.setattr(ui_app, "start_arc_action", _capture)
+        return threads
+
+    def test_mockter_plan_approve_run_results_dashboard(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters.arc import MOCK_LEVEL_OF_THEORY
+
+        self._replay_fixture(monkeypatch)
+        threads = self._capture_arc_threads(monkeypatch)
+
+        cid, ws = _arc_planned(client, workspaces_root, name="mockter-e2e", level_of_theory=MOCK_LEVEL_OF_THEORY)
+        plan = load_plan(ws)
+        action = plan.actions[0]
+        assert action.kind == ActionKind.ARC_RUN
+        assert action.parameters["level_of_theory"] == MOCK_LEVEL_OF_THEORY
+        # The small Mockter action clears the combined gate: auto-approved,
+        # so /run needs no human decision and M9 enforcement does not block.
+        assert not plan.requires_approval
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+
+        assert _post(client, f"/campaigns/{cid}/run", follow_redirects=False).status_code == 302
+        assert threads, "the run route never started an ARC action"
+        for thread in threads:
+            thread.join(timeout=120)
+            assert not thread.is_alive()
+
+        # COMPLETED_PHASE1 is only reachable through RESULTS_READY, so the
+        # terminal state proves the whole ARC state arc was walked.
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+        events = read_events(ws / "decision_log.jsonl")
+        finished = [e for e in events if e.get("event") == "arc_run_finished"]
+        assert finished and finished[-1].get("status") == "succeeded"
+
+        diagnostics = load_arc_diagnostics(ws)
+        assert diagnostics is not None
+        assert sorted(s.label for s in diagnostics.species_to_compute) == ["CH3", "OH"]
+        assert diagnostics.level_of_theory == MOCK_LEVEL_OF_THEORY
+
+        page = client.get(f"/campaigns/{cid}").data
+        assert b"completed_phase1" in page
+        assert "Diagnostics · ARC".encode() in page
+        assert diagnostics.run_id.encode() in page
+
+        svg = client.get(f"/campaigns/{cid}/svg/species_selection.svg?tool=arc")
+        assert svg.status_code == 200
+        assert b"<svg" in svg.data
+        assert b"no diagnostics yet" not in svg.data

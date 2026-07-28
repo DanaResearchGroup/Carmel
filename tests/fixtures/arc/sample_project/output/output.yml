@@ -1,0 +1,110 @@
+arc_git_commit: b0dd288c75163af3ff9d877f1c113a624a94f2d8
+arc_version: 1.1.0
+arkane_git_commit: dfc4df8682106b1b8393c92633d3f51c3d95607f
+arkane_level_of_theory:
+  basis: cc-pvmockz
+  method: ccsd(t)-mock12
+  method_type: wavefunction
+  software: mockter
+atom_energy_corrections: null
+bac_type: p
+bond_additivity_corrections: null
+composite_method: null
+datetime_completed: 2026-07-26 11:38
+datetime_started: 2026-07-26 11:38
+freq_level: null
+freq_scale_factor: null
+freq_scale_factor_source: null
+opt_level:
+  basis: def2tzmockp
+  method: b2plypdmock
+  method_type: dft
+  software: mockter
+project: carmel_mock_opt
+reactions: []
+schema_version: '1.0'
+sp_level:
+  basis: cc-pvmockz
+  method: ccsd(t)-mock12
+  method_type: wavefunction
+  software: mockter
+species:
+- charge: 0
+  coarse_opt_final_energy_hartree: null
+  coarse_opt_log: null
+  coarse_opt_n_steps: null
+  converged: true
+  ess_versions: null
+  formula: HO
+  freq_log: null
+  freq_n_imag: 0
+  imag_freq_cm1: null
+  inchi: InChI=1S/HO/h1H
+  inchi_key: TUJKJAMUKRIRHC-UHFFFAOYSA-N
+  is_ts: false
+  label: OH
+  multiplicity: 2
+  opt_converged: true
+  opt_final_energy_hartree: null
+  opt_log: calcs/Species/OH/opt_a1656/output.yml
+  opt_n_steps: null
+  original_label: null
+  smiles: '[OH]'
+  sp_energy_hartree: null
+  sp_log: null
+  statmech:
+    e0_kj_mol: null
+    external_symmetry: null
+    harmonic_frequencies_cm1: null
+    is_linear: null
+    optical_isomers: null
+    point_group: Cinfv
+    rigid_rotor_kind: asymmetric_top
+    spin_multiplicity: 2
+    torsions: []
+  thermo: null
+  xyz: |-
+    O       0.00000000    0.00000000    0.61310000
+    H       0.00000000    0.00000000   -0.61310000
+  zpe_hartree: null
+- charge: 0
+  coarse_opt_final_energy_hartree: null
+  coarse_opt_log: null
+  coarse_opt_n_steps: null
+  converged: true
+  ess_versions: null
+  formula: CH3
+  freq_log: null
+  freq_n_imag: 0
+  imag_freq_cm1: null
+  inchi: InChI=1S/CH3/h1H3
+  inchi_key: WCYWZMWISLQXQU-UHFFFAOYSA-N
+  is_ts: false
+  label: CH3
+  multiplicity: 2
+  opt_converged: true
+  opt_final_energy_hartree: null
+  opt_log: calcs/Species/CH3/opt_a1657/output.yml
+  opt_n_steps: null
+  original_label: null
+  smiles: '[CH3]'
+  sp_energy_hartree: null
+  sp_log: null
+  statmech:
+    e0_kj_mol: null
+    external_symmetry: null
+    harmonic_frequencies_cm1: null
+    is_linear: null
+    optical_isomers: null
+    point_group: D3h
+    rigid_rotor_kind: asymmetric_top
+    spin_multiplicity: 2
+    torsions: []
+  thermo: null
+  xyz: |-
+    C       0.00000000    0.00000001   -0.00000000
+    H       1.06690511   -0.17519582    0.05416493
+    H      -0.68531716   -0.83753536   -0.02808565
+    H      -0.38158795    1.01273118   -0.02607927
+  zpe_hartree: null
+transition_states: []

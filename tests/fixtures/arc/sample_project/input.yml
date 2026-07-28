@@ -1,0 +1,17 @@
+project: carmel_mock_opt
+level_of_theory: CCSD(T)-Mock12/cc-pVMockZ//B2PLYPDMock/Def2TZMockP
+compute_thermo: false
+ts_adapters: []
+job_types:
+  conf_opt: false
+  fine: false
+  freq: false
+  sp: false
+  rotors: false
+  bde: false
+  opt: true
+species:
+  - label: OH
+    smiles: '[OH]'
+  - label: CH3
+    smiles: '[CH3]'

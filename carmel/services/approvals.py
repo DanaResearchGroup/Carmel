@@ -17,7 +17,7 @@ from carmel.schemas.approval import (
 from carmel.schemas.campaign import Budgets
 from carmel.schemas.plan import PlannedAction
 from carmel.services.artifacts import read_yaml, write_yaml
-from carmel.services.decision_log import append_event
+from carmel.services.decision_log import append_event, read_events
 
 POLICY_FILE_NAME = "approval_policy.yaml"
 
@@ -90,6 +90,77 @@ def evaluate_action(
             return ApprovalRequirement.REQUIRES_APPROVAL
         return ApprovalRequirement.AUTO_APPROVED
     return ApprovalRequirement.REQUIRES_APPROVAL
+
+
+def has_effective_human_approval(workspace_root: Path, action_id: str) -> bool:
+    """Report whether a human's standing approval authorizes this action.
+
+    Effective means: the *latest* human decision (``APPROVED`` or
+    ``REJECTED``) recorded for the action is ``APPROVED``. Non-human
+    statuses are deliberately ignored on both sides:
+
+    * ``AUTO_APPROVED`` records do not count — an auto-approval is only
+      valid while the live gate still auto-approves, so it can never
+      authorize a launch the live gate escalates (e.g. a stale
+      auto-approval from before the budget ran out).
+    * ``PENDING`` records (written when a budget violation is detected at
+      planning time) do not revoke a human's explicit approval — a human
+      who approved an over-budget action has overridden the budget, and a
+      retry of that action must still launch.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        action_id: The action being launched.
+
+    Returns:
+        True if the latest human decision for the action is ``APPROVED``.
+    """
+    return _latest_human_decision_status(workspace_root, action_id) == ApprovalStatus.APPROVED.value
+
+
+def has_effective_human_rejection(workspace_root: Path, action_id: str) -> bool:
+    """Report whether a human's standing decision refuses this action.
+
+    Mirror of :func:`has_effective_human_approval`: effective means the
+    *latest* human decision (``APPROVED`` or ``REJECTED``) recorded for the
+    action is ``REJECTED``. As with the approval side, ``AUTO_APPROVED``
+    and ``PENDING`` records are ignored on both sides — only an explicit
+    human decision can flip this, and a later ``APPROVED`` always
+    supersedes an earlier ``REJECTED`` for the same action.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        action_id: The action being launched.
+
+    Returns:
+        True if the latest human decision for the action is ``REJECTED``.
+    """
+    return _latest_human_decision_status(workspace_root, action_id) == ApprovalStatus.REJECTED.value
+
+
+def _latest_human_decision_status(workspace_root: Path, action_id: str) -> str | None:
+    """Return the latest human (``APPROVED``/``REJECTED``) decision status for an action.
+
+    ``AUTO_APPROVED`` and ``PENDING`` records are ignored: they are not
+    human decisions, so they can neither authorize nor revoke one.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        action_id: The action being decided on.
+
+    Returns:
+        The latest human decision's status value, or ``None`` if no human
+        decision has been recorded for this action.
+    """
+    human_statuses = {ApprovalStatus.APPROVED.value, ApprovalStatus.REJECTED.value}
+    last_human: str | None = None
+    for event in read_events(workspace_root / "decision_log.jsonl"):
+        if event.get("event") != "approval_decision" or event.get("action_id") != action_id:
+            continue
+        status = event.get("status")
+        if status in human_statuses:
+            last_human = str(status)
+    return last_human
 
 
 def record_decision(

@@ -55,6 +55,12 @@ class ActiveRun(BaseModel):
 
     action_id: str = Field(min_length=1)
     started_at: datetime
+    estimated_cpu_hours: float = Field(default=0.0, ge=0)
+    """The launched action's estimated cost, reserved against the campaign
+    budget while the run is in flight (see
+    :func:`carmel.services.spend.compute_spend`). Defaults to ``0.0`` so
+    records written before this field existed still load."""
+
     supervisor_pid: int = Field(gt=0)
     """The Carmel process that started the run. Recorded for operators to
     read; liveness is never inferred from it, because a pid outlives its

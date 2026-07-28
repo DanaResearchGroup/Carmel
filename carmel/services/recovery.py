@@ -338,12 +338,16 @@ class RunSupervision:
             self._lock_file.close()
 
 
-def start_supervision(workspace_root: Path, action_id: str) -> RunSupervision:
+def start_supervision(workspace_root: Path, action_id: str, estimated_cpu_hours: float = 0.0) -> RunSupervision:
     """Take the run lock and write the in-flight record for one T3 run.
 
     Args:
         workspace_root: The campaign workspace root.
         action_id: The planned action being run.
+        estimated_cpu_hours: The action's estimated cost, recorded on the
+            in-flight record so the run is *reserved* against the campaign
+            budget while nothing under ``runs/`` accounts for it yet (see
+            :func:`carmel.services.spend.compute_spend`).
 
     Returns:
         The held :class:`RunSupervision`. The caller owns it and must
@@ -370,7 +374,12 @@ def start_supervision(workspace_root: Path, action_id: str) -> RunSupervision:
     try:
         write_json(
             active_run_path(workspace_root),
-            ActiveRun(action_id=action_id, started_at=datetime.now(UTC), supervisor_pid=os.getpid()),
+            ActiveRun(
+                action_id=action_id,
+                started_at=datetime.now(UTC),
+                estimated_cpu_hours=estimated_cpu_hours,
+                supervisor_pid=os.getpid(),
+            ),
         )
     except OSError:
         fcntl.flock(lock_file, fcntl.LOCK_UN)
@@ -380,7 +389,7 @@ def start_supervision(workspace_root: Path, action_id: str) -> RunSupervision:
 
 
 @contextlib.contextmanager
-def supervise_run(workspace_root: Path, action_id: str) -> Iterator[RunSupervision]:
+def supervise_run(workspace_root: Path, action_id: str, estimated_cpu_hours: float = 0.0) -> Iterator[RunSupervision]:
     """Hold the run lock and the in-flight record for the duration of a block.
 
     The scoped form of :func:`start_supervision`, for callers that both
@@ -389,6 +398,8 @@ def supervise_run(workspace_root: Path, action_id: str) -> Iterator[RunSupervisi
     Args:
         workspace_root: The campaign workspace root.
         action_id: The planned action being run.
+        estimated_cpu_hours: The action's estimated cost, reserved on the
+            in-flight record — see :func:`start_supervision`.
 
     Yields:
         The held :class:`RunSupervision`.
@@ -398,7 +409,7 @@ def supervise_run(workspace_root: Path, action_id: str) -> Iterator[RunSupervisi
             this campaign's run lock.
         LockStateUnknownError: If the lock could not be interrogated.
     """
-    supervision = start_supervision(workspace_root, action_id)
+    supervision = start_supervision(workspace_root, action_id, estimated_cpu_hours)
     try:
         yield supervision
     finally:

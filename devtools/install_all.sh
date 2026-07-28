@@ -54,6 +54,6 @@ Done. To use Carmel:
     conda activate $CARMEL_ENV
     carmel --help
 
-The tool paths (T3_CONDA_ENV, T3_PATH, RMG_PATH, RMG_DB_PATH) are exported by
-that activation, so nothing else has to be set by hand.
+The tool paths (T3_CONDA_ENV, T3_PATH, ARC_PATH, RMG_PATH, RMG_DB_PATH) are
+exported by that activation, so nothing else has to be set by hand.
 EOF

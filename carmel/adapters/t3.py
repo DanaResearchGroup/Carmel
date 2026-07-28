@@ -31,16 +31,10 @@ locally if T3 cannot actually be imported.
 
 from __future__ import annotations
 
-import atexit
-import contextlib
 import importlib.util
 import os
 import shutil
-import signal
 import subprocess
-import sys
-import threading
-import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -50,6 +44,7 @@ from uuid import uuid4
 
 import yaml
 
+from carmel.adapters import _launcher
 from carmel.logger import get_logger
 from carmel.schemas.campaign import Campaign, MixtureComponent, ReactorSystem, ReactorType
 from carmel.schemas.diagnostics import (
@@ -146,6 +141,14 @@ T3_TOOL_NAME: str = "t3"
 
 _log = get_logger("adapters.t3")
 
+# Precedence-ordered sources for T3's resolved interpreter/environment, shared
+# by _launcher.launch_command/conda_env_error. A conda env, if set, always
+# wins over a bare interpreter path.
+_T3_SOURCES: list[tuple[str, str]] = [
+    ("conda", T3_LAYOUT.T3_CONDA_ENV_VAR),
+    ("python", T3_LAYOUT.T3_PYTHON_ENV_VAR),
+]
+
 # Keeps is_t3_importable()/_t3_version()/_t3_conda_env_error() subprocess
 # probes bounded so they can never hang a CI run. This budgets for the full
 # cold-start cost under the three-env deployment model: `conda run` first
@@ -187,73 +190,25 @@ _RUN_TIMEOUT_BUFFER_S: float = 600.0
 # ---------------------------------------------------------------------------
 
 
-# Every tool process tree currently running, so interpreter shutdown can take
-# them with it. A run executes on a daemon thread, which is *not* joined at
-# exit, so without this a stopped server leaves T3 and RMG running with no
-# supervisor — the same orphaning this module exists to prevent, one layer up.
-# It cannot help when Carmel is SIGKILLed; nothing running in Carmel can.
-_LIVE_TREES: set[subprocess.Popen[Any]] = set()
-_LIVE_TREES_LOCK = threading.Lock()
-
-
-def _register_live_tree(proc: subprocess.Popen[Any]) -> None:
-    """Track *proc* so it can be killed if the interpreter shuts down.
-
-    Args:
-        proc: A process started with ``start_new_session=True``.
-    """
-    with _LIVE_TREES_LOCK:
-        _LIVE_TREES.add(proc)
-
-
-def _forget_live_tree(proc: subprocess.Popen[Any]) -> None:
-    """Stop tracking *proc*; it has finished or has already been killed.
-
-    Args:
-        proc: The process to forget.
-    """
-    with _LIVE_TREES_LOCK:
-        _LIVE_TREES.discard(proc)
-
-
-def _terminate_live_trees() -> None:
-    """Kill every still-running tool process tree. Registered with ``atexit``."""
-    with _LIVE_TREES_LOCK:
-        survivors = [proc for proc in _LIVE_TREES if proc.poll() is None]
-    for proc in survivors:
-        _log.warning("Interpreter is shutting down; killing the T3 process tree at pid %s", proc.pid)
-        with contextlib.suppress(Exception):
-            _terminate_process_tree(proc)
-
-
-atexit.register(_terminate_live_trees)
+# Process-tree lifecycle (registry, atexit sweep, terminate, run-in-group) now
+# lives in carmel.adapters._launcher, shared with the ARC adapter. The names
+# below are re-exported from there so existing monkeypatches/attribute access
+# on this module (``t3._LIVE_TREES``, ``t3._register_live_tree``, etc.)
+# continue to work unchanged.
+_LIVE_TREES = _launcher._LIVE_TREES
+_LIVE_TREES_LOCK = _launcher._LIVE_TREES_LOCK
+_register_live_tree = _launcher._register_live_tree
+_forget_live_tree = _launcher._forget_live_tree
+_terminate_live_trees = _launcher._terminate_live_trees
 
 
 def _terminate_process_tree(proc: subprocess.Popen[Any], grace_period_s: float | None = None) -> None:
     """Kill *proc* and every descendant sharing its process group, then reap it.
 
-    *proc* must have been started with ``start_new_session=True``, which
-    makes it the leader of a brand-new process group whose id equals its
-    pid — so its pid doubles as the group id, and no ``getpgid`` lookup
-    that could race with the child exiting is needed.
-
-    The escalation is SIGTERM, then SIGKILL after *grace_period_s*, and
-    the direct child is reaped **last**. That ordering is the whole point:
-    an unreaped child — even a zombie — keeps its pid, and therefore the
-    group id, reserved, so the SIGKILL cannot land on an unrelated process
-    that recycled the pid in the meantime.
-
-    Nothing here polls the child during the grace period, deliberately.
-    ``Popen.poll`` *reaps* an exited child, which would release exactly the
-    pid this function still needs reserved. Buying an early exit with that
-    reservation is what makes the recycling race real, so the full grace is
-    waited out instead and the SIGKILL is sent unconditionally — signalling
-    an already-empty group is a harmless ESRCH. This is the timeout path;
-    it has already waited hours, and a few more seconds cost nothing.
-
-    On a platform without ``os.killpg`` (i.e. not POSIX) this degrades to
-    killing the direct child only, which is what the standard library
-    would have done anyway.
+    Thin wrapper over :func:`carmel.adapters._launcher.terminate_process_tree`
+    that supplies T3's own grace period default, logger, and tool label. The
+    actual kill/reap machinery lives in :mod:`carmel.adapters._launcher`,
+    shared with the ARC adapter.
 
     Args:
         proc: The running child process.
@@ -264,35 +219,7 @@ def _terminate_process_tree(proc: subprocess.Popen[Any], grace_period_s: float |
     """
     if grace_period_s is None:
         grace_period_s = _KILL_GRACE_PERIOD_S
-    if not hasattr(os, "killpg"):  # pragma: no cover -- POSIX-only branch
-        proc.kill()
-        proc.wait()
-        return
-
-    pgid = proc.pid
-    # A group that is already gone is a success, not an error: the tree can
-    # exit between the timeout firing and the signal being delivered.
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGTERM)
-    time.sleep(grace_period_s)
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(pgid, signal.SIGKILL)
-
-    # Bounded, because an unbounded wait here would hang the calling thread
-    # forever in the one case that matters: a SIGKILL that never landed.
-    try:
-        proc.wait(timeout=grace_period_s)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError):
-            proc.kill()
-        try:
-            proc.wait(timeout=grace_period_s)
-        except subprocess.TimeoutExpired:
-            _log.error(
-                "Could not reap process %s after SIGKILL; a T3 process tree may still be running as group %s",
-                proc.pid,
-                pgid,
-            )
+    _launcher.terminate_process_tree(proc, grace_period_s=grace_period_s, logger=_log, tool_label="T3")
 
 
 def _run_in_process_group(
@@ -307,11 +234,9 @@ def _run_in_process_group(
 ) -> subprocess.CompletedProcess[Any]:
     """Run *command* in its own process group, killing the whole tree on timeout.
 
-    A drop-in replacement for ``subprocess.run(...)`` for every call that
-    launches T3 (directly or through ``conda run``). The difference is the
-    only one that matters here: when the timeout expires, or the calling
-    thread is interrupted, every descendant is killed rather than just the
-    process Carmel happens to hold a handle to.
+    Thin wrapper over :func:`carmel.adapters._launcher.run_in_process_group`
+    that supplies T3's own :func:`_terminate_process_tree` as the kill
+    callback, so T3's grace period/logger apply on timeout.
 
     Args:
         command: The argv to execute.
@@ -334,48 +259,20 @@ def _run_in_process_group(
             has already been killed and reaped when this propagates.
         OSError: If the child cannot be spawned at all.
     """
-    proc: subprocess.Popen[Any] = subprocess.Popen(  # noqa: S603 -- resolved, locally-configured commands only
+    return _launcher.run_in_process_group(
         command,
+        timeout=timeout,
         cwd=cwd,
         stdout=stdout,
         stderr=stderr,
         text=text,
-        start_new_session=True,
+        terminate=_terminate_process_tree,
+        register=_register_live_tree,
+        forget=_forget_live_tree,
+        drain_timeout=_KILL_GRACE_PERIOD_S,
+        on_process_start=on_process_start,
+        logger=_log,
     )
-    _register_live_tree(proc)
-    try:
-        if on_process_start is not None:
-            try:
-                on_process_start(proc.pid, command)
-            except BaseException:
-                # A tree nothing can identify is worse than no tree at
-                # all. It would outlive this process unrecorded, and a
-                # later recovery reads such a run exactly like one that
-                # never launched — so it would offer to abandon a campaign
-                # whose tool is still writing into it. Stop what was just
-                # started rather than run it blind.
-                _log.error("Could not record the process group of pid %s; stopping it", proc.pid)
-                _terminate_process_tree(proc)
-                with contextlib.suppress(Exception):
-                    proc.communicate(timeout=_KILL_GRACE_PERIOD_S)
-                raise
-        try:
-            captured_stdout, captured_stderr = proc.communicate(timeout=timeout)
-        except BaseException:
-            # Covers TimeoutExpired and anything that interrupts the wait
-            # (KeyboardInterrupt, a thread being torn down): in every case
-            # the tree must not outlive the call that started it.
-            _terminate_process_tree(proc)
-            # Drain and close the pipes. communicate() abandoned them when
-            # it raised, and the tree is dead now, so this returns
-            # immediately — without it the read ends stay open until the
-            # Popen is collected.
-            with contextlib.suppress(Exception):
-                proc.communicate(timeout=_KILL_GRACE_PERIOD_S)
-            raise
-    finally:
-        _forget_live_tree(proc)
-    return subprocess.CompletedProcess(command, proc.returncode, captured_stdout, captured_stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -407,17 +304,7 @@ def _resolve_t3_python() -> str:
     Returns:
         Absolute or relative path to the interpreter to use for T3.
     """
-    env_python = os.environ.get(T3_LAYOUT.T3_PYTHON_ENV_VAR)
-    if env_python:
-        if os.path.isfile(env_python) and os.access(env_python, os.X_OK):
-            return env_python
-        _log.warning(
-            "%s is set to %r but is not an existing executable file; falling back to %s",
-            T3_LAYOUT.T3_PYTHON_ENV_VAR,
-            env_python,
-            sys.executable,
-        )
-    return sys.executable
+    return _launcher.resolve_python([T3_LAYOUT.T3_PYTHON_ENV_VAR], logger=_log)
 
 
 def _t3_python_command() -> list[str]:
@@ -457,18 +344,7 @@ def _t3_python_command() -> list[str]:
         The argv prefix to prepend to a python invocation (e.g. ``["-c",
         "..."]`` or a script path) to run it inside T3's environment.
     """
-    conda_env = os.environ.get(T3_LAYOUT.T3_CONDA_ENV_VAR)
-    if conda_env:
-        conda = shutil.which("conda")
-        if conda is not None:
-            return [conda, "run", "-n", conda_env, "--no-capture-output", "python"]
-        _log.warning(
-            "%s is set to %r but no 'conda' executable was found on PATH; falling back to %s",
-            T3_LAYOUT.T3_CONDA_ENV_VAR,
-            conda_env,
-            T3_LAYOUT.T3_PYTHON_ENV_VAR,
-        )
-    return [_resolve_t3_python()]
+    return _launcher.launch_command(_T3_SOURCES, logger=_log, tool_label="T3", which=shutil.which)
 
 
 def _t3_conda_env_error() -> str | None:
@@ -501,33 +377,13 @@ def _t3_conda_env_error() -> str | None:
         a ``RunRecord.error_message`` (greppable for
         ``T3_CONDA_ENV`` and/or ``conda``).
     """
-    conda_env = os.environ.get(T3_LAYOUT.T3_CONDA_ENV_VAR)
-    if not conda_env:
-        return None
-    conda = shutil.which("conda")
-    if conda is None:
-        return (
-            f"{T3_LAYOUT.T3_CONDA_ENV_VAR} is set to {conda_env!r} but no 'conda' executable "
-            "was found on PATH; refusing to silently launch T3 under a different interpreter"
-        )
-    try:
-        completed = _run_in_process_group(
-            [conda, "run", "-n", conda_env, "--no-capture-output", "python", "-c", "pass"],
-            timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        return f"{T3_LAYOUT.T3_CONDA_ENV_VAR} is set to {conda_env!r} but conda could not run it: {e}"
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
-        return (
-            f"{T3_LAYOUT.T3_CONDA_ENV_VAR} is set to {conda_env!r} but conda could not run "
-            f"a trivial command in it (exit {completed.returncode}); the environment may not "
-            f"exist or may be corrupt: {detail}"
-        )
-    return None
+    return _launcher.conda_env_error(
+        _T3_SOURCES,
+        probe_timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
+        runner=_run_in_process_group,
+        tool_label="T3",
+        which=shutil.which,
+    )
 
 
 def is_t3_importable() -> bool:
@@ -547,17 +403,9 @@ def is_t3_importable() -> bool:
     dependency like ARC uses ``distutils`` on Python 3.12, or if openbabel's
     conda activation hooks never ran — see :func:`_t3_python_command`).
     """
-    t3_python = _t3_python_command()
-    try:
-        completed = _run_in_process_group(
-            [*t3_python, "-c", "import t3"],
-            timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except OSError, subprocess.SubprocessError:
-        return False
-    return completed.returncode == 0
+    return _launcher.probe_importable(
+        _t3_python_command(), "t3", timeout=_T3_IMPORT_PROBE_TIMEOUT_S, runner=_run_in_process_group
+    )
 
 
 def is_t3_installed() -> bool:
@@ -573,21 +421,9 @@ def _t3_version() -> str | None:
     importing ``t3`` into Carmel's own process, for the same three-env
     reason.
     """
-    t3_python = _t3_python_command()
-    try:
-        completed = _run_in_process_group(
-            [*t3_python, "-c", "import t3; print(getattr(t3, '__version__', ''))"],
-            timeout=_T3_IMPORT_PROBE_TIMEOUT_S,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except OSError, subprocess.SubprocessError:
-        return None
-    if completed.returncode != 0:
-        return None
-    version = completed.stdout.strip()
-    return version or None
+    return _launcher.probe_version(
+        _t3_python_command(), "t3", timeout=_T3_IMPORT_PROBE_TIMEOUT_S, runner=_run_in_process_group
+    )
 
 
 def _find_t3_executable() -> list[str] | None:
@@ -617,32 +453,18 @@ def _find_t3_executable() -> list[str] | None:
     ``conda run`` rather than a bare interpreter path, so that conda
     activation hooks (e.g. openbabel's) actually run.
     """
-    t3_python = _t3_python_command()
     conda_env = os.environ.get(T3_LAYOUT.T3_CONDA_ENV_VAR)
-
-    env_path = os.environ.get("T3_PATH")
-    if env_path:
-        candidate = Path(env_path) / T3_LAYOUT.EXECUTABLE_SCRIPT
-        if candidate.exists():
-            return [*t3_python, str(candidate)]
-
-    if not conda_env:
-        spec = importlib.util.find_spec("t3")
-        if spec is not None and spec.origin is not None:
-            # spec.origin is .../t3/__init__.py; T3.py lives at the repo root
-            repo_root = Path(spec.origin).parent.parent
-            candidate = repo_root / T3_LAYOUT.EXECUTABLE_SCRIPT
-            if candidate.exists():
-                return [*t3_python, str(candidate)]
-
-        which = shutil.which(T3_LAYOUT.EXECUTABLE_SCRIPT)
-        if which is not None:
-            return [*t3_python, which]
-
-    if is_t3_importable():
-        return [*t3_python, "-m", T3_LAYOUT.EXECUTABLE_MODULE]
-
-    return None
+    return _launcher.find_executable(
+        path_env_var="T3_PATH",
+        executable_script=T3_LAYOUT.EXECUTABLE_SCRIPT,
+        executable_module=T3_LAYOUT.EXECUTABLE_MODULE,
+        package_name="t3",
+        python_command=_t3_python_command(),
+        host_discovery_allowed=not conda_env,
+        is_importable=is_t3_importable,
+        which=shutil.which,
+        find_spec=importlib.util.find_spec,
+    )
 
 
 # ---------------------------------------------------------------------------
