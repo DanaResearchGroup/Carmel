@@ -49,7 +49,7 @@ from carmel.services.execution import (
 )
 from carmel.services.planner import generate_arc_plan, generate_initial_plan, load_plan, save_plan
 from carmel.services.recovery import active_run_path, load_active_run, supervise_run
-from carmel.services.spend import compute_spend
+from carmel.services.spend import _recover_estimate, compute_spend
 from carmel.services.state_machine import load_state, update_state
 
 # ----------------------- fixtures & helpers ---------------------
@@ -258,6 +258,24 @@ class TestComputeSpend:
         assert spend.consumed_cpu_hours == 0.0
         assert any(r.levelno == logging.ERROR for r in caplog.records)
 
+    def test_malformed_actual_with_implausible_estimate_is_skipped_with_error_log(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A record that fails schema validation *and* whose raw
+        ``estimated_cpu_hours`` is itself implausible (negative) has nothing
+        recoverable to charge, so it is skipped rather than crediting
+        budget."""
+        path = save_run_record(tmp_path, _run_record(actual=1.0, estimated=5.0))
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["actual_cpu_hours"] = "oops"
+        data["estimated_cpu_hours"] = -5.0
+        path.write_text(json.dumps(data), encoding="utf-8")
+
+        with caplog.at_level(logging.ERROR):
+            spend = compute_spend(tmp_path)
+        assert spend.consumed_cpu_hours == 0.0
+        assert any(r.levelno == logging.ERROR for r in caplog.records)
+
     def test_retries_are_not_deduplicated_by_action_id(self, tmp_path: Path) -> None:
         # Two attempts of the same action each spent compute; both count.
         for _ in range(2):
@@ -297,6 +315,23 @@ class TestComputeSpend:
         with supervise_run(tmp_path, "act-1", estimated_cpu_hours=3.0):
             assert compute_spend(tmp_path).reserved_cpu_hours == 3.0
         assert compute_spend(tmp_path).reserved_cpu_hours == 0.0
+
+
+class TestRecoverEstimate:
+    """Direct unit tests for ``_recover_estimate``'s non-dict-input branch.
+
+    ``compute_spend`` can never reach this branch through a real
+    ``runs/*.json`` file: ``read_json`` already raises ``ValueError`` (and
+    gets skipped by the outer read failure handler) for any top-level JSON
+    that isn't an object, before ``_recover_estimate`` is ever called. This
+    exercises the defensive check directly, matching the "small pure
+    helper, tested directly" style used for ARC's ``_requested_labels`` and
+    friends.
+    """
+
+    @pytest.mark.parametrize("raw", [[], "x", 1, None])
+    def test_non_dict_raw_returns_none(self, raw: Any) -> None:
+        assert _recover_estimate(raw) is None
 
 
 # ----------------------- cumulative escalation ------------------

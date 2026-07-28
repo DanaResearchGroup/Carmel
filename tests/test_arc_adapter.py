@@ -48,8 +48,11 @@ from carmel.adapters.arc import (
     _arc_version,
     _coerce_reaction_entry,
     _coerce_species_entry,
+    _converged_species_labels,
     _count_converged,
     _find_arc_executable,
+    _requested_labels,
+    _success_labels,
     arc_info_filename,
     build_arc_input,
     extract_level_of_theory,
@@ -787,6 +790,29 @@ class TestCountConverged:
         assert _count_converged({}) == 0
 
 
+class TestRequestedLabels:
+    def test_non_dict_entry_is_skipped(self) -> None:
+        assert _requested_labels(["not-a-dict", {"label": "OH"}]) == ["OH"]
+
+    def test_entry_missing_label_is_skipped(self) -> None:
+        assert _requested_labels([{"smiles": "[OH]"}, {"label": "OH"}]) == ["OH"]
+
+    def test_entry_with_empty_label_is_skipped(self) -> None:
+        assert _requested_labels([{"label": ""}, {"label": "OH"}]) == ["OH"]
+
+
+class TestSuccessLabels:
+    def test_non_list_returns_empty_frozenset(self) -> None:
+        assert _success_labels(None) == frozenset()
+        assert _success_labels({"label": "OH", "success": True}) == frozenset()
+
+
+class TestConvergedSpeciesLabels:
+    def test_falsy_output_dict_returns_empty_frozenset(self) -> None:
+        assert _converged_species_labels(None) == frozenset()
+        assert _converged_species_labels({}) == frozenset()
+
+
 class TestArcInfoFilename:
     def test_derives_from_project_key(self) -> None:
         assert arc_info_filename({"project": "my_project"}) == "my_project_info.yml"
@@ -1003,6 +1029,30 @@ class TestARCQuality:
         assert not quality.ok
         assert quality.count_mismatch
         assert any("mismatch" not in w and "reports" in w for w in diag.warnings)
+
+    def test_requested_reaction_not_in_info_file_fails_with_warning(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "proj_info.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "species": [{"label": "OH", "success": True}],
+                    "reactions": [{"label": "A <=> B", "success": True}],
+                }
+            )
+        )
+        (project / "output").mkdir()
+        (project / "output" / "output.yml").write_text(
+            yaml.safe_dump({"species": [{"label": "OH", "converged": True}]})
+        )
+        diag, quality = normalize_arc_outputs(
+            project, self._input(["OH"], ["A <=> B", "OH + CH3 <=> CH4 + O"]), campaign_id="c", run_id="r"
+        )
+        assert not quality.ok
+        # The succeeded reaction is not marked as failed; only the missing one is.
+        assert quality.failed_labels == ["OH + CH3 <=> CH4 + O"]
+        assert any("OH + CH3 <=> CH4 + O" in w and "did not succeed" in w for w in diag.warnings)
+        assert not any("A <=> B" in w for w in diag.warnings)
 
 
 # ---------------------------------------------------------------------------
