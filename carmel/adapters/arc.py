@@ -161,6 +161,10 @@ _ARC_IMPORT_PROBE_TIMEOUT_S: float = 120.0
 # SIGKILLed. Mirrors t3.py's _KILL_GRACE_PERIOD_S.
 _KILL_GRACE_PERIOD_S: float = 10.0
 
+# Mirrors t3.py's _SECONDS_PER_HOUR (used to turn the action's estimated
+# CPU-hours into the subprocess wall-clock timeout).
+_SECONDS_PER_HOUR: float = 3600.0
+
 
 # ---------------------------------------------------------------------------
 # Subprocess execution — process-group aware. Process-tree lifecycle
@@ -247,16 +251,20 @@ def _arc_run_in_process_group(
 class ARCGuardrails:
     """Native Carmel policy encoding the *spirit* of babysit-arc.
 
-    Submission-rate, concurrency, and retry limits enforced by the adapter
-    itself — NOT by importing or shelling out to the babysit-arc operator skill.
-    A standalone ARC job is a single orchestrated submission, so the effective
-    concurrency is one and there is no automatic re-submission (escalate to the
-    user instead of spamming the cluster).
+    Enforced by the adapter itself — NOT by importing or shelling out to the
+    babysit-arc operator skill. The only tunable is
+    ``subprocess_grace_seconds``, the slack added to the action's estimated
+    CPU budget before :meth:`ARCAdapter.run` kills the subprocess tree.
+
+    The other babysit-arc principles need no knob here because they hold by
+    construction: a standalone ARC job is a single orchestrated submission
+    (the adapter launches exactly one subprocess and never re-submits —
+    failures escalate to the user instead of spamming the cluster), and
+    concurrency-one is enforced one layer up by the per-campaign run lock
+    (``active_run.lock`` in :mod:`carmel.services.execution`), which refuses
+    a second run while one is in flight.
     """
 
-    max_concurrent_jobs: int = 1
-    max_retries: int = 0
-    min_seconds_between_submissions: float = 0.0
     subprocess_grace_seconds: int = 600
 
 
@@ -638,9 +646,11 @@ def read_arc_output_file(project_dir: Path) -> dict[str, Any] | None:
 def _coerce_species_entry(entry: Any) -> SpeciesSelection | None:
     """Coerce a raw ARC info species dict into a SpeciesSelection."""
     if not isinstance(entry, dict):
+        _log.warning("Dropping malformed ARC info species entry (not a mapping): %r", entry)
         return None
     label = entry.get(ARC_LAYOUT.INFO_LABEL_KEY)
     if not label:
+        _log.warning("Dropping ARC info species entry with no %r: %r", ARC_LAYOUT.INFO_LABEL_KEY, entry)
         return None
     success = entry.get(ARC_LAYOUT.INFO_SUCCESS_KEY)
     smiles = entry.get("smiles")
@@ -649,14 +659,22 @@ def _coerce_species_entry(entry: Any) -> SpeciesSelection | None:
 
 
 def _coerce_reaction_entry(entry: Any) -> ReactionSelection | None:
-    """Coerce a raw ARC info reaction dict into a ReactionSelection."""
+    """Coerce a raw ARC info reaction dict into a ReactionSelection.
+
+    Real ARC emits exactly ``{label, success}`` per reaction entry
+    (``arc/main.py``, ``save_project_info_file``); ``reactants``/``products``
+    are parsed when present for forward compatibility but ARC does not
+    currently write them, so they normally come back empty.
+    """
     if not isinstance(entry, dict):
+        _log.warning("Dropping malformed ARC info reaction entry (not a mapping): %r", entry)
         return None
-    label = entry.get(ARC_LAYOUT.INFO_LABEL_KEY) or entry.get("equation") or entry.get("reaction")
+    label = entry.get(ARC_LAYOUT.INFO_LABEL_KEY)
     if not label:
+        _log.warning("Dropping ARC info reaction entry with no %r: %r", ARC_LAYOUT.INFO_LABEL_KEY, entry)
         return None
-    reactants = list(entry.get("reactants") or entry.get("reactant_labels") or [])
-    products = list(entry.get("products") or entry.get("product_labels") or [])
+    reactants = list(entry.get("reactants") or [])
+    products = list(entry.get("products") or [])
     success = entry.get(ARC_LAYOUT.INFO_SUCCESS_KEY)
     reason = f"ARC · success={success!r}" if success is not None else "ARC"
     return ReactionSelection(
@@ -1048,7 +1066,9 @@ class ARCAdapter:
         #    location, so it writes its output tree directly under run_dir.
         command = [*arc_executable, str(input_path)]
         _log.info("Invoking ARC: %s", " ".join(command))
-        timeout = int(self.estimate_cost(action, campaign) * 3600 + self.guardrails.subprocess_grace_seconds)
+        timeout = int(
+            self.estimate_cost(action, campaign) * _SECONDS_PER_HOUR + self.guardrails.subprocess_grace_seconds
+        )
         try:
             with (
                 open(stdout_path, "w", encoding="utf-8") as stdout_file,

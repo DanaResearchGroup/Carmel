@@ -17,10 +17,22 @@ concurrency:
   cancel-in-progress: false
 
 # BEST-EFFORT LANE. Builds the real chemistry stack and exercises the real T3
-# subprocess path. Carries `continue-on-error: true` at the job level, so a
-# collapse anywhere in the heavy install chain cannot redden the required lanes
-# in the CI workflow. Drop that once this lane has been green often enough to
-# trust.
+# and ARC subprocess paths. Carries `continue-on-error: true` at the job level,
+# so a collapse anywhere in the heavy install chain cannot redden the required
+# lanes in the CI workflow. Drop that once this lane has been green often
+# enough to trust.
+#
+# Consequence, stated so nobody mistakes it: because continue-on-error sits at
+# the JOB level, everything in this lane — including the "must not skip" JUnit
+# gates on the real T3/ARC execution tests — is visible-but-advisory. A genuine
+# T3/ARC failure shows red on this job but cannot block a PR. That is a
+# deliberate trade: the alternative, a blocking assertion that the real ARC
+# subprocess launched, cannot be had cheaply — any real ARC launch needs the
+# full t3_env build above, so a separate blocking job would re-run the exact
+# heavy, flaky install chain this posture exists to keep out of the required
+# lanes. (The fast, blocking CI workflow already covers the adapters' mocked
+# launch paths.) When this lane is trusted enough to block, remove the
+# job-level continue-on-error rather than adding a parallel gate.
 #
 # THREE conda environments, because the tools' python requirements are mutually
 # exclusive and no single environment can satisfy them:

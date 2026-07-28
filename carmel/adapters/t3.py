@@ -206,10 +206,9 @@ def _terminate_process_tree(proc: subprocess.Popen[Any], grace_period_s: float |
     """Kill *proc* and every descendant sharing its process group, then reap it.
 
     Thin wrapper over :func:`carmel.adapters._launcher.terminate_process_tree`
-    that supplies T3's own grace period default and logger, so existing
-    monkeypatches of ``t3.os``/``t3.signal``/``t3.time``/``t3._log`` — which
-    the shared implementation reads through this module's own imports where
-    applicable — keep taking effect.
+    that supplies T3's own grace period default, logger, and tool label. The
+    actual kill/reap machinery lives in :mod:`carmel.adapters._launcher`,
+    shared with the ARC adapter.
 
     Args:
         proc: The running child process.

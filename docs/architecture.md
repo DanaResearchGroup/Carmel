@@ -32,13 +32,19 @@ carmel/
 │   ├── campaigns.py            # create_campaign, load_campaign, list_campaigns
 │   ├── state_machine.py        # Transition table + persistence
 │   ├── approvals.py            # Policy evaluation + decision recording
-│   ├── planner.py              # Deterministic Phase 1 plan generator
+│   ├── authorization.py        # Per-adapter execution envelopes + combined approval gate
+│   ├── spend.py                # Cumulative CPU-hour spend (consumed + reserved)
+│   ├── planner.py              # Deterministic plan generators (T3 + standalone ARC)
 │   ├── provenance.py           # Per-action provenance records
-│   ├── execution.py            # T3 orchestration + diagnostics persistence
+│   ├── execution.py            # T3/ARC orchestration + diagnostics persistence
+│   ├── recovery.py             # Run-liveness probing + abandonment
+│   ├── processes.py            # /proc-based process-group identity checks
 │   ├── drawing.py              # Pure-Python SVG renderer for selections
 │   └── intake.py               # Free-text intake protocol + stub backend
 ├── adapters/
-│   └── t3.py                   # Real T3 subprocess adapter
+│   ├── _launcher.py            # Shared subprocess launcher (process groups, tree kill, conda-env resolution)
+│   ├── t3.py                   # Real T3 subprocess adapter
+│   └── arc.py                  # Real standalone-ARC subprocess adapter
 └── ui/
     ├── app.py                  # Flask app factory + routes
     ├── templates/              # Jinja templates (HTMX via CDN)
@@ -60,14 +66,14 @@ my-campaign/
 ├── plan.json                   # Current plan (canonical)
 ├── plan.md                     # Rendered plan summary
 ├── decision_log.jsonl          # Append-only decision stream
-├── diagnostics.json            # Normalized T3 output (DiagnosticsV1)
+├── diagnostics.json            # Normalized T3/ARC output (DiagnosticsV1)
 ├── intake_review.md            # Optional advisory free-text review
 ├── benchmarks/                 # Curated benchmarks
 ├── evidence/                   # Literature memos and source links
 ├── models/                     # Mechanism versions, SVG selection artifacts
 ├── provenance/                 # Per-action provenance records
 ├── reports/                    # Reports
-└── runs/                       # T3 (and future) run records
+└── runs/                       # T3/ARC run records
 ```
 
 ## Lifecycle State Machine
@@ -75,11 +81,16 @@ my-campaign/
 ```
 draft → validated → ready_for_planning → plan_pending_approval
                                      ↓
-                       approved_for_execution → running_t3
-                                     ↓
-                          diagnostics_ready → completed_phase1
+                       approved_for_execution
+                          ↓                  ↓
+                     running_t3         running_arc
+                          ↓                  ↓
+                  diagnostics_ready    results_ready
+                          ↘                 ↙
+                         completed_phase1
 
-(every state except completed_phase1 can also transition to → failed;
+(a T3 plan runs the left branch, a standalone-ARC plan the right one;
+ every state except completed_phase1 can also transition to → failed;
  only plan_pending_approval can transition to → blocked, by rejection)
 ```
 
@@ -101,8 +112,9 @@ later one.** Three edges follow from it:
 | Exit | Available when | Meaning |
 |------|----------------|---------|
 | → `ready_for_planning` | always | Discard the plan and re-plan. Bypasses nothing: planning and the approval policy both run again from the start. |
-| → `approved_for_execution` | `failed_from == running_t3` or `approved_for_execution` | Retry a tool run of a plan that was already approved — whether it failed during the run, or between approval and launch. |
+| → `approved_for_execution` | `failed_from == running_t3`, `running_arc`, or `approved_for_execution` | Retry a tool run of a plan that was already approved — whether it failed during the run, or between approval and launch. |
 | → `diagnostics_ready` | `failed_from == diagnostics_ready` | Adopt diagnostics already durable on disk, for a run that succeeded and then failed while being recorded as complete. |
+| → `results_ready` | `failed_from == results_ready` | The same adoption edge for a standalone ARC run's results. |
 
 `CampaignState.failed_from` records the origin, and the direct resumes
 are gated on it. A state file Carmel did not write has no origin
@@ -114,10 +126,12 @@ The plan is never un-rejected; a new one is generated and judged afresh.
 
 ### Recovering a run whose supervisor died
 
-`running_t3` is the one state whose truth cannot be read off disk. If
-the Carmel process supervising a run is killed, no `except` runs, nobody
-writes the run's ending, and the campaign sits in `running_t3` forever
-while the dashboard promises progress.
+`running_t3` and `running_arc` are the states whose truth cannot be read
+off disk. If the Carmel process supervising a run is killed, no `except`
+runs, nobody writes the run's ending, and the campaign sits in the
+running state forever while the dashboard promises progress. (The rest
+of this section says `running_t3`/T3 for concreteness; the identical
+machinery supervises `running_arc`/ARC.)
 
 Guessing is harmful in both directions. Guessing "still running" wedges
 the campaign, which is the bug. Guessing "finished" is worse: it records
@@ -202,21 +216,63 @@ holds no file descriptors and can write nothing.
 
 ## Approval Policy
 
-Phase 1 enforces compute-side approval for T3 actions only. The
-`ApprovalPolicy` model is designed so future ARC, experiment, and
-literature actions fit the same framework:
+Compute-side approval is enforced for T3 and ARC actions. The
+`ApprovalPolicy` model is designed so future experiment and literature
+actions fit the same framework:
 
 | Field                                      | Default | Effect |
 |--------------------------------------------|---------|--------|
 | `auto_approve_t3_under_cpu_hours`          | 10.0    | T3 runs ≤ this estimate auto-approve |
-| `auto_approve_arc_under_cpu_hours`         | 5.0     | (reserved for Phase 2+) |
+| `auto_approve_arc_under_cpu_hours`         | 5.0     | ARC runs ≤ this estimate auto-approve |
 | `require_approval_for_experiments`         | True    | (reserved) |
 | `require_approval_for_literature`          | False   | (reserved) |
 
 The deterministic planner always asks the approval engine before marking
 an action as auto-approved.
 
-## T3 Adapter
+### The cumulative-budget gate
+
+The policy thresholds above are per-action; on their own they would let a
+sequence of small auto-approved runs spend past the campaign's declared
+`Budgets.cpu_hours`. `carmel/services/authorization.py` therefore runs
+ONE combined gate (`decide_requirement`) for every planned action — T3
+and ARC symmetrically: the per-kind policy threshold, a per-adapter
+`ExecutionEnvelope` cap on what a single action may cost, and the
+campaign's *remaining* budget (declared budget minus
+`carmel/services/spend.py`'s consumed + reserved CPU-hours). An action
+auto-approves only if all of them clear; the action whose estimate
+crosses the remaining budget escalates to the user. The launch paths
+re-run the same gate against the then-current remaining budget and raise
+`BudgetExceededError` — before any state transition — if approval is
+missing, so the gate cannot be raced by planning ahead of spending.
+Every envelope decision is appended to the decision log.
+
+## Adapters: T3, ARC, and the shared launcher
+
+`carmel/adapters/` holds one adapter per external tool plus
+`_launcher.py`, the shared subprocess machinery both adapters delegate
+to: process-group launch (`start_new_session`), whole-tree
+SIGTERM→SIGKILL termination on timeout, the live-tree registry with its
+`atexit` sweep, executable discovery, and conda-environment resolution
+(`$T3_CONDA_ENV`/`$ARC_CONDA_ENV` etc.). The per-tool adapters supply
+their own layout constants, grace periods, and loggers.
+
+### ARC Adapter
+
+`carmel/adapters/arc.py` runs **one standalone ARC job** (thermochemistry
+/ rates for explicitly requested species and reactions), where T3 drives
+a whole generation/refinement loop. Same protocol shape as the T3
+adapter: build a typed `input.yml` from the campaign/action, invoke
+`ARC.py` as a subprocess in ARC's own environment, then normalize ARC's
+real project tree (`<project>_info.yml`, `output/output.yml`) into
+`DiagnosticsV1`, cross-checking the requested labels against ARC's
+per-entry `success`/`converged` flags so an exit code of 0 cannot
+masquerade as converged chemistry. All ARC layout assumptions live in
+the `ARCLayout` constants block. A plan targets ARC via
+`generate_arc_plan` (`run_arc` actions), and execution flows
+`approved_for_execution → running_arc → results_ready`.
+
+### T3 Adapter
 
 `carmel/adapters/t3.py` is the only place that knows how to invoke T3.
 Every assumption Carmel makes about T3's input/output contract is
@@ -343,11 +399,15 @@ Two limits are deliberate and worth stating:
 
 ### Runs execute in the background
 
-`POST /run` performs the `RUNNING_T3` transition in the request thread and
-then hands the work to a daemon thread, returning immediately. Executed
-inline, a run holds the request open for hours: the browser times out, the
-redirect to the auto-refreshing dashboard never arrives, and the whole
-`RUNNING_T3` UX is unreachable from the tab that started the run.
+The Flask UI (`carmel serve`, `carmel/ui/app.py`) is the production
+caller for both tools: `POST /plan` generates a T3 or standalone-ARC plan
+depending on the selected tool, and `POST /run` dispatches on the planned
+action's kind. It performs the `RUNNING_T3`/`RUNNING_ARC` transition in
+the request thread and then hands the work to a daemon thread, returning
+immediately. Executed inline, a run holds the request open for hours: the
+browser times out, the redirect to the auto-refreshing dashboard never
+arrives, and the whole running-state UX is unreachable from the tab that
+started the run.
 
 The *transition* stays synchronous on purpose. It is what rejects a
 double-submitted run — with a `409`, in the request that submitted it —
@@ -361,7 +421,8 @@ itself is `SIGKILL`ed; nothing running inside Carmel can.
 
 ## Diagnostics Schema (DiagnosticsV1)
 
-The single Carmel-internal contract for T3 output. Includes:
+The single Carmel-internal contract for tool output (T3 and standalone
+ARC alike). Includes:
 
 - per-observable sensitivity summaries (rates and thermo)
 - `species_to_compute`, `reactions_to_compute`, `pdep_networks_to_compute`
@@ -369,7 +430,7 @@ The single Carmel-internal contract for T3 output. Includes:
 - `pdep_sensitivity_flag` and free-form `warnings`
 - arbitrary `tool_metadata`
 
-The dashboard reads only this schema; it never reads raw T3 output.
+The dashboard reads only this schema; it never reads raw tool output.
 
 ## Graphical Compute Selection
 
@@ -412,7 +473,7 @@ later phase.
 |---------|-------------------------|----------------|
 | T3      | Trusted                 | Real subprocess adapter |
 | RMG-Py  | Trusted with caution    | Required by T3 |
-| ARC     | Trusted                 | Reserved (Phase 2+) |
+| ARC     | Trusted                 | Real subprocess adapter (standalone jobs) |
 | Cantera | Trusted                 | Used by T3 |
 | TCKDB   | Trusted                 | Reserved |
 

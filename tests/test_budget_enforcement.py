@@ -292,6 +292,7 @@ class TestCumulativeEscalation:
         # remaining = 3.5 - 3 = 0.5 < 1.0: the crossing action must escalate.
         plan = generate_arc_plan(campaign, workspace_root=ws)
         assert plan.requires_approval is True
+        assert plan.actions[0].approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
         assert "remaining budget" in plan.rationale
 
     def test_in_flight_reservation_reduces_planning_budget(self, tmp_path: Path) -> None:

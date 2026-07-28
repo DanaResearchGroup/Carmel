@@ -39,9 +39,12 @@ class CampaignState(BaseModel):
     """The state the campaign was in immediately before it transitioned to
     ``FAILED``. ``None`` when the campaign has never failed, and cleared
     (set back to ``None``) as soon as the campaign leaves ``FAILED``.
-    Used to gate the ``FAILED`` → ``APPROVED_FOR_EXECUTION`` retry edge so
-    that only a genuine tool-execution failure of an already-approved plan
-    (failed from ``RUNNING_T3``) can retry — a failure during validation
-    or planning, before any human approved anything, must not bypass the
-    HITL approval gate.
+    Gates the direct recovery edges out of ``FAILED`` (see
+    ``RECOVERY_TARGETS`` in :mod:`carmel.services.state_machine`): retrying
+    an already-approved plan via ``APPROVED_FOR_EXECUTION`` is allowed only
+    when the campaign failed from ``RUNNING_T3``, ``RUNNING_ARC``, or
+    ``APPROVED_FOR_EXECUTION`` itself, and adopting results already on disk
+    via ``DIAGNOSTICS_READY``/``RESULTS_READY`` only when it failed from
+    that same state. A failure during validation or planning, before any
+    human approved anything, must not bypass the HITL approval gate.
     """

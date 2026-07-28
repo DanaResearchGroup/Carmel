@@ -24,9 +24,11 @@ and T3 may share a single environment).
 
 from __future__ import annotations
 
+import logging
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -760,16 +762,18 @@ class TestCoerceEntries:
         assert _coerce_species_entry("nope") is None
 
     def test_reaction_entry_with_labels(self) -> None:
-        sel = _coerce_reaction_entry(
-            {"label": "A => B", "reactant_labels": ["A"], "product_labels": ["B"], "success": True}
-        )
+        sel = _coerce_reaction_entry({"label": "A => B", "reactants": ["A"], "products": ["B"], "success": True})
         assert sel is not None
         assert sel.label == "A => B"
         assert sel.reactants == ["A"]
         assert sel.products == ["B"]
 
-    def test_reaction_entry_missing_label(self) -> None:
-        assert _coerce_reaction_entry({"reactants": ["A"]}) is None
+    def test_reaction_entry_missing_label(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Dropped, but not silently: ARC writes a label for every reaction it
+        # reports, so an entry without one is surprising enough to warn about.
+        with caplog.at_level(logging.WARNING, logger="carmel.adapters.arc"):
+            assert _coerce_reaction_entry({"reactants": ["A"]}) is None
+        assert any("no 'label'" in message for message in caplog.messages)
 
     def test_reaction_entry_non_dict(self) -> None:
         assert _coerce_reaction_entry("nope") is None
@@ -1650,6 +1654,69 @@ class TestArcTerminateProcessTree:
         proc = subprocess.Popen([sys.executable, "-c", "pass"], start_new_session=True)
         proc.wait()
         arc_module._arc_terminate_process_tree(proc, grace_period_s=0.01)
+
+
+class TestARCProcessTreeTermination:
+    """ARC wires into the shared ``_launcher`` process-tree kill — proven live.
+
+    The full termination machinery (grandchild death, write liveness, pgid
+    reporting, recorder failure) is exercised by
+    ``tests/test_t3_adapter.py::TestProcessTreeTermination`` against the
+    shared implementation in ``carmel.adapters._launcher``. This class does
+    not duplicate that suite; it proves the one thing T3's tests cannot:
+    that ARC's own wrapper (``_arc_run_in_process_group`` →
+    ``_arc_terminate_process_tree``) actually delegates a timeout into that
+    shared path, grandchildren included — with ARC's grace period, not just
+    the direct child.
+    """
+
+    # Parent spawns a grandchild that outlives it, then blocks forever —
+    # the same tree shape as T3's regression test for the orphan.
+    _TREE = (
+        "import subprocess, sys, time, pathlib;"
+        "gc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)']);"
+        "pathlib.Path(sys.argv[1]).write_text(str(gc.pid));"
+        "time.sleep(300)"
+    )
+
+    @staticmethod
+    def _alive(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        return True
+
+    @classmethod
+    def _died_within(cls, pid: int, timeout_s: float = 15.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            if not cls._alive(pid):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_timeout_kills_the_grandchild_via_the_shared_launcher(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_KILL_GRACE_PERIOD_S", 1.0)
+        pid_file = tmp_path / "grandchild.pid"
+        command = [sys.executable, "-c", self._TREE, str(pid_file)]
+
+        with pytest.raises(subprocess.TimeoutExpired):
+            arc_module._arc_run_in_process_group(command, timeout=3.0)
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and not (pid_file.exists() and pid_file.read_text().strip()):
+            time.sleep(0.05)
+        assert pid_file.exists() and pid_file.read_text().strip(), "the child never reported a grandchild pid"
+        grandchild = int(pid_file.read_text().strip())
+        assert self._died_within(grandchild), (
+            f"grandchild {grandchild} survived an ARC timeout — the ARC wrapper is not "
+            "delegating to the shared _launcher process-tree kill"
+        )
 
 
 class TestARCAdapterRealSubprocess:

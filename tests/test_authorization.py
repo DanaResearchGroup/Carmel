@@ -86,7 +86,6 @@ class TestAuthorizeSymmetry:
         env = ExecutionEnvelope(
             adapter="arc",
             cpu_hours_per_action=4.0,
-            max_concurrent_jobs=1,
             allowed_action_kinds=[ActionKind.ARC_RUN],
             allowed_levels=["wb97xd/def2tzvp"],
         )
@@ -102,7 +101,6 @@ class TestAuthorizeSymmetry:
         env = ExecutionEnvelope(
             adapter="arc",
             cpu_hours_per_action=4.0,
-            max_concurrent_jobs=1,
             allowed_action_kinds=[ActionKind.ARC_RUN],
             allowed_levels=["wb97xd/def2tzvp"],
         )
@@ -213,7 +211,6 @@ class TestDecideRequirement:
             ActionKind.ARC_RUN: ExecutionEnvelope(
                 adapter="arc",
                 cpu_hours_per_action=0.5,
-                max_concurrent_jobs=1,
                 allowed_action_kinds=[ActionKind.ARC_RUN],
             )
         }

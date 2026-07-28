@@ -62,7 +62,6 @@ class ExecutionEnvelope(BaseModel):
 
     adapter: str = Field(min_length=1)
     cpu_hours_per_action: float = Field(gt=0)
-    max_concurrent_jobs: int = Field(ge=1)
     allowed_action_kinds: list[ActionKind]
     # None means "any level allowed". A list restricts to the named levels of
     # theory, and the action must then *declare* a level in that list — an
@@ -92,14 +91,12 @@ class AuthorizationResult(BaseModel):
 DEFAULT_ARC_ENVELOPE = ExecutionEnvelope(
     adapter="arc",
     cpu_hours_per_action=4.0,
-    max_concurrent_jobs=1,
     allowed_action_kinds=[ActionKind.ARC_RUN],
 )
 
 DEFAULT_T3_ENVELOPE = ExecutionEnvelope(
     adapter="t3",
     cpu_hours_per_action=24.0,
-    max_concurrent_jobs=1,
     allowed_action_kinds=[ActionKind.T3_RUN],
 )
 
@@ -128,6 +125,13 @@ def authorize(
     ``action.estimated_cpu_hours`` (which the planner sets from the owning
     adapter's ``estimate_cost``). Within envelope **and** within remaining
     campaign ``cpu_hours`` -> auto-approve; over either -> escalate to the user.
+
+    The declared estimate is trusted here, and that is deliberate: the same
+    number also derives the adapter's subprocess timeout (see
+    ``T3Adapter.run``/``ARCAdapter.run``), so under-declaring is
+    self-defeating — a job that declares 0.5 cpu-h to get authorized cheaply
+    is killed once it exceeds its own declared budget, and over-declaring
+    only makes escalation to the user more likely.
 
     Args:
         action: The planned action to authorize.
