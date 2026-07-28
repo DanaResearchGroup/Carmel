@@ -845,28 +845,36 @@ class TestGoldenFixture:
         return _fixture_input()
 
     def test_normalize_finds_species(self, input_dict: dict[str, object]) -> None:
-        diag = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
+        diag, quality = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
         assert sorted(s.label for s in diag.species_to_compute) == ["CH3", "OH"]
+        assert quality.ok
+        assert quality.warnings == []
 
     def test_normalize_records_success_in_reason(self, input_dict: dict[str, object]) -> None:
-        diag = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
+        diag, _quality = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
         by_label = {s.label: s for s in diag.species_to_compute}
         assert "success=True" in (by_label["OH"].reason or "")
 
     def test_normalize_no_pdep_networks(self, input_dict: dict[str, object]) -> None:
-        diag = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
+        diag, _quality = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
         assert diag.pdep_networks_to_compute == []
 
     def test_normalize_extracts_lot(self, input_dict: dict[str, object]) -> None:
-        diag = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
+        diag, _quality = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
         assert diag.level_of_theory == MOCK_LEVEL_OF_THEORY
 
     def test_normalize_records_metadata(self, input_dict: dict[str, object]) -> None:
-        diag = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
+        diag, quality = normalize_arc_outputs(FIXTURE_ROOT, input_dict, campaign_id="c", run_id="r")
         assert diag.tool_metadata["adapter"] == "arc"
         assert diag.tool_metadata["species_count"] == 2
         assert diag.tool_metadata["converged_species_count"] == 2
         assert diag.tool_metadata["arc_version"] == "1.1.0"
+        assert diag.tool_metadata["requested_count"] == 2
+        assert diag.tool_metadata["succeeded_count"] == 2
+        assert diag.tool_metadata["failed_labels"] == []
+        assert diag.tool_metadata["missing_output"] is False
+        assert diag.tool_metadata["count_mismatch"] is False
+        assert quality.failed_labels == []
 
     def test_normalize_raises_when_no_output(self, tmp_path: Path, input_dict: dict[str, object]) -> None:
         with pytest.raises(ValueError, match="No ARC info file"):
@@ -890,10 +898,25 @@ class TestNormalizeArcOutputsInline:
                 }
             )
         )
-        diag = normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
+        # Reaction quality depends only on `success`, so it needs no output.yml,
+        # but species quality also requires convergence — write one so OH's
+        # inclusion in species_to_compute exercises the invalid-entry filtering
+        # this test is actually about, rather than the (separately-tested)
+        # missing-output path.
+        (project / "output").mkdir()
+        (project / "output" / "output.yml").write_text(
+            yaml.safe_dump({"species": [{"label": "OH", "converged": True}]})
+        )
+        diag, quality = normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
         assert [s.label for s in diag.species_to_compute] == ["OH"]
         assert [r.label for r in diag.reactions_to_compute] == ["OH + CH3 => CH4 + O"]
         assert diag.tool_metadata["reaction_count"] == 1
+        # No species/reactions were requested via the ARC *input* dict here
+        # (it is a bare {"project": ...}), so ARCQuality has nothing to
+        # cross-check against and `ok` reads as False — this test is only
+        # about entry coercion/filtering, not the requested-vs-actual gate.
+        assert quality.requested_labels == frozenset()
+        assert not quality.ok
 
     def test_output_only_without_info_file_raises(self, tmp_path: Path) -> None:
         """F12: an output.yml with no ``<project>_info.yml`` is not a success.
@@ -905,6 +928,76 @@ class TestNormalizeArcOutputsInline:
         (project / "output" / "output.yml").write_text(yaml.safe_dump({"arc_version": "0.0.1", "species": []}))
         with pytest.raises(ValueError, match="No ARC info file"):
             normalize_arc_outputs(project, {"project": "proj"}, campaign_id="c", run_id="r")
+
+
+class TestARCQuality:
+    """Unit tests for the requested-vs-actual quality gate (ARCQuality)."""
+
+    def _input(self, species: list[str], reactions: list[str] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {"project": "proj", "species": [{"label": lbl} for lbl in species]}
+        if reactions:
+            payload["reactions"] = [{"label": lbl} for lbl in reactions]
+        return payload
+
+    def test_golden_fixture_is_ok_with_no_warnings(self) -> None:
+        diag, quality = normalize_arc_outputs(FIXTURE_ROOT, _fixture_input(), campaign_id="c", run_id="r")
+        assert quality.ok
+        assert quality.warnings == []
+        assert diag.warnings == []
+
+    def test_one_species_failed_excludes_it_and_warns(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "proj_info.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "species": [{"label": "OH", "success": True}, {"label": "CH3", "success": False}],
+                    "reactions": [],
+                }
+            )
+        )
+        (project / "output").mkdir()
+        (project / "output" / "output.yml").write_text(
+            yaml.safe_dump({"species": [{"label": "OH", "converged": True}, {"label": "CH3", "converged": False}]})
+        )
+        diag, quality = normalize_arc_outputs(project, self._input(["OH", "CH3"]), campaign_id="c", run_id="r")
+        assert not quality.ok
+        assert quality.failed_labels == ["CH3"]
+        assert [s.label for s in diag.species_to_compute] == ["OH"]
+        assert any("CH3" in w for w in diag.warnings)
+
+    def test_missing_output_file_fails_with_warning(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "proj_info.yml").write_text(
+            yaml.safe_dump({"species": [{"label": "OH", "success": True}], "reactions": []})
+        )
+        diag, quality = normalize_arc_outputs(project, self._input(["OH"]), campaign_id="c", run_id="r")
+        assert not quality.ok
+        assert quality.missing_output
+        assert diag.species_to_compute == []
+        assert any("output" in w.lower() for w in diag.warnings)
+
+    def test_count_mismatch_fails_with_warning(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "proj_info.yml").write_text(
+            yaml.safe_dump(
+                {
+                    "species": [{"label": "OH", "success": True}, {"label": "CH3", "success": True}],
+                    "reactions": [],
+                }
+            )
+        )
+        (project / "output").mkdir()
+        # Info reports 2 successful species; output.yml reports only 1 converged.
+        (project / "output" / "output.yml").write_text(
+            yaml.safe_dump({"species": [{"label": "OH", "converged": True}, {"label": "CH3", "converged": False}]})
+        )
+        diag, quality = normalize_arc_outputs(project, self._input(["OH", "CH3"]), campaign_id="c", run_id="r")
+        assert not quality.ok
+        assert quality.count_mismatch
+        assert any("mismatch" not in w and "reports" in w for w in diag.warnings)
 
 
 # ---------------------------------------------------------------------------
@@ -1364,6 +1457,64 @@ class TestARCAdapterFailures:
         assert diagnostics is not None
         assert sorted(s.label for s in diagnostics.species_to_compute) == ["CH3", "OH"]
         assert diagnostics.level_of_theory == MOCK_LEVEL_OF_THEORY
+
+    def test_non_converged_species_yields_failed_status(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """End-to-end: returncode==0 but one requested species never converged.
+
+        ARCAdapter.run must not report SUCCEEDED purely off the subprocess exit
+        code -- it has to gate on ARCQuality. Diagnostics must still come back
+        (with the good subset + warnings) rather than None, so the partial
+        result stays inspectable even though the run is FAILED."""
+        from carmel.adapters import arc as arc_module
+
+        monkeypatch.setattr(arc_module, "_find_arc_executable", lambda: ["arc-stub"])
+
+        class _Completed:
+            returncode = 0
+
+        class _ProbeCompleted:
+            returncode = 1  # non-zero: _arc_version's probe call returns None, never touching .stdout
+
+        def _fake_run(command: list[str], cwd: Path | None = None, **kwargs: object) -> object:
+            if cwd is None:  # version-probe call inside _failed_record; see above
+                return _ProbeCompleted()
+            run_dir = Path(cwd)
+            payload = yaml.safe_load((run_dir / "input.yml").read_text())
+            (run_dir / arc_info_filename(payload)).write_text(
+                yaml.safe_dump(
+                    {
+                        "species": [
+                            {"label": "OH", "success": True},
+                            {"label": "CH3", "success": False},
+                        ],
+                        "reactions": [],
+                    }
+                )
+            )
+            (run_dir / "output").mkdir(exist_ok=True)
+            (run_dir / "output" / "output.yml").write_text(
+                yaml.safe_dump(
+                    {
+                        "species": [
+                            {"label": "OH", "converged": True},
+                            {"label": "CH3", "converged": False},
+                        ]
+                    }
+                )
+            )
+            return _Completed()
+
+        monkeypatch.setattr(arc_module, "_arc_run_in_process_group", _fake_run)
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        run, diagnostics = ARCAdapter().run(
+            workspace_root=ws, campaign=_campaign(ws), action=_action(level_of_theory=MOCK_LEVEL_OF_THEORY)
+        )
+        assert run.status == RunStatus.FAILED
+        assert run.failure_code == FailureCode.INVALID_OUTPUT
+        assert diagnostics is not None
+        assert [s.label for s in diagnostics.species_to_compute] == ["OH"]
+        assert any("CH3" in w for w in diagnostics.warnings)
 
     def test_corrupt_info_yaml_is_typed_invalid_output(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """F11 end-to-end: a corrupt ``<project>_info.yml`` must produce a typed

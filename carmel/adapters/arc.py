@@ -681,13 +681,153 @@ def _count_converged(output_dict: dict[str, Any] | None) -> int:
     return sum(1 for s in species if isinstance(s, dict) and s.get("converged"))
 
 
+def _requested_labels(entries: Any) -> list[str]:
+    """Extract the ordered list of labels an ARC input requested.
+
+    Used against the top-level ``species``/``reactions`` lists in the ARC
+    *input* dict, whose entries carry the same ``label`` key ARC echoes back
+    in ``<project>_info.yml`` and ``output/output.yml``.
+    """
+    if not isinstance(entries, list):
+        return []
+    labels = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            label = entry.get(ARC_LAYOUT.INFO_LABEL_KEY)
+            if label:
+                labels.append(str(label))
+    return labels
+
+
+def _success_labels(entries: Any) -> frozenset[str]:
+    """Labels of ``<project>_info.yml`` entries whose ``success`` flag is truthy."""
+    if not isinstance(entries, list):
+        return frozenset()
+    return frozenset(
+        str(entry[ARC_LAYOUT.INFO_LABEL_KEY])
+        for entry in entries
+        if isinstance(entry, dict) and entry.get(ARC_LAYOUT.INFO_LABEL_KEY) and entry.get(ARC_LAYOUT.INFO_SUCCESS_KEY)
+    )
+
+
+def _converged_species_labels(output_dict: dict[str, Any] | None) -> frozenset[str]:
+    """Labels of ``output.yml`` species entries whose ``converged`` flag is truthy."""
+    if not output_dict:
+        return frozenset()
+    species = output_dict.get("species") or []
+    return frozenset(
+        str(entry[ARC_LAYOUT.INFO_LABEL_KEY])
+        for entry in species
+        if isinstance(entry, dict) and entry.get(ARC_LAYOUT.INFO_LABEL_KEY) and entry.get("converged")
+    )
+
+
+@dataclass(frozen=True)
+class ARCQuality:
+    """Whether an ARC run actually computed what it was asked to compute.
+
+    ARC's ``<project>_info.yml`` reports per-entry ``success`` and
+    ``output/output.yml`` separately reports per-species ``converged`` — a
+    subprocess ``returncode == 0`` says nothing about either. This ties both
+    files back to what the ARC *input* actually requested, so a run where
+    every QM job failed to converge cannot be reported as a clean success
+    with a full ``species_to_compute`` list and no warnings.
+
+    Reaction quality depends only on ``success`` in the info file — ARC/Mockter
+    ``output.yml`` legitimately reports ``reactions: []`` even for successful
+    reaction jobs, so reaction convergence is deliberately not required here.
+    """
+
+    requested_labels: frozenset[str]
+    succeeded_labels: frozenset[str]
+    converged_labels: frozenset[str]
+    failed_labels: list[str]
+    missing_output: bool
+    count_mismatch: bool
+    warnings: list[str]
+    ok: bool
+
+
+def _assess_arc_quality(
+    input_dict: dict[str, Any],
+    info: dict[str, Any],
+    output_dict: dict[str, Any] | None,
+) -> ARCQuality:
+    """Cross-check requested labels against ARC's info/output files.
+
+    Args:
+        input_dict: The ARC input dict (source of the requested species/reactions).
+        info: The parsed ``<project>_info.yml`` (via :func:`read_arc_info_file`).
+        output_dict: The parsed ``output/output.yml``, or None if absent/invalid.
+    """
+    requested_species = _requested_labels(input_dict.get(ARC_LAYOUT.INPUT_SPECIES_KEY))
+    requested_reactions = _requested_labels(input_dict.get(ARC_LAYOUT.INPUT_REACTIONS_KEY))
+    requested_labels = frozenset(requested_species) | frozenset(requested_reactions)
+
+    succeeded_species = _success_labels(info.get(ARC_LAYOUT.INFO_SPECIES_KEY))
+    succeeded_reactions = _success_labels(info.get(ARC_LAYOUT.INFO_REACTIONS_KEY))
+    succeeded_labels = succeeded_species | succeeded_reactions
+
+    missing_output = bool(requested_species) and not isinstance(output_dict, dict)
+    converged_labels = _converged_species_labels(output_dict) if isinstance(output_dict, dict) else frozenset()
+
+    failed_labels: list[str] = []
+    warnings: list[str] = []
+
+    for label in requested_species:
+        succeeded = label in succeeded_species
+        converged = label in converged_labels
+        if succeeded and converged:
+            continue
+        failed_labels.append(label)
+        if not succeeded:
+            warnings.append(f"ARC species {label!r} did not succeed")
+        else:
+            warnings.append(f"ARC species {label!r} succeeded but did not converge")
+
+    for label in requested_reactions:
+        if label in succeeded_reactions:
+            continue
+        failed_labels.append(label)
+        warnings.append(f"ARC reaction {label!r} did not succeed")
+
+    if missing_output:
+        warnings.append(
+            "ARC output/output.yml is missing or not a valid mapping; species convergence could not be verified"
+        )
+
+    info_success_species_count = len(succeeded_species)
+    output_converged_species_count = _count_converged(output_dict)
+    count_mismatch = (
+        not missing_output and bool(requested_species) and info_success_species_count != output_converged_species_count
+    )
+    if count_mismatch:
+        warnings.append(
+            f"ARC info reports {info_success_species_count} successful species but output.yml "
+            f"reports {output_converged_species_count} converged"
+        )
+
+    ok = bool(requested_species) and not missing_output and not failed_labels and not count_mismatch
+
+    return ARCQuality(
+        requested_labels=requested_labels,
+        succeeded_labels=succeeded_labels,
+        converged_labels=converged_labels,
+        failed_labels=failed_labels,
+        missing_output=missing_output,
+        count_mismatch=count_mismatch,
+        warnings=warnings,
+        ok=ok,
+    )
+
+
 def normalize_arc_outputs(
     project_dir: Path,
     input_dict: dict[str, Any],
     campaign_id: str,
     run_id: str,
-) -> DiagnosticsV1:
-    """Normalize a real ARC project tree into a ``DiagnosticsV1``.
+) -> tuple[DiagnosticsV1, ARCQuality]:
+    """Normalize a real ARC project tree into a ``DiagnosticsV1`` + quality summary.
 
     Args:
         project_dir: The ARC project directory (where ARC wrote its output).
@@ -696,7 +836,12 @@ def normalize_arc_outputs(
         run_id: The Carmel run that produced this output.
 
     Returns:
-        A validated ``DiagnosticsV1``.
+        A ``(DiagnosticsV1, ARCQuality)`` tuple. ``species_to_compute`` and
+        ``reactions_to_compute`` include only entries ARCQuality judged good
+        (successful, and for species, converged); failed/non-converged/missing
+        requested labels are excluded but surfaced via ``ARCQuality`` and
+        ``DiagnosticsV1.warnings`` so the caller can gate ``RunStatus`` on
+        ``quality.ok`` while still inspecting the partial result.
 
     Raises:
         ValueError: If ARC did not write its ``<project>_info.yml``. ARC saves
@@ -714,21 +859,23 @@ def normalize_arc_outputs(
             "of a run, so a missing info file means ARC did not run to completion."
         )
 
+    info = read_arc_info_file(info_path)
+    quality = _assess_arc_quality(input_dict, info, output_dict)
+
     species: list[SpeciesSelection] = []
     reactions: list[ReactionSelection] = []
-    info = read_arc_info_file(info_path)
     for raw in info.get(ARC_LAYOUT.INFO_SPECIES_KEY, []) or []:
         sel = _coerce_species_entry(raw)
-        if sel is not None:
+        if sel is not None and sel.label in quality.succeeded_labels and sel.label in quality.converged_labels:
             species.append(sel)
     for raw in info.get(ARC_LAYOUT.INFO_REACTIONS_KEY, []) or []:
         rxn = _coerce_reaction_entry(raw)
-        if rxn is not None:
+        if rxn is not None and rxn.label in quality.succeeded_labels:
             reactions.append(rxn)
 
     arc_version = output_dict.get(ARC_LAYOUT.OUTPUT_VERSION_KEY) if output_dict else None
 
-    return DiagnosticsV1(
+    diagnostics = DiagnosticsV1(
         campaign_id=campaign_id,
         run_id=run_id,
         model_version=None,
@@ -739,15 +886,21 @@ def normalize_arc_outputs(
         reactions_to_compute=reactions,
         pdep_networks_to_compute=[],  # standalone ARC does not discover PDep networks (that is T3's job)
         pdep_sensitivity_flag=False,
-        warnings=[],
+        warnings=list(quality.warnings),
         tool_metadata={
             "adapter": ARC_TOOL_NAME,
             "arc_version": arc_version,
             "species_count": len(species),
             "reaction_count": len(reactions),
             "converged_species_count": _count_converged(output_dict),
+            "requested_count": len(quality.requested_labels),
+            "succeeded_count": len(quality.succeeded_labels),
+            "failed_labels": list(quality.failed_labels),
+            "missing_output": quality.missing_output,
+            "count_mismatch": quality.count_mismatch,
         },
     )
+    return diagnostics, quality
 
 
 # ---------------------------------------------------------------------------
@@ -961,7 +1114,7 @@ class ARCAdapter:
 
         # 4. Normalize ARC's real output tree into DiagnosticsV1.
         try:
-            diagnostics = normalize_arc_outputs(
+            diagnostics, quality = normalize_arc_outputs(
                 project_dir=run_dir,
                 input_dict=payload,
                 campaign_id=campaign.campaign_id,
@@ -982,13 +1135,30 @@ class ARCAdapter:
                 command=command,
             ), None
 
+        # A returncode of 0 only means the ARC process exited cleanly — it says
+        # nothing about whether the QM jobs it ran actually converged. Decide
+        # the final status from ARCQuality (cross-checked against the ARC
+        # input) rather than the subprocess exit code alone, so a run where
+        # every species failed to converge cannot report SUCCEEDED with a full
+        # species_to_compute list and no warnings. Diagnostics — the good
+        # subset plus warnings — are still returned on a quality failure so the
+        # caller can gate on status while keeping the partial result inspectable.
+        if quality.ok:
+            status = RunStatus.SUCCEEDED
+            failure_code = FailureCode.NONE
+            error_message = None
+        else:
+            status = RunStatus.FAILED
+            failure_code = FailureCode.INVALID_OUTPUT
+            error_message = "; ".join(quality.warnings) or "ARC run did not produce usable output"
+
         record = RunRecord(
             run_id=run_id,
             action_id=action.action_id,
             tool_name=ARC_TOOL_NAME,
             tool_version=_arc_version(),
-            status=RunStatus.SUCCEEDED,
-            failure_code=FailureCode.NONE,
+            status=status,
+            failure_code=failure_code,
             started_at=started,
             ended_at=ended,
             # The same estimate the envelope and timeout were computed from, so
@@ -1002,6 +1172,7 @@ class ARCAdapter:
             stdout_path=stdout_path,
             stderr_path=stderr_path,
             level_of_theory=diagnostics.level_of_theory,
+            error_message=error_message,
         )
         return record, diagnostics
 
