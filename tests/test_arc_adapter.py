@@ -1528,8 +1528,11 @@ class TestARCAdapterRealSubprocess:
         assert run.input_path.exists()
         # The stdout/stderr capture files are opened immediately before the
         # subprocess is spawned, so their presence is on-disk proof ARC really
-        # ran as a subprocess (they do not exist on a prelaunch failure).
-        run_dir = ws / run.run_id
+        # ran as a subprocess (they do not exist on a prelaunch failure). They
+        # live in the run directory alongside the input file the adapter wrote
+        # (workspace/runs/<run_id>/), so derive it from input_path rather than
+        # re-deriving the layout here.
+        run_dir = run.input_path.parent
         assert (run_dir / ARC_LAYOUT.CARMEL_STDOUT_FILENAME).exists()
         assert (run_dir / ARC_LAYOUT.CARMEL_STDERR_FILENAME).exists()
         if run.status == RunStatus.SUCCEEDED:
