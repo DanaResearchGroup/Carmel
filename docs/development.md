@@ -242,6 +242,19 @@ single supported mypy target: CI's `agents` job installs the extra and owns
 typecheck; CI's `lint` job installs only the base `dev` extras and runs
 `ruff` alone, deliberately skipping `make typecheck` for the same reason.
 
+**Enforcement gap (admin action needed):** the `agents` job's display name
+is `Agents extra — tests + typecheck (required)`, but that job is **not**
+actually present in the repo's "Protect Main" ruleset
+(`gh api repos/DanaResearchGroup/Carmel/rulesets/14702943`). Only
+`Lint + format + typecheck (required)`,
+`Tests + packaging smoke (required) (3.14)`, `Check CLA signature`, and
+`build` are listed as required status checks. That means, as of this
+change, a failing mypy run in the `agents` job can go red without blocking
+any PR — typecheck is no longer an enforced merge gate anywhere, only a job
+that must pass *if it runs and is looked at*. Fixing this requires a repo
+admin to add the `agents` job to the ruleset's required status checks; it
+is not something a contributor or this doc can do unilaterally.
+
 ## Full Verification
 
 ```bash
@@ -250,13 +263,20 @@ make check       # lint + typecheck + test
 
 ## CI
 
-GitHub Actions has **two lanes** that run on every push to `main` and
-on pull requests.
+GitHub Actions has **three** relevant jobs that run on every push to `main`
+and on pull requests: two required by the "Protect Main" ruleset, and one
+("agents") that runs typecheck but is not (yet) wired into that ruleset —
+see the enforcement-gap note above.
 
 ### Required lane (must pass for merge)
 
-- **`lint`** — `make lint` (ruff check + ruff format check) and
-  `make typecheck` (mypy strict).
+- **`lint`** (job name `Lint + format + typecheck (required)`) — runs
+  `make lint` (ruff check + ruff format check) only. It installs the base
+  `dev` extras (no `agents`) and deliberately does **not** run
+  `make typecheck` any more — see "`make typecheck` requires the `agents`
+  extra" above for why. The job's display name is now slightly inaccurate
+  as a result; renaming it requires updating the ruleset's required-check
+  string in lockstep, so it was left as-is.
 - **`test`** — pytest with branch coverage, plus a **packaging smoke
   step** that exercises:
   - `carmel version`
@@ -266,6 +286,15 @@ on pull requests.
 
   This catches console-script regressions (e.g. broken entrypoints,
   missing template folder) without spinning up the full server.
+
+### Typecheck lane (`agents`, not currently a required check)
+
+- **`agents`** (job name `Agents extra — tests + typecheck (required)`) —
+  installs the `agents` extra and runs both the test suite and
+  `make typecheck` in that environment. It is the only job that ever runs
+  mypy. Despite the "(required)" in its display name, it is **not** listed
+  in the "Protect Main" ruleset's required status checks, so a red result
+  here does not currently block a merge. See the enforcement-gap note above.
 
 ### Best-effort lane (`tools`)
 

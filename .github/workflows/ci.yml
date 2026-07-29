@@ -43,7 +43,18 @@ jobs:
   # environments, and weakening strictness (blanket `ignore_missing_imports`,
   # `warn_unused_ignores = false`) is not acceptable. So the agents-installed
   # environment is the one supported mypy target; the `agents` job below
-  # (required) already owns typecheck there.
+  # (its display name says "(required)") owns typecheck there.
+  #
+  # ENFORCEMENT GAP: despite that "(required)" in its name, the `agents` job
+  # is NOT actually listed in the repo's "Protect Main" ruleset
+  # (`gh api repos/DanaResearchGroup/Carmel/rulesets/14702943` ->
+  # required_status_checks), only `Lint + format + typecheck (required)`,
+  # `Tests + packaging smoke (required) (3.14)`, `Check CLA signature`, and
+  # `build` are. So as of this change, a red mypy result in the `agents` job
+  # cannot block a merge -- it can only go red without gating anything. This
+  # is an admin-only fix: someone with repo admin rights needs to add the
+  # `agents` job to the ruleset's required status checks to restore typecheck
+  # as an actual merge gate.
   lint:
     name: Lint + format + typecheck (required)
     runs-on: ubuntu-latest
