@@ -34,6 +34,16 @@ reports a `SyntaxError` during collection rather than anything about
 versions. The floor is declared once, in `requires-python`; `mypy` and the
 CI workflows are held against it by a test.
 
+The specific 3.14 feature that trips reviewers and tooling is [PEP 758][pep758]:
+`except TypeError, ValueError:` without parentheses. It is valid on 3.14 and
+appears in roughly eight modules. An older interpreter — including a default
+`anaconda3` base env on 3.12 — reports it as a `SyntaxError` at the `except`
+line. Those reports are false: the code is correct and must not be
+"fixed" by adding parentheses. If a linter, IDE, type checker, or code-review
+tool flags one, check which interpreter it is running before changing anything.
+
+[pep758]: https://peps.python.org/pep-0758/
+
 ### Three-env deployment model
 
 Carmel, T3, and RMG have mutually exclusive Python requirements and

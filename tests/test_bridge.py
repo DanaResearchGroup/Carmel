@@ -521,6 +521,13 @@ class TestModelLadderFallback:
         assert attempted == ["gemini-3.5-flash", "gemini-3-flash-preview"]
         # The cost must be attributed to the model that actually ran, not the one asked for.
         assert response.model_name == "gemini-3-flash-preview"
+        # `self.name` must stay the constructor-given preferred model, not the fallback
+        # rung that happened to succeed. A prior version mutated `self.name = candidate`
+        # inside the fallback loop and never restored it, so a caller reading
+        # `deps.model.name` (e.g. carmel/services/literature.py) after a successful
+        # fallback would see the wrong, drifted value -- this asserts that regression
+        # stays fixed.
+        assert model.name == "gemini-3.5-flash"
 
     def test_404_retirement_falls_through_too(self, monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.importorskip("pydantic_ai")
@@ -689,7 +696,7 @@ class TestPydanticAIModelApiKeyThreading:
             model_name="gemini-2.5-flash", provider=AgentProvider.GOOGLE, api_key="sk-explicit-secret"
         )
         pydantic_ai_module = model._build_agent()
-        model._infer_model(pydantic_ai_module)
+        model._infer_model(pydantic_ai_module, "gemini-2.5-flash")
 
         assert captured["provider_name"] == "google"
         assert captured["api_key"] == "sk-explicit-secret"

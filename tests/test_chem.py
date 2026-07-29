@@ -126,8 +126,14 @@ class TestInchikey:
 
 
 def test_real_rdkit_end_to_end_if_installed() -> None:
-    """When rdkit is genuinely installed, sanity-check against real chemistry."""
+    """When rdkit is genuinely installed, sanity-check against real chemistry.
+
+    Asserting real, known-correct values (not just ``is not None``) matters here:
+    an ``is not None`` check alone would also pass for a passthrough/constant stub
+    that never actually canonicalized or hashed anything -- these are the exact,
+    independently-verifiable RDKit outputs for ethanol.
+    """
     pytest.importorskip("rdkit")
-    assert canonical_smiles("CCO") is not None
+    assert canonical_smiles("CCO") == "CCO"
     assert canonical_smiles("not a smiles string $$$") is None
-    assert inchikey("CCO") is not None
+    assert inchikey("CCO") == "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"

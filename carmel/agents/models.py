@@ -39,6 +39,13 @@ __all__ = ["AgentBridgeError", "MockModel", "PydanticAIModel", "build_model", "c
 # which is always true for moving aliases like `gemini-pro-latest` (genai_prices.calc_price
 # raises LookupError for it). Values cross-checked against the genai_prices data snapshot
 # as of this change.
+#
+# Verified-on date: 2026-07-28. This table is a hand-maintained snapshot, not a live
+# lookup, so it WILL rot the same way the dated pins in `model_catalog.py` rot -- the
+# difference is a stale price only over- or under-charges the budget ledger rather than
+# failing a call outright, so there is no loud signal forcing a re-check. Treat any entry
+# older than a few months as due for re-verification against `genai_prices` the next time
+# this file is touched for an unrelated reason.
 _MODEL_PRICING_USD_PER_1M_TOKENS: dict[str, dict[str, float]] = {
     "gemini-2.5-flash": {"input": 0.30, "output": 2.50},
     "gemini-3.5-flash": {"input": 1.50, "output": 9.00},
@@ -88,6 +95,12 @@ _FALLBACK_UNKNOWN_MODEL_RATE: dict[str, float] = {"input": 50.0, "output": 150.0
 # from a genuine, believable report of 0 tokens. This is a documented judgment call, not
 # a measurement: it assumes a call large enough that under-charging would be the worse
 # failure mode.
+#
+# This happens to equal `AgentBudgetConfig.max_cost_usd`'s default (also 5.0, in
+# `carmel/config.py`) -- that match is COINCIDENTAL, not a derived relationship. This
+# constant is a per-call worst-case estimate chosen independently of any particular
+# budget; `max_cost_usd` is an operator-configurable ceiling for an entire run and can be
+# set to any value. Do not read a change to one as implying the other should change too.
 _WORST_CASE_NO_USAGE_COST_USD = 5.0
 
 
@@ -160,7 +173,10 @@ def _genai_prices_cost_usd(usage: Any, model_name: str, provider_id: str) -> flo
     into 0.0 or to blow up the request path.
     """
     try:
-        import genai_prices  # type: ignore[import-not-found]
+        # `genai_prices` ships `py.typed`, so once the `agents` extra is installed
+        # mypy resolves this directly -- no `type: ignore` needed (a stale one would
+        # be an unused-ignore error under the agents-installed mypy lane).
+        import genai_prices
     except ImportError:
         return None
 
@@ -345,7 +361,10 @@ class PydanticAIModel:
             AgentBridgeError: If pydantic-ai is not importable.
         """
         try:
-            import pydantic_ai  # type: ignore[import-not-found]
+            # `pydantic-ai` ships `py.typed`, so once the `agents` extra is installed
+            # mypy resolves this directly -- no `type: ignore` needed (a stale one
+            # would be an unused-ignore error under the agents-installed mypy lane).
+            import pydantic_ai
         except ImportError as exc:
             raise AgentBridgeError(
                 "pydantic-ai not installed: the agentic layer's 'agents' extra is "
@@ -353,7 +372,7 @@ class PydanticAIModel:
             ) from exc
         return pydantic_ai
 
-    def _infer_model(self, pydantic_ai: Any) -> Any:
+    def _infer_model(self, pydantic_ai: Any, model_name: str) -> Any:
         """Build a concrete pydantic-ai ``Model`` bound to ``self._api_key``.
 
         ``pydantic_ai.Agent("provider:model")`` (a bare string) resolves its provider via
@@ -366,8 +385,18 @@ class PydanticAIModel:
         the constructed object to ``Agent``, ensuring the key we were actually given is
         the one used -- regardless of what (if anything) happens to be in the ambient
         environment.
+
+        Args:
+            pydantic_ai: The lazily-imported ``pydantic_ai`` module.
+            model_name: The specific model id to bind (the ladder candidate currently
+                being attempted), passed explicitly rather than read off ``self.name`` so
+                a fallback attempt never has to mutate shared instance state to try a
+                different model.
         """
-        from pydantic_ai.providers import infer_provider_class  # type: ignore[import-not-found]
+        # `pydantic-ai` ships `py.typed`, so once the `agents` extra is installed mypy
+        # resolves this directly -- no `type: ignore` needed (a stale one would be an
+        # unused-ignore error under the agents-installed mypy lane).
+        from pydantic_ai.providers import infer_provider_class
 
         provider_name = self._provider.value
 
@@ -384,7 +413,7 @@ class PydanticAIModel:
             provider_cls: Any = infer_provider_class(name)
             return provider_cls(api_key=self._api_key)
 
-        return pydantic_ai.models.infer_model(f"{provider_name}:{self.name}", provider_factory=_provider_factory)
+        return pydantic_ai.models.infer_model(f"{provider_name}:{model_name}", provider_factory=_provider_factory)
 
     def complete(
         self,
@@ -409,9 +438,9 @@ class PydanticAIModel:
         """
         last_index = len(self._ladder) - 1
         for index, candidate in enumerate(self._ladder):
-            self.name = candidate
             try:
                 return self._complete_once(
+                    model_name=candidate,
                     system_prompt=system_prompt,
                     user_prompt=user_prompt,
                     output_schema=output_schema,
@@ -432,18 +461,28 @@ class PydanticAIModel:
     def _complete_once(
         self,
         *,
+        model_name: str,
         system_prompt: str,
         user_prompt: str,
         output_schema: type[BaseModel],
         tools: Sequence[AgentTool],
     ) -> ModelResponse:
-        """Run a single structured completion against ``self.name``.
+        """Run a single structured completion against ``model_name``.
+
+        ``model_name`` is threaded through explicitly (rather than read off
+        ``self.name``) so a fallback attempt in :meth:`complete` never has to mutate
+        ``self.name`` -- shared instance state that outlives this single call and is
+        read elsewhere (e.g. ``deps.model.name`` in ``carmel/services/literature.py``).
+        A prior version set ``self.name = candidate`` before each attempt and left it
+        mutated after a successful fallback, so a caller reading ``self.name`` after
+        ``complete()`` returned would see whichever ladder rung last succeeded --
+        surprising for something that looks like a fixed, constructor-provided name.
 
         Raises:
             AgentBridgeError: If pydantic-ai is not installed.
         """
         pydantic_ai = self._build_agent()
-        model = self._infer_model(pydantic_ai)
+        model = self._infer_model(pydantic_ai, model_name)
         agent = pydantic_ai.Agent(
             model,
             output_type=output_schema,
@@ -473,7 +512,7 @@ class PydanticAIModel:
         input_tokens = raw_input_tokens or 0
         output_tokens = raw_output_tokens or 0
         cost_usd = compute_cost_usd(
-            self.name,
+            model_name,
             input_tokens,
             output_tokens,
             tokens_available=tokens_available,
@@ -485,7 +524,7 @@ class PydanticAIModel:
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cost_usd=cost_usd,
-            model_name=self.name,
+            model_name=model_name,
             tool_calls=[],
         )
 

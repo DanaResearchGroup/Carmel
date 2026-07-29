@@ -148,6 +148,28 @@ def _fetch_catalogue(provider: AgentProvider, api_key: str) -> tuple[str, ...]:
     Returns an empty tuple on any failure, which callers translate into "use the static
     fallback ladder" -- a catalogue lookup failing must degrade the CHOICE of model, not
     break the run.
+
+    Consent and budget, documented: this is the one HTTP egress point in the agents
+    stack that deliberately does NOT go through ``BudgetLedger`` (unlike
+    ``HttpFetchTool``, whose every call reserves and settles against it) and has no
+    size cap of its own. That is a considered choice, not an oversight:
+      * Consent IS already enforced -- this function is only ever reached via
+        ``resolve_model_ladder`` from ``build_model``, which raises before this point
+        if ``config.external_provider_consent`` is False (see the check immediately
+        above the ``resolve_model_ladder`` call in ``carmel/agents/models.py``). There
+        is no path to this function that bypasses that gate.
+      * The URL is a fixed, hardcoded entry from ``_CATALOGUE_URLS`` -- never
+        attacker- or LLM-influenced -- so the SSRF threat model that ``HttpFetchTool``
+        guards against (an adversary choosing an arbitrary destination) does not apply
+        here.
+      * The response body is a small, provider-controlled JSON model listing (not
+        arbitrary attacker content), so the decompression-bomb-scale risk
+        ``HttpFetchTool``'s byte cap defends against is not in play either; it is read
+        whole via ``response.read()`` rather than streamed.
+    If this function is ever changed to accept a caller-supplied URL, or to fetch
+    something whose size is not provider-bounded, it must gain the same ledger
+    reservation and streaming cap ``HttpFetchTool`` uses -- at that point the
+    reasoning above no longer holds.
     """
     url = _CATALOGUE_URLS.get(provider)
     if url is None:

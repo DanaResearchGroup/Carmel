@@ -12,9 +12,14 @@ def _disable_rdkit_logging() -> None:
     """Silence RDKit's C++-level stderr chatter (e.g. "SMILES Parse Error") for
     invalid input. Best-effort: if the logger API is unavailable, proceed anyway."""
     try:
-        from rdkit import RDLogger  # type: ignore[import-not-found]
+        # Imported from `rdkit.rdBase` (the compiled extension `RDLogger.py` re-exports
+        # this from) rather than from `rdkit.RDLogger` itself: the `rdkit-stubs` package
+        # (bundled inside every `rdkit` install, verified via its dist-info RECORD) types
+        # `rdBase.DisableLog` fully, but `RDLogger.pyi`'s `__all__` does not re-export it,
+        # so mypy sees it as missing there even though it exists at runtime.
+        from rdkit.rdBase import DisableLog
 
-        RDLogger.DisableLog("rdApp.*")
+        DisableLog("rdApp.*")
     except Exception:  # noqa: BLE001 - logging suppression must never break callers
         pass
 
@@ -75,6 +80,10 @@ def inchikey(raw_smiles: str) -> str | None:
         mol = Chem.MolFromSmiles(raw_smiles)
         if mol is None:
             return None
-        return str(Chem.MolToInchiKey(mol))
+        # `rdkit-stubs`' `inchi.pyi` leaves `MolToInchiKey` entirely unannotated (no
+        # parameter or return types at all), so this is a genuine gap in the third-party
+        # stub, not something a typed rewrite on our side can close. Narrowly ignored by
+        # error code, not blanket-ignored.
+        return str(Chem.MolToInchiKey(mol))  # type: ignore[no-untyped-call]
     except Exception:  # noqa: BLE001 - fail soft on any parse/conversion error
         return None
