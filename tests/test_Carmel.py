@@ -489,3 +489,152 @@ class TestServeConfigOption:
         code = main(["serve", "--config", str(tmp_path / "missing.yaml")])
         assert code == 1
         assert "Failed to load config" in capsys.readouterr().err
+
+
+CAMPAIGN_YAML = """\
+workspace_name: nh3-cli
+workspace_root: {root}
+agents:
+  tier: test
+  provider: mock
+  external_provider_consent: false
+  literature_at_campaign_start: false
+  budget:
+    max_model_calls: 5
+    max_tokens: 50000
+    max_fetches: 5
+    max_cost_usd: 1.0
+campaign:
+  initial_mixture:
+    components:
+      - species: NH3
+        mole_fraction: 0.01
+      - species: O2
+        mole_fraction: 0.0075
+      - species: AR
+        mole_fraction: 0.9825
+  target_observables:
+    - name: ignition_delay_time
+  target_reactor_systems:
+    - reactor_type: shock_tube
+      temperature_range_K: [1400.0, 2000.0]
+      pressure_range_bar: [1.0, 30.0]
+  budgets:
+    cpu_hours: 10.0
+    experiment_budget: 0.0
+"""
+
+
+def _write_campaign_config(tmp_path: Path) -> Path:
+    cfg = tmp_path / "nh3.yaml"
+    cfg.write_text(CAMPAIGN_YAML.format(root=tmp_path / "ws"), encoding="utf-8")
+    return cfg
+
+
+class TestNewCampaignCommand:
+    """`carmel new-campaign` replaces the hand-written setup script an operator would
+    otherwise maintain outside the repo -- a private mock of Carmel's own API that rots
+    against the real one."""
+
+    def test_creates_a_campaign_from_the_config_file(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from Carmel import main
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        out = capsys.readouterr().out
+        assert "Campaign ID" in out
+        assert (tmp_path / "ws" / "campaign.yaml").exists()
+
+    def test_a_config_without_a_campaign_section_explains_what_to_add(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cfg = tmp_path / "bare.yaml"
+        cfg.write_text(f"workspace_name: bare\nworkspace_root: {tmp_path / 'ws2'}\n", encoding="utf-8")
+
+        from Carmel import main
+
+        assert main(["new-campaign", "--config", str(cfg)]) == 1
+        assert "campaign" in capsys.readouterr().out.lower()
+
+
+class TestRequestsCommand:
+    """The manual-acquisition step. Listing must print the exact command to run next,
+    and admitting must report the identity verdict immediately -- waiting for a whole
+    literature run to learn whether a file was accepted is what made this painful."""
+
+    def _campaign_with_request(self, tmp_path: Path) -> tuple[str, Path]:
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import record_request
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        record_request(
+            ws,
+            title="Shock tube study of ammonia oxidation ignition delay times",
+            doi="10.1016/j.test.2019.01.001",
+            landing_url="https://doi.org/10.1016/j.test.2019.01.001",
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+        return load_campaign(ws).campaign_id, ws
+
+    def test_listing_prints_the_next_command_for_each_pending_paper(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cid, _ = self._campaign_with_request(tmp_path)
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path)]) == 0
+        out = capsys.readouterr().out
+        assert "awaiting a human" in out
+        assert "--add" in out and "--slug" in out
+
+    def test_the_wrong_paper_is_rejected_and_nothing_is_admitted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cid, ws = self._campaign_with_request(tmp_path)
+        wrong = tmp_path / "wrong.txt"
+        wrong.write_text("Laminar burning velocities of methane air mixtures\n", encoding="utf-8")
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(wrong)]) == 1
+        out = capsys.readouterr().out
+        assert "REJECTED" in out
+        assert "Nothing was admitted" in out
+
+    def test_the_right_paper_is_accepted_and_says_so(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, _ = self._campaign_with_request(tmp_path)
+        right = tmp_path / "right.txt"
+        right.write_text(
+            "Shock tube study of ammonia oxidation ignition delay times\n"
+            "DOI: 10.1016/j.test.2019.01.001\nAbstract: we report ignition delay times.\n",
+            encoding="utf-8",
+        )
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(right)]) == 0
+        assert "ACCEPTED" in capsys.readouterr().out
+
+    def test_a_rejected_drop_can_be_retried_with_the_correct_paper(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A rejection must leave the request on the worklist, not retire it."""
+        cid, _ = self._campaign_with_request(tmp_path)
+        wrong = tmp_path / "wrong.txt"
+        wrong.write_text("Something else entirely\n", encoding="utf-8")
+        right = tmp_path / "right.txt"
+        right.write_text(
+            "Shock tube study of ammonia oxidation ignition delay times\nDOI: 10.1016/j.test.2019.01.001\n",
+            encoding="utf-8",
+        )
+
+        from Carmel import main
+
+        main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(wrong)])
+        capsys.readouterr()
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(right)]) == 0
+        assert "ACCEPTED" in capsys.readouterr().out

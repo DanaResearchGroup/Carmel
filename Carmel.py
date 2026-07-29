@@ -40,6 +40,43 @@ def create_parser() -> argparse.ArgumentParser:
         help="Carmel config file whose 'agents' section enables the literature auto-run",
     )
 
+    new_campaign = subparsers.add_parser(
+        "new-campaign",
+        help="Create a campaign from the 'campaign' section of a config file",
+    )
+    new_campaign.add_argument("--config", type=Path, required=True, help="Carmel config file with a 'campaign' section")
+    new_campaign.add_argument(
+        "--workspaces",
+        type=Path,
+        default=None,
+        help="Parent workspaces directory (default: the config's workspace_root)",
+    )
+
+    requests_cmd = subparsers.add_parser(
+        "requests",
+        help="List papers awaiting a human, or hand one to Carmel",
+    )
+    requests_cmd.add_argument("--campaign", type=str, required=True, help="Campaign ID")
+    requests_cmd.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    requests_cmd.add_argument(
+        "--add",
+        type=Path,
+        default=None,
+        help="A downloaded paper to admit. Carmel identity-checks it immediately and reports the verdict.",
+    )
+    requests_cmd.add_argument(
+        "--slug",
+        type=str,
+        default=None,
+        help="Which request --add satisfies. Inferred when unambiguous; required when it is not.",
+    )
+    requests_cmd.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Carmel config file, for the artifact size limit",
+    )
+
     literature = subparsers.add_parser("literature", help="Run the literature-search step for an existing campaign")
     literature.add_argument("--campaign", type=str, required=True, help="Campaign ID")
     literature.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
@@ -169,6 +206,114 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     return 0
 
 
+def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
+    """Create a campaign from a config file's ``campaign:`` section.
+
+    Exists so an operator never has to hand-write a Python script that builds a
+    ``CampaignInput`` -- a private mock of Carmel's own API that inevitably rots against
+    the real one. The config file is the single description of a run.
+    """
+    from carmel.config import load_config
+    from carmel.services.campaigns import MissingCampaignConfigError, create_campaign_from_config
+
+    try:
+        config = load_config(config_file)
+    except (OSError, ValueError) as exc:
+        print(f"Could not load {config_file}: {exc}")
+        return 1
+
+    try:
+        campaign = create_campaign_from_config(config, workspaces_root=workspaces)
+    except MissingCampaignConfigError as exc:
+        print(str(exc))
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"Could not create the campaign: {exc}")
+        return 1
+
+    print(f"Campaign ID : {campaign.campaign_id}")
+    print(f"Workspace   : {campaign.workspace_root}")
+    print()
+    print(f"Next: carmel literature --campaign {campaign.campaign_id} --config {config_file}")
+    return 0
+
+
+def _cmd_requests(
+    campaign_id: str,
+    workspaces: Path | None,
+    add: Path | None,
+    slug: str | None,
+    config_file: Path | None,
+) -> int:
+    """List papers awaiting a human, or admit one that has been obtained.
+
+    Without ``--add`` this prints the queue. With ``--add`` it copies the file into the
+    inbox under the right name AND runs the identity check immediately, so the operator
+    learns accepted-or-rejected now rather than after a whole literature run -- the long
+    feedback loop that made this step painful.
+    """
+    from carmel.config import AgentBudgetConfig, load_config
+    from carmel.paths import default_workspaces_root
+    from carmel.schemas.acquisition import AcquisitionStatus
+    from carmel.services.acquisition import admit_file, drop_path_for, pending_requests
+    from carmel.services.campaigns import find_campaign_workspace
+
+    root = workspaces.expanduser() if workspaces is not None else default_workspaces_root()
+    ws = find_campaign_workspace(root, campaign_id)
+    if ws is None:
+        print(f"No campaign {campaign_id!r} under {root}")
+        return 1
+
+    max_bytes = AgentBudgetConfig().max_artifact_bytes
+    if config_file is not None:
+        try:
+            config = load_config(config_file)
+        except (OSError, ValueError) as exc:
+            print(f"Could not load {config_file}: {exc}")
+            return 1
+        if config.agents is not None:
+            max_bytes = config.agents.budget.max_artifact_bytes
+
+    if add is not None:
+        try:
+            request = admit_file(ws, add, slug=slug, max_bytes=max_bytes)
+        except (OSError, ValueError) as exc:
+            print(f"Could not admit {add}: {exc}")
+            return 1
+        if request.status == AcquisitionStatus.FULFILLED:
+            print(f"ACCEPTED  {request.title}")
+            print(f"          {request.identity_note}")
+            print()
+            print("Re-run `carmel literature` to ground findings against it.")
+            return 0
+        print(f"REJECTED  {request.title}")
+        print(f"          {request.identity_note}")
+        print()
+        print("Nothing was admitted to the evidence store. Drop the correct document.")
+        return 1
+
+    pending = pending_requests(ws)
+    if not pending:
+        print("No papers are awaiting acquisition.")
+        return 0
+
+    print(f"{len(pending)} paper(s) awaiting a human:")
+    print()
+    for request in pending:
+        print(f"  {request.title}")
+        if request.doi:
+            print(f"    doi   : {request.doi}")
+        print(f"    get   : {request.landing_url}")
+        detail = f" -- {request.detail}" if request.detail else ""
+        print(f"    why   : {request.reason.value}{detail}")
+        if request.status == AcquisitionStatus.REJECTED and request.identity_note:
+            print(f"    last  : REJECTED -- {request.identity_note}")
+        print(f"    then  : carmel requests --campaign {campaign_id} --add <file> --slug {request.slug}")
+        print(f"    or copy to: {drop_path_for(ws, request.slug)}")
+        print()
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and dispatch to the appropriate command.
 
@@ -191,6 +336,12 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_serve(args.workspaces, args.host, args.port, args.debug, args.config)
     if args.command == "literature":
         return _cmd_literature(args.campaign, args.workspaces, args.config)
+
+    if args.command == "new-campaign":
+        return _cmd_new_campaign(args.config, args.workspaces)
+
+    if args.command == "requests":
+        return _cmd_requests(args.campaign, args.workspaces, args.add, args.slug, args.config)
 
     parser.print_help()
     return 1
