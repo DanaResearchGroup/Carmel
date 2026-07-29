@@ -13,6 +13,13 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+#: How far a mixture's mole fractions may drift from 1.0 and still be accepted.
+#: Loose enough to tolerate YAML-authored fixtures rounded to a few decimal places
+#: (e.g. 0.01 + 0.005 + 0.985 for a dilute trace species), tight enough to still
+#: catch a genuinely wrong composition (a component left out, a units slip such as
+#: percent instead of fraction) rather than only a rounding artifact.
+MOLE_FRACTION_SUM_TOLERANCE = 1e-3
+
 
 class BudgetsConfig(BaseModel):
     """Budget constraints for a Carmel campaign."""
@@ -32,6 +39,10 @@ class CarmelConfig(BaseModel):
         logging_level: Logging verbosity level.
         budgets: Optional budget constraints.
         metadata: Optional free-form metadata.
+        campaign: Optional full campaign definition (initial mixture, targets,
+            reactor systems, budgets) -- see :class:`CampaignConfig`. Absent for
+            configs that only describe a workspace (e.g. ``carmel init``); required
+            for :func:`carmel.services.campaigns.create_campaign_from_config`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -42,6 +53,7 @@ class CarmelConfig(BaseModel):
     budgets: BudgetsConfig | None = None
     metadata: dict[str, Any] | None = None
     agents: AgentConfig | None = None
+    campaign: CampaignConfig | None = None
 
     @field_validator("workspace_name")
     @classmethod
@@ -192,6 +204,103 @@ class AgentBudgetConfig(BaseModel):
     session_max_cost_usd: float = Field(default=20.0, gt=0)  # process-wide, all runs
     daily_max_cost_usd: float = Field(default=50.0, gt=0)  # persisted, all campaigns
     max_concurrent_runs: int = Field(default=2, gt=0)
+
+
+# Deliberately imported here, not at module top, to break a real circular import:
+# `carmel.schemas` (imported transitively by `carmel.schemas.campaign`) pulls in
+# `carmel.schemas.literature`, which imports `carmel.agents.budget`, which does
+# `from carmel.config import AgentBudgetConfig`. If this module is the one that
+# starts the import chain (i.e. something imports `carmel.config` first), that
+# reentrant import finds `carmel.config` already in `sys.modules` but only
+# partially executed -- so `AgentBudgetConfig` must already be bound in this
+# module's namespace by the time we reach here. Placing the import after
+# `AgentBudgetConfig` (defined just above) and using `from __future__ import
+# annotations` (so `CampaignConfig`'s field types below are resolved lazily by
+# pydantic, exactly like `CarmelConfig.agents: AgentConfig | None` already relies
+# on `AgentConfig` being defined later in this same file) is what makes this safe.
+from carmel.schemas.campaign import (  # noqa: E402
+    Budgets,
+    CampaignInput,
+    EntryMode,
+    InitialMixture,
+    ReactorSystem,
+    TargetObservable,
+)
+
+
+class CampaignConfig(BaseModel):
+    """The optional ``campaign:`` section of a Carmel config file.
+
+    This is what lets a single YAML file fully describe a run instead of an
+    operator hand-writing a private Python script that builds ``CampaignInput``
+    (see the module docstring context in ``carmel/services/campaigns.py`` for why
+    that was unacceptable). It deliberately REUSES the ``carmel.schemas.campaign``
+    models field-for-field rather than defining a parallel set of config-only
+    models: those are already pydantic, YAML maps onto them cleanly, and a second
+    definition would only rot against the real ``CampaignInput`` contract over
+    time. ``workspace_name`` is intentionally NOT a field here -- it already lives
+    on :class:`CarmelConfig` and duplicating it would create exactly the kind of
+    two-sources-of-truth drift this whole section exists to avoid.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    initial_mixture: InitialMixture
+    target_observables: list[TargetObservable]
+    target_reactor_systems: list[ReactorSystem]
+    budgets: Budgets
+    entry_mode: EntryMode = EntryMode.BUILD_FROM_SCRATCH
+    benchmarks: list[str] | None = None
+    preferred_tools: list[str] | None = None
+    notes: str | None = None
+
+    @field_validator("initial_mixture")
+    @classmethod
+    def mole_fractions_must_sum_to_one(cls, v: InitialMixture) -> InitialMixture:
+        """Reject a mixture whose mole fractions do not sum to ~1.0.
+
+        Each ``MixtureComponent`` already bounds its own fraction to ``(0, 1]``
+        (see ``carmel/schemas/campaign.py``), and ``InitialMixture`` already
+        rejects an empty component list -- but nothing upstream checks that the
+        SET of components sums to a physically valid mixture. A config with a
+        missing component, a typo'd fraction, or a units slip (percent instead of
+        a fraction) would otherwise pass every field-level check and only fail
+        much later, deep inside a solver, with no message pointing back at the
+        actual mistake in the YAML. Checked here, at config-load time, instead.
+
+        Scoped to this config-only wrapper rather than to the shared
+        ``InitialMixture`` schema itself: other callers already construct
+        ``InitialMixture`` directly with mixtures that intentionally do not sum
+        to 1.0 (fixtures exercising a single reactive species in isolation), and
+        this section is specifically about validating an operator-authored,
+        real-run YAML, not the general-purpose schema.
+        """
+        total = sum(c.mole_fraction for c in v.components)
+        if abs(total - 1.0) > MOLE_FRACTION_SUM_TOLERANCE:
+            raise ValueError(
+                f"campaign.initial_mixture mole fractions must sum to 1.0 "
+                f"(within {MOLE_FRACTION_SUM_TOLERANCE}): got {total!r}"
+            )
+        return v
+
+    def to_campaign_input(self, workspace_name: str) -> CampaignInput:
+        """Build the real ``CampaignInput`` this section describes.
+
+        Args:
+            workspace_name: The owning ``CarmelConfig.workspace_name`` -- passed
+                in rather than duplicated as a field on this model.
+        """
+        return CampaignInput(
+            workspace_name=workspace_name,
+            entry_mode=self.entry_mode,
+            initial_mixture=self.initial_mixture,
+            target_observables=self.target_observables,
+            target_reactor_systems=self.target_reactor_systems,
+            budgets=self.budgets,
+            benchmarks=self.benchmarks,
+            preferred_tools=self.preferred_tools,
+            notes=self.notes,
+        )
 
 
 class AgentConfig(BaseModel):

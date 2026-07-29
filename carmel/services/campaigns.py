@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from carmel.config import AgentConfig
+from carmel.config import AgentConfig, CarmelConfig
 from carmel.logger import get_logger
 from carmel.paths import init_workspace
 from carmel.schemas.approval import ApprovalPolicy, ApprovalStatus
@@ -31,6 +31,26 @@ if TYPE_CHECKING:
 CAMPAIGN_FILE_NAME = "campaign.yaml"
 
 _log = get_logger("services.campaigns")
+
+
+class MissingCampaignConfigError(ValueError):
+    """Raised by :func:`create_campaign_from_config` when ``config.campaign`` is unset.
+
+    A typed, named error rather than letting ``config.campaign`` be used and fail as
+    an ``AttributeError`` on ``None`` -- an operator who forgot the section needs to
+    be told exactly what to add to their YAML, not shown a stack trace pointing at
+    ``NoneType has no attribute ...`` deep inside this function.
+    """
+
+    def __init__(self, config_path_hint: str | None = None) -> None:
+        location = f" ({config_path_hint})" if config_path_hint else ""
+        super().__init__(
+            f"config{location} has no 'campaign:' section -- add one describing "
+            "initial_mixture, target_observables, target_reactor_systems, and "
+            "budgets (see CampaignConfig in carmel/config.py) before calling "
+            "create_campaign_from_config"
+        )
+
 
 #: Bound on how long :func:`start_literature_at_creation` will synchronously wait for
 #: the dispatched literature run before giving up on waiting (the run itself is NOT
@@ -111,6 +131,38 @@ def create_campaign(
 
     maybe_start_literature_at_creation(workspace_root, campaign, agent_config, wait_timeout_s=literature_wait_timeout_s)
     return campaign
+
+
+def create_campaign_from_config(config: CarmelConfig, *, workspaces_root: Path | None = None) -> Campaign:
+    """Build a :class:`CampaignInput` from ``config.campaign`` and create the campaign.
+
+    This is the single function an operator needs to go from a YAML config file to a
+    running campaign, replacing the private hand-maintained "mock of CampaignInput"
+    scripts operators previously had to write and keep in sync with this API by hand.
+
+    Args:
+        config: A loaded :class:`~carmel.config.CarmelConfig`. Must have a ``campaign``
+            section (see :class:`~carmel.config.CampaignConfig`); ``config.agents`` is
+            threaded through unchanged so the same config controls whether
+            literature-at-creation runs, and against which provider/tier.
+        workspaces_root: Where to create the campaign workspace. If ``None``, falls
+            back to ``config.workspace_root`` -- the explicit argument wins so
+            callers (e.g. a server handling many operators' configs against one
+            shared workspaces directory) can override where campaigns land without
+            editing every operator's config file.
+
+    Returns:
+        The created Campaign.
+
+    Raises:
+        MissingCampaignConfigError: If ``config.campaign`` is ``None``.
+    """
+    if config.campaign is None:
+        raise MissingCampaignConfigError()
+
+    campaign_input = config.campaign.to_campaign_input(config.workspace_name)
+    root = workspaces_root if workspaces_root is not None else config.workspace_root
+    return create_campaign(root, campaign_input, agent_config=config.agents)
 
 
 class LiteratureStartSkipped(StrEnum):

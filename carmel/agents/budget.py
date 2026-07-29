@@ -20,13 +20,28 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from carmel.config import AgentBudgetConfig
 from carmel.logger import get_logger
 from carmel.services.artifacts import write_bytes
+
+if TYPE_CHECKING:
+    # Typing-only, and load-bearing. `carmel.config` gained a `campaign:` section that
+    # imports `carmel.schemas.campaign`, which pulls in `carmel/schemas/__init__.py` ->
+    # `schemas.literature` -> this module, so a runtime import of `carmel.config` here
+    # closes a cycle.
+    #
+    # `carmel.config` defers its own import too, which is enough when `carmel.config` is
+    # the FIRST module imported -- but not when `carmel.agents.budget` is (as
+    # tests/test_agents_budget.py does), which still fails with a
+    # partially-initialized-module ImportError. Both ends need to stay deferred; do not
+    # "simplify" this one away on the grounds that config already handles it.
+    #
+    # `from __future__ import annotations` is on, so the annotation never needs the real
+    # class at runtime.
+    from carmel.config import AgentBudgetConfig
 
 logger = get_logger("agents.budget")
 

@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Iterator
@@ -555,3 +557,32 @@ def test_reservation_is_a_plain_serializable_model() -> None:
     r = Reservation(reservation_id="abc", kind="model_call", reserved_date="2026-07-26")
     assert r.settled is False
     assert r.model_dump()["reservation_id"] == "abc"
+
+
+class TestImportCycle:
+    """Every module in the config/schemas/budget loop must import first, alone.
+
+    `carmel.config` gained a `campaign:` section importing `carmel.schemas.campaign`,
+    which reaches `schemas.literature` -> `carmel.agents.budget` -> back to
+    `carmel.config`. Both ends defer their import to break it, but the failure is
+    ENTRY-POINT DEPENDENT: with only one end deferred, `import carmel.config` succeeds
+    while `import carmel.agents.budget` still raises. A full-suite run hid this, because
+    by the time any one test module loads, something else has already imported the
+    package in a working order.
+
+    Each import runs in a FRESH interpreter, because within one process the first
+    successful import poisons the check for every later one.
+    """
+
+    @pytest.mark.parametrize(
+        "module",
+        ["carmel.config", "carmel.agents.budget", "carmel.schemas.literature", "carmel.schemas.campaign"],
+    )
+    def test_module_imports_first_in_a_fresh_interpreter(self, module: str) -> None:
+        result = subprocess.run(  # noqa: S603
+            [sys.executable, "-c", f"import {module}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, f"importing {module} first failed:\n{result.stderr}"
