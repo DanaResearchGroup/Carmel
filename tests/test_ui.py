@@ -13,6 +13,7 @@ import pytest
 from flask.testing import FlaskClient
 from werkzeug.test import TestResponse
 
+from carmel.paths import default_workspaces_root
 from carmel.schemas import CampaignStateValue, DiagnosticsV1
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalStatus
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
@@ -211,11 +212,11 @@ class TestResolveWorkspacesRoot:
 
     def test_falls_back_to_home_when_env_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("CARMEL_WORKSPACES", "")
-        assert _resolve_workspaces_root(None) == Path.home() / "carmel_workspaces"
+        assert _resolve_workspaces_root(None) == default_workspaces_root()
 
     def test_falls_back_to_home_when_env_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("CARMEL_WORKSPACES", raising=False)
-        assert _resolve_workspaces_root(None) == Path.home() / "carmel_workspaces"
+        assert _resolve_workspaces_root(None) == default_workspaces_root()
 
 
 class TestFormParsing:

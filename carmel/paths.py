@@ -3,7 +3,23 @@
 
 """Path utilities and workspace initialization for Carmel."""
 
+import os
 from pathlib import Path
+
+#: Where campaign workspaces live when nothing else says otherwise.
+#:
+#: Deliberately nested rather than a top-level ``~/carmel_workspaces``: a tool has no
+#: business creating its own directory directly in a user's home, and this machine keeps
+#: every tool's output under ``~/runs/<tool>/``. Sitting under ``~/runs/carmel/`` also
+#: leaves room for Carmel to put non-workspace run output beside it later without
+#: claiming a second home-level name.
+#:
+#: Callers should prefer :func:`default_workspaces_root`, which honours the
+#: ``$CARMEL_WORKSPACES`` override.
+DEFAULT_WORKSPACES_SUBPATH: tuple[str, ...] = ("runs", "carmel", "workspaces")
+
+#: Environment variable that overrides :func:`default_workspaces_root`.
+WORKSPACES_ROOT_ENV_VAR = "CARMEL_WORKSPACES"
 
 WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "benchmarks",
@@ -101,3 +117,24 @@ def init_workspace(directory: Path | str) -> Path:
     for subdir in WORKSPACE_SUBDIRS:
         (root / subdir).mkdir(exist_ok=True)
     return root
+
+
+def default_workspaces_root() -> Path:
+    """Resolve the workspaces root from the environment, or the packaged default.
+
+    Preference order:
+
+    1. ``$CARMEL_WORKSPACES`` when set and non-empty (an empty value is treated as
+       unset, so ``CARMEL_WORKSPACES=`` in a sourced env file cannot silently redirect
+       every campaign to the filesystem root).
+    2. :data:`DEFAULT_WORKSPACES_SUBPATH` under the user's home.
+
+    Returns:
+        Absolute path to the workspaces root. The directory is NOT created here --
+        callers that need it on disk create it, so a read-only query never has a side
+        effect.
+    """
+    env = os.environ.get(WORKSPACES_ROOT_ENV_VAR)
+    if env:
+        return Path(env).expanduser()
+    return Path.home().joinpath(*DEFAULT_WORKSPACES_SUBPATH)

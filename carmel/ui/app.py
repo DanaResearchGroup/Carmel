@@ -23,6 +23,7 @@ from werkzeug.wrappers.response import Response
 
 from carmel.config import AgentConfig
 from carmel.logger import get_logger
+from carmel.paths import default_workspaces_root
 from carmel.schemas.approval import ActionKind, ApprovalStatus
 from carmel.schemas.campaign import (
     Budgets,
@@ -120,14 +121,15 @@ def _resolve_workspaces_root(workspaces_root: Path | None) -> Path:
     Preference order:
         1. explicit ``workspaces_root`` argument
         2. ``$CARMEL_WORKSPACES`` env var
-        3. ``~/carmel_workspaces`` (user-level default, repo-independent)
+        3. the packaged default (see :func:`carmel.paths.default_workspaces_root`)
+
+    Steps 2 and 3 are delegated rather than reimplemented here: the CLI resolves the
+    same root, and two copies of this rule would let the UI and the CLI disagree about
+    where a campaign lives -- which an operator experiences as a campaign that vanished.
     """
     if workspaces_root is not None:
         return Path(workspaces_root).expanduser()
-    env = os.environ.get("CARMEL_WORKSPACES")
-    if env:
-        return Path(env).expanduser()
-    return Path.home() / "carmel_workspaces"
+    return default_workspaces_root()
 
 
 def _safe_workspace_dirname(name: str) -> str:
