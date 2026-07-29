@@ -8,6 +8,9 @@ regex (which is a separate, already-tested concern).
 
 from __future__ import annotations
 
+import pytest
+from pydantic import ValidationError
+
 from carmel.agents.tools.extract import (
     ExtractedText,
     TextSection,
@@ -28,18 +31,23 @@ from carmel.schemas.literature import (
     SpeciesRef,
 )
 from carmel.services.grounding import (
+    _QUOTE_MISS_EXPLANATIONS,
     MIN_NORMALIZED_QUOTE_LENGTH,
+    QuoteMissReason,
+    UnsupportedFindingPayloadError,
     _find_all_normalized,
     _fuzzy_search,
-    _has_numeric_discrepancy,
+    _has_semantic_discrepancy,
     _present_outside_references,
     _section_for,
     _surname,
     check_evidence_spans,
     check_identity,
     find_quote,
+    find_quote_with_reason,
     ground_finding,
     required_spans_for,
+    unreadable_reason,
 )
 
 
@@ -549,8 +557,10 @@ def test_fuzzy_search_returns_none_for_empty_needle_or_haystack() -> None:
     assert _fuzzy_search("something", "", 0.92) is None
 
 
-def test_has_numeric_discrepancy_false_when_diff_has_no_digits() -> None:
-    assert _has_numeric_discrepancy("substantial result", "significant result") is False
+def test_has_semantic_discrepancy_false_when_diff_has_no_digits_or_negation() -> None:
+    # "substantial"/"significant" is an ordinary PDF-damage-style near-miss with no
+    # digit change, negation, or antonym involved -- must stay unflagged.
+    assert _has_semantic_discrepancy("substantial result", "significant result") is False
 
 
 def test_find_quote_returns_none_for_blank_quote() -> None:
@@ -855,3 +865,421 @@ def test_check_identity_short_surname_does_not_spuriously_confirm_identity() -> 
     assert surname_norm in extracted.normalized
 
     assert check_identity(extracted, citation) is False
+
+
+# --- P1-2/P1-3/P1-4 critical reproductions and fixes -------------------------------
+
+
+def test_find_quote_rejects_negation_deletion_even_though_similar() -> None:
+    """P1-2: deleting "not" is a one-word edit with a very high character-similarity
+    ratio, yet it inverts the sentence's meaning entirely -- the old numeric-only
+    guard (_has_numeric_discrepancy) had no way to catch this."""
+    raw_text = "The additive did not increase the ignition delay time under these conditions.\n"
+    extracted = _extracted(raw_text)
+    fabricated_quote = "The additive did increase the ignition delay time under these conditions."
+
+    match = find_quote(extracted, fabricated_quote)
+
+    assert match is None
+
+
+def test_find_quote_rejects_antonym_substitution_even_though_similar() -> None:
+    """P1-2: "increases" -> "decreases" is a high-ratio near-miss (they share a long
+    common suffix) that flips the claimed direction of an effect."""
+    raw_text = "The additive increases the ignition delay time under these standard conditions.\n"
+    extracted = _extracted(raw_text)
+    fabricated_quote = "The additive decreases the ignition delay time under these standard conditions."
+
+    match = find_quote(extracted, fabricated_quote)
+
+    assert match is None
+
+
+def test_find_quote_rejects_negating_prefix_addition_even_though_similar() -> None:
+    """P1-2: adding the "un-" prefix ("stable" -> "unstable") is a tiny character
+    edit that inverts meaning."""
+    raw_text = "The mixture was stable under these conditions during the entire experiment.\n"
+    extracted = _extracted(raw_text)
+    fabricated_quote = "The mixture was unstable under these conditions during the entire experiment."
+
+    match = find_quote(extracted, fabricated_quote)
+
+    assert match is None
+
+
+def test_ground_finding_negation_deletion_rejected_end_to_end() -> None:
+    """P1-2 end-to-end: before the fix this fabricated negation-dropped quote would
+    be accepted via the fuzzy fallback and could proceed to a GROUNDED_* verdict."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "The additive did not increase the ignition delay time under these conditions.\n"
+    )
+    extracted = _extracted(text)
+    fabricated_quote = "The additive did increase the ignition delay time under these conditions."
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = PriorModelPayload(model_name="ignition delay time additive study", n_species=1)
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=fabricated_quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.QUOTE_NOT_FOUND
+    assert verdict.grounded is False
+
+
+def test_has_semantic_discrepancy_true_for_negation_token_deletion() -> None:
+    assert (
+        _has_semantic_discrepancy("the additive did increase the delay", "the additive did not increase the delay")
+        is True
+    )
+
+
+def test_has_semantic_discrepancy_true_for_antonym_substitution() -> None:
+    assert _has_semantic_discrepancy("the additive increases the delay", "the additive decreases the delay") is True
+
+
+def test_has_semantic_discrepancy_true_for_negating_prefix_addition() -> None:
+    assert _has_semantic_discrepancy("the mixture was stable", "the mixture was unstable") is True
+
+
+def test_has_semantic_discrepancy_false_for_ordinary_words_sharing_a_negating_prefix() -> None:
+    # "increase"/"increased" both start with "in", but neither is the bare stem of
+    # the other with the prefix removed ("crease"/"creased" are not real words in
+    # this text), so this must NOT be flagged as a negating-prefix edit.
+    assert _has_semantic_discrepancy("measurements increase over time", "measurements increased over time") is False
+
+
+def test_has_semantic_discrepancy_true_for_numeric_change_unchanged_behavior() -> None:
+    # The original numeric-discrepancy behavior must be fully preserved.
+    assert _has_semantic_discrepancy("1200 K", "1500 K") is True
+
+
+def test_ground_finding_degraded_reload_rejected_not_grounded() -> None:
+    """P1-3: when extracted.json is missing, evidence.load_artifact_text's degraded
+    reload sets sections=[] and lossy=True. Before the fix, ground_finding never
+    consulted `lossy`, so this silently produced a GROUNDED_EXACT pass instead of a
+    fail-closed rejection."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds in these shock "
+        "tube experiments using O2 under stoichiometric conditions.\n"
+    )
+    extracted = ExtractedText(
+        text=text,
+        normalized=normalize_for_match(text),
+        sections=[],
+        extractor="text",
+        lossy=True,
+    )
+    quote = "The measured ignition delay time at 1200 K was 850 microseconds"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=850.0, unit="microseconds")],
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.ARTIFACT_DEGRADED
+    assert verdict.grounded is False
+
+
+def test_ground_finding_lossy_but_sections_retained_is_not_degraded() -> None:
+    """Guard against over-rejection: `lossy=True` is also set for ordinary,
+    acceptable truncation where sections were retained (e.g. a long PDF cut off
+    partway through). That must NOT be treated the same as a degraded reload."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds in these shock "
+        "tube experiments using O2 under stoichiometric conditions.\n"
+    )
+    extracted = ExtractedText(
+        text=text,
+        normalized=normalize_for_match(text),
+        sections=[TextSection(label="body", start=0, end=len(text))],
+        extractor="text",
+        lossy=True,
+    )
+    quote = "The measured ignition delay time at 1200 K was 850 microseconds"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=850.0, unit="microseconds")],
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.GROUNDED_EXACT
+    assert verdict.grounded is True
+
+
+def test_required_spans_for_only_anchors_first_measured_value_is_the_bug() -> None:
+    """P1-4: a second, fabricated ``measured`` entry must also be required -- not
+    silently ignored because only ``measured[0]`` was anchored."""
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=850.0, unit="microseconds"), Quantity(value=9999.0, unit="parsecs")],
+    )
+
+    required = required_spans_for(payload)
+
+    assert "9999.0" in required
+    assert "parsecs" in required
+
+
+def test_required_spans_for_requires_each_species_individually() -> None:
+    """P1-4: ``species`` must not be a single any-one-suffices tuple anchor -- a
+    single genuine species must not vouch for an arbitrary number of fabricated
+    ones alongside it."""
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2"), SpeciesRef(raw_name="Unobtainium")],
+        measured=[Quantity(value=850.0, unit="microseconds")],
+    )
+
+    required = required_spans_for(payload)
+
+    assert "O2" in required
+    assert "Unobtainium" in required
+    assert not any(isinstance(r, tuple) and "O2" in r and "Unobtainium" in r for r in required)
+
+
+def test_ground_finding_fabricated_extra_measurement_is_not_silently_corroborated() -> None:
+    """P1-4 end-to-end: before the fix, only measured[0] (850 microseconds, genuinely
+    present) was anchored, so a second fabricated measurement sailed through
+    unchecked."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds in these shock "
+        "tube experiments using O2 under stoichiometric conditions.\n"
+    )
+    extracted = _extracted(text)
+    quote = "The measured ignition delay time at 1200 K was 850 microseconds"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=850.0, unit="microseconds"), Quantity(value=9999.0, unit="parsecs")],
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.SPANS_MISSING
+    assert verdict.grounded is False
+    assert any("9999.0" in span for span in verdict.missing_spans)
+
+
+def test_ground_finding_fabricated_extra_species_is_not_silently_corroborated() -> None:
+    """P1-4 end-to-end: before the fix, ``species`` was checked as an any-one-of
+    tuple, so the genuinely-present "O2" alone let a fabricated "Unobtainium" ride
+    along unchecked."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds in these shock "
+        "tube experiments using O2 under stoichiometric conditions.\n"
+    )
+    extracted = _extracted(text)
+    quote = "The measured ignition delay time at 1200 K was 850 microseconds"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2"), SpeciesRef(raw_name="Unobtainium")],
+        measured=[Quantity(value=850.0, unit="microseconds")],
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.SPANS_MISSING
+    assert verdict.grounded is False
+    assert any("Unobtainium" in span for span in verdict.missing_spans)
+
+
+def test_ground_finding_multiple_genuine_measured_and_species_still_grounds() -> None:
+    """Guard against over-rejection: when there really are two measured values and
+    two species, both genuinely present near the quote, the finding must still
+    ground -- the per-entry requirement must not become an unsatisfiable AND over
+    entries that were never meant to share one sentence."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "In these shock tube experiments, the measured ignition delay times were 850 "
+        "microseconds for O2 and 920 microseconds for CH4 under stoichiometric conditions.\n"
+    )
+    extracted = _extracted(text)
+    quote = (
+        "the measured ignition delay times were 850 microseconds for O2 and 920 "
+        "microseconds for CH4 under stoichiometric conditions"
+    )
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2"), SpeciesRef(raw_name="CH4")],
+        measured=[Quantity(value=850.0, unit="microseconds"), Quantity(value=920.0, unit="microseconds")],
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.GROUNDED_EXACT
+    assert verdict.grounded is True
+    assert verdict.missing_spans == []
+
+
+def test_experimental_benchmark_payload_rejects_too_many_measured_entries() -> None:
+    with pytest.raises(ValidationError):
+        ExperimentalBenchmarkPayload(
+            reactor_type=ReactorType.SHOCK_TUBE,
+            observable=ObservableKind.IGNITION_DELAY_TIME,
+            observable_raw="ignition delay time",
+            measured=[Quantity(value=float(i), unit="microseconds") for i in range(9)],
+        )
+
+
+def test_experimental_benchmark_payload_rejects_too_many_species() -> None:
+    with pytest.raises(ValidationError):
+        ExperimentalBenchmarkPayload(
+            reactor_type=ReactorType.SHOCK_TUBE,
+            observable=ObservableKind.IGNITION_DELAY_TIME,
+            observable_raw="ignition delay time",
+            species=[SpeciesRef(raw_name=f"species{i}") for i in range(21)],
+        )
+
+
+# --- Informational fixes: exhaustiveness, coverage gaps -----------------------------
+
+
+def test_required_spans_for_unsupported_payload_type_raises_named_error() -> None:
+    with pytest.raises(UnsupportedFindingPayloadError):
+        required_spans_for(object())  # type: ignore[arg-type]
+
+
+def test_ground_finding_unsupported_payload_type_fails_closed_as_spans_missing() -> None:
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report combustion results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    extracted = _extracted(text)
+    quote = "The measured ignition delay time at 1200 K was 850 microseconds"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+
+    verdict = ground_finding(payload=object(), citation=citation, quote=quote, extracted=extracted)  # type: ignore[arg-type]
+
+    assert verdict.status == GroundingStatus.SPANS_MISSING
+    assert verdict.grounded is False
+
+
+def test_required_spans_for_prior_model_with_n_reactions_only() -> None:
+    payload = PriorModelPayload(model_name="GRI-Mech 3.0", n_reactions=325)
+
+    assert required_spans_for(payload) == ["GRI-Mech 3.0", "325"]
+
+
+def test_required_spans_for_prior_model_with_mechanism_url_only() -> None:
+    payload = PriorModelPayload(model_name="GRI-Mech 3.0", mechanism_url="https://example.org/mech.yaml")
+
+    assert required_spans_for(payload) == ["GRI-Mech 3.0", "https://example.org/mech.yaml"]
+
+
+def test_required_spans_for_qm_calculation_empty_floor_returns_empty_list() -> None:
+    payload = QMCalculationPayload(
+        level_of_theory="CCSD(T)/cc-pVTZ",
+        property=QMProperty.BARRIER_HEIGHT,
+        value=Quantity(value=42.5, unit="kcal/mol"),
+    )
+
+    assert required_spans_for(payload) == []
+
+
+def test_unreadable_reason_pdf_unavailable() -> None:
+    extracted = ExtractedText(
+        text="",
+        normalized="",
+        sections=[],
+        extractor="pdf:unavailable",
+        lossy=True,
+    )
+
+    reason = unreadable_reason(extracted)
+
+    assert reason is not None
+    assert "pdf" in reason.lower()
+
+
+def test_ground_finding_pdf_unavailable_is_artifact_unreadable_not_fabrication() -> None:
+    extracted = ExtractedText(
+        text="",
+        normalized="",
+        sections=[],
+        extractor="pdf:unavailable",
+        lossy=True,
+    )
+    quote = "Any claimed quote at all"
+    citation = Citation(title="Some paper", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = PriorModelPayload(model_name="GRI-Mech 3.0", n_species=53)
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.ARTIFACT_UNREADABLE
+    assert verdict.grounded is False
+
+
+class TestQuoteMissReasonsAreDistinguishable:
+    """All four misses reject, but the decision log must say WHICH.
+
+    "the agent altered a measured value" and "the agent invented this wholesale" are
+    different findings about a model's reliability, and a researcher reads this log to
+    tell them apart. Before this, all four produced one generic fabrication accusation --
+    which for the too-short case was simply untrue.
+    """
+
+    SOURCE = (
+        "In these experiments the ignition delay time was not significantly affected by "
+        "the additive at 1200 K and 10 bar, across the full range of equivalence ratios."
+    )
+
+    def test_too_short_is_not_reported_as_fabrication(self) -> None:
+        match, reason = find_quote_with_reason(_extracted(self.SOURCE), "1200 K")
+        assert match is None
+        assert reason is QuoteMissReason.TOO_SHORT
+
+    def test_absent_text_is_reported_as_fabrication(self) -> None:
+        match, reason = find_quote_with_reason(
+            _extracted(self.SOURCE),
+            "the catalyst was regenerated by calcination at 800 K for six hours",
+        )
+        assert match is None
+        assert reason is QuoteMissReason.NOT_FOUND
+
+    def test_negation_deletion_is_reported_as_misrepresentation_not_invention(self) -> None:
+        """The near-identical passage IS in the document -- the quote misstates it."""
+        match, reason = find_quote_with_reason(
+            _extracted(self.SOURCE),
+            "the ignition delay time was significantly affected by the additive at 1200 K and 10 bar",
+        )
+        assert match is None
+        assert reason is QuoteMissReason.SEMANTIC_DISCREPANCY
+
+    def test_the_three_reasons_produce_three_different_operator_explanations(self) -> None:
+        explanations = {
+            _QUOTE_MISS_EXPLANATIONS[reason]
+            for reason in (
+                QuoteMissReason.TOO_SHORT,
+                QuoteMissReason.NOT_FOUND,
+                QuoteMissReason.SEMANTIC_DISCREPANCY,
+            )
+        }
+        assert len(explanations) == 3
+        assert "NOT evidence that the quote was fabricated" in _QUOTE_MISS_EXPLANATIONS[QuoteMissReason.TOO_SHORT]

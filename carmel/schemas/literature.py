@@ -161,10 +161,16 @@ class ExperimentalBenchmarkPayload(BaseModel):
     pressure_range_bar: tuple[float, float] | None = None
     equivalence_ratio_range: tuple[float, float] | None = None
     residence_time_s: float | None = None
-    species: list[SpeciesRef] = Field(default_factory=list)
-    measured: list[Quantity] = Field(default_factory=list)
+    species: list[SpeciesRef] = Field(default_factory=list, max_length=20)
+    measured: list[Quantity] = Field(default_factory=list, max_length=8)
     apparatus: str | None = None
     n_data_points: int | None = None
+    #: Length caps above: grounding.required_spans_for now anchors EVERY
+    #: measured/species entry individually (spar hardening note, P1-4), so an
+    #: unbounded list here would let a fabricator pad a finding arbitrarily large.
+    #: 8/20 are not calibrated against the 69-paper corpus -- generous ceilings
+    #: chosen to comfortably exceed any legitimate single-finding benchmark report
+    #: while still bounding the anchor-checking cost.
 
 
 class PriorModelPayload(BaseModel):
@@ -230,6 +236,15 @@ class GroundingStatus(StrEnum):
     search for a quote at all (e.g. a scanned/image-only PDF, or an extraction that
     lost word spacing). Distinct from QUOTE_NOT_FOUND: the finding is still rejected,
     but the cause is our extraction, not a suspected fabrication by the agent."""
+    ARTIFACT_DEGRADED = "artifact_degraded"
+    """The artifact's extracted text was reloaded in a lossy, structure-free form
+    (``ExtractedText.lossy`` True with an empty ``sections`` list) -- e.g. a reload
+    path that recovers only a flat text blob when the original structured
+    ``extracted.json`` is missing. Distinct from ARTIFACT_UNREADABLE: the text
+    itself may be searchable (a quote could still exact-match), but structural
+    checks such as references-section detection cannot run reliably against it, so
+    the finding is rejected rather than risk a false pass. Also not the agent's
+    fault -- the cause is our storage/reload path, not a suspected fabrication."""
 
 
 class GroundingVerdict(BaseModel):

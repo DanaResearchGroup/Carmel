@@ -61,6 +61,7 @@ import math
 import re
 from collections.abc import Sequence
 from difflib import SequenceMatcher
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -85,15 +86,86 @@ from carmel.schemas.literature import (
 
 __all__ = [
     "QuoteMatch",
+    "UnsupportedFindingPayloadError",
     "check_evidence_spans",
     "check_identity",
+    "QuoteMissReason",
     "find_quote",
+    "find_quote_with_reason",
     "ground_finding",
     "required_spans_for",
     "unreadable_reason",
 ]
 
 _NUMBER_RE = re.compile(r"[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?")
+
+#: Word tokenizer used by :func:`_has_semantic_discrepancy` to compare the fuzzy
+#: window and the claimed quote on WORD boundaries (a symmetric difference of word
+#: sets), rather than raw ``difflib`` character opcodes -- a single deleted/added
+#: word (e.g. "not") is exactly the kind of edit a high character-similarity ratio
+#: can hide, since removing 3 characters from a 60-character sentence barely moves
+#: the ratio.
+_WORD_RE = re.compile(r"[a-zA-Z]+")
+
+#: Negation tokens whose presence in exactly one of {window, needle} (per the word
+#: symmetric-difference) flags a semantic discrepancy: a quote with "not"/"no"/etc.
+#: deleted (or added) reads as almost the same string to a character-diff but means
+#: the opposite thing. NOT calibrated against the 69-paper corpus (no repository of
+#: negation-edit near-misses to calibrate against) -- a deliberately conservative,
+#: small, unambiguous list.
+_NEGATION_TOKENS = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "none",
+        "cannot",
+        "cant",
+        "doesnt",
+        "dont",
+        "didnt",
+        "isnt",
+        "wasnt",
+        "arent",
+        "werent",
+        "without",
+        "neither",
+        "nor",
+    }
+)
+
+#: Negating prefixes checked via stem-matching (see ``_has_semantic_discrepancy``):
+#: only flagged when one diff word equals ``prefix + other_diff_word`` and both
+#: forms are actually present, one on each side of the window/needle diff -- never
+#: via a bare ``word.startswith(prefix)``, which would misfire on ordinary words
+#: ("increase", "individual", "international", "instrument"). NOT calibrated
+#: against the 69-paper corpus.
+_NEGATING_PREFIXES = ("un", "in", "im", "il", "ir", "non")
+
+#: Curated antonym pairs checked on the word symmetric difference only (not the
+#: full word sets), so a pair that happens to co-occur unchanged in both window and
+#: needle is never flagged. Deliberately small and NOT calibrated against the
+#: 69-paper corpus -- covers common scientific-claim reversals, not exhaustive.
+_ANTONYM_PAIRS = frozenset(
+    {
+        frozenset({"increase", "decrease"}),
+        frozenset({"increases", "decreases"}),
+        frozenset({"increased", "decreased"}),
+        frozenset({"increasing", "decreasing"}),
+        frozenset({"higher", "lower"}),
+        frozenset({"more", "less"}),
+        frozenset({"above", "below"}),
+        frozenset({"positive", "negative"}),
+        frozenset({"before", "after"}),
+        frozenset({"faster", "slower"}),
+        frozenset({"maximum", "minimum"}),
+        frozenset({"consistent", "inconsistent"}),
+        frozenset({"stable", "unstable"}),
+        frozenset({"present", "absent"}),
+        frozenset({"agrees", "disagrees"}),
+        frozenset({"agreement", "disagreement"}),
+    }
+)
 
 #: Default sliding-window fuzzy-match acceptance threshold for find_quote.
 DEFAULT_FUZZY_THRESHOLD = 0.92
@@ -142,6 +214,51 @@ _SPACE_LOSS_BLOCK_FRACTION = 0.25
 #: mostly-punctuation quote could normalize down to.
 MIN_NORMALIZED_QUOTE_LENGTH = 20
 
+
+class QuoteMissReason(StrEnum):
+    """Why :func:`find_quote_with_reason` could not return a match.
+
+    Every value REJECTS the finding -- this enum changes only the explanation written to
+    the decision log, which is what a researcher reads when deciding whether an agent is
+    unreliable or merely unlucky.
+    """
+
+    TOO_SHORT = "too_short"
+    """The normalized quote was under :data:`MIN_NORMALIZED_QUOTE_LENGTH`. This is a
+    malformed proposal, NOT evidence of fabrication -- the gate never even searched."""
+
+    NOT_FOUND = "not_found"
+    """Nothing resembling the quote appears in the document. The genuine fabrication
+    signal: the agent asserted a quote the source does not contain in any form."""
+
+    SEMANTIC_DISCREPANCY = "semantic_discrepancy"
+    """A near-identical passage EXISTS, but the difference between it and the claimed
+    quote changes the science -- an altered number, a deleted negation, a flipped
+    antonym. Strictly more damning than NOT_FOUND and far more actionable: it names the
+    specific alteration, so the operator can see exactly what was misrepresented."""
+
+
+#: Operator-facing explanation per miss reason. These are read by a researcher deciding
+#: whether an agent is unreliable, so each says what actually happened rather than
+#: repeating one generic fabrication accusation for every case.
+_QUOTE_MISS_EXPLANATIONS: dict[QuoteMissReason, str] = {
+    QuoteMissReason.TOO_SHORT: (
+        f"the claimed quote is shorter than {MIN_NORMALIZED_QUOTE_LENGTH} characters after "
+        "normalization, so it was rejected without being searched for. This is a malformed "
+        "proposal, NOT evidence that the quote was fabricated."
+    ),
+    QuoteMissReason.NOT_FOUND: (
+        "the claimed verbatim quote was not located in the fetched artifact, exactly or by "
+        "fuzzy matching, and no near-identical passage exists either. This is the signature "
+        "of a fabricated quote."
+    ),
+    QuoteMissReason.SEMANTIC_DISCREPANCY: (
+        "a near-identical passage EXISTS in the artifact, but it differs from the claimed "
+        "quote in a way that changes its meaning -- an altered number, a deleted negation, "
+        "or a reversed comparison. The source was read; the quote misrepresents it."
+    ),
+}
+
 #: Minimum length of an identity term (title/author-surname/DOI/year) AFTER
 #: normalization, below which the term is treated as NOT present rather than
 #: matched. A 1-3 normalized-character term (e.g. an initials-only surname
@@ -150,6 +267,16 @@ MIN_NORMALIZED_QUOTE_LENGTH = 20
 #: four-digit publication year (the shortest legitimate identity term this
 #: function handles) so real years, surnames, titles, and DOIs are unaffected.
 MIN_IDENTITY_TERM_LENGTH = 4
+
+
+class UnsupportedFindingPayloadError(ValueError):
+    """Raised by :func:`required_spans_for` when given a ``FindingPayload`` variant
+    it does not have a required-anchor rule for.
+
+    Named (rather than a bare ``ValueError``) so :func:`ground_finding` can catch it
+    specifically and fail CLOSED (``SPANS_MISSING``) instead of letting an unrelated
+    ``ValueError`` elsewhere in the call chain be misread as "no anchors required."
+    """
 
 
 class QuoteMatch(BaseModel):
@@ -277,14 +404,30 @@ def _find_all_normalized(haystack: str, needle: str) -> list[int]:
     return positions
 
 
-def _has_numeric_discrepancy(window: str, needle: str) -> bool:
-    """True if any non-equal opcode between ``window`` and ``needle`` touches a digit.
+def _has_semantic_discrepancy(window: str, needle: str) -> bool:
+    """True if ``window`` and ``needle`` differ in a way that can flip the claim's
+    meaning even though their character-similarity ratio is high: a changed digit,
+    a deleted/added negation token, a negating prefix added/removed, or a curated
+    antonym substitution.
 
     A fuzzy-similarity ratio alone is not a safe acceptance criterion for scientific
-    quotes: changing "1200 K" to "1500 K" is a single-character edit with a ratio
-    well above any reasonable threshold, yet it is exactly the kind of fabrication
-    this gate exists to catch (spar round 3 hardening note). So any fuzzy candidate
-    whose diff touches a digit is disqualified outright, regardless of its ratio.
+    quotes. The digit check is the original guard: changing "1200 K" to "1500 K" is
+    a single-character edit with a ratio well above any reasonable threshold, yet is
+    exactly the kind of fabrication this gate exists to catch (spar round 3
+    hardening note). The negation/prefix/antonym checks close a second hole found
+    later: deleting "not" from a 60-character sentence is a 3-character edit that
+    barely moves the ratio, but "X does not increase Y" and "X does increase Y"
+    are opposite claims. Any fuzzy candidate tripping any of these checks is
+    disqualified outright, regardless of its ratio.
+
+    The digit check remains character-opcode-based (unchanged behavior). The
+    negation/prefix/antonym checks are word-boundary-based (a symmetric difference
+    of lowercased word sets) rather than character-opcode-based, since a single
+    word add/delete is exactly what they need to catch, and word-set comparison is
+    robust to nearby, unrelated character-level reflow that a fuzzy match already
+    tolerates. NOT calibrated against the 69-paper corpus (no repository of
+    negation/antonym near-misses to calibrate against) -- deliberately
+    conservative, curated lists; see the module-level constants for rationale.
     """
     sm = SequenceMatcher(None, window, needle)
     for tag, i1, i2, j1, j2 in sm.get_opcodes():
@@ -292,15 +435,33 @@ def _has_numeric_discrepancy(window: str, needle: str) -> bool:
             continue
         if any(c.isdigit() for c in window[i1:i2]) or any(c.isdigit() for c in needle[j1:j2]):
             return True
-    return False
+
+    window_words = {w.lower() for w in _WORD_RE.findall(window)}
+    needle_words = {w.lower() for w in _WORD_RE.findall(needle)}
+    diff_words = window_words ^ needle_words
+    if not diff_words:
+        return False
+
+    if diff_words & _NEGATION_TOKENS:
+        return True
+
+    for word in diff_words:
+        for prefix in _NEGATING_PREFIXES:
+            if word.startswith(prefix) and len(word) > len(prefix):
+                stem = word[len(prefix) :]
+                if stem in diff_words:
+                    return True
+
+    return any(pair <= diff_words for pair in _ANTONYM_PAIRS)
 
 
 def _fuzzy_search(haystack: str, needle: str, threshold: float) -> tuple[int, int, float] | None:
     """Sliding-window ``difflib`` search for the best-matching span of ``needle``'s
     length within ``haystack``, accepted only when its ratio clears ``threshold`` AND
-    no part of the diff touches a digit (see :func:`_has_numeric_discrepancy`) — a
-    quote that differs from the source by a changed number must never be accepted as
-    a fuzzy match, however high its character-similarity ratio.
+    no part of the diff constitutes a semantic discrepancy (see
+    :func:`_has_semantic_discrepancy`) — a quote that differs from the source by a
+    changed number, a deleted/added negation, or an antonym substitution must never
+    be accepted as a fuzzy match, however high its character-similarity ratio.
 
     The stride is coarsened for long haystacks/needles rather than checking every
     single offset — a best-effort tradeoff appropriate for a fallback path that only
@@ -326,7 +487,45 @@ def _fuzzy_search(haystack: str, needle: str, threshold: float) -> tuple[int, in
         return None
 
     pos, end, ratio = best
-    if _has_numeric_discrepancy(haystack[pos:end], needle):
+    if _has_semantic_discrepancy(haystack[pos:end], needle):
+        return None
+    return best
+
+
+def _best_fuzzy_window(haystack: str, needle: str, threshold: float) -> tuple[int, int, float] | None:
+    """Find the best-matching window IGNORING the semantic-discrepancy veto.
+
+    :func:`_fuzzy_search` deliberately conflates "nothing here resembles the quote" with
+    "a passage here is nearly identical but the diff changes the science" -- both return
+    None, because both must reject. This re-runs the same scan WITHOUT the veto purely to
+    tell those two apart for the decision log. It never grants a match; only
+    :func:`_fuzzy_search` can do that.
+
+    Args:
+        haystack: Normalized document text.
+        needle: Normalized claimed quote.
+        threshold: Same ratio floor ``_fuzzy_search`` uses.
+
+    Returns:
+        ``(start, end, ratio)`` of the best window clearing ``threshold``, else None.
+    """
+    n = len(needle)
+    h = len(haystack)
+    if n == 0 or h < n:
+        return None
+    last = max(h - n, 0)
+    stride = max(1, n // 8)
+    positions = list(range(0, last + 1, stride))
+    if positions and positions[-1] != last:
+        positions.append(last)
+
+    best: tuple[int, int, float] | None = None
+    for pos in positions:
+        window = haystack[pos : pos + n]
+        ratio = SequenceMatcher(None, window, needle).ratio()
+        if best is None or ratio > best[2]:
+            best = (pos, pos + n, ratio)
+    if best is None or best[2] < threshold:
         return None
     return best
 
@@ -344,10 +543,11 @@ def find_quote(
     Algorithm: try an exact substring match of the normalized quote against
     ``extracted.normalized`` first. Only on failure, fall back to a sliding-window
     ``difflib.SequenceMatcher`` search, accepted only when its ratio is
-    ``>= fuzzy_threshold`` AND the diff does not touch any digit (see
-    :func:`_has_numeric_discrepancy`) — a quote that changes a number (e.g. "1200 K"
-    to "1500 K") is a near-perfect character match but a scientifically false quote,
-    so it is rejected outright rather than fuzzy-accepted. The fallback match, when
+    ``>= fuzzy_threshold`` AND the diff has no semantic discrepancy (see
+    :func:`_has_semantic_discrepancy`) — a quote that changes a number (e.g. "1200 K"
+    to "1500 K"), deletes/adds a negation, or substitutes an antonym is a
+    near-perfect character match but a scientifically false (or reversed) quote, so
+    it is rejected outright rather than fuzzy-accepted. The fallback match, when
     accepted, carries ``exact=False`` so callers (notably :func:`ground_finding`) can
     distinguish and penalize it.
 
@@ -359,9 +559,36 @@ def find_quote(
     Returns:
         A :class:`QuoteMatch`, or ``None`` if the quote could not be located at all.
     """
+    match, _reason = find_quote_with_reason(extracted, quote, fuzzy_threshold=fuzzy_threshold)
+    return match
+
+
+def find_quote_with_reason(
+    extracted: ExtractedText, quote: str, *, fuzzy_threshold: float = DEFAULT_FUZZY_THRESHOLD
+) -> tuple[QuoteMatch | None, QuoteMissReason | None]:
+    """Locate ``quote``, also reporting WHY it was not located.
+
+    :func:`find_quote` collapses four genuinely different outcomes into a bare ``None``,
+    and :func:`ground_finding` then reports all four to the decision log as "this looks
+    like a fabricated quote". For :attr:`QuoteMissReason.TOO_SHORT` that accusation is
+    simply false, and for the discrepancy cases it discards the most actionable
+    diagnostic the gate produces: "the agent altered a measured value" and "the agent
+    invented this wholesale" are different findings about a model's behaviour, and a
+    researcher reads this log to tell them apart.
+
+    All four outcomes still REJECT the finding; only the explanation differs.
+
+    Args:
+        extracted: The fetched artifact's extracted text.
+        quote: The claimed verbatim quote to locate.
+        fuzzy_threshold: Minimum ``difflib`` ratio to accept a fuzzy fallback match.
+
+    Returns:
+        ``(match, None)`` when located, otherwise ``(None, reason)``.
+    """
     normalized_quote = normalize_for_match(quote)
     if len(normalized_quote) < MIN_NORMALIZED_QUOTE_LENGTH:
-        return None
+        return None, QuoteMissReason.TOO_SHORT
     haystack = extracted.normalized
     _, index_map = normalize_with_map(extracted.text)
 
@@ -370,15 +597,27 @@ def find_quote(
         norm_start, norm_end = idx, idx + len(normalized_quote)
         raw_start, raw_end = raw_span(index_map, norm_start, norm_end, len(extracted.text))
         label, page = _section_for(extracted.sections, raw_start)
-        return QuoteMatch(start=raw_start, end=raw_end, ratio=1.0, exact=True, section_label=label, page=page)
+        return (
+            QuoteMatch(start=raw_start, end=raw_end, ratio=1.0, exact=True, section_label=label, page=page),
+            None,
+        )
 
     fuzzy = _fuzzy_search(haystack, normalized_quote, fuzzy_threshold)
     if fuzzy is None:
-        return None
+        # Distinguish "nothing resembling this text is here" from "something very like
+        # it is here, but the diff changes the science". The second is the strongest
+        # signal this gate can emit and must not be reported as a generic miss.
+        near = _best_fuzzy_window(haystack, normalized_quote, fuzzy_threshold)
+        if near is not None:
+            return None, QuoteMissReason.SEMANTIC_DISCREPANCY
+        return None, QuoteMissReason.NOT_FOUND
     norm_start, norm_end, ratio = fuzzy
     raw_start, raw_end = raw_span(index_map, norm_start, norm_end, len(extracted.text))
     label, page = _section_for(extracted.sections, raw_start)
-    return QuoteMatch(start=raw_start, end=raw_end, ratio=ratio, exact=False, section_label=label, page=page)
+    return (
+        QuoteMatch(start=raw_start, end=raw_end, ratio=ratio, exact=False, section_label=label, page=page),
+        None,
+    )
 
 
 def _present_outside_references(extracted: ExtractedText, term_normalized: str) -> bool:
@@ -655,16 +894,27 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
 
     Floors and anchors:
       - ``EXPERIMENTAL_BENCHMARK``: requires at least one ``measured`` Quantity
-        (its value and unit are both required anchors) AND at least one
-        ``species`` entry; if either is missing the floor is not met. When met,
-        also requires: the observable as printed in the source (``observable_raw``
-        -- the controlled-vocabulary ``observable`` enum is not expected to appear
-        literally in prose); the reactor type's surface form (any synonym from
-        :data:`_REACTOR_TYPE_TERMS`, since ``reactor_type`` is always set); at
-        least one populated species identifier (``species[*].raw_name``, any one
-        of them); and, for each of ``temperature_range_K``, ``pressure_range_bar``,
-        and ``equivalence_ratio_range`` that is populated, BOTH bounds of that
-        range as separate anchors.
+        AND at least one ``species`` entry; if either is missing the floor is not
+        met. When met, EVERY ``measured`` entry's value and unit are required
+        anchors (not just the first) -- an earlier version anchored only
+        ``measured[0]``, silently letting a fabricator append extra, uncorroborated
+        measurements to a finding that otherwise grounds cleanly (spar hardening
+        note, P1-4). Likewise, EVERY populated species identifier
+        (``species[*].raw_name``) is now its own required anchor, individually --
+        an earlier version treated the whole species list as a single
+        any-one-suffices anchor, which let a fabricator add extra, uncorroborated
+        species alongside one genuine one. Also always requires: the observable as
+        printed in the source (``observable_raw`` -- the controlled-vocabulary
+        ``observable`` enum is not expected to appear literally in prose); the
+        reactor type's surface form (any synonym from :data:`_REACTOR_TYPE_TERMS`,
+        since ``reactor_type`` is always set); and, for each of
+        ``temperature_range_K``, ``pressure_range_bar``, and
+        ``equivalence_ratio_range`` that is populated, BOTH bounds of that range as
+        separate anchors. ``measured`` and ``species`` are additionally
+        length-capped at the schema level (``max_length=8`` / ``max_length=20``,
+        see :class:`~carmel.schemas.literature.ExperimentalBenchmarkPayload`) so
+        this per-entry anchoring can't be used to construct a pathologically large
+        finding.
       - ``QM_CALCULATION``: requires ``level_of_theory`` and its result value and
         unit (all always-set fields), AND at least one of ``species`` or
         ``reaction_label``; if neither is populated the floor is not met.
@@ -682,14 +932,15 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
     if isinstance(payload, ExperimentalBenchmarkPayload):
         if not payload.measured or not payload.species:
             return []
-        q = payload.measured[0]
         required: list[RequiredAnchor] = [
-            str(q.value),
-            q.unit,
             payload.observable_raw,
             tuple(_REACTOR_TYPE_TERMS[payload.reactor_type]),
-            tuple(s.raw_name for s in payload.species),
         ]
+        for q in payload.measured:
+            required.append(str(q.value))
+            required.append(q.unit)
+        for s in payload.species:
+            required.append(s.raw_name)
         for bound in (
             payload.temperature_range_K,
             payload.pressure_range_bar,
@@ -725,7 +976,7 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
             return []
         return [payload.model_name, *extra]
 
-    raise ValueError(f"unsupported finding payload type: {type(payload)!r}")
+    raise UnsupportedFindingPayloadError(f"unsupported finding payload type: {type(payload)!r}")
 
 
 def _bibliography_region_confidence(extracted: ExtractedText, position: int) -> str | None:
@@ -752,10 +1003,10 @@ def ground_finding(
     """The grounding gate: decide whether a proposed finding is corroborated.
 
     Evaluated in this exact order, short-circuiting at the first applicable status:
-    ``NO_ARTIFACT`` -> ``ARTIFACT_UNREADABLE`` -> ``QUOTE_NOT_FOUND`` -> ``REFERENCES_ONLY`` ->
-    ``IDENTITY_MISMATCH`` -> ``SPANS_MISSING`` -> ``GROUNDED_FUZZY`` /
-    ``GROUNDED_EXACT``. ``grounded`` on the returned verdict is True only for the
-    two ``GROUNDED_*`` statuses.
+    ``NO_ARTIFACT`` -> ``ARTIFACT_UNREADABLE`` -> ``ARTIFACT_DEGRADED`` ->
+    ``QUOTE_NOT_FOUND`` -> ``REFERENCES_ONLY`` -> ``IDENTITY_MISMATCH`` ->
+    ``SPANS_MISSING`` -> ``GROUNDED_FUZZY`` / ``GROUNDED_EXACT``. ``grounded`` on
+    the returned verdict is True only for the two ``GROUNDED_*`` statuses.
 
     This is a *first filter* against fabricated quotes and misattributed sources —
     see the module docstring. It is not, and cannot be, a guarantee that the
@@ -783,7 +1034,7 @@ def ground_finding(
             reasons=["No artifact was fetched for this finding, so the claimed quote cannot be checked at all."],
         )
 
-    match = find_quote(extracted, quote)
+    match, miss_reason = find_quote_with_reason(extracted, quote)
     if match is None:
         # A quote that did not match has two very different causes. Check whether the
         # artifact was readable at all BEFORE attributing the failure to the agent --
@@ -810,8 +1061,39 @@ def ground_finding(
             identity_ok=False,
             missing_spans=[],
             reasons=[
+                _QUOTE_MISS_EXPLANATIONS[miss_reason] if miss_reason is not None else "the quote was not located.",
                 "The claimed verbatim quote could not be located in the fetched artifact text, "
-                "exactly or via fuzzy matching; this looks like a fabricated quote."
+                "exactly or via fuzzy matching; this looks like a fabricated quote.",
+            ],
+        )
+
+    if extracted.lossy and not extracted.sections:
+        # extracted.lossy is True both for acceptable truncation (sections are still
+        # retained, so structural checks like references-detection keep working) AND
+        # for a degraded reload where the sections list itself came back empty (spar
+        # hardening note, P1-3). The latter is dangerous, not just lossy: e.g.
+        # evidence.load_artifact_text's degraded reload path returns lossy=True,
+        # sections=[] when extracted.json is missing, and downstream structural
+        # checks (references-section detection in particular) silently behave as if
+        # there were no references section at all -- turning what should be a
+        # REFERENCES_ONLY rejection into a false GROUNDED_EXACT pass. Checked here,
+        # AFTER a quote was actually located (a genuinely unreadable artifact was
+        # already ruled out above via unreadable_reason returning None for
+        # find_quote to have succeeded at all) and BEFORE the references-section
+        # check below, which is exactly the structural check this gap would defeat.
+        # Fail CLOSED whenever sections are unavailable on a lossy reload, rather
+        # than silently trusting a flat, unstructured text blob for a fail-open
+        # structural check.
+        return GroundingVerdict(
+            status=GroundingStatus.ARTIFACT_DEGRADED,
+            grounded=False,
+            match_ratio=match.ratio,
+            identity_ok=False,
+            missing_spans=[],
+            reasons=[
+                "The artifact's extracted text was reloaded in a degraded, structure-free form "
+                "(no sections available), so structural checks such as references-section "
+                "detection cannot run reliably. Rejected rather than risk a false pass."
             ],
         )
 
@@ -868,7 +1150,24 @@ def ground_finding(
             reasons=[reason],
         )
 
-    required = required_spans_for(payload)
+    try:
+        required = required_spans_for(payload)
+    except UnsupportedFindingPayloadError as exc:
+        # Fail CLOSED on a payload type required_spans_for has no anchor rule for --
+        # never treat "we don't know how to check this" as "there is nothing to
+        # check" (which SPANS_MISSING with an empty `required` list would otherwise
+        # silently degrade into further down).
+        return GroundingVerdict(
+            status=GroundingStatus.SPANS_MISSING,
+            grounded=False,
+            match_ratio=match.ratio,
+            identity_ok=True,
+            missing_spans=[],
+            reasons=[
+                f"This finding's payload type has no known required-anchor rule ({exc}); "
+                "cannot verify corroboration, so it is rejected rather than passed."
+            ],
+        )
     if not required:
         return GroundingVerdict(
             status=GroundingStatus.SPANS_MISSING,
