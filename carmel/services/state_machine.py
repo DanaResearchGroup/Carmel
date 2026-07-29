@@ -157,6 +157,13 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
 RECOVERY_TARGETS: dict[CampaignStateValue, CampaignStateValue] = {
     CampaignStateValue.RUNNING_T3: CampaignStateValue.APPROVED_FOR_EXECUTION,
     CampaignStateValue.RUNNING_ARC: CampaignStateValue.APPROVED_FOR_EXECUTION,
+    # Finding P1-8: RUNNING_LITERATURE was added to CampaignStateValue and
+    # VALID_TRANSITIONS but omitted here -- the only RUNNING_* member missing
+    # from this allowlist. Without it a campaign that failed during
+    # literature could never take the guarded FAILED -> APPROVED_FOR_EXECUTION
+    # retry edge; `/retry` would 409 forever and only `/replan` could recover
+    # it, discarding whatever approvals it already held.
+    CampaignStateValue.RUNNING_LITERATURE: CampaignStateValue.APPROVED_FOR_EXECUTION,
     CampaignStateValue.APPROVED_FOR_EXECUTION: CampaignStateValue.APPROVED_FOR_EXECUTION,
     CampaignStateValue.DIAGNOSTICS_READY: CampaignStateValue.DIAGNOSTICS_READY,
     CampaignStateValue.RESULTS_READY: CampaignStateValue.RESULTS_READY,

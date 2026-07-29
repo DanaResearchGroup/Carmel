@@ -236,6 +236,31 @@ class TestValidatePlanShape:
         problems = validate_plan_shape(_plan([_action("dup", kind=ActionKind.LITERATURE_SEARCH), _action("dup")], "c"))
         assert any("not unique" in p for p in problems)
 
+    def test_two_literature_actions_rejected(self) -> None:
+        """Informational #4: at most one LITERATURE_SEARCH action is allowed,
+        mirroring the existing at-most-one-T3_RUN check above.
+        """
+        problems = validate_plan_shape(
+            _plan(
+                [
+                    _action("lit_a", kind=ActionKind.LITERATURE_SEARCH),
+                    _action("lit_b", kind=ActionKind.LITERATURE_SEARCH),
+                ],
+                "c",
+            )
+        )
+        assert any("at most one" in p for p in problems)
+
+    def test_action_after_t3_rejected_even_when_not_literature(self) -> None:
+        """Informational #4: T3_RUN must be LAST among executable actions.
+
+        Literature-before-T3 alone would not catch this: ARC_RUN is also in
+        EXECUTABLE_ACTION_KINDS and could otherwise follow T3_RUN without
+        tripping the literature-precedes-T3 check.
+        """
+        problems = validate_plan_shape(_plan([_action("t3"), _action("arc", kind=ActionKind.ARC_RUN)], "c"))
+        assert any("must be the last executable action" in p for p in problems)
+
     def test_save_plan_rejects_bad_shape(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
         campaign = create_campaign(ws, _make_input())
@@ -523,6 +548,166 @@ class TestExecuteNextAction:
         assert result is not None and result.action_id == "a1"
         assert t3.calls == ["a1"]  # migration seeded AUTO_APPROVED, not PENDING
         assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+    def test_recorded_human_rejection_blocks_launch_even_when_plan_progress_disagrees(self, tmp_path: Path) -> None:
+        """Informational #6: a human REJECTED decision in the decision log
+        must veto a launch, even when it diverges from
+        ``plan_progress.json``'s own ``approval_status`` (here left
+        AUTO_APPROVED). ``has_effective_human_rejection`` is consulted
+        precisely because the decision log, not the plan-progress snapshot,
+        is authoritative for an explicit human decision (see
+        ``execute_next_action``'s "Step 3b" comment on this dispatcher's
+        launch gate).
+
+        Uses LITERATURE_SEARCH, not T3_RUN: LITERATURE_SEARCH has no
+        execution envelope, so it takes the ``has_effective_human_rejection``
+        branch of the gate rather than the full budget-authorization branch
+        that every other T3_RUN test in this file already exercises.
+        """
+        from carmel.services.approvals import record_decision
+        from carmel.services.authorization import BudgetExceededError
+        from carmel.services.plan_progress import load_progress
+
+        ws, campaign = _ready_campaign(tmp_path, [_action("lit", kind=ActionKind.LITERATURE_SEARCH)])
+        assert load_progress(ws).actions[0].approval_status == ApprovalStatus.AUTO_APPROVED
+        record_decision(ws, "lit", ApprovalStatus.REJECTED, decided_by="human")
+
+        with pytest.raises(BudgetExceededError, match="rejected"):
+            execute_next_action(ws, campaign, handlers=_handlers())
+
+        # The veto fired before any state change or lock was taken.
+        assert load_state(ws).state == CampaignStateValue.APPROVED_FOR_EXECUTION
+        assert load_progress(ws).actions[0].approval_status == ApprovalStatus.AUTO_APPROVED
+
+
+class TestDispatchedRunReservationVisibleInSpend:
+    def test_a_dispatched_t3_runs_reservation_is_visible_in_compute_spend_while_in_flight(self, tmp_path: Path) -> None:
+        """Finding P1-13: the dispatcher must pass ``estimated_cpu_hours`` to
+        ``start_supervision``, matching every other launch site in
+        execution.py. Omitting it (the pre-fix behavior) defaults the
+        reservation to 0.0, and ``spend.compute_spend`` derives the
+        in-flight reservation from exactly that field
+        (``reserved = active.estimated_cpu_hours if active is not None else
+        0.0``) -- so a dispatcher-launched run in flight would read as
+        reserving nothing, silently blinding the dispatcher's own launch
+        gate (which itself consults ``compute_spend``) to every run it
+        started.
+
+        Exercises this directly: dispatch a T3 action whose handler blocks
+        on a ``threading.Event`` until released, so the run is
+        provably still in flight (the background thread has not finished)
+        when ``compute_spend`` is checked, then release the handler and
+        let the dispatch finish cleanly.
+        """
+        from carmel.services.spend import compute_spend
+
+        action = _action("t3")
+        ws, campaign = _ready_campaign(tmp_path, [action])
+        assert action.estimated_cpu_hours != 0.0  # else the assertion below would be vacuous
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocking_t3(
+            workspace_root: Path,
+            campaign: Campaign,
+            action: PlannedAction,
+            *,
+            supervision: Any = None,
+        ) -> ActionResult:
+            # Advertises `wants_supervision` below, so `execute_action` hands
+            # the run lock straight through instead of closing it here as an
+            # "unwanted" lock (see execute_action's docstring) -- exactly
+            # like the real T3 handler, this is what keeps the reservation
+            # open for the run's actual duration rather than for a sliver of
+            # a background-thread scheduling race.
+            entered.set()
+            assert release.wait(timeout=10), "test never released the blocked handler"
+            if supervision is not None:
+                supervision.close()
+            return ActionResult(
+                action_id=action.action_id,
+                kind=action.kind,
+                run_record=_run_record(action, RunStatus.SUCCEEDED),
+                outcome=ActionOutcome.SUCCEEDED,
+            )
+
+        _blocking_t3.wants_supervision = True  # type: ignore[attr-defined]
+
+        ticket = execute_next_action(ws, campaign, handlers=_handlers(t3=_blocking_t3))
+
+        assert ticket is not None
+        assert entered.wait(timeout=10), "background dispatch never started"
+        try:
+            # The run is still in flight: the handler is parked on `release`
+            # and the background thread has not finished. The reservation
+            # must already be visible here -- this is exactly the window
+            # the pre-fix 0.0 default would have blinded.
+            spend = compute_spend(ws)
+            assert spend.reserved_cpu_hours == action.estimated_cpu_hours
+            assert spend.reserved_cpu_hours != 0.0
+        finally:
+            release.set()
+            result = ticket.wait(timeout=10)
+
+        assert result is not None and result.outcome == ActionOutcome.SUCCEEDED
+        assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
+
+
+class TestDispatchTicketWaitTimeout:
+    def test_wait_with_timeout_raises_instead_of_returning_none_while_still_running(self, tmp_path: Path) -> None:
+        """Informational #5: ``DispatchTicket.wait(timeout=...)`` must raise
+        ``TimeoutError`` when the background run has not finished, rather
+        than returning ``None``. ``None`` is also the return value for a run
+        that finished but *failed* to produce a result, so a caller passing
+        a timeout would otherwise have no way to distinguish "still running"
+        (unsafe to inspect ``self.error``/workspace state yet) from "failed"
+        (safe to inspect both) -- see ``DispatchTicket.wait``'s own
+        docstring.
+
+        Exercises this directly: dispatch a T3 action whose handler blocks
+        indefinitely (until released), call ``wait`` with a short timeout
+        while it is still blocked, and confirm ``TimeoutError`` is raised
+        rather than ``None`` being returned.
+        """
+        action = _action("t3")
+        ws, campaign = _ready_campaign(tmp_path, [action])
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def _blocking_t3(
+            workspace_root: Path,
+            campaign: Campaign,
+            action: PlannedAction,
+            *,
+            supervision: Any = None,
+        ) -> ActionResult:
+            entered.set()
+            assert release.wait(timeout=10), "test never released the blocked handler"
+            if supervision is not None:
+                supervision.close()
+            return ActionResult(
+                action_id=action.action_id,
+                kind=action.kind,
+                run_record=_run_record(action, RunStatus.SUCCEEDED),
+                outcome=ActionOutcome.SUCCEEDED,
+            )
+
+        _blocking_t3.wants_supervision = True  # type: ignore[attr-defined]
+
+        ticket = execute_next_action(ws, campaign, handlers=_handlers(t3=_blocking_t3))
+
+        assert ticket is not None
+        assert entered.wait(timeout=10), "background dispatch never started"
+        try:
+            with pytest.raises(TimeoutError, match=action.action_id):
+                ticket.wait(timeout=0.05)
+        finally:
+            release.set()
+            result = ticket.wait(timeout=10)
+
+        assert result is not None and result.outcome == ActionOutcome.SUCCEEDED
 
 
 # --------------------------- crash recovery (defects 1-3) ---------------------

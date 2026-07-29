@@ -1575,6 +1575,78 @@ class TestRunDispatchesOnActionKind:
         assert started["dispatch"], "the T3 plan did not reach the dispatcher"
         assert started["arc"] == []
 
+    def test_a_literature_approval_does_not_stand_in_for_arcs(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Finding P1-14: the ARC route must select its action by kind, not
+        ``plan.actions[0]``.
+
+        Note on reachability: ``campaign_run``'s own routing gate (``if
+        plan.actions[0].kind == ActionKind.ARC_RUN: return
+        _start_arc_run(...)``) already requires index 0 to be the ARC
+        action before ``_start_arc_run`` -- where this fix lives -- is
+        entered at all. And ``/plan`` with ``tool=arc`` (the only producer
+        of ARC plans) always emits a single-action plan with no
+        ``include_literature`` option, unlike the T3 planner. So no
+        currently-reachable flow can present ``_start_arc_run`` with a plan
+        where a literature action sits ahead of ARC at index 0 -- for any
+        plan that actually reaches this function, `plan.actions[0]` and the
+        kind-based `next(...)` this fix uses are provably the same object,
+        and the pre-fix index-based selection could not have picked a
+        literature action by mistake either.
+
+        What the fix genuinely hardens against is a plan where ARC sits at
+        index 0 (satisfying the outer gate) but a LATER action -- e.g. a
+        trailing literature step appended by some future planner change, or
+        by hand-edited/corrupted plan.json -- has its own, separate
+        approval recorded. This constructs exactly that: ARC at index 0,
+        unapproved; literature at index 1, approved. Kind-based selection
+        (and index-based selection, here, since ARC is still at 0) both
+        correctly key off the ARC action's own id and must refuse with 409
+        rather than ever launch on the strength of an approval recorded for
+        a different action.
+        """
+        from uuid import uuid4
+
+        from carmel.schemas.approval import ApprovalRequirement
+        from carmel.schemas.plan import PlannedAction
+        from carmel.services.approvals import record_decision
+        from carmel.services.planner import save_plan
+
+        started = self._recorders(monkeypatch)
+        cid, ws = _arc_planned(client, workspaces_root, name="lit-then-arc")
+        original_arc_action = load_plan(ws).actions[0]
+        assert original_arc_action.kind == ActionKind.ARC_RUN
+        literature_action = PlannedAction(
+            action_id=str(uuid4()),
+            kind=ActionKind.LITERATURE_SEARCH,
+            description="Literature search",
+            estimated_cpu_hours=0.0,
+            estimated_cost=0.0,
+            estimated_spend_usd=0.0,
+            blocking=False,
+            rationale="test fixture",
+            approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+            parameters={},
+        )
+        # A fresh action_id, not `original_arc_action`'s: `_arc_planned`'s
+        # own auto-approval already wrote an AUTO_APPROVED decision for that
+        # id to the decision log, which would leak into this action's
+        # approval check and defeat the test. Only the literature decision
+        # below should exist for this plan's actions.
+        arc_action = original_arc_action.model_copy(
+            update={"action_id": str(uuid4()), "approval_requirement": ApprovalRequirement.REQUIRES_APPROVAL}
+        )
+        save_plan(ws, load_plan(ws).model_copy(update={"actions": [arc_action, literature_action]}))
+        record_decision(ws, literature_action.action_id, ApprovalStatus.AUTO_APPROVED, decided_by="auto")
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code == 409
+        assert started["arc"] == []
+        assert load_state(ws).state != CampaignStateValue.RUNNING_ARC
+        assert load_plan(ws).actions[0].kind == ActionKind.ARC_RUN
+
     def test_rerunning_a_running_arc_campaign_is_a_conflict(
         self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2193,6 +2265,26 @@ class TestDashboardAgenticCards:
         assert b"auto_approved" in response.data
 
 
+def _wait_for_literature(ws: Path, timeout_s: float = 30.0) -> None:
+    """Block until the background literature run reaches a terminal state.
+
+    Campaign creation over HTTP now dispatches and returns, so tests that assert on the
+    run's RESULT have to wait for the worker thread instead of relying on the handler to
+    have finished it. Polls rather than joining because the thread is owned by the
+    dispatcher, not by the test.
+    """
+    import time
+
+    from carmel.services.state_machine import load_state
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if load_state(ws).state != CampaignStateValue.RUNNING_LITERATURE:
+            return
+        time.sleep(0.02)
+    raise AssertionError(f"literature run did not finish within {timeout_s}s")
+
+
 class TestCreateAppWithAgentConfig:
     def test_campaign_creation_auto_runs_literature(self, tmp_path: Path) -> None:
         """create_app(agent_config=...) wires the literature auto-run; the
@@ -2210,10 +2302,60 @@ class TestCreateAppWithAgentConfig:
 
         ws = find_campaign_workspace(tmp_path, cid)
         assert ws is not None
+        # The request handler no longer blocks for the whole run, so the run is
+        # in-flight (or already done) when the response comes back. The pre-transition
+        # to RUNNING_LITERATURE happens synchronously inside `execute_next_action`,
+        # before the worker thread starts, so the campaign is never still DRAFT here.
+        assert load_state(ws).state in {
+            CampaignStateValue.RUNNING_LITERATURE,
+            CampaignStateValue.LITERATURE_READY,
+        }
+        _wait_for_literature(ws)
         assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
         assert (ws / "literature_report.json").exists()
         dashboard = client.get(f"/campaigns/{cid}").data
         assert b"Literature report" in dashboard
+
+    def test_campaign_creation_does_not_block_on_the_literature_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The HTTP handler must dispatch and return, not hold a Flask worker for the
+        entire run (many model calls, fetches and PDF extractions). A blocking handler
+        makes a couple of concurrent creations enough to wedge the UI, and a client-side
+        timeout would abandon a run that keeps going with nobody to read its result."""
+        import threading
+
+        from carmel.config import AgentConfig
+        from carmel.services import campaigns as campaigns_module
+        from carmel.services.campaigns import find_campaign_workspace
+
+        release = threading.Event()
+        waited = threading.Event()
+        real_start = campaigns_module.start_literature_at_creation
+
+        def _recording_start(*args: object, **kwargs: object) -> object:
+            # `literature_wait_timeout_s=None` is the contract under test: the HTTP
+            # caller must pass it so the campaigns layer dispatches without waiting.
+            assert kwargs.get("wait_timeout_s", "missing") is None, (
+                "the HTTP path must dispatch without waiting for the literature run"
+            )
+            waited.set()
+            return real_start(*args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(campaigns_module, "start_literature_at_creation", _recording_start)
+
+        app = create_app(workspaces_root=tmp_path, agent_config=AgentConfig())
+        app.config["TESTING"] = True
+        client = app.test_client()
+        try:
+            cid = _create_via_form(client, name="nonblocking")
+        finally:
+            release.set()
+
+        assert waited.is_set(), "literature-at-creation was never reached"
+        ws = find_campaign_workspace(tmp_path, cid)
+        assert ws is not None
+        _wait_for_literature(ws)
 
     def test_no_agent_config_means_no_auto_run(self, client: FlaskClient, workspaces_root: Path) -> None:
         from carmel.services.campaigns import find_campaign_workspace
@@ -2326,6 +2468,63 @@ class TestLiteratureCrashRecovery:
 
         assert response.status_code == 409
         assert load_state(ws).state == CampaignStateValue.RUNNING_LITERATURE
+
+
+class TestPlanProgressRecreatedOnMissingFile:
+    """Finding P1-1: `/run` and `/abandon` must recreate a missing
+    ``plan_progress.json`` rather than 503 forever.
+
+    ``load_or_init_progress`` -> ``reconcile`` in the wrong order left every
+    first ``/run`` of a campaign missing that file 503ing permanently
+    (``reconcile`` -> ``load_progress`` -> ``read_json`` raises
+    ``FileNotFoundError``, an ``OSError``, which the route's ``except
+    OSError`` then reported as a 503 with no way to retry out of it).
+    ``load_or_init_progress`` is idempotent, so calling it first closes this
+    for good.
+
+    No currently-reachable UI flow actually leaves a fresh campaign without
+    the file: ``plan_and_save`` (the T3 planning path) and
+    ``start_literature_at_creation`` (the literature-at-creation path) both
+    call ``init_progress``/``load_or_init_progress`` themselves before
+    ``/run`` can ever be reached, and an ARC plan's first action routes
+    around the reconcile call entirely (see the ``ARC_RUN`` branch in
+    ``campaign_run``). These tests instead delete the file out from under an
+    otherwise-normal campaign workspace to model it going missing some other
+    way -- hand-editing, filesystem corruption, or a future planner
+    regression that forgets to initialise it -- which is exactly the
+    scenario the fix's ordering guards against.
+    """
+
+    def test_run_recreates_a_missing_plan_progress_file(
+        self, client: FlaskClient, workspaces_root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from carmel.services.plan_progress import PLAN_PROGRESS_NAME
+        from carmel.ui import app as ui_app
+
+        monkeypatch.setattr(ui_app, "execute_next_action", lambda ws, campaign, **kwargs: None)
+        cid = _create_via_form(client, "missing-progress-run")
+        _post(client, f"/campaigns/{cid}/plan")
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        (ws / PLAN_PROGRESS_NAME).unlink()
+
+        response = _post(client, f"/campaigns/{cid}/run", follow_redirects=False)
+
+        assert response.status_code != 503
+        assert (ws / PLAN_PROGRESS_NAME).exists()
+
+    def test_abandon_recreates_a_missing_plan_progress_file(self, client: FlaskClient, workspaces_root: Path) -> None:
+        from carmel.services.plan_progress import PLAN_PROGRESS_NAME
+
+        cid, ws, _lit_id = TestLiteratureCrashRecovery._wedged_literature(
+            client, workspaces_root, "missing-progress-abandon", stale=True
+        )
+        (ws / PLAN_PROGRESS_NAME).unlink()
+
+        response = _post(client, f"/campaigns/{cid}/abandon", follow_redirects=False)
+
+        assert response.status_code != 503
+        assert (ws / PLAN_PROGRESS_NAME).exists()
 
 
 class TestLiteratureReportLoading:

@@ -165,8 +165,21 @@ class DispatchTicket:
         Returns None when the run failed before producing a result (the
         failure is persisted in the workspace; ``self.error`` carries the
         exception).
+
+        Raises:
+            TimeoutError: If ``timeout`` is given and the background run had
+                not finished when it elapsed. Without this, a timed-out wait
+                and a genuine failure were indistinguishable — both returned
+                None — which would have left a caller passing a timeout no
+                way to tell "the run failed" (safe to inspect ``self.error``
+                and the persisted workspace state) from "the run is still
+                going" (unsafe to do either yet). The one production caller
+                (:func:`carmel.services.campaigns.start_literature_at_creation`)
+                calls ``wait()`` with no timeout, so it is unaffected.
         """
         self.join(timeout)
+        if timeout is not None and self.thread is not None and self.thread.is_alive():
+            raise TimeoutError(f"dispatch of action {self.action_id!r} did not finish within {timeout}s")
         return self.result
 
 
@@ -265,7 +278,12 @@ def make_t3_handler(adapter: T3AdapterProtocol | None = None) -> ActionHandler:
                 supervision.close()
             raise UnsupportedActionKindError(f"T3 handler cannot execute kind {action.kind.value!r}")
         if supervision is None:
-            supervision = start_supervision(workspace_root, action.action_id)
+            # P1-13, second site: pass estimated_cpu_hours here too. `start_supervision`
+            # defaults it to 0.0, and `spend.compute_spend` derives the in-flight CPU
+            # reservation from exactly this value -- so a run supervised without it is
+            # invisible to the budget gate for its whole duration, and every launch
+            # decision taken meanwhile is made against a ledger that under-reports.
+            supervision = start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
         run_record, diagnostics = execution._finish_t3_run(
             workspace_root,
             campaign,
@@ -406,12 +424,18 @@ def validate_plan_shape(plan: Plan) -> list[str]:
       ``carmel.services.execution``, not through this dispatcher, so judging it
       by the dispatcher's own handler registry rejected every valid ARC plan.
     - at most one T3_RUN action
+    - at most one LITERATURE_SEARCH action
     - any LITERATURE_SEARCH action must precede the T3_RUN action
+    - the T3_RUN action, when present, must be LAST among the plan's
+      executable actions — no action of any kind (including ARC_RUN) may
+      follow it. Checking literature-before-T3 alone does not guarantee
+      this: a plan could still place ARC_RUN (also in
+      ``EXECUTABLE_ACTION_KINDS``) after T3_RUN without tripping either of
+      the two checks above, so T3-last is enforced directly here.
 
-    Together the last two guarantee the T3 action, when present, is the
-    LAST action of the plan — which is what lets the dispatcher reuse
-    ``_finish_t3_run`` (whose success path ends at ``COMPLETED_PHASE1``)
-    verbatim; see the module docstring.
+    T3-last is what lets the dispatcher reuse ``_finish_t3_run`` (whose
+    success path ends at ``COMPLETED_PHASE1``) verbatim; see the module
+    docstring.
 
     - action_ids must be unique
     """
@@ -422,12 +446,22 @@ def validate_plan_shape(plan: Plan) -> list[str]:
     t3_indices = [i for i, a in enumerate(plan.actions) if a.kind == ActionKind.T3_RUN]
     if len(t3_indices) > 1:
         problems.append(f"plan contains {len(t3_indices)} T3_RUN actions; at most one is allowed")
+    literature_indices = [i for i, a in enumerate(plan.actions) if a.kind == ActionKind.LITERATURE_SEARCH]
+    if len(literature_indices) > 1:
+        problems.append(f"plan contains {len(literature_indices)} LITERATURE_SEARCH actions; at most one is allowed")
     if t3_indices:
         first_t3 = t3_indices[0]
         for i, action in enumerate(plan.actions):
-            if action.kind == ActionKind.LITERATURE_SEARCH and i > first_t3:
+            if i <= first_t3:
+                continue
+            if action.kind == ActionKind.LITERATURE_SEARCH:
                 problems.append(
                     f"literature action {action.action_id!r} follows the T3_RUN action; literature must precede T3"
+                )
+            elif action.kind in EXECUTABLE_ACTION_KINDS:
+                problems.append(
+                    f"action {action.action_id!r} (kind {action.kind.value!r}) follows the T3_RUN action; "
+                    "T3_RUN must be the last executable action in the plan"
                 )
     action_ids = [a.action_id for a in plan.actions]
     if len(set(action_ids)) != len(action_ids):
@@ -663,10 +697,16 @@ def execute_next_action(
        None and record why; never execute a PENDING action.
     4. Pre-transition the campaign state (RUNNING_T3 / RUNNING_LITERATURE)
        synchronously — exactly like
-       :func:`carmel.services.execution.begin_t3_run`, this locked
-       transition is the authoritative concurrency gate: of two racing
-       dispatch attempts, the loser raises ``InvalidTransitionError`` in
-       its own caller instead of silently racing a run already in flight.
+       :func:`carmel.services.execution.begin_t3_run`. This is NOT the gate
+       that decides between two racing dispatch attempts: the exclusive
+       ``.dispatch.lock`` mkdir lease (:func:`_acquire_dispatch_lock`,
+       acquired before step 0) already wins that race and rejects the
+       loser with ``ActionInFlightError`` before it ever reaches this
+       step. The transition's own ``InvalidTransitionError`` instead
+       guards against the campaign being in a state this dispatch does
+       not expect to find it in for some other reason — e.g. state and
+       progress having drifted out of sync — and is raised in the calling
+       thread, before any background work starts.
     5. ``mark_running(attempt_id)`` (atomic under the workspace lock).
 
     On the background thread:
@@ -828,7 +868,20 @@ def execute_next_action(
         # surface to the caller (a 409) instead of being swallowed into
         # ticket.error where nobody is waiting for it.
         running_state = _pre_transition_state(action.kind)
-        supervision = start_supervision(workspace_root, action.action_id) if action.kind == ActionKind.T3_RUN else None
+        # Finding P1-13: pass estimated_cpu_hours, matching every launch site
+        # in execution.py (start_t3_action / execute_t3_action /
+        # start_arc_action). Omitting it defaults the reservation to 0.0, and
+        # spend.compute_spend derives the in-flight reservation from exactly
+        # this field (`reserved = active.estimated_cpu_hours if active is not
+        # None else 0.0`) -- so a dispatcher-launched run in flight would
+        # read as reserving nothing, and this dispatcher's own launch gate
+        # (`_require_launch_authorization` -> `compute_spend`, above) would
+        # be evaluated against a ledger blind to every run it itself started.
+        supervision = (
+            start_supervision(workspace_root, action.action_id, action.estimated_cpu_hours)
+            if action.kind == ActionKind.T3_RUN
+            else None
+        )
         try:
             if load_state(workspace_root).state != running_state:
                 update_state(workspace_root, running_state, notes=f"action={action.action_id}")
@@ -888,19 +941,27 @@ def recover_workspace(workspace_root: Path, *, stale_after_s: float = DEFAULT_ST
     """Recover a workspace wedged in a ``RUNNING_*`` state after a crash (Finding 1).
 
     :func:`~carmel.services.plan_progress.reconcile` is the dispatcher's crash-repair
-    pass, but its ONE existing caller is :func:`execute_next_action` — and every UI
-    route that could reach ``execute_next_action`` refuses outright while the
-    campaign is ``RUNNING_*`` (the UI 409s from ``RUNNING_LITERATURE`` on
-    ``/run``/``/replan``/``/retry``/``/finalize``/``/approve``/``/reject``, and
-    ``/abandon`` hardcodes ``RUNNING_T3``). Campaign creation runs literature
-    synchronously inside the POST handler, so a crash mid-run there — the campaign
-    left at ``RUNNING_LITERATURE`` with a ``RUNNING`` action and nothing behind it —
-    is the first thing a new user can hit, and until now only a hand-edit of the
-    persisted JSON could recover it.
+    pass. It is called from three sites: :func:`execute_next_action` here, and
+    (Finding P1-1) ``/run`` and ``/abandon`` in ``carmel.ui.app``, which call it
+    directly before their own preflight looks at campaign state — so, unlike an
+    earlier version of this docstring claimed, reaching ``RUNNING_*`` no longer
+    requires going through ``execute_next_action`` at all.
 
-    This is the reachable entry point: call it directly while the campaign sits in
-    a ``RUNNING_*`` state, with no need to route through ``execute_next_action``
-    (which would refuse to do anything else until this repair has run).
+    ``recover_workspace`` itself, however, has no caller anywhere in this codebase
+    today (only tests invoke it directly) — it is a repair entry point for callers
+    outside the request/response cycle that ``/run``/``/abandon`` cover: an ops
+    script, a future admin action, or a campaign-creation crash. Campaign creation
+    runs literature synchronously inside the POST handler, so a crash mid-run there
+    — the campaign left at ``RUNNING_LITERATURE`` with a ``RUNNING`` action and
+    nothing behind it — is the first thing a new user can hit, and none of
+    ``/run``/``/replan``/``/retry``/``/finalize``/``/approve``/``/reject`` can reach
+    it (they all 409 outright while the campaign reads ``RUNNING_*``, and
+    ``/abandon`` hardcodes ``RUNNING_T3``). Until now only a hand-edit of the
+    persisted JSON could recover such a campaign.
+
+    Call this directly while the campaign sits in a ``RUNNING_*`` state, with no
+    need to route through ``execute_next_action`` or the UI (which would refuse to
+    do anything else until this repair has run).
 
     Deliberately does NOT take :func:`_acquire_dispatch_lock`'s exclusive
     ``.dispatch.lock`` mkdir lease the way ``execute_next_action`` does. That lease

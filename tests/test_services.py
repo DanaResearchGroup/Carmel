@@ -124,6 +124,7 @@ from carmel.services.recovery import (
     supervisor_is_alive,
 )
 from carmel.services.state_machine import (
+    RECOVERY_TARGETS,
     VALID_TRANSITIONS,
     InvalidTransitionError,
     can_transition,
@@ -525,6 +526,12 @@ class TestStateMachine:
                 {
                     CampaignStateValue.RUNNING_T3,
                     CampaignStateValue.RUNNING_ARC,
+                    # Finding P1-8: RUNNING_LITERATURE was missing from
+                    # RECOVERY_TARGETS -- the only RUNNING_* origin without a
+                    # direct resume -- so a campaign that failed during
+                    # literature could never retry, only /replan (discarding
+                    # any approvals it already held).
+                    CampaignStateValue.RUNNING_LITERATURE,
                     CampaignStateValue.APPROVED_FOR_EXECUTION,
                 },
             ),
@@ -533,6 +540,23 @@ class TestStateMachine:
         ]:
             for origin in CampaignStateValue:
                 assert can_transition(CampaignStateValue.FAILED, target, failed_from=origin) == (origin in unlocked_by)
+
+    def test_every_running_state_has_a_recovery_target(self) -> None:
+        """Finding P1-8: every ``RUNNING_*`` state must be a recoverable origin.
+
+        ``RECOVERY_TARGETS`` is the allowlist ``can_transition`` consults to
+        let a campaign resume directly out of ``FAILED`` rather than being
+        forced back through ``READY_FOR_PLANNING``. A ``RUNNING_*`` member
+        missing from it (as ``RUNNING_LITERATURE`` was) is not merely an
+        inconvenience -- ``/retry`` 409s forever for that origin, and only
+        ``/replan`` can recover it, discarding whatever approvals the
+        campaign already held. This is a standing guard against a repeat of
+        that omission for any ``RUNNING_*`` member added in the future.
+        """
+        running_states = {state for state in CampaignStateValue if state.name.startswith("RUNNING_")}
+        assert running_states, "expected at least one RUNNING_* state to exist"
+        for state in running_states:
+            assert state in RECOVERY_TARGETS, f"{state} has no entry in RECOVERY_TARGETS"
 
     def test_a_plan_approved_but_never_launched_resumes_without_re_planning(self, tmp_path: Path) -> None:
         """Failing between approval and launch must not discard the approval.

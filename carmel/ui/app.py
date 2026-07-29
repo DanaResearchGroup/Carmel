@@ -321,7 +321,18 @@ def create_app(
         if ws.exists() and (ws / "campaign.yaml").exists():
             flash(f"A campaign already exists at {ws}", "error")
             return render_template("campaign_create.html", form=request.form), 400  # type: ignore[return-value]
-        campaign = create_campaign(ws, campaign_input, agent_config=agent_config)
+        # `literature_wait_timeout_s=None` means "dispatch and return, never block".
+        # The synchronous default is right for the CLI but wrong here: it pins one
+        # Flask worker for an entire literature run (many model calls, fetches and PDF
+        # extractions), so a couple of concurrent campaign creations make the UI
+        # unresponsive, and a client-side timeout would abandon a run that keeps going
+        # with nobody left to read its result.
+        campaign = create_campaign(
+            ws,
+            campaign_input,
+            agent_config=agent_config,
+            literature_wait_timeout_s=None,
+        )
         # With an agent config, literature-at-creation may already have
         # advanced the campaign past DRAFT; only apply the manual
         # transitions when it has not.
@@ -536,7 +547,16 @@ def create_app(
         another workstream's execution path during a rebase is exactly the kind of
         change that looks harmless and is not.
         """
-        action = plan.actions[0]
+        # Finding P1-14: select the ARC action by kind, not by position. Plans
+        # are multi-action now (planner.py appends LITERATURE_SEARCH before
+        # ARC_RUN), so `plan.actions[0]` is the literature action, not ARC --
+        # reading its approval would let a literature approval stand in for
+        # ARC's. One selection is used for both the launch call below and the
+        # approval check, so the two can never disagree about which action
+        # this route is launching.
+        action = next((a for a in plan.actions if a.kind == ActionKind.ARC_RUN), None)
+        if action is None:
+            abort(400, description="Plan has no ARC_RUN action.")
         decisions = [
             event
             for event in read_events(ws / "decision_log.jsonl")
@@ -576,15 +596,6 @@ def create_app(
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
-        # Crash recovery (Finding 1): replay any missing post-transition or
-        # adopt any persisted attempt result BEFORE the preflight below looks
-        # at campaign state. Every UI route otherwise refuses while the
-        # campaign reads RUNNING_* (no self-edge in the state machine), so
-        # without this a campaign left there by a crash could only be
-        # recovered by hand-editing JSON. A still-live attempt
-        # (ActionInFlightError) means the run genuinely is in progress, not
-        # stuck -- leave it alone and let the existing preflight/dispatcher
-        # report the conflict.
         campaign = load_campaign(ws)
         plan = load_plan(ws)
         if not plan.actions:
@@ -600,6 +611,18 @@ def create_app(
         if plan.actions[0].kind == ActionKind.ARC_RUN:
             return _start_arc_run(ws, campaign, plan, campaign_id)
 
+        # Finding P1-1: initialise plan_progress.json BEFORE reconcile, not
+        # after. `reconcile` -> `load_progress` -> `read_json` raises
+        # FileNotFoundError (an OSError) when the progress file does not yet
+        # exist, and every campaign workspace created by `main` lacks one
+        # until this call creates it. With the two calls in the other order
+        # that FileNotFoundError was caught below and turned into a 503 on
+        # EVERY first `/run` of EVERY campaign -- permanently, since retrying
+        # repeats the identical failure. `load_or_init_progress` is
+        # idempotent (a no-op once the file exists), so calling it first is
+        # always safe.
+        progress = load_or_init_progress(ws, plan)
+
         # Crash recovery (Finding 1): replay any missing post-transition or
         # adopt any persisted attempt result BEFORE the preflight below looks
         # at campaign state. Every UI route otherwise refuses while the
@@ -613,10 +636,12 @@ def create_app(
             with contextlib.suppress(ActionInFlightError):
                 reconcile(ws, in_dispatch_lock=False)
         except OSError as e:
-            # Mirrors dispatcher.execute_next_action's own translation: the
-            # workspace filesystem cannot answer whether the workspace lock
-            # is held. That is an environment fault (503), not a crash.
-            abort(503, description=f"Cannot determine run-lock state for this workspace: {e}")
+            # The progress file itself is now guaranteed to exist (see
+            # above), so this is a genuine filesystem fault acquiring the
+            # workspace's advisory lock (e.g. permissions), not a missing
+            # file misread as a lock problem. Either way it is an
+            # environment fault (503), not a crash.
+            abort(503, description=f"Cannot determine plan-progress/run-lock state for this workspace: {e}")
 
         progress = load_or_init_progress(ws, plan)
         next_id = progress.next_action_id()
@@ -795,12 +820,22 @@ def create_app(
         if state.state == CampaignStateValue.RUNNING_LITERATURE:
             # Literature has no supervised process tree, so "abandon" here means
             # lock-file reconciliation rather than killing an adapter.
+            #
+            # Finding P1-1: as in `campaign_run`, initialise plan_progress.json
+            # BEFORE reconcile, not after. A campaign cannot legitimately reach
+            # RUNNING_LITERATURE without one (`/run` creates it before making
+            # that transition), but a defensive `load_or_init_progress` here
+            # is a cheap, idempotent no-op in the normal case and closes the
+            # same FileNotFoundError-as-503 trap for any workspace left
+            # inconsistent by hand-editing or an older bug.
+            plan = load_plan(ws)
+            load_or_init_progress(ws, plan)
             try:
                 reconcile(ws, in_dispatch_lock=False)
             except ActionInFlightError as e:
                 abort(409, description=str(e))
             except OSError as e:
-                abort(503, description=f"Cannot determine run-lock state for this workspace: {e}")
+                abort(503, description=f"Cannot determine plan-progress/run-lock state for this workspace: {e}")
             state = load_state(ws)
             if state.state == CampaignStateValue.RUNNING_LITERATURE:
                 # No stale lock and no live attempt, yet still RUNNING_LITERATURE:
