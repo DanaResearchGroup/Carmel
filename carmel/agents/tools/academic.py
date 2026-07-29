@@ -6,7 +6,9 @@ endpoint plus a bearer key, which no scholarly index requires — and demanding 
 them impossible to configure at all. The second half of the module is
 :class:`OpenAccessResolver`: deterministic DOI/title -> open-access-PDF resolution over
 a pluggable list of OA indexes (OpenAlex, Unpaywall, Crossref TDM links, Semantic
-Scholar, CORE, DOAJ, FatCat, ChemRxiv, arXiv).
+Scholar, CORE, DOAJ, ChemRxiv, arXiv). ChemRxiv is registered but disabled by default;
+see :data:`DEFAULT_ENABLED_PROVIDERS`. FatCat / Internet Archive Scholar was removed
+entirely on 2026-07-29 -- see the note by the provider registry.
 
 Both adapters are shaped by a live probe of 60 combustion-kinetics works rather than by
 the APIs' own documentation, because the two disagree sharply:
@@ -55,13 +57,22 @@ UNPAYWALL_ENDPOINT = "https://api.unpaywall.org/v2"
 SEMANTIC_SCHOLAR_ENDPOINT = "https://api.semanticscholar.org/graph/v1/paper"
 CORE_ENDPOINT = "https://api.core.ac.uk/v3/search/works"
 DOAJ_ENDPOINT = "https://doaj.org/api/search/articles"
-FATCAT_ENDPOINT = "https://api.fatcat.wiki/v0/release/lookup"
 CHEMRXIV_ENDPOINT = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
 ARXIV_ENDPOINT = "https://export.arxiv.org/api/query"
 
 #: Sent on every request so the upstream operator can identify (and contact us about)
 #: this client rather than silently rate-limiting it.
 USER_AGENT = "Carmel/0.1 (+https://github.com/DanaResearchGroup/Carmel)"
+
+#: Per-request timeout for OA *index* lookups -- the small JSON/Atom metadata calls
+#: that ``_lookup_*`` methods make to discover whether a paper has an OA copy, not the
+#: (much larger, and much slower) actual PDF/document fetch, which is a different code
+#: path in a different tool and keeps its own ~30s timeout. A dead index (FatCat's
+#: api.fatcat.wiki timed out at the default 30s on every one of 12 probed DOIs, costing
+#: ~6 minutes of wall-clock on a single 12-paper run) should cost at most a few seconds
+#: per paper, not tens of seconds, and a short timeout here can never truncate a real
+#: document download because it is never used for one.
+OA_INDEX_LOOKUP_TIMEOUT_S = 10.0
 
 #: Host types worth trying to fetch directly, best first. Publisher-hosted copies are
 #: last because they bot-block plain HTTP clients.
@@ -449,12 +460,35 @@ class OaCandidate:
     tier: OaTier
 
 
-#: Hard ceiling on index lookup calls per resolved paper. Nine providers exist today
-#: and each makes at most one call, so this never trips in normal operation; it is the
-#: bound that keeps a 12-paper run at <=120 small JSON/Atom lookups no matter how many
-#: providers are added later, instead of letting provider growth silently multiply
-#: network fan-out. Providers beyond the cap are skipped loudly in the resolution note.
+#: Hard ceiling on index lookup calls per resolved paper. Eight providers are
+#: registered today and each makes at most one call, so this never trips in normal
+#: operation; it is the bound that keeps a 12-paper run at <=96 small JSON/Atom
+#: lookups no matter how many providers are added later, instead of letting provider
+#: growth silently multiply network fan-out. Providers beyond the cap are skipped
+#: loudly in the resolution note.
 MAX_OA_LOOKUP_CALLS_PER_PAPER = 10
+
+#: Providers actually queried by :class:`OpenAccessResolver` by default. All
+#: registered providers are listed in the class's ``all_providers`` tuple; only the
+#: ones named here are kept, so disabling a provider without deleting its parser/
+#: lookup method is just leaving its name out of this set.
+#:
+#: ChemRxiv is registered (parser + lookup method preserved -- chemistry preprints
+#: are genuinely relevant to this domain) but excluded here as of 2026-07-29: its
+#: ``public-api/v1/items?term=`` endpoint returned 403/404 for all 12 probed titles
+#: in a live probe, so querying it by default is pure latency/log noise. Re-enable
+#: by adding "ChemRxiv" back to this set once the endpoint is re-verified alive.
+DEFAULT_ENABLED_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "OpenAlex",
+        "Unpaywall",
+        "Crossref",
+        "Semantic Scholar",
+        "CORE",
+        "DOAJ",
+        "arXiv",
+    }
+)
 
 #: Results requested from each search-shaped index (CORE, ChemRxiv, arXiv). Small on
 #: purpose: the match criteria are exact (DOI or exact title), so the wanted paper is
@@ -751,47 +785,6 @@ def _doaj_names_doi(identifiers: Any, doi: str) -> bool:
     return False
 
 
-def fatcat_oa_candidates(payload: Any) -> list[OaCandidate]:
-    """Archived PDF copies from one FatCat release lookup (``expand=files``).
-
-    Web-archive URLs are ordered first: they are the stable, always-was-OA snapshots
-    (the point of consulting an archive at all), while the original ``web`` URLs may
-    have rotted. UNVERIFIED SHAPE -- and worse: a live probe on 2026-07-29 found
-    ``api.fatcat.wiki`` refusing connections outright (the Internet Archive has been
-    sunsetting the service), so in production this provider is expected to fail soft
-    every time until that changes. The parser follows the published release schema
-    (``files[]`` with ``mimetype`` and ``urls[]`` of ``{url, rel}``).
-
-    Args:
-        payload: The raw release lookup payload, of unknown shape.
-
-    Returns:
-        Deduplicated :attr:`OaTier.REPOSITORY` candidates, archive snapshots first.
-    """
-    files = payload.get("files") if isinstance(payload, dict) else None
-    if not isinstance(files, list):
-        return []
-    archived: list[OaCandidate] = []
-    direct: list[OaCandidate] = []
-    seen: set[str] = set()
-    for file_entry in files:
-        if not isinstance(file_entry, dict) or file_entry.get("mimetype") != "application/pdf":
-            continue
-        urls = file_entry.get("urls")
-        if not isinstance(urls, list):
-            continue
-        for url_entry in urls:
-            if not isinstance(url_entry, dict):
-                continue
-            url = url_entry.get("url")
-            if not isinstance(url, str) or not url or url in seen:
-                continue
-            seen.add(url)
-            target = archived if url_entry.get("rel") == "webarchive" else direct
-            target.append(OaCandidate(url=url, tier=OaTier.REPOSITORY))
-    return archived + direct
-
-
 def chemrxiv_oa_candidates(payload: Any, *, doi: str, title: str | None) -> list[OaCandidate]:
     """Preprint PDFs from a ChemRxiv (Cambridge Open Engage) term-search response.
 
@@ -805,6 +798,10 @@ def chemrxiv_oa_candidates(payload: Any, *, doi: str, title: str | None) -> list
     ``doi``, ``title``, ``vor.vorDoi``, ``asset.original.url``); a live probe was
     blocked (HTTP 403 to non-browser fetchers), so treat ``asset.original.url`` in
     particular as UNVERIFIED against a live response.
+
+    The ``public-api/v1/items?term=`` endpoint returned 403/404 for all 12 probed
+    titles on 2026-07-29; needs re-verification before re-enabling by default (see
+    :data:`DEFAULT_ENABLED_PROVIDERS`).
 
     Args:
         payload: The raw items search payload, of unknown shape.
@@ -934,10 +931,13 @@ class _ProviderSkip(Exception):
 class OpenAccessResolver(_KeylessSearchTool):
     """DOI -> open-access PDF candidates, via a pluggable list of OA index providers.
 
-    Providers (consulted in this order, each at most one lookup call): OpenAlex,
-    Unpaywall, Crossref (publisher TDM links), Semantic Scholar, CORE, DOAJ, FatCat,
-    ChemRxiv and arXiv. Adding one is a small, isolated change: one pure parser, one
-    ``_lookup_*`` method, one entry in the ``self._providers`` registry.
+    Providers registered (each at most one lookup call): OpenAlex, Unpaywall, Crossref
+    (publisher TDM links), Semantic Scholar, CORE, DOAJ, ChemRxiv and arXiv, consulted
+    in that order for whichever of them are enabled -- see
+    :data:`DEFAULT_ENABLED_PROVIDERS` (ChemRxiv is registered but disabled by
+    default). Adding a provider is a small, isolated change: one pure parser, one
+    ``_lookup_*`` method, one entry in the registry construction, one name in
+    :data:`DEFAULT_ENABLED_PROVIDERS` if it should be queried by default.
 
     Every provider is independently fail-soft -- one index erroring, rate-limiting or
     returning junk never loses the others' candidates and never aborts the run -- and
@@ -965,7 +965,7 @@ class OpenAccessResolver(_KeylessSearchTool):
         core_api_key: str | None = None,
         semantic_scholar_api_key: str | None = None,
         opener: Callable[..., Any] | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float = OA_INDEX_LOOKUP_TIMEOUT_S,
     ) -> None:
         """Construct the resolver.
 
@@ -981,7 +981,11 @@ class OpenAccessResolver(_KeylessSearchTool):
                 limits); ``None`` still queries their keyless shared pool.
             opener: Injected ``(url, headers=..., timeout_s=...) -> response`` opener,
                 for tests. Defaults to a real urllib GET.
-            timeout_s: Per-request socket timeout.
+            timeout_s: Per-request socket timeout for the index/metadata lookup calls
+                this resolver makes. Defaults to :data:`OA_INDEX_LOOKUP_TIMEOUT_S`
+                (10s), much shorter than the ~30s used elsewhere for actual PDF/
+                document fetches, because these are small JSON/Atom calls and a dead
+                index should not cost more than a few seconds per paper.
         """
         super().__init__(
             ledger=ledger,
@@ -998,17 +1002,26 @@ class OpenAccessResolver(_KeylessSearchTool):
         #: The provider registry. Order is the consultation order and, within a tier,
         #: the candidate order. To add a provider: write a pure parser above, a
         #: ``_lookup_*`` method below, and register it here.
-        self._providers: tuple[tuple[str, Callable[[str, str | None], list[OaCandidate]]], ...] = (
+        #:
+        #: FatCat / Internet Archive Scholar was removed entirely on 2026-07-29
+        #: because api.fatcat.wiki no longer resolves (connection timeouts on every
+        #: lookup) -- do not re-add from the old documented schema without
+        #: re-verifying the endpoint is alive.
+        #:
+        #: Only providers named in :data:`DEFAULT_ENABLED_PROVIDERS` are actually
+        #: queried by default; see that constant for why ChemRxiv is registered but
+        #: excluded.
+        all_providers: tuple[tuple[str, Callable[[str, str | None], list[OaCandidate]]], ...] = (
             ("OpenAlex", self._lookup_openalex),
             ("Unpaywall", self._lookup_unpaywall),
             ("Crossref", self._lookup_crossref),
             ("Semantic Scholar", self._lookup_semantic_scholar),
             ("CORE", self._lookup_core),
             ("DOAJ", self._lookup_doaj),
-            ("FatCat", self._lookup_fatcat),
             ("ChemRxiv", self._lookup_chemrxiv),
             ("arXiv", self._lookup_arxiv),
         )
+        self._providers = tuple(p for p in all_providers if p[0] in DEFAULT_ENABLED_PROVIDERS)
 
     def resolve(self, doi: str, *, title: str | None = None) -> OaResolution:
         """Resolve one DOI (and optionally a title) to fetchable OA PDF candidates.
@@ -1119,10 +1132,6 @@ class OpenAccessResolver(_KeylessSearchTool):
     def _lookup_doaj(self, doi: str, title: str | None) -> list[OaCandidate]:
         url = f"{DOAJ_ENDPOINT}/{quote(f'doi:{doi}', safe='')}"
         return doaj_oa_candidates(self._counted_get_json(url), doi=doi)
-
-    def _lookup_fatcat(self, doi: str, title: str | None) -> list[OaCandidate]:
-        url = f"{FATCAT_ENDPOINT}?doi={quote_plus(doi)}&expand=files"
-        return fatcat_oa_candidates(self._counted_get_json(url))
 
     def _lookup_chemrxiv(self, doi: str, title: str | None) -> list[OaCandidate]:
         if not title:

@@ -25,7 +25,6 @@ from carmel.agents.tools.academic import (
     CORE_ENDPOINT,
     CROSSREF_ENDPOINT,
     DOAJ_ENDPOINT,
-    FATCAT_ENDPOINT,
     OPENALEX_ENDPOINT,
     SEMANTIC_SCHOLAR_ENDPOINT,
     UNPAYWALL_ENDPOINT,
@@ -40,7 +39,6 @@ from carmel.agents.tools.academic import (
     crossref_tdm_candidates,
     dedupe_by_doi,
     doaj_oa_candidates,
-    fatcat_oa_candidates,
     normalize_doi,
     openalex_oa_pdf_urls,
     semantic_scholar_oa_candidates,
@@ -417,7 +415,6 @@ _QUIET_PROVIDER_ROUTES: dict[str, Any] = {
     CROSSREF_ENDPOINT: {},
     SEMANTIC_SCHOLAR_ENDPOINT: {},
     DOAJ_ENDPOINT: {},
-    FATCAT_ENDPOINT: {},
 }
 
 
@@ -676,32 +673,6 @@ class TestDoajCandidates:
         assert doaj_oa_candidates(payload, doi=_RESOLVER_DOI) == []
 
 
-class TestFatcatCandidates:
-    """FatCat release files: archived PDF copies, web-archive URLs first."""
-
-    def test_pdf_files_yield_urls_webarchive_first(self) -> None:
-        payload = {
-            "files": [
-                {
-                    "mimetype": "application/pdf",
-                    "urls": [
-                        {"url": "https://repo.example/live.pdf", "rel": "web"},
-                        {"url": "https://web.archive.org/web/2020/https://repo.example/live.pdf", "rel": "webarchive"},
-                    ],
-                },
-                {"mimetype": "text/html", "urls": [{"url": "https://repo.example/landing", "rel": "web"}]},
-            ]
-        }
-        assert fatcat_oa_candidates(payload) == [
-            OaCandidate(url="https://web.archive.org/web/2020/https://repo.example/live.pdf", tier=OaTier.REPOSITORY),
-            OaCandidate(url="https://repo.example/live.pdf", tier=OaTier.REPOSITORY),
-        ]
-
-    @pytest.mark.parametrize("payload", [None, [], "x", {}, {"files": "no"}, {"files": [7]}])
-    def test_garbage_shapes_yield_no_candidates(self, payload: Any) -> None:
-        assert fatcat_oa_candidates(payload) == []
-
-
 _CHEMRXIV_ASSET = {"original": {"url": "https://chemrxiv.example/item/original/preprint.pdf"}}
 _WANTED_TITLE = "Ammonia Combustion Kinetics: A Study"
 
@@ -842,14 +813,6 @@ def _full_provider_routes() -> dict[str, Any]:
                 }
             ]
         },
-        FATCAT_ENDPOINT: {
-            "files": [
-                {
-                    "mimetype": "application/pdf",
-                    "urls": [{"url": "https://web.archive.org/web/2020/p.pdf", "rel": "webarchive"}],
-                }
-            ]
-        },
         CHEMRXIV_ENDPOINT: {
             "itemHits": [
                 {
@@ -887,7 +850,13 @@ def _full_resolver(
 class TestPluggableProviderResolution:
     """The provider list as a whole: ordering, dedupe, cap, keys, fail-softness."""
 
-    def test_candidates_are_ordered_publisher_then_repository_then_preprint(self, ledger: BudgetLedger) -> None:
+    def test_candidates_are_ordered_publisher_then_repository_then_preprint(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # ChemRxiv is disabled by default (see DEFAULT_ENABLED_PROVIDERS); re-enable
+        # it here since this test exercises the full pluggable-provider mechanism,
+        # including preprint ordering, not just the production default set.
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"ChemRxiv"})
         seen: list[str] = []
         resolver = _full_resolver(ledger, _full_provider_routes(), seen)
 
@@ -903,12 +872,11 @@ class TestPluggableProviderResolution:
             "https://repo.example/mirror.pdf",
             "https://green.example/copy.pdf",
             "https://core.example/download.pdf",
-            "https://web.archive.org/web/2020/p.pdf",
             # ... and preprints strictly last: they are not the version of record.
             "https://chemrxiv.example/item/original/preprint.pdf",
             "https://arxiv.org/pdf/1405.5500v3",
         ]
-        assert len(seen) == 9, "expected exactly one lookup call per provider"
+        assert len(seen) == 8, "expected exactly one lookup call per provider"
         assert "preprint, not the version of record" in resolution.note
 
     def test_one_provider_rate_limiting_does_not_suppress_the_others(self, ledger: BudgetLedger) -> None:
@@ -968,9 +936,15 @@ class TestPluggableProviderResolution:
             assert all(secret not in url for url in headers_by_url)
             assert all(secret not in r.getMessage() for r in caplog.records)
 
-    def test_without_a_title_the_title_matched_providers_are_skipped(self, ledger: BudgetLedger) -> None:
+    def test_without_a_title_the_title_matched_providers_are_skipped(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """ChemRxiv and arXiv can only be matched safely against a title; with no
         title there is nothing to match, so they must not even be queried."""
+        # ChemRxiv is disabled by default (see DEFAULT_ENABLED_PROVIDERS); re-enable
+        # it here so the title-matched-provider-skip behavior is still exercised for
+        # ChemRxiv specifically, in addition to arXiv (which is enabled by default).
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"ChemRxiv"})
         routes = _full_provider_routes()
         del routes[CHEMRXIV_ENDPOINT]
         del routes[ARXIV_ENDPOINT]
