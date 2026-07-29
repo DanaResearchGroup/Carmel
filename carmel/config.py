@@ -172,6 +172,17 @@ KEYLESS_SEARCH_PROVIDERS: frozenset[SearchProvider] = frozenset({SearchProvider.
 #: an env var is the standard way to supply exactly that.
 UNPAYWALL_EMAIL_ENV = "CARMEL_UNPAYWALL_EMAIL"
 
+#: Environment-variable fallback for :attr:`AgentConfig.core_api_key`. Holds the CORE
+#: API key itself (not the name of another variable): the key is a deploy-time secret
+#: that must never be committed to the repo, and an env var is the standard way to
+#: supply exactly that.
+CORE_API_KEY_ENV = "CARMEL_CORE_API_KEY"
+
+#: Environment-variable fallback for :attr:`AgentConfig.semantic_scholar_api_key`.
+#: Same discipline as :data:`CORE_API_KEY_ENV`: the variable holds the key itself,
+#: which is a secret and never lives in the repository.
+SEMANTIC_SCHOLAR_API_KEY_ENV = "CARMEL_SEMANTIC_SCHOLAR_API_KEY"
+
 
 #: Model each tier uses when the operator does not name one.
 #:
@@ -341,6 +352,21 @@ class AgentConfig(BaseModel):
     skipped entirely; Carmel never sends a fake or placeholder address, which would
     violate Unpaywall's API terms. See :meth:`resolved_unpaywall_email`.
     """
+    core_api_key: str | None = None
+    """API key for the CORE aggregator (https://core.ac.uk), which REQUIRES one.
+
+    Same discipline as :attr:`unpaywall_email`: a deploy-time secret supplied per
+    deployment (here, or via :data:`CORE_API_KEY_ENV`), never hardcoded and never
+    logged. When neither is set, the CORE open-access lookup is skipped entirely with
+    a single warning. See :meth:`resolved_core_api_key`.
+    """
+    semantic_scholar_api_key: str | None = None
+    """Optional API key for Semantic Scholar (raises their rate limits).
+
+    Unlike :attr:`core_api_key` this is never required: without it the lookup still
+    runs keyless, and a 429 from their shared pool is handled as an ordinary
+    fail-soft lookup failure. See :meth:`resolved_semantic_scholar_api_key`.
+    """
     external_provider_consent: bool = False
     literature_at_campaign_start: bool = True
     budget: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
@@ -386,3 +412,23 @@ class AgentConfig(BaseModel):
             case Unpaywall must be skipped (never called with a fabricated address).
         """
         return self.unpaywall_email or os.environ.get(UNPAYWALL_EMAIL_ENV) or None
+
+    def resolved_core_api_key(self) -> str | None:
+        """The CORE API key: config field first, then the environment.
+
+        Returns:
+            :attr:`core_api_key` when set, else a non-empty :data:`CORE_API_KEY_ENV`
+            environment value, else ``None`` -- in which case the CORE lookup must be
+            skipped (their API refuses keyless calls).
+        """
+        return self.core_api_key or os.environ.get(CORE_API_KEY_ENV) or None
+
+    def resolved_semantic_scholar_api_key(self) -> str | None:
+        """The optional Semantic Scholar API key: config field first, then the environment.
+
+        Returns:
+            :attr:`semantic_scholar_api_key` when set, else a non-empty
+            :data:`SEMANTIC_SCHOLAR_API_KEY_ENV` environment value, else ``None`` --
+            in which case the lookup simply runs keyless.
+        """
+        return self.semantic_scholar_api_key or os.environ.get(SEMANTIC_SCHOLAR_API_KEY_ENV) or None

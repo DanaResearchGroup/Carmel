@@ -6,7 +6,9 @@ import pytest
 from pydantic import ValidationError
 
 from carmel.config import (
+    CORE_API_KEY_ENV,
     DEFAULT_TIER_MODELS,
+    SEMANTIC_SCHOLAR_API_KEY_ENV,
     UNPAYWALL_EMAIL_ENV,
     AgentBudgetConfig,
     AgentConfig,
@@ -196,3 +198,51 @@ class TestUnpaywallEmail:
     def test_empty_env_value_counts_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(UNPAYWALL_EMAIL_ENV, "")
         assert AgentConfig().resolved_unpaywall_email() is None
+
+
+class TestCoreApiKey:
+    """The CORE API key: required by their API, a secret never hardcoded."""
+
+    def test_field_defaults_to_none(self) -> None:
+        assert AgentConfig().core_api_key is None
+
+    def test_config_field_wins_over_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(CORE_API_KEY_ENV, "env-key")
+        cfg = AgentConfig(core_api_key="cfg-key")
+        assert cfg.resolved_core_api_key() == "cfg-key"
+
+    def test_environment_variable_is_the_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(CORE_API_KEY_ENV, "env-key")
+        assert AgentConfig().resolved_core_api_key() == "env-key"
+
+    def test_nothing_configured_resolves_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(CORE_API_KEY_ENV, raising=False)
+        assert AgentConfig().resolved_core_api_key() is None
+
+    def test_empty_env_value_counts_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(CORE_API_KEY_ENV, "")
+        assert AgentConfig().resolved_core_api_key() is None
+
+
+class TestSemanticScholarApiKey:
+    """The optional Semantic Scholar API key: raises rate limits, never required."""
+
+    def test_field_defaults_to_none(self) -> None:
+        assert AgentConfig().semantic_scholar_api_key is None
+
+    def test_config_field_wins_over_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(SEMANTIC_SCHOLAR_API_KEY_ENV, "env-key")
+        cfg = AgentConfig(semantic_scholar_api_key="cfg-key")
+        assert cfg.resolved_semantic_scholar_api_key() == "cfg-key"
+
+    def test_environment_variable_is_the_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(SEMANTIC_SCHOLAR_API_KEY_ENV, "env-key")
+        assert AgentConfig().resolved_semantic_scholar_api_key() == "env-key"
+
+    def test_nothing_configured_resolves_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(SEMANTIC_SCHOLAR_API_KEY_ENV, raising=False)
+        assert AgentConfig().resolved_semantic_scholar_api_key() is None
+
+    def test_empty_env_value_counts_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(SEMANTIC_SCHOLAR_API_KEY_ENV, "")
+        assert AgentConfig().resolved_semantic_scholar_api_key() is None
