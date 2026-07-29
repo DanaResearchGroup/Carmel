@@ -555,6 +555,49 @@ class TestNewCampaignCommand:
         assert main(["new-campaign", "--config", str(cfg)]) == 1
         assert "campaign" in capsys.readouterr().out.lower()
 
+    def test_workspaces_is_the_parent_directory_so_requests_can_find_the_campaign(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """`--workspaces` must mean the same thing in every command: the PARENT holding
+        one subdirectory per campaign.
+
+        This used to be passed straight through as the campaign's own workspace root, so
+        `new-campaign --workspaces D` put the campaign directly in ``D`` while
+        `requests --workspaces D` scanned ``D``'s subdirectories -- and could never find
+        the campaign that had just been created there.
+        """
+        from Carmel import main
+        from carmel.config import load_config
+
+        parent = tmp_path / "workspaces"
+        cfg = _write_campaign_config(tmp_path)
+        name = load_config(cfg).workspace_name
+
+        assert main(["new-campaign", "--config", str(cfg), "--workspaces", str(parent)]) == 0
+        assert (parent / name / "campaign.yaml").exists()
+        capsys.readouterr()
+
+        from carmel.services.campaigns import load_campaign
+
+        campaign_id = load_campaign(parent / name).campaign_id
+        assert main(["requests", "--campaign", campaign_id, "--workspaces", str(parent)]) == 0
+        assert "not found" not in capsys.readouterr().out.lower()
+
+    def test_a_workspace_name_that_escapes_the_parent_is_refused(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """``workspace_name`` is only validated as non-blank, so it can carry ``..``."""
+        cfg = tmp_path / "escape.yaml"
+        cfg.write_text(
+            f"workspace_name: ../escaped\nworkspace_root: {tmp_path / 'ws3'}\n",
+            encoding="utf-8",
+        )
+
+        from Carmel import main
+
+        assert main(["new-campaign", "--config", str(cfg), "--workspaces", str(tmp_path / "parent")]) == 1
+        assert not (tmp_path / "escaped").exists()
+
 
 class TestRequestsCommand:
     """The manual-acquisition step. Listing must print the exact command to run next,

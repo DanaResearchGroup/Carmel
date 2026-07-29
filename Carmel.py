@@ -222,8 +222,29 @@ def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
         print(f"Could not load {config_file}: {exc}")
         return 1
 
+    # `--workspaces` means the same thing in EVERY command: the PARENT directory that
+    # holds one subdirectory per campaign. `create_campaign_from_config` instead takes
+    # the campaign's own workspace root, so the parent has to be joined with the
+    # workspace name here. Passing the parent straight through created the campaign
+    # directly in it, and `carmel requests --workspaces <same dir>` -- which scans
+    # subdirectories via `find_campaign_workspace` -- then could never find the campaign
+    # it had just made. The flag's help text already promised "parent"; only this
+    # command disagreed.
+    campaign_root: Path | None = None
+    if workspaces is not None:
+        parent = workspaces.expanduser().resolve()
+        campaign_root = (parent / config.workspace_name).resolve()
+        # `workspace_name` is only validated as non-blank, so it can still carry path
+        # separators or `..`. Without this it would escape the parent the operator named.
+        if not campaign_root.is_relative_to(parent):
+            print(
+                f"Refusing to create a campaign outside {parent}: workspace_name {config.workspace_name!r} escapes it.",
+                file=sys.stderr,
+            )
+            return 1
+
     try:
-        campaign = create_campaign_from_config(config, workspaces_root=workspaces)
+        campaign = create_campaign_from_config(config, workspaces_root=campaign_root)
     except MissingCampaignConfigError as exc:
         print(str(exc))
         return 1
