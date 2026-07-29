@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 from collections.abc import Iterator
@@ -25,7 +26,7 @@ from carmel.agents.literature_agent import (
 )
 from carmel.agents.models import AgentBridgeError, MockModel
 from carmel.agents.tools.fetch import FetchError, MockFetchTool
-from carmel.agents.tools.search import MockSearchTool, SearchResult
+from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
 from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
 from carmel.schemas import (
     ActionKind,
@@ -62,6 +63,7 @@ from carmel.services.literature import (
     run_literature_research,
     run_record_for,
 )
+from carmel.services.plan_progress import publish_lock_info
 
 DOI = "10.1000/test.doi"
 SOURCE_URL = "https://example.com/papers/secret-paper-url"
@@ -604,6 +606,210 @@ class TestRunLock:
         assert len(broken) == 1
         assert "missing/unparseable" in broken[0]["reason"]
         assert not lock_dir.exists()
+
+    def test_losing_the_steal_race_reacquires_from_scratch(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1-5: two racers must not both acquire a lock they each judge stale.
+
+        The old implementation stole a stale lock via a non-atomic
+        ``rmtree`` then ``mkdir``, so two racers could both observe the
+        lock gone and both believe they had acquired it. The rewrite
+        reuses ``plan_progress``'s atomic-rename-to-a-uuid-suffixed-target
+        steal, mirroring ``dispatcher._acquire_dispatch_lock``'s own
+        race-safety test. Here we simulate a peer winning the SAME steal
+        race: this frame's ``Path.rename`` is intercepted so that, on its
+        first call against the literature lock dir, a peer moves the
+        stale lock dir aside itself and publishes a fresh, live lock
+        before this frame's rename lands. Our rename must then observe
+        ``FileNotFoundError`` and loop back to re-evaluate from scratch,
+        seeing the peer's fresh lock as live and refusing with
+        ``LiteratureRunLockedError`` instead of also believing it holds
+        the lease.
+        """
+        lock_dir = campaign.workspace_root / EVIDENCE_LITERATURE_DIR / RUN_LOCK_DIR_NAME
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "info.json").write_text(
+            json.dumps(
+                {
+                    "pid": 2**22 - 1,  # extremely unlikely to be alive: looks stale
+                    "hostname": socket.gethostname(),
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "pid_start": 0,
+                }
+            )
+        )
+
+        original_rename = Path.rename
+        state = {"intercepted": False}
+
+        def racy_rename(self_path: Path, target: Path, *args: object, **kwargs: object) -> object:
+            if self_path == lock_dir and not state["intercepted"]:
+                state["intercepted"] = True
+                # A peer wins the steal race first: it moves the same stale
+                # lock dir aside under its OWN process-unique name and
+                # immediately publishes a fresh, live lock in its place —
+                # all before our rename call (below) can land.
+                peer_target = lock_dir.with_name(f"{lock_dir.name}.stale.peer")
+                original_rename(self_path, peer_target)
+                lock_dir.mkdir()
+                publish_lock_info(lock_dir)
+                shutil.rmtree(peer_target, ignore_errors=True)
+                raise FileNotFoundError("lock dir already moved by a peer")
+            return original_rename(self_path, target, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "rename", racy_rename)
+
+        deps, model, config = _make_deps([_proposal()])
+        with pytest.raises(LiteratureRunLockedError):
+            run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+        assert model.calls == []
+        # Exactly one lock dir exists afterwards (the peer's) — no stray
+        # renamed-aside directory left over from either racer.
+        assert lock_dir.exists()
+        assert not lock_dir.with_name(f"{lock_dir.name}.stale.peer").exists()
+        leftovers = list((campaign.workspace_root / EVIDENCE_LITERATURE_DIR).glob(f"{lock_dir.name}.stale.*"))
+        assert leftovers == []
+
+    def test_live_pid_with_mismatched_pid_start_is_reused_pid_and_broken(self, campaign: Campaign) -> None:
+        """P1-6: a lock recorded against a live pid whose ``pid_start`` differs
+        from the process currently holding that pid is a stale lock from a
+        crashed/recycled holder, not a live one, and must be breakable.
+
+        The old hand-rolled ``info.json`` never recorded ``pid_start`` at
+        all, so this guard was permanently disabled: any lock whose pid
+        happened to be reused by an unrelated process would look live
+        forever and wedge the workspace. We use this very test process's
+        own (guaranteed-alive) pid but an impossible ``pid_start`` so the
+        real ``/proc/<pid>/stat`` start time can never match it.
+        """
+        lock_dir = campaign.workspace_root / EVIDENCE_LITERATURE_DIR / RUN_LOCK_DIR_NAME
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "info.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "hostname": socket.gethostname(),
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "pid_start": -1,  # cannot match the real /proc/<pid>/stat start time
+                    "action_id": "crashed",
+                }
+            )
+        )
+        deps, _, config = _make_deps([_proposal()])
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.stop_reason == StopReason.SELF_TERMINATED
+        events = read_events(campaign.workspace_root / "decision_log.jsonl")
+        broken = [e for e in events if e["event"] == "literature.lock_broken"]
+        assert len(broken) == 1
+        assert "reused" in broken[0]["reason"]
+        assert not lock_dir.exists()
+
+    def test_release_does_not_delete_a_successors_lock(self, campaign: Campaign) -> None:
+        """P1-7: releasing a lease this frame no longer actually owns (because
+        it was stolen out from under it) must NOT delete the successor's live
+        lock.
+
+        The old implementation released via an unconditional
+        ``shutil.rmtree(lock_dir, ignore_errors=True)`` with no ownership
+        check at all, so a frame that woke up after its lock had been
+        stolen as stale (e.g. after a long GC pause or a slow unwind of an
+        unrelated exception) could delete a successor's in-progress lock.
+        The new lease records the pid/pid_start it observed at acquire
+        time and only removes the lock dir if those still match at
+        release time.
+        """
+        lock_dir = campaign.workspace_root / EVIDENCE_LITERATURE_DIR / RUN_LOCK_DIR_NAME
+        log_path = campaign.workspace_root / "decision_log.jsonl"
+        lease = literature_module._acquire_run_lock(
+            campaign.workspace_root,
+            action_id="a",
+            run_id="r1",
+            stale_after_s=1.0,
+            log_path=log_path,
+        )
+        assert lease.lock_dir == lock_dir
+
+        # Simulate a successor having stolen this (now-stale) lock: the
+        # original holder's lease token no longer describes what is on disk.
+        # A different pid/pid_start than this test process's own (which the
+        # lease captured at acquire time) stands in for a genuinely different
+        # holder -- a real successor would never share our pid.
+        shutil.rmtree(lock_dir, ignore_errors=True)
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "info.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "hostname": socket.gethostname(),
+                    "started_at": datetime.now(UTC).isoformat(),
+                    "pid_start": -1,
+                    "action_id": "successor",
+                }
+            )
+        )
+
+        lease.release()
+
+        assert lock_dir.exists()
+        info = json.loads((lock_dir / "info.json").read_text(encoding="utf-8"))
+        assert info["action_id"] == "successor"
+
+
+class _FailingAfterNSearchTool:
+    """A search backend that succeeds ``n_ok`` times, then raises ``SearchError``.
+
+    Simulates a transport failure (503, DNS blip, timeout) arriving mid-run: earlier,
+    already-completed rounds must still make it into the final report (P1-12).
+    """
+
+    def __init__(self, n_ok: int, results: dict[str, list[SearchResult]] | None = None) -> None:
+        self._remaining_ok = n_ok
+        self._results = results or {}
+        self.calls = 0
+
+    def search(self, query: str, *, limit: int = 10) -> list[SearchResult]:
+        self.calls += 1
+        if self._remaining_ok <= 0:
+            raise SearchError("simulated transport failure (503)")
+        self._remaining_ok -= 1
+        return self._results.get(query, [])[:limit]
+
+
+class TestSearchTransportFailure:
+    """P1-12: ``HttpSearchTool``/``budgeted_get_json`` used to let a bare transport
+    exception propagate straight out of ``HttpSearchTool.search``, past every handler in
+    ``run_literature_research`` -- crashing the whole run and discarding every finding
+    already paid for in earlier rounds. A search failure must instead surface as a typed
+    ``SearchError``, caught alongside ``BudgetExceededError``/``AgentBridgeError``, so the
+    run stops with ``StopReason.ERROR`` and still reports whatever prior rounds produced.
+    """
+
+    def test_earlier_rounds_findings_survive_a_later_search_failure(self, campaign: Campaign) -> None:
+        # Round 1: search succeeds, a finding is proposed and processed (verified via the
+        # single queued VerifierAssessment). ``done=False`` so the loop proceeds to round 2
+        # -- proving this is about SURVIVING a later failure, not merely returning early.
+        # Round 2: the literature agent proposes another query, but the search backend
+        # itself has now failed; this must happen strictly BEFORE round 2's (nonexistent)
+        # findings would be processed, per ``_research_loop``'s query-then-findings order.
+        deps, model, config = _make_deps(
+            [
+                _proposal(findings=[_finding_dict()], queries=["q1"], done=False),
+                _proposal(findings=[], queries=["q2"], done=False),
+                _assessment(),
+            ],
+        )
+        deps.search = _FailingAfterNSearchTool(n_ok=1)
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.search.calls == 2, "the fake was not called for both rounds"
+        assert report.stop_reason == StopReason.ERROR
+        assert len(report.findings) == 1, "round 1's finding must survive round 2's search failure"
+        assert any("search failed" in warning for warning in report.warnings)
+        assert "q1" in report.queries
 
 
 class TestCredencePenalties:

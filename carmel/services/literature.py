@@ -60,6 +60,7 @@ from carmel.agents.tools.fetch import (
 from carmel.agents.tools.search import (
     HttpSearchTool,
     MockSearchTool,
+    SearchError,
     SearchResult,
     SearchToolProtocol,
 )
@@ -91,8 +92,15 @@ from carmel.services import chem
 from carmel.services.acquisition import collect_inbox, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
-from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
+from carmel.services.evidence import store_artifact
 from carmel.services.grounding import find_quote, ground_finding
+from carmel.services.plan_progress import (
+    DEFAULT_LOCK_GRACE_S,
+    LITERATURE_RUN_LOCK_DIR,
+    lock_is_live,
+    publish_lock_info,
+    read_lock_info,
+)
 from carmel.services.provenance import record_agent_provenance
 
 logger = get_logger("services.literature")
@@ -117,8 +125,11 @@ SEARCH_RESULTS_PER_QUERY = 5
 
 #: Grace period during which a run-lock directory with missing/unparseable
 #: ``info.json`` is still treated as LIVE -- a peer may be between ``mkdir()`` and
-#: its metadata write. Mirrors ``carmel.services.plan_progress.DEFAULT_LOCK_GRACE_S``.
-LOCK_GRACE_S = 30.0
+#: its metadata write. Kept as an alias so existing callers/tests do not need to
+#: import two names for the same constant; the actual liveness decision is made
+#: exclusively by :func:`carmel.services.plan_progress.lock_is_live`, which takes
+#: this same default.
+LOCK_GRACE_S = DEFAULT_LOCK_GRACE_S
 
 #: Stop reasons that mean "a budget ceiling ended the run".
 _BUDGET_STOP_REASONS = frozenset(STOP_REASON_FOR_DIMENSION.values())
@@ -265,7 +276,11 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
         model=build_model(config),
         verifier_model=build_model(config),
         search=search,
-        fetch=HttpFetchTool(ledger=ledger, max_artifact_bytes=config.budget.max_artifact_bytes),
+        fetch=HttpFetchTool(
+            ledger=ledger,
+            max_artifact_bytes=config.budget.max_artifact_bytes,
+            external_provider_consent=config.external_provider_consent,
+        ),
         ledger=ledger,
     )
 
@@ -289,9 +304,17 @@ def _build_search_tool(config: AgentConfig, ledger: BudgetLedger) -> SearchToolP
             key env var name, or with that env var unset/empty.
     """
     if config.search_provider == SearchProvider.OPENALEX:
-        return OpenAlexSearchTool(ledger=ledger, contact_email=config.search_contact_email)
+        return OpenAlexSearchTool(
+            ledger=ledger,
+            contact_email=config.search_contact_email,
+            external_provider_consent=config.external_provider_consent,
+        )
     if config.search_provider == SearchProvider.CROSSREF:
-        return CrossrefSearchTool(ledger=ledger, contact_email=config.search_contact_email)
+        return CrossrefSearchTool(
+            ledger=ledger,
+            contact_email=config.search_contact_email,
+            external_provider_consent=config.external_provider_consent,
+        )
     if config.search_provider in KEYLESS_SEARCH_PROVIDERS:  # pragma: no cover - defensive
         raise AgentBridgeError(
             f"search provider {config.search_provider!r} is declared keyless but has no "
@@ -307,47 +330,59 @@ def _build_search_tool(config: AgentConfig, ledger: BudgetLedger) -> SearchToolP
     api_key = os.environ.get(env_var, "")
     if not api_key:
         raise AgentBridgeError(f"environment variable {env_var!r} (search_api_key_env) is not set or empty")
-    return HttpSearchTool(endpoint=config.search_endpoint, api_key=api_key, ledger=ledger)
+    return HttpSearchTool(
+        endpoint=config.search_endpoint,
+        api_key=api_key,
+        ledger=ledger,
+        external_provider_consent=config.external_provider_consent,
+    )
 
 
 # --------------------------- run lock -----------------------------------------
+#
+# This used to be a 131-line hand-rolled mkdir lock with no literature-specific
+# content at all -- and it got all three hard parts of a breakable mkdir lock
+# wrong relative to the lock `carmel.services.dispatcher` implements for the
+# structurally identical `.dispatch.lock` (both are leases that outlive a short
+# critical section, guarded by pid+pid_start liveness, breakable when stale):
+#
+#   - stealing a stale lock via `rmtree` then `mkdir` is NOT atomic: two racers
+#     that both judge the lock stale can both `rmtree` + `mkdir` and both
+#     believe they hold it, because each racer's `rmtree` unconditionally
+#     removes whatever is there -- including a peer's brand-new live lock.
+#   - hand-writing `info.json` with `write_text` (no `pid_start`) leaves the
+#     pid-reuse guard in `plan_progress.lock_is_live` permanently dead for this
+#     lock: a crash whose pid later gets reused makes the lock unbreakable.
+#   - releasing via a bare, unconditional `rmtree(lock_dir)` deletes whatever is
+#     at that path when this frame returns, including a SUCCESSOR's live lock if
+#     this frame's own lock was ever broken as stale (e.g. cross-host, or via
+#     the missing-pid_start bug above).
+#
+# `plan_progress` already solves all three (atomic rename-to-a-uuid-suffixed
+# stale target, publish_lock_info with pid_start, and -- via the pattern this
+# module mirrors from `dispatcher._DispatchLease` -- an ownership-checked
+# release). The steal/acquire loop below deliberately mirrors
+# `dispatcher._acquire_dispatch_lock` rather than reusing it directly: that
+# function and its `_DispatchLease` companion are private to `dispatcher.py`
+# (owned by a different part of this change), so the acquire/steal/release
+# *loop* is necessarily written twice for now. What is NOT duplicated is the
+# actual liveness/staleness JUDGMENT (`lock_is_live`) or the metadata
+# read/write (`read_lock_info`/`publish_lock_info`) -- those are the shared,
+# previously-buggy parts, and both call sites now defer to the same
+# `plan_progress` implementation. The right long-term fix is to lift the
+# lease type itself (acquire loop + ownership-checked release) into
+# `plan_progress` so neither module carries its own copy of the loop; that is
+# a cross-cutting change outside this module's ownership boundary and is
+# flagged in the review response rather than done here.
 
 
-def _read_lock_info(lock_dir: Path) -> dict[str, Any]:
-    """Best-effort read of the lock's ``info.json``; empty dict when unreadable."""
-    try:
-        parsed = json.loads((lock_dir / LOCK_INFO_NAME).read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+def _describe_stale_reason(lock_dir: Path, info: dict[str, Any], *, stale_after_s: float) -> str:
+    """Human-readable explanation for a lock ``lock_is_live`` already judged not-live.
 
-
-def _lock_dir_age_s(lock_dir: Path) -> float:
-    """Seconds since the lock directory's mtime; +inf when it vanished."""
-    try:
-        mtime = lock_dir.stat().st_mtime
-    except OSError:
-        return float("inf")
-    return max(0.0, datetime.now(UTC).timestamp() - mtime)
-
-
-def _lock_is_stale(
-    lock_dir: Path, info: dict[str, Any], *, stale_after_s: float, lock_grace_s: float = LOCK_GRACE_S
-) -> tuple[bool, str]:
-    """Decide whether an existing lock may be broken.
-
-    A lock is stale when (a) it was taken on THIS host and its pid is dead, (b) it is
-    older than ``stale_after_s``, or (c) its ``info.json`` is missing/unparseable AND
-    the lock directory itself is older than ``lock_grace_s``. A lock whose pid is
-    verifiably ALIVE on this host is NEVER stale, regardless of age.
-
-    Case (c) matters because ``mkdir()`` (claiming the lock) and the ``info.json``
-    write (publishing who holds it) are two separate steps: a crash in between used
-    to leave a lock directory with no metadata that was PERMANENTLY non-stale, since
-    neither the pid branch nor the ``started_at`` branch had anything to check
-    (Finding 4) -- only ``rm -rf`` could recover. Within ``lock_grace_s`` of the lock
-    dir's own mtime, missing metadata still fails CLOSED (not stale), since a peer may
-    simply be mid-publication; only past the grace period is it treated as abandoned.
+    Purely descriptive, for the ``literature.lock_broken`` decision-log event --
+    the stale/live DECISION itself is made exclusively by
+    :func:`carmel.services.plan_progress.lock_is_live` before this is ever
+    called, so there is only one place that judgment can be gotten wrong.
     """
     pid = info.get("pid")
     hostname = info.get("hostname")
@@ -355,32 +390,63 @@ def _lock_is_stale(
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
-            return True, f"pid {pid} on this host is dead"
-        except PermissionError:
-            return False, ""  # pid exists (owned by another user): live lock.
+            return f"pid {pid} on this host is dead"
         else:
-            return False, ""  # live pid on this host: never break.
+            # Alive but judged not-live: `lock_is_live` only reaches this state
+            # for a live pid when the recorded `pid_start` no longer matches --
+            # i.e. the pid number was reused after the original holder died.
+            return f"pid {pid} on this host was reused since the lock was taken (original holder is dead)"
 
-    started_at: datetime | None = None
     started_at_raw = info.get("started_at")
     if isinstance(started_at_raw, str):
         try:
             started_at = datetime.fromisoformat(started_at_raw)
         except ValueError:
-            started_at = None
-    if started_at is not None:
-        age_s = (datetime.now(UTC) - started_at).total_seconds()
-        if age_s > stale_after_s:
-            return True, f"lock is {age_s:.0f}s old (> stale_after_s={stale_after_s:.0f}s)"
-        return False, ""
+            pass  # Unparseable: fall through to the mtime-based explanation below.
+        else:
+            # `publish_lock_info` writes an aware timestamp, but this value comes off
+            # disk and may have been written by an older Carmel, hand-edited, or
+            # truncated. Subtracting a naive datetime from an aware one raises
+            # TypeError, which here would escape as an unhandled crash from a function
+            # whose whole job is to EXPLAIN a lock -- so normalize instead of trusting.
+            if started_at.tzinfo is None:
+                started_at = started_at.replace(tzinfo=UTC)
+            age_s = (datetime.now(UTC) - started_at).total_seconds()
+            return f"lock is {age_s:.0f}s old (> stale_after_s={stale_after_s:.0f}s)"
 
-    lock_age_s = _lock_dir_age_s(lock_dir)
-    if lock_age_s > lock_grace_s:
-        return True, (
-            f"lock metadata missing/unparseable and lock dir is {lock_age_s:.0f}s old "
-            f"(> lock_grace_s={lock_grace_s:.0f}s)"
-        )
-    return False, ""
+    if lock_dir.exists():
+        lock_age_s = max(0.0, datetime.now(UTC).timestamp() - lock_dir.stat().st_mtime)
+    else:
+        lock_age_s = float("inf")
+    return (
+        f"lock metadata missing/unparseable and lock dir is {lock_age_s:.0f}s old "
+        f"(> lock_grace_s={DEFAULT_LOCK_GRACE_S:.0f}s)"
+    )
+
+
+class _LiteratureLockLease:
+    """Ownership token for a held literature run lock (P1-7).
+
+    Carries the pid + ``/proc`` start time this frame itself published, so
+    :meth:`release` can refuse to remove a lock dir whose ``info.json`` no
+    longer names this process -- mirroring
+    ``carmel.services.dispatcher._DispatchLease`` exactly, for the same
+    reason: a frame whose lock was broken as stale (by a peer, cross-host, or
+    formerly via the missing-``pid_start`` bug) must never delete its
+    SUCCESSOR's live lock just because it still holds the bare ``Path``.
+    """
+
+    def __init__(self, lock_dir: Path) -> None:
+        self.lock_dir = lock_dir
+        info = read_lock_info(lock_dir)
+        self._pid = info.get("pid")
+        self._pid_start = info.get("pid_start")
+
+    def release(self) -> None:
+        """Remove the lock dir iff its ``info.json`` still names THIS process."""
+        info = read_lock_info(self.lock_dir)
+        if info.get("pid") == self._pid and info.get("pid_start") == self._pid_start:
+            shutil.rmtree(self.lock_dir, ignore_errors=True)
 
 
 def _acquire_run_lock(
@@ -390,57 +456,66 @@ def _acquire_run_lock(
     run_id: str,
     stale_after_s: float,
     log_path: Path,
-) -> Path:
-    """Atomically acquire ``evidence/literature/.run.lock``.
+) -> _LiteratureLockLease:
+    """Atomically acquire ``evidence/literature/.run.lock`` as a lease.
+
+    Stealing a stale lock is an ATOMIC RENAME to a process-unique
+    ``.stale.<uuid>`` path, never ``rmtree`` + ``mkdir`` (P1-5): renaming a
+    given inode can only ever succeed for exactly one racer, so a peer that
+    already renamed (or replaced) this same stale lock makes our rename raise
+    ``FileNotFoundError`` -- which MUST be treated as losing the race, looping
+    back to re-evaluate the lock from scratch, rather than assuming we
+    performed the steal.
 
     Raises:
         LiteratureRunLockedError: If a live (non-stale) lock is already held.
     """
-    lock_dir = workspace_root / EVIDENCE_LITERATURE_DIR / RUN_LOCK_DIR_NAME
+    lock_dir = workspace_root / LITERATURE_RUN_LOCK_DIR
     lock_dir.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        lock_dir.mkdir()
-    except FileExistsError:
-        info = _read_lock_info(lock_dir)
-        stale, reason = _lock_is_stale(lock_dir, info, stale_after_s=stale_after_s)
-        if not stale:
-            raise LiteratureRunLockedError(
-                f"a literature run already holds {lock_dir} (pid={info.get('pid')}, hostname={info.get('hostname')})"
-            ) from None
-        logger.warning("breaking stale literature run lock %s: %s", lock_dir, reason)
-        append_typed_event(
-            log_path,
-            event="literature.lock_broken",
-            action_id=action_id,
-            run_id=run_id,
-            payload={
-                "level": "warning",
-                "reason": reason,
-                "lock_pid": info.get("pid"),
-                "lock_hostname": info.get("hostname"),
-                "lock_started_at": info.get("started_at"),
-            },
-        )
-        shutil.rmtree(lock_dir, ignore_errors=True)
+    while True:
         try:
             lock_dir.mkdir()
         except FileExistsError:
-            raise LiteratureRunLockedError(
-                f"lost the race re-acquiring {lock_dir} after breaking a stale lock"
-            ) from None
-
-    (lock_dir / LOCK_INFO_NAME).write_text(
-        json.dumps(
-            {
-                "pid": os.getpid(),
-                "hostname": socket.gethostname(),
-                "started_at": datetime.now(UTC).isoformat(),
-                "action_id": action_id,
-            }
-        ),
-        encoding="utf-8",
-    )
-    return lock_dir
+            if lock_is_live(lock_dir, stale_after_s=stale_after_s):
+                info = read_lock_info(lock_dir)
+                raise LiteratureRunLockedError(
+                    f"a literature run already holds {lock_dir} "
+                    f"(pid={info.get('pid')}, hostname={info.get('hostname')})"
+                ) from None
+            info = read_lock_info(lock_dir)
+            reason = _describe_stale_reason(lock_dir, info, stale_after_s=stale_after_s)
+            stale_target = lock_dir.with_name(f"{lock_dir.name}.stale.{uuid.uuid4().hex}")
+            try:
+                lock_dir.rename(stale_target)
+            except FileNotFoundError:
+                # Lost the steal race: a peer already renamed this exact stale lock
+                # away (or has since replaced it with a fresh one) between our
+                # liveness check and this rename landing. We broke nothing and own
+                # nothing -- retry from the top instead of proceeding as if we
+                # performed the steal (P1-5).
+                continue
+            logger.warning("breaking stale literature run lock %s: %s", lock_dir, reason)
+            append_typed_event(
+                log_path,
+                event="literature.lock_broken",
+                action_id=action_id,
+                run_id=run_id,
+                payload={
+                    "level": "warning",
+                    "reason": reason,
+                    "lock_pid": info.get("pid"),
+                    "lock_hostname": info.get("hostname"),
+                    "lock_started_at": info.get("started_at"),
+                },
+            )
+            # The rename gave this frame exclusive ownership of the renamed-aside
+            # inode (no other racer can have a reference to it), so removing it
+            # here is race-free.
+            shutil.rmtree(stale_target, ignore_errors=True)
+            continue
+        else:
+            publish_lock_info(lock_dir, extra={"action_id": action_id})
+            return _LiteratureLockLease(lock_dir)
 
 
 # --------------------------- helpers ------------------------------------------
@@ -762,6 +837,13 @@ def _maybe_queue_acquisition(
     invented a quote" into "we are waiting on a human", quietly retiring the strongest
     rejection the system can produce -- so ``QUOTE_NOT_FOUND`` deliberately falls
     through to a plain rejection here and is never given a second chance.
+
+    ``ARTIFACT_DEGRADED`` is a THIRD case and is queued for neither. It means the stored
+    bytes are fine but their ``extracted.json`` sidecar is missing, so the gate refused
+    to judge against an unlabelled reload. Asking a human to obtain a paper Carmel
+    already holds would be nonsense; the remedy is mechanical re-extraction. Since a
+    bare rejection in the decision log reads like a verdict on the CLAIM rather than on
+    our storage, it is surfaced as a run warning naming the real remedy.
     """
     url = proposed.source_url
     failure = state.fetch_failures.get(url)
@@ -771,6 +853,13 @@ def _maybe_queue_acquisition(
     elif verdict.status == GroundingStatus.ARTIFACT_UNREADABLE:
         acquisition_reason = AcquisitionReason.UNREADABLE
         detail = "; ".join(verdict.reasons)
+    elif verdict.status == GroundingStatus.ARTIFACT_DEGRADED:
+        state.warnings.append(
+            f"finding for {proposed.citation.title!r} was rejected because its stored artifact "
+            f"has no extraction sidecar, not because the claim failed: re-extract the artifact "
+            f"and re-run to get a real verdict"
+        )
+        return
     else:
         return
 
@@ -1027,7 +1116,7 @@ def run_literature_research(
     created_at = datetime.now(UTC)
     log_path = workspace_root / "decision_log.jsonl"
 
-    lock_dir = _acquire_run_lock(
+    lease = _acquire_run_lock(
         workspace_root,
         action_id=action.action_id,
         run_id=run_id,
@@ -1069,6 +1158,17 @@ def run_literature_research(
             state.stop_reason = StopReason.ERROR
             state.warnings.append(f"agent error: {exc}")
             logger.warning("literature run %s stopped on agent error: %s", run_id, exc)
+        except SearchError as exc:
+            # P1-12: a search backend transport failure (503, DNS blip, timeout)
+            # describes this one round's queries, not the campaign -- everything
+            # ``state`` already accumulated in EARLIER completed rounds (findings,
+            # artifacts, queries, acquisitions) is real, paid-for work and must still
+            # be reported. Mirrors the ``AgentBridgeError`` handling immediately
+            # above: stop the run with a typed reason rather than losing the whole
+            # report to an exception that used to propagate past every handler here.
+            state.stop_reason = StopReason.ERROR
+            state.warnings.append(f"search failed: {exc}")
+            logger.warning("literature run %s stopped on search error: %s", run_id, exc)
         finally:
             if slot_acquired:
                 session_budget().release_run_slot()
@@ -1128,7 +1228,10 @@ def run_literature_research(
         )
         return report
     finally:
-        shutil.rmtree(lock_dir, ignore_errors=True)
+        # Ownership-checked release (P1-7): only removes the lock dir if it still
+        # names THIS process's pid/pid_start, never a successor's lock this frame
+        # does not actually hold.
+        lease.release()
 
 
 def run_record_for(report: LiteratureReport, action: PlannedAction) -> RunRecord:
