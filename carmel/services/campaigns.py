@@ -32,12 +32,22 @@ CAMPAIGN_FILE_NAME = "campaign.yaml"
 
 _log = get_logger("services.campaigns")
 
+#: Bound on how long :func:`start_literature_at_creation` will synchronously wait for
+#: the dispatched literature run before giving up on waiting (the run itself is NOT
+#: cancelled -- see the ``TimeoutError`` handling there). Generous but finite: a
+#: provider hang must not be able to wedge a caller that asked for a synchronous
+#: result forever. Callers that must never block at all (the HTTP API) pass ``None``
+#: instead, which skips waiting entirely rather than waiting up to this bound.
+DEFAULT_LITERATURE_WAIT_TIMEOUT_S = 3600.0
+
 
 def create_campaign(
     workspace_root: Path,
     campaign_input: CampaignInput,
     approval_policy: ApprovalPolicy | None = None,
     agent_config: AgentConfig | None = None,
+    *,
+    literature_wait_timeout_s: float | None = DEFAULT_LITERATURE_WAIT_TIMEOUT_S,
 ) -> Campaign:
     """Create a new campaign workspace and write canonical artifacts.
 
@@ -49,6 +59,13 @@ def create_campaign(
             literature auto-run (spar round 3, P1-12) — creating a campaign
             must never incur network traffic or spend as a side effect of a
             missing config.
+        literature_wait_timeout_s: How long the auto-started literature run (if
+            any) is allowed to block this call. The default is a bounded wait
+            (see :data:`DEFAULT_LITERATURE_WAIT_TIMEOUT_S`) rather than an
+            unbounded one — a request-serving caller (the HTTP API) MUST pass
+            ``None`` here to dispatch the run and return immediately instead
+            of tying up a request worker until a provider call finishes or
+            times out.
 
     Returns:
         The created Campaign.
@@ -92,7 +109,7 @@ def create_campaign(
     )
     _log.info("Created campaign %s in %s", campaign_id, workspace_root)
 
-    maybe_start_literature_at_creation(workspace_root, campaign, agent_config)
+    maybe_start_literature_at_creation(workspace_root, campaign, agent_config, wait_timeout_s=literature_wait_timeout_s)
     return campaign
 
 
@@ -142,7 +159,7 @@ LITERATURE_SKIP_EXPLANATIONS: dict[LiteratureStartSkipped, str] = {
 
 @dataclass(frozen=True)
 class LiteratureStartOutcome:
-    """Either a completed literature action, or a NAMED reason there wasn't one."""
+    """Either a completed literature action, a still-running one, or a NAMED reason there wasn't one."""
 
     result: ActionResult | None = None
     skip_reason: LiteratureStartSkipped | None = None
@@ -153,13 +170,24 @@ class LiteratureStartOutcome:
     code checked, rather than the most likely story. Naming a plausible cause as though
     it were the observed one is the exact habit this whole change exists to remove.
     """
+    dispatched_action_id: str | None = None
+    """Set when the literature action was dispatched but this call did not wait for it
+    to finish (either the caller asked not to wait at all, or the bounded wait it asked
+    for elapsed first). Distinct from ``skip_reason``: nothing was skipped here -- the
+    run is genuinely in flight, and a caller can poll campaign state to observe it.
+    """
+    dispatched_attempt_id: str | None = None
+    """The dispatcher's attempt id for ``dispatched_action_id``, when set."""
 
     def explain(self) -> str:
-        """Return an operator-facing sentence for a skipped start."""
-        if self.skip_reason is None:
-            return "the literature action ran"
-        explanation = LITERATURE_SKIP_EXPLANATIONS[self.skip_reason]
-        return f"{explanation} [{self.detail}]" if self.detail else explanation
+        """Return an operator-facing sentence for a skipped or still-running start."""
+        if self.skip_reason is not None:
+            explanation = LITERATURE_SKIP_EXPLANATIONS[self.skip_reason]
+            return f"{explanation} [{self.detail}]" if self.detail else explanation
+        if self.dispatched_action_id is not None:
+            base = f"literature action {self.dispatched_action_id} was dispatched but not waited for"
+            return f"{base} ({self.detail})" if self.detail else base
+        return "the literature action ran"
 
 
 def maybe_start_literature_at_creation(
@@ -167,6 +195,8 @@ def maybe_start_literature_at_creation(
     campaign: Campaign,
     config: AgentConfig | None,
     deps: LiteratureDeps | None = None,
+    *,
+    wait_timeout_s: float | None = DEFAULT_LITERATURE_WAIT_TIMEOUT_S,
 ) -> ActionResult | None:
     """Run the literature-at-creation step, returning only its ActionResult.
 
@@ -179,11 +209,16 @@ def maybe_start_literature_at_creation(
         campaign: The campaign to run literature for.
         config: The agentic-layer configuration, or None for no auto-run.
         deps: Optional injected literature dependencies (tests).
+        wait_timeout_s: See :func:`start_literature_at_creation`. Note that when the
+            run is dispatched but not waited for (``None``, or a bounded wait that
+            elapsed), this wrapper's ``None`` return is indistinguishable from every
+            other "nothing to report" case -- callers that need to tell those apart
+            must call :func:`start_literature_at_creation` directly.
 
     Returns:
         The dispatcher's ActionResult for the literature action, or None.
     """
-    return start_literature_at_creation(workspace_root, campaign, config, deps).result
+    return start_literature_at_creation(workspace_root, campaign, config, deps, wait_timeout_s=wait_timeout_s).result
 
 
 def start_literature_at_creation(
@@ -191,6 +226,8 @@ def start_literature_at_creation(
     campaign: Campaign,
     config: AgentConfig | None,
     deps: LiteratureDeps | None = None,
+    *,
+    wait_timeout_s: float | None = DEFAULT_LITERATURE_WAIT_TIMEOUT_S,
 ) -> LiteratureStartOutcome:
     """Single owner of the literature-at-creation auto-run.
 
@@ -207,7 +244,7 @@ def start_literature_at_creation(
       legally start, or the next plan action is not a literature search.
 
     Otherwise it advances the campaign to ``APPROVED_FOR_EXECUTION``,
-    generates and saves a ``[LITERATURE_SEARCH, T3_RUN]`` plan, and runs
+    generates and saves a ``[LITERATURE_SEARCH, T3_RUN]`` plan, and dispatches
     exactly the literature action through the dispatcher.
 
     Args:
@@ -215,10 +252,21 @@ def start_literature_at_creation(
         campaign: The campaign to run literature for.
         config: The agentic-layer configuration, or None for no auto-run.
         deps: Optional injected literature dependencies (tests).
+        wait_timeout_s: How long to synchronously wait for the dispatched run.
+            ``None`` means do not wait at all -- dispatch and return immediately,
+            reporting a ``dispatched_action_id`` (the HTTP path: a request handler
+            must not block on a background provider call). A numeric value waits up
+            to that many seconds and, on timeout, reports the same "dispatched, not
+            waited for" outcome rather than raising -- the run keeps going in the
+            background either way; only this call's patience differs. Defaults to
+            :data:`DEFAULT_LITERATURE_WAIT_TIMEOUT_S`, a bounded (not unbounded) wait,
+            so the CLI's direct call (``Carmel.py``'s ``carmel literature``) cannot
+            hang forever on a wedged provider without any caller-side change.
 
     Returns:
-        A :class:`LiteratureStartOutcome` carrying either the dispatcher's ActionResult
-        or a named :class:`LiteratureStartSkipped` reason -- never an unexplained None.
+        A :class:`LiteratureStartOutcome` carrying either the dispatcher's ActionResult,
+        a still-running dispatch, or a named :class:`LiteratureStartSkipped` reason --
+        never an unexplained None.
     """
     if config is None or not config.literature_at_campaign_start:
         return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.DISABLED_IN_CONFIG)
@@ -276,10 +324,28 @@ def start_literature_at_creation(
     ticket = execute_next_action(workspace_root, campaign, handlers=handlers)
     if ticket is None:
         return LiteratureStartOutcome(skip_reason=LiteratureStartSkipped.NO_ACTION_DISPATCHED)
-    # The dispatcher starts the action on a background thread; this hook is a
-    # synchronous convenience for campaign creation and the CLI, so wait for
-    # the run to finish and return its persisted result.
-    return LiteratureStartOutcome(result=ticket.wait())
+
+    if wait_timeout_s is None:
+        # HTTP path: the dispatcher already runs the action on its own background
+        # thread (see DispatchTicket); a request handler must not block on it too,
+        # or a slow/hanging provider call ties up a request worker indefinitely.
+        # Report that the run was dispatched -- the caller polls campaign state for
+        # progress instead of getting a synchronous result here.
+        return LiteratureStartOutcome(dispatched_action_id=ticket.action_id, dispatched_attempt_id=ticket.attempt_id)
+    try:
+        return LiteratureStartOutcome(result=ticket.wait(timeout=wait_timeout_s))
+    except TimeoutError:
+        # The run is NOT abandoned -- only this call's patience ran out (no
+        # cancellation exists here, or is warranted: the dispatcher's thread keeps
+        # going and will still persist its result to the workspace). Report the
+        # same "dispatched, not waited for" outcome as the no-wait branch above
+        # rather than letting the timeout escape as a bare exception to a caller
+        # that only asked for a bounded wait, not a guarantee of completion.
+        return LiteratureStartOutcome(
+            dispatched_action_id=ticket.action_id,
+            dispatched_attempt_id=ticket.attempt_id,
+            detail=f"did not finish within {wait_timeout_s:.0f}s; still running in the background",
+        )
 
 
 def load_campaign(workspace_root: Path) -> Campaign:
