@@ -31,7 +31,11 @@ def rdkit_available() -> bool:
         True if ``rdkit`` can be imported, False otherwise.
     """
     try:
-        import rdkit  # noqa: F401  # type: ignore[import-not-found]
+        # No `# type: ignore` here: mypy only honours that comment when it is the FIRST
+        # comment on the line, so the `# noqa` that has to precede it would silently
+        # neutralise it anyway. None is needed -- `make typecheck` requires the `agents`
+        # extra (see docs/development.md), and rdkit resolves in that environment.
+        import rdkit  # noqa: F401
     except ImportError:
         return False
     return True
