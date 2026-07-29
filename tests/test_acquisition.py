@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from carmel.agents.tools.extract import ExtractedText, normalize_for_match
 from carmel.schemas.acquisition import (
@@ -151,6 +152,21 @@ class TestCheckIdentity:
         ok, _ = check_identity(_extracted(text), _request())
         assert ok is False
 
+    def test_an_erratum_with_its_own_doi_is_still_rejected_on_the_title_only_branch(self) -> None:
+        """The marker check must fire on the title-only fallback too, not only when the
+        requested DOI is found. An erratum has its OWN DOI, different from the original
+        paper's -- so if a human drops the erratum instead of the original, the
+        requested DOI is simply absent from the text. That sends this straight to the
+        title-only branch, and the erratum reprints the original's full title by
+        construction, so the title-only ratio passes. Before the fix, that branch never
+        consulted the marker check at all, so this exact substitution was admitted."""
+        erratum_doi = "10.1016/j.combustflame.2020.09.001"
+        assert erratum_doi != DOI
+        text = f"Erratum to: {TITLE}\nDOI: {erratum_doi}\nThe authors regret an error in Table 2."
+        ok, note = check_identity(_extracted(text), _request())
+        assert ok is False
+        assert "erratum" in note
+
 
 class TestRecordRequest:
     def test_request_is_persisted_with_operator_instructions(self, tmp_path: Path) -> None:
@@ -262,6 +278,24 @@ class TestCollectInbox:
         assert changed[0].status == AcquisitionStatus.REJECTED
         assert "over the" in changed[0].identity_note
 
+    def test_an_oversized_drop_is_rejected_via_stat_without_reading_it(
+        self, tmp_path: Path, queued: AcquisitionRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The size cap must reject a huge file BEFORE it is pulled into memory, or the
+        cap defeats its own purpose. Prove this by making a full read fail loudly:
+        if the rejection still happens, it happened via `Path.stat()` alone."""
+        _drop(tmp_path, queued.slug, f"{TITLE} DOI: {DOI} " + "x" * 5000)
+
+        def _boom(self: Path, *args: object, **kwargs: object) -> bytes:
+            raise AssertionError(f"read_bytes() must not be called on an oversized file: {self}")
+
+        monkeypatch.setattr(Path, "read_bytes", _boom)
+
+        changed = collect_inbox(tmp_path, max_bytes=100)
+
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert "over the" in changed[0].identity_note
+
     def test_an_already_fulfilled_request_is_not_reprocessed(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
         _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\n")
         collect_inbox(tmp_path, max_bytes=10_000_000)
@@ -320,6 +354,46 @@ class TestDropPathFor:
 
     def test_suffix_without_a_leading_dot_is_normalized(self, tmp_path: Path) -> None:
         assert drop_path_for(tmp_path, "some-slug", suffix="txt") == inbox_dir(tmp_path) / "some-slug.txt"
+
+    @pytest.mark.parametrize("slug", ["../../etc/passwd", "../escape", "a/../../b"])
+    def test_a_traversal_slug_cannot_escape_the_inbox_directory(self, tmp_path: Path, slug: str) -> None:
+        """Defence in depth: even if a raw string bypassed schema validation (a
+        tampered manifest, a raw CLI --slug flag), this function must never hand back a
+        path outside the inbox directory."""
+        with pytest.raises(ValueError, match="inbox"):
+            drop_path_for(tmp_path, slug)
+
+
+class TestAcquisitionRequestSlugValidation:
+    def test_a_traversal_slug_is_rejected_by_the_schema(self) -> None:
+        with pytest.raises(ValidationError, match="String should match pattern"):
+            AcquisitionRequest(
+                slug="../../etc/passwd",
+                title=TITLE,
+                doi=DOI,
+                landing_url="https://doi.org/10.1/x",
+                reason=AcquisitionReason.PAYWALLED,
+                requested_at=datetime.now(UTC),
+            )
+
+    def test_slug_for_output_still_validates_against_the_pattern(self) -> None:
+        """The schema's pattern must not be narrower than what slug_for() actually
+        emits -- widen the pattern, never the generator, if this ever fails."""
+        for doi, title in [
+            (DOI, TITLE),
+            (None, TITLE),
+            ("", ""),
+            ("10.1016/j.combustflame.2015.11.011", "x"),
+        ]:
+            slug = slug_for(doi, title)
+            AcquisitionRequest(
+                slug=slug,
+                title=title or "untitled",
+                doi=doi or None,
+                landing_url="https://doi.org/10.1/x",
+                reason=AcquisitionReason.PAYWALLED,
+                requested_at=datetime.now(UTC),
+            )
 
 
 class TestAdmitFile:

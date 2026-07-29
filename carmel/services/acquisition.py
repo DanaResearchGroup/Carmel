@@ -299,6 +299,33 @@ def _secondary_document_marker(head: str, requested_title: str) -> str | None:
     return None
 
 
+def _gate_on_secondary_document_marker(ok: bool, note: str, *, marker: str | None) -> tuple[bool, str]:
+    """The single exit point every acceptance path in :func:`check_identity` must route
+    through before returning ``True``.
+
+    An erratum, corrigendum, comment, or reply has its OWN DOI, different from the
+    original paper's -- so when a human drops one of these by mistake, the requested
+    (original) DOI is simply absent from the text. That fails ``doi_found`` and sends
+    the check down the title-only fallback, and a secondary document reprints the
+    original's full title by construction ("Erratum to: <title>"), so the title-only
+    ratio passes too. Neither identity route can separate an erratum from the paper it
+    concerns; only the marker scan can. If the marker check is nested under just the
+    DOI-matched branch, this exact substitution -- an erratum dropped in place of the
+    original -- sails through the title-only branch untouched. Routing every ``True``
+    through this single gate makes that structurally impossible: there is no accept
+    path left that does not pass the marker check, including any added in the future.
+    """
+    if ok and marker:
+        return False, (
+            f"the document announces itself as a '{marker}' for the requested paper "
+            f"rather than being that paper. Secondary documents like this commonly "
+            f"reprint the original's DOI and its full title, so neither the DOI route "
+            f"nor the title route can separate them from the original -- drop the "
+            f"article itself"
+        )
+    return ok, note
+
+
 def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tuple[bool, str]:
     """Verify that a dropped document really is the requested paper.
 
@@ -354,6 +381,12 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
         doi = request.doi.lower()
         doi_found = doi in head or re.sub(r"\s+", "", doi) in collapsed
 
+    # Computed ONCE, ahead of both accept branches below, and both branches' ``True``
+    # returns are routed through :func:`_gate_on_secondary_document_marker` -- see that
+    # function's docstring for why the marker check must never be nested under just the
+    # DOI-matched branch.
+    marker = _secondary_document_marker(head, request.title.lower())
+
     if doi_found:
         # A DOI in the front matter is strong but NOT self-sufficient, and this is the
         # deliberate difference from an earlier version of this function that returned
@@ -374,22 +407,12 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
         # navigation chrome. NOT calibrated against a corpus; chosen as half of the
         # standalone bar. AcquisitionRequest carries no author list, so the author route
         # that grounding.check_identity can take is not available here.
-        #
-        # Title overlap alone does NOT separate a paper from its own erratum, which
-        # reprints the full title by construction ("Erratum to: <title>"). That case is
-        # handled by the explicit marker check below rather than by the threshold.
-        marker = _secondary_document_marker(head, request.title.lower())
-        if marker:
-            return False, (
-                f"DOI {request.doi} appears in the front matter, but the document announces "
-                f"itself as a '{marker}' for the requested paper rather than the paper itself. "
-                f"Secondary documents carry the original's DOI and title, so neither check can "
-                f"separate them -- drop the article itself"
-            )
         if ratio >= DOI_CORROBORATION_THRESHOLD:
-            return True, (
+            return _gate_on_secondary_document_marker(
+                True,
                 f"DOI {request.doi} found in the document's front matter, corroborated by "
-                f"{ratio:.0%} of the title's significant words"
+                f"{ratio:.0%} of the title's significant words",
+                marker=marker,
             )
         return False, (
             f"DOI {request.doi} appears in the front matter but nothing corroborates it: only "
@@ -402,7 +425,17 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
         return False, "the request has no DOI and no distinctive title words to match on"
 
     if ratio >= TITLE_MATCH_THRESHOLD:
-        return True, f"title matched at {ratio:.0%} of significant words (no DOI in text)"
+        # Title overlap alone does NOT separate a paper from its own erratum, which
+        # reprints the full title by construction ("Erratum to: <title>") and has no DOI
+        # of the original paper's in it at all -- that is exactly why this branch is
+        # reached instead of the DOI branch above. The marker gate below is what catches
+        # it; do not remove this call believing the DOI branch already covers erratum
+        # documents, it only covers the ones that also print the original's DOI.
+        return _gate_on_secondary_document_marker(
+            True,
+            f"title matched at {ratio:.0%} of significant words (no DOI in text)",
+            marker=marker,
+        )
 
     doi_note = " and its DOI was not found" if request.doi else ""
     return False, (
@@ -491,6 +524,23 @@ def _admit_one(
     """
     from carmel.agents.tools.fetch import FetchedArtifact
 
+    # Check the size via stat BEFORE reading: a huge dropped file must be rejected
+    # without ever being pulled fully into memory, or the cap below defeats its own
+    # purpose. The stat check is cheap and reads nothing; it is not, on its own,
+    # sufficient (the file could grow between this stat and the read below), so the
+    # length check after the read stays in place too -- this is a belt-and-suspenders
+    # pair, not a replacement.
+    try:
+        st_size = path.stat().st_size
+    except OSError as exc:
+        request.status = AcquisitionStatus.REJECTED
+        request.identity_note = f"could not read the dropped file: {exc}"
+        return None
+    if st_size > max_bytes:
+        request.status = AcquisitionStatus.REJECTED
+        request.identity_note = f"dropped file is {st_size} bytes, over the {max_bytes} cap"
+        return None
+
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -498,6 +548,8 @@ def _admit_one(
         request.identity_note = f"could not read the dropped file: {exc}"
         return None
 
+    # TOCTOU: the file can grow between the stat above and this read completing, so the
+    # cap is enforced a second time here, against what was actually read.
     if len(data) > max_bytes:
         request.status = AcquisitionStatus.REJECTED
         request.identity_note = f"dropped file is {len(data)} bytes, over the {max_bytes} cap"
@@ -545,7 +597,7 @@ def _admit_one(
         return None
 
 
-def _infer_slug(source: Path, pending: list[AcquisitionRequest]) -> str:
+def _infer_slug(source: Path, pending: list[AcquisitionRequest], *, max_bytes: int) -> str:
     """Work out which pending request ``source`` is meant to fulfil, when the caller
     did not say. NEVER guesses between two plausible papers: a wrong guess attaches
     one paper's bytes to another paper's citation, exactly the failure this whole
@@ -554,13 +606,17 @@ def _infer_slug(source: Path, pending: list[AcquisitionRequest]) -> str:
     Args:
         source: The operator's file, not yet copied anywhere.
         pending: Candidate requests (see :func:`pending_requests`).
+        max_bytes: Hard cap on the file read for inference -- the same cap
+            :func:`_admit_one` enforces on the file actually admitted, applied here too
+            since this reads the same untrusted operator-dropped bytes.
 
     Returns:
         The one slug this file can be confidently matched to.
 
     Raises:
-        ValueError: no requests are pending, or the file's extracted text does not
-            let :func:`check_identity` settle on exactly one candidate.
+        ValueError: no requests are pending, the file is over ``max_bytes``, or the
+            file's extracted text does not let :func:`check_identity` settle on exactly
+            one candidate.
     """
     if not pending:
         raise ValueError("no acquisition requests are pending; there is nothing to admit this file against")
@@ -568,8 +624,38 @@ def _infer_slug(source: Path, pending: list[AcquisitionRequest]) -> str:
         return pending[0].slug
 
     candidates = ", ".join(sorted(r.slug for r in pending))
+
+    # Stat before reading, same reasoning as in `_admit_one`: a huge file must be
+    # rejected without being pulled fully into memory first.
+    try:
+        st_size = source.stat().st_size
+    except OSError as exc:
+        raise ValueError(
+            f"could not read {source} well enough to infer which request it is for: {exc}. "
+            f"Pass slug= explicitly. Candidates: {candidates}"
+        ) from exc
+    if st_size > max_bytes:
+        raise ValueError(
+            f"{source} is {st_size} bytes, over the {max_bytes} cap, so it cannot be read to "
+            f"infer which request it is for. Pass slug= explicitly. Candidates: {candidates}"
+        )
+
     try:
         data = source.read_bytes()
+    except OSError as exc:
+        raise ValueError(
+            f"could not read {source} well enough to infer which request it is for: {exc}. "
+            f"Pass slug= explicitly. Candidates: {candidates}"
+        ) from exc
+
+    # TOCTOU: enforce the cap again against what was actually read.
+    if len(data) > max_bytes:
+        raise ValueError(
+            f"{source} is {len(data)} bytes, over the {max_bytes} cap, so it cannot be read to "
+            f"infer which request it is for. Pass slug= explicitly. Candidates: {candidates}"
+        )
+
+    try:
         extracted = extract_text(data, _sniff_content_type(data))
     except Exception as exc:  # noqa: BLE001 - inference failing must not crash, just refuse to guess
         raise ValueError(
@@ -627,7 +713,7 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
 
     if slug is None:
         pending = [r for r in manifest.requests if r.status in _PENDING_STATUSES]
-        slug = _infer_slug(source, pending)
+        slug = _infer_slug(source, pending, max_bytes=max_bytes)
 
     request = by_slug.get(slug)
     if request is None:

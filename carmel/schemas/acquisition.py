@@ -59,10 +59,17 @@ class AcquisitionRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    slug: str = Field(min_length=1)
+    slug: str = Field(min_length=1, pattern=r"^[a-z0-9][a-z0-9._-]{0,180}$")
     """Filesystem-safe identifier derived from the DOI (or title). This is the name the
     human gives the dropped file, and the only link between a file on disk and the
-    paper it is meant to be."""
+    paper it is meant to be.
+
+    The pattern matches :data:`carmel.services.acquisition._VALID_SLUG_RE` -- the same
+    charset :func:`carmel.services.acquisition.slug_for` is guaranteed to emit -- and
+    exists so a slug read back from a hand-edited or otherwise tampered manifest can
+    never carry a path separator or a ``..`` traversal segment into
+    :func:`carmel.services.acquisition.drop_path_for`, which builds a filesystem path
+    directly from this field."""
     title: str = Field(min_length=1)
     doi: str | None = None
     landing_url: str = Field(min_length=1)
