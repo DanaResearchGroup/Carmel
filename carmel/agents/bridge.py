@@ -31,6 +31,16 @@ from carmel.schemas.literature import StopReason
 
 logger = get_logger("agents.bridge")
 
+# Fallback reservation used ONLY when ``model`` does not provide its own
+# ``estimate_worst_case_cost_usd`` (spar round 5, Finding 1). Every real Carmel-owned
+# model (``MockModel``, ``PydanticAIModel`` -- see carmel.agents.models) implements
+# that method, so in production this constant is dead code; it exists purely so an
+# ad-hoc ``ModelProtocol``-conforming test double that predates this method (this
+# module's own test seam explicitly allows a bare ``name`` + ``complete()`` stub) does
+# not crash with an ``AttributeError`` before ever reaching the model it wants to
+# exercise.
+_LEGACY_DEFAULT_ESTIMATED_COST_USD = 0.05
+
 
 @dataclass(frozen=True)
 class AgentTool:
@@ -173,7 +183,7 @@ class CarmelAgent:
         user_prompt: str,
         *,
         estimated_tokens: int = 8000,
-        estimated_cost_usd: float = 0.05,
+        estimated_cost_usd: float | None = None,
     ) -> AgentRunResult:
         """Reserve budget, call the model, settle, and validate the output.
 
@@ -186,6 +196,11 @@ class CarmelAgent:
             user_prompt: The user/task prompt for this call.
             estimated_tokens: Worst-case token estimate used for the reservation.
             estimated_cost_usd: Worst-case dollar estimate used for the reservation.
+                Defaults to ``None``, which asks ``model`` itself (via an
+                ``estimate_worst_case_cost_usd(estimated_tokens)`` method, if it has
+                one) for a reservation priced from that model's real per-1M-token
+                rates -- rather than a flat constant that a real pro-model call could
+                exceed (spar round 5, Finding 1). Pass an explicit value to override.
 
         Returns:
             The validated, typed run result.
@@ -197,6 +212,12 @@ class CarmelAgent:
             AgentBridgeError: If the model's output fails validation against
                 ``output_schema``.
         """
+        if estimated_cost_usd is None:
+            estimate_fn = getattr(self.model, "estimate_worst_case_cost_usd", None)
+            estimated_cost_usd = (
+                estimate_fn(estimated_tokens) if estimate_fn is not None else _LEGACY_DEFAULT_ESTIMATED_COST_USD
+            )
+
         with self.ledger.model_call(
             estimated_tokens=estimated_tokens, estimated_cost_usd=estimated_cost_usd
         ) as reservation:

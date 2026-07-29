@@ -175,11 +175,12 @@ def store_artifact(
 
     if raw_path.exists():
         existing = _load_meta(meta_path)
-        if existing is not None and _artifact_intact(raw_path, text_path, digest, existing):
+        if existing is not None and _artifact_intact(raw_path, text_path, extracted_path, digest, existing):
             return existing
         logger.warning(
             "repairing corrupted or incomplete artifact %s (missing/unreadable meta.json, "
-            "raw.bin digest mismatch, meta/byte-count disagreement, or missing text.txt)",
+            "raw.bin digest mismatch, meta/byte-count disagreement, missing text.txt, or "
+            "missing/unparseable extracted.json)",
             digest,
         )
         return _write_all(
@@ -211,28 +212,40 @@ def store_artifact(
     )
 
 
-def _artifact_intact(raw_path: Path, text_path: Path, digest: str, meta: StoredArtifact) -> bool:
+def _artifact_intact(raw_path: Path, text_path: Path, extracted_path: Path, digest: str, meta: StoredArtifact) -> bool:
     """Verify that an existing on-disk artifact still agrees with the directory name.
 
     Re-reads ``raw.bin`` from disk (never trusts that a prior write succeeded) and
     checks its digest and byte count against both the directory name and the
-    previously persisted ``meta.json``, and confirms ``text.txt`` is present. This is
-    what prevents a corrupted or partially-written artifact from being trusted forever
-    just because ``raw.bin`` and a parseable ``meta.json`` both happen to exist.
+    previously persisted ``meta.json``, confirms ``text.txt`` is present, and confirms
+    ``extracted.json`` is present AND parses as a valid :class:`ExtractedText` (spar
+    round 5, Finding 2). ``extracted.json`` is the source of truth the grounding gate
+    depends on for section labels; a missing or truncated/corrupt sidecar must be
+    treated exactly like a missing ``text.txt`` -- repaired from the caller's bytes in
+    hand -- rather than silently trusted forever because ``raw.bin`` and a parseable
+    ``meta.json`` both happen to exist. This is what prevents a corrupted or
+    partially-written artifact from being trusted forever.
 
     Args:
         raw_path: Path to the stored raw bytes.
         text_path: Path to the stored extracted text.
+        extracted_path: Path to the stored full ``ExtractedText`` sidecar.
         digest: The directory name (expected sha256 of the raw bytes).
         meta: The previously persisted metadata for this artifact.
 
     Returns:
         True only if the on-disk bytes, their digest, and ``meta.json`` all agree with
-        ``digest`` and with each other, and ``text.txt`` exists.
+        ``digest`` and with each other, ``text.txt`` exists, and ``extracted.json``
+        exists and parses as a valid ``ExtractedText``.
     """
     if meta.sha256 != digest:
         return False
     if not text_path.exists():
+        return False
+    try:
+        raw_extracted = read_json(extracted_path)
+        ExtractedText.model_validate(raw_extracted)
+    except FileNotFoundError, ValueError, OSError:
         return False
     try:
         on_disk = read_bytes(raw_path)

@@ -303,6 +303,64 @@ class TestCorruptionDetectionAndRepair:
         assert text_path.exists()
         assert repaired.sha256 == stored.sha256
 
+    def test_missing_extracted_json_triggers_repair(self, tmp_path: Path) -> None:
+        # spar round 5, Finding 2: the idempotent path re-stored identical bytes and
+        # returned the existing meta.json WITHOUT checking that extracted.json (the
+        # section-labelled source of truth the grounding gate depends on) still
+        # exists -- silently treating a lost sidecar as intact forever, and leaving
+        # future grounding with no structural evidence to check against.
+        data = b"paper whose sidecar goes missing"
+        artifact = _artifact(data)
+        sections = [TextSection(label="body", start=0, end=5), TextSection(label="references", start=5, end=33)]
+        extracted = ExtractedText(
+            text="paper whose sidecar goes missing",
+            normalized="paper whose sidecar goes missing",
+            sections=sections,
+            extractor="pdf:pypdf",
+            lossy=False,
+        )
+
+        stored = store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+        extracted_json_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+        extracted_json_path.unlink()
+        assert not extracted_json_path.exists()
+
+        repaired = store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+
+        assert extracted_json_path.exists()
+        assert repaired.sha256 == stored.sha256
+        loaded = load_artifact_text(tmp_path, stored.sha256)
+        assert loaded is not None
+        assert [s.label for s in loaded.sections] == ["body", "references"]
+        assert loaded.lossy is False
+
+    def test_truncated_unparseable_extracted_json_triggers_repair(self, tmp_path: Path) -> None:
+        # A partial write (crash mid-write, disk full) can leave extracted.json present
+        # but not valid JSON / not a valid ExtractedText -- this must be treated the
+        # same as "missing", not trusted just because the file exists.
+        data = b"paper whose sidecar gets truncated"
+        artifact = _artifact(data)
+        sections = [TextSection(label="body", start=0, end=5)]
+        extracted = ExtractedText(
+            text="paper whose sidecar gets truncated",
+            normalized="paper whose sidecar gets truncated",
+            sections=sections,
+            extractor="pdf:pypdf",
+            lossy=False,
+        )
+
+        stored = store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+        extracted_json_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+        extracted_json_path.write_text("{not valid json", encoding="utf-8")
+
+        repaired = store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+
+        assert repaired.sha256 == stored.sha256
+        loaded = load_artifact_text(tmp_path, stored.sha256)
+        assert loaded is not None
+        assert [s.label for s in loaded.sections] == ["body"]
+        assert loaded.lossy is False
+
 
 class TestExtractedJsonPersistsSections:
     """DEFECT 2 regression: reload must retain section labels the grounding gate needs."""

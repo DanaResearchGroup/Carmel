@@ -194,6 +194,26 @@ def _genai_prices_cost_usd(usage: Any, model_name: str, provider_id: str) -> flo
     return float(price.total_price)
 
 
+def estimate_worst_case_model_cost_usd(model_name: str, estimated_tokens: int) -> float:
+    """Compute a pre-call worst-case dollar RESERVATION for ``model_name``.
+
+    Unlike :func:`compute_cost_usd` (which prices an *actual* input/output split
+    reported after a call completes), this prices a call that has not happened yet:
+    every one of ``estimated_tokens`` is charged at the model's OUTPUT rate -- the
+    more expensive of the two -- because the real input/output split is unknown until
+    the call returns and any split is cheaper than "all output". The result is
+    therefore guaranteed to be >= the actual cost of a call that produces at most
+    ``estimated_tokens`` total tokens, regardless of the real split.
+
+    Reuses ``_table_cost_usd``'s fail-closed fallback ladder (exact table entry ->
+    known-family rate -> deliberately absurd unknown-model rate), so a not-yet-priced
+    or unrecognized model still reserves a conservative amount rather than silently
+    reserving too little (spar round 5, Finding 1 -- reservations must never
+    under-estimate a real call's cost).
+    """
+    return _table_cost_usd(model_name, input_tokens=0, output_tokens=estimated_tokens)
+
+
 def compute_cost_usd(
     model_name: str,
     input_tokens: int,
@@ -296,6 +316,19 @@ class MockModel:
     def __repr__(self) -> str:
         """Return a repr naming only the model, never any prompt/response content."""
         return f"MockModel(name={self.name!r})"
+
+    def estimate_worst_case_cost_usd(self, estimated_tokens: int) -> float:
+        """Return a deterministic worst-case reservation estimate for the mock model.
+
+        Deliberately NOT derived from ``estimated_tokens`` or the real pricing table:
+        MockModel never calls a real provider, so there is no real-money worst case to
+        estimate, and mock-backed tests must stay deterministic regardless of the
+        token estimate a caller passes (spar round 5, Finding 1 -- "do not change the
+        mock/test model path in a way that makes tests reserve real money semantics").
+        Matches :class:`~carmel.agents.bridge.CarmelAgent.run`'s pre-existing flat
+        default, so mock-backed budget arithmetic in existing tests is unchanged.
+        """
+        return 0.05
 
 
 #: HTTP statuses that mean "this model cannot serve you", as opposed to "your request
@@ -531,6 +564,17 @@ class PydanticAIModel:
     def __repr__(self) -> str:
         """Return a repr showing only the model name and provider, never the API key."""
         return f"PydanticAIModel(model_name={self.name!r}, provider={self._provider!r})"
+
+    def estimate_worst_case_cost_usd(self, estimated_tokens: int) -> float:
+        """Return the worst-case dollar reservation for a not-yet-made call.
+
+        ``complete()`` may land on ANY model in ``self._ladder`` -- the preferred
+        model or any of its availability fallbacks (see :meth:`complete` and
+        :func:`_is_model_unavailable`) -- so the reservation must cover whichever
+        ladder member is priciest, not just ``self.name``; otherwise a fallback to a
+        more expensive model could be under-reserved (spar round 5, Finding 1).
+        """
+        return max(estimate_worst_case_model_cost_usd(candidate, estimated_tokens) for candidate in self._ladder)
 
 
 def build_model(config: AgentConfig) -> ModelProtocol:

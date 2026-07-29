@@ -15,7 +15,14 @@ from pydantic import BaseModel, ConfigDict
 
 from carmel.agents.bridge import AgentRunResult, AgentTool, CarmelAgent, ModelResponse
 from carmel.agents.budget import BudgetExceededError, BudgetLedger, session_budget
-from carmel.agents.models import AgentBridgeError, MockModel, PydanticAIModel, build_model, compute_cost_usd
+from carmel.agents.models import (
+    AgentBridgeError,
+    MockModel,
+    PydanticAIModel,
+    build_model,
+    compute_cost_usd,
+    estimate_worst_case_model_cost_usd,
+)
 from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
 from carmel.schemas.literature import StopReason
 
@@ -144,8 +151,81 @@ class TestCarmelAgentRun:
         assert model.calls[0]["tool_names"] == ["lookup_species"]
 
 
+class TestCarmelAgentRunCostEstimation:
+    """CarmelAgent.run's DEFAULT per-call reservation must come from the model's own
+    real worst-case pricing, not a flat constant a real pro-model call could exceed
+    (spar round 5, Finding 1). Reservations must round UP, never under-estimate.
+    """
+
+    class _ExpensiveFakeModel:
+        """A ModelProtocol-conforming stub priced far above the old flat $0.05 default."""
+
+        name = "expensive-fake"
+
+        def estimate_worst_case_cost_usd(self, estimated_tokens: int) -> float:
+            return 3.0
+
+        def complete(self, **kwargs: Any) -> ModelResponse:
+            return ModelResponse(output={"answer": "x", "confidence": 0.5}, model_name=self.name, cost_usd=3.0)
+
+    class _NoEstimateModel:
+        """A bare ModelProtocol stub predating estimate_worst_case_cost_usd."""
+
+        name = "no-estimate"
+
+        def complete(self, **kwargs: Any) -> ModelResponse:
+            return ModelResponse(output={"answer": "x", "confidence": 0.1}, model_name=self.name)
+
+    def test_default_reservation_uses_the_models_own_worst_case_estimate(self) -> None:
+        # A cap comfortably above the old flat $0.05 default but below the model's real
+        # $3.00 worst case: the old flat default would sail through this cap and let the
+        # call proceed; the fix must reject it BEFORE ever calling the model.
+        model = self._ExpensiveFakeModel()
+        ledger = _ledger(max_cost_usd=1.0)
+        agent = CarmelAgent(
+            name="test-agent", system_prompt="sp", model=model, tools=[], ledger=ledger, output_schema=_Output
+        )
+        with pytest.raises(BudgetExceededError):
+            agent.run("prompt")
+
+    def test_explicit_override_still_wins_over_the_models_estimate(self) -> None:
+        model = self._ExpensiveFakeModel()
+        ledger = _ledger(max_cost_usd=10.0)
+        agent = CarmelAgent(
+            name="test-agent", system_prompt="sp", model=model, tools=[], ledger=ledger, output_schema=_Output
+        )
+        agent.run("prompt", estimated_cost_usd=0.01)
+        assert ledger.usage().cost_usd == pytest.approx(3.0)  # settled to the model's reported actual cost
+
+    def test_model_without_estimate_method_falls_back_to_the_legacy_flat_default(self) -> None:
+        # A cap exactly at the legacy $0.05 default must still allow the call...
+        model = self._NoEstimateModel()
+        ledger_ok = _ledger(max_cost_usd=0.05)
+        agent_ok = CarmelAgent(
+            name="test-agent", system_prompt="sp", model=model, tools=[], ledger=ledger_ok, output_schema=_Output
+        )
+        result = agent_ok.run("prompt")
+        assert result.output["answer"] == "x"
+
+        # ...but a cap just under it must reject it, pinning the fallback at exactly 0.05.
+        ledger_tight = _ledger(max_cost_usd=0.04)
+        agent_tight = CarmelAgent(
+            name="test-agent", system_prompt="sp", model=model, tools=[], ledger=ledger_tight, output_schema=_Output
+        )
+        with pytest.raises(BudgetExceededError):
+            agent_tight.run("prompt")
+
+
 class TestMockModel:
     """MockModel-specific behavior."""
+
+    def test_estimate_worst_case_cost_usd_is_flat_and_deterministic(self) -> None:
+        # MockModel never calls a real provider, so it must NOT reserve real-money-scale
+        # amounts derived from the token estimate -- mock-backed tests must stay
+        # deterministic regardless of `estimated_tokens` (spar round 5, Finding 1).
+        model = MockModel()
+        assert model.estimate_worst_case_cost_usd(8_000) == 0.05
+        assert model.estimate_worst_case_cost_usd(10_000_000) == 0.05
 
     def test_raises_when_exhausted(self) -> None:
         model = MockModel(responses=[])
@@ -290,6 +370,40 @@ class TestComputeCostUsd:
             "gemini-2.5-flash", input_tokens=1_000_000, output_tokens=1_000_000, tokens_available=True
         )
         assert cost == pytest.approx(0.30 + 2.50)
+
+
+class TestEstimateWorstCaseModelCostUsd:
+    """Pre-call worst-case RESERVATION helper (spar round 5, Finding 1): must always be
+    >= the actual cost `compute_cost_usd` would report for any real split of the same
+    total token count, since the real split is unknown until the call returns.
+    """
+
+    def test_charges_all_estimated_tokens_at_the_output_rate(self) -> None:
+        # gemini-2.5-flash: input $0.30/1M, output $2.50/1M -- the estimate must use the
+        # more expensive output rate for every one of the estimated tokens.
+        cost = estimate_worst_case_model_cost_usd("gemini-2.5-flash", 8_000)
+        assert cost == pytest.approx(8_000 / 1_000_000 * 2.50)
+
+    def test_exceeds_any_real_split_of_the_same_total_tokens(self) -> None:
+        # However the real call actually splits its 8000 tokens between input and
+        # output, the pre-call worst-case reservation must be >= the resulting real cost.
+        estimate = estimate_worst_case_model_cost_usd("gemini-3.1-pro-preview", 8_000)
+        for input_tokens in (0, 2_000, 4_000, 6_000, 8_000):
+            output_tokens = 8_000 - input_tokens
+            real_cost = compute_cost_usd(
+                "gemini-3.1-pro-preview",
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                tokens_available=True,
+            )
+            assert estimate >= real_cost
+
+    def test_unpriced_model_uses_the_same_fail_closed_fallback_ladder(self) -> None:
+        # An unrecognized model must reserve the deliberately-absurd unknown-model rate
+        # -- never silently reserve $0.0 or a too-small amount.
+        cost = estimate_worst_case_model_cost_usd("some-brand-new-unpriced-model", 8_000)
+        priced_model_cost = estimate_worst_case_model_cost_usd("gemini-3.1-pro-preview", 8_000)
+        assert cost > priced_model_cost
 
 
 class TestComputeCostUsdGenaiPrices:
@@ -619,6 +733,41 @@ class TestModelLadderFallback:
             model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
 
         assert attempted == ["gemini-3.6-flash"]
+
+
+class TestPydanticAIModelEstimateWorstCaseCostUsd:
+    """A real model's worst-case reservation must cover whichever ladder rung
+    `complete()` might actually land on (spar round 5, Finding 1) -- `complete()` can
+    fall through to a pricier fallback model on a 404/503, so pricing only the
+    preferred model would under-reserve for that outcome.
+    """
+
+    def test_takes_the_max_over_the_full_fallback_ladder(self) -> None:
+        # gemini-2.5-flash ($0.30/$2.50 per 1M) is far cheaper than its fallback
+        # gemini-3.1-pro-preview ($4.00/$18.00 per 1M); the reservation must reflect
+        # the pricier fallback, not just the cheap preferred model.
+        model = PydanticAIModel(
+            model_name="gemini-2.5-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.1-pro-preview"],
+        )
+
+        estimate = model.estimate_worst_case_cost_usd(8_000)
+
+        preferred_only = estimate_worst_case_model_cost_usd("gemini-2.5-flash", 8_000)
+        fallback_only = estimate_worst_case_model_cost_usd("gemini-3.1-pro-preview", 8_000)
+        assert fallback_only > preferred_only
+        assert estimate == pytest.approx(fallback_only)
+
+    def test_no_fallbacks_prices_just_the_one_model(self) -> None:
+        model = PydanticAIModel(
+            model_name="gemini-2.5-flash", provider=AgentProvider.GOOGLE, api_key="placeholder-not-a-real-key"
+        )
+
+        estimate = model.estimate_worst_case_cost_usd(8_000)
+
+        assert estimate == pytest.approx(estimate_worst_case_model_cost_usd("gemini-2.5-flash", 8_000))
 
 
 class TestFamilyFallbackPricing:
