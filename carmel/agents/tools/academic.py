@@ -998,6 +998,7 @@ class OpenAccessResolver(_KeylessSearchTool):
         self._core_api_key = core_api_key
         self._semantic_scholar_api_key = semantic_scholar_api_key
         self._warned_skips: set[str] = set()
+        self._warned_failures: set[str] = set()
         self._lookup_calls = 0
         #: The provider registry. Order is the consultation order and, within a tier,
         #: the candidate order. To add a provider: write a pure parser above, a
@@ -1063,7 +1064,12 @@ class OpenAccessResolver(_KeylessSearchTool):
                 notes.append(f"{name}: skipped ({skip})")
                 continue
             except SearchError as exc:
-                logger.warning("%s OA lookup failed: %s", name, exc)
+                # Warn at most once per provider per resolver instance -- not once per
+                # paper -- so a dead index (e.g. a timing-out endpoint) costs one log
+                # line for the whole run, not one per paper resolved.
+                if name not in self._warned_failures:
+                    self._warned_failures.add(name)
+                    logger.warning("%s OA lookup failed: %s", name, exc)
                 notes.append(f"{name}: lookup failed ({exc})")
                 continue
             plural = "" if len(found) == 1 else "s"

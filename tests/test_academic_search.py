@@ -511,6 +511,33 @@ class TestOpenAccessResolver:
         assert "openalex" in resolution.note.lower()
         assert "failed" in resolution.note.lower()
 
+    def test_a_persistently_failing_provider_warns_only_once_per_resolver_instance(
+        self, ledger: BudgetLedger, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A provider whose endpoint is simply dead (connection error, timeout,
+        non-200 -- not a credential skip) must warn at most once per resolver
+        instance, not once per paper resolved."""
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            unpaywall_email="ops@example.org",
+            opener=_routing_opener(
+                {
+                    OPENALEX_ENDPOINT: OSError("connection refused"),
+                    UNPAYWALL_ENDPOINT: _UNPAYWALL_RECORD,
+                    **_QUIET_PROVIDER_ROUTES,
+                }
+            ),
+        )
+
+        with caplog.at_level("WARNING", logger="carmel.agents.tools.academic"):
+            resolver.resolve(_RESOLVER_DOI)
+            resolver.resolve(_RESOLVER_DOI)
+            resolver.resolve(_RESOLVER_DOI)
+
+        failure_warnings = [r for r in caplog.records if "openalex" in r.getMessage().lower()]
+        assert len(failure_warnings) == 1
+
 
 class TestCrossrefTdmCandidates:
     """Publisher-sanctioned Crossref ``link[]`` full-text entries (TDM links)."""
