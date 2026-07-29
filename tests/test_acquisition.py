@@ -85,14 +85,37 @@ class TestSlugFor:
 
 
 class TestCheckIdentity:
-    def test_doi_in_the_front_matter_is_conclusive(self) -> None:
-        ok, note = check_identity(_extracted(f"Some Journal\nDOI: {DOI}\nAbstract..."), _request())
+    def test_doi_corroborated_by_the_title_passes(self) -> None:
+        ok, note = check_identity(_extracted(f"Some Journal\nDOI: {DOI}\n{TITLE}\nAbstract..."), _request())
         assert ok is True
         assert DOI in note
 
     def test_doi_split_across_whitespace_still_matches(self) -> None:
         """PDF extraction routinely injects line breaks mid-identifier."""
-        ok, _ = check_identity(_extracted(f"DOI: {DOI[:12]}\n{DOI[12:]}\n"), _request())
+        ok, _ = check_identity(_extracted(f"DOI: {DOI[:12]}\n{DOI[12:]}\n{TITLE}\n"), _request())
+        assert ok is True
+
+    def test_a_bare_doi_with_no_corroborating_title_is_refused(self) -> None:
+        """A DOI alone is what a publisher landing page or a cover sheet carries. The
+        earlier contract accepted it, which admitted the right DOI on the wrong bytes."""
+        ok, note = check_identity(_extracted(f"Some Journal\nDOI: {DOI}\nAbstract..."), _request())
+        assert ok is False
+        assert "nothing corroborates it" in note
+
+    def test_an_erratum_carrying_the_requested_doi_and_title_is_refused(self) -> None:
+        """The case neither the DOI route nor the title route can catch: an erratum
+        reprints both by construction, so only its own announcement distinguishes it."""
+        ok, note = check_identity(
+            _extracted(f"Erratum to: {TITLE}\nDOI: {DOI}\nThe authors regret an error in Table 2."),
+            _request(),
+        )
+        assert ok is False
+        assert "erratum" in note
+
+    def test_a_paper_genuinely_titled_comment_on_is_not_blocked_by_its_own_title(self) -> None:
+        """The marker check must not reject a request whose real title contains the word."""
+        title = "Comment on the pressure dependence of the ignition delay of n-heptane"
+        ok, _ = check_identity(_extracted(f"{title}\nDOI: {DOI}\n"), _request(title=title))
         assert ok is True
 
     def test_matching_title_without_a_doi_passes(self) -> None:

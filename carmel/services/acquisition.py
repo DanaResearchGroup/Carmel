@@ -58,6 +58,35 @@ README_NAME = "README.md"
 #: the same topic, which shares topic words but not the full title.
 TITLE_MATCH_THRESHOLD = 0.8
 
+#: Fraction of a title's significant words that must appear when a DOI has ALSO matched.
+#: Lower than :data:`TITLE_MATCH_THRESHOLD` because it corroborates an already-strong
+#: signal instead of carrying the decision alone. NOT calibrated against a corpus --
+#: chosen as half the standalone bar, on the reasoning that a genuine paper reprints its
+#: own title verbatim in the front matter while the documents this rejects (landing
+#: pages, cover sheets) carry mostly chrome.
+DOI_CORROBORATION_THRESHOLD = 0.4
+
+#: Front-matter phrases that mark a document as being *about* the requested paper rather
+#: than being it. Each of these reprints the original's DOI and usually its full title,
+#: so neither the DOI route nor the title route can separate them -- only the announcement
+#: can. Matched against the first :data:`_MARKER_SCAN_CHARS` characters, where a journal
+#: prints the article type, and suppressed when the requested title itself contains the
+#: word (a paper genuinely titled "Comment on ..." is a legitimate request).
+_SECONDARY_DOCUMENT_MARKERS: tuple[str, ...] = (
+    "erratum",
+    "corrigendum",
+    "correction to",
+    "comment on",
+    "reply to",
+    "retraction",
+    "editorial expression of concern",
+)
+
+#: How far into the front matter to look for an article-type announcement. Much shorter
+#: than :data:`IDENTITY_SEARCH_CHARS`: journals print the article type in the header, and
+#: scanning further would match a mere mention of an erratum in the body or a footnote.
+_MARKER_SCAN_CHARS = 600
+
 #: Words too generic to distinguish one combustion paper from another.
 _TITLE_STOPWORDS = frozenset(
     {
@@ -198,16 +227,47 @@ def record_request(
     return request
 
 
+def _secondary_document_marker(head: str, requested_title: str) -> str | None:
+    """Return the phrase marking ``head`` as a document *about* the requested paper.
+
+    Args:
+        head: Lowercased front matter of the dropped document.
+        requested_title: Lowercased title of the request, used to suppress the check for
+            papers whose own title contains one of the marker phrases.
+
+    Returns:
+        The matched marker, or ``None`` when the document does not announce itself as a
+        secondary document.
+    """
+    window = head[:_MARKER_SCAN_CHARS]
+    for marker in _SECONDARY_DOCUMENT_MARKERS:
+        if marker in window and marker not in requested_title:
+            return marker
+    return None
+
+
 def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tuple[bool, str]:
     """Verify that a dropped document really is the requested paper.
 
-    Two independent routes, strongest first:
+    Two routes, strongest first:
 
-    1. **DOI present in the text.** Conclusive: a DOI is unique to the work, and papers
-       print their own DOI in the front matter.
-    2. **Title overlap.** Fallback when no DOI is known or the DOI is not printed.
-       Requires :data:`TITLE_MATCH_THRESHOLD` of the title's significant words to appear
-       in the document's front matter.
+    1. **DOI present, corroborated by the title.** A DOI is unique to the work and papers
+       print their own DOI in the front matter, but a DOI alone is NOT accepted: an
+       erratum, a comment, a reply, or a publisher landing page all reprint the DOI of
+       the paper they concern. So a DOI match additionally requires
+       :data:`DOI_CORROBORATION_THRESHOLD` of the title's significant words, and is
+       refused outright when the front matter announces the document as a secondary one
+       (see :data:`_SECONDARY_DOCUMENT_MARKERS`).
+    2. **Title overlap alone.** Fallback when no DOI is known or the DOI is not printed.
+       Requires the stricter :data:`TITLE_MATCH_THRESHOLD`, since nothing corroborates it.
+
+    This mirrors the conjunction that :func:`carmel.services.grounding.check_identity`
+    documents as load-bearing (``doi_ok and (title_ok or author_ok)``). The two functions
+    answer the same question and must not disagree: this one gates the MANUAL acquisition
+    path, and once a document is admitted the stricter rule never re-runs -- the
+    quote-grounding gate only ever asks whether a quote appears in the supplied bytes,
+    never whether those bytes are the right paper. The author half of the conjunction is
+    unavailable here because :class:`AcquisitionRequest` carries no author list.
 
     Only the first :data:`IDENTITY_SEARCH_CHARS` characters are searched, so that a mere
     *citation* of the requested paper inside a different paper's reference list cannot
@@ -230,19 +290,64 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
     head = extracted.text[:IDENTITY_SEARCH_CHARS].lower()
     collapsed = re.sub(r"\s+", "", head)
 
-    if request.doi:
-        doi = request.doi.lower()
-        if doi in head or re.sub(r"\s+", "", doi) in collapsed:
-            return True, f"DOI {request.doi} found in the document's front matter"
-
     title_words = [
         word for word in _WORD_RE.findall(request.title.lower()) if len(word) > 2 and word not in _TITLE_STOPWORDS
     ]
+    present = sum(1 for word in set(title_words) if word in head) if title_words else 0
+    ratio = present / len(set(title_words)) if title_words else 0.0
+
+    doi_found = False
+    if request.doi:
+        doi = request.doi.lower()
+        doi_found = doi in head or re.sub(r"\s+", "", doi) in collapsed
+
+    if doi_found:
+        # A DOI in the front matter is strong but NOT self-sufficient, and this is the
+        # deliberate difference from an earlier version of this function that returned
+        # True here. The documents that print another work's DOI in their own front
+        # matter are exactly the ones a human mis-drop produces: an erratum or comment
+        # on the requested paper, a preprint cover page listing the published version's
+        # DOI, or a publisher landing page saved as PDF. Each of those carries the right
+        # DOI and is the wrong document, and nothing downstream re-asks the question --
+        # once admitted, the quote-grounding gate only checks whether the quote appears
+        # in these bytes, never whether these bytes are the right paper.
+        #
+        # So require corroboration, matching the conjunction that
+        # :func:`carmel.services.grounding.check_identity` documents as load-bearing
+        # (``doi_ok and (title_ok or author_ok)``). The threshold is lower than
+        # TITLE_MATCH_THRESHOLD because it is corroborating an already-strong signal
+        # rather than standing alone: a genuine paper reprints its own title verbatim in
+        # its front matter, while a publisher landing page saved as PDF carries mostly
+        # navigation chrome. NOT calibrated against a corpus; chosen as half of the
+        # standalone bar. AcquisitionRequest carries no author list, so the author route
+        # that grounding.check_identity can take is not available here.
+        #
+        # Title overlap alone does NOT separate a paper from its own erratum, which
+        # reprints the full title by construction ("Erratum to: <title>"). That case is
+        # handled by the explicit marker check below rather than by the threshold.
+        marker = _secondary_document_marker(head, request.title.lower())
+        if marker:
+            return False, (
+                f"DOI {request.doi} appears in the front matter, but the document announces "
+                f"itself as a '{marker}' for the requested paper rather than the paper itself. "
+                f"Secondary documents carry the original's DOI and title, so neither check can "
+                f"separate them -- drop the article itself"
+            )
+        if ratio >= DOI_CORROBORATION_THRESHOLD:
+            return True, (
+                f"DOI {request.doi} found in the document's front matter, corroborated by "
+                f"{ratio:.0%} of the title's significant words"
+            )
+        return False, (
+            f"DOI {request.doi} appears in the front matter but nothing corroborates it: only "
+            f"{ratio:.0%} of the title's significant words are present. This is what a publisher "
+            f"landing page or a cover sheet for the requested paper looks like -- the right DOI "
+            f"on the wrong document"
+        )
+
     if not title_words:
         return False, "the request has no DOI and no distinctive title words to match on"
 
-    present = sum(1 for word in set(title_words) if word in head)
-    ratio = present / len(set(title_words))
     if ratio >= TITLE_MATCH_THRESHOLD:
         return True, f"title matched at {ratio:.0%} of significant words (no DOI in text)"
 
