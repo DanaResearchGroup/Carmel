@@ -213,6 +213,35 @@ make typecheck   # Run mypy in strict mode
 Carmel uses mypy in strict mode. All public functions require complete
 type annotations and Google-style docstrings.
 
+### `make typecheck` requires the `agents` extra
+
+`make typecheck` refuses to run (and prints an error pointing at
+`make install-agents-dev`) unless `pydantic_ai`, `pypdf`, and `rdkit` are all
+importable in the active environment. This isn't an arbitrary restriction —
+the two environments (with and without the `agents` extra) produce mypy
+results that genuinely **contradict** each other, and no single mypy
+invocation can satisfy both:
+
+- `carmel/services/chem.py` calls `Chem.MolToInchiKey(mol)` under a
+  `# type: ignore[no-untyped-call]`. That comment is *required* when
+  `rdkit-stubs` is installed, because the stub leaves `MolToInchiKey`
+  completely unannotated. But with `rdkit` absent entirely (no `agents`
+  extra), mypy never resolves the `rdkit` import in the first place, so the
+  same `type: ignore` is flagged `[unused-ignore]` — and `strict = true`
+  turns on `warn_unused_ignores`, making that a hard error.
+- Conversely, running mypy *without* the extra reports `import-not-found`
+  for `rdkit`, `pypdf`, `pydantic_ai`, and `genai_prices` — real errors in
+  that environment, but not ones that reflect the environment Carmel is
+  actually meant to run in.
+
+Weakening strictness to paper over this (blanket `ignore_missing_imports`,
+or `warn_unused_ignores = false`) was rejected as a fix: it would hide real
+type errors project-wide just to reconcile two environments that were never
+both "correct" at once. Instead, the agents-installed environment is the
+single supported mypy target: CI's `agents` job installs the extra and owns
+typecheck; CI's `lint` job installs only the base `dev` extras and runs
+`ruff` alone, deliberately skipping `make typecheck` for the same reason.
+
 ## Full Verification
 
 ```bash

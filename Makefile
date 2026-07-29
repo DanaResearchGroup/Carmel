@@ -65,6 +65,8 @@ lint:
 	ruff format --check .
 
 typecheck:
+	@python -c "import pydantic_ai, pypdf, rdkit" 2>/dev/null || \
+		{ echo "make typecheck requires the agents extra: run 'make install-agents-dev' first" >&2; exit 1; }
 	mypy carmel Carmel.py
 
 format:

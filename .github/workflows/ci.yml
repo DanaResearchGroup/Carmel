@@ -22,6 +22,28 @@ concurrency:
 # RMG/ARC/T3 stack is a separate workflow, tools.yml.
 
 jobs:
+  # NOTE: this job's `name:` says "typecheck" but no longer runs it -- that
+  # name is a literal required status-check context in the repo's "Protect
+  # Main" ruleset (see `gh api repos/DanaResearchGroup/Carmel/rulesets`), so
+  # renaming it would silently stop satisfying branch protection for every
+  # future PR. Left as-is deliberately; do not rename without first updating
+  # the ruleset.
+  #
+  # Why typecheck moved out of this job: `carmel/services/chem.py`,
+  # `carmel/agents/tools/extract.py`, `carmel/agents/models.py` import the
+  # optional `rdkit`/`pypdf`/`pydantic-ai`/`genai-prices` dependencies, which
+  # this job's `make install-dev` deliberately does NOT install (see
+  # `install-dev`'s comment in the Makefile). Running mypy here without those
+  # packages produces `import-not-found` errors that are real once, but the
+  # inverse also happens: `chem.py`'s `# type: ignore[no-untyped-call]` on
+  # `Chem.MolToInchiKey` is REQUIRED once `rdkit-stubs` is installed (that
+  # stub leaves the function unannotated), yet flagged `unused-ignore` when
+  # rdkit is absent, because `strict = true` turns on
+  # `warn_unused_ignores`. No single mypy invocation satisfies both
+  # environments, and weakening strictness (blanket `ignore_missing_imports`,
+  # `warn_unused_ignores = false`) is not acceptable. So the agents-installed
+  # environment is the one supported mypy target; the `agents` job below
+  # (required) already owns typecheck there.
   lint:
     name: Lint + format + typecheck (required)
     runs-on: ubuntu-latest
@@ -40,9 +62,6 @@ jobs:
 
       - name: Lint and format check
         run: make lint
-
-      - name: Type check
-        run: make typecheck
 
   test:
     name: Tests + packaging smoke (required)
