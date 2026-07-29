@@ -140,7 +140,21 @@ def drop_path_for(workspace_root: Path, slug: str, suffix: str = ".pdf") -> Path
     """
     if not suffix.startswith("."):
         suffix = f".{suffix}"
-    return inbox_dir(workspace_root) / f"{slug}{suffix}"
+    inbox = inbox_dir(workspace_root)
+    candidate = inbox / f"{slug}{suffix}"
+    # Defence in depth, on top of the schema's ``pattern`` constraint on ``slug``: this
+    # function is also reachable with a raw string that never passed through
+    # :class:`carmel.schemas.acquisition.AcquisitionRequest` validation (e.g. a CLI
+    # ``--slug`` flag), so a ``../`` traversal attempt must be caught here too, not only
+    # at the schema boundary.
+    resolved_inbox = inbox.resolve()
+    resolved_candidate = candidate.resolve()
+    if not resolved_candidate.is_relative_to(resolved_inbox):
+        raise ValueError(
+            f"slug {slug!r} would place the drop path outside the inbox directory "
+            f"({resolved_candidate} is not inside {resolved_inbox})"
+        )
+    return candidate
 
 
 def slug_for(doi: str | None, title: str) -> str:

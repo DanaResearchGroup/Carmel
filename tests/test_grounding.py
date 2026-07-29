@@ -220,6 +220,64 @@ def test_ground_finding_identity_mismatch_when_doi_absent() -> None:
     assert verdict.identity_ok is False
 
 
+def test_check_identity_doi_and_bare_surname_no_year_no_title_is_not_confirmed() -> None:
+    """Spar round 5, P0: a review article that merely mentions the cited work's DOI
+    in its body text, and which happens to contain the first author's bare surname
+    somewhere (e.g. discussing a *different* paper by an author with the same common
+    surname), must NOT be accepted as the cited paper. The review's own title never
+    matches, and no corroborating year is present either -- only the DOI and a bare
+    surname. Under the old ``doi_ok and (title_ok or author_ok)`` rule this passed,
+    which is exactly the misattribution this regression pins closed."""
+    text = (
+        "Abstract\n\nThis review of combustion chemistry surveys many works. "
+        "It cites DOI: 10.1000/xyz123 among numerous other references. "
+        "Elsewhere, Smith and coworkers have separately studied unrelated polymer "
+        "kinetics in a completely different context.\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    extracted = _extracted(text)
+    # The review's own title ("A Survey of Combustion Chemistry") never appears, and
+    # the citation year (2019) is absent from the text entirely.
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+
+    assert check_identity(extracted, citation) is False
+
+
+def test_check_identity_doi_and_title_confirms_with_no_author_info() -> None:
+    """Positive case: ``doi_ok and title_ok`` alone (no author corroboration at all)
+    must still be sufficient -- the primary rule must not regress."""
+    text = (
+        "Abstract\n\nThis paper, titled 'Ignition delay times study', presents new "
+        "shock tube results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    extracted = _extracted(text)
+    citation = Citation(title="Ignition delay times study", authors=[], doi="10.1000/xyz123")
+
+    assert check_identity(extracted, citation) is True
+
+
+def test_check_identity_doi_author_and_year_fallback_confirms_without_title() -> None:
+    """Fallback case: when the title is absent/OCR-mangled but the DOI, first-author
+    surname, AND the citation year are all corroborated outside references, identity
+    is confirmed -- the fallback requires surname AND year together, never surname
+    alone."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) present new shock tube combustion "
+        "results. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    extracted = _extracted(text)
+    citation = Citation(
+        title="A title that never appears anywhere in this text",
+        authors=["Smith, J."],
+        year=2019,
+        doi="10.1000/xyz123",
+    )
+
+    assert check_identity(extracted, citation) is True
+
+
 def test_ground_finding_identity_mismatch_when_citation_only_in_references() -> None:
     body = (
         "Body text describing an unrelated ignition delay time measurement. "
@@ -1201,6 +1259,197 @@ def test_required_spans_for_qm_calculation_empty_floor_returns_empty_list() -> N
     )
 
     assert required_spans_for(payload) == []
+
+
+# --- Finding 2 (spar round 5, P1): required_spans_for must be exhaustive over ------
+# --- every load-bearing populated payload field, per category. ---------------------
+
+
+def test_required_spans_for_experimental_benchmark_anchors_residence_time_apparatus_and_n_data_points() -> None:
+    """``residence_time_s``, ``apparatus``, and ``n_data_points`` are numeric/
+    identifying claims that must be individually anchored when populated -- an
+    earlier version silently omitted them, letting an LLM fabricate them freely."""
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=850.0, unit="microseconds")],
+        residence_time_s=0.5,
+        apparatus="high-pressure shock tube",
+        n_data_points=12,
+    )
+
+    required = required_spans_for(payload)
+
+    assert "0.5" in required
+    assert "high-pressure shock tube" in required
+    assert "12" in required
+
+
+def test_required_spans_for_prior_model_anchors_fuel_species_and_validation_targets() -> None:
+    """``fuel_species`` and ``validation_targets`` are identifying/factual claims
+    (which species the model covers, which datasets it was validated against) and
+    must be anchored individually when populated."""
+    payload = PriorModelPayload(
+        model_name="GRI-Mech 3.0",
+        n_species=53,
+        fuel_species=[SpeciesRef(raw_name="CH4"), SpeciesRef(raw_name="C2H6")],
+        validation_targets=["Dooley et al. shock tube ignition delays"],
+    )
+
+    required = required_spans_for(payload)
+
+    assert "CH4" in required
+    assert "C2H6" in required
+    assert "Dooley et al. shock tube ignition delays" in required
+
+
+def test_required_spans_for_prior_model_conditions_note_is_deliberately_not_anchored() -> None:
+    """``conditions_note`` is free-text narrative commentary, not a discrete
+    verifiable claim like a species name or a count -- it is deliberately NOT
+    required as a literal anchor (see report/commit message for the judgement)."""
+    payload = PriorModelPayload(
+        model_name="GRI-Mech 3.0",
+        n_species=53,
+        conditions_note="This is a narrative aside that need not appear verbatim near any quote.",
+    )
+
+    required = required_spans_for(payload)
+
+    assert "This is a narrative aside that need not appear verbatim near any quote." not in required
+
+
+def test_required_spans_for_qm_calculation_anchors_property_surface_form_and_software() -> None:
+    """``property`` (an identifying fact about what was computed) and ``software``
+    must be anchored when populated. ``property`` has no raw-text companion field
+    (unlike ``observable``/``observable_raw``), so it is anchored via a surface-form
+    synonym table, analogous to ``_REACTOR_TYPE_TERMS``."""
+    payload = QMCalculationPayload(
+        level_of_theory="CCSD(T)/cc-pVTZ",
+        property=QMProperty.BOND_DISSOCIATION_ENERGY,
+        value=Quantity(value=42.5, unit="kcal/mol"),
+        reaction_label="R1",
+        software="Gaussian 16",
+    )
+
+    required = required_spans_for(payload)
+
+    assert any(isinstance(r, tuple) and "bond dissociation energy" in r for r in required), required
+    assert "Gaussian 16" in required
+
+
+def test_required_spans_for_qm_calculation_other_property_has_no_literal_anchor() -> None:
+    """Judgement call: ``QMProperty.OTHER`` is a catch-all with no verbatim surface
+    form to search for (unlike a specific property name), so it is deliberately
+    exempted from the property anchor rather than requiring the literal word
+    "other" to appear near the quote, which would spuriously reject genuine
+    findings."""
+    payload = QMCalculationPayload(
+        level_of_theory="CCSD(T)/cc-pVTZ",
+        property=QMProperty.OTHER,
+        value=Quantity(value=42.5, unit="kcal/mol"),
+        reaction_label="R1",
+    )
+
+    required = required_spans_for(payload)
+
+    assert not any(isinstance(r, tuple) and "other" in r for r in required)
+    assert "other" not in required
+
+
+def test_required_spans_for_is_exhaustive_over_every_finding_category() -> None:
+    """Structural regression: walk the ``FindingPayload`` discriminated union and
+    confirm every declared category has representative coverage in
+    ``required_spans_for`` for its claim-bearing fields. A new category added to the
+    union without a corresponding branch in ``required_spans_for`` must fail this
+    test (via the ``UnsupportedFindingPayloadError`` fail-closed path) rather than
+    silently grounding with zero required anchors."""
+    import typing
+
+    from carmel.schemas.literature import FindingPayload
+
+    union_type = typing.get_args(FindingPayload)[0]
+    declared_categories = set(typing.get_args(union_type))
+
+    representative_payloads: dict[type, FindingPayload] = {
+        ExperimentalBenchmarkPayload: ExperimentalBenchmarkPayload(
+            reactor_type=ReactorType.SHOCK_TUBE,
+            observable=ObservableKind.IGNITION_DELAY_TIME,
+            observable_raw="ignition delay time",
+            species=[SpeciesRef(raw_name="O2")],
+            measured=[Quantity(value=850.0, unit="microseconds")],
+            temperature_range_K=(1000.0, 1200.0),
+            pressure_range_bar=(1.0, 2.0),
+            equivalence_ratio_range=(0.5, 1.5),
+            residence_time_s=0.5,
+            apparatus="high-pressure shock tube",
+            n_data_points=12,
+        ),
+        PriorModelPayload: PriorModelPayload(
+            model_name="GRI-Mech 3.0",
+            n_species=53,
+            n_reactions=325,
+            fuel_species=[SpeciesRef(raw_name="CH4")],
+            mechanism_url="https://example.org/mech.yaml",
+            validation_targets=["Dooley et al. shock tube ignition delays"],
+        ),
+        QMCalculationPayload: QMCalculationPayload(
+            level_of_theory="CCSD(T)/cc-pVTZ",
+            property=QMProperty.BOND_DISSOCIATION_ENERGY,
+            value=Quantity(value=42.5, unit="kcal/mol"),
+            species=[SpeciesRef(raw_name="CH3")],
+            reaction_label="R1",
+            software="Gaussian 16",
+        ),
+    }
+
+    # Every category declared in the union must have representative coverage above --
+    # this is what makes the test fail loudly if a category is added without also
+    # updating this structural test and (by extension) required_spans_for.
+    assert declared_categories == set(representative_payloads)
+
+    expected_claim_fragments: dict[type, list[str]] = {
+        ExperimentalBenchmarkPayload: [
+            "ignition delay time",
+            "O2",
+            "850.0",
+            "microseconds",
+            "1000.0",
+            "1200.0",
+            "1.0",
+            "2.0",
+            "0.5",
+            "1.5",
+            "high-pressure shock tube",
+            "12",
+        ],
+        PriorModelPayload: [
+            "GRI-Mech 3.0",
+            "53",
+            "325",
+            "CH4",
+            "https://example.org/mech.yaml",
+            "Dooley et al. shock tube ignition delays",
+        ],
+        QMCalculationPayload: [
+            "CCSD(T)/cc-pVTZ",
+            "42.5",
+            "kcal/mol",
+            "Gaussian 16",
+        ],
+    }
+
+    for payload_type, payload in representative_payloads.items():
+        required = required_spans_for(payload)
+        flattened: list[str] = []
+        for r in required:
+            if isinstance(r, tuple):
+                flattened.extend(r)
+            else:
+                flattened.append(r)
+        for fragment in expected_claim_fragments[payload_type]:
+            assert fragment in flattened, (payload_type, fragment, required)
 
 
 def test_unreadable_reason_pdf_unavailable() -> None:

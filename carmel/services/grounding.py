@@ -82,6 +82,7 @@ from carmel.schemas.literature import (
     GroundingVerdict,
     PriorModelPayload,
     QMCalculationPayload,
+    QMProperty,
 )
 
 __all__ = [
@@ -663,9 +664,20 @@ def check_identity(extracted: ExtractedText, citation: Citation) -> bool:
       - If ``citation.doi`` is set, the normalized DOI MUST occur literally in the
         text (necessary) -- but a DOI mentioned in a review article's body text does
         not, by itself, make that article the cited paper (spar round N, P1-2), so
-        DOI presence alone is never sufficient. The title OR the first author's
-        surname must ALSO be corroborated (outside any references section) before
-        identity is confirmed.
+        DOI presence alone is never sufficient. The primary corroboration is the
+        title: ``doi_ok and title_ok``. A surname-based fallback exists only for the
+        realistic case where the title is OCR-mangled or absent, and (spar round 5,
+        P0) that fallback now requires BOTH the first author's surname AND the
+        citation year, never the surname alone: a bare surname is far too weak a
+        signal on its own, because (a) a common surname (e.g. "Smith", "Wang")
+        appears in huge numbers of unrelated documents, and (b) review articles
+        routinely quote/restate measurements from primary literature, so
+        DOI-in-body-text plus an incidental surname match (e.g. a different paper by
+        an author with the same surname, or the author merely being discussed in
+        passing) could previously "confirm" identity against the wrong source
+        document and let a quoted span be misattributed to it. Requiring the year
+        alongside the surname closes that gap without over-tightening the OCR/
+        title-mangled case this fallback exists for.
       - Otherwise (no DOI), ALL of the following must hold: the normalized title
         occurs, the first author's surname occurs, and (if ``citation.year`` is
         set) the year occurs. If no authors are given there is nothing to confirm
@@ -693,7 +705,10 @@ def check_identity(extracted: ExtractedText, citation: Citation) -> bool:
     if citation.doi:
         doi_norm = normalize_for_match(citation.doi)
         doi_ok = _present_outside_references(extracted, doi_norm)
-        return doi_ok and (title_ok or author_ok)
+        doi_year_ok = citation.year is not None and _present_outside_references(
+            extracted, normalize_for_match(str(citation.year))
+        )
+        return doi_ok and (title_ok or (author_ok and doi_year_ok))
 
     if not citation.authors:
         return False
@@ -731,6 +746,25 @@ _REACTOR_TYPE_TERMS: dict[ReactorType, tuple[str, ...]] = {
     ReactorType.PFR: ("plug flow", "plug-flow", "pfr"),
     ReactorType.BATCH: ("batch reactor", "batch"),
     ReactorType.FLAME: ("flame",),
+}
+
+#: Surface forms accepted for each :class:`~carmel.schemas.literature.QMProperty`
+#: value. ``QMCalculationPayload`` has no raw-text companion field for ``property``
+#: (unlike ``observable``/``observable_raw`` on the experimental-benchmark payload),
+#: so this table plays the same role as :data:`_REACTOR_TYPE_TERMS`: it maps the
+#: controlled-vocabulary enum to the surface forms a paper would actually use.
+#: ``QMProperty.OTHER`` is deliberately absent -- it is a catch-all with no verbatim
+#: surface form to search for, and requiring the literal word "other" to appear near
+#: the quote would spuriously reject genuine findings (spar round 5, P1).
+_QM_PROPERTY_TERMS: dict[QMProperty, tuple[str, ...]] = {
+    QMProperty.ENTHALPY_OF_FORMATION: ("enthalpy of formation", "heat of formation"),
+    QMProperty.ENTROPY: ("entropy",),
+    QMProperty.HEAT_CAPACITY: ("heat capacity",),
+    QMProperty.RATE_COEFFICIENT: ("rate coefficient", "rate constant"),
+    QMProperty.BARRIER_HEIGHT: ("barrier height", "activation barrier", "activation energy"),
+    QMProperty.BOND_DISSOCIATION_ENERGY: ("bond dissociation energy", "bde"),
+    QMProperty.GEOMETRY: ("geometry",),
+    QMProperty.FREQUENCIES: ("frequencies", "vibrational frequencies"),
 }
 
 #: Sentence/row/paragraph boundary characters used by :func:`_bounded_window`.
@@ -914,13 +948,35 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
         length-capped at the schema level (``max_length=8`` / ``max_length=20``,
         see :class:`~carmel.schemas.literature.ExperimentalBenchmarkPayload`) so
         this per-entry anchoring can't be used to construct a pathologically large
-        finding.
+        finding. (Spar round 5, P1) When populated, ``residence_time_s``,
+        ``apparatus``, and ``n_data_points`` are ALSO required anchors -- an earlier
+        version omitted these three populated fields entirely, which let an LLM
+        fabricate a residence time, an apparatus name, or a data-point count freely
+        with no corroboration at all.
       - ``QM_CALCULATION``: requires ``level_of_theory`` and its result value and
         unit (all always-set fields), AND at least one of ``species`` or
-        ``reaction_label``; if neither is populated the floor is not met.
+        ``reaction_label``; if neither is populated the floor is not met. (Spar
+        round 5, P1) The ``property`` field is now also anchored via a surface-form
+        synonym table (:data:`_QM_PROPERTY_TERMS`), analogous to
+        ``_REACTOR_TYPE_TERMS`` -- ``property`` has no raw-text companion field like
+        ``observable_raw``, so the controlled-vocabulary enum value is mapped to the
+        surface forms a paper would actually use (e.g. ``BOND_DISSOCIATION_ENERGY``
+        -> "bond dissociation energy"/"bde"). ``QMProperty.OTHER`` is deliberately
+        exempted: it is a catch-all with no verbatim form to search for, and
+        demanding the literal word "other" appear near the quote would spuriously
+        reject genuine findings. ``software`` is also now a required anchor when
+        populated.
       - ``PRIOR_MODEL``: requires ``model_name``, plus at least one of
         ``{n_species, n_reactions, mechanism_url}``; if none of those three is
-        populated the floor is not met.
+        populated the floor is not met. (Spar round 5, P1) When populated,
+        ``fuel_species`` (each entry individually, like ``species`` above) and
+        ``validation_targets`` (each entry individually) are ALSO required anchors
+        -- these are factual/identifying claims (which species the model covers,
+        which datasets it was validated against), not narrative. ``conditions_note``
+        is deliberately NOT anchored: it is free-text commentary rather than a
+        discrete, verifiable claim, so requiring it to appear verbatim near the
+        quote would reject genuine findings whose note is a paraphrase/summary
+        rather than a quotable fact.
 
     Args:
         payload: The finding's typed payload.
@@ -949,6 +1005,12 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
             if bound is not None:
                 required.append(str(bound[0]))
                 required.append(str(bound[1]))
+        if payload.residence_time_s is not None:
+            required.append(str(payload.residence_time_s))
+        if payload.apparatus:
+            required.append(payload.apparatus)
+        if payload.n_data_points is not None:
+            required.append(str(payload.n_data_points))
         return required
 
     if isinstance(payload, QMCalculationPayload):
@@ -957,12 +1019,18 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
         )
         if not species_or_reaction:
             return []
-        return [
+        required = [
             payload.level_of_theory,
             str(payload.value.value),
             payload.value.unit,
             species_or_reaction,
         ]
+        property_terms = _QM_PROPERTY_TERMS.get(payload.property)
+        if property_terms is not None:
+            required.append(property_terms)
+        if payload.software:
+            required.append(payload.software)
+        return required
 
     if isinstance(payload, PriorModelPayload):
         extra: list[str] = []
@@ -974,7 +1042,12 @@ def required_spans_for(payload: FindingPayload) -> list[RequiredAnchor]:
             extra.append(payload.mechanism_url)
         if not extra:
             return []
-        return [payload.model_name, *extra]
+        required = [payload.model_name, *extra]
+        for s in payload.fuel_species:
+            required.append(s.raw_name)
+        for target in payload.validation_targets:
+            required.append(target)
+        return required
 
     raise UnsupportedFindingPayloadError(f"unsupported finding payload type: {type(payload)!r}")
 
