@@ -168,7 +168,7 @@ class HttpSearchTool:
         return _parse_results(payload)[:limit]
 
 
-def budgeted_get_json(
+def budgeted_get_raw(
     url: str,
     *,
     headers: dict[str, str],
@@ -176,15 +176,18 @@ def budgeted_get_json(
     opener: Callable[..., Any],
     timeout_s: float,
     external_provider_consent: bool,
-) -> Any | None:
-    """GET ``url`` under full budget discipline and parse it as JSON.
+) -> bytes:
+    """GET ``url`` under full budget discipline, returning the raw body bytes.
 
     This is the single implementation of the ledger/streaming contract shared by every
     search backend (generic ``HttpSearchTool`` and the keyless scholarly adapters in
     :mod:`carmel.agents.tools.academic`). It is deliberately ONE function: the
     reserve/settle and mid-stream size-check behaviour below is budget-enforcement
     code, and a second hand-rolled copy in another backend is exactly how one backend
-    ends up quietly unmetered.
+    ends up quietly unmetered. JSON backends go through :func:`budgeted_get_json`, a
+    thin parse wrapper over this; the raw form exists because not every scholarly
+    index speaks JSON (arXiv answers with an Atom XML feed) and a non-JSON body must
+    not mean an unmetered second code path.
 
     Args:
         url: Fully-formed request URL (must never carry an API key in its query).
@@ -195,7 +198,7 @@ def budgeted_get_json(
         external_provider_consent: Operator opt-in to third-party network egress.
 
     Returns:
-        The parsed JSON payload, or ``None`` when the body was not valid JSON.
+        The raw response body.
 
     Raises:
         BudgetExceededError: Propagated from the reservation or the mid-stream check.
@@ -249,6 +252,44 @@ def budgeted_get_json(
             raise
         ledger.settle_fetch(reservation, actual_bytes=len(raw))
 
+    return raw
+
+
+def budgeted_get_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    ledger: BudgetLedger,
+    opener: Callable[..., Any],
+    timeout_s: float,
+    external_provider_consent: bool,
+) -> Any | None:
+    """GET ``url`` via :func:`budgeted_get_raw` and parse the body as JSON.
+
+    Args:
+        url: Fully-formed request URL (must never carry an API key in its query).
+        headers: Request headers, including any API-key header.
+        ledger: Budget ledger; the call is reserved and settled through it.
+        opener: ``(url, headers=..., timeout_s=...) -> response`` opener.
+        timeout_s: Per-request socket timeout.
+        external_provider_consent: Operator opt-in to third-party network egress.
+
+    Returns:
+        The parsed JSON payload, or ``None`` when the body was not valid JSON.
+
+    Raises:
+        BudgetExceededError: Propagated from :func:`budgeted_get_raw`.
+        SearchError: Propagated from :func:`budgeted_get_raw` (consent withheld, or
+            any transport failure).
+    """
+    raw = budgeted_get_raw(
+        url,
+        headers=headers,
+        ledger=ledger,
+        opener=opener,
+        timeout_s=timeout_s,
+        external_provider_consent=external_provider_consent,
+    )
     try:
         return json.loads(raw)
     except json.JSONDecodeError, TypeError, UnicodeDecodeError:

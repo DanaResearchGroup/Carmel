@@ -1268,11 +1268,13 @@ class _FakeOaResolver:
     def __init__(self, resolutions: dict[str, OaResolution] | None = None) -> None:
         self._resolutions = resolutions or {}
         self.calls: list[str] = []
+        self.titles: list[str | None] = []
 
-    def resolve(self, doi: str) -> OaResolution:
+    def resolve(self, doi: str, *, title: str | None = None) -> OaResolution:
         self.calls.append(doi)
+        self.titles.append(title)
         return self._resolutions.get(
-            doi, OaResolution(candidates=(), note="no open-access copy advertised by OpenAlex or Unpaywall")
+            doi, OaResolution(candidates=(), note="no open-access copy advertised by any open-access index")
         )
 
 
@@ -1318,6 +1320,7 @@ class TestWantedPaperOpenAccessResolution:
         report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         assert resolver.calls == [WANTED_DOI]
+        assert resolver.titles == [WANTED_TITLE], "the paper's title must reach the title-matched OA providers"
         assert load_manifest(campaign.workspace_root).requests == []
         sha = hashlib.sha256(DOC.encode()).hexdigest()
         assert [a.sha256 for a in report.artifacts] == [sha]

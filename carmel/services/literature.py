@@ -307,6 +307,8 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
             external_provider_consent=config.external_provider_consent,
             contact_email=config.search_contact_email,
             unpaywall_email=config.resolved_unpaywall_email(),
+            core_api_key=config.resolved_core_api_key(),
+            semantic_scholar_api_key=config.resolved_semantic_scholar_api_key(),
         ),
     )
 
@@ -855,11 +857,16 @@ def _attempt_oa_fetch(
     return stored, None, ""
 
 
-def _resolve_oa_candidates(paper_doi: str | None, deps: LiteratureDeps) -> tuple[list[str], str]:
+def _resolve_oa_candidates(
+    paper_doi: str | None, paper_title: str | None, deps: LiteratureDeps
+) -> tuple[list[str], str]:
     """Deterministically resolve a wanted paper's OA candidates, with an honest note.
 
     Args:
         paper_doi: The paper's normalized DOI, if it has one.
+        paper_title: The paper's title, passed through to the resolver's
+            title-matched providers (ChemRxiv, arXiv); those skip themselves when it
+            is unavailable.
         deps: Injected dependencies (the resolver in particular).
 
     Returns:
@@ -871,7 +878,7 @@ def _resolve_oa_candidates(paper_doi: str | None, deps: LiteratureDeps) -> tuple
         return [], "paper has no DOI, so automated open-access resolution was not attempted"
     if deps.oa_resolver is None:
         return [], "no open-access resolver is configured for this run"
-    resolution = deps.oa_resolver.resolve(paper_doi)
+    resolution = deps.oa_resolver.resolve(paper_doi, title=paper_title)
     candidates = list(resolution.candidates)
     note = resolution.note
     if len(candidates) > MAX_OA_FETCH_ATTEMPTS_PER_PAPER:
@@ -899,8 +906,9 @@ def _queue_wanted_paper(
     status: a real run queued 12 papers as ``paywalled`` on the model's say-so, of
     which 5 were open access and never once fetched. So, before queuing:
 
-    1. Resolve OA candidates for the DOI deterministically (OpenAlex/Unpaywall --
-       never model judgement).
+    1. Resolve OA candidates for the DOI (and, for the title-matched preprint
+       indexes, the title) deterministically via the pluggable OA provider list --
+       never model judgement.
     2. Fetch them in order through the ordinary guarded fetch tool. A success is
        stored as FETCHED evidence and the paper is NOT queued.
     3. Only then queue, with the OBSERVED reason: 401/402/403 -> ``PAYWALLED``
@@ -917,7 +925,7 @@ def _queue_wanted_paper(
         state.warnings.append(f"ignored a requested paper with neither a DOI nor a URL: {paper.title!r}")
         return
 
-    candidates, resolution_note = _resolve_oa_candidates(doi, deps)
+    candidates, resolution_note = _resolve_oa_candidates(doi, paper.title or None, deps)
 
     attempts: list[tuple[str, str]] = []
     observed_reason: AcquisitionReason | None = None
