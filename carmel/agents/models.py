@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
+from functools import cache
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
@@ -130,16 +131,29 @@ def _family_fallback_rates(model_name: str) -> dict[str, float] | None:
     """
     for pattern, rates in _FAMILY_FALLBACK_RATES:
         if pattern.search(model_name):
-            logger.warning(
-                "no exact pricing entry for model %r; charging the family fallback rate "
-                "($%.2f/$%.2f per 1M input/output tokens), which deliberately over-estimates "
-                "-- add a verified rate to _MODEL_PRICING_USD_PER_1M_TOKENS for exact costs",
-                model_name,
-                rates["input"],
-                rates["output"],
-            )
+            _warn_family_fallback_once(model_name, rates["input"], rates["output"])
             return rates
     return None
+
+
+@cache
+def _warn_family_fallback_once(model_name: str, input_rate: float, output_rate: float) -> None:
+    """Emit the family-fallback pricing warning once per model per process.
+
+    This is consulted on every cost computation -- worst-case estimation before a call
+    (across the whole fallback ladder) and settlement after it -- so warning at each call
+    site printed the same two lines five times over during a single literature run and
+    buried the campaign ID the operator actually needed. The condition is a property of
+    the pricing table, not of any one call, so repeating it carries no information.
+    """
+    logger.warning(
+        "no exact pricing entry for model %r; charging the family fallback rate "
+        "($%.2f/$%.2f per 1M input/output tokens), which deliberately over-estimates "
+        "-- add a verified rate to _MODEL_PRICING_USD_PER_1M_TOKENS for exact costs",
+        model_name,
+        input_rate,
+        output_rate,
+    )
 
 
 def _table_cost_usd(model_name: str, input_tokens: int, output_tokens: int) -> float:

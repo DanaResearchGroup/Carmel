@@ -6,6 +6,7 @@ none of these tests require pydantic-ai to be installed.
 
 from __future__ import annotations
 
+import logging
 import sys
 from collections.abc import Iterator
 from typing import Any
@@ -809,6 +810,25 @@ class TestFamilyFallbackPricing:
     def test_exact_table_entries_still_win_over_family_fallback(self) -> None:
         # gemini-2.5-flash has a verified rate; it must not be re-priced at the family rate.
         assert self._cost("gemini-2.5-flash") == pytest.approx(0.30 + 2.50)
+
+    def test_the_family_fallback_warning_is_emitted_once_per_model(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A single literature run computes cost many times -- worst-case estimation across
+        the whole fallback ladder before each call, then settlement after it. Warning every
+        time printed the same lines five times over and buried the campaign ID the operator
+        needed. The missing pricing entry is a property of the table, not of one call.
+        """
+        from carmel.agents.models import _warn_family_fallback_once
+
+        _warn_family_fallback_once.cache_clear()
+        try:
+            with caplog.at_level(logging.WARNING):
+                for _ in range(5):
+                    self._cost("gemini-9.9-flash")
+
+            hits = [r for r in caplog.records if "no exact pricing entry" in r.getMessage()]
+            assert len(hits) == 1, f"expected exactly one warning, got {len(hits)}"
+        finally:
+            _warn_family_fallback_once.cache_clear()
 
     def test_pro_latest_alias_is_priced_like_the_family_it_aliases(self) -> None:
         assert self._cost("gemini-pro-latest") == pytest.approx(self._cost("gemini-3.1-pro-preview"))
