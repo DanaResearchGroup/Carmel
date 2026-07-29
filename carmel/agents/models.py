@@ -13,7 +13,6 @@ a mock. A caller who wants MockModel must ask for it explicitly via
 
 from __future__ import annotations
 
-import os
 import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
@@ -23,6 +22,7 @@ from pydantic import BaseModel
 from carmel.agents.bridge import AgentBridgeError, AgentTool, ModelResponse
 from carmel.agents.model_catalog import resolve_model_ladder
 from carmel.config import AgentConfig, AgentProvider
+from carmel.credentials import credential_search_path, resolve_api_key
 from carmel.logger import get_logger
 
 if TYPE_CHECKING:
@@ -537,17 +537,21 @@ def build_model(config: AgentConfig) -> ModelProtocol:
     """Fail-closed factory for the model backing a Carmel agent.
 
     ``AgentProvider.MOCK`` always returns a :class:`MockModel`. Any other provider
-    requires ``config.external_provider_consent`` to be ``True`` AND
-    ``config.api_key_env`` to name an environment variable that is present and
-    non-empty in ``os.environ``; only then is a :class:`PydanticAIModel` constructed.
+    requires ``config.external_provider_consent`` to be ``True`` AND a resolvable API
+    key: :func:`carmel.credentials.resolve_api_key` is consulted, which checks
+    ``os.environ`` first (so an explicitly exported value always wins) and then falls
+    back to a documented search path of on-disk credential files -- see that module for
+    the full precedence order. Only once a key is found is a :class:`PydanticAIModel`
+    constructed.
 
     This function must NEVER silently fall back to a mock for a non-mock provider — a
     silent downgrade would make a "real" run quietly fake.
 
     Raises:
         AgentBridgeError: With a message naming the specific failure cause: missing
-            consent, an unset env var, an empty env var, or the pydantic-ai dependency
-            being absent.
+            consent, no api_key_env configured, no key found anywhere in the search
+            path (the message names every location searched), or the pydantic-ai
+            dependency being absent.
     """
     if config.provider == AgentProvider.MOCK:
         return MockModel(name=config.resolved_model_name())
@@ -562,12 +566,14 @@ def build_model(config: AgentConfig) -> ModelProtocol:
     if not env_var:
         raise AgentBridgeError(f"provider {config.provider!r} requires api_key_env to be set")
 
-    if env_var not in os.environ:
-        raise AgentBridgeError(f"environment variable {env_var!r} (api_key_env) is not set")
-
-    api_key = os.environ[env_var]
+    api_key = resolve_api_key(env_var, provider=config.provider.value)
     if not api_key:
-        raise AgentBridgeError(f"environment variable {env_var!r} (api_key_env) is set but empty")
+        searched = credential_search_path(env_var, provider=config.provider.value)
+        searched_str = ", ".join(str(path) for path in searched)
+        raise AgentBridgeError(
+            f"no API key found for provider {config.provider.value!r}: set ${env_var}, "
+            f"or put {env_var}=... in one of: {searched_str}"
+        )
 
     # Resolve `auto:<family>` to concrete provider model ids, newest first. A model named
     # explicitly resolves to itself alone, so this cannot swap out an operator's choice.

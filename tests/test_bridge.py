@@ -184,26 +184,36 @@ class TestBuildModel:
         with pytest.raises(AgentBridgeError, match="external_provider_consent"):
             build_model(config)
 
-    def test_consent_but_unset_env_var_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_consent_but_unset_env_var_raises(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         monkeypatch.delenv("FAKE_GOOGLE_KEY_UNSET", raising=False)
+        # Point every on-disk fallback location somewhere empty, so resolution
+        # genuinely finds nothing anywhere -- not just an unset env var.
+        monkeypatch.setenv("CARMEL_HOME", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
         config = AgentConfig(
             tier=ModelTier.DEV,
             provider=AgentProvider.GOOGLE,
             api_key_env="FAKE_GOOGLE_KEY_UNSET",
             external_provider_consent=True,
         )
-        with pytest.raises(AgentBridgeError, match="not set"):
+        with pytest.raises(AgentBridgeError, match="no API key found") as excinfo:
             build_model(config)
+        # The error must name the search path, so an operator knows exactly where to
+        # put the credentials file -- a "not found" error that doesn't say where it
+        # looked is not actionable.
+        assert "credentials.env" in str(excinfo.value)
 
-    def test_consent_but_empty_env_var_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_consent_but_empty_env_var_raises(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
         monkeypatch.setenv("FAKE_GOOGLE_KEY_EMPTY", "")
+        monkeypatch.setenv("CARMEL_HOME", str(tmp_path))
+        monkeypatch.setenv("HOME", str(tmp_path))
         config = AgentConfig(
             tier=ModelTier.DEV,
             provider=AgentProvider.GOOGLE,
             api_key_env="FAKE_GOOGLE_KEY_EMPTY",
             external_provider_consent=True,
         )
-        with pytest.raises(AgentBridgeError, match="empty"):
+        with pytest.raises(AgentBridgeError, match="no API key found"):
             build_model(config)
 
     def test_missing_pydantic_ai_dependency_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
