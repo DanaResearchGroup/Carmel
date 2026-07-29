@@ -681,3 +681,85 @@ class TestRequestsCommand:
         capsys.readouterr()
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(right)]) == 0
         assert "ACCEPTED" in capsys.readouterr().out
+
+    def test_collect_admits_a_good_dropped_file(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """`--collect` calls the existing service and reports its verdict -- no
+        reimplementation of the sweep in the CLI layer."""
+        cid, ws = self._campaign_with_request(tmp_path)
+        from carmel.services.acquisition import drop_path_for, pending_requests
+
+        slug = pending_requests(ws)[0].slug
+        drop = drop_path_for(ws, slug, suffix=".txt")
+        drop.parent.mkdir(parents=True, exist_ok=True)
+        drop.write_text(
+            "Shock tube study of ammonia oxidation ignition delay times\n"
+            "DOI: 10.1016/j.test.2019.01.001\nAbstract: we report ignition delay times.\n",
+            encoding="utf-8",
+        )
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"]) == 0
+        out = capsys.readouterr().out
+        assert "ACCEPTED" in out
+        assert "1 accepted, 0 rejected" in out
+
+    def test_collect_rejects_a_wrong_dropped_file(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, ws = self._campaign_with_request(tmp_path)
+        from carmel.services.acquisition import drop_path_for, pending_requests
+
+        slug = pending_requests(ws)[0].slug
+        drop = drop_path_for(ws, slug, suffix=".txt")
+        drop.parent.mkdir(parents=True, exist_ok=True)
+        drop.write_text("Laminar burning velocities of methane air mixtures\n", encoding="utf-8")
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"]) == 1
+        out = capsys.readouterr().out
+        assert "REJECTED" in out
+        assert "0 accepted, 1 rejected" in out
+
+    def test_collect_with_empty_inbox_tells_the_operator_where_to_drop_files(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cid, ws = self._campaign_with_request(tmp_path)
+        from Carmel import main
+        from carmel.services.acquisition import inbox_dir
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"]) == 0
+        out = capsys.readouterr().out
+        assert "Nothing new in the inbox" in out
+        assert str(inbox_dir(ws)) in out
+
+    def test_collect_and_add_together_are_refused(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, _ = self._campaign_with_request(tmp_path)
+        right = tmp_path / "right.txt"
+        right.write_text("Shock tube study\n", encoding="utf-8")
+
+        from Carmel import main
+
+        assert (
+            main(
+                [
+                    "requests",
+                    "--campaign",
+                    cid,
+                    "--workspaces",
+                    str(tmp_path),
+                    "--collect",
+                    "--add",
+                    str(right),
+                ]
+            )
+            == 1
+        )
+
+    def test_listing_tells_the_operator_about_collect(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, _ = self._campaign_with_request(tmp_path)
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path)]) == 0
+        out = capsys.readouterr().out
+        assert "--collect" in out

@@ -65,6 +65,14 @@ def create_parser() -> argparse.ArgumentParser:
         help="A downloaded paper to admit. Carmel identity-checks it immediately and reports the verdict.",
     )
     requests_cmd.add_argument(
+        "--collect",
+        action="store_true",
+        help=(
+            "Sweep every file already dropped into the inbox directory and admit or reject "
+            "each one, instead of admitting a single file with --add."
+        ),
+    )
+    requests_cmd.add_argument(
         "--slug",
         type=str,
         default=None,
@@ -265,18 +273,25 @@ def _cmd_requests(
     add: Path | None,
     slug: str | None,
     config_file: Path | None,
+    collect: bool = False,
 ) -> int:
-    """List papers awaiting a human, or admit one that has been obtained.
+    """List papers awaiting a human, or admit one (or all) that have been obtained.
 
-    Without ``--add`` this prints the queue. With ``--add`` it copies the file into the
-    inbox under the right name AND runs the identity check immediately, so the operator
-    learns accepted-or-rejected now rather than after a whole literature run -- the long
-    feedback loop that made this step painful.
+    Without ``--add``/``--collect`` this prints the queue. With ``--add`` it copies a
+    single file into the inbox under the right name AND runs the identity check
+    immediately. With ``--collect`` it instead sweeps every file already dropped into
+    the inbox directory in one shot, so the operator can download several papers into
+    one folder and admit them all with a single command -- the long feedback loop and
+    the per-paper typing were both what made this step painful.
     """
+    if add is not None and collect:
+        print("--collect and --add are mutually exclusive. Use one or the other.")
+        return 1
+
     from carmel.config import AgentBudgetConfig, load_config
     from carmel.paths import default_workspaces_root
     from carmel.schemas.acquisition import AcquisitionStatus
-    from carmel.services.acquisition import admit_file, drop_path_for, pending_requests
+    from carmel.services.acquisition import admit_file, collect_inbox, drop_path_for, inbox_dir, pending_requests
     from carmel.services.campaigns import find_campaign_workspace
 
     root = workspaces.expanduser() if workspaces is not None else default_workspaces_root()
@@ -294,6 +309,26 @@ def _cmd_requests(
             return 1
         if config.agents is not None:
             max_bytes = config.agents.budget.max_artifact_bytes
+
+    if collect:
+        changed = collect_inbox(ws, max_bytes=max_bytes)
+        if not changed:
+            print("Nothing new in the inbox.")
+            print(f"Drop papers into: {inbox_dir(ws)}")
+            return 0
+        accepted = 0
+        rejected = 0
+        for request in changed:
+            if request.status == AcquisitionStatus.FULFILLED:
+                accepted += 1
+                print(f"ACCEPTED  {request.title}")
+            else:
+                rejected += 1
+                print(f"REJECTED  {request.title}")
+            print(f"          {request.identity_note}")
+            print()
+        print(f"{accepted} accepted, {rejected} rejected")
+        return 1 if rejected else 0
 
     if add is not None:
         try:
@@ -332,6 +367,7 @@ def _cmd_requests(
         print(f"    then  : carmel requests --campaign {campaign_id} --add <file> --slug {request.slug}")
         print(f"    or copy to: {drop_path_for(ws, request.slug)}")
         print()
+    print(f"Or drop all the files into {inbox_dir(ws)} and run `carmel requests --campaign {campaign_id} --collect`.")
     return 0
 
 
@@ -362,7 +398,7 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_new_campaign(args.config, args.workspaces)
 
     if args.command == "requests":
-        return _cmd_requests(args.campaign, args.workspaces, args.add, args.slug, args.config)
+        return _cmd_requests(args.campaign, args.workspaces, args.add, args.slug, args.config, args.collect)
 
     parser.print_help()
     return 1
