@@ -31,8 +31,15 @@ class AcquisitionReason(StrEnum):
     """Why automated retrieval did not yield readable text."""
 
     PAYWALLED = "paywalled"
-    """The host refused the request (typically HTTP 401/403), or no full-text URL
-    was advertised at all."""
+    """A host actually REFUSED an attempted fetch (HTTP 401/402/403). This is an
+    observation about a real request, never a model's assertion; when no full-text URL
+    was known to try at all, the reason is :attr:`NO_OPEN_ACCESS_COPY` instead."""
+    NO_OPEN_ACCESS_COPY = "no_open_access_copy"
+    """Automated open-access resolution produced no fetchable candidate URL -- either
+    the OA indexes (OpenAlex/Unpaywall) advertise none for this DOI, or resolution
+    could not run at all (no DOI, no resolver configured, consent withheld);
+    ``detail`` says which. Unlike :attr:`PAYWALLED` this asserts nothing about how
+    any host responded, because no host was ever asked."""
     NOT_A_DOCUMENT = "not_a_document"
     """A full-text URL was advertised but served something other than a document --
     in the probe, an HTML landing page five times out of eleven."""

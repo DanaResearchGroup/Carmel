@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -49,7 +50,13 @@ from carmel.agents.literature_agent import (
     build_verifier_agent,
 )
 from carmel.agents.models import build_model
-from carmel.agents.tools.academic import CrossrefSearchTool, OpenAlexSearchTool, normalize_doi
+from carmel.agents.tools.academic import (
+    CrossrefSearchTool,
+    OpenAccessResolver,
+    OpenAccessResolverProtocol,
+    OpenAlexSearchTool,
+    normalize_doi,
+)
 from carmel.agents.tools.extract import ExtractedText, extract_text, normalize_for_match
 from carmel.agents.tools.fetch import (
     FetchError,
@@ -122,6 +129,11 @@ MAX_QUERIES_PER_ROUND = 5
 
 #: Search results requested per executed query.
 SEARCH_RESULTS_PER_QUERY = 5
+
+#: Max open-access candidate URLs actually fetched per wanted paper. OA resolution can
+#: advertise many repository mirrors for one DOI; without a cap a single paper could
+#: burn the run's whole fetch budget on copies of bytes it already failed to get.
+MAX_OA_FETCH_ATTEMPTS_PER_PAPER = 5
 
 #: Grace period during which a run-lock directory with missing/unparseable
 #: ``info.json`` is still treated as LIVE -- a peer may be between ``mkdir()`` and
@@ -215,6 +227,14 @@ class LiteratureDeps:
     ``model`` -- see :meth:`__post_init__`. Real production wiring should prefer
     :func:`build_deps`, which always supplies a genuinely fresh model built the same
     way as ``model``."""
+    oa_resolver: OpenAccessResolverProtocol | None = None
+    """Deterministic DOI -> open-access-PDF resolution for the ``wanted`` channel.
+
+    ``None`` (the mock tier, and any caller that does not wire one) means resolution
+    simply cannot run; a wanted paper is then queued with
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.NO_OPEN_ACCESS_COPY` and a
+    detail saying so -- NEVER with ``PAYWALLED``, which would assert an observation
+    nobody made."""
 
     def __post_init__(self) -> None:
         """Guarantee ``verifier_model`` is never the same object as ``model``."""
@@ -282,6 +302,12 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
             external_provider_consent=config.external_provider_consent,
         ),
         ledger=ledger,
+        oa_resolver=OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=config.external_provider_consent,
+            contact_email=config.search_contact_email,
+            unpaywall_email=config.resolved_unpaywall_email(),
+        ),
     )
 
 
@@ -770,22 +796,120 @@ def _process_finding(
     )
 
 
+def _attempt_oa_fetch(
+    workspace_root: Path,
+    url: str,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+) -> tuple[StoredArtifact | None, AcquisitionReason | None, str]:
+    """Try one open-access candidate URL through the ordinary guarded fetch tool.
+
+    Every byte moves through ``deps.fetch`` -- the same SSRF guard, consent gate,
+    budget reservation and size caps as any agent-proposed fetch; this function opens
+    no sockets of its own.
+
+    Success requires the bytes to actually BE a document (sniffed
+    ``application/pdf``/``text/plain``): a live probe found 5 of 11 advertised OA
+    "PDF" URLs served an HTML landing page, and storing one of those as "the paper"
+    would silently retire the acquisition request while leaving no readable text.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        url: The OA candidate URL to try.
+        deps: Injected dependencies (the fetch tool in particular).
+        config: The agent configuration (artifact size cap).
+
+    Returns:
+        ``(stored, None, "")`` on success, else ``(None, reason, outcome)`` where
+        ``reason`` is the OBSERVED :class:`AcquisitionReason` and ``outcome`` a
+        human-readable account naming the host (e.g. ``"HTTP 403 from
+        pubs.rsc.org"``).
+
+    Raises:
+        BudgetExceededError: Propagated from the fetch tool's own reservation, like
+            every other fetch in this module -- a budget ceiling is a run-level stop,
+            not a per-candidate outcome.
+    """
+    host = urlsplit(url).hostname or url
+    try:
+        artifact, data = deps.fetch.fetch(url)
+    except FetchError as exc:
+        if exc.status in (401, 402, 403):
+            return None, AcquisitionReason.PAYWALLED, f"HTTP {exc.status} from {host}"
+        outcome = f"HTTP {exc.status} from {host}" if exc.status else f"fetch from {host} failed: {exc}"
+        return None, AcquisitionReason.FETCH_FAILED, outcome
+    if artifact.content_type not in ("application/pdf", "text/plain"):
+        return None, AcquisitionReason.NOT_A_DOCUMENT, f"{artifact.content_type} served from {host}"
+    extracted = extract_text(data, artifact.content_type)
+    try:
+        stored = store_artifact(
+            workspace_root,
+            data=data,
+            artifact=artifact,
+            extracted=extracted,
+            max_bytes=config.budget.max_artifact_bytes,
+        )
+    except ValueError as exc:
+        return None, AcquisitionReason.FETCH_FAILED, f"storing artifact from {host} failed: {exc}"
+    return stored, None, ""
+
+
+def _resolve_oa_candidates(paper_doi: str | None, deps: LiteratureDeps) -> tuple[list[str], str]:
+    """Deterministically resolve a wanted paper's OA candidates, with an honest note.
+
+    Args:
+        paper_doi: The paper's normalized DOI, if it has one.
+        deps: Injected dependencies (the resolver in particular).
+
+    Returns:
+        ``(candidates, note)``: candidate URLs capped at
+        :data:`MAX_OA_FETCH_ATTEMPTS_PER_PAPER`, and a note describing what
+        resolution did (or why it could not run) for the operator-facing ``detail``.
+    """
+    if paper_doi is None:
+        return [], "paper has no DOI, so automated open-access resolution was not attempted"
+    if deps.oa_resolver is None:
+        return [], "no open-access resolver is configured for this run"
+    resolution = deps.oa_resolver.resolve(paper_doi)
+    candidates = list(resolution.candidates)
+    note = resolution.note
+    if len(candidates) > MAX_OA_FETCH_ATTEMPTS_PER_PAPER:
+        note = f"{note}; trying the first {MAX_OA_FETCH_ATTEMPTS_PER_PAPER} of {len(candidates)} candidates"
+        candidates = candidates[:MAX_OA_FETCH_ATTEMPTS_PER_PAPER]
+    return candidates, note
+
+
 def _queue_wanted_paper(
     workspace_root: Path,
     paper: RequestedPaper,
+    deps: LiteratureDeps,
     *,
+    config: AgentConfig,
     state: _RunState,
     log_path: Path,
     action_id: str,
     run_id: str,
 ) -> None:
-    """Queue a paper the agent asked a human to obtain.
+    """Acquire a wanted paper's open-access copy if one exists; queue it otherwise.
 
-    Note what is NOT checked here: the agent's claim that this paper is relevant, or even
-    that it exists. Nothing in the queue is evidence -- a queued paper makes no assertion
-    about combustion chemistry, it only asks a person to look something up, and that
-    person can see the title, DOI and stated reason before spending any effort. The
-    evidentiary checks all still apply later, unchanged, to whatever they drop in.
+    The agent's claim that this paper is relevant is still NOT checked -- nothing in
+    the queue is evidence, and the evidentiary gates apply unchanged to whatever is
+    eventually obtained. What IS no longer taken from the agent is the paper's access
+    status: a real run queued 12 papers as ``paywalled`` on the model's say-so, of
+    which 5 were open access and never once fetched. So, before queuing:
+
+    1. Resolve OA candidates for the DOI deterministically (OpenAlex/Unpaywall --
+       never model judgement).
+    2. Fetch them in order through the ordinary guarded fetch tool. A success is
+       stored as FETCHED evidence and the paper is NOT queued.
+    3. Only then queue, with the OBSERVED reason: 401/402/403 -> ``PAYWALLED``
+       (preferred over other failures when both were seen, because a paywall is the
+       one outcome the operator can act on with a subscription), other failures ->
+       ``FETCH_FAILED``/``NOT_A_DOCUMENT``, and no candidate at all ->
+       ``NO_OPEN_ACCESS_COPY``. The detail records every URL tried and what it
+       returned; the model's relevance prose is kept, clearly labelled, and is never
+       the sole content.
     """
     doi = normalize_doi(paper.doi)
     landing_url = paper.landing_url or (f"https://doi.org/{doi}" if doi else None)
@@ -793,13 +917,45 @@ def _queue_wanted_paper(
         state.warnings.append(f"ignored a requested paper with neither a DOI nor a URL: {paper.title!r}")
         return
 
+    candidates, resolution_note = _resolve_oa_candidates(doi, deps)
+
+    attempts: list[tuple[str, str]] = []
+    observed_reason: AcquisitionReason | None = None
+    for url in candidates:
+        stored, failure_reason, outcome = _attempt_oa_fetch(workspace_root, url, deps, config=config)
+        if stored is not None:
+            if all(a.sha256 != stored.sha256 for a in state.artifacts):
+                state.artifacts.append(stored)
+            state.warnings.append(
+                f"fetched an open-access copy of {paper.title!r} from {url}; not queued for manual acquisition"
+            )
+            append_typed_event(
+                log_path,
+                event="literature.oa_copy_acquired",
+                action_id=action_id,
+                run_id=run_id,
+                payload={"doi": doi, "title": paper.title, "url": url, "sha256": stored.sha256},
+            )
+            return
+        attempts.append((url, outcome))
+        if failure_reason == AcquisitionReason.PAYWALLED or observed_reason is None:
+            observed_reason = failure_reason
+
+    if observed_reason is None:
+        reason = AcquisitionReason.NO_OPEN_ACCESS_COPY
+        observed = resolution_note
+    else:
+        reason = observed_reason
+        observed = "open-access fetch failed: " + "; ".join(f"{url} -> {outcome}" for url, outcome in attempts)
+    detail = observed if not paper.relevance else f"{observed} | agent's stated relevance: {paper.relevance}"
+
     request = record_request(
         workspace_root,
         title=paper.title,
         doi=doi,
         landing_url=landing_url,
-        reason=AcquisitionReason.PAYWALLED,
-        detail=paper.relevance,
+        reason=reason,
+        detail=detail,
     )
     if request.slug in state.acquisition_slugs:
         return
@@ -809,7 +965,13 @@ def _queue_wanted_paper(
         event="literature.paper_requested",
         action_id=action_id,
         run_id=run_id,
-        payload={"slug": request.slug, "doi": doi, "title": paper.title},
+        payload={
+            "slug": request.slug,
+            "doi": doi,
+            "title": paper.title,
+            "reason": reason.value,
+            "oa_attempts": [url for url, _ in attempts],
+        },
     )
 
 
@@ -997,7 +1159,14 @@ def _research_loop(
 
         for paper in proposal.wanted:
             _queue_wanted_paper(
-                workspace_root, paper, state=state, log_path=log_path, action_id=action_id, run_id=run_id
+                workspace_root,
+                paper,
+                deps,
+                config=config,
+                state=state,
+                log_path=log_path,
+                action_id=action_id,
+                run_id=run_id,
             )
 
         new_findings = []

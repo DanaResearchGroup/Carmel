@@ -25,7 +25,8 @@ from carmel.agents.literature_agent import (
     VerifierAssessment,
 )
 from carmel.agents.models import AgentBridgeError, MockModel
-from carmel.agents.tools.fetch import FetchError, MockFetchTool
+from carmel.agents.tools.academic import OaResolution, OpenAccessResolver
+from carmel.agents.tools.fetch import FetchError, HttpFetchTool, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
 from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
 from carmel.schemas import (
@@ -183,6 +184,7 @@ def _make_deps(
     fetch: dict[str, tuple[bytes, str]] | None = None,
     budget: AgentBudgetConfig | None = None,
     search: dict[str, list[SearchResult]] | None = None,
+    oa_resolver: Any = None,
 ) -> tuple[LiteratureDeps, MockModel, AgentConfig]:
     config = AgentConfig(budget=budget) if budget is not None else AgentConfig()
     literature_responses, verifier_responses = _split_responses(responses)
@@ -195,6 +197,7 @@ def _make_deps(
         search=MockSearchTool(search or {}),
         fetch=MockFetchTool(fetch if fetch is not None else {SOURCE_URL: (DOC.encode(), "text/plain")}),
         ledger=BudgetLedger(config.budget),
+        oa_resolver=oa_resolver,
     )
     return deps, model, config
 
@@ -1251,3 +1254,215 @@ class TestResearchLoopReachesASecondRound:
         report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         assert report.stop_reason == StopReason.NO_NEW_INFORMATION
+
+
+WANTED_DOI = "10.1039/c9re00429g"
+WANTED_TITLE = "Continuous flow synthesis under catalytic conditions in a packed bed reactor"
+OA_PDF_URL = "https://pubs.rsc.org/en/content/articlepdf/2020/re/c9re00429g"
+RELEVANCE = "direct benchmark at the campaign's exact conditions"
+
+
+class _FakeOaResolver:
+    """Canned DOI -> OaResolution, recording every resolution request."""
+
+    def __init__(self, resolutions: dict[str, OaResolution] | None = None) -> None:
+        self._resolutions = resolutions or {}
+        self.calls: list[str] = []
+
+    def resolve(self, doi: str) -> OaResolution:
+        self.calls.append(doi)
+        return self._resolutions.get(
+            doi, OaResolution(candidates=(), note="no open-access copy advertised by OpenAlex or Unpaywall")
+        )
+
+
+class _RoutedFetchTool:
+    """Per-URL outcomes: canned bytes for some URLs, a chosen HTTP status for others."""
+
+    def __init__(self, ok: dict[str, tuple[bytes, str]], statuses: dict[str, int]) -> None:
+        self._ok = MockFetchTool(ok)
+        self._statuses = statuses
+        self.fetched: list[str] = []
+
+    def fetch(self, url: str) -> tuple[Any, bytes]:
+        self.fetched.append(url)
+        if url in self._statuses:
+            raise FetchError(f"simulated failure for {url!r}", status=self._statuses[url])
+        return self._ok.fetch(url)
+
+
+def _wanted_proposal() -> dict[str, Any]:
+    proposal = _proposal(findings=[])
+    proposal["wanted"] = [{"title": WANTED_TITLE, "doi": WANTED_DOI, "relevance": RELEVANCE}]
+    return proposal
+
+
+class TestWantedPaperOpenAccessResolution:
+    """A wanted paper's access status must be OBSERVED, never asserted by the model.
+
+    The defect this class pins down: a real campaign queued 12 papers as ``paywalled``
+    on nothing but the proposing agent's say-so -- 5 of the 12 were genuinely open
+    access and Carmel never attempted a single fetch.
+    """
+
+    def test_an_open_access_copy_is_fetched_and_stored_instead_of_queued(self, campaign: Campaign) -> None:
+        resolver = _FakeOaResolver(
+            {WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="OpenAlex: 1 OA PDF candidate")}
+        )
+        deps, _, config = _make_deps(
+            [_wanted_proposal()],
+            fetch={OA_PDF_URL: (DOC.encode(), "text/plain")},
+            oa_resolver=resolver,
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert resolver.calls == [WANTED_DOI]
+        assert load_manifest(campaign.workspace_root).requests == []
+        sha = hashlib.sha256(DOC.encode()).hexdigest()
+        assert [a.sha256 for a in report.artifacts] == [sha]
+        assert (campaign.workspace_root / EVIDENCE_LITERATURE_DIR / sha / "raw.bin").exists()
+        events = read_events(campaign.workspace_root / "decision_log.jsonl")
+        acquired = [e for e in events if e["event"] == "literature.oa_copy_acquired"]
+        assert len(acquired) == 1
+        assert acquired[0]["url"] == OA_PDF_URL
+        assert acquired[0]["sha256"] == sha
+        assert not any(e["event"] == "literature.paper_requested" for e in events)
+
+    def test_candidates_are_tried_in_order_until_one_succeeds(self, campaign: Campaign) -> None:
+        second = "https://repo.example/green.pdf"
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
+        fetch = _RoutedFetchTool(ok={second: (DOC.encode(), "text/plain")}, statuses={OA_PDF_URL: 404})
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
+        deps.fetch = fetch
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert fetch.fetched == [OA_PDF_URL, second]
+        assert load_manifest(campaign.workspace_root).requests == []
+        assert [a.sha256 for a in report.artifacts] == [hashlib.sha256(DOC.encode()).hexdigest()]
+
+    def test_a_403_on_the_oa_copy_is_queued_as_an_observed_paywall(self, campaign: Campaign) -> None:
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
+        deps.fetch = _StatusFetchTool(403)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert len(requests) == 1
+        request = requests[0]
+        assert request.reason == AcquisitionReason.PAYWALLED
+        assert "HTTP 403" in request.detail
+        assert "pubs.rsc.org" in request.detail
+        assert RELEVANCE in request.detail
+        assert request.landing_url == f"https://doi.org/{WANTED_DOI}"
+        events = read_events(campaign.workspace_root / "decision_log.jsonl")
+        requested = [e for e in events if e["event"] == "literature.paper_requested"]
+        assert requested[0]["oa_attempts"] == [OA_PDF_URL]
+        assert requested[0]["reason"] == "paywalled"
+
+    def test_a_404_on_the_oa_copy_is_queued_as_fetch_failed_not_paywalled(self, campaign: Campaign) -> None:
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
+        deps.fetch = _StatusFetchTool(404)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.FETCH_FAILED]
+        assert "HTTP 404" in requests[0].detail
+
+    def test_an_observed_paywall_wins_over_an_earlier_broken_link(self, campaign: Campaign) -> None:
+        """403 is the reason the operator can act on (a subscription): if ANY candidate
+        observed one, that is the request's reason, not whichever failure came first."""
+        second = "https://pubs.example/vor.pdf"
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
+        deps.fetch = _RoutedFetchTool(ok={}, statuses={OA_PDF_URL: 404, second: 403})
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.PAYWALLED]
+        assert "HTTP 404" in requests[0].detail and "HTTP 403" in requests[0].detail
+
+    def test_an_html_landing_page_is_not_passed_off_as_the_paper(self, campaign: Campaign) -> None:
+        """The live probe found 5 of 11 advertised PDF URLs served an HTML landing page;
+        storing one as 'the paper' would silently retire the acquisition request while
+        leaving Carmel with no readable full text."""
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        deps, _, config = _make_deps(
+            [_wanted_proposal()],
+            fetch={OA_PDF_URL: (b"<html><body>Please sign in</body></html>", "text/html")},
+            oa_resolver=resolver,
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NOT_A_DOCUMENT]
+        assert "text/html" in requests[0].detail
+        assert report.artifacts == []
+
+    def test_no_oa_candidate_is_queued_with_the_truthful_reason(self, campaign: Campaign) -> None:
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver())
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert len(requests) == 1
+        assert requests[0].reason == AcquisitionReason.NO_OPEN_ACCESS_COPY
+        assert "no open-access copy advertised" in requests[0].detail
+        assert RELEVANCE in requests[0].detail
+
+    def test_without_a_resolver_the_paper_is_still_queued_without_asserting_a_paywall(self, campaign: Campaign) -> None:
+        """Even with no resolver wired (mock tier), 'paywalled' must not be recorded:
+        nothing observed a paywall."""
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=None)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert "resolver" in requests[0].detail
+
+    def test_a_wanted_paper_without_a_doi_skips_resolution(self, campaign: Campaign) -> None:
+        resolver = _FakeOaResolver()
+        proposal = _proposal(findings=[])
+        proposal["wanted"] = [{"title": WANTED_TITLE, "landing_url": "https://example.org/paper"}]
+        deps, _, config = _make_deps([proposal], oa_resolver=resolver)
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert resolver.calls == []
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert "no DOI" in requests[0].detail
+
+    def test_consent_withheld_makes_zero_network_calls_end_to_end(self, campaign: Campaign) -> None:
+        """A run with consent withheld, wired with the REAL resolver and REAL fetch
+        tool, must never open a socket: the booby-trapped opener proves it."""
+
+        def _boom(url: str, **kwargs: Any) -> Any:
+            raise AssertionError(f"network call attempted without consent: {url}")
+
+        deps, _, config = _make_deps([_wanted_proposal()])
+        deps.oa_resolver = OpenAccessResolver(
+            ledger=deps.ledger,
+            external_provider_consent=False,
+            unpaywall_email="ops@example.org",
+            opener=_boom,
+        )
+        deps.fetch = HttpFetchTool(
+            ledger=deps.ledger,
+            external_provider_consent=False,
+            opener=_boom,
+            resolver=lambda hostname: ["93.184.216.34"],
+        )
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert "consent" in requests[0].detail
