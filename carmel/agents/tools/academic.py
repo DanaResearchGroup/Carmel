@@ -27,17 +27,19 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
-from typing import Any
-from urllib.parse import quote_plus
+from dataclasses import dataclass
+from typing import Any, Protocol
+from urllib.parse import quote, quote_plus
 
 from carmel.agents.budget import BudgetLedger
-from carmel.agents.tools.search import SearchResult, budgeted_get_json, default_opener
+from carmel.agents.tools.search import SearchError, SearchResult, budgeted_get_json, default_opener
 from carmel.logger import get_logger
 
 logger = get_logger("agents.tools.academic")
 
 OPENALEX_ENDPOINT = "https://api.openalex.org/works"
 CROSSREF_ENDPOINT = "https://api.crossref.org/works"
+UNPAYWALL_ENDPOINT = "https://api.unpaywall.org/v2"
 
 #: Sent on every request so the upstream operator can identify (and contact us about)
 #: this client rather than silently rate-limiting it.
@@ -128,12 +130,18 @@ def _best_location(locations: Any) -> tuple[str | None, str]:
 
     Returns:
         ``(pdf_url, repository_display_name)``; ``(None, "")`` when nothing carries a
-        full-text URL. Repository-hosted copies win over publisher-hosted ones.
+        full-text URL. Repository-hosted copies win over publisher-hosted ones, and a
+        pdf_url on a host typed neither of those (e.g. an OpenAlex source of type
+        ``journal``) is kept as a LAST RESORT rather than dropped: this function used
+        to discard exactly those, which is one of the two ways a genuinely fetchable
+        OA PDF ended up shown to the agent as "FULL TEXT: no" (the other being
+        ``best_oa_location``, a distinct top-level field this list never contains --
+        see the fallback in :meth:`OpenAlexSearchTool.search`).
     """
     if not isinstance(locations, list):
         return None, ""
 
-    best_rank = len(_HOST_TYPE_PREFERENCE)
+    best_rank = len(_HOST_TYPE_PREFERENCE) + 1
     best: tuple[str | None, str] = (None, "")
     for location in locations:
         if not isinstance(location, dict):
@@ -152,6 +160,27 @@ def _best_location(locations: Any) -> tuple[str | None, str]:
             best_rank = rank
             best = (pdf_url, name if isinstance(name, str) else "")
     return best
+
+
+def _best_oa_location_pdf(best_oa_location: Any) -> tuple[str | None, str]:
+    """Extract ``(pdf_url, source_display_name)`` from OpenAlex ``best_oa_location``.
+
+    Args:
+        best_oa_location: The raw top-level ``best_oa_location`` value, of unknown
+            shape (it is ``None`` for non-OA works).
+
+    Returns:
+        ``(pdf_url, display_name)``, or ``(None, "")`` when there is no usable PDF URL.
+    """
+    if not isinstance(best_oa_location, dict):
+        return None, ""
+    pdf_url = best_oa_location.get("pdf_url")
+    if not isinstance(pdf_url, str) or not pdf_url:
+        return None, ""
+    source = best_oa_location.get("source")
+    source = source if isinstance(source, dict) else {}
+    name = source.get("display_name")
+    return pdf_url, name if isinstance(name, str) else ""
 
 
 def dedupe_by_doi(results: Iterable[SearchResult]) -> list[SearchResult]:
@@ -259,6 +288,11 @@ class OpenAlexSearchTool(_KeylessSearchTool):
             open_access = work.get("open_access")
             open_access = open_access if isinstance(open_access, dict) else {}
             pdf_url, repository = _best_location(work.get("locations"))
+            if pdf_url is None:
+                # ``best_oa_location`` is a TOP-LEVEL field, not an entry of
+                # ``locations[]``; ignoring it dropped real publisher OA PDFs (the
+                # queued-as-"paywalled" defect's search-side half).
+                pdf_url, repository = _best_oa_location_pdf(work.get("best_oa_location"))
 
             landing = work.get("id")
             fetch_target = pdf_url or (f"https://doi.org/{doi}" if doi else None)
@@ -365,3 +399,226 @@ def _crossref_pdf_link(links: Any) -> str | None:
         if isinstance(url, str) and url:
             return url
     return None
+
+
+# --------------------- deterministic open-access resolution ---------------------
+#
+# This exists because of a real-run defect: 12 papers were queued for manual
+# acquisition as "paywalled" purely on the proposing LLM's say-so, and 5 of the 12
+# were in fact open access (2 with a directly fetchable publisher PDF). Whether a
+# paper has an OA copy is a question for the OA indexes, keyed on DOI, in plain
+# deterministic code -- it must NEVER depend on model judgement.
+
+
+def openalex_oa_pdf_urls(work: Any) -> list[str]:
+    """Ordered OA PDF candidates from one OpenAlex work record.
+
+    ``best_oa_location.pdf_url`` comes first (for gold OA that is the publisher's
+    version of record), followed by every ``locations[].pdf_url`` whose location is
+    explicitly ``is_oa: true``. A location's pdf_url WITHOUT the OA flag is excluded:
+    using it would assert open access the index never claimed.
+
+    Args:
+        work: The raw OpenAlex work payload, of unknown/untrusted shape.
+
+    Returns:
+        Deduplicated candidate URLs in preference order; empty for unusable shapes.
+    """
+    if not isinstance(work, dict):
+        return []
+    urls: list[str] = []
+    best = work.get("best_oa_location")
+    if isinstance(best, dict):
+        pdf_url = best.get("pdf_url")
+        if isinstance(pdf_url, str) and pdf_url:
+            urls.append(pdf_url)
+    locations = work.get("locations")
+    if isinstance(locations, list):
+        for location in locations:
+            if not isinstance(location, dict) or location.get("is_oa") is not True:
+                continue
+            pdf_url = location.get("pdf_url")
+            if isinstance(pdf_url, str) and pdf_url and pdf_url not in urls:
+                urls.append(pdf_url)
+    return urls
+
+
+def unpaywall_oa_pdf_urls(payload: Any) -> list[str]:
+    """Ordered OA PDF candidates from one Unpaywall DOI record.
+
+    ``best_oa_location.url_for_pdf`` first, then every ``oa_locations[].url_for_pdf``.
+    Everything in ``oa_locations`` is open access by construction of the API.
+
+    Args:
+        payload: The raw Unpaywall response payload, of unknown/untrusted shape.
+
+    Returns:
+        Deduplicated candidate URLs in preference order; empty for unusable shapes.
+    """
+    if not isinstance(payload, dict):
+        return []
+    urls: list[str] = []
+    best = payload.get("best_oa_location")
+    if isinstance(best, dict):
+        url_for_pdf = best.get("url_for_pdf")
+        if isinstance(url_for_pdf, str) and url_for_pdf:
+            urls.append(url_for_pdf)
+    oa_locations = payload.get("oa_locations")
+    if isinstance(oa_locations, list):
+        for location in oa_locations:
+            if not isinstance(location, dict):
+                continue
+            url_for_pdf = location.get("url_for_pdf")
+            if isinstance(url_for_pdf, str) and url_for_pdf and url_for_pdf not in urls:
+                urls.append(url_for_pdf)
+    return urls
+
+
+@dataclass(frozen=True)
+class OaResolution:
+    """The outcome of one DOI's open-access resolution.
+
+    ``note`` is a human-readable account of what resolution actually did (which
+    indexes were consulted, which were skipped and why, how many candidates each
+    advertised). It exists so a paper queued with
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.NO_OPEN_ACCESS_COPY` can
+    show the operator an honest ``detail`` -- "skipped: consent withheld" and "both
+    indexes advertise nothing" are very different facts and must not collapse into
+    one wording.
+    """
+
+    candidates: tuple[str, ...]
+    """OA PDF URLs to try fetching, best first, deduplicated across indexes."""
+    note: str
+
+
+class OpenAccessResolverProtocol(Protocol):
+    """Structural type for anything that can resolve a DOI to OA PDF candidates."""
+
+    def resolve(self, doi: str) -> OaResolution: ...
+
+
+class OpenAccessResolver(_KeylessSearchTool):
+    """DOI -> open-access PDF candidates, via OpenAlex and Unpaywall.
+
+    Both lookups go through :func:`~carmel.agents.tools.search.budgeted_get_json`
+    (inherited ``_get``), so budget reservation happens before any socket opens and
+    the ``external_provider_consent`` gate applies -- belt and braces, since
+    :meth:`resolve` also refuses up front when consent is withheld, making a
+    consent-less run provably network-silent.
+
+    Unpaywall REQUIRES a contact email as a condition of use. When none is
+    configured the Unpaywall lookup is skipped entirely (one warning per resolver,
+    not one per paper); a fake or placeholder address is never sent.
+    """
+
+    def __init__(
+        self,
+        *,
+        ledger: BudgetLedger,
+        external_provider_consent: bool,
+        contact_email: str | None = None,
+        unpaywall_email: str | None = None,
+        opener: Callable[..., Any] | None = None,
+        timeout_s: float = 30.0,
+    ) -> None:
+        """Construct the resolver.
+
+        Args:
+            ledger: Budget ledger; every lookup is reserved and settled through it.
+            external_provider_consent: Operator opt-in to third-party network egress.
+            contact_email: Optional OpenAlex "polite pool" address (``mailto=``).
+            unpaywall_email: Contact email REQUIRED by Unpaywall; ``None`` skips
+                Unpaywall entirely rather than sending a fabricated address.
+            opener: Injected ``(url, headers=..., timeout_s=...) -> response`` opener,
+                for tests. Defaults to a real urllib GET.
+            timeout_s: Per-request socket timeout.
+        """
+        super().__init__(
+            ledger=ledger,
+            external_provider_consent=external_provider_consent,
+            contact_email=contact_email,
+            opener=opener,
+            timeout_s=timeout_s,
+        )
+        self._unpaywall_email = unpaywall_email
+        self._warned_unpaywall_skipped = False
+
+    def resolve(self, doi: str) -> OaResolution:
+        """Resolve one DOI to fetchable OA PDF candidates.
+
+        Args:
+            doi: Bare, normalized DOI (``10.xxxx/yyy``).
+
+        Returns:
+            Candidates in preference order -- OpenAlex first (its
+            ``best_oa_location`` leads, so a publisher OA PDF precedes repository
+            copies), then any Unpaywall-only URLs -- plus an honest note of what was
+            consulted. One index failing never loses the other's candidates.
+
+        Raises:
+            BudgetExceededError: Propagated from the ledger; a budget ceiling is a
+                run-level condition, not a per-paper resolution outcome.
+        """
+        if not self._external_provider_consent:
+            return OaResolution(
+                candidates=(),
+                note="open-access resolution skipped: external_provider_consent is False",
+            )
+
+        notes: list[str] = []
+        candidates: list[str] = []
+
+        openalex_url = f"{OPENALEX_ENDPOINT}/doi:{quote(doi, safe='/')}"
+        if self._contact_email:
+            openalex_url = f"{openalex_url}?mailto={quote_plus(self._contact_email)}"
+        for url in self._lookup(openalex_url, "OpenAlex", openalex_oa_pdf_urls, notes):
+            if url not in candidates:
+                candidates.append(url)
+
+        if not self._unpaywall_email:
+            if not self._warned_unpaywall_skipped:
+                self._warned_unpaywall_skipped = True
+                logger.warning(
+                    "Unpaywall lookups are skipped: no contact email configured "
+                    "(set agents.unpaywall_email or the CARMEL_UNPAYWALL_EMAIL "
+                    "environment variable); Unpaywall requires a real address and "
+                    "Carmel will not send a fabricated one"
+                )
+            notes.append("Unpaywall: skipped (no contact email configured)")
+        else:
+            unpaywall_url = f"{UNPAYWALL_ENDPOINT}/{quote(doi, safe='/')}?email={quote_plus(self._unpaywall_email)}"
+            for url in self._lookup(unpaywall_url, "Unpaywall", unpaywall_oa_pdf_urls, notes):
+                if url not in candidates:
+                    candidates.append(url)
+
+        return OaResolution(candidates=tuple(candidates), note="; ".join(notes))
+
+    def _lookup(
+        self,
+        url: str,
+        index_name: str,
+        parse: Callable[[Any], list[str]],
+        notes: list[str],
+    ) -> list[str]:
+        """One budgeted index lookup; transport failure yields no candidates, loudly.
+
+        Args:
+            url: Fully-formed lookup URL.
+            index_name: Human-readable index name for the note.
+            parse: Payload -> candidate URLs parser.
+            notes: Accumulator the outcome sentence is appended to.
+
+        Returns:
+            The parsed candidates (empty on failure/unusable payload).
+        """
+        try:
+            payload = self._get(url)
+        except SearchError as exc:
+            logger.warning("%s OA lookup failed: %s", index_name, exc)
+            notes.append(f"{index_name}: lookup failed ({exc})")
+            return []
+        urls = parse(payload)
+        plural = "" if len(urls) == 1 else "s"
+        notes.append(f"{index_name}: {len(urls)} OA PDF candidate{plural}")
+        return urls

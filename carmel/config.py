@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from enum import StrEnum
 from pathlib import Path
@@ -165,6 +166,12 @@ class SearchProvider(StrEnum):
 #: one of the fail-closed branches in ``carmel.services.literature.build_deps``.
 KEYLESS_SEARCH_PROVIDERS: frozenset[SearchProvider] = frozenset({SearchProvider.OPENALEX, SearchProvider.CROSSREF})
 
+#: Environment-variable fallback for :attr:`AgentConfig.unpaywall_email`. Holds the
+#: operator's contact email itself (not the name of another variable): an email
+#: address is deploy-time operator PII that must never be committed to the repo, and
+#: an env var is the standard way to supply exactly that.
+UNPAYWALL_EMAIL_ENV = "CARMEL_UNPAYWALL_EMAIL"
+
 
 #: Model each tier uses when the operator does not name one.
 #:
@@ -324,6 +331,16 @@ class AgentConfig(BaseModel):
     Optional: both APIs answer without it, but at a much lower rate limit and with no
     way for the operator to be told about a misbehaving client before being blocked.
     """
+    unpaywall_email: str | None = None
+    """Contact email sent to the Unpaywall API, which REQUIRES one as a condition of
+    use (``api.unpaywall.org/v2/{doi}?email=...``).
+
+    Deliberately optional with no default: this is operator PII and must be supplied
+    per deployment (here, or via the :data:`UNPAYWALL_EMAIL_ENV` environment
+    variable) -- never hardcoded in the repository. When neither is set, Unpaywall is
+    skipped entirely; Carmel never sends a fake or placeholder address, which would
+    violate Unpaywall's API terms. See :meth:`resolved_unpaywall_email`.
+    """
     external_provider_consent: bool = False
     literature_at_campaign_start: bool = True
     budget: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
@@ -359,3 +376,13 @@ class AgentConfig(BaseModel):
     def resolved_model_name(self) -> str:
         """Return model_name if set, else the tier's default model."""
         return self.model_name or DEFAULT_TIER_MODELS[self.tier]
+
+    def resolved_unpaywall_email(self) -> str | None:
+        """The Unpaywall contact email: config field first, then the environment.
+
+        Returns:
+            :attr:`unpaywall_email` when set, else a non-empty
+            :data:`UNPAYWALL_EMAIL_ENV` environment value, else ``None`` -- in which
+            case Unpaywall must be skipped (never called with a fabricated address).
+        """
+        return self.unpaywall_email or os.environ.get(UNPAYWALL_EMAIL_ENV) or None

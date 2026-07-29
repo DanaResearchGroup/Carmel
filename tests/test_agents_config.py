@@ -7,6 +7,7 @@ from pydantic import ValidationError
 
 from carmel.config import (
     DEFAULT_TIER_MODELS,
+    UNPAYWALL_EMAIL_ENV,
     AgentBudgetConfig,
     AgentConfig,
     AgentProvider,
@@ -171,3 +172,27 @@ class TestCarmelConfigAgentsField:
         config = CarmelConfig(**valid_config_data, agents={"tier": "test", "provider": "mock"})
         assert config.agents is not None
         assert config.agents.provider == AgentProvider.MOCK
+
+
+class TestUnpaywallEmail:
+    """The Unpaywall contact email: required by their API, PII never hardcoded."""
+
+    def test_field_defaults_to_none(self) -> None:
+        assert AgentConfig().unpaywall_email is None
+
+    def test_config_field_wins_over_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(UNPAYWALL_EMAIL_ENV, "env@example.org")
+        cfg = AgentConfig(unpaywall_email="cfg@example.org")
+        assert cfg.resolved_unpaywall_email() == "cfg@example.org"
+
+    def test_environment_variable_is_the_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(UNPAYWALL_EMAIL_ENV, "env@example.org")
+        assert AgentConfig().resolved_unpaywall_email() == "env@example.org"
+
+    def test_nothing_configured_resolves_to_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv(UNPAYWALL_EMAIL_ENV, raising=False)
+        assert AgentConfig().resolved_unpaywall_email() is None
+
+    def test_empty_env_value_counts_as_unset(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(UNPAYWALL_EMAIL_ENV, "")
+        assert AgentConfig().resolved_unpaywall_email() is None
