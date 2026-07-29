@@ -30,6 +30,20 @@ _ESTIMATED_SEARCH_BYTES = 65536
 CHUNK_SIZE = 65536
 
 
+class SearchError(RuntimeError):
+    """Raised for a search backend transport failure (P1-12).
+
+    Mirrors :class:`carmel.agents.tools.fetch.FetchError`'s role exactly: a single
+    query's 503, DNS blip, or timeout describes THAT backend call, not the campaign,
+    so it must surface as a typed, catchable outcome instead of a bare exception. A
+    bare ``BaseException`` propagating out of ``HttpSearchTool.search`` used to
+    escape every handler in ``_research_loop``/``run_literature_research`` (neither
+    ``BudgetExceededError`` nor ``AgentBridgeError``) and crash the entire literature
+    run, discarding every finding/artifact already paid for in earlier rounds instead
+    of producing the documented PARTIAL report.
+    """
+
+
 class SearchResult(BaseModel):
     """A single search hit."""
 
@@ -88,6 +102,7 @@ class HttpSearchTool:
         endpoint: str,
         api_key: str,
         ledger: BudgetLedger,
+        external_provider_consent: bool,
         opener: Callable[..., Any] | None = None,
         timeout_s: float = 30.0,
     ) -> None:
@@ -97,6 +112,10 @@ class HttpSearchTool:
             endpoint: Base search API URL. Must be non-empty.
             api_key: API key sent via header. Must be non-empty.
             ledger: Budget ledger; every search call is reserved and settled through it.
+            external_provider_consent: Whether the operator has agreed to let Carmel
+                talk to third-party hosts. Required, with no default: search egress was
+                previously ungated entirely, and a default would let a caller re-acquire
+                that hole by omission.
             opener: Injected ``(url, headers=..., timeout_s=...) -> response`` opener,
                 for tests. Defaults to a real urllib GET.
             timeout_s: Per-request socket timeout.
@@ -113,6 +132,7 @@ class HttpSearchTool:
         self._endpoint = endpoint
         self._api_key = api_key
         self._ledger = ledger
+        self._external_provider_consent = external_provider_consent
         self._opener = opener if opener is not None else default_opener
         self._timeout_s = timeout_s
 
@@ -126,6 +146,10 @@ class HttpSearchTool:
         Returns:
             Parsed search results. Returns an empty list (never raises) when the
             response has an unexpected JSON shape.
+
+        Raises:
+            SearchError: On a transport failure (P1-12) -- see ``budgeted_get_json``.
+            BudgetExceededError: Propagated from the reservation or the mid-stream check.
         """
         query_string = urlencode({"q": query, "limit": limit})
         url = f"{self._endpoint}?{query_string}"
@@ -137,6 +161,7 @@ class HttpSearchTool:
             ledger=self._ledger,
             opener=self._opener,
             timeout_s=self._timeout_s,
+            external_provider_consent=self._external_provider_consent,
         )
         if payload is None:
             return []
@@ -150,6 +175,7 @@ def budgeted_get_json(
     ledger: BudgetLedger,
     opener: Callable[..., Any],
     timeout_s: float,
+    external_provider_consent: bool,
 ) -> Any | None:
     """GET ``url`` under full budget discipline and parse it as JSON.
 
@@ -166,13 +192,33 @@ def budgeted_get_json(
         ledger: Budget ledger; the call is reserved and settled through it.
         opener: ``(url, headers=..., timeout_s=...) -> response`` opener.
         timeout_s: Per-request socket timeout.
+        external_provider_consent: Operator opt-in to third-party network egress.
 
     Returns:
         The parsed JSON payload, or ``None`` when the body was not valid JSON.
 
     Raises:
         BudgetExceededError: Propagated from the reservation or the mid-stream check.
+        SearchError: When ``external_provider_consent`` is False. Every search backend
+            reaches the network through this one function, so gating here covers
+            ``HttpSearchTool`` and both keyless scholarly tools at once. Without it the
+            consent flag was enforced only for LLM calls and (since the fetch fix) for
+            artifact fetches, leaving search egress ungated -- so "no network without
+            explicit opt-in" was simply untrue for the OpenAlex/Crossref queries that
+            begin every literature run.
+        SearchError: On any transport failure opening the request (P1-12) --
+            connection refused, DNS failure, timeout, or a non-2xx HTTP status the
+            opener raises as an exception. Normalized the same way
+            ``HttpFetchTool.fetch`` normalizes its own opener call, so callers get one
+            typed, catchable outcome instead of whatever exception type the
+            underlying transport happened to raise.
     """
+    # Fail closed BEFORE reserving budget or opening a socket, mirroring
+    # ``HttpFetchTool.fetch``. This is the single egress choke point for every search
+    # backend, keyed or keyless.
+    if not external_provider_consent:
+        raise SearchError("external_provider_consent is False; refusing to run any search query")
+
     with ledger.fetch_call(estimated_bytes=_ESTIMATED_SEARCH_BYTES) as reservation:
         # Finding 10: a failed search attempt still consumed a real outbound request
         # and whatever bytes actually crossed the wire before it failed. ``total``
@@ -182,7 +228,10 @@ def budgeted_get_json(
         # worst-case ``reserved_bytes`` charge.
         total = 0
         try:
-            response = opener(url, headers=headers, timeout_s=timeout_s)
+            try:
+                response = opener(url, headers=headers, timeout_s=timeout_s)
+            except Exception as exc:  # noqa: BLE001 - normalize all transport errors (P1-12)
+                raise SearchError(f"search request failed for {url!r}: {exc}") from exc
             try:
                 chunks: list[bytes] = []
                 while True:

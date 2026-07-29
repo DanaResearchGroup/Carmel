@@ -131,6 +131,19 @@ def is_safe_url(url: str, *, resolver: Callable[[str], list[str]] | None = None)
         present; the port (if any) is ``80`` or ``443``; and every resolved address
         (A and AAAA) is global. A hostname that fails to resolve is treated as unsafe
         (fail closed).
+
+    Known, accepted residual gap (DNS-rebinding TOCTOU, not fixed by this function):
+        this resolves ``hostname`` and validates THOSE addresses, but the actual
+        connection is made later by urllib inside ``_default_opener``/``HttpFetchTool``,
+        which independently re-resolves the same hostname via its own DNS lookup. An
+        attacker who controls authoritative DNS for the hostname (e.g. a TTL-0 record)
+        can serve a public, globally-routable address to THIS check and then serve a
+        private/internal address to urllib's later, independent resolution -- the
+        classic rebinding window between check-time and use-time. Closing this
+        requires resolving once and connecting to that exact validated address (e.g.
+        pinning the IP into the request and setting the Host header separately), which
+        is deliberately out of scope for this pass; this docstring only makes the
+        limitation explicit so it is not mistaken for full protection.
     """
     try:
         parts = urlsplit(url)
@@ -287,6 +300,7 @@ class HttpFetchTool:
         self,
         *,
         ledger: BudgetLedger,
+        external_provider_consent: bool,
         max_redirects: int = 3,
         timeout_s: float = 30.0,
         max_artifact_bytes: int = 25_000_000,
@@ -297,6 +311,16 @@ class HttpFetchTool:
 
         Args:
             ledger: Budget ledger; every fetch is reserved and settled through it.
+            external_provider_consent: Whether the operator has consented to Carmel
+                making real, unmediated outbound HTTP calls to third-party hosts.
+                ``build_model`` (see ``carmel/agents/models.py``) already gates LLM
+                calls on this same flag, but that check lived ONLY there: nothing
+                previously stopped an ``HttpFetchTool`` from being constructed and used
+                to reach arbitrary, LLM-chosen URLs regardless of consent. This is a
+                required keyword (no default) precisely so every call site is forced to
+                make an explicit decision rather than silently inheriting a permissive
+                default -- constructing this tool with consent not yet obtained is
+                itself the bug this parameter exists to catch.
             max_redirects: Maximum number of redirect hops to follow.
             timeout_s: Per-request socket timeout.
             max_artifact_bytes: Hard cap on a single artifact's size.
@@ -305,6 +329,7 @@ class HttpFetchTool:
             resolver: Injected hostname resolver passed through to ``is_safe_url``.
         """
         self._ledger = ledger
+        self._external_provider_consent = external_provider_consent
         self._max_redirects = max_redirects
         self._timeout_s = timeout_s
         self._max_artifact_bytes = max_artifact_bytes
@@ -321,9 +346,13 @@ class HttpFetchTool:
             Tuple of (metadata, raw bytes).
 
         Raises:
-            FetchError: On an unsafe URL, redirect scheme violation, too many
-                redirects, an oversized response, or any transport error.
+            FetchError: On missing consent, an unsafe URL, redirect scheme violation,
+                too many redirects, an oversized response, or any transport error.
         """
+        # Fail closed BEFORE the SSRF check even runs: without consent, no outbound
+        # egress of any shape is permitted, safe-looking or not.
+        if not self._external_provider_consent:
+            raise FetchError("external_provider_consent is False; refusing to fetch any URL")
         if not is_safe_url(url, resolver=self._resolver):
             raise FetchError(f"unsafe URL rejected: {url!r}")
 

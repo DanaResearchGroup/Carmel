@@ -19,11 +19,13 @@ The orchestration that enforces this ordering lives in
 from __future__ import annotations
 
 from collections.abc import Sequence
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from carmel.agents.bridge import AgentTool, CarmelAgent, ModelProtocol
 from carmel.agents.budget import BudgetLedger
+from carmel.schemas.acquisition import ALLOWED_LANDING_URL_SCHEMES as _ALLOWED_LANDING_URL_SCHEMES
 from carmel.schemas.literature import Citation, CredenceVerdict, FindingPayload
 
 __all__ = [
@@ -86,6 +88,28 @@ class RequestedPaper(BaseModel):
     doi: str | None = None
     landing_url: str | None = None
     """Where the paper can be obtained, if the search result gave one."""
+
+    @field_validator("landing_url")
+    @classmethod
+    def _reject_unsafe_url_scheme(cls, value: str | None) -> str | None:
+        """Reject any scheme but http/https.
+
+        This field is proposed by the LLM and flows into the operator dashboard's
+        "obtain" link, so it is attacker-influenceable via prompt injection in fetched
+        page content. Jinja autoescaping stops attribute breakout but not a
+        ``javascript:`` or ``data:`` URI, which would execute in the operator's
+        authenticated session. Validating here means the value cannot reach any renderer
+        that forgets to re-check it -- and it is the same rule
+        :class:`carmel.schemas.acquisition.AcquisitionRequest` enforces, which is where
+        this value ends up.
+        """
+        if value is None:
+            return None
+        scheme = urlsplit(value).scheme.lower()
+        if scheme not in _ALLOWED_LANDING_URL_SCHEMES:
+            raise ValueError(f"landing_url scheme {scheme!r} is not allowed; must be http or https")
+        return value
+
     relevance: str = Field(default="", max_length=500)
     """Why this paper is worth a human's effort -- shown to the operator, who is being
     asked to spend real time on it and deserves to know what it is for."""

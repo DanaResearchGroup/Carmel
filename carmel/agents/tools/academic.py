@@ -190,6 +190,7 @@ class _KeylessSearchTool:
         self,
         *,
         ledger: BudgetLedger,
+        external_provider_consent: bool,
         contact_email: str | None = None,
         opener: Callable[..., Any] | None = None,
         timeout_s: float = 30.0,
@@ -198,6 +199,8 @@ class _KeylessSearchTool:
 
         Args:
             ledger: Budget ledger; every search call is reserved and settled through it.
+            external_provider_consent: Operator opt-in to third-party network egress.
+                Required, with no default -- see ``budgeted_get_json``.
             contact_email: Optional address for the API's "polite pool" (higher rate
                 limits). Omitted from the URL entirely when not supplied.
             opener: Injected ``(url, headers=..., timeout_s=...) -> response`` opener,
@@ -205,6 +208,7 @@ class _KeylessSearchTool:
             timeout_s: Per-request socket timeout.
         """
         self._ledger = ledger
+        self._external_provider_consent = external_provider_consent
         self._contact_email = contact_email
         self._opener = opener if opener is not None else default_opener
         self._timeout_s = timeout_s
@@ -217,6 +221,7 @@ class _KeylessSearchTool:
             ledger=self._ledger,
             opener=self._opener,
             timeout_s=self._timeout_s,
+            external_provider_consent=self._external_provider_consent,
         )
 
 

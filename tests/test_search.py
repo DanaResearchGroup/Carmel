@@ -8,7 +8,8 @@ from collections.abc import Iterator
 import pytest
 
 from carmel.agents.budget import BudgetExceededError, BudgetLedger, session_budget
-from carmel.agents.tools.search import CHUNK_SIZE, HttpSearchTool, MockSearchTool, SearchResult
+from carmel.agents.tools.academic import OpenAlexSearchTool
+from carmel.agents.tools.search import CHUNK_SIZE, HttpSearchTool, MockSearchTool, SearchError, SearchResult
 from carmel.config import AgentBudgetConfig
 
 
@@ -47,12 +48,14 @@ class TestHttpSearchToolConfig:
     def test_raises_when_endpoint_empty(self) -> None:
         ledger = make_ledger()
         with pytest.raises(ValueError):
-            HttpSearchTool(endpoint="", api_key="key", ledger=ledger)
+            HttpSearchTool(external_provider_consent=True, endpoint="", api_key="key", ledger=ledger)
 
     def test_raises_when_api_key_empty(self) -> None:
         ledger = make_ledger()
         with pytest.raises(ValueError):
-            HttpSearchTool(endpoint="https://search.example/v1", api_key="", ledger=ledger)
+            HttpSearchTool(
+                external_provider_consent=True, endpoint="https://search.example/v1", api_key="", ledger=ledger
+            )
 
 
 class TestHttpSearchToolRequest:
@@ -66,7 +69,11 @@ class TestHttpSearchToolRequest:
             return FakeSearchResponse(json.dumps({"results": []}).encode())
 
         tool = HttpSearchTool(
-            endpoint="https://search.example/v1", api_key="super-secret-key", ledger=ledger, opener=opener
+            external_provider_consent=True,
+            endpoint="https://search.example/v1",
+            api_key="super-secret-key",
+            ledger=ledger,
+            opener=opener,
         )
         tool.search("acetone ignition delay")
 
@@ -83,7 +90,13 @@ class TestHttpSearchToolRequest:
             captured["url"] = url
             return FakeSearchResponse(json.dumps([]).encode())
 
-        tool = HttpSearchTool(endpoint="https://search.example/v1", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True,
+            endpoint="https://search.example/v1",
+            api_key="k",
+            ledger=ledger,
+            opener=opener,
+        )
         tool.search("a b c")
 
         assert "q=a" in str(captured["url"])
@@ -95,7 +108,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(json.dumps(payload).encode())
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
         results = tool.search("q")
 
         assert results == [SearchResult(title="T1", url="http://x/1")]
@@ -108,7 +123,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(json.dumps(payload).encode())
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
         results = tool.search("q")
 
         assert results == [SearchResult(title="T", url="http://x/", snippet="s", source="src")]
@@ -119,7 +136,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(json.dumps({"totally": "unexpected"}).encode())
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
 
         assert tool.search("q") == []
 
@@ -129,7 +148,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(b"not json{{{")
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
 
         assert tool.search("q") == []
 
@@ -140,7 +161,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(json.dumps(payload).encode())
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
         results = tool.search("q")
 
         assert len(results) == 1
@@ -153,7 +176,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(json.dumps(payload).encode())
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
         results = tool.search("q", limit=3)
 
         assert len(results) == 3
@@ -165,7 +190,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
             return FakeSearchResponse(payload)
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
         tool.search("q")
 
         assert ledger.usage().fetch_bytes == len(payload)
@@ -179,7 +206,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float):
             raise RuntimeError("network down")
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
 
         with pytest.raises(RuntimeError):
             tool.search("q")
@@ -210,7 +239,9 @@ class TestHttpSearchToolRequest:
         def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> CountingResponse:
             return response
 
-        tool = HttpSearchTool(endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener)
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
 
         with pytest.raises(BudgetExceededError):
             tool.search("q")
@@ -245,3 +276,61 @@ class TestMockSearchTool:
         tool = MockSearchTool({"q": results})
 
         assert len(tool.search("q", limit=2)) == 2
+
+
+class TestSearchEgressRequiresConsent:
+    """Search was the last ungated network path.
+
+    ``external_provider_consent`` gated LLM calls and (later) artifact fetches, but not
+    the OpenAlex/Crossref queries that OPEN every literature run -- so the documented
+    "no network without explicit opt-in" property was false for the first thing a run
+    does. These tests pin the gate at ``budgeted_get_json``, the single choke point every
+    backend shares, so a new backend cannot reintroduce the hole by not asking.
+    """
+
+    def test_http_search_tool_refuses_without_consent(self) -> None:
+        ledger = make_ledger()
+        called: list[str] = []
+
+        def _opener(url: str, **_: object) -> object:
+            called.append(url)
+            raise AssertionError("must not open a socket without consent")
+
+        tool = HttpSearchTool(
+            endpoint="https://search.example/v1",
+            api_key="k",
+            ledger=ledger,
+            external_provider_consent=False,
+            opener=_opener,
+        )
+        with pytest.raises(SearchError, match="external_provider_consent"):
+            tool.search("ignition delay n-heptane")
+        assert called == []
+
+    def test_refusal_happens_before_any_budget_is_reserved(self) -> None:
+        """A refused call must not consume budget: it never reached the network."""
+        ledger = make_ledger()
+        before = ledger.usage()
+        tool = HttpSearchTool(
+            endpoint="https://search.example/v1",
+            api_key="k",
+            ledger=ledger,
+            external_provider_consent=False,
+            opener=lambda *a, **k: None,
+        )
+        with pytest.raises(SearchError):
+            tool.search("q")
+        after = ledger.usage()
+        # Compare only the fetch dimensions: BudgetUsage also carries elapsed wall-clock,
+        # which advances regardless and would make this assertion vacuously false.
+        assert (after.fetches, after.fetch_bytes) == (before.fetches, before.fetch_bytes)
+
+    def test_keyless_backends_are_gated_by_the_same_choke_point(self) -> None:
+        ledger = make_ledger()
+        tool = OpenAlexSearchTool(
+            ledger=ledger,
+            external_provider_consent=False,
+            opener=lambda *a, **k: None,
+        )
+        with pytest.raises(SearchError, match="external_provider_consent"):
+            tool.search("ignition delay")

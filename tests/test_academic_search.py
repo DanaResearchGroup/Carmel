@@ -111,7 +111,7 @@ class TestOpenAlexSearchTool:
                 }
             ]
         }
-        tool = OpenAlexSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
 
         results = tool.search("methane ignition delay")
 
@@ -133,7 +133,7 @@ class TestOpenAlexSearchTool:
                 }
             ]
         }
-        tool = OpenAlexSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
 
         results = tool.search("ammonia flame speed")
 
@@ -153,18 +153,25 @@ class TestOpenAlexSearchTool:
                 }
             ]
         }
-        tool = OpenAlexSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
 
         assert tool.search("q")[0].snippet == "Ignition delay measured"
 
     def test_contact_email_is_sent_only_when_configured(self, ledger: BudgetLedger) -> None:
         seen: list[str] = []
-        tool = OpenAlexSearchTool(ledger=ledger, opener=_opener_for({"results": []}, seen))
+        tool = OpenAlexSearchTool(
+            external_provider_consent=True, ledger=ledger, opener=_opener_for({"results": []}, seen)
+        )
         tool.search("q")
         assert "mailto=" not in seen[0]
 
         seen.clear()
-        polite = OpenAlexSearchTool(ledger=ledger, contact_email="a@b.org", opener=_opener_for({"results": []}, seen))
+        polite = OpenAlexSearchTool(
+            external_provider_consent=True,
+            ledger=ledger,
+            contact_email="a@b.org",
+            opener=_opener_for({"results": []}, seen),
+        )
         polite.search("q")
         assert "mailto=a%40b.org" in seen[0]
 
@@ -173,11 +180,11 @@ class TestOpenAlexSearchTool:
         [{}, {"results": "nope"}, {"results": [None, 3]}, [], "garbage", {"results": [{}]}],
     )
     def test_malformed_payloads_yield_no_results_rather_than_raising(self, ledger: BudgetLedger, payload: Any) -> None:
-        tool = OpenAlexSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
         assert tool.search("q") == []
 
     def test_search_is_charged_to_the_ledger(self, ledger: BudgetLedger) -> None:
-        tool = OpenAlexSearchTool(ledger=ledger, opener=_opener_for({"results": []}))
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for({"results": []}))
         before = ledger.usage().fetches
         tool.search("q")
         assert ledger.usage().fetches == before + 1
@@ -210,7 +217,7 @@ class TestCrossrefSearchTool:
                 ]
             }
         }
-        tool = CrossrefSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = CrossrefSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
 
         results = tool.search("methane mechanisms")
 
@@ -232,20 +239,20 @@ class TestCrossrefSearchTool:
                 ]
             }
         }
-        tool = CrossrefSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = CrossrefSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
 
         assert tool.search("q")[0].pdf_url == "https://x.example/full.pdf"
 
     def test_never_claims_open_access_since_crossref_does_not_report_it(self, ledger: BudgetLedger) -> None:
         payload = {"message": {"items": [{"type": "journal-article", "DOI": "10.1/a", "title": ["A"]}]}}
-        tool = CrossrefSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = CrossrefSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
         assert tool.search("q")[0].is_open_access is False
 
     @pytest.mark.parametrize(
         "payload", [{}, {"message": {}}, {"message": {"items": "no"}}, {"message": {"items": [{}]}}]
     )
     def test_malformed_payloads_yield_no_results_rather_than_raising(self, ledger: BudgetLedger, payload: Any) -> None:
-        tool = CrossrefSearchTool(ledger=ledger, opener=_opener_for(payload))
+        tool = CrossrefSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
         assert tool.search("q") == []
 
 

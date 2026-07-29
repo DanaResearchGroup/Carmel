@@ -188,7 +188,7 @@ class TestHttpFetchTool:
         body = b"<html>hello</html>"
         response = FakeResponse([body], headers={"Content-Type": "application/pdf"}, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER)
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=True, opener=opener, resolver=PUBLIC_RESOLVER)
 
         artifact, data = tool.fetch("http://good.example/")
 
@@ -203,10 +203,26 @@ class TestHttpFetchTool:
     def test_rejects_unsafe_url_before_any_open(self) -> None:
         ledger = make_ledger()
         opener = make_opener({})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=resolver_map({}))
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=True, opener=opener, resolver=resolver_map({}))
 
         with pytest.raises(FetchError):
             tool.fetch("http://localhost/")
+
+        assert opener.calls == []  # type: ignore[attr-defined]
+
+    def test_refuses_to_fetch_without_external_provider_consent(self) -> None:
+        # Regression for the P1-informational gap: `build_model` was the ONLY place
+        # `external_provider_consent` was ever checked, so nothing stopped this tool
+        # from reaching arbitrary, LLM-chosen URLs even when the operator had not
+        # consented to real outbound network calls. This must fail closed BEFORE the
+        # SSRF check even runs, and before the opener is ever called -- an
+        # even-safe-looking URL must still be refused.
+        ledger = make_ledger()
+        opener = make_opener({"http://good.example/": FakeResponse([b"hi"], url="http://good.example/")})
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=False, opener=opener, resolver=PUBLIC_RESOLVER)
+
+        with pytest.raises(FetchError, match="external_provider_consent"):
+            tool.fetch("http://good.example/")
 
         assert opener.calls == []  # type: ignore[attr-defined]
 
@@ -215,7 +231,7 @@ class TestHttpFetchTool:
         first = FakeResponse([], status=302, headers={"Location": "http://evil.example/"}, url="http://good.example/")
         resolver = resolver_map({"good.example": ["93.184.216.34"], "evil.example": ["10.0.0.1"]})
         opener = make_opener({"http://good.example/": first})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=resolver)
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=True, opener=opener, resolver=resolver)
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -235,7 +251,9 @@ class TestHttpFetchTool:
                 "http://redirect.example/4": hop4,
             }
         )
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=resolver, max_redirects=2)
+        tool = HttpFetchTool(
+            ledger=ledger, external_provider_consent=True, opener=opener, resolver=resolver, max_redirects=2
+        )
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -247,7 +265,13 @@ class TestHttpFetchTool:
         chunks = [big_chunk] * 20
         response = FakeResponse(chunks, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER, max_artifact_bytes=10)
+        tool = HttpFetchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            resolver=PUBLIC_RESOLVER,
+            max_artifact_bytes=10,
+        )
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -260,7 +284,13 @@ class TestHttpFetchTool:
         ledger = make_ledger(max_artifact_bytes=10)
         response = FakeResponse([b"x" * 100], headers={"Content-Length": "1000000"}, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER, max_artifact_bytes=10)
+        tool = HttpFetchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            resolver=PUBLIC_RESOLVER,
+            max_artifact_bytes=10,
+        )
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -275,7 +305,13 @@ class TestHttpFetchTool:
         chunks = [b"x" * CHUNK_SIZE] * 5
         response = FakeResponse(chunks, headers={"Content-Length": "5"}, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER, max_artifact_bytes=10)
+        tool = HttpFetchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            resolver=PUBLIC_RESOLVER,
+            max_artifact_bytes=10,
+        )
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -286,7 +322,7 @@ class TestHttpFetchTool:
         body = b"hello world"
         response = FakeResponse([body], url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER)
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=True, opener=opener, resolver=PUBLIC_RESOLVER)
 
         tool.fetch("http://good.example/")
 
@@ -309,7 +345,9 @@ class TestHttpFetchTool:
             usage_during_opener["fetches"] = ledger.usage().fetches
             raise RuntimeError("boom")
 
-        tool = HttpFetchTool(ledger=ledger, opener=_raising_opener, resolver=PUBLIC_RESOLVER)
+        tool = HttpFetchTool(
+            ledger=ledger, external_provider_consent=True, opener=_raising_opener, resolver=PUBLIC_RESOLVER
+        )
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -329,7 +367,13 @@ class TestHttpFetchTool:
         ledger = make_ledger(max_artifact_bytes=10, max_fetches=1)
         response = FakeResponse([b"x" * 100], headers={"Content-Length": "1000000"}, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER, max_artifact_bytes=10)
+        tool = HttpFetchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            resolver=PUBLIC_RESOLVER,
+            max_artifact_bytes=10,
+        )
 
         with pytest.raises(FetchError):
             tool.fetch("http://good.example/")
@@ -353,7 +397,7 @@ class TestHttpFetchTool:
 
         response = RaisingResponse([b"data"], url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER)
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=True, opener=opener, resolver=PUBLIC_RESOLVER)
 
         with pytest.raises(OSError):
             tool.fetch("http://good.example/")
@@ -366,7 +410,7 @@ class TestHttpFetchTool:
         ledger = make_ledger()
         response = FakeResponse([], status=302, headers={}, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER)
+        tool = HttpFetchTool(ledger=ledger, external_provider_consent=True, opener=opener, resolver=PUBLIC_RESOLVER)
 
         with pytest.raises(FetchError, match="no Location header"):
             tool.fetch("http://good.example/")
@@ -383,7 +427,13 @@ class TestHttpFetchTool:
         body = b"hi"
         response = FakeResponse([body], headers={"Content-Length": "not-a-number"}, url="http://good.example/")
         opener = make_opener({"http://good.example/": response})
-        tool = HttpFetchTool(ledger=ledger, opener=opener, resolver=PUBLIC_RESOLVER, max_artifact_bytes=10)
+        tool = HttpFetchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            resolver=PUBLIC_RESOLVER,
+            max_artifact_bytes=10,
+        )
 
         artifact, data = tool.fetch("http://good.example/")
 

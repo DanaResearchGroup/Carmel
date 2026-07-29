@@ -14,8 +14,17 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import StrEnum
+from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+#: Schemes an operator can safely be shown as a clickable link. Rejecting everything
+#: else (in particular ``javascript:`` and ``data:``) at the schema boundary means no
+#: downstream renderer -- the operator dashboard's ``<a href=...>``, or anything else
+#: that ever trusts this field -- has to remember to re-check it: an LLM-authored or
+#: otherwise attacker-influenced ``landing_url`` can never carry a scheme that would
+#: execute script or smuggle a payload if a human simply clicks it.
+ALLOWED_LANDING_URL_SCHEMES = frozenset({"http", "https"})
 
 
 class AcquisitionReason(StrEnum):
@@ -58,6 +67,7 @@ class AcquisitionRequest(BaseModel):
     doi: str | None = None
     landing_url: str = Field(min_length=1)
     """Where a human should go to obtain the paper."""
+
     reason: AcquisitionReason
     detail: str = ""
     """Human-readable specifics (e.g. ``"HTTP 403"``), for the operator's benefit."""
@@ -68,6 +78,17 @@ class AcquisitionRequest(BaseModel):
     identity_note: str = ""
     """Why the identity check passed or failed. Kept for rejected requests too, so a
     puzzled operator can see what the check was looking for."""
+
+    @field_validator("landing_url")
+    @classmethod
+    def _reject_unsafe_url_scheme(cls, value: str) -> str:
+        """Reject any scheme but http/https (P1-11: this field reaches an operator
+        dashboard ``href`` unsanitized; ``javascript:``/``data:``/``file:`` etc. must
+        never survive construction of this model)."""
+        scheme = urlsplit(value).scheme.lower()
+        if scheme not in ALLOWED_LANDING_URL_SCHEMES:
+            raise ValueError(f"landing_url scheme {scheme!r} is not allowed; must be http or https")
+        return value
 
 
 class AcquisitionManifest(BaseModel):
