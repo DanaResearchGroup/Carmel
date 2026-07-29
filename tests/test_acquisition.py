@@ -26,10 +26,13 @@ from carmel.schemas.acquisition import (
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.acquisition import (
+    admit_file,
     check_identity,
     collect_inbox,
+    drop_path_for,
     inbox_dir,
     load_manifest,
+    pending_requests,
     record_request,
     requests_dir,
     slug_for,
@@ -267,3 +270,237 @@ class TestCollectInbox:
 
     def test_no_inbox_directory_is_not_an_error(self, tmp_path: Path) -> None:
         assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
+
+
+def _source(tmp_path: Path, name: str, body: str) -> Path:
+    """Write an operator's "downloaded" file somewhere OUTSIDE the inbox, the way a
+    real download lands in e.g. ``~/Downloads`` before the operator hands it to us."""
+    downloads = tmp_path / "downloads"
+    downloads.mkdir(exist_ok=True)
+    path = downloads / name
+    path.write_bytes(body.encode("utf-8"))
+    return path
+
+
+SECOND_TITLE = "Laminar burning velocities of ammonia hydrogen blends at elevated pressure"
+SECOND_DOI = "10.1016/j.combustflame.2019.01.002"
+
+
+class TestPendingRequests:
+    def test_requested_and_rejected_are_both_pending(self, tmp_path: Path) -> None:
+        requested = record_request(
+            tmp_path, title=TITLE, doi=DOI, landing_url="https://doi.org/" + DOI, reason=AcquisitionReason.PAYWALLED
+        )
+        rejected = record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        _drop(tmp_path, rejected.slug, "Some other document entirely, wrong on purpose.")
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        slugs = {r.slug for r in pending_requests(tmp_path)}
+        assert slugs == {requested.slug, rejected.slug}
+
+    def test_fulfilled_requests_are_not_pending(self, tmp_path: Path) -> None:
+        fulfilled = record_request(
+            tmp_path, title=TITLE, doi=DOI, landing_url="https://doi.org/" + DOI, reason=AcquisitionReason.PAYWALLED
+        )
+        _drop(tmp_path, fulfilled.slug, f"{TITLE}\nDOI: {DOI}\n")
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert pending_requests(tmp_path) == []
+
+
+class TestDropPathFor:
+    def test_default_suffix_is_pdf(self, tmp_path: Path) -> None:
+        assert drop_path_for(tmp_path, "some-slug") == inbox_dir(tmp_path) / "some-slug.pdf"
+
+    def test_suffix_without_a_leading_dot_is_normalized(self, tmp_path: Path) -> None:
+        assert drop_path_for(tmp_path, "some-slug", suffix="txt") == inbox_dir(tmp_path) / "some-slug.txt"
+
+
+class TestAdmitFile:
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_the_correct_paper_is_admitted_and_the_request_fulfilled(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        source = _source(tmp_path, "download.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.FULFILLED
+        assert request.fulfilled_sha256
+        meta = StoredArtifact.model_validate(
+            json.loads((artifact_dir(tmp_path, request.fulfilled_sha256) / "meta.json").read_text())
+        )
+        assert meta.provenance == ArtifactProvenance.MANUAL
+        # The original download must survive untouched.
+        assert source.exists()
+        assert TITLE in source.read_text(encoding="utf-8")
+
+    def test_the_wrong_paper_is_rejected_and_never_stored(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        source = _source(tmp_path, "download.pdf", "An entirely different paper about catalytic converters.")
+
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert request.fulfilled_sha256 is None
+        assert request.identity_note
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_an_erratum_for_the_requested_paper_is_rejected_by_name(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The live-acceptance case that matters most: an erratum carries the right DOI
+        and reprints the full title, defeating both identity routes unless the marker
+        check catches it. This exercises the full drop path, not just check_identity."""
+        source = _source(
+            tmp_path,
+            "download.pdf",
+            f"Erratum to: {TITLE}\nDOI: {DOI}\nThe authors regret an error in Table 2.",
+        )
+
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "erratum" in request.identity_note
+        assert request.fulfilled_sha256 is None
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_slug_is_inferred_when_exactly_one_request_is_pending(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        source = _source(tmp_path, "whatever_the_download_was_named.pdf", f"{TITLE}\nDOI: {DOI}\n")
+
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert request.slug == queued.slug
+        assert request.status == AcquisitionStatus.FULFILLED
+
+    def test_slug_is_inferred_by_matching_text_when_several_are_pending(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        second = record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = _source(tmp_path, "download.pdf", f"{SECOND_TITLE}\nDOI: {SECOND_DOI}\n")
+
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert request.slug == second.slug
+        assert request.status == AcquisitionStatus.FULFILLED
+
+    def test_ambiguous_inference_raises_and_lists_candidates(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        second = record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        # Matches neither pending request's identity, so inference cannot settle on one.
+        source = _source(tmp_path, "download.pdf", "Some unrelated document about turbine blades.")
+
+        with pytest.raises(ValueError, match="cannot tell which pending request"):
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        # Both candidates must be named so the operator can pass slug= explicitly.
+        try:
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+        except ValueError as exc:
+            assert queued.slug in str(exc)
+            assert second.slug in str(exc)
+
+    def test_explicit_slug_skips_inference(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = _source(tmp_path, "download.pdf", f"{TITLE}\nDOI: {DOI}\n")
+
+        request = admit_file(tmp_path, source, slug=queued.slug, max_bytes=10_000_000)
+
+        assert request.slug == queued.slug
+        assert request.status == AcquisitionStatus.FULFILLED
+
+    def test_a_slug_matching_no_request_raises(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        source = _source(tmp_path, "download.pdf", "content")
+
+        with pytest.raises(ValueError, match="no acquisition request queued"):
+            admit_file(tmp_path, source, slug="not-a-real-slug", max_bytes=10_000_000)
+
+    def test_no_pending_requests_raises(self, tmp_path: Path) -> None:
+        source = _source(tmp_path, "download.pdf", "content")
+
+        with pytest.raises(ValueError, match="no acquisition requests are pending"):
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+
+    def test_a_nonexistent_source_raises(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        with pytest.raises(ValueError, match="does not exist"):
+            admit_file(tmp_path, tmp_path / "downloads" / "missing.pdf", max_bytes=10_000_000)
+
+    def test_a_directory_source_raises(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        directory = tmp_path / "downloads" / "not_a_file"
+        directory.mkdir(parents=True)
+
+        with pytest.raises(ValueError, match="directory"):
+            admit_file(tmp_path, directory, max_bytes=10_000_000)
+
+    def test_an_unreadable_source_raises(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        source = _source(tmp_path, "download.pdf", f"{TITLE}\nDOI: {DOI}\n")
+        source.chmod(0o000)
+        try:
+            with pytest.raises(ValueError):
+                admit_file(tmp_path, source, max_bytes=10_000_000)
+        finally:
+            # Restore permissions so pytest's tmp_path cleanup can remove the file.
+            source.chmod(0o644)
+
+    def test_an_oversized_source_is_rejected_not_raised(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """Same untrusted-input path as a fetched PDF: an operator can drop an
+        arbitrarily large file, and max_bytes must still be enforced."""
+        source = _source(tmp_path, "download.pdf", f"{TITLE} DOI: {DOI} " + "x" * 5000)
+
+        request = admit_file(tmp_path, source, max_bytes=100)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "over the" in request.identity_note
+
+    def test_dropping_a_second_time_overwrites_the_first_inbox_copy(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """After a rejected first attempt, the operator's very next action is to drop
+        the correct file under the same slug -- this must not require them to delete
+        the stale copy by hand."""
+        wrong = _source(tmp_path, "wrong.pdf", "An entirely different paper about catalytic converters.")
+        first = admit_file(tmp_path, wrong, slug=queued.slug, max_bytes=10_000_000)
+        assert first.status == AcquisitionStatus.REJECTED
+
+        correct = _source(tmp_path, "correct.pdf", f"{TITLE}\nDOI: {DOI}\n")
+        second = admit_file(tmp_path, correct, slug=queued.slug, max_bytes=10_000_000)
+
+        assert second.status == AcquisitionStatus.FULFILLED
+        assert second.fulfilled_sha256
+        drop_path = drop_path_for(tmp_path, queued.slug)
+        assert drop_path.read_bytes() == correct.read_bytes()

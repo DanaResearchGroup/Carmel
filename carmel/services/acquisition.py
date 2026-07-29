@@ -19,12 +19,21 @@ another paper's citation, and every downstream grounding check would then pass a
 the wrong document -- producing a finding that is fully "grounded" and entirely false.
 The quote-grounding gate cannot catch this, because it only ever asks whether the quote
 appears in the supplied bytes, never whether those bytes are the right paper.
+
+:func:`pending_requests`, :func:`drop_path_for` and :func:`admit_file` exist to shrink
+the operator's loop for step 2: today it costs opening the manifest by hand, reading a
+slug, naming the dropped file exactly right, and then re-running an entire literature
+pass just to learn whether the drop was accepted. ``admit_file`` is a thin front door
+onto :func:`collect_inbox` -- it copies one file into the inbox under the right name and
+runs the identity check immediately, so the operator learns accepted-or-rejected in one
+step instead of after the next full run.
 """
 
 from __future__ import annotations
 
 import hashlib
 import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -122,6 +131,18 @@ def manifest_path(workspace_root: Path) -> Path:
     return requests_dir(workspace_root) / MANIFEST_NAME
 
 
+def drop_path_for(workspace_root: Path, slug: str, suffix: str = ".pdf") -> Path:
+    """Return the exact path the operator should copy their downloaded file to.
+
+    A caller (CLI, UI) prints this so the operator never has to reconstruct
+    ``inbox/<slug>.pdf`` by hand -- getting that name exactly right is the whole reason
+    this subsystem needs a human to type carefully in the first place.
+    """
+    if not suffix.startswith("."):
+        suffix = f".{suffix}"
+    return inbox_dir(workspace_root) / f"{slug}{suffix}"
+
+
 def slug_for(doi: str | None, title: str) -> str:
     """Derive a filesystem-safe slug identifying one requested paper.
 
@@ -181,6 +202,24 @@ def save_manifest(workspace_root: Path, manifest: AcquisitionManifest) -> None:
     inbox_dir(workspace_root).mkdir(parents=True, exist_ok=True)
     write_json(manifest_path(workspace_root), manifest)
     write_text(directory / README_NAME, _readme_text(manifest))
+
+
+_PENDING_STATUSES = (AcquisitionStatus.REQUESTED, AcquisitionStatus.REJECTED)
+"""Statuses a request can be admitted (or re-admitted) against.
+
+REJECTED is included deliberately, not just REQUESTED: a rejection means the last drop
+was the wrong file, not that the paper is no longer needed. Excluding it here would
+drop the request from the operator's worklist at exactly the moment they most need to
+see it again -- immediately after being told their first attempt was wrong."""
+
+
+def pending_requests(workspace_root: Path) -> list[AcquisitionRequest]:
+    """Return the requests still awaiting an admitted file (REQUESTED or REJECTED).
+
+    See :data:`_PENDING_STATUSES` for why REJECTED counts as pending rather than final.
+    """
+    manifest = load_manifest(workspace_root)
+    return [r for r in manifest.requests if r.status in _PENDING_STATUSES]
 
 
 def record_request(
@@ -490,6 +529,114 @@ def _admit_one(
         request.status = AcquisitionStatus.REJECTED
         request.identity_note = f"storing the dropped file failed: {exc}"
         return None
+
+
+def _infer_slug(source: Path, pending: list[AcquisitionRequest]) -> str:
+    """Work out which pending request ``source`` is meant to fulfil, when the caller
+    did not say. NEVER guesses between two plausible papers: a wrong guess attaches
+    one paper's bytes to another paper's citation, exactly the failure this whole
+    subsystem exists to prevent.
+
+    Args:
+        source: The operator's file, not yet copied anywhere.
+        pending: Candidate requests (see :func:`pending_requests`).
+
+    Returns:
+        The one slug this file can be confidently matched to.
+
+    Raises:
+        ValueError: no requests are pending, or the file's extracted text does not
+            let :func:`check_identity` settle on exactly one candidate.
+    """
+    if not pending:
+        raise ValueError("no acquisition requests are pending; there is nothing to admit this file against")
+    if len(pending) == 1:
+        return pending[0].slug
+
+    candidates = ", ".join(sorted(r.slug for r in pending))
+    try:
+        data = source.read_bytes()
+        extracted = extract_text(data, _sniff_content_type(data))
+    except Exception as exc:  # noqa: BLE001 - inference failing must not crash, just refuse to guess
+        raise ValueError(
+            f"could not read {source} well enough to infer which request it is for: {exc}. "
+            f"Pass slug= explicitly. Candidates: {candidates}"
+        ) from exc
+
+    matches = [r.slug for r in pending if check_identity(extracted, r)[0]]
+    if len(matches) == 1:
+        return matches[0]
+
+    raise ValueError(
+        f"cannot tell which pending request this file is for ({len(matches)} matched); "
+        f"pass slug= explicitly. Candidates: {candidates}"
+    )
+
+
+def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, max_bytes: int) -> AcquisitionRequest:
+    """Copy ``source`` into the inbox under the right name and identity-check it now.
+
+    This is the fast front door onto :func:`collect_inbox`: instead of the operator
+    hand-editing the manifest, hand-naming the file, and re-running an entire
+    literature pass just to learn whether the drop was accepted, this does the copy
+    and the check in one call and returns the outcome immediately.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        source: The operator's downloaded file. Read-only: never mutated or deleted,
+            and never the file actually stored (a copy is made).
+        slug: Which request this file is for. If omitted: the sole pending request if
+            there is exactly one, otherwise inferred by running :func:`check_identity`
+            against every pending request and requiring exactly one match (see
+            :func:`_infer_slug`).
+        max_bytes: Hard cap on the admitted artifact's size, enforced by
+            :func:`_admit_one` exactly as :func:`collect_inbox` enforces it -- an
+            operator-dropped file is the same untrusted-input path as a fetched one.
+
+    Returns:
+        The request after the attempt: ``FULFILLED`` with ``fulfilled_sha256`` set on
+        success, or ``REJECTED`` with ``identity_note`` explaining why on failure. The
+        caller can report this straight back to the operator without a fresh run.
+
+    Raises:
+        ValueError: ``source`` does not exist, is a directory, cannot be copied, no
+            slug could be confidently resolved, or the given/resolved slug matches no
+            queued request.
+    """
+    if not source.exists():
+        raise ValueError(f"source file does not exist: {source}")
+    if source.is_dir():
+        raise ValueError(f"source is a directory, not a file: {source}")
+
+    manifest = load_manifest(workspace_root)
+    by_slug = {r.slug: r for r in manifest.requests}
+
+    if slug is None:
+        pending = [r for r in manifest.requests if r.status in _PENDING_STATUSES]
+        slug = _infer_slug(source, pending)
+
+    request = by_slug.get(slug)
+    if request is None:
+        known = ", ".join(sorted(by_slug)) or "(none queued)"
+        raise ValueError(f"no acquisition request queued under slug {slug!r}; known slugs: {known}")
+
+    drop_path = drop_path_for(workspace_root, slug, suffix=source.suffix or ".pdf")
+    inbox_dir(workspace_root).mkdir(parents=True, exist_ok=True)
+    try:
+        # Overwrite, deliberately, rather than refuse: the whole point of this function
+        # is to shorten the retry loop after a wrong drop, and the file is re-verified
+        # immediately below, so a stale inbox copy is never left standing as the thing
+        # that determines the request's fate -- this call's ``source`` always is.
+        shutil.copyfile(source, drop_path)
+    except OSError as exc:
+        raise ValueError(f"could not copy {source} into the inbox: {exc}") from exc
+
+    stored = _admit_one(workspace_root, drop_path, request, max_bytes=max_bytes)
+    if stored is not None:
+        request.status = AcquisitionStatus.FULFILLED
+        request.fulfilled_sha256 = stored.sha256
+    save_manifest(workspace_root, manifest)
+    return request
 
 
 def _readme_text(manifest: AcquisitionManifest) -> str:
