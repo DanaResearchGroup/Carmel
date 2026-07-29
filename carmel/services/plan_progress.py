@@ -819,11 +819,20 @@ def _replay_missing_post_transition(workspace_root: Path, progress: PlanProgress
     target = _post_transition_target(finished[-1])
     if target == current or not can_transition(current, target):
         return
-    update_state(
-        workspace_root,
-        target,
-        notes=f"reconcile: replayed missing post-transition for action {finished[-1].action_id}",
-    )
+    # The ``can_transition`` check above is only advisory: this function holds no lock
+    # across it and ``update_state``, so a concurrent repairer/dispatch can legally move
+    # the persisted state between our read of ``current`` and this write. Mirrors
+    # ``repair_campaign_state``'s identical guard around its own ``update_state`` call.
+    try:
+        update_state(
+            workspace_root,
+            target,
+            notes=f"reconcile: replayed missing post-transition for action {finished[-1].action_id}",
+        )
+    except InvalidTransitionError:
+        # A concurrent repairer (or dispatch) moved the state between our
+        # read and this write; the winner's transition stands.
+        _log.warning("post-transition replay lost a race for %s; leaving the winner's state", workspace_root)
 
 
 def _transition_path(

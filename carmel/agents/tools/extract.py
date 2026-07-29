@@ -106,6 +106,17 @@ _ABSTRACT_MAX_LEN = 2000
 #: was measured to peak at ~381 MB RSS (76x) for a 5.0 MB input.
 MAX_EXTRACTED_TEXT_CHARS = 500_000
 
+#: Hard cap on the number of PDF pages whose ``extract_text()`` we will ever call,
+#: independent of :data:`MAX_EXTRACTED_TEXT_CHARS`. The character cap alone is not
+#: enough: it only bounds the RETURNED text, and if it were checked only after every
+#: page had been materialized, an attacker-controlled PDF with an enormous page count
+#: (each page cheap on its own) could still force pypdf to walk the whole document --
+#: and, per-page, each ``extract_text()`` call allocates independently -- before the
+#: cap ever applied. Real papers run a handful to a few dozen pages; the largest
+#: legitimate case seen (supplementary-information PDFs) runs to a few hundred. 2000
+#: is generous headroom over that while bounding the worst case.
+MAX_PDF_PAGES = 2000
+
 
 class TextSection(BaseModel):
     """A labeled span of :class:`ExtractedText.text`.
@@ -518,13 +529,20 @@ def _extract_pdf(data: bytes) -> ExtractedText:
     this falls back to an empty, ``lossy=True`` result rather than raising.
     """
     try:
-        import pypdf  # type: ignore[import-not-found]
+        # `pypdf` ships its own `py.typed` marker, so once the `agents` extra is
+        # installed mypy resolves this import directly -- no `type: ignore` needed
+        # (and an unconditional one would be a stale, unused-ignore error under that
+        # extra, which is exactly what CI's agents-installed lane now checks for).
+        import pypdf
     except ImportError:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:unavailable", lossy=True)
 
     try:
         reader = pypdf.PdfReader(io.BytesIO(data))
-        page_texts = [(page.extract_text() or "") for page in reader.pages]
+        # `len(reader.pages)` is cheap (it reads the page tree, not page content), so
+        # checking it before calling any `extract_text()` bounds the page count up
+        # front rather than after the fact.
+        page_count = len(reader.pages)
     except Exception:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
 
@@ -532,23 +550,44 @@ def _extract_pdf(data: bytes) -> ExtractedText:
     sections: list[TextSection] = []
     cursor = 0
     separator = "\n\n"
-    for i, page_text in enumerate(page_texts):
-        start = cursor
-        parts.append(page_text)
-        cursor += len(page_text)
-        sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
-        if i < len(page_texts) - 1:
-            parts.append(separator)
-            cursor += len(separator)
+    # `truncated` (-> `lossy=True`) covers BOTH ways a PDF can exceed the bounds we
+    # enforce: too many pages, or too many characters. Either one means the returned
+    # text is a partial view of the document, and `lossy=True` is load-bearing: the
+    # grounding gate fails CLOSED on it rather than silently grounding against a
+    # partial document.
+    truncated = page_count > MAX_PDF_PAGES
+    pages_to_process = min(page_count, MAX_PDF_PAGES)
+    try:
+        for i in range(pages_to_process):
+            # Stop calling `extract_text()` -- the expensive, memory-allocating step --
+            # the moment the running character count would already exceed the cap,
+            # rather than materializing every remaining page and trimming only the
+            # RETURNED value afterwards. That "trim after the fact" ordering is exactly
+            # the gap this fix closes: it let a compression-bomb PDF blow past peak
+            # memory before `_cap_text` (below) ever got a chance to run.
+            if cursor >= MAX_EXTRACTED_TEXT_CHARS:
+                truncated = True
+                break
+            page_text = reader.pages[i].extract_text() or ""
+            start = cursor
+            parts.append(page_text)
+            cursor += len(page_text)
+            sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
+            if i < pages_to_process - 1:
+                parts.append(separator)
+                cursor += len(separator)
+    except Exception:
+        return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
 
     text = "".join(parts)
-    text, sections, truncated = _cap_text(text, sections)
+    text, sections, cap_truncated = _cap_text(text, sections)
+    truncated = truncated or cap_truncated
     sections = _label_special_sections(text, sections)
     return ExtractedText(
         text=text,
         normalized=normalize_for_match(text),
         sections=sections,
-        page_count=len(page_texts),
+        page_count=page_count,
         extractor="pdf:pypdf",
         lossy=truncated,
     )

@@ -26,7 +26,7 @@ from pydantic import BaseModel, ConfigDict
 
 from carmel.config import AgentBudgetConfig
 from carmel.logger import get_logger
-from carmel.services.artifacts import _atomic_write_bytes
+from carmel.services.artifacts import write_bytes
 
 logger = get_logger("agents.budget")
 
@@ -586,7 +586,7 @@ def guard_daily_budget(
             # version of it. The flock above still serializes writers to this path,
             # but the helper's unique temp name additionally means no two callers
             # can ever collide on the same temp file even if the lock were bypassed.
-            _atomic_write_bytes(path, json.dumps(data).encode("utf-8"))
+            write_bytes(path, json.dumps(data).encode("utf-8"))
 
             if new_total > limit_usd:
                 raise BudgetExceededError(BudgetDimension.DAILY_COST_USD, new_total, limit_usd)

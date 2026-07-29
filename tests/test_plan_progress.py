@@ -602,6 +602,49 @@ class TestReconcile:
         assert progress.cursor == 1  # advanced past the finished lit action
         assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
 
+    def test_post_transition_replay_loses_a_race_without_crashing(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``_replay_missing_post_transition`` checks ``can_transition`` and then calls
+        ``update_state`` with no lock held across the two -- a concurrent repairer (or
+        dispatch) can legally move the persisted state in between. This must be caught
+        the same way ``repair_campaign_state``'s sibling guard catches it, not crash the
+        whole reconcile pass.
+
+        Deterministically injects the interleaving: monkeypatch ``update_state`` (as
+        imported into ``plan_progress``) so that, on the call ``_replay_missing_post_
+        transition`` makes, a "concurrent" writer moves the persisted state to FAILED
+        (a legal ``RUNNING_LITERATURE -> FAILED`` edge) immediately before the real
+        transition is attempted -- so the real call now targets an now-illegal edge
+        (``FAILED -> LITERATURE_READY`` does not exist) and raises.
+        """
+        import carmel.services.plan_progress as plan_progress_module
+        from carmel.services.state_machine import update_state as real_update_state
+
+        _to_approved_for_execution(ws)
+        update_state(ws, CampaignStateValue.RUNNING_LITERATURE)
+        init_progress(ws, _two_action_plan())
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+
+        raced = {"done": False}
+
+        def racing_update_state(workspace_root: Path, target: CampaignStateValue, notes: str | None = None):
+            if not raced["done"] and target == CampaignStateValue.LITERATURE_READY:
+                raced["done"] = True
+                # Simulate a concurrent winner landing between our stale
+                # ``can_transition`` check and this call.
+                real_update_state(workspace_root, CampaignStateValue.FAILED, notes="concurrent winner")
+            return real_update_state(workspace_root, target, notes=notes)
+
+        monkeypatch.setattr(plan_progress_module, "update_state", racing_update_state)
+
+        with caplog.at_level("WARNING"):
+            reconcile(ws)
+
+        assert raced["done"], "the race was never actually exercised"
+        assert load_state(ws).state == CampaignStateValue.FAILED, "the winner's state must stand"
+        assert any("lost a race" in message for message in caplog.messages)
+
     def test_truly_illegal_mismatch_records_warning_not_forced(self, ws: Path) -> None:
         """When NO legal path to the projection exists, a warning is logged, not forced."""
         _to_approved_for_execution(ws)
@@ -719,6 +762,64 @@ class TestReconcile:
 
         assert progress.actions[0].execution_status == ActionExecutionStatus.FAILED
 
+    def test_reconcile_ignores_corrupt_attempt_result_marker(self, ws: Path) -> None:
+        """A truncated/corrupt marker file must not crash reconcile.
+
+        ``read_attempt_result`` is best-effort by design (``OSError`` and
+        ``json.JSONDecodeError`` both return None); this hand-writes a marker
+        that isn't valid JSON at all, standing in for a crash mid-write, and
+        checks reconcile falls back to the ordinary FAILED-recovery path
+        instead of propagating the parse error.
+        """
+        _to_approved_for_execution(ws)
+        init_progress(ws, _plan([_action("t3-only")]))
+        mark_running(ws, "t3-only", "a1")
+        _age_action(ws, 0)
+        marker_path = attempt_result_path(ws, "a1")
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("{not valid json", encoding="utf-8")
+
+        progress = reconcile(ws)
+
+        action = progress.actions[0]
+        assert action.execution_status == ActionExecutionStatus.FAILED
+        assert action.notes == "recovered from interrupted attempt"
+
+    def test_reconcile_ignores_attempt_result_marker_with_invalid_enum_values(self, ws: Path) -> None:
+        """A syntactically valid marker with a nonsense status/outcome must not crash.
+
+        ``_adopt_attempt_result`` constructs ``ActionExecutionStatus``/``ActionOutcome``
+        from the recorded strings and catches ``KeyError``/``ValueError`` from that
+        construction; this writes a marker whose ``status`` is not a member of the
+        enum at all (e.g. a stale marker from a since-renamed status) and checks
+        reconcile falls back to FAILED-recovery instead of raising.
+        """
+        _to_approved_for_execution(ws)
+        init_progress(ws, _plan([_action("t3-only")]))
+        mark_running(ws, "t3-only", "a1")
+        _age_action(ws, 0)
+        marker_path = attempt_result_path(ws, "a1")
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "action_id": "t3-only",
+                    "attempt_id": "a1",
+                    "run_id": "r-bogus",
+                    "status": "not_a_real_status",
+                    "outcome": "not_a_real_outcome",
+                    "recorded_at": OLD.isoformat(),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        progress = reconcile(ws)
+
+        action = progress.actions[0]
+        assert action.execution_status == ActionExecutionStatus.FAILED
+        assert action.notes == "recovered from interrupted attempt"
+
     def test_reconcile_is_idempotent(self, ws: Path) -> None:
         _to_approved_for_execution(ws)
         init_progress(ws, _two_action_plan())
@@ -731,6 +832,57 @@ class TestReconcile:
         assert second.model_dump(exclude={"updated_at"}) == first.model_dump(exclude={"updated_at"})
         events = read_events(ws / "decision_log.jsonl")
         assert sum(1 for e in events if e.get("event") == "dispatch.attempt_recovered") == 1
+
+
+class TestRepairCampaignState:
+    def test_multi_step_repair_loses_a_race_without_crashing(
+        self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``repair_campaign_state`` walks a multi-step path with no lock held across
+        the individual ``update_state`` calls -- a concurrent repairer (or dispatch)
+        can legally move the persisted state in the middle of that walk. This is the
+        sibling of ``test_post_transition_replay_loses_a_race_without_crashing`` but
+        exercises ``repair_campaign_state`` itself (its own ``InvalidTransitionError``
+        guard around the ``for step in path`` loop), not ``_replay_missing_post_
+        transition``.
+
+        Deterministically injects the interleaving: the projected terminal state is
+        ``COMPLETED_PHASE1``, reached from ``RUNNING_T3`` via the two-step legal path
+        ``RUNNING_T3 -> DIAGNOSTICS_READY -> COMPLETED_PHASE1``. The patched
+        ``update_state`` lets the first step land normally, then -- immediately before
+        the second step -- a "concurrent" winner moves the state to FAILED (a legal
+        ``DIAGNOSTICS_READY -> FAILED`` edge), so the real second step now targets an
+        illegal ``FAILED -> COMPLETED_PHASE1`` edge and raises.
+        """
+        import carmel.services.plan_progress as plan_progress_module
+        from carmel.services.state_machine import update_state as real_update_state
+
+        _to_approved_for_execution(ws)
+        update_state(ws, CampaignStateValue.RUNNING_T3)
+        init_progress(ws, _plan([_action("t3-only")]))
+        mark_finished(ws, "t3-only", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws)
+        progress = load_progress(ws)
+        assert aggregate_state(progress) == CampaignStateValue.COMPLETED_PHASE1
+
+        raced = {"done": False}
+
+        def racing_update_state(workspace_root: Path, target: CampaignStateValue, notes: str | None = None):
+            if not raced["done"] and target == CampaignStateValue.COMPLETED_PHASE1:
+                raced["done"] = True
+                # Simulate a concurrent winner landing between the first and
+                # second steps of the repair's multi-step walk.
+                real_update_state(workspace_root, CampaignStateValue.FAILED, notes="concurrent winner")
+            return real_update_state(workspace_root, target, notes=notes)
+
+        monkeypatch.setattr(plan_progress_module, "update_state", racing_update_state)
+
+        with caplog.at_level("WARNING"):
+            plan_progress_module.repair_campaign_state(ws, progress)
+
+        assert raced["done"], "the race was never actually exercised"
+        assert load_state(ws).state == CampaignStateValue.FAILED, "the winner's state must stand"
+        assert any("lost a race" in message for message in caplog.messages)
 
 
 class TestLockIsLive:

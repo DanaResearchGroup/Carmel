@@ -10,6 +10,7 @@ import pytest
 
 from carmel.agents.tools.extract import (
     MAX_EXTRACTED_TEXT_CHARS,
+    MAX_PDF_PAGES,
     ExtractedText,
     TextSection,
     extract_text,
@@ -224,6 +225,82 @@ class TestExtractPdf:
         assert result.lossy is True
         assert result.text == ""
 
+    def test_pdf_huge_page_count_stops_before_extracting_every_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # P1-10 regression: a PDF whose page TREE claims far more pages than
+        # MAX_PDF_PAGES must never have extract_text() called on every one of them --
+        # that is exactly the "cheap page, huge count" decompression-bomb shape. The
+        # fake reader reports a page count 10x the cap up front (mimicking pypdf's
+        # cheap `len(reader.pages)`, which reads the page tree, not page content) but
+        # would raise if extract_text() were ever called past the cap, so this test
+        # fails loudly if the cap is not enforced BEFORE materializing pages.
+        call_count = 0
+
+        class _FakePage:
+            def extract_text(self) -> str:
+                nonlocal call_count
+                call_count += 1
+                if call_count > MAX_PDF_PAGES:
+                    raise AssertionError("extract_text() called past MAX_PDF_PAGES")
+                return "x"
+
+        class _FakeReader:
+            def __init__(self, _stream: object) -> None:
+                self.pages = [_FakePage() for _ in range(MAX_PDF_PAGES * 10)]
+
+        fake_pypdf = types.ModuleType("pypdf")
+        fake_pypdf.PdfReader = _FakeReader  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+        result = extract_text(b"%PDF-1.4 irrelevant", "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        # Load-bearing: the grounding gate fails closed on lossy=True, so a
+        # capped/partial extraction MUST be flagged, never silently returned as if
+        # it were the whole document.
+        assert result.lossy is True
+        # The reported page count is the document's TRUE total (not the truncated
+        # processing count), so downstream per-page-density calculations
+        # (carmel/services/grounding.py) stay meaningful even when extraction stops
+        # early.
+        assert result.page_count == MAX_PDF_PAGES * 10
+        assert call_count <= MAX_PDF_PAGES
+
+    def test_pdf_huge_per_page_text_stops_before_materializing_every_page(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # P1-10 regression: a small NUMBER of pages, each individually huge, must
+        # also stop early once the running character count reaches the cap -- the
+        # other half of the decompression-bomb shape (a Flate-compressed stream that
+        # expands 100-1000x per page). The fake page's extract_text() returns text
+        # far larger than the cap; the loop must call it only until the cap is
+        # crossed, never on every one of the (few) remaining pages.
+        call_count = 0
+        huge_chunk = "y" * (MAX_EXTRACTED_TEXT_CHARS // 2 + 1)
+
+        class _FakePage:
+            def extract_text(self) -> str:
+                nonlocal call_count
+                call_count += 1
+                return huge_chunk
+
+        class _FakeReader:
+            def __init__(self, _stream: object) -> None:
+                # Only a handful of pages -- well under MAX_PDF_PAGES -- so this
+                # exercises the character cap specifically, not the page-count cap.
+                self.pages = [_FakePage() for _ in range(10)]
+
+        fake_pypdf = types.ModuleType("pypdf")
+        fake_pypdf.PdfReader = _FakeReader  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+        result = extract_text(b"%PDF-1.4 irrelevant", "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        assert result.lossy is True
+        assert result.page_count == 10
+        # Two ~250,001-char chunks already exceed MAX_EXTRACTED_TEXT_CHARS, so the
+        # loop must have stopped well short of materializing all 10 pages.
+        assert call_count < 10
+        assert len(result.text) <= MAX_EXTRACTED_TEXT_CHARS
+
     def test_pdf_extraction_or_graceful_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Build a minimal, syntactically valid one-page PDF containing the text "Hello PDF".
         pdf_bytes = _build_tiny_pdf(b"Hello PDF")
@@ -241,6 +318,12 @@ class TestExtractPdf:
             assert result.lossy is False
             assert result.page_count == 1
             assert any(sec.page == 1 for sec in result.sections)
+            # The original version of this test stopped at the assertions above, which
+            # a passthrough/no-op "extraction" (e.g. one that always returns an empty
+            # string with the right metadata) would also satisfy. Assert the actual
+            # extracted content to prove real text extraction happened, not just that
+            # the right shape of result was returned.
+            assert "Hello PDF" in result.text
         else:
             assert result.extractor == "pdf:unavailable"
             assert result.lossy is True
