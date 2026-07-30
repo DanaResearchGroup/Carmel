@@ -785,6 +785,52 @@ class TestFamilyFallbackPricing:
     def _cost(model_name: str) -> float:
         return compute_cost_usd(model_name, input_tokens=1_000_000, output_tokens=1_000_000, tokens_available=True)
 
+    def test_a_zero_from_genai_prices_is_rejected_not_trusted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """genai_prices reads the usage OBJECT, not the counts we already extracted, so
+        when its view disagrees with ours it prices zero tokens and returns 0.0.
+
+        Trusting that would record a real, paid call as free and defeat the whole budget
+        ledger. Observed for real: genai-prices 0.0.73 returns 0.0 for a pre-2.x-shaped
+        usage object whose `request_tokens`/`response_tokens` Carmel reads correctly, and
+        CI caught it while a local 0.0.72 install passed. Pinned here against a forced
+        zero so the guard cannot regress on a library upgrade.
+        """
+        import carmel.agents.models as models
+
+        monkeypatch.setattr(models, "_genai_prices_cost_usd", lambda *a, **kw: 0.0)
+
+        cost = models.compute_cost_usd(
+            "gemini-2.5-flash",
+            input_tokens=200,
+            output_tokens=100,
+            tokens_available=True,
+            usage=object(),
+            provider_id="google",
+        )
+
+        # Falls through to the hand-maintained table rather than returning the zero.
+        assert cost > 0.0
+        assert cost == pytest.approx(200 / 1e6 * 0.30 + 100 / 1e6 * 2.50)
+
+    def test_a_genuine_zero_token_call_still_costs_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The guard above must reject only a zero that came from genai_prices failing to
+        see the tokens -- not make a real 0-token call cost something it did not.
+        """
+        import carmel.agents.models as models
+
+        monkeypatch.setattr(models, "_genai_prices_cost_usd", lambda *a, **kw: 0.0)
+
+        cost = models.compute_cost_usd(
+            "gemini-2.5-flash",
+            input_tokens=0,
+            output_tokens=0,
+            tokens_available=True,
+            usage=object(),
+            provider_id="google",
+        )
+
+        assert cost == 0.0
+
     def test_unknown_flash_model_uses_the_cheap_family_rate(self) -> None:
         cost = self._cost("gemini-9.9-flash")
 

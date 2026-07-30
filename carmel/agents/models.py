@@ -269,7 +269,22 @@ def compute_cost_usd(
 
     if usage is not None and provider_id is not None:
         genai_cost = _genai_prices_cost_usd(usage, model_name, provider_id)
-        if genai_cost is not None:
+        # A ZERO from genai_prices is rejected, not trusted. It reads the usage object
+        # ITSELF rather than the counts we already extracted, so whenever its view of
+        # that object disagrees with ours it prices zero tokens and returns 0.0 -- and
+        # returning that would record a real, paid call as free, which defeats the
+        # entire budget ledger. This is not hypothetical: genai-prices 0.0.73 returns
+        # 0.0 for a pre-2.x-shaped usage object carrying `request_tokens`/
+        # `response_tokens`, which `_read_usage_token_count` reads correctly. CI caught
+        # it on 2026-07-29 (genai-prices 0.0.73 / pydantic-ai 2.20.0) while a local
+        # 0.0.72 install passed, so the divergence is a library-version behaviour
+        # change, not a fixture artefact.
+        #
+        # Falling through to the hand-maintained table is the fail-closed direction:
+        # it over-charges rather than under-charges. A genuine zero-token call still
+        # costs 0.0 via the table below, which is correct -- the guard only rejects a
+        # zero that came from genai_prices failing to see the tokens.
+        if genai_cost is not None and genai_cost > 0.0:
             return genai_cost
 
     return _table_cost_usd(model_name, input_tokens, output_tokens)
