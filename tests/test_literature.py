@@ -6,6 +6,8 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
+import types
 from collections.abc import Iterator
 from collections.abc import Sequence as AbcSequence
 from datetime import UTC, datetime, timedelta
@@ -355,6 +357,54 @@ class TestGroundingGate:
         assert len(model.calls) == 1
         assert report.warnings  # the fetch failure is surfaced, not swallowed
 
+    def test_html_source_url_is_not_stored_as_the_paper(self, campaign: Campaign) -> None:
+        """Live campaign 5b766b4b-bf72-4db9-bb28-4229b037bf07 (workspace ``live-syngas``)
+        stored all 3 artifacts fetched via this exact path -- the LLM-proposed
+        ``source_url`` -- as ``text/html``. This path had NO content-type gate at all,
+        unlike ``_attempt_oa_fetch``'s OA-candidate path. A landing page still carries
+        the paper's title/abstract, so a quote lifted from an abstract could pass
+        ``ground_finding`` against it and read as backed by the full paper."""
+        deps, model, config = _make_deps(
+            [_proposal(findings=[_finding_dict()])],
+            fetch={SOURCE_URL: (b"<html><body>Please sign in to view this article</body></html>", "text/html")},
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert report.artifacts == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.status == GroundingStatus.NO_ARTIFACT
+        assert any("rejected fetch" in w for w in report.warnings)
+        # It must still be queued for a human, not silently dropped.
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NOT_A_DOCUMENT]
+        assert "text/html" in requests[0].detail
+
+    def test_elsevier_redirect_stub_is_rejected_not_grounded_against(self, campaign: Campaign) -> None:
+        """Regression test for the exact observed defect: artifact sha256
+        ``fdaceab39e73...`` from the live campaign above was a 2710-byte Elsevier
+        redirect stub whose entire extracted text was the single word "Redirecting"
+        (83 whitespace-padded chars) -- non-empty, so a check that only looked at
+        extracted-text length would have let it through. The content-type gate must
+        reject it before extracted-text length is even considered."""
+        redirect_stub = (
+            b'<html><head><meta HTTP-EQUIV="REFRESH" '
+            b'content="0; URL=https://linkinghub.elsevier.com/retrieve/pii/S0000000000000000">'
+            b"</head><body>Redirecting</body></html>"
+        )
+        deps, model, config = _make_deps(
+            [_proposal(findings=[_finding_dict()])],
+            fetch={SOURCE_URL: (redirect_stub, "text/html")},
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.artifacts == []
+        assert report.findings == []
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NOT_A_DOCUMENT]
+
     def test_verifier_prompt_never_contains_source_url(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -379,6 +429,62 @@ class TestGroundingGate:
         assert "Further discussion of the measurements" in verifier_call["user_prompt"]
         # And it is offered no tools whatsoever.
         assert verifier_call["tool_names"] == []
+
+
+class TestValidateDocument:
+    """Unit tests for the shared gate both storage paths route through.
+
+    ``_attempt_oa_fetch`` (open-access candidates) and ``_fetch_and_store``
+    (the LLM-proposed ``source_url``) used to duplicate this validation in one
+    and omit it entirely in the other -- see ``_validate_document``'s docstring
+    for the live-campaign evidence that omission produced.
+    """
+
+    def test_html_content_type_is_rejected(self) -> None:
+        extracted, reason = literature_module._validate_document(
+            "text/html", b"<html><body>Full text of the paper here.</body></html>"
+        )
+
+        assert extracted is None
+        assert reason == AcquisitionReason.NOT_A_DOCUMENT
+
+    def test_zero_bytes_is_rejected(self) -> None:
+        extracted, reason = literature_module._validate_document("text/plain", b"")
+
+        assert extracted is None
+        assert reason == AcquisitionReason.EMPTY_DOCUMENT
+
+    def test_whitespace_only_text_is_rejected(self) -> None:
+        extracted, reason = literature_module._validate_document("text/plain", b"   \n\t  ")
+
+        assert extracted is None
+        assert reason == AcquisitionReason.EMPTY_DOCUMENT
+
+    def test_text_plain_with_real_content_is_accepted(self) -> None:
+        extracted, reason = literature_module._validate_document("text/plain", DOC.encode())
+
+        assert reason is None
+        assert extracted is not None
+        assert QUOTE in extracted.text
+
+    def test_application_pdf_with_real_content_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class _FakePage:
+            def extract_text(self) -> str:
+                return QUOTE
+
+        class _FakeReader:
+            def __init__(self, _stream: object) -> None:
+                self.pages = [_FakePage()]
+
+        fake_pypdf = types.ModuleType("pypdf")
+        fake_pypdf.PdfReader = _FakeReader  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+        extracted, reason = literature_module._validate_document("application/pdf", b"%PDF-1.4 irrelevant")
+
+        assert reason is None
+        assert extracted is not None
+        assert QUOTE in extracted.text
 
 
 class TestLoopTermination:

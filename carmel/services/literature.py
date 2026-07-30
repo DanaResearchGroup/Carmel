@@ -798,6 +798,48 @@ def _process_finding(
     )
 
 
+def _validate_document(content_type: str, data: bytes) -> tuple[ExtractedText | None, AcquisitionReason | None]:
+    """Gate one fetched payload before it may become a stored evidence artifact.
+
+    This is the ONE place both storage paths in this module must route through --
+    :func:`_attempt_oa_fetch` (open-access candidate URLs) and :func:`_fetch_and_store`
+    (the LLM-proposed ``source_url`` on a grounding finding). It used to be
+    duplicated in the former and simply absent in the latter: live campaign
+    ``5b766b4b-bf72-4db9-bb28-4229b037bf07`` (workspace ``live-syngas``) stored all
+    3 artifacts fetched via the LLM-proposed-URL path as ``text/html`` with no gate
+    at all. One (sha256 ``fdaceab39e73...``) was an Elsevier redirect stub -- 2710
+    bytes of HTML whose entire extracted text was the word "Redirecting" (83
+    whitespace-padded chars, so it passes a naive non-empty check). The other two
+    were repository landing pages carrying nav chrome ("Skip to main content",
+    "Log In", "Communities & Collections") rather than the paper. A landing page
+    still carries the paper's title/abstract, so a quote lifted from an abstract
+    could pass :func:`~carmel.services.grounding.ground_finding` against that
+    artifact and read as backed by the full paper.
+
+    HTML is rejected even when it holds real full text -- one artifact from that
+    same run was a legitimate ~39.7K-char Frontiers full-text HTML page -- because
+    that paper should route to the human PDF queue instead of being trusted as a
+    document: consistency and fail-closed behaviour beat retrieval breadth here.
+
+    Args:
+        content_type: The sniffed MIME type of the fetched bytes.
+        data: The fetched bytes.
+
+    Returns:
+        ``(extracted, None)`` on success, else ``(None, reason)`` where ``reason``
+        is the OBSERVED :class:`AcquisitionReason` (``NOT_A_DOCUMENT`` or
+        ``EMPTY_DOCUMENT``).
+    """
+    if content_type not in ("application/pdf", "text/plain"):
+        return None, AcquisitionReason.NOT_A_DOCUMENT
+    if not data:
+        return None, AcquisitionReason.EMPTY_DOCUMENT
+    extracted = extract_text(data, content_type)
+    if not extracted.text.strip():
+        return None, AcquisitionReason.EMPTY_DOCUMENT
+    return extracted, None
+
+
 def _attempt_oa_fetch(
     workspace_root: Path,
     url: str,
@@ -845,21 +887,13 @@ def _attempt_oa_fetch(
             return None, AcquisitionReason.PAYWALLED, f"HTTP {exc.status} from {host}"
         outcome = f"HTTP {exc.status} from {host}" if exc.status else f"fetch from {host} failed: {exc}"
         return None, AcquisitionReason.FETCH_FAILED, outcome
-    if artifact.content_type not in ("application/pdf", "text/plain"):
-        return None, AcquisitionReason.NOT_A_DOCUMENT, f"{artifact.content_type} served from {host}"
-    if not data:
-        return (
-            None,
-            AcquisitionReason.EMPTY_DOCUMENT,
-            f"{artifact.content_type} served from {host} was empty (0 bytes)",
-        )
-    extracted = extract_text(data, artifact.content_type)
-    if not extracted.text.strip():
-        return (
-            None,
-            AcquisitionReason.EMPTY_DOCUMENT,
-            f"{artifact.content_type} served from {host} yielded no extractable text",
-        )
+    extracted, reason = _validate_document(artifact.content_type, data)
+    if reason is AcquisitionReason.NOT_A_DOCUMENT:
+        return None, reason, f"{artifact.content_type} served from {host}"
+    if reason is AcquisitionReason.EMPTY_DOCUMENT:
+        detail = "was empty (0 bytes)" if not data else "yielded no extractable text"
+        return None, reason, f"{artifact.content_type} served from {host} {detail}"
+    assert extracted is not None  # only remaining case: _validate_document succeeded
     try:
         stored = store_artifact(
             workspace_root,
@@ -1092,6 +1126,13 @@ def _fetch_and_store(
     A :class:`BudgetExceededError` raised by the fetch tool's own reservation is NOT
     swallowed here — it propagates to the top-level handler and becomes the run's
     stop reason.
+
+    ``url`` here is the agent-PROPOSED ``source_url`` on a grounding finding, not an
+    open-access candidate Carmel resolved itself -- so it goes through the exact same
+    :func:`_validate_document` gate as :func:`_attempt_oa_fetch`. Before this gate
+    existed, this path stored whatever the LLM's URL returned unvalidated; live
+    campaign ``5b766b4b-bf72-4db9-bb28-4229b037bf07`` shows what that produces (see
+    :func:`_validate_document`'s docstring for the observed artifacts).
     """
     try:
         artifact, data = deps.fetch.fetch(url)
@@ -1109,7 +1150,25 @@ def _fetch_and_store(
             f"HTTP {exc.status}" if exc.status else str(exc),
         )
         return None
-    extracted = extract_text(data, artifact.content_type)
+    host = urlsplit(url).hostname or url
+    extracted, reason = _validate_document(artifact.content_type, data)
+    if reason is not None:
+        if reason is AcquisitionReason.NOT_A_DOCUMENT:
+            detail = f"{artifact.content_type} served from {host}"
+        else:
+            detail = f"{artifact.content_type} served from {host} " + (
+                "was empty (0 bytes)" if not data else "yielded no extractable text"
+            )
+        # Same reasoning as the FetchError branch above: this failure describes the
+        # URL the LLM proposed, not the paper itself, so it is worth queuing for
+        # manual acquisition rather than silently dropping -- see
+        # ``_maybe_queue_acquisition``, which consults ``state.fetch_failures`` before
+        # it looks at the grounding verdict at all.
+        logger.warning("literature: rejected fetch for %s: %s (%s)", url, reason.value, detail)
+        state.warnings.append(f"rejected fetch for {url}: {detail}")
+        state.fetch_failures[url] = (reason, detail)
+        return None
+    assert extracted is not None  # only remaining case: _validate_document succeeded
     try:
         stored = store_artifact(
             workspace_root,
