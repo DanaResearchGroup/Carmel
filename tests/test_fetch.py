@@ -18,6 +18,8 @@ from carmel.agents.tools.fetch import (
     MockFetchTool,
     _build_opener,
     _default_opener,
+    _default_resolver,
+    _is_global_address,
     is_safe_url,
     sniff_content_type,
 )
@@ -106,6 +108,66 @@ class TestIsSafeUrl:
         resolver = resolver_map({"good.example": ["93.184.216.34"]})
         assert is_safe_url("http://good.example:80/", resolver=resolver) is True
         assert is_safe_url("https://good.example:443/", resolver=resolver) is True
+
+    def test_rejects_a_malformed_ipv6_host_that_urlsplit_cannot_parse(self) -> None:
+        # An unclosed IPv6 bracket makes `urlsplit` itself raise ValueError -- an
+        # attacker-shaped malformed URL, not merely a disallowed well-formed one. This
+        # must fail closed rather than propagate the exception.
+        assert is_safe_url("http://[::1") is False
+
+    def test_rejects_a_host_urlsplit_cannot_parse_as_ipv6(self) -> None:
+        assert is_safe_url("http://[bad ipv6]/") is False
+
+    def test_rejects_a_non_numeric_port(self) -> None:
+        # `urlsplit` parses this fine, but accessing `.port` raises ValueError because
+        # "port" cannot be cast to an int.
+        resolver = resolver_map({"good.example": ["93.184.216.34"]})
+        assert is_safe_url("http://good.example:port/", resolver=resolver) is False
+
+    def test_rejects_a_port_out_of_range(self) -> None:
+        # `urlsplit` parses this fine too, but `.port` raises ValueError because the
+        # port number is outside 0-65535.
+        assert is_safe_url("http://[::1]:99999/") is False
+
+
+class TestIsGlobalAddress:
+    def test_rejects_an_unparseable_ip_string(self) -> None:
+        # `_is_global_address` is only ever called with what a resolver returned, but
+        # a malicious or buggy injected resolver (tests use exactly this seam) could
+        # hand back a string `ipaddress.ip_address` cannot parse at all. This must
+        # fail closed rather than let the ValueError propagate.
+        assert _is_global_address("not-an-ip-address") is False
+
+    def test_a_resolver_returning_an_unparseable_address_makes_the_url_unsafe(self) -> None:
+        resolver = resolver_map({"evil.example": ["not-an-ip-address"]})
+        assert is_safe_url("http://evil.example/", resolver=resolver) is False
+
+
+class TestDefaultResolver:
+    def test_a_getaddrinfo_oserror_yields_no_addresses(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import socket
+
+        def _boom(*args: object, **kwargs: object) -> object:
+            raise OSError("simulated DNS failure")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _boom)
+
+        assert _default_resolver("anything.example") == []
+
+    def test_a_getaddrinfo_oserror_makes_the_default_resolver_reject_the_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # This is the real fail-closed path: `is_safe_url` with the DEFAULT resolver
+        # (no injected resolver) must reject the URL when the real `getaddrinfo` call
+        # blows up, not merely return an empty address list in isolation.
+        import socket
+
+        def _boom(*args: object, **kwargs: object) -> object:
+            raise OSError("simulated DNS failure")
+
+        monkeypatch.setattr(socket, "getaddrinfo", _boom)
+
+        assert is_safe_url("http://anything.example/") is False
 
 
 # --------------------------------------------------------------------------- #

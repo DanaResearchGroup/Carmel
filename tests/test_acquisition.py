@@ -296,6 +296,41 @@ class TestCollectInbox:
         assert changed[0].status == AcquisitionStatus.REJECTED
         assert "over the" in changed[0].identity_note
 
+    def test_a_file_that_grows_past_the_cap_between_the_stat_and_the_read_is_rejected(
+        self, tmp_path: Path, queued: AcquisitionRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The TOCTOU pair documented in `_admit_one`: the pre-read `stat()` check is
+        cheap but not sufficient on its own, because the file can grow between that
+        stat and the read completing, so `len(data)` is re-checked against the same cap
+        after the read. Simulate that exact race by making `stat()` lie about a small
+        size for this file, while its real (larger) bytes are what actually gets read."""
+        path = _drop(tmp_path, queued.slug, f"{TITLE} DOI: {DOI} " + "x" * 5000)
+        real_stat = Path.stat
+
+        class _ShrunkStat:
+            def __init__(self, real: object) -> None:
+                self._real = real
+
+            @property
+            def st_size(self) -> int:
+                return 10
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        def _lying_stat(self: Path, *args: object, **kwargs: object) -> object:
+            real = real_stat(self, *args, **kwargs)
+            if self == path:
+                return _ShrunkStat(real)
+            return real
+
+        monkeypatch.setattr(Path, "stat", _lying_stat)
+
+        changed = collect_inbox(tmp_path, max_bytes=100)
+
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert "over the 100 cap" in changed[0].identity_note
+
     def test_an_already_fulfilled_request_is_not_reprocessed(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
         _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\n")
         collect_inbox(tmp_path, max_bytes=10_000_000)
@@ -560,6 +595,70 @@ class TestAdmitFile:
 
         assert request.status == AcquisitionStatus.REJECTED
         assert "over the" in request.identity_note
+
+    def test_inference_rejects_an_oversized_source_via_stat_without_reading_it(
+        self, tmp_path: Path, queued: AcquisitionRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same stat-before-read discipline as `_admit_one`, but inside `_infer_slug`
+        itself: this only runs when more than one request is pending (a single pending
+        request short-circuits before any stat/read), so a second request is queued
+        here to force the real inference path. Prove the cap is enforced via `stat()`
+        alone by making a full read fail loudly."""
+        record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = _source(tmp_path, "download.pdf", f"{TITLE} DOI: {DOI} " + "x" * 5000)
+
+        def _boom(self: Path, *args: object, **kwargs: object) -> bytes:
+            raise AssertionError(f"read_bytes() must not be called on an oversized file: {self}")
+
+        monkeypatch.setattr(Path, "read_bytes", _boom)
+
+        with pytest.raises(ValueError, match="over the 100 cap"):
+            admit_file(tmp_path, source, max_bytes=100)
+
+    def test_inference_rejects_a_source_that_grows_past_the_cap_between_stat_and_read(
+        self, tmp_path: Path, queued: AcquisitionRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The equivalent TOCTOU pair inside `_infer_slug`: the pre-read `stat()` check
+        is not sufficient on its own, so `len(data)` is re-checked after the read. A
+        second request is queued so `_infer_slug` actually runs its own stat/read
+        instead of short-circuiting on a single pending request."""
+        record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = _source(tmp_path, "download.pdf", f"{TITLE} DOI: {DOI} " + "x" * 5000)
+        real_stat = Path.stat
+
+        class _ShrunkStat:
+            def __init__(self, real: object) -> None:
+                self._real = real
+
+            @property
+            def st_size(self) -> int:
+                return 10
+
+            def __getattr__(self, name: str) -> object:
+                return getattr(self._real, name)
+
+        def _lying_stat(self: Path, *args: object, **kwargs: object) -> object:
+            real = real_stat(self, *args, **kwargs)
+            if self == source:
+                return _ShrunkStat(real)
+            return real
+
+        monkeypatch.setattr(Path, "stat", _lying_stat)
+
+        with pytest.raises(ValueError, match="over the 100 cap"):
+            admit_file(tmp_path, source, max_bytes=100)
 
     def test_dropping_a_second_time_overwrites_the_first_inbox_copy(
         self, tmp_path: Path, queued: AcquisitionRequest

@@ -35,6 +35,7 @@ from carmel.services.grounding import (
     MIN_NORMALIZED_QUOTE_LENGTH,
     QuoteMissReason,
     UnsupportedFindingPayloadError,
+    _bounded_window,
     _find_all_normalized,
     _fuzzy_search,
     _has_semantic_discrepancy,
@@ -368,6 +369,30 @@ def test_ground_finding_value_present_but_far_from_quote_is_spans_missing() -> N
     assert verdict.status == GroundingStatus.SPANS_MISSING
     assert verdict.grounded is False
     assert verdict.missing_spans != []
+
+
+def test_bounded_window_forward_scan_falls_back_to_flat_window_when_no_boundary_is_found() -> None:
+    """A sentence/row/paragraph boundary is not always nearby (e.g. a long unbroken
+    run, or a table cell with no punctuation), and `_bounded_window` falls back to a
+    flat `fallback`-character window on whichever side no boundary turns up within
+    `2 * fallback` characters. Only the boundary-FOUND path is exercised elsewhere
+    (via ordinary prose that reaches a period); this proves the forward/right-side
+    scan-exhausted fallback specifically, by putting no boundary character anywhere
+    within range on that side while the left side does find one, so the two sides can
+    be told apart."""
+    prefix = "Sentence one ends here. "
+    quote = "QUOTE"
+    suffix = "b" * 100  # no '.', '!', '?', or '\n' anywhere within 2 * fallback
+    text = prefix + quote + suffix
+    start = len(prefix)
+    end = start + len(quote)
+
+    window_start, window_end = _bounded_window(text, start, end, fallback=20)
+
+    # Left side: the period right before `start` is found, so this is NOT the fallback.
+    assert window_start == prefix.index(".") + 1
+    # Right side: no boundary within 2*fallback=40 chars, so this is the flat fallback.
+    assert window_end == end + 20
 
 
 def test_check_evidence_spans_numeric_value_normalization() -> None:
@@ -1008,6 +1033,18 @@ def test_has_semantic_discrepancy_false_for_ordinary_words_sharing_a_negating_pr
 def test_has_semantic_discrepancy_true_for_numeric_change_unchanged_behavior() -> None:
     # The original numeric-discrepancy behavior must be fully preserved.
     assert _has_semantic_discrepancy("1200 K", "1500 K") is True
+
+
+def test_has_semantic_discrepancy_false_when_word_sets_are_identical_despite_a_character_diff() -> None:
+    # A comma is a non-"equal" opcode with no digit in it, so the loop runs past the
+    # digit check without returning; the two strings then reduce to the exact same
+    # lowercased word set, so `diff_words` is empty and the function must fall
+    # through to `return False` at that pass-through, not reach the negation/prefix/
+    # antonym checks below it (which would also return False, but for the wrong
+    # reason -- this proves the *empty diff_words* branch specifically).
+    assert _has_semantic_discrepancy("the delay was measured, carefully.", "the delay was measured carefully.") is (
+        False
+    )
 
 
 def test_ground_finding_degraded_reload_rejected_not_grounded() -> None:
