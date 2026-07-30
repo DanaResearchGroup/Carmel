@@ -21,6 +21,7 @@ from carmel.agents.models import (
     MockModel,
     PydanticAIModel,
     build_model,
+    clear_dead_model_cache,
     compute_cost_usd,
     estimate_worst_case_model_cost_usd,
 )
@@ -592,6 +593,17 @@ class TestModelLadderFallback:
     literature run outright.
     """
 
+    @pytest.fixture(autouse=True)
+    def _clear_dead_model_cache(self) -> Iterator[None]:
+        # The 404 dead-model cache (see `models._dead_model_cache`) is process-lifetime
+        # and keyed by (provider, api-key digest, model id), so without this a 404 cached
+        # by one test would make a later test's identically-provider/key/model-named
+        # rung silently skip instead of being attempted -- exactly the cross-test leak
+        # `clear_catalogue_cache()` guards against in `test_model_catalog.py`.
+        clear_dead_model_cache()
+        yield
+        clear_dead_model_cache()
+
     @staticmethod
     def _install_agent_failing_for(monkeypatch: pytest.MonkeyPatch, failures: dict[str, Exception]) -> list[str]:
         """Fake pydantic_ai.Agent so named models raise; records models actually called."""
@@ -695,7 +707,14 @@ class TestModelLadderFallback:
 
         assert attempted == ["gemini-3.6-flash"]
 
-    def test_the_last_rung_raises_rather_than_silently_returning_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_the_last_rung_raises_a_clear_agent_bridge_error_not_the_raw_provider_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Before this fix, ladder exhaustion re-raised the raw `ModelHTTPError` from the
+        # LAST (weakest) rung -- ~200 lines of pydantic-ai/tenacity/asyncio internals
+        # headlined by a model the operator never configured directly. Exhaustion must
+        # now surface a clear, actionable `AgentBridgeError` instead, with the original
+        # error still reachable via `__cause__` for debugging.
         pytest.importorskip("pydantic_ai")
         from pydantic_ai.exceptions import ModelHTTPError
 
@@ -713,10 +732,16 @@ class TestModelLadderFallback:
             fallback_model_names=["gemini-3.5-flash"],
         )
 
-        with pytest.raises(ModelHTTPError):
+        with pytest.raises(AgentBridgeError) as exc_info:
             model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
 
         assert attempted == ["gemini-3.6-flash", "gemini-3.5-flash"]
+        # Names every rung so the message stands on its own.
+        assert "gemini-3.6-flash" in str(exc_info.value)
+        assert "gemini-3.5-flash" in str(exc_info.value)
+        # A 503 remedy (transient outage, retry later), not the 404 one.
+        assert "transient" in str(exc_info.value).lower()
+        assert isinstance(exc_info.value.__cause__, ModelHTTPError)
 
     def test_no_fallbacks_means_no_substitution(self, monkeypatch: pytest.MonkeyPatch) -> None:
         pytest.importorskip("pydantic_ai")
@@ -730,10 +755,236 @@ class TestModelLadderFallback:
             model_name="gemini-3.6-flash", provider=AgentProvider.GOOGLE, api_key="placeholder-not-a-real-key"
         )
 
+        # A single-rung ladder that fails is still "the ladder is exhausted": the same
+        # clear `AgentBridgeError` applies, not the raw provider error.
+        with pytest.raises(AgentBridgeError):
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.6-flash"]
+
+    def test_ladder_exhausted_by_404s_names_every_rung_and_chains_the_original_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {
+                "gemini-3.6-flash": ModelHTTPError(404, "gemini-3.6-flash", "no longer available"),
+                "gemini-3.5-flash": ModelHTTPError(404, "gemini-3.5-flash", "no longer available"),
+            },
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        with pytest.raises(AgentBridgeError) as exc_info:
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.6-flash", "gemini-3.5-flash"]
+        assert "gemini-3.6-flash" in str(exc_info.value)
+        assert "gemini-3.5-flash" in str(exc_info.value)
+        # A 404 remedy (stale ladder / key without access), not the 503 one.
+        assert "stale ladder" in str(exc_info.value).lower()
+        assert isinstance(exc_info.value.__cause__, ModelHTTPError)
+        assert exc_info.value.__cause__.status_code == 404
+
+    def test_a_non_availability_error_makes_exactly_one_attempt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Distinct from `test_a_non_availability_error_is_never_retried_on_another_model`
+        # above (401): a 400 bad-request must behave identically -- propagate unchanged,
+        # with no fallback attempt and no ladder-exhaustion wrapping.
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = self._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(400, "gemini-3.6-flash", "bad request")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
         with pytest.raises(ModelHTTPError):
             model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
 
         assert attempted == ["gemini-3.6-flash"]
+
+
+class TestDeadModelCache:
+    """A model that answers 404 (permanently retired) must not be re-paid on every
+    `complete()` call in a campaign; a model that answers 503 (transient) must be,
+    because it may well succeed next time (`gemini-3.1-pro-preview` did, ninety seconds
+    later, on 2026-07-28 -- see `TestModelLadderFallback`).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_dead_model_cache(self) -> Iterator[None]:
+        clear_dead_model_cache()
+        yield
+        clear_dead_model_cache()
+
+    def test_a_404_rung_is_cached_and_skipped_on_a_second_complete_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = TestModelLadderFallback._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(404, "gemini-3.6-flash", "no longer available")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        # The dead 404 rung is attempted once (the first call); the second call skips
+        # straight to the fallback instead of re-paying it.
+        assert attempted.count("gemini-3.6-flash") == 1
+        assert attempted.count("gemini-3.5-flash") == 2
+
+    def test_a_503_rung_is_not_cached_and_is_retried_on_a_second_complete_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = TestModelLadderFallback._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(503, "gemini-3.6-flash", "busy")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="placeholder-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        # A transient 503 must be re-attempted every time -- it may succeed on a later
+        # call, unlike a permanent 404.
+        assert attempted.count("gemini-3.6-flash") == 2
+        assert attempted.count("gemini-3.5-flash") == 2
+
+    def test_all_rungs_known_dead_raises_agent_bridge_error_not_indexerror(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = TestModelLadderFallback._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(404, "gemini-3.6-flash", "no longer available")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash", provider=AgentProvider.GOOGLE, api_key="placeholder-not-a-real-key"
+        )
+
+        # First call: the only rung 404s, is cached, and the (single-rung) ladder is
+        # exhausted -- a clear AgentBridgeError, per the ladder-exhaustion tests above.
+        with pytest.raises(AgentBridgeError):
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        # Second call: every rung is now already known-dead, so there is nothing left to
+        # try at all. This must still be a clear AgentBridgeError -- not an IndexError,
+        # StopIteration, or a silent None -- even though no HTTP call is made this time.
+        with pytest.raises(AgentBridgeError):
+            model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == ["gemini-3.6-flash"]
+
+    def test_a_404_under_one_api_key_does_not_poison_a_different_key_for_the_same_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The important one. A 404 body reading "no longer available to NEW USERS" is
+        # evidence the retirement is scoped to the account/key that asked, not to the
+        # model id globally -- a different key can still have access to the very same
+        # model. `carmel serve` is a long-lived process where each campaign carries its
+        # own `AgentConfig`/api key, so one process genuinely spans multiple keys. If the
+        # dead-model cache were keyed by model id alone, a 404 recorded for key A would
+        # silently make key B skip a rung it could actually still use -- an undiagnosable
+        # downgrade. This asserts key B still attempts the rung key A got 404'd on.
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = TestModelLadderFallback._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(404, "gemini-3.6-flash", "no longer available")},
+        )
+        model_key_a = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="key-a-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+        model_key_b = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="key-b-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        # Key A hits the 404 and gets it cached under key A's own cache entry.
+        model_key_a.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+        # Key B must still attempt "gemini-3.6-flash" itself -- it must not be skipped
+        # just because key A's identical-named rung was already recorded as dead.
+        model_key_b.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted == [
+            "gemini-3.6-flash",  # key A's first (and only, since it 404s) attempt
+            "gemini-3.5-flash",  # key A's fallback after the 404
+            "gemini-3.6-flash",  # key B must attempt this rung too, not skip it
+            "gemini-3.5-flash",  # key B also falls through after its own 404
+        ]
+
+    def test_a_404_under_the_same_api_key_still_caches_and_skips_on_the_next_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Confirms the re-keying to (provider, key-digest, model_id) did not break the
+        # previously-verified same-key caching behaviour: the *same* key hitting the
+        # *same* model twice must still skip the dead rung on the second call.
+        pytest.importorskip("pydantic_ai")
+        from pydantic_ai.exceptions import ModelHTTPError
+
+        attempted = TestModelLadderFallback._install_agent_failing_for(
+            monkeypatch,
+            {"gemini-3.6-flash": ModelHTTPError(404, "gemini-3.6-flash", "no longer available")},
+        )
+        model = PydanticAIModel(
+            model_name="gemini-3.6-flash",
+            provider=AgentProvider.GOOGLE,
+            api_key="same-key-not-a-real-key",
+            fallback_model_names=["gemini-3.5-flash"],
+        )
+
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+        model.complete(system_prompt="sp", user_prompt="up", output_schema=_Output, tools=[])
+
+        assert attempted.count("gemini-3.6-flash") == 1
+        assert attempted.count("gemini-3.5-flash") == 2
+
+    # A same-key/same-model-id/different-provider non-collision test is deliberately not
+    # included here: `_install_agent_failing_for` fakes `pydantic_ai.Agent` keyed purely
+    # by `model_name` and never inspects `provider`, so a test exercising the provider
+    # axis through this harness would pass regardless of whether `provider` were
+    # actually part of the cache key -- it would pass for an unrelated reason (the fake
+    # never behaves differently per provider) rather than proving the cache key's
+    # provider component does anything. The provider component is instead justified
+    # directly by inspection: `_dead_model_cache`'s key tuple is
+    # `(AgentProvider, str, str)`, so two providers naturally land in distinct set
+    # entries even given an identical model id and key digest.
 
 
 class TestPydanticAIModelEstimateWorstCaseCostUsd:

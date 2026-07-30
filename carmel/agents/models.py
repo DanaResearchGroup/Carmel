@@ -13,6 +13,7 @@ a mock. A caller who wants MockModel must ask for it explicitly via
 
 from __future__ import annotations
 
+import hashlib
 import re
 from collections.abc import Sequence
 from functools import cache
@@ -361,15 +362,80 @@ class MockModel:
 
 
 #: HTTP statuses that mean "this model cannot serve you", as opposed to "your request
-#: was wrong". 404 is a retirement (observed: ``gemini-2.5-flash`` -> *"no longer
-#: available to new users"``), 503 is transient load (observed: ``gemini-3.5-flash`` ->
-#: *"currently experiencing high demand"*, and ``gemini-3.1-pro-preview`` failing then
-#: succeeding ninety seconds later). Both are answered by trying the next model down.
-_UNAVAILABLE_STATUS_CODES = frozenset({404, 503})
+#: was wrong". Split into a PERMANENT and a TRANSIENT set (rather than one flat set)
+#: because, although both are answered the same way in a single call (try the next model
+#: down), they must be treated differently ACROSS calls -- see `_dead_model_cache` below.
+#:
+#: 404 is a permanent retirement (observed live 2026-07-28: ``gemini-2.5-flash`` ->
+#: *"no longer available to new users"*) -- the catalogue keeps advertising the model
+#: (`model_catalog._fetch_catalogue` has no field that would let it filter this out), but
+#: the model itself never becomes callable again within the process's lifetime.
+#:
+#: 503 is transient load (observed live 2026-07-28: ``gemini-3.5-flash`` -> *"currently
+#: experiencing high demand"*, and ``gemini-3.1-pro-preview`` failing with a 503 and then
+#: serving normally ninety seconds later on the very same key). Treating a 503 as
+#: permanent would let one momentary capacity blip permanently downgrade every later call
+#: in the process.
+_PERMANENTLY_UNAVAILABLE_STATUS_CODES = frozenset({404})
+_TRANSIENTLY_UNAVAILABLE_STATUS_CODES = frozenset({503})
+_UNAVAILABLE_STATUS_CODES = _PERMANENTLY_UNAVAILABLE_STATUS_CODES | _TRANSIENTLY_UNAVAILABLE_STATUS_CODES
+
+#: Process-lifetime cache of ``(provider, key-digest, model_id)`` triples that have
+#: already answered a call with a PERMANENT unavailability (404). Without this,
+#: `self._ladder` is a fixed tuple that is never narrowed, so a permanently-retired rung
+#: sitting early in the ladder (e.g. a stale `gemini-2.5-flash` at the end of the
+#: discovered flash ladder) gets re-paid on *every* `complete()` call in a campaign -- up
+#: to `max_model_calls` wasted round-trips.
+#:
+#: Keyed by MORE than just the model id: the observed 404 wording is *"no longer
+#: available to NEW USERS"*, which is evidence that the retirement is scoped to the
+#: account/key, not global to the model id -- an older key can retain access to the exact
+#: same id a newer key is refused. `carmel serve` is a long-lived process
+#: (`carmel/ui/app.py`) whose campaigns each carry their own `AgentConfig` /
+#: `api_key_env`, so a single process genuinely spans multiple providers and multiple
+#: keys. Keying on model id alone would let a 404 recorded for one key silently make a
+#: DIFFERENT key skip a model it actually has access to -- a silent downgrade to a
+#: weaker rung with no error, exactly the failure `_is_model_unavailable`'s docstring
+#: warns about. The provider is included too so the same model id under two different
+#: providers (however unlikely) cannot collide.
+#:
+#: Scoped and justified the same way as `model_catalog._catalogue_cache` (see its
+#: docstring): module-level and process-lifetime because a model's retirement status
+#: changes on the order of weeks, not within a single campaign, so re-paying the call
+#: per-agent would add latency and a failure mode for no benefit.
+#:
+#: Deliberately NOT extended to 503s (see the status-code split above) and NOT persisted
+#: to disk: an on-disk denylist would outlive the process and could keep denying a model
+#: that has since been un-retired, which is worse than one wasted call the next time
+#: Carmel starts up.
+_dead_model_cache: set[tuple[AgentProvider, str, str]] = set()
+
+
+def _key_digest(api_key: str) -> str:
+    """Return a short, non-reversible fingerprint of ``api_key`` for use as a cache key
+    component.
+
+    This codebase never stores or logs raw key values (see `PydanticAIModel`'s own
+    docstring), and `_dead_model_cache` is a module-level global that outlives any single
+    request, so the raw key must never enter it. A truncated SHA-256 digest lets two
+    distinct keys land in distinct cache entries -- which is the only property the cache
+    needs -- without the secret itself being recoverable from the cache or from any log
+    line that might print a cache key. This digest is itself never logged either.
+    """
+    return hashlib.sha256(api_key.encode()).hexdigest()[:16]
+
+
+def clear_dead_model_cache() -> None:
+    """Drop the cache of known-permanently-dead (404) (provider, key, model) triples. For
+    tests and long-lived processes -- mirrors
+    :func:`carmel.agents.model_catalog.clear_catalogue_cache`. Clears everything rather
+    than taking a scope to clear, matching that function's blunt-reset shape.
+    """
+    _dead_model_cache.clear()
 
 
 def _is_model_unavailable(exc: BaseException) -> bool:
-    """Return True if ``exc`` means the model itself is unavailable.
+    """Return True if ``exc`` means the model itself is unavailable (404 or 503).
 
     Reads the structured ``status_code`` that pydantic-ai's ``ModelHTTPError`` carries
     rather than pattern-matching the message text: a substring check would be at the
@@ -378,6 +444,14 @@ def _is_model_unavailable(exc: BaseException) -> bool:
     """
     status = getattr(exc, "status_code", None)
     return isinstance(status, int) and status in _UNAVAILABLE_STATUS_CODES
+
+
+def _is_permanently_unavailable(exc: BaseException) -> bool:
+    """Return True if ``exc`` is a 404 -- the subset of :func:`_is_model_unavailable`
+    worth caching for the rest of the process (see `_dead_model_cache`).
+    """
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and status in _PERMANENTLY_UNAVAILABLE_STATUS_CODES
 
 
 class PydanticAIModel:
@@ -489,17 +563,30 @@ class PydanticAIModel:
 
         Only an *availability* failure advances to the next model: a 404 (retired) or a
         503 (transient capacity). Every other error -- a bad request, an auth failure, a
-        schema violation -- propagates immediately, because retrying it on a different
-        model would convert one clear error into several confusing ones.
+        schema violation -- propagates immediately, unchanged, because retrying it on a
+        different model would convert one clear error into several confusing ones.
+
+        Rungs already known (from an earlier call, on this process, with THIS provider
+        and THIS api key) to answer with a permanent 404 are skipped rather than re-paid
+        -- see `_dead_model_cache`. The cache is scoped per (provider, key), not just per
+        model id, because a 404 is evidence about account access, not about the model
+        globally -- a different key can still have access to the same model id.
 
         A failed attempt generated no tokens, so it costs nothing and settles nothing;
         the caller's single budget reservation still covers the one call that succeeds.
 
         Raises:
-            AgentBridgeError: If pydantic-ai is not installed.
+            AgentBridgeError: If pydantic-ai is not installed, or if every rung in the
+                ladder is unavailable (or already known-dead for this provider/key) --
+                see `_ladder_exhausted_error` for the message shape.
         """
-        last_index = len(self._ladder) - 1
-        for index, candidate in enumerate(self._ladder):
+        key_digest = _key_digest(self._api_key)
+        candidates = [name for name in self._ladder if (self._provider, key_digest, name) not in _dead_model_cache]
+        if not candidates:
+            raise self._ladder_exhausted_error(last_status_code=None)
+
+        last_index = len(candidates) - 1
+        for index, candidate in enumerate(candidates):
             try:
                 return self._complete_once(
                     model_name=candidate,
@@ -509,16 +596,53 @@ class PydanticAIModel:
                     tools=tools,
                 )
             except Exception as exc:
-                if index == last_index or not _is_model_unavailable(exc):
+                if not _is_model_unavailable(exc):
                     raise
+                if _is_permanently_unavailable(exc):
+                    _dead_model_cache.add((self._provider, key_digest, candidate))
+                if index == last_index:
+                    status_code = getattr(exc, "status_code", None)
+                    raise self._ladder_exhausted_error(last_status_code=status_code) from exc
                 logger.warning(
                     "model %r is unavailable (%s); falling back to %r",
                     candidate,
                     type(exc).__name__,
-                    self._ladder[index + 1],
+                    candidates[index + 1],
                 )
-        # Unreachable: the final iteration either returns or re-raises.
-        raise AgentBridgeError(f"no model in the ladder {self._ladder!r} could be called")
+        # Unreachable: the loop above always either returns or raises on its last
+        # iteration (the `index == last_index` branch covers it).
+        raise AssertionError("unreachable")
+
+    def _ladder_exhausted_error(self, *, last_status_code: int | None) -> AgentBridgeError:
+        """Build the operator-facing error for "no model in the ladder is callable".
+
+        Names the FULL configured ladder (including any rungs already skipped as
+        known-dead), not just the ones actually retried this call, so the message stays
+        legible on its own without needing `_dead_model_cache` state to interpret it.
+
+        A raw provider traceback here used to be the operator-visible failure: when the
+        ladder is exhausted, pydantic-ai/tenacity/asyncio internals would surface with a
+        headline naming only the LAST (weakest) rung -- e.g. a permanently-retired
+        `gemini-2.5-flash` the operator never configured directly -- which actively
+        misdirected diagnosis. This message instead states the actual situation (no model
+        in the family is currently callable with this API key) and gives the two distinct
+        remedies, since a 404 and a 503 mean different things: a 404 on every rung usually
+        means a stale ladder or an API key without access to any of these models, while a
+        503 on every rung usually means a transient provider outage that a retry later
+        would likely clear. The original provider error is chained via `from exc` at the
+        call site, so it remains available for debugging without being the headline.
+        """
+        if last_status_code in _PERMANENTLY_UNAVAILABLE_STATUS_CODES:
+            remedy = "a 404 on every rung usually means a stale ladder or an API key without access to any of them"
+        elif last_status_code in _TRANSIENTLY_UNAVAILABLE_STATUS_CODES:
+            remedy = "a 503 on every rung usually means a transient provider outage -- retrying later may clear it"
+        else:
+            remedy = "every rung was already known-unavailable from an earlier call this process"
+        return AgentBridgeError(
+            f"no model in the ladder {self._ladder!r} could be called (last status: "
+            f"{last_status_code!r}). This is not a Carmel crash: it means no model in "
+            f"this family is currently callable with this API key. {remedy}."
+        )
 
     def _complete_once(
         self,
