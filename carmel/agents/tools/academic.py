@@ -6,9 +6,10 @@ endpoint plus a bearer key, which no scholarly index requires — and demanding 
 them impossible to configure at all. The second half of the module is
 :class:`OpenAccessResolver`: deterministic DOI/title -> open-access-PDF resolution over
 a pluggable list of OA indexes (OpenAlex, Unpaywall, Crossref TDM links, Semantic
-Scholar, CORE, DOAJ, Europe PMC, ChemRxiv, arXiv). ChemRxiv is registered but disabled
-by default; see :data:`DEFAULT_ENABLED_PROVIDERS`. FatCat / Internet Archive Scholar
-was removed entirely on 2026-07-29 -- see the note by the provider registry.
+Scholar, CORE, DOAJ, Europe PMC, Elsevier TDM, ChemRxiv, arXiv). ChemRxiv and Elsevier
+are registered but disabled by default; see :data:`DEFAULT_ENABLED_PROVIDERS`. FatCat
+/ Internet Archive Scholar was removed entirely on 2026-07-29 -- see the note by the
+provider registry.
 
 Both adapters are shaped by a live probe of 60 combustion-kinetics works rather than by
 the APIs' own documentation, because the two disagree sharply:
@@ -60,6 +61,13 @@ DOAJ_ENDPOINT = "https://doaj.org/api/search/articles"
 EUROPEPMC_ENDPOINT = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 CHEMRXIV_ENDPOINT = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
 ARXIV_ENDPOINT = "https://export.arxiv.org/api/query"
+#: Elsevier's TDM (Text & Data Mining) Article Retrieval endpoint, keyed by DOI.
+#: There is also a separate Entitlement endpoint
+#: (``https://api.elsevier.com/content/article/entitlement/doi/{doi}``) that only
+#: reports yes/no access without content; it is deliberately NOT queried here so
+#: that, like every other provider in this module, Elsevier costs at most one
+#: lookup call per paper (see ``OpenAccessResolver``'s docstring).
+ELSEVIER_ARTICLE_ENDPOINT = "https://api.elsevier.com/content/article/doi"
 
 #: Sent on every request so the upstream operator can identify (and contact us about)
 #: this client rather than silently rate-limiting it.
@@ -479,6 +487,18 @@ MAX_OA_LOOKUP_CALLS_PER_PAPER = 10
 #: ``public-api/v1/items?term=`` endpoint returned 403/404 for all 12 probed titles
 #: in a live probe, so querying it by default is pure latency/log noise. Re-enable
 #: by adding "ChemRxiv" back to this set once the endpoint is re-verified alive.
+#:
+#: Elsevier is likewise registered but excluded here as of 2026-07-30. Unlike CORE
+#: (also key-gated but default-ENABLED), a missing Elsevier key is not the measured
+#: failure mode: a live probe with a VALID key reached ScienceDirect search (200
+#: OK) but got HTTP 403 ``AUTHENTICATION_ERROR`` from Article Retrieval for BOTH a
+#: paywalled DOI and a gold-OA DOI -- an academic IP alone is insufficient; the key
+#: needs institutional entitlement association or an ``X-ELS-Insttoken``, pending
+#: with the library. Enabling it by default today would mark every paper's OA
+#: resolution ``complete=False`` (a real, run-wide behavior change, not mere log
+#: noise -- see ChemRxiv's precedent above for the log-noise-only case). Re-enable
+#: by adding "Elsevier" back to this set once entitlement is confirmed working
+#: against a live DOI.
 DEFAULT_ENABLED_PROVIDERS: frozenset[str] = frozenset(
     {
         "OpenAlex",
@@ -960,6 +980,45 @@ def arxiv_oa_candidates(atom_xml: str, *, doi: str, title: str | None) -> list[O
     return candidates
 
 
+def elsevier_oa_candidates(payload: Any, *, doi: str) -> list[OaCandidate]:
+    """One publisher-hosted full-text candidate from an Elsevier Article Retrieval response.
+
+    UNVERIFIED SHAPE: live probes on this machine (2026-07-30, valid key, academic IP
+    AS378 IUCC Israel) reached ScienceDirect search successfully (200 OK, so the key
+    itself is valid) but got HTTP 403 ``AUTHENTICATION_ERROR`` from Article Retrieval
+    for BOTH a paywalled DOI and a gold-OA DOI -- "Requestor configuration settings
+    insufficient for access to this resource". A 403 never reaches this function
+    (``OpenAccessResolver._lookup_elsevier`` raises :class:`SearchError` before
+    parsing, marking resolution ``complete=False`` rather than treating it as "no OA
+    copy"); this parser has therefore never seen an actual entitled response. It
+    follows the published ``full-text-retrieval-response.coredata`` schema
+    defensively, the same discipline used for CORE and Europe PMC above. RE-PROBE
+    this shape once institutional entitlement (or an ``X-ELS-Insttoken``) lands and a
+    200 response with real content is finally observed.
+
+    Accepted ONLY when the response itself names the wanted DOI (``coredata.prism:doi``):
+    as with every other provider here, a mismatched DOI would offer the wrong paper.
+
+    Args:
+        payload: The raw Article Retrieval JSON response, of unknown shape.
+        doi: The wanted paper's bare, normalized DOI.
+
+    Returns:
+        A single :attr:`OaTier.PUBLISHER` candidate naming the Article Retrieval
+        endpoint for this DOI -- the only full-text URL Elsevier's TDM API offers --
+        or empty for a DOI mismatch or an unusable/malformed shape.
+    """
+    response = payload.get("full-text-retrieval-response") if isinstance(payload, dict) else None
+    if not isinstance(response, dict):
+        return []
+    coredata = response.get("coredata")
+    if not isinstance(coredata, dict):
+        return []
+    if normalize_doi(coredata.get("prism:doi")) != doi:
+        return []
+    return [OaCandidate(url=f"{ELSEVIER_ARTICLE_ENDPOINT}/{doi}", tier=OaTier.PUBLISHER)]
+
+
 @dataclass(frozen=True)
 class OaResolution:
     """The outcome of one DOI's open-access resolution.
@@ -1016,10 +1075,10 @@ class OpenAccessResolver(_KeylessSearchTool):
     """DOI -> open-access PDF candidates, via a pluggable list of OA index providers.
 
     Providers registered (each at most one lookup call): OpenAlex, Unpaywall, Crossref
-    (publisher TDM links), Semantic Scholar, CORE, DOAJ, ChemRxiv and arXiv, consulted
-    in that order for whichever of them are enabled -- see
-    :data:`DEFAULT_ENABLED_PROVIDERS` (ChemRxiv is registered but disabled by
-    default). Adding a provider is a small, isolated change: one pure parser, one
+    (publisher TDM links), Semantic Scholar, CORE, DOAJ, Europe PMC, Elsevier,
+    ChemRxiv and arXiv, consulted in that order for whichever of them are enabled --
+    see :data:`DEFAULT_ENABLED_PROVIDERS` (ChemRxiv and Elsevier are registered but
+    disabled by default). Adding a provider is a small, isolated change: one pure parser, one
     ``_lookup_*`` method, one entry in the registry construction, one name in
     :data:`DEFAULT_ENABLED_PROVIDERS` if it should be queried by default.
 
@@ -1034,9 +1093,10 @@ class OpenAccessResolver(_KeylessSearchTool):
 
     Credential-gated providers skip cleanly (one warning per resolver, not one per
     paper) instead of failing: Unpaywall REQUIRES a contact email as a condition of
-    use (a fake or placeholder address is never sent), and CORE REQUIRES an API key
-    (sent only in the ``Authorization`` header, never in a URL, a log line or a
-    resolution note).
+    use (a fake or placeholder address is never sent), and CORE and Elsevier REQUIRE
+    an API key (sent only in headers -- ``Authorization`` for CORE, ``X-ELS-APIKey``
+    /``X-ELS-Insttoken`` for Elsevier -- never in a URL, a log line or a resolution
+    note).
     """
 
     def __init__(
@@ -1048,6 +1108,8 @@ class OpenAccessResolver(_KeylessSearchTool):
         unpaywall_email: str | None = None,
         core_api_key: str | None = None,
         semantic_scholar_api_key: str | None = None,
+        elsevier_api_key: str | None = None,
+        elsevier_insttoken: str | None = None,
         opener: Callable[..., Any] | None = None,
         timeout_s: float = OA_INDEX_LOOKUP_TIMEOUT_S,
     ) -> None:
@@ -1063,6 +1125,13 @@ class OpenAccessResolver(_KeylessSearchTool):
                 Travels only in the ``Authorization`` header and is never logged.
             semantic_scholar_api_key: OPTIONAL Semantic Scholar key (higher rate
                 limits); ``None`` still queries their keyless shared pool.
+            elsevier_api_key: API key REQUIRED by Elsevier's TDM API; ``None`` skips
+                Elsevier entirely. Travels only in the ``X-ELS-APIKey`` header and is
+                never logged. Elsevier is registered but not in
+                :data:`DEFAULT_ENABLED_PROVIDERS` today -- see that constant.
+            elsevier_insttoken: OPTIONAL institutional token sent alongside
+                ``elsevier_api_key`` (``X-ELS-Insttoken``); ``None`` still attempts
+                the lookup with the key alone.
             opener: Injected ``(url, headers=..., timeout_s=...) -> response`` opener,
                 for tests. Defaults to a real urllib GET.
             timeout_s: Per-request socket timeout for the index/metadata lookup calls
@@ -1081,6 +1150,8 @@ class OpenAccessResolver(_KeylessSearchTool):
         self._unpaywall_email = unpaywall_email
         self._core_api_key = core_api_key
         self._semantic_scholar_api_key = semantic_scholar_api_key
+        self._elsevier_api_key = elsevier_api_key
+        self._elsevier_insttoken = elsevier_insttoken
         self._warned_skips: set[str] = set()
         self._warned_failures: set[str] = set()
         self._lookup_calls = 0
@@ -1104,6 +1175,7 @@ class OpenAccessResolver(_KeylessSearchTool):
             ("CORE", self._lookup_core),
             ("DOAJ", self._lookup_doaj),
             ("Europe PMC", self._lookup_europepmc),
+            ("Elsevier", self._lookup_elsevier),
             ("ChemRxiv", self._lookup_chemrxiv),
             ("arXiv", self._lookup_arxiv),
         )
@@ -1233,6 +1305,41 @@ class OpenAccessResolver(_KeylessSearchTool):
         query = quote_plus(f'DOI:"{doi}"')
         url = f"{EUROPEPMC_ENDPOINT}?query={query}&format=json&resultType=core"
         return europepmc_oa_candidates(self._counted_get_json(url), doi=doi)
+
+    def _lookup_elsevier(self, doi: str, title: str | None) -> list[OaCandidate]:
+        if not self._elsevier_api_key:
+            self._warn_skip_once(
+                "elsevier",
+                "Elsevier lookups are skipped: no API key configured (set "
+                "agents.elsevier_api_key or the CARMEL_ELSEVIER_API_KEY "
+                "environment variable; a key is issued at https://dev.elsevier.com)",
+            )
+            raise _ProviderSkip("no API key configured")
+        headers = {"X-ELS-APIKey": self._elsevier_api_key}
+        if self._elsevier_insttoken:
+            headers["X-ELS-Insttoken"] = self._elsevier_insttoken
+        url = f"{ELSEVIER_ARTICLE_ENDPOINT}/{quote(doi, safe='/')}"
+        try:
+            payload = self._counted_get_json(url, extra_headers=headers)
+        except SearchError as exc:
+            # A 403 here is a FIRST-CLASS expected state today (see
+            # elsevier_oa_candidates' UNVERIFIED SHAPE note), not a rare transport
+            # blip: the deployed key lacks institutional entitlement association.
+            # Re-raising with the remedy named lets the operator act, since no code
+            # change can fix a missing entitlement. This still propagates as a
+            # SearchError so resolve() marks the resolution incomplete rather than
+            # "no open-access copy" -- that distinction must not invert.
+            if "403" in str(exc):
+                raise SearchError(
+                    f"{exc}; Elsevier requires institutional entitlement association "
+                    "for this API key (or an X-ELS-Insttoken) before it will serve "
+                    "full text -- set agents.elsevier_insttoken or the "
+                    "CARMEL_ELSEVIER_INSTTOKEN environment variable, or contact your "
+                    "librarian to associate this key's entitlements; this is not "
+                    "fixable in code"
+                ) from exc
+            raise
+        return elsevier_oa_candidates(payload, doi=doi)
 
     def _lookup_chemrxiv(self, doi: str, title: str | None) -> list[OaCandidate]:
         if not title:

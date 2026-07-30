@@ -309,6 +309,8 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
             unpaywall_email=config.resolved_unpaywall_email(),
             core_api_key=config.resolved_core_api_key(),
             semantic_scholar_api_key=config.resolved_semantic_scholar_api_key(),
+            elsevier_api_key=config.resolved_elsevier_api_key(),
+            elsevier_insttoken=config.resolved_elsevier_insttoken(),
         ),
     )
 

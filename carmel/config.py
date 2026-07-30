@@ -183,6 +183,16 @@ CORE_API_KEY_ENV = "CARMEL_CORE_API_KEY"
 #: which is a secret and never lives in the repository.
 SEMANTIC_SCHOLAR_API_KEY_ENV = "CARMEL_SEMANTIC_SCHOLAR_API_KEY"
 
+#: Environment-variable fallback for :attr:`AgentConfig.elsevier_api_key`. Same
+#: discipline as :data:`CORE_API_KEY_ENV`: the variable holds the key itself, which
+#: is a secret and never lives in the repository.
+ELSEVIER_API_KEY_ENV = "CARMEL_ELSEVIER_API_KEY"
+
+#: Environment-variable fallback for :attr:`AgentConfig.elsevier_insttoken`. An
+#: institutional token, not an API key, but the same secret-handling discipline
+#: applies: it is a deploy-time credential and must never be committed or logged.
+ELSEVIER_INSTTOKEN_ENV = "CARMEL_ELSEVIER_INSTTOKEN"
+
 
 #: Model each tier uses when the operator does not name one.
 #:
@@ -373,6 +383,25 @@ class AgentConfig(BaseModel):
     runs keyless, and a 429 from their shared pool is handled as an ordinary
     fail-soft lookup failure. See :meth:`resolved_semantic_scholar_api_key`.
     """
+    elsevier_api_key: str | None = None
+    """API key for the Elsevier TDM (Text & Data Mining) API, which REQUIRES one.
+
+    Same discipline as :attr:`core_api_key`: a deploy-time secret supplied per
+    deployment (here, or via :data:`ELSEVIER_API_KEY_ENV`), never hardcoded and
+    never logged. When neither is set, the Elsevier open-access lookup is skipped
+    entirely with a single warning. See :meth:`resolved_elsevier_api_key`.
+    """
+    elsevier_insttoken: str | None = None
+    """Optional institutional token (``X-ELS-Insttoken``) for the Elsevier TDM API.
+
+    Elsevier's Article Retrieval API can require an institutional token, in
+    addition to the API key, before it will actually serve full text for a given
+    institution's entitlements -- a bare key alone has been observed (2026-07-30
+    live probe) to be insufficient even from an academic IP. Optional even when
+    :attr:`elsevier_api_key` is set: without it, lookups are still attempted with
+    the key alone. Never hardcoded, never logged. See
+    :meth:`resolved_elsevier_insttoken`.
+    """
     external_provider_consent: bool = False
     literature_at_campaign_start: bool = True
     budget: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
@@ -438,3 +467,24 @@ class AgentConfig(BaseModel):
             in which case the lookup simply runs keyless.
         """
         return self.semantic_scholar_api_key or os.environ.get(SEMANTIC_SCHOLAR_API_KEY_ENV) or None
+
+    def resolved_elsevier_api_key(self) -> str | None:
+        """The Elsevier API key: config field first, then the environment.
+
+        Returns:
+            :attr:`elsevier_api_key` when set, else a non-empty
+            :data:`ELSEVIER_API_KEY_ENV` environment value, else ``None`` -- in
+            which case the Elsevier lookup must be skipped (their API refuses
+            keyless calls).
+        """
+        return self.elsevier_api_key or os.environ.get(ELSEVIER_API_KEY_ENV) or None
+
+    def resolved_elsevier_insttoken(self) -> str | None:
+        """The optional Elsevier institutional token: config field first, then the environment.
+
+        Returns:
+            :attr:`elsevier_insttoken` when set, else a non-empty
+            :data:`ELSEVIER_INSTTOKEN_ENV` environment value, else ``None`` -- in
+            which case lookups are still attempted with the API key alone.
+        """
+        return self.elsevier_insttoken or os.environ.get(ELSEVIER_INSTTOKEN_ENV) or None

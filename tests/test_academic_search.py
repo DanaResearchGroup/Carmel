@@ -25,6 +25,7 @@ from carmel.agents.tools.academic import (
     CORE_ENDPOINT,
     CROSSREF_ENDPOINT,
     DOAJ_ENDPOINT,
+    ELSEVIER_ARTICLE_ENDPOINT,
     EUROPEPMC_ENDPOINT,
     OPENALEX_ENDPOINT,
     SEMANTIC_SCHOLAR_ENDPOINT,
@@ -40,6 +41,7 @@ from carmel.agents.tools.academic import (
     crossref_tdm_candidates,
     dedupe_by_doi,
     doaj_oa_candidates,
+    elsevier_oa_candidates,
     europepmc_oa_candidates,
     normalize_doi,
     openalex_oa_pdf_urls,
@@ -864,6 +866,40 @@ class TestEuropepmcCandidates:
         assert europepmc_oa_candidates(payload, doi=_RESOLVER_DOI) == []
 
 
+class TestElsevierCandidates:
+    """Elsevier Article Retrieval responses, DOI-gated (see ``elsevier_oa_candidates``'s
+    ``UNVERIFIED SHAPE`` docstring: no live entitled response has been observed yet, so
+    this fixture follows the published ``full-text-retrieval-response.coredata`` schema)."""
+
+    def test_matching_doi_yields_a_publisher_candidate(self) -> None:
+        payload = {"full-text-retrieval-response": {"coredata": {"prism:doi": _RESOLVER_DOI}}}
+        assert elsevier_oa_candidates(payload, doi=_RESOLVER_DOI) == [
+            OaCandidate(url=f"{ELSEVIER_ARTICLE_ENDPOINT}/{_RESOLVER_DOI}", tier=OaTier.PUBLISHER)
+        ]
+
+    def test_mismatched_doi_is_excluded(self) -> None:
+        """A DOI-keyed request should always echo the same DOI back, but the parser
+        must not just trust the request path -- it names the wanted DOI explicitly."""
+        payload = {"full-text-retrieval-response": {"coredata": {"prism:doi": "10.9999/other"}}}
+        assert elsevier_oa_candidates(payload, doi=_RESOLVER_DOI) == []
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            [],
+            "x",
+            {},
+            {"full-text-retrieval-response": "no"},
+            {"full-text-retrieval-response": {"coredata": "no"}},
+            {"full-text-retrieval-response": {"coredata": {"prism:doi": None}}},
+            {"full-text-retrieval-response": {"coredata": {}}},
+        ],
+    )
+    def test_garbage_shapes_yield_no_candidates(self, payload: Any) -> None:
+        assert elsevier_oa_candidates(payload, doi=_RESOLVER_DOI) == []
+
+
 _CHEMRXIV_ASSET = {"original": {"url": "https://chemrxiv.example/item/original/preprint.pdf"}}
 _WANTED_TITLE = "Ammonia Combustion Kinetics: A Study"
 
@@ -1116,9 +1152,15 @@ class TestPluggableProviderResolution:
         assert len(core_warnings) == 1
 
     def test_api_keys_travel_in_headers_and_are_never_logged(
-        self, ledger: BudgetLedger, caplog: pytest.LogCaptureFixture
+        self, ledger: BudgetLedger, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Elsevier is disabled by default (see DEFAULT_ENABLED_PROVIDERS); re-enable
+        # it here since this test's whole point is that every key-bearing provider's
+        # secret stays out of logs/URLs/notes, and Elsevier is one of only two
+        # key-gated providers (with CORE).
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"Elsevier"})
         routes = _full_provider_routes()
+        routes[ELSEVIER_ARTICLE_ENDPOINT] = {"full-text-retrieval-response": {"coredata": {"prism:doi": _RESOLVER_DOI}}}
         headers_by_url: dict[str, dict[str, str]] = {}
         inner = _routing_opener(routes)
 
@@ -1126,16 +1168,25 @@ class TestPluggableProviderResolution:
             headers_by_url[url] = dict(headers)
             return inner(url, headers=headers, timeout_s=timeout_s)
 
-        resolver = _full_resolver(ledger, routes, opener=opener)
+        resolver = _full_resolver(
+            ledger,
+            routes,
+            opener=opener,
+            elsevier_api_key="sekret-elsevier-key",
+            elsevier_insttoken="sekret-elsevier-insttoken",
+        )
 
         with caplog.at_level("DEBUG"):
             resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
 
         core_headers = [h for u, h in headers_by_url.items() if u.startswith(CORE_ENDPOINT)]
         s2_headers = [h for u, h in headers_by_url.items() if u.startswith(SEMANTIC_SCHOLAR_ENDPOINT)]
+        elsevier_headers = [h for u, h in headers_by_url.items() if u.startswith(ELSEVIER_ARTICLE_ENDPOINT)]
         assert [h.get("Authorization") for h in core_headers] == ["Bearer sekret-core-key"]
         assert [h.get("x-api-key") for h in s2_headers] == ["sekret-s2-key"]
-        for secret in ("sekret-core-key", "sekret-s2-key"):
+        assert [h.get("X-ELS-APIKey") for h in elsevier_headers] == ["sekret-elsevier-key"]
+        assert [h.get("X-ELS-Insttoken") for h in elsevier_headers] == ["sekret-elsevier-insttoken"]
+        for secret in ("sekret-core-key", "sekret-s2-key", "sekret-elsevier-key", "sekret-elsevier-insttoken"):
             assert secret not in resolution.note
             assert all(secret not in url for url in headers_by_url)
             assert all(secret not in r.getMessage() for r in caplog.records)
@@ -1179,6 +1230,79 @@ class TestPluggableProviderResolution:
             "https://repo.example/mirror.pdf",
             "https://green.example/copy.pdf",
         ]
+
+
+class TestElsevierResolver:
+    """Resolver-level behavior specific to Elsevier: default-disabled, key-gated,
+    and (load-bearing) that a 403 marks the resolution incomplete rather than "no
+    open-access copy" -- see ``_lookup_elsevier``'s and ``elsevier_oa_candidates``'s
+    ``UNVERIFIED SHAPE`` notes for why this is the only failure mode observed live."""
+
+    def test_missing_elsevier_key_skips_it_with_one_warning_and_zero_calls(
+        self, ledger: BudgetLedger, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"Elsevier"})
+        seen: list[str] = []
+        resolver = _full_resolver(ledger, _full_provider_routes(), seen)
+
+        with caplog.at_level("WARNING", logger="carmel.agents.tools.academic"):
+            first = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
+            resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
+
+        assert not any(u.startswith(ELSEVIER_ARTICLE_ENDPOINT) for u in seen)
+        assert first.complete is True
+        assert "Elsevier: skipped (no API key configured)" in first.note
+        elsevier_warnings = [r for r in caplog.records if "CARMEL_ELSEVIER_API_KEY" in r.getMessage()]
+        assert len(elsevier_warnings) == 1
+
+    def test_entitled_response_yields_a_publisher_candidate(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"Elsevier"})
+        routes = _full_provider_routes()
+        routes[ELSEVIER_ARTICLE_ENDPOINT] = {"full-text-retrieval-response": {"coredata": {"prism:doi": _RESOLVER_DOI}}}
+        resolver = _full_resolver(ledger, routes, elsevier_api_key="sekret-elsevier-key")
+
+        resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
+
+        assert f"{ELSEVIER_ARTICLE_ENDPOINT}/{_RESOLVER_DOI}" in resolution.candidates
+        assert resolution.complete is True
+
+    def test_403_authentication_error_marks_incomplete_and_names_the_remedy(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The measured live failure mode (see module docstrings): a valid key from
+        an academic IP still gets 403 AUTHENTICATION_ERROR without institutional
+        entitlement association. This must mark the resolution incomplete -- never
+        silently "no open-access copy" -- and must name the actual remedy (an
+        insttoken or entitlement association), since no code change fixes it."""
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"Elsevier"})
+        routes = _full_provider_routes()
+        routes[ELSEVIER_ARTICLE_ENDPOINT] = Exception(
+            "HTTP Error 403: Forbidden - AUTHENTICATION_ERROR: Requestor configuration "
+            "settings insufficient for access to this resource"
+        )
+        resolver = _full_resolver(ledger, routes, elsevier_api_key="sekret-elsevier-key")
+
+        resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
+
+        assert not any(c.startswith(ELSEVIER_ARTICLE_ENDPOINT) for c in resolution.candidates)
+        assert resolution.complete is False
+        assert "institutional entitlement" in resolution.note
+        assert "CARMEL_ELSEVIER_INSTTOKEN" in resolution.note
+
+    def test_malformed_elsevier_payload_yields_no_candidate_and_does_not_crash(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", academic.DEFAULT_ENABLED_PROVIDERS | {"Elsevier"})
+        routes = _full_provider_routes()
+        routes[ELSEVIER_ARTICLE_ENDPOINT] = {"unexpected": "shape"}
+        resolver = _full_resolver(ledger, routes, elsevier_api_key="sekret-elsevier-key")
+
+        resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
+
+        assert not any(c.startswith(ELSEVIER_ARTICLE_ENDPOINT) for c in resolution.candidates)
+        assert resolution.complete is True
 
 
 class TestOpenAlexBestOaLocationFallback:
