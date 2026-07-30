@@ -214,7 +214,10 @@ class TestHttpSearchToolRequest:
             tool.search("q")
 
         usage = ledger.usage()
-        assert usage.fetches == 1
+        # A search is an index lookup, not a document fetch: the attempt stays charged
+        # to INDEX_LOOKUPS and must not touch the document-download count.
+        assert usage.index_lookups == 1
+        assert usage.fetches == 0
         assert usage.fetch_bytes == 0
 
     def test_oversized_response_trips_mid_read_not_after_full_buffering(self) -> None:
@@ -256,7 +259,8 @@ class TestHttpSearchToolRequest:
         # tripped -- not refunded down to zero and not left at the worst-case
         # estimate.
         usage = ledger.usage()
-        assert usage.fetches == 1
+        assert usage.index_lookups == 1
+        assert usage.fetches == 0
         assert usage.fetch_bytes == CHUNK_SIZE
 
 

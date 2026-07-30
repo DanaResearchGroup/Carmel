@@ -6,6 +6,8 @@ import pytest
 
 from carmel.paths import (
     WORKSPACE_SUBDIRS,
+    WORKSPACES_ROOT_ENV_VAR,
+    default_workspaces_root,
     ensure_directory,
     init_workspace,
     is_valid_workspace_name,
@@ -174,3 +176,45 @@ class TestInitWorkspace:
     def test_expected_subdirs(self) -> None:
         expected = {"benchmarks", "evidence", "models", "provenance", "reports", "runs"}
         assert set(WORKSPACE_SUBDIRS) == expected
+
+
+class TestDefaultWorkspacesRoot:
+    """The default workspaces root, and the env override that relocates it."""
+
+    def test_defaults_to_a_top_level_carmel_workspaces_in_the_home_directory(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Pins the location so it cannot be relocated silently again.
+
+        This has already flip-flopped once: it was deliberately moved to a top-level
+        ``~/carmel_workspaces`` to be repo-independent, then quietly changed to
+        ``~/runs/carmel/workspaces``. That split live campaigns across two roots, and a
+        bare ``carmel requests --campaign <id>`` could only see one half. Relocating the
+        default is a decision, not a refactor -- if this test fails, that is the point.
+        """
+        monkeypatch.delenv(WORKSPACES_ROOT_ENV_VAR, raising=False)
+        assert default_workspaces_root() == Path.home() / "carmel_workspaces"
+
+    def test_the_env_var_overrides_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(WORKSPACES_ROOT_ENV_VAR, "/somewhere/else")
+        assert default_workspaces_root() == Path("/somewhere/else")
+
+    def test_a_tilde_in_the_env_var_is_expanded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(WORKSPACES_ROOT_ENV_VAR, "~/my_workspaces")
+        assert default_workspaces_root() == Path.home() / "my_workspaces"
+
+    def test_an_empty_env_var_is_treated_as_unset_not_as_the_filesystem_root(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``CARMEL_WORKSPACES=`` must not resolve workspaces to ``/``."""
+        monkeypatch.setenv(WORKSPACES_ROOT_ENV_VAR, "")
+        assert default_workspaces_root() == Path.home() / "carmel_workspaces"
+
+    def test_resolving_the_default_does_not_create_the_directory(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Read-only callers must not have a directory created as a side effect."""
+        target = tmp_path / "not_yet"
+        monkeypatch.setenv(WORKSPACES_ROOT_ENV_VAR, str(target))
+        assert default_workspaces_root() == target
+        assert not target.exists()

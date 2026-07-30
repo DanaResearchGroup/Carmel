@@ -222,7 +222,11 @@ def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
     the real one. The config file is the single description of a run.
     """
     from carmel.config import load_config
-    from carmel.services.campaigns import MissingCampaignConfigError, create_campaign_from_config
+    from carmel.services.campaigns import (
+        CampaignWorkspaceConflictError,
+        MissingCampaignConfigError,
+        create_campaign_from_config,
+    )
 
     try:
         config = load_config(config_file)
@@ -253,6 +257,11 @@ def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
 
     try:
         campaign = create_campaign_from_config(config, workspaces_root=campaign_root)
+    except CampaignWorkspaceConflictError as exc:
+        # Fail closed, matching the --workspaces containment check above: print the
+        # actionable reason to stderr and create/modify nothing.
+        print(str(exc), file=sys.stderr)
+        return 1
     except MissingCampaignConfigError as exc:
         print(str(exc))
         return 1

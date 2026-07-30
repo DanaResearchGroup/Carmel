@@ -312,6 +312,7 @@ class StopReason(StrEnum):
     MAX_MODEL_CALLS = "max_model_calls"
     MAX_TOKENS = "max_tokens"
     MAX_FETCHES = "max_fetches"
+    MAX_INDEX_LOOKUPS = "max_index_lookups"
     MAX_FETCH_BYTES = "max_fetch_bytes"
     MAX_ARTIFACT_BYTES = "max_artifact_bytes"
     MAX_WALL_CLOCK = "max_wall_clock"
@@ -327,6 +328,7 @@ STOP_REASON_FOR_DIMENSION: dict[BudgetDimension, StopReason] = {
     BudgetDimension.TOKENS: StopReason.MAX_TOKENS,
     BudgetDimension.COST_USD: StopReason.MAX_COST,
     BudgetDimension.FETCHES: StopReason.MAX_FETCHES,
+    BudgetDimension.INDEX_LOOKUPS: StopReason.MAX_INDEX_LOOKUPS,
     BudgetDimension.FETCH_BYTES: StopReason.MAX_FETCH_BYTES,
     BudgetDimension.ARTIFACT_BYTES: StopReason.MAX_ARTIFACT_BYTES,
     BudgetDimension.WALL_CLOCK_S: StopReason.MAX_WALL_CLOCK,

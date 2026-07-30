@@ -29,6 +29,7 @@ from carmel.schemas import (
 )
 from carmel.services.campaigns import (
     DEFAULT_LITERATURE_WAIT_TIMEOUT_S,
+    CampaignWorkspaceConflictError,
     MissingCampaignConfigError,
     create_campaign,
     create_campaign_from_config,
@@ -238,3 +239,58 @@ class TestCreateCampaignFromConfig:
         # A dispatch only happens if agent_config reached create_campaign's
         # maybe_start_literature_at_creation call -- confirming the threading.
         assert ticket.wait_calls == [DEFAULT_LITERATURE_WAIT_TIMEOUT_S]
+
+
+class TestCreateCampaignRefusesToOverwriteADifferentCampaign:
+    """Regression coverage for the destructive-overwrite bug: running ``new-campaign``
+    twice against the same workspace used to rewrite campaign.yaml/campaign_state.json
+    with the new campaign's identity in place while leaving the FIRST campaign's
+    literature_requests/manifest.json and provenance records behind -- the new campaign
+    then silently inherited a stranger's manual-acquisition queue. create_campaign must
+    now fail closed: refuse and touch nothing when the target already holds a different
+    campaign_id.
+    """
+
+    def test_create_campaign_into_a_workspace_holding_a_different_campaign_is_refused_and_leaves_it_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        ws = tmp_path / "ws"
+        first = create_campaign(ws, _make_input("first-campaign"))
+
+        # Simulate the first campaign's manual-acquisition queue -- the artifact the
+        # real bug left stranded and silently inherited by the second campaign.
+        literature_requests_dir = ws / "literature_requests"
+        literature_requests_dir.mkdir()
+        manifest_path = literature_requests_dir / "manifest.json"
+        manifest_path.write_text(f'{{"campaign_id": "{first.campaign_id}", "requests": []}}', encoding="utf-8")
+
+        campaign_yaml_before = (ws / "campaign.yaml").read_bytes()
+        campaign_state_before = (ws / "campaign_state.json").read_bytes()
+        manifest_before = manifest_path.read_bytes()
+
+        with pytest.raises(CampaignWorkspaceConflictError) as excinfo:
+            create_campaign(ws, _make_input("second-campaign"))
+
+        # The error names the existing campaign_id and the directory, so an operator
+        # can act on it without digging through a traceback.
+        assert first.campaign_id in str(excinfo.value)
+        assert str(ws) in str(excinfo.value)
+
+        # Nothing about the first campaign's artifacts moved -- this is the actual
+        # regression: a silent identity clobber that left stale request state intact
+        # under a NEW campaign_id.
+        assert (ws / "campaign.yaml").read_bytes() == campaign_yaml_before
+        assert (ws / "campaign_state.json").read_bytes() == campaign_state_before
+        assert manifest_path.read_bytes() == manifest_before
+
+        # And the first campaign is still the one on record.
+        from carmel.services.campaigns import load_campaign
+
+        assert load_campaign(ws).campaign_id == first.campaign_id
+
+    def test_create_campaign_into_a_fresh_workspace_still_succeeds(self, tmp_path: Path) -> None:
+        ws = tmp_path / "brand-new-ws"
+        campaign = create_campaign(ws, _make_input("only-campaign"))
+
+        assert (ws / "campaign.yaml").exists()
+        assert campaign.input.workspace_name == "only-campaign"

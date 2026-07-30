@@ -815,6 +815,10 @@ def _attempt_oa_fetch(
     ``application/pdf``/``text/plain``): a live probe found 5 of 11 advertised OA
     "PDF" URLs served an HTML landing page, and storing one of those as "the paper"
     would silently retire the acquisition request while leaving no readable text.
+    It also requires the bytes to be non-empty and to yield non-whitespace extractable
+    text: a live campaign fetched a figshare landing page's zero-byte response and
+    stored it as a successful acquisition, silently suppressing the manual queue --
+    see :attr:`AcquisitionReason.EMPTY_DOCUMENT`.
 
     Args:
         workspace_root: Root of the campaign workspace.
@@ -843,7 +847,19 @@ def _attempt_oa_fetch(
         return None, AcquisitionReason.FETCH_FAILED, outcome
     if artifact.content_type not in ("application/pdf", "text/plain"):
         return None, AcquisitionReason.NOT_A_DOCUMENT, f"{artifact.content_type} served from {host}"
+    if not data:
+        return (
+            None,
+            AcquisitionReason.EMPTY_DOCUMENT,
+            f"{artifact.content_type} served from {host} was empty (0 bytes)",
+        )
     extracted = extract_text(data, artifact.content_type)
+    if not extracted.text.strip():
+        return (
+            None,
+            AcquisitionReason.EMPTY_DOCUMENT,
+            f"{artifact.content_type} served from {host} yielded no extractable text",
+        )
     try:
         stored = store_artifact(
             workspace_root,
@@ -859,7 +875,7 @@ def _attempt_oa_fetch(
 
 def _resolve_oa_candidates(
     paper_doi: str | None, paper_title: str | None, deps: LiteratureDeps
-) -> tuple[list[str], str]:
+) -> tuple[list[str], str, bool]:
     """Deterministically resolve a wanted paper's OA candidates, with an honest note.
 
     Args:
@@ -870,21 +886,28 @@ def _resolve_oa_candidates(
         deps: Injected dependencies (the resolver in particular).
 
     Returns:
-        ``(candidates, note)``: candidate URLs capped at
-        :data:`MAX_OA_FETCH_ATTEMPTS_PER_PAPER`, and a note describing what
-        resolution did (or why it could not run) for the operator-facing ``detail``.
+        ``(candidates, note, complete)``: candidate URLs capped at
+        :data:`MAX_OA_FETCH_ATTEMPTS_PER_PAPER`, a note describing what resolution did
+        (or why it could not run) for the operator-facing ``detail``, and whether every
+        enabled provider actually answered. ``complete=False`` means an empty
+        ``candidates`` establishes nothing -- see
+        :attr:`~carmel.agents.tools.academic.OaResolution.complete`.
+
+        The two early returns below are ``complete=True`` deliberately: "this paper has
+        no DOI" and "no resolver is configured" are fully-established facts about why
+        resolution did not run, not truncated attempts.
     """
     if paper_doi is None:
-        return [], "paper has no DOI, so automated open-access resolution was not attempted"
+        return [], "paper has no DOI, so automated open-access resolution was not attempted", True
     if deps.oa_resolver is None:
-        return [], "no open-access resolver is configured for this run"
+        return [], "no open-access resolver is configured for this run", True
     resolution = deps.oa_resolver.resolve(paper_doi, title=paper_title)
     candidates = list(resolution.candidates)
     note = resolution.note
     if len(candidates) > MAX_OA_FETCH_ATTEMPTS_PER_PAPER:
         note = f"{note}; trying the first {MAX_OA_FETCH_ATTEMPTS_PER_PAPER} of {len(candidates)} candidates"
         candidates = candidates[:MAX_OA_FETCH_ATTEMPTS_PER_PAPER]
-    return candidates, note
+    return candidates, note, resolution.complete
 
 
 def _queue_wanted_paper(
@@ -925,7 +948,7 @@ def _queue_wanted_paper(
         state.warnings.append(f"ignored a requested paper with neither a DOI nor a URL: {paper.title!r}")
         return
 
-    candidates, resolution_note = _resolve_oa_candidates(doi, paper.title or None, deps)
+    candidates, resolution_note, resolution_complete = _resolve_oa_candidates(doi, paper.title or None, deps)
 
     attempts: list[tuple[str, str]] = []
     observed_reason: AcquisitionReason | None = None
@@ -950,7 +973,12 @@ def _queue_wanted_paper(
             observed_reason = failure_reason
 
     if observed_reason is None:
-        reason = AcquisitionReason.NO_OPEN_ACCESS_COPY
+        # No candidate was even attempted. Only claim "no open-access copy exists" when
+        # resolution actually finished; if it was cut short (per-paper lookup cap, or a
+        # provider failing in transit) nothing has been established, so say exactly that.
+        reason = (
+            AcquisitionReason.NO_OPEN_ACCESS_COPY if resolution_complete else AcquisitionReason.OA_LOOKUP_INCOMPLETE
+        )
         observed = resolution_note
     else:
         reason = observed_reason

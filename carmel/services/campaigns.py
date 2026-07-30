@@ -33,6 +33,32 @@ CAMPAIGN_FILE_NAME = "campaign.yaml"
 _log = get_logger("services.campaigns")
 
 
+class CampaignWorkspaceConflictError(ValueError):
+    """Raised by :func:`create_campaign` when ``workspace_root`` already holds a
+    DIFFERENT campaign.
+
+    Without this check, a second ``new-campaign`` run against the same workspace
+    silently overwrote ``campaign.yaml``/``campaign_state.json`` in place with the new
+    campaign's identity while leaving the first campaign's
+    ``literature_requests/manifest.json`` and ``provenance/`` records behind -- the new
+    campaign then inherited a stranger's manual-acquisition queue, and evidence dropped
+    later against that inherited request would be admitted into a campaign that never
+    asked for it. Failing closed here (raise before anything is created or written) is
+    cheap; a corrupted or split campaign identity discovered later is not.
+    """
+
+    def __init__(self, workspace_root: Path, existing_campaign_id: str) -> None:
+        self.workspace_root = workspace_root
+        self.existing_campaign_id = existing_campaign_id
+        super().__init__(
+            f"{workspace_root} already holds campaign {existing_campaign_id!r}. Creating a new "
+            "campaign here would overwrite that campaign's identity in place (campaign.yaml, "
+            "campaign_state.json) while leaving its literature_requests/manifest.json and "
+            "provenance records behind for the new campaign to inherit. Choose a different "
+            f"workspace_name, or remove {workspace_root} first if it is no longer needed."
+        )
+
+
 class MissingCampaignConfigError(ValueError):
     """Raised by :func:`create_campaign_from_config` when ``config.campaign`` is unset.
 
@@ -91,9 +117,23 @@ def create_campaign(
         The created Campaign.
     """
     workspace_root = Path(workspace_root)
+    campaign_id = str(uuid4())
+
+    # Fail closed BEFORE creating or writing anything: a workspace that already holds
+    # a different campaign's `campaign.yaml` must never be silently overwritten (see
+    # CampaignWorkspaceConflictError). A campaign.yaml that fails to parse is treated
+    # the same way -- an unreadable file is not evidence the workspace is free to use.
+    existing_file = workspace_root / CAMPAIGN_FILE_NAME
+    if existing_file.exists():
+        try:
+            existing_campaign_id = load_campaign(workspace_root).campaign_id
+        except (ValueError, OSError) as exc:
+            raise CampaignWorkspaceConflictError(workspace_root, f"<unreadable campaign.yaml: {exc}>") from exc
+        if existing_campaign_id != campaign_id:
+            raise CampaignWorkspaceConflictError(workspace_root, existing_campaign_id)
+
     init_workspace(workspace_root)
 
-    campaign_id = str(uuid4())
     now = datetime.now(UTC)
     campaign = Campaign(
         campaign_id=campaign_id,

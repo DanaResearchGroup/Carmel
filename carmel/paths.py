@@ -8,15 +8,21 @@ from pathlib import Path
 
 #: Where campaign workspaces live when nothing else says otherwise.
 #:
-#: Deliberately nested rather than a top-level ``~/carmel_workspaces``: a tool has no
-#: business creating its own directory directly in a user's home, and this machine keeps
-#: every tool's output under ``~/runs/<tool>/``. Sitting under ``~/runs/carmel/`` also
-#: leaves room for Carmel to put non-workspace run output beside it later without
-#: claiming a second home-level name.
+#: Top-level ``~/carmel_workspaces``, per commit a986543 ("Move default workspaces dir to
+#: ``~/carmel_workspaces``: repo-independent, user-level, no longer dependent on cwd").
 #:
-#: Callers should prefer :func:`default_workspaces_root`, which honours the
-#: ``$CARMEL_WORKSPACES`` override.
-DEFAULT_WORKSPACES_SUBPATH: tuple[str, ...] = ("runs", "carmel", "workspaces")
+#: This value was previously changed to ``("runs", "carmel", "workspaces")`` with a comment
+#: arguing that a tool should not claim a home-level name. That was a reversal of the
+#: decision above, made without flagging it as one, and it split live state across two
+#: roots on at least one machine -- campaigns created before the change sat in
+#: ``~/carmel_workspaces`` while later ones went under ``~/runs/``, and a bare
+#: ``carmel requests --campaign <id>`` could not see the other half. Restored here.
+#:
+#: If nesting under ``~/runs/`` is wanted per-machine, that is what the
+#: ``$CARMEL_WORKSPACES`` override below is for -- it needs no code change.
+#:
+#: Callers should prefer :func:`default_workspaces_root`, which honours that override.
+DEFAULT_WORKSPACES_SUBPATH: tuple[str, ...] = ("carmel_workspaces",)
 
 #: Environment variable that overrides :func:`default_workspaces_root`.
 WORKSPACES_ROOT_ENV_VAR = "CARMEL_WORKSPACES"

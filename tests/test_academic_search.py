@@ -215,9 +215,13 @@ class TestOpenAlexSearchTool:
 
     def test_search_is_charged_to_the_ledger(self, ledger: BudgetLedger) -> None:
         tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for({"results": []}))
-        before = ledger.usage().fetches
+        before = ledger.usage().index_lookups
         tool.search("q")
-        assert ledger.usage().fetches == before + 1
+        # Charged to INDEX_LOOKUPS, not FETCHES: a search returns a small JSON result
+        # set, and charging it to the document-download ceiling starved real fetches on
+        # a live run (see BudgetDimension.INDEX_LOOKUPS).
+        assert ledger.usage().index_lookups == before + 1
+        assert ledger.usage().fetches == 0
 
 
 class TestCrossrefSearchTool:
@@ -408,6 +412,11 @@ _UNPAYWALL_RECORD = {
     ],
 }
 
+#: Well-formed responses that advertise NO open-access copy. Distinct from a provider
+#: FAILING: these are honest negatives and must leave a resolution ``complete``.
+_OPENALEX_NO_OA: dict[str, Any] = {"best_oa_location": None, "locations": []}
+_UNPAYWALL_EMPTY: dict[str, Any] = {"best_oa_location": None, "oa_locations": []}
+
 #: Empty-but-well-formed payloads for the always-consulted providers that these
 #: focused tests are not exercising: they advertise nothing, so assertions about
 #: OpenAlex/Unpaywall behaviour stay undiluted.
@@ -416,6 +425,76 @@ _QUIET_PROVIDER_ROUTES: dict[str, Any] = {
     SEMANTIC_SCHOLAR_ENDPOINT: {},
     DOAJ_ENDPOINT: {},
 }
+
+
+class TestOpenAccessResolverCompleteness:
+    """Whether resolution actually finished -- the exhausted-vs-truncated distinction.
+
+    An empty candidate list means two very different things depending on this flag, and
+    conflating them is what let ``no_open_access_copy`` overstate what had been
+    established (the same asserted-vs-observed defect already fixed for ``paywalled``).
+    """
+
+    def test_a_provider_lookup_failing_in_transit_marks_the_resolution_incomplete(self, ledger: BudgetLedger) -> None:
+        """Observed live: an arXiv read timeout and a Semantic Scholar 404 in one run."""
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            contact_email="ops@example.org",
+            unpaywall_email="ops@example.org",
+            opener=_routing_opener(
+                {
+                    OPENALEX_ENDPOINT: TimeoutError("read operation timed out"),
+                    UNPAYWALL_ENDPOINT: _UNPAYWALL_EMPTY,
+                    **_QUIET_PROVIDER_ROUTES,
+                }
+            ),
+        )
+
+        resolution = resolver.resolve(_RESOLVER_DOI)
+
+        assert resolution.candidates == ()
+        assert resolution.complete is False
+        assert "lookup failed" in resolution.note
+
+    def test_a_resolution_where_every_provider_answered_is_complete(self, ledger: BudgetLedger) -> None:
+        """The honest negative: all providers consulted, none had a copy."""
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            contact_email="ops@example.org",
+            unpaywall_email="ops@example.org",
+            opener=_routing_opener(
+                {OPENALEX_ENDPOINT: _OPENALEX_NO_OA, UNPAYWALL_ENDPOINT: _UNPAYWALL_EMPTY, **_QUIET_PROVIDER_ROUTES}
+            ),
+        )
+
+        resolution = resolver.resolve(_RESOLVER_DOI)
+
+        assert resolution.candidates == ()
+        assert resolution.complete is True
+
+    def test_a_provider_declining_for_a_missing_api_key_does_not_mark_it_incomplete(self, ledger: BudgetLedger) -> None:
+        """A missing optional key is a stable configuration fact, not an unknown.
+
+        CORE ships keyless by default, so counting its skip as "incomplete" would mark
+        every paper incomplete and make the distinction worthless.
+        """
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            contact_email="ops@example.org",
+            unpaywall_email="ops@example.org",
+            core_api_key=None,
+            opener=_routing_opener(
+                {OPENALEX_ENDPOINT: _OPENALEX_NO_OA, UNPAYWALL_ENDPOINT: _UNPAYWALL_EMPTY, **_QUIET_PROVIDER_ROUTES}
+            ),
+        )
+
+        resolution = resolver.resolve(_RESOLVER_DOI)
+
+        assert resolution.complete is True
+        assert "CORE" in resolution.note
 
 
 class TestOpenAccessResolver:

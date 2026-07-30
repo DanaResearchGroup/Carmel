@@ -53,6 +53,24 @@ class BudgetDimension(StrEnum):
     TOKENS = "tokens"
     COST_USD = "cost_usd"
     FETCHES = "fetches"
+    INDEX_LOOKUPS = "index_lookups"
+    """Scholarly-index and metadata calls, counted separately from ``FETCHES``.
+
+    A search query or an open-access resolver lookup returns a few hundred bytes of
+    JSON; a document fetch returns a multi-megabyte PDF. Counting both against one
+    ceiling makes that ceiling impossible to choose: the number that correctly bounds
+    document downloads starves lookups, and the number that allows enough lookups puts
+    no useful bound on downloads.
+
+    This is not hypothetical. A live campaign with ``max_fetches: 25`` stopped at
+    ``stop_reason: max_fetches`` after 4 search queries and only 3 papers, having
+    downloaded ZERO documents -- the per-paper resolver lookups (up to 10 each) had
+    consumed the entire budget first. An earlier campaign reached 12 papers on the same
+    limit only because it predated the resolver and made no lookups at all.
+
+    Egress bytes are still charged to the shared :attr:`FETCH_BYTES`, which measures a
+    genuinely common resource. Only the CALL COUNTS are split.
+    """
     FETCH_BYTES = "fetch_bytes"
     ARTIFACT_BYTES = "artifact_bytes"
     WALL_CLOCK_S = "wall_clock_s"
@@ -86,6 +104,11 @@ class BudgetUsage(BaseModel):
     tokens: int
     cost_usd: float
     fetches: int
+    index_lookups: int = 0
+    """Defaulted, unlike its siblings, purely for backward compatibility: literature
+    reports written before this dimension existed have a ``usage`` block without the
+    field, and making it required would render those persisted reports unreadable (the
+    UI dashboard loads them). A live ledger always supplies a real value."""
     fetch_bytes: int
     elapsed_s: float
 
@@ -102,12 +125,13 @@ class Reservation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reservation_id: str
-    kind: Literal["model_call", "fetch"]
+    kind: Literal["model_call", "fetch", "index_lookup"]
     reserved_tokens: int = 0
     reserved_cost_usd: float = 0.0
     reserved_bytes: int = 0
     reserved_calls: int = 0  # 1 for model_call
     reserved_fetches: int = 0  # 1 for fetch
+    reserved_index_lookups: int = 0  # 1 for index_lookup
     reserved_date: str  # UTC date at reservation time, for daily-ledger refunds
     settled: bool = False
     observed_bytes: int | None = None
@@ -175,6 +199,7 @@ class BudgetLedger:
         self._tokens: int = 0
         self._cost_usd: float = 0.0
         self._fetches: int = 0
+        self._index_lookups: int = 0
         self._fetch_bytes: int = 0
 
     # -- reservations ------------------------------------------------------
@@ -298,6 +323,37 @@ class BudgetLedger:
                 reserved_date=_today_utc(),
             )
 
+    def reserve_index_lookup(self, *, estimated_bytes: int) -> Reservation:
+        """Reserve worst-case budget for a scholarly-index or metadata lookup.
+
+        Charges the :attr:`BudgetDimension.INDEX_LOOKUPS` count -- NOT
+        :attr:`BudgetDimension.FETCHES`, which is reserved for document downloads (see
+        that dimension's docstring for why conflating them broke a live run). Egress
+        bytes still go to the shared ``FETCH_BYTES`` ceiling.
+
+        Settles through :meth:`settle_fetch` / :meth:`abandon` exactly like a fetch;
+        only the count it draws down differs. Raises before any state mutation.
+        """
+        with self._lock:
+            if self._index_lookups >= self._limits.max_index_lookups:
+                raise BudgetExceededError(
+                    BudgetDimension.INDEX_LOOKUPS, self._index_lookups, self._limits.max_index_lookups
+                )
+            prospective_bytes = self._fetch_bytes + estimated_bytes
+            if prospective_bytes > self._limits.max_fetch_bytes:
+                raise BudgetExceededError(BudgetDimension.FETCH_BYTES, prospective_bytes, self._limits.max_fetch_bytes)
+
+            self._index_lookups += 1
+            self._fetch_bytes = prospective_bytes
+
+            return Reservation(
+                reservation_id=uuid.uuid4().hex,
+                kind="index_lookup",
+                reserved_bytes=estimated_bytes,
+                reserved_index_lookups=1,
+                reserved_date=_today_utc(),
+            )
+
     def settle_fetch(self, r: Reservation, *, actual_bytes: int) -> None:
         """Settle a fetch reservation against actual bytes transferred."""
         with self._lock:
@@ -348,9 +404,9 @@ class BudgetLedger:
                 self._cost_usd = _clamp_nonnegative(
                     self._cost_usd - r.reserved_cost_usd, dimension=BudgetDimension.COST_USD
                 )
-            else:  # fetch
-                # reserved_fetches is deliberately NOT refunded (Finding 10): the
-                # attempt happened regardless of outcome.
+            else:  # fetch or index_lookup -- identical settlement, different count
+                # Neither reserved_fetches nor reserved_index_lookups is refunded
+                # (Finding 10): the attempt happened regardless of outcome.
                 actual_bytes = r.observed_bytes if r.observed_bytes is not None else r.reserved_bytes
                 self._fetch_bytes = int(
                     _clamp_nonnegative(
@@ -436,6 +492,20 @@ class BudgetLedger:
             if not r.settled:
                 self.abandon(r)
 
+    @contextmanager
+    def index_lookup_call(self, *, estimated_bytes: int) -> Iterator[Reservation]:
+        """The only sanctioned way to spend index-lookup budget.
+
+        Same contract as :meth:`fetch_call`, against the separate
+        :attr:`BudgetDimension.INDEX_LOOKUPS` ceiling.
+        """
+        r = self.reserve_index_lookup(estimated_bytes=estimated_bytes)
+        try:
+            yield r
+        finally:
+            if not r.settled:
+                self.abandon(r)
+
     # -- peeks / checks ------------------------------------------------------
 
     def check_wall_clock(self) -> None:
@@ -460,6 +530,7 @@ class BudgetLedger:
                 tokens=self._tokens,
                 cost_usd=self._cost_usd,
                 fetches=self._fetches,
+                index_lookups=self._index_lookups,
                 fetch_bytes=self._fetch_bytes,
                 elapsed_s=self._now() - self._start,
             )
@@ -469,11 +540,16 @@ class BudgetLedger:
         with self._lock:
             return max(0, self._limits.max_fetches - self._fetches)
 
+    def remaining_index_lookups(self) -> int:
+        """Return how many more index lookups may be reserved."""
+        with self._lock:
+            return max(0, self._limits.max_index_lookups - self._index_lookups)
+
     def exhausted_dimension(self) -> BudgetDimension | None:
         """Return the first exhausted dimension tracked by this ledger, else None.
 
         Only dimensions this ledger directly tracks are considered here
-        (per-run model calls/tokens/cost/fetches/fetch-bytes/wall-clock).
+        (per-run model calls/tokens/cost/fetches/index-lookups/fetch-bytes/wall-clock).
         ``SESSION_COST_USD``, ``DAILY_COST_USD`` and ``CONCURRENT_RUNS`` are
         owned by :class:`SessionBudget` / :func:`guard_daily_budget`
         respectively and surface via their own ``BudgetExceededError`` raises
@@ -489,6 +565,8 @@ class BudgetLedger:
                 return BudgetDimension.COST_USD
             if self._fetches >= self._limits.max_fetches:
                 return BudgetDimension.FETCHES
+            if self._index_lookups >= self._limits.max_index_lookups:
+                return BudgetDimension.INDEX_LOOKUPS
             if self._fetch_bytes >= self._limits.max_fetch_bytes:
                 return BudgetDimension.FETCH_BYTES
             if (self._now() - self._start) >= self._limits.max_wall_clock_s:

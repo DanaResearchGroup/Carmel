@@ -222,7 +222,11 @@ def budgeted_get_raw(
     if not external_provider_consent:
         raise SearchError("external_provider_consent is False; refusing to run any search query")
 
-    with ledger.fetch_call(estimated_bytes=_ESTIMATED_SEARCH_BYTES) as reservation:
+    # A search query is an INDEX LOOKUP, not a document fetch: it returns a small JSON
+    # result set, and charging it to the document-download ceiling starved real fetches
+    # on a live run (see BudgetDimension.INDEX_LOOKUPS). Egress bytes still land on the
+    # shared FETCH_BYTES ceiling via the reservation below.
+    with ledger.index_lookup_call(estimated_bytes=_ESTIMATED_SEARCH_BYTES) as reservation:
         # Finding 10: a failed search attempt still consumed a real outbound request
         # and whatever bytes actually crossed the wire before it failed. ``total``
         # tracks the true transferred count; on any failure it is recorded on the

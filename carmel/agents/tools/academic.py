@@ -911,6 +911,24 @@ class OaResolution:
     candidates: tuple[str, ...]
     """OA PDF URLs to try fetching, best first, deduplicated across indexes."""
     note: str
+    complete: bool = True
+    """Whether every enabled provider actually got to answer.
+
+    ``False`` means resolution was CUT SHORT -- the per-paper lookup cap was reached, or
+    a provider's lookup failed in transit (timeout, HTTP error) -- so an empty
+    ``candidates`` establishes nothing about whether an OA copy exists. A caller must
+    then queue the paper as
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.OA_LOOKUP_INCOMPLETE`, never as
+    ``NO_OPEN_ACCESS_COPY``: "we did not finish looking" is not "there is nothing there".
+    This is the same asserted-vs-observed distinction already fixed once for
+    ``PAYWALLED``; it must not creep back in one level down.
+
+    A provider declining via :class:`_ProviderSkip` (a missing optional API key, say)
+    deliberately does NOT clear this flag. That is a stable configuration fact, already
+    spelled out in ``note``, not a transient unknown -- and since CORE ships keyless by
+    default, counting it as incomplete would mark every paper incomplete and make the
+    distinction worthless.
+    """
 
 
 class OpenAccessResolverProtocol(Protocol):
@@ -1053,10 +1071,14 @@ class OpenAccessResolver(_KeylessSearchTool):
         notes: list[str] = []
         ranked: list[OaCandidate] = []
         self._lookup_calls = 0
+        # Cleared the moment a provider is cut short or fails in transit, so an empty
+        # result is never reported as "no OA copy exists" (see OaResolution.complete).
+        complete = True
 
         for name, lookup in self._providers:
             if self._lookup_calls >= MAX_OA_LOOKUP_CALLS_PER_PAPER:
                 notes.append(f"{name}: skipped (per-paper lookup cap of {MAX_OA_LOOKUP_CALLS_PER_PAPER} calls reached)")
+                complete = False
                 continue
             try:
                 found = lookup(doi, title)
@@ -1071,6 +1093,7 @@ class OpenAccessResolver(_KeylessSearchTool):
                     self._warned_failures.add(name)
                     logger.warning("%s OA lookup failed: %s", name, exc)
                 notes.append(f"{name}: lookup failed ({exc})")
+                complete = False
                 continue
             plural = "" if len(found) == 1 else "s"
             note = f"{name}: {len(found)} OA PDF candidate{plural}"
@@ -1087,7 +1110,7 @@ class OpenAccessResolver(_KeylessSearchTool):
             if candidate.url not in candidates:
                 candidates.append(candidate.url)
 
-        return OaResolution(candidates=tuple(candidates), note="; ".join(notes))
+        return OaResolution(candidates=tuple(candidates), note="; ".join(notes), complete=complete)
 
     # ------------------------- provider lookups -------------------------
 

@@ -131,6 +131,20 @@ class TestStoreArtifact:
 
         assert not (tmp_path / "evidence").exists()
 
+    def test_empty_data_raises_value_error(self, tmp_path: Path) -> None:
+        """A zero-byte artifact is never legitimate evidence: the store must refuse it
+        outright, as defence in depth behind the acquisition layer's own empty-fetch
+        check (the layer that lied about this in the live incident this guards
+        against)."""
+        data = b""
+        artifact = _artifact(data)
+        extracted = _extracted()
+
+        with pytest.raises(ValueError, match="zero-byte"):
+            store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+
+        assert not (tmp_path / "evidence").exists()
+
     def test_hostile_source_url_path_traversal_does_not_affect_path(self, tmp_path: Path) -> None:
         data = b"hostile url payload"
         artifact = _artifact(data, url="http://x/../../../etc/passwd")

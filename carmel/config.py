@@ -214,7 +214,13 @@ class AgentBudgetConfig(BaseModel):
 
     max_model_calls: int = Field(default=40, gt=0)
     max_tokens: int = Field(default=400_000, gt=0)
-    max_fetches: int = Field(default=60, gt=0)
+    max_fetches: int = Field(default=60, gt=0)  # DOCUMENT downloads only
+    #: Scholarly-index and metadata calls (search queries, open-access resolver lookups).
+    #: Separate from ``max_fetches`` because a lookup returns a few hundred bytes of JSON
+    #: while a fetch returns a multi-megabyte PDF -- see ``BudgetDimension.INDEX_LOOKUPS``
+    #: for the live failure that conflating them caused. Default is generous: the resolver
+    #: can spend up to 10 lookups per paper, so a 15-paper run needs ~150 on its own.
+    max_index_lookups: int = Field(default=200, gt=0)
     max_fetch_bytes: int = Field(default=200_000_000, gt=0)  # total across run
     max_artifact_bytes: int = Field(default=25_000_000, gt=0)  # single artifact cap
     max_wall_clock_s: float = Field(default=1800.0, gt=0)

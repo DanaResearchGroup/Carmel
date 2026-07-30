@@ -35,14 +35,36 @@ class AcquisitionReason(StrEnum):
     observation about a real request, never a model's assertion; when no full-text URL
     was known to try at all, the reason is :attr:`NO_OPEN_ACCESS_COPY` instead."""
     NO_OPEN_ACCESS_COPY = "no_open_access_copy"
-    """Automated open-access resolution produced no fetchable candidate URL -- either
-    the OA indexes (OpenAlex/Unpaywall) advertise none for this DOI, or resolution
+    """Automated open-access resolution RAN TO COMPLETION and produced no fetchable
+    candidate URL -- either the OA indexes advertise none for this DOI, or resolution
     could not run at all (no DOI, no resolver configured, consent withheld);
     ``detail`` says which. Unlike :attr:`PAYWALLED` this asserts nothing about how
-    any host responded, because no host was ever asked."""
+    any host responded, because no host was ever asked.
+
+    Requires that every enabled provider actually answered. If resolution was cut
+    short, the reason is :attr:`OA_LOOKUP_INCOMPLETE` instead."""
+    OA_LOOKUP_INCOMPLETE = "oa_lookup_incomplete"
+    """Open-access resolution was CUT SHORT, so nothing is established about whether a
+    copy exists: the per-paper lookup cap was reached, or a provider's lookup failed in
+    transit (a live run saw an arXiv read timeout and a Semantic Scholar HTTP 404 in the
+    same campaign). ``detail`` carries the resolver's per-provider note saying which.
+
+    Exists because :attr:`NO_OPEN_ACCESS_COPY` was being used for this case too, which
+    overstated what had actually been established -- the same asserted-vs-observed
+    defect already fixed once for :attr:`PAYWALLED`, one level down. A provider merely
+    declining for a missing optional API key does NOT count as incomplete; that is a
+    stable configuration fact reported in ``detail``, not an unknown."""
     NOT_A_DOCUMENT = "not_a_document"
     """A full-text URL was advertised but served something other than a document --
     in the probe, an HTML landing page five times out of eleven."""
+    EMPTY_DOCUMENT = "empty_document"
+    """A full-text URL was advertised, the content type was a document type, and the
+    fetch itself succeeded -- but the response was zero bytes, or yielded no
+    non-whitespace extractable text. Distinct from :attr:`NO_OPEN_ACCESS_COPY`: a copy
+    WAS found and fetched, it was simply unusable. A live campaign stored a zero-byte
+    ``text/plain`` response from a figshare landing page as a successful acquisition
+    and never queued the paper for a human; this reason exists so that never happens
+    silently again."""
     UNREADABLE = "unreadable"
     """The bytes were fetched but yielded no usable text (scanned/image-only pages, or
     a font encoding that loses spaces). See

@@ -1408,6 +1408,46 @@ class TestWantedPaperOpenAccessResolution:
         assert "text/html" in requests[0].detail
         assert report.artifacts == []
 
+    def test_a_zero_byte_response_is_not_stored_and_the_paper_is_queued_as_empty(self, campaign: Campaign) -> None:
+        """The defect this pins down: a live campaign fetched a figshare landing page,
+        received zero bytes, and stored it as a successful acquisition -- suppressing
+        the manual queue that is the whole fallback. A zero-byte fetch must be treated
+        as a failed acquisition, not evidence."""
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        deps, _, config = _make_deps(
+            [_wanted_proposal()],
+            fetch={OA_PDF_URL: (b"", "text/plain")},
+            oa_resolver=resolver,
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.artifacts == []
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.EMPTY_DOCUMENT]
+        assert "0 bytes" in requests[0].detail
+        events = read_events(campaign.workspace_root / "decision_log.jsonl")
+        assert not any(e["event"] == "literature.oa_copy_acquired" for e in events)
+        requested = [e for e in events if e["event"] == "literature.paper_requested"]
+        assert requested[0]["reason"] == "empty_document"
+
+    def test_a_response_with_bytes_but_no_extractable_text_is_queued_as_empty(self, campaign: Campaign) -> None:
+        """Non-empty bytes that extract to whitespace-only text are just as unusable
+        as zero bytes and must be rejected the same way."""
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        deps, _, config = _make_deps(
+            [_wanted_proposal()],
+            fetch={OA_PDF_URL: (b"   \n\t  ", "text/plain")},
+            oa_resolver=resolver,
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.artifacts == []
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.EMPTY_DOCUMENT]
+        assert "no extractable text" in requests[0].detail
+
     def test_no_oa_candidate_is_queued_with_the_truthful_reason(self, campaign: Campaign) -> None:
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver())
 
@@ -1418,6 +1458,40 @@ class TestWantedPaperOpenAccessResolution:
         assert requests[0].reason == AcquisitionReason.NO_OPEN_ACCESS_COPY
         assert "no open-access copy advertised" in requests[0].detail
         assert RELEVANCE in requests[0].detail
+
+    def test_a_truncated_resolution_is_queued_as_incomplete_not_as_no_open_access_copy(
+        self, campaign: Campaign
+    ) -> None:
+        """A resolution cut short establishes nothing, so it must not claim nothing exists.
+
+        Guards the asserted-vs-observed distinction: ``no_open_access_copy`` is a
+        finding, ``oa_lookup_incomplete`` is an admission. A live run hit this via an
+        arXiv read timeout and a Semantic Scholar 404 in the same campaign.
+        """
+        truncated = OaResolution(
+            candidates=(),
+            note="OpenAlex: 0 OA PDF candidates; arXiv: lookup failed (read operation timed out)",
+            complete=False,
+        )
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver({WANTED_DOI: truncated}))
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_INCOMPLETE]
+        assert "lookup failed" in requests[0].detail
+
+    def test_a_completed_resolution_that_found_nothing_is_still_no_open_access_copy(self, campaign: Campaign) -> None:
+        """The complement of the test above -- the honest negative must survive."""
+        exhausted = OaResolution(
+            candidates=(), note="OpenAlex: 0 OA PDF candidates; Unpaywall: 0 OA PDF candidates", complete=True
+        )
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver({WANTED_DOI: exhausted}))
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
 
     def test_without_a_resolver_the_paper_is_still_queued_without_asserting_a_paywall(self, campaign: Campaign) -> None:
         """Even with no resolver wired (mock tier), 'paywalled' must not be recorded:

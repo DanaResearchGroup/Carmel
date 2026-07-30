@@ -151,10 +151,15 @@ def store_artifact(
         The persisted (or pre-existing) :class:`StoredArtifact` metadata.
 
     Raises:
-        ValueError: If ``len(data)`` exceeds ``max_bytes``, if the recomputed
-            sha256 disagrees with ``artifact.sha256``, or if the resolved
-            destination would fall outside the resolved workspace root.
+        ValueError: If ``data`` is empty, if ``len(data)`` exceeds ``max_bytes``, if
+            the recomputed sha256 disagrees with ``artifact.sha256``, or if the
+            resolved destination would fall outside the resolved workspace root.
     """
+    if not data:
+        raise ValueError(
+            "refusing to store a zero-byte artifact: a fetch that yields no bytes is a "
+            "failed acquisition, never evidence"
+        )
     if len(data) > max_bytes:
         raise ValueError(f"artifact size {len(data)} exceeds max_bytes cap {max_bytes}")
 

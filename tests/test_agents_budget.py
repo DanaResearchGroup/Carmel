@@ -586,3 +586,73 @@ class TestImportCycle:
             check=False,
         )
         assert result.returncode == 0, f"importing {module} first failed:\n{result.stderr}"
+
+
+class TestIndexLookupBudget:
+    """Index lookups are counted separately from document downloads."""
+
+    def test_index_lookups_do_not_consume_the_document_download_budget(self) -> None:
+        """The exact regression that broke a live run.
+
+        A campaign with ``max_fetches: 25`` stopped at ``stop_reason: max_fetches``
+        after 4 search queries and only 3 papers, having downloaded ZERO documents --
+        the per-paper resolver lookups had eaten the whole budget first. A tight
+        document ceiling must not restrict cheap metadata lookups at all.
+        """
+        ledger = make_ledger(max_fetches=1, max_index_lookups=50)
+
+        for _ in range(40):
+            with ledger.index_lookup_call(estimated_bytes=1_000) as r:
+                ledger.settle_fetch(r, actual_bytes=500)
+
+        usage = ledger.usage()
+        assert usage.index_lookups == 40
+        assert usage.fetches == 0
+        # The single document fetch is still available -- it was never spent on lookups.
+        assert ledger.remaining_fetches() == 1
+
+    def test_exhausting_the_index_lookup_ceiling_reports_that_dimension(self) -> None:
+        ledger = make_ledger(max_index_lookups=2)
+
+        for _ in range(2):
+            with ledger.index_lookup_call(estimated_bytes=10) as r:
+                ledger.settle_fetch(r, actual_bytes=10)
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            ledger.reserve_index_lookup(estimated_bytes=10)
+        assert excinfo.value.dimension is BudgetDimension.INDEX_LOOKUPS
+        assert ledger.exhausted_dimension() is BudgetDimension.INDEX_LOOKUPS
+
+    def test_document_fetches_still_charge_the_fetches_dimension(self) -> None:
+        """Guards against the split accidentally moving downloads off their own ceiling."""
+        ledger = make_ledger(max_fetches=1, max_index_lookups=50)
+
+        with ledger.fetch_call(estimated_bytes=1_000) as r:
+            ledger.settle_fetch(r, actual_bytes=1_000)
+
+        assert ledger.usage().fetches == 1
+        assert ledger.usage().index_lookups == 0
+        with pytest.raises(BudgetExceededError) as excinfo:
+            ledger.reserve_fetch(estimated_bytes=1)
+        assert excinfo.value.dimension is BudgetDimension.FETCHES
+
+    def test_egress_bytes_remain_a_shared_ceiling_across_both_kinds(self) -> None:
+        """Bytes are a genuinely common resource; only the call counts were split."""
+        ledger = make_ledger(max_fetches=5, max_index_lookups=5, max_fetch_bytes=1_000)
+
+        with ledger.index_lookup_call(estimated_bytes=600) as r:
+            ledger.settle_fetch(r, actual_bytes=600)
+
+        with pytest.raises(BudgetExceededError) as excinfo:
+            ledger.reserve_fetch(estimated_bytes=600)
+        assert excinfo.value.dimension is BudgetDimension.FETCH_BYTES
+
+    def test_an_abandoned_index_lookup_still_counts_as_an_attempt(self) -> None:
+        """A failed lookup consumed a real outbound request; it is not refunded."""
+        ledger = make_ledger(max_index_lookups=5)
+
+        with pytest.raises(RuntimeError), ledger.index_lookup_call(estimated_bytes=100):
+            raise RuntimeError("transport blew up")
+
+        assert ledger.usage().index_lookups == 1
+        assert ledger.usage().fetches == 0
