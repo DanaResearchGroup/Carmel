@@ -744,6 +744,13 @@ class TestPydanticAIModelEstimateWorstCaseCostUsd:
     """
 
     def test_takes_the_max_over_the_full_fallback_ladder(self) -> None:
+        # Constructing a real PydanticAIModel needs pydantic-ai, which the base test lane
+        # deliberately does NOT install -- without this guard the test fails there with
+        # AgentBridgeError rather than skipping, while passing locally and on the agents
+        # lane (both have the extra). Every other PydanticAIModel test here guards the
+        # same way.
+        pytest.importorskip("pydantic_ai")
+
         # gemini-2.5-flash ($0.30/$2.50 per 1M) is far cheaper than its fallback
         # gemini-3.1-pro-preview ($4.00/$18.00 per 1M); the reservation must reflect
         # the pricier fallback, not just the cheap preferred model.
@@ -762,6 +769,8 @@ class TestPydanticAIModelEstimateWorstCaseCostUsd:
         assert estimate == pytest.approx(fallback_only)
 
     def test_no_fallbacks_prices_just_the_one_model(self) -> None:
+        pytest.importorskip("pydantic_ai")
+
         model = PydanticAIModel(
             model_name="gemini-2.5-flash", provider=AgentProvider.GOOGLE, api_key="placeholder-not-a-real-key"
         )
