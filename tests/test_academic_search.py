@@ -25,6 +25,7 @@ from carmel.agents.tools.academic import (
     CORE_ENDPOINT,
     CROSSREF_ENDPOINT,
     DOAJ_ENDPOINT,
+    EUROPEPMC_ENDPOINT,
     OPENALEX_ENDPOINT,
     SEMANTIC_SCHOLAR_ENDPOINT,
     UNPAYWALL_ENDPOINT,
@@ -39,6 +40,7 @@ from carmel.agents.tools.academic import (
     crossref_tdm_candidates,
     dedupe_by_doi,
     doaj_oa_candidates,
+    europepmc_oa_candidates,
     normalize_doi,
     openalex_oa_pdf_urls,
     semantic_scholar_oa_candidates,
@@ -424,6 +426,7 @@ _QUIET_PROVIDER_ROUTES: dict[str, Any] = {
     CROSSREF_ENDPOINT: {},
     SEMANTIC_SCHOLAR_ENDPOINT: {},
     DOAJ_ENDPOINT: {},
+    EUROPEPMC_ENDPOINT: {},
 }
 
 
@@ -779,6 +782,88 @@ class TestDoajCandidates:
         assert doaj_oa_candidates(payload, doi=_RESOLVER_DOI) == []
 
 
+class TestEuropepmcCandidates:
+    """Europe PMC ``resultType=core`` search results, PDF-only and DOI-gated."""
+
+    def test_pdf_full_text_url_for_the_matching_doi_yields_a_candidate(self) -> None:
+        payload = {
+            "resultList": {
+                "result": [
+                    {
+                        "doi": _RESOLVER_DOI,
+                        "fullTextUrlList": {
+                            "fullTextUrl": [{"documentStyle": "pdf", "url": "https://europepmc.example/fulltext.pdf"}]
+                        },
+                    }
+                ]
+            }
+        }
+        assert europepmc_oa_candidates(payload, doi=_RESOLVER_DOI) == [
+            OaCandidate(url="https://europepmc.example/fulltext.pdf", tier=OaTier.REPOSITORY)
+        ]
+
+    def test_results_not_naming_the_wanted_doi_are_excluded(self) -> None:
+        """Europe PMC's ``query=DOI:"..."`` search can still surface a citing or
+        related work; a near-miss DOI must not be treated as the wanted paper."""
+        payload = {
+            "resultList": {
+                "result": [
+                    {
+                        "doi": "10.9999/other",
+                        "fullTextUrlList": {
+                            "fullTextUrl": [{"documentStyle": "pdf", "url": "https://europepmc.example/wrong.pdf"}]
+                        },
+                    },
+                    {
+                        "fullTextUrlList": {
+                            "fullTextUrl": [{"documentStyle": "pdf", "url": "https://europepmc.example/anonymous.pdf"}]
+                        },
+                    },
+                ]
+            }
+        }
+        assert europepmc_oa_candidates(payload, doi=_RESOLVER_DOI) == []
+
+    def test_empty_result_list_yields_no_candidates(self) -> None:
+        payload = {"resultList": {"result": []}}
+        assert europepmc_oa_candidates(payload, doi=_RESOLVER_DOI) == []
+
+    def test_html_only_full_text_url_is_not_offered_as_a_pdf_candidate(self) -> None:
+        """The acquisition layer's ``_validate_document`` rejects ``text/html``
+        outright, so advertising an HTML-only URL as a candidate would just burn a
+        fetch on a guaranteed non-document outcome."""
+        payload = {
+            "resultList": {
+                "result": [
+                    {
+                        "doi": _RESOLVER_DOI,
+                        "fullTextUrlList": {
+                            "fullTextUrl": [{"documentStyle": "html", "url": "https://europepmc.example/article"}]
+                        },
+                    }
+                ]
+            }
+        }
+        assert europepmc_oa_candidates(payload, doi=_RESOLVER_DOI) == []
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            None,
+            [],
+            "x",
+            {},
+            {"resultList": "no"},
+            {"resultList": {"result": "no"}},
+            {"resultList": {"result": [7]}},
+            {"resultList": {"result": [{"doi": _RESOLVER_DOI, "fullTextUrlList": "no"}]}},
+            {"resultList": {"result": [{"doi": _RESOLVER_DOI, "fullTextUrlList": {"fullTextUrl": [7]}}]}},
+        ],
+    )
+    def test_garbage_shapes_yield_no_candidates(self, payload: Any) -> None:
+        assert europepmc_oa_candidates(payload, doi=_RESOLVER_DOI) == []
+
+
 _CHEMRXIV_ASSET = {"original": {"url": "https://chemrxiv.example/item/original/preprint.pdf"}}
 _WANTED_TITLE = "Ammonia Combustion Kinetics: A Study"
 
@@ -919,6 +1004,18 @@ def _full_provider_routes() -> dict[str, Any]:
                 }
             ]
         },
+        EUROPEPMC_ENDPOINT: {
+            "resultList": {
+                "result": [
+                    {
+                        "doi": _RESOLVER_DOI,
+                        "fullTextUrlList": {
+                            "fullTextUrl": [{"documentStyle": "pdf", "url": "https://europepmc.example/fulltext.pdf"}]
+                        },
+                    }
+                ]
+            }
+        },
         CHEMRXIV_ENDPOINT: {
             "itemHits": [
                 {
@@ -978,11 +1075,12 @@ class TestPluggableProviderResolution:
             "https://repo.example/mirror.pdf",
             "https://green.example/copy.pdf",
             "https://core.example/download.pdf",
+            "https://europepmc.example/fulltext.pdf",
             # ... and preprints strictly last: they are not the version of record.
             "https://chemrxiv.example/item/original/preprint.pdf",
             "https://arxiv.org/pdf/1405.5500v3",
         ]
-        assert len(seen) == 8, "expected exactly one lookup call per provider"
+        assert len(seen) == 9, "expected exactly one lookup call per provider"
         assert "preprint, not the version of record" in resolution.note
 
     def test_one_provider_rate_limiting_does_not_suppress_the_others(self, ledger: BudgetLedger) -> None:

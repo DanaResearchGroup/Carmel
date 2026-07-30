@@ -6,9 +6,9 @@ endpoint plus a bearer key, which no scholarly index requires — and demanding 
 them impossible to configure at all. The second half of the module is
 :class:`OpenAccessResolver`: deterministic DOI/title -> open-access-PDF resolution over
 a pluggable list of OA indexes (OpenAlex, Unpaywall, Crossref TDM links, Semantic
-Scholar, CORE, DOAJ, ChemRxiv, arXiv). ChemRxiv is registered but disabled by default;
-see :data:`DEFAULT_ENABLED_PROVIDERS`. FatCat / Internet Archive Scholar was removed
-entirely on 2026-07-29 -- see the note by the provider registry.
+Scholar, CORE, DOAJ, Europe PMC, ChemRxiv, arXiv). ChemRxiv is registered but disabled
+by default; see :data:`DEFAULT_ENABLED_PROVIDERS`. FatCat / Internet Archive Scholar
+was removed entirely on 2026-07-29 -- see the note by the provider registry.
 
 Both adapters are shaped by a live probe of 60 combustion-kinetics works rather than by
 the APIs' own documentation, because the two disagree sharply:
@@ -57,6 +57,7 @@ UNPAYWALL_ENDPOINT = "https://api.unpaywall.org/v2"
 SEMANTIC_SCHOLAR_ENDPOINT = "https://api.semanticscholar.org/graph/v1/paper"
 CORE_ENDPOINT = "https://api.core.ac.uk/v3/search/works"
 DOAJ_ENDPOINT = "https://doaj.org/api/search/articles"
+EUROPEPMC_ENDPOINT = "https://www.ebi.ac.uk/europepmc/webservices/rest/search"
 CHEMRXIV_ENDPOINT = "https://chemrxiv.org/engage/chemrxiv/public-api/v1/items"
 ARXIV_ENDPOINT = "https://export.arxiv.org/api/query"
 
@@ -460,7 +461,7 @@ class OaCandidate:
     tier: OaTier
 
 
-#: Hard ceiling on index lookup calls per resolved paper. Eight providers are
+#: Hard ceiling on index lookup calls per resolved paper. Nine providers are
 #: registered today and each makes at most one call, so this never trips in normal
 #: operation; it is the bound that keeps a 12-paper run at <=96 small JSON/Atom
 #: lookups no matter how many providers are added later, instead of letting provider
@@ -486,6 +487,7 @@ DEFAULT_ENABLED_PROVIDERS: frozenset[str] = frozenset(
         "Semantic Scholar",
         "CORE",
         "DOAJ",
+        "Europe PMC",
         "arXiv",
     }
 )
@@ -785,6 +787,70 @@ def _doaj_names_doi(identifiers: Any, doi: str) -> bool:
     return False
 
 
+def europepmc_oa_candidates(payload: Any, *, doi: str) -> list[OaCandidate]:
+    """Repository/aggregator OA PDF candidates from one Europe PMC search response.
+
+    Europe PMC is overwhelmingly a life-sciences index (it mirrors PubMed Central and
+    kin): two combustion-kinetics DOIs probed live 2026-07-30
+    (``10.1039/c9re00429g``, ``10.1016/j.combustflame.2015.11.011``) both returned
+    ``hitCount: 0`` -- expect a LOW hit rate for Carmel's corpus, unlike the
+    OpenAlex/Unpaywall disagreement documented at the top of this module, which is
+    drawn from works this index does cover. It is kept in the default rotation anyway
+    because it is free, keyless, and the rare hit (a combustion paper that happens to
+    be cross-deposited, or one with biological/toxicological relevance) is a genuine
+    additional OA copy at zero marginal cost.
+
+    A result is accepted ONLY when its own ``doi`` field names the wanted DOI: like
+    CORE, Europe PMC's ``query=DOI:"..."`` search can still surface a citing or
+    related work instead of an exact match, and a topically-similar paper's PDF is the
+    wrong paper -- far worse than a miss.
+
+    Only ``fullTextUrlList.fullTextUrl[]`` entries whose ``documentStyle`` is ``"pdf"``
+    are emitted. An HTML-only ``fullTextUrl`` is deliberately dropped rather than
+    advertised under some non-PDF tier: the acquisition layer's
+    :func:`~carmel.services.literature._validate_document` rejects ``text/html``
+    outright, so advertising an HTML-only URL as a candidate would just burn a fetch
+    call for a guaranteed ``NOT_A_DOCUMENT`` outcome.
+
+    Shape per the Europe PMC ``resultType=core`` REST response (``resultList.result[]``
+    with per-result ``doi`` and ``fullTextUrlList.fullTextUrl[]`` entries carrying
+    ``documentStyle``/``availability``/``url``); verified against a live response
+    2026-07-30 for a known open-access biology DOI.
+
+    Args:
+        payload: The raw Europe PMC search response payload, of unknown shape.
+        doi: The wanted paper's bare normalized DOI.
+
+    Returns:
+        Deduplicated :attr:`OaTier.REPOSITORY` candidates; empty for unusable shapes.
+    """
+    result_list = payload.get("resultList") if isinstance(payload, dict) else None
+    results = result_list.get("result") if isinstance(result_list, dict) else None
+    if not isinstance(results, list):
+        return []
+    candidates: list[OaCandidate] = []
+    seen: set[str] = set()
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if normalize_doi(result.get("doi")) != doi:
+            continue
+        full_text_list = result.get("fullTextUrlList")
+        entries = full_text_list.get("fullTextUrl") if isinstance(full_text_list, dict) else None
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("documentStyle") != "pdf":
+                continue
+            url = entry.get("url")
+            if isinstance(url, str) and url and url not in seen:
+                candidates.append(OaCandidate(url=url, tier=OaTier.REPOSITORY))
+                seen.add(url)
+    return candidates
+
+
 def chemrxiv_oa_candidates(payload: Any, *, doi: str, title: str | None) -> list[OaCandidate]:
     """Preprint PDFs from a ChemRxiv (Cambridge Open Engage) term-search response.
 
@@ -1037,6 +1103,7 @@ class OpenAccessResolver(_KeylessSearchTool):
             ("Semantic Scholar", self._lookup_semantic_scholar),
             ("CORE", self._lookup_core),
             ("DOAJ", self._lookup_doaj),
+            ("Europe PMC", self._lookup_europepmc),
             ("ChemRxiv", self._lookup_chemrxiv),
             ("arXiv", self._lookup_arxiv),
         )
@@ -1161,6 +1228,11 @@ class OpenAccessResolver(_KeylessSearchTool):
     def _lookup_doaj(self, doi: str, title: str | None) -> list[OaCandidate]:
         url = f"{DOAJ_ENDPOINT}/{quote(f'doi:{doi}', safe='')}"
         return doaj_oa_candidates(self._counted_get_json(url), doi=doi)
+
+    def _lookup_europepmc(self, doi: str, title: str | None) -> list[OaCandidate]:
+        query = quote_plus(f'DOI:"{doi}"')
+        url = f"{EUROPEPMC_ENDPOINT}?query={query}&format=json&resultType=core"
+        return europepmc_oa_candidates(self._counted_get_json(url), doi=doi)
 
     def _lookup_chemrxiv(self, doi: str, title: str | None) -> list[OaCandidate]:
         if not title:
