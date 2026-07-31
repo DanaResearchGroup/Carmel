@@ -351,6 +351,32 @@ def _literature_outcome(report: LiteratureReport, action: PlannedAction) -> Acti
     return ActionOutcome.SUCCEEDED
 
 
+def _apply_action_budget(deps: LiteratureDeps, action: PlannedAction) -> LiteratureDeps:
+    """Bind a corpus pass to the budget the operator named when appending it.
+
+    Without this the operator's ``--budget-usd`` would be recorded on the action and
+    read only by the approval gate, while the run itself spent up to whatever the
+    config file's ``max_cost_usd`` happened to be -- a control that looks like a
+    ceiling in the plan and is not one at run time. A safety number that does not
+    bind is worse than none, because it is believed.
+
+    Only ``max_cost_usd`` is replaced. The session and daily ceilings are process-
+    and machine-wide protections against many runs in aggregate, and one operator
+    authorising one action does not authorise breaching those.
+    """
+    budget_usd = action.estimated_spend_usd
+    if budget_usd is None or budget_usd <= 0:
+        return deps
+
+    import dataclasses
+
+    from carmel.agents.budget import BudgetLedger
+
+    budget = deps.config.budget.model_copy(update={"max_cost_usd": budget_usd})
+    config = deps.config.model_copy(update={"budget": budget})
+    return dataclasses.replace(deps, config=config, ledger=BudgetLedger(budget))
+
+
 def make_literature_handler(
     agent_config: AgentConfig | None = None,
     literature_deps: LiteratureDeps | None = None,
@@ -384,6 +410,8 @@ def make_literature_handler(
         from carmel.services.literature import build_deps, run_corpus_pass, run_literature_research, run_record_for
 
         deps = literature_deps if literature_deps is not None else build_deps(agent_config)  # type: ignore[arg-type]
+        if action.kind == ActionKind.LITERATURE_CORPUS_PASS:
+            deps = _apply_action_budget(deps, action)
         run_pass = run_corpus_pass if action.kind == ActionKind.LITERATURE_CORPUS_PASS else run_literature_research
         report = run_pass(workspace_root, campaign, action, deps, config=deps.config)
         run_record = run_record_for(report, action)

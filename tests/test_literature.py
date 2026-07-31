@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 import carmel.services.literature
 from carmel.agents.bridge import AgentTool, ModelResponse
-from carmel.agents.budget import BudgetLedger, BudgetUsage, session_budget
+from carmel.agents.budget import BudgetExceededError, BudgetLedger, BudgetUsage, session_budget
 from carmel.agents.literature_agent import (
     LITERATURE_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
@@ -1984,3 +1984,41 @@ class TestCorpusPass:
         assert [p.run_id for p in report.passes] == [first.run_id, report.run_id]
         assert [q.text for q in report.queries] == ["first query"], "a corpus pass contributes no queries"
         assert report.findings_for(report.run_id) == report.findings
+
+
+class TestOperatorBudgetBinds:
+    """Decision 0004/D2: the budget named when appending the action must bound the
+    run, not merely be recorded on it."""
+
+    def test_the_actions_budget_replaces_the_config_ceiling(self, campaign: Campaign) -> None:
+        """Without this the number shows up in the plan as if it were a ceiling while
+        the run spends up to whatever the config file allows. A safety number that
+        does not bind is worse than none, because it is believed."""
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _apply_action_budget
+
+        deps, _, config = _make_deps([])
+        assert deps.config.budget.max_cost_usd != 0.25
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 0.25})
+
+        bound = _apply_action_budget(deps, action)
+
+        assert bound.config.budget.max_cost_usd == 0.25
+        # The ledger must actually refuse above the operator's number, not merely
+        # carry it: this is the assertion that would fail if the budget were wired
+        # into the config and not into the thing that does the gating.
+        with pytest.raises(BudgetExceededError):
+            bound.ledger.reserve_model_call(estimated_tokens=1000, estimated_cost_usd=0.30)
+        # Session and daily ceilings are machine-wide protections; one operator
+        # authorising one action does not authorise breaching them.
+        assert bound.config.budget.session_max_cost_usd == deps.config.budget.session_max_cost_usd
+        assert bound.config.budget.daily_max_cost_usd == deps.config.budget.daily_max_cost_usd
+
+    def test_an_absent_budget_leaves_the_configured_ceiling_alone(self, campaign: Campaign) -> None:
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _apply_action_budget
+
+        deps, _, _ = _make_deps([])
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 0.0})
+
+        assert _apply_action_budget(deps, action) is deps
