@@ -622,6 +622,48 @@ class TestRequestsCommand:
         )
         return load_campaign(ws).campaign_id, ws
 
+    def test_config_workspace_root_is_honoured_without_an_explicit_workspaces_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--config` names a workspace_root; this command used to ignore it.
+
+        It resolved the root before the config was even loaded, then read the config
+        only for max_artifact_bytes -- so it scanned the DEFAULT workspaces directory
+        while the operator had just handed it a config naming a different one. The
+        failure is quiet in the worst way: "No campaign <id> under <dir>", naming a
+        directory the operator never asked about, for a campaign that exists.
+
+        `new-campaign --workspaces` already advertises "default: the config's
+        workspace_root"; only this command disagreed.
+        """
+        cid, _ = self._campaign_with_request(tmp_path)
+        from Carmel import main
+
+        # Point the default elsewhere and leave it empty: if the config's
+        # workspace_root were ignored, the campaign could only be found by accident.
+        empty_default = tmp_path / "not-here"
+        empty_default.mkdir()
+        monkeypatch.setenv("CARMEL_WORKSPACES", str(empty_default))
+
+        code = main(["requests", "--campaign", cid, "--config", str(tmp_path / "nh3.yaml")])
+
+        assert code == 0, "the campaign named by the config's workspace_root was not found"
+        assert "Shock tube" in capsys.readouterr().out
+
+    def test_an_explicit_workspaces_flag_still_wins_over_the_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Precedence must not invert: an operator who types --workspaces means it."""
+        cid, _ = self._campaign_with_request(tmp_path)
+        from Carmel import main
+
+        code = main(
+            ["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--config", str(tmp_path / "nh3.yaml")]
+        )
+
+        assert code == 0
+        assert "Shock tube" in capsys.readouterr().out
+
     def test_listing_prints_the_next_command_for_each_pending_paper(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1125,7 +1167,9 @@ class TestCorpusPassCommand:
         assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
         cid = load_campaign(tmp_path / "ws").campaign_id
 
-        code = main(["corpus-pass", "--campaign", cid, "--budget-usd", "1", "--workspaces", str(tmp_path), "--dry-run"])
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "100000", "--workspaces", str(tmp_path), "--dry-run"]
+        )
 
         assert code == 1
         err = capsys.readouterr().err
@@ -1144,15 +1188,71 @@ class TestCorpusPassCommand:
         cid, ws = self._campaign(tmp_path)
 
         code = main(
-            ["corpus-pass", "--campaign", cid, "--budget-usd", "2.50", "--workspaces", str(tmp_path), "--dry-run"]
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "250000", "--workspaces", str(tmp_path), "--dry-run"]
         )
 
         assert code == 0
         out = capsys.readouterr().out
-        assert "$2.50" in out
+        # The cap is reported in the unit that binds. With no --config there is no
+        # model to price against, so the dollar cost is declared unavailable rather
+        # than defaulted to a number that would read as free.
+        assert "250,000 tokens" in out
+        assert "cannot be estimated" in out
         kinds = [a.kind for a in load_plan(ws).actions]
         assert ActionKind.LITERATURE_CORPUS_PASS in kinds
         assert kinds.index(ActionKind.LITERATURE_CORPUS_PASS) < kinds.index(ActionKind.T3_RUN)
+
+    def test_the_dollar_cost_is_reported_as_an_estimate_beside_the_binding_token_cap(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Tokens are the authorisation unit; dollars are derived and REPORTED.
+
+        The operator still needs to know roughly what a token number costs, or the
+        cap is unusable in practice -- but the moment a dollar figure is printed it
+        invites being read as the ceiling. That is precisely the confusion that cost a
+        live run 87% of its authorised budget: it stopped on a token cap nobody had
+        looked at while the dollar figure sat there looking authoritative.
+
+        So the output must carry BOTH, and must say which one binds. Asserting on the
+        disambiguating phrase, not merely on the number, is the point of this test.
+        """
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "250000",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+                "--dry-run",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "250,000 tokens" in out, "the binding cap must be stated in the unit that binds"
+        assert "at most ~$" in out, "an operator cannot use a token cap without knowing its cost"
+        assert "estimated ~$" not in out, (
+            "the figure is a worst-case bound (unpriced models get a punitive fallback rate), "
+            "so printing it as a point estimate would mislead in the same way a non-binding "
+            "dollar ceiling did"
+        )
+        assert "the token cap is what binds" in out, (
+            "a bare dollar figure beside a token cap reads as the ceiling; it must say which one binds"
+        )
 
     def test_progress_gains_the_action_at_the_same_position_as_the_plan(self, tmp_path: Path) -> None:
         """Plan and progress are index-aligned; drifting them apart would make the
@@ -1163,7 +1263,18 @@ class TestCorpusPassCommand:
 
         cid, ws = self._campaign(tmp_path)
         assert (
-            main(["corpus-pass", "--campaign", cid, "--budget-usd", "1", "--workspaces", str(tmp_path), "--dry-run"])
+            main(
+                [
+                    "corpus-pass",
+                    "--campaign",
+                    cid,
+                    "--budget-tokens",
+                    "100000",
+                    "--workspaces",
+                    str(tmp_path),
+                    "--dry-run",
+                ]
+            )
             == 0
         )
 
@@ -1181,7 +1292,9 @@ class TestCorpusPassCommand:
 
         cid, ws = self._campaign(tmp_path)
 
-        code = main(["corpus-pass", "--campaign", cid, "--budget-usd", "0", "--workspaces", str(tmp_path), "--dry-run"])
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "0", "--workspaces", str(tmp_path), "--dry-run"]
+        )
 
         assert code == 1
         assert "must be positive" in capsys.readouterr().err
@@ -1195,7 +1308,16 @@ class TestCorpusPassCommand:
         self._campaign(tmp_path)
 
         code = main(
-            ["corpus-pass", "--campaign", "no-such-id", "--budget-usd", "1", "--workspaces", str(tmp_path), "--dry-run"]
+            [
+                "corpus-pass",
+                "--campaign",
+                "no-such-id",
+                "--budget-tokens",
+                "100000",
+                "--workspaces",
+                str(tmp_path),
+                "--dry-run",
+            ]
         )
 
         assert code == 1
@@ -1233,8 +1355,8 @@ class TestCorpusPassCommand:
                 "corpus-pass",
                 "--campaign",
                 cid,
-                "--budget-usd",
-                "1",
+                "--budget-tokens",
+                "100000",
                 "--workspaces",
                 str(tmp_path),
                 "--config",
@@ -1297,8 +1419,8 @@ class TestCorpusPassCommand:
                 "corpus-pass",
                 "--campaign",
                 cid,
-                "--budget-usd",
-                "1",
+                "--budget-tokens",
+                "100000",
                 "--workspaces",
                 str(tmp_path),
                 "--config",

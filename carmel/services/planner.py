@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from carmel.agents.models import estimate_worst_case_model_cost_usd
 from carmel.schemas.action_state import ActionExecutionStatus
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
 from carmel.schemas.campaign import Campaign
@@ -351,7 +352,8 @@ def plan_and_save(workspace_root: Path, campaign: Campaign, *, include_literatur
 def append_corpus_pass_action(
     workspace_root: Path,
     *,
-    budget_usd: float,
+    budget_tokens: int,
+    model_name: str | None = None,
     rationale: str = "",
 ) -> PlannedAction:
     """Append a corpus-pass action to the campaign's plan, on operator command.
@@ -370,22 +372,30 @@ def append_corpus_pass_action(
 
     Args:
         workspace_root: The campaign workspace root.
-        budget_usd: What this pass may spend. Required and explicit: the ledger
-            bounds AUTONOMOUS spend, whereas an operator typing a command with a
-            number in it is AUTHORISED spend, and the two should not be conflated.
-            Note this means there is no campaign-lifetime hard stop -- cumulative
-            spend across passes is reported, not enforced.
+        budget_tokens: How many model tokens this pass may consume. Required and
+            explicit: the ledger bounds AUTONOMOUS spend, whereas an operator typing a
+            command with a number in it is AUTHORISED spend, and the two should not be
+            conflated. Note this means there is no campaign-lifetime hard stop --
+            cumulative consumption across passes is reported, not enforced.
+
+            Tokens rather than dollars because tokens are what the run consumes and
+            what the provider meters. A dollar ceiling puts a pricing table between
+            the number the operator typed and the quantity that actually binds, so a
+            stale price moves the real limit without anyone editing it.
+        model_name: Model the pass will run against, used ONLY to derive the reported
+            dollar estimate. ``None`` records an estimate of 0.0, which reads as
+            "unknown", never as "free".
         rationale: Optional operator note recorded on the action.
 
     Returns:
         The appended action.
 
     Raises:
-        ValueError: If ``budget_usd`` is not positive, or if the resulting plan would
-            not be executable.
+        ValueError: If ``budget_tokens`` is not positive, or if the resulting plan
+            would not be executable.
     """
-    if budget_usd <= 0:
-        raise ValueError(f"budget_usd must be positive, got {budget_usd!r}")
+    if budget_tokens <= 0:
+        raise ValueError(f"budget_tokens must be positive, got {budget_tokens!r}")
 
     # ONE lock across the whole read-modify-write of BOTH files (spar round 7, P1).
     # The plan was previously loaded, edited and saved outside any lock while progress
@@ -395,10 +405,12 @@ def append_corpus_pass_action(
     # the whole sequence also closes the window in which progress had been written and
     # the plan had not.
     with workspace_lock(workspace_root):
-        return _append_corpus_pass_action_locked(workspace_root, budget_usd, rationale)
+        return _append_corpus_pass_action_locked(workspace_root, budget_tokens, model_name, rationale)
 
 
-def _append_corpus_pass_action_locked(workspace_root: Path, budget_usd: float, rationale: str) -> PlannedAction:
+def _append_corpus_pass_action_locked(
+    workspace_root: Path, budget_tokens: int, model_name: str | None, rationale: str
+) -> PlannedAction:
     """Body of :func:`append_corpus_pass_action`, with the workspace lock held."""
     plan = load_plan(workspace_root)
 
@@ -427,7 +439,13 @@ def _append_corpus_pass_action_locked(workspace_root: Path, budget_usd: float, r
         description="Literature corpus pass — ground findings in the papers already held",
         estimated_cpu_hours=0.0,
         estimated_cost=0.0,
-        estimated_spend_usd=budget_usd,
+        estimated_tokens=budget_tokens,
+        # DERIVED and reported, never enforced: `_apply_action_budget` binds
+        # `estimated_tokens`. Recording the estimate next to the cap is what lets an
+        # operator see what a token number costs without letting a price move the cap.
+        estimated_spend_usd=(
+            estimate_worst_case_model_cost_usd(model_name, budget_tokens) if model_name is not None else 0.0
+        ),
         blocking=False,
         rationale=rationale
         or (

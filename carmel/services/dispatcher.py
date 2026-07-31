@@ -41,6 +41,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from carmel.config import AgentConfig
 from carmel.logger import get_logger
+from carmel.paths import default_daily_ledger_path
 from carmel.schemas.action_state import ActionExecutionStatus, ActionOutcome, PlanProgress
 from carmel.schemas.approval import LITERATURE_ACTION_KINDS, ActionKind, ApprovalStatus
 from carmel.schemas.campaign import Campaign
@@ -364,36 +365,49 @@ def _literature_outcome(report: LiteratureReport, action: PlannedAction) -> Acti
 def _apply_action_budget(deps: LiteratureDeps, action: PlannedAction) -> LiteratureDeps:
     """Bind a corpus pass to the budget the operator named when appending it.
 
-    Without this the operator's ``--budget-usd`` would be recorded on the action and
-    read only by the approval gate, while the run itself spent up to whatever the
-    config file's ``max_cost_usd`` happened to be -- a control that looks like a
+    Without this the operator's ``--budget-tokens`` would be recorded on the action and
+    read only by the approval gate, while the run itself consumed up to whatever the
+    config file's ``max_tokens`` happened to be -- a control that looks like a
     ceiling in the plan and is not one at run time. A safety number that does not
     bind is worse than none, because it is believed.
 
-    Only ``max_cost_usd`` is replaced. The session and daily ceilings are process-
+    **Tokens, not dollars, are the authorisation unit.** They are what the run
+    consumes and what the provider meters, so the number the operator typed is the
+    number enforced. A dollar ceiling would put the pricing table in between, and a
+    stale or wrong per-token rate then moves the real limit without anyone editing it
+    -- the same class of silently-non-binding control this function exists to prevent.
+    A live run made the cost of getting this backwards concrete: authorised at $3, it
+    stopped on an unrelated 200k-token cap having spent $0.40, delivering 13% of what
+    the operator granted while appearing to respect their number.
+
+    Only ``max_tokens`` is replaced. The session and daily ceilings are process-
     and machine-wide protections against many runs in aggregate, and one operator
     authorising one action does not authorise breaching those -- so the rebuilt
     ledger CARRIES THEM OVER (spar round 7, P1). Constructing ``BudgetLedger(budget)``
     bare leaves ``daily_ledger_path=None``, which silently switches the file-backed
-    daily cap off for exactly the runs an operator has just authorised extra money
+    daily cap off for exactly the runs an operator has just authorised extra work
     for. That is the opposite of what the paragraph above promises, and the promise is
     the dangerous half: a ceiling believed to hold is worse than one known to be
     absent.
 
+    ``max_cost_usd`` is deliberately left at the config value. It is no longer the
+    operator's authorisation, so it reverts to being an ordinary autonomous-spend
+    guard, and whichever of the two dimensions binds first stops the run.
+
     Raises:
         ValueError: If the action names no usable budget. Only a corpus pass reaches
-            here, and for a corpus pass the operator's ``--budget-usd`` IS the
+            here, and for a corpus pass the operator's ``--budget-tokens`` IS the
             authorisation -- appending one without a positive budget is refused at
             :func:`~carmel.services.planner.append_corpus_pass_action`. Falling back to
             the config ceiling for an action that reached this point some other way
-            (a hand-edited or tampered plan) would spend up to a limit nobody
+            (a hand-edited or tampered plan) would consume up to a limit nobody
             authorised, so fail closed instead.
     """
-    budget_usd = action.estimated_spend_usd
-    if budget_usd is None or budget_usd <= 0:
+    budget_tokens = action.estimated_tokens
+    if budget_tokens is None or budget_tokens <= 0:
         raise ValueError(
             f"corpus-pass action {action.action_id} names no positive budget "
-            f"(estimated_spend_usd={budget_usd!r}); the operator budget is the "
+            f"(estimated_tokens={budget_tokens!r}); the operator budget is the "
             f"authorisation for this action and there is no safe default"
         )
 
@@ -401,7 +415,7 @@ def _apply_action_budget(deps: LiteratureDeps, action: PlannedAction) -> Literat
 
     from carmel.agents.budget import BudgetLedger
 
-    budget = deps.config.budget.model_copy(update={"max_cost_usd": budget_usd})
+    budget = deps.config.budget.model_copy(update={"max_tokens": budget_tokens})
     config = deps.config.model_copy(update={"budget": budget})
     ledger = BudgetLedger(
         budget,
@@ -449,7 +463,17 @@ def make_literature_handler(
             run_record_for,
         )
 
-        deps = literature_deps if literature_deps is not None else build_deps(agent_config)  # type: ignore[arg-type]
+        # Pass the daily ledger path explicitly. `build_deps` defaults it to None, and
+        # `BudgetLedger` reads None as "no daily cap", so this -- the ONLY production
+        # call site -- was silently running every literature action with the
+        # configured `daily_max_cost_usd` unenforced. `_apply_action_budget` below
+        # carefully carries the path over when it rebuilds the ledger, but it was
+        # faithfully carrying over None.
+        deps = (
+            literature_deps
+            if literature_deps is not None
+            else build_deps(agent_config, daily_ledger_path=default_daily_ledger_path())  # type: ignore[arg-type]
+        )
         if action.kind == ActionKind.LITERATURE_CORPUS_PASS:
             try:
                 deps = _apply_action_budget(deps, action)

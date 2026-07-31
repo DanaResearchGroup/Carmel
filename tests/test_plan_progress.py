@@ -1095,7 +1095,7 @@ class TestConcurrentCorpusPassAppend:
         def _append() -> None:
             try:
                 barrier.wait(timeout=5)
-                append_corpus_pass_action(ws, budget_usd=1.0)
+                append_corpus_pass_action(ws, budget_tokens=100_000)
             except BaseException as exc:  # noqa: BLE001 - recorded and re-raised below
                 errors.append(exc)
 
@@ -1141,10 +1141,10 @@ class TestCorpusPassAppendIsNotRepeatable:
         save_plan(ws, plan)
         init_progress(ws, plan)
 
-        first = append_corpus_pass_action(ws, budget_usd=1.0)
+        first = append_corpus_pass_action(ws, budget_tokens=100_000)
 
         with pytest.raises(ValueError, match="already queued"):
-            append_corpus_pass_action(ws, budget_usd=1.0)
+            append_corpus_pass_action(ws, budget_tokens=100_000)
 
         kinds = [a.kind for a in load_progress(ws).actions]
         assert kinds.count(ActionKind.LITERATURE_CORPUS_PASS) == 1, "a duplicate pass was queued"
@@ -1160,7 +1160,7 @@ class TestCorpusPassAppendIsNotRepeatable:
         save_plan(ws, plan)
         init_progress(ws, plan)
 
-        first = append_corpus_pass_action(ws, budget_usd=1.0)
+        first = append_corpus_pass_action(ws, budget_tokens=100_000)
         mark_running(ws, first.action_id, "a1")
         mark_finished(
             ws,
@@ -1169,7 +1169,7 @@ class TestCorpusPassAppendIsNotRepeatable:
             outcome=ActionOutcome.SUCCEEDED,
         )
 
-        second = append_corpus_pass_action(ws, budget_usd=1.0)
+        second = append_corpus_pass_action(ws, budget_tokens=100_000)
 
         assert second.action_id != first.action_id
         kinds = [a.kind for a in load_progress(ws).actions]

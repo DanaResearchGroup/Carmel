@@ -27,6 +27,17 @@ DEFAULT_WORKSPACES_SUBPATH: tuple[str, ...] = ("carmel_workspaces",)
 #: Environment variable that overrides :func:`default_workspaces_root`.
 WORKSPACES_ROOT_ENV_VAR = "CARMEL_WORKSPACES"
 
+#: Default location of the file-backed daily cost ledger.
+#:
+#: Deliberately NOT inside a campaign workspace. The daily cap exists to bound what
+#: this machine spends in aggregate across every campaign in a day, so a per-workspace
+#: ledger would hand each new workspace a fresh full allowance and silently turn the
+#: cap into a per-campaign one.
+DEFAULT_DAILY_LEDGER_SUBPATH: tuple[str, ...] = (".carmel", "daily_ledger.json")
+
+#: Environment variable that overrides :func:`default_daily_ledger_path`.
+DAILY_LEDGER_ENV_VAR = "CARMEL_DAILY_LEDGER"
+
 WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "benchmarks",
     "evidence",
@@ -144,3 +155,26 @@ def default_workspaces_root() -> Path:
     if env:
         return Path(env).expanduser()
     return Path.home().joinpath(*DEFAULT_WORKSPACES_SUBPATH)
+
+
+def default_daily_ledger_path() -> Path:
+    """Resolve the machine-wide daily cost ledger path.
+
+    Preference order mirrors :func:`default_workspaces_root`:
+
+    1. ``$CARMEL_DAILY_LEDGER`` when set and non-empty.
+    2. :data:`DEFAULT_DAILY_LEDGER_SUBPATH` under the user's home.
+
+    A path is ALWAYS returned. ``BudgetLedger`` treats ``daily_ledger_path=None`` as
+    "no daily cap at all" and skips the check entirely, so a resolver that could
+    return ``None`` would make the cap quietly optional -- which is how it came to be
+    unenforced in production despite being configurable.
+
+    Returns:
+        The daily ledger path. The file and its parent are NOT created here; the
+        ledger creates them on first write, so a read-only query has no side effect.
+    """
+    env = os.environ.get(DAILY_LEDGER_ENV_VAR)
+    if env:
+        return Path(env).expanduser()
+    return Path.home().joinpath(*DEFAULT_DAILY_LEDGER_SUBPATH)

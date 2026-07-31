@@ -108,13 +108,16 @@ def create_parser() -> argparse.ArgumentParser:
     )
     corpus.add_argument("--campaign", type=str, required=True, help="Campaign ID")
     corpus.add_argument(
-        "--budget-usd",
-        type=float,
+        "--budget-tokens",
+        type=int,
         required=True,
         help=(
-            "What this pass may spend on model calls. Required and explicit: an "
+            "How many model tokens this pass may consume. Required and explicit: an "
             "operator-authorised action names its own budget rather than drawing on "
-            "the campaign's autonomous-spend ceiling."
+            "the campaign's autonomous-spend ceiling. Tokens rather than dollars "
+            "because tokens are what the run consumes and what the provider meters, "
+            "so this number is the one that binds; the equivalent dollar cost is "
+            "estimated and printed for you."
         ),
     )
     corpus.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
@@ -251,7 +254,7 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
 
 def _cmd_corpus_pass(
     campaign_id: str,
-    budget_usd: float,
+    budget_tokens: int,
     workspaces: Path | None,
     config: Path | None,
     *,
@@ -290,8 +293,20 @@ def _cmd_corpus_pass(
         return 1
     campaign = load_campaign(ws)
 
+    # The model name only shapes the REPORTED dollar estimate; the token cap binds
+    # regardless. A dry run without a config therefore still appends a valid action,
+    # it just cannot say what the tokens would have cost.
+    # `_load_agent_config` returns `object | None` so this module stays importable
+    # without the agents extra, which is why every use site here carries a targeted
+    # ignore rather than a real annotation.
+    model_name = (
+        agent_config.resolved_model_name()  # type: ignore[attr-defined]
+        if agent_config is not None
+        else None
+    )
+
     try:
-        action = append_corpus_pass_action(ws, budget_usd=budget_usd)
+        action = append_corpus_pass_action(ws, budget_tokens=budget_tokens, model_name=model_name)
     except FileNotFoundError:
         # Distinguished from the generic OSError below because the remedy is
         # specific and the raw message ("JSON file not found: .../plan.json") tells
@@ -305,7 +320,27 @@ def _cmd_corpus_pass(
     except (OSError, ValueError) as e:
         print(f"Could not append the corpus pass: {e}", file=sys.stderr)
         return 1
-    print(f"Appended corpus-pass action {action.action_id} with a budget of ${budget_usd:.2f}")
+    # Report the cap in the unit that binds, and the dollars as what they are. Naming
+    # the model the estimate came from matters: the same token cap costs different
+    # amounts on different tiers, so a bare figure would invite reading it as fixed.
+    if action.estimated_spend_usd > 0:
+        # "at most", not "about": the figure comes from
+        # `estimate_worst_case_model_cost_usd`, which prices an unknown model at a
+        # deliberately punitive fallback rate so no call can escape the ledger at zero
+        # cost. That is right for a reservation and wrong to print as a point
+        # estimate -- an operator told "~$2.50" who then spends $0.40 has been
+        # misled in exactly the way this whole change exists to stop.
+        print(
+            f"Appended corpus-pass action {action.action_id} with a budget of "
+            f"{budget_tokens:,} tokens (at most ~${action.estimated_spend_usd:.2f} "
+            f"on {model_name}; the token cap is what binds)"
+        )
+    else:
+        print(
+            f"Appended corpus-pass action {action.action_id} with a budget of "
+            f"{budget_tokens:,} tokens (no model configured, so the dollar cost "
+            f"cannot be estimated)"
+        )
     if dry_run:
         print("--dry-run: the action was appended but not run.")
         return 0
@@ -563,13 +598,15 @@ def _cmd_requests(
     )
     from carmel.services.campaigns import find_campaign_workspace
 
-    root = workspaces.expanduser() if workspaces is not None else default_workspaces_root()
-    ws = find_campaign_workspace(root, campaign_id)
-    if ws is None:
-        print(f"No campaign {campaign_id!r} under {root}")
-        return 1
-
+    # Load the config BEFORE resolving the root: it is one of the inputs to that
+    # resolution. This command used to resolve the root first and read the config only
+    # for `max_artifact_bytes`, so `carmel requests --config <file>` silently scanned
+    # the default workspaces directory rather than the one the config named -- while
+    # `new-campaign --workspaces` advertises "default: the config's workspace_root".
+    # The two commands disagreed, and the failure is quiet: you get "no campaign
+    # found" while looking in a directory you never asked about.
     max_bytes = AgentBudgetConfig().max_artifact_bytes
+    config_root: Path | None = None
     if config_file is not None:
         try:
             config = load_config(config_file)
@@ -578,6 +615,22 @@ def _cmd_requests(
             return 1
         if config.agents is not None:
             max_bytes = config.agents.budget.max_artifact_bytes
+        # `--workspaces` means the PARENT directory in every command, whereas
+        # `config.workspace_root` is the campaign's OWN directory -- so its parent is
+        # what `find_campaign_workspace` needs to scan.
+        config_root = config.workspace_root.expanduser().parent
+
+    if workspaces is not None:
+        root = workspaces.expanduser()
+    elif config_root is not None:
+        root = config_root
+    else:
+        root = default_workspaces_root()
+
+    ws = find_campaign_workspace(root, campaign_id)
+    if ws is None:
+        print(f"No campaign {campaign_id!r} under {root}")
+        return 1
 
     if collect:
         changed = collect_inbox(ws, max_bytes=max_bytes)
@@ -676,7 +729,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "corpus-pass":
         return _cmd_corpus_pass(
             args.campaign,
-            args.budget_usd,
+            args.budget_tokens,
             args.workspaces,
             args.config,
             dry_run=args.dry_run,

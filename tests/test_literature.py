@@ -2086,6 +2086,83 @@ class TestCorpusPass:
         assert report.findings_for(report.run_id) == report.findings
 
 
+class TestTheDailyCapIsActuallyWired:
+    """The daily cost cap was configurable but unenforced in production.
+
+    ``build_deps`` defaults ``daily_ledger_path`` to ``None`` and ``BudgetLedger``
+    reads ``None`` as "no daily cap", skipping the check outright. The dispatcher --
+    the only production caller -- passed nothing, so every literature action ran with
+    ``daily_max_cost_usd`` silently inert. The bug was invisible precisely because
+    ``_apply_action_budget`` looks like it protects the daily ceiling: it carries the
+    path over when rebuilding the ledger, but it was carrying over ``None``.
+
+    This asserts the path reaches the ledger, which is the thing that was missing.
+    Asserting only that ``default_daily_ledger_path()`` returns a path would pass
+    against the broken code, since the resolver was never the problem.
+    """
+
+    def test_a_dispatched_literature_run_gets_a_daily_ledger_path(
+        self, monkeypatch: pytest.MonkeyPatch, campaign: Campaign
+    ) -> None:
+        """The load-bearing assertion: the path reaches ``build_deps`` on the real
+        dispatch path. Asserting only that the resolver returns a path would pass
+        against the broken code, because the resolver was never what was missing."""
+        from carmel.config import AgentConfig
+        from carmel.schemas.approval import ActionKind
+        from carmel.services import literature as literature_mod
+        from carmel.services.dispatcher import make_literature_handler
+
+        seen: dict[str, object] = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _spy(config: object, *, daily_ledger_path: object = None) -> object:
+            seen["daily_ledger_path"] = daily_ledger_path
+            raise _Stop  # the wiring is all this test needs; do not build a real stack
+
+        monkeypatch.setattr(literature_mod, "build_deps", _spy)
+
+        handler = make_literature_handler(agent_config=AgentConfig(), literature_deps=None)
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 5_000})
+
+        with pytest.raises(_Stop):
+            handler(campaign.workspace_root, campaign, action)
+
+        assert seen["daily_ledger_path"] is not None, (
+            "the dispatcher built the ledger without a daily path, so daily_max_cost_usd "
+            "is configurable but never enforced"
+        )
+
+    def test_the_resolver_never_returns_none(self) -> None:
+        """A resolver that could return ``None`` would make the cap quietly optional,
+        which is exactly how it came to be unenforced while looking configured."""
+        from carmel.paths import default_daily_ledger_path
+
+        assert default_daily_ledger_path() is not None
+
+    def test_the_env_var_overrides_the_default(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from carmel.paths import DAILY_LEDGER_ENV_VAR, default_daily_ledger_path
+
+        target = tmp_path / "elsewhere" / "ledger.json"
+        monkeypatch.setenv(DAILY_LEDGER_ENV_VAR, str(target))
+
+        assert default_daily_ledger_path() == target
+
+    def test_resolving_the_path_creates_nothing_on_disk(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A read-only query must have no side effect; the ledger creates the file on
+        first write."""
+        from carmel.paths import DAILY_LEDGER_ENV_VAR, default_daily_ledger_path
+
+        target = tmp_path / "untouched" / "ledger.json"
+        monkeypatch.setenv(DAILY_LEDGER_ENV_VAR, str(target))
+
+        default_daily_ledger_path()
+
+        assert not target.exists()
+        assert not target.parent.exists()
+
+
 class TestOperatorBudgetBinds:
     """Decision 0004/D2: the budget named when appending the action must bound the
     run, not merely be recorded on it."""
@@ -2098,17 +2175,17 @@ class TestOperatorBudgetBinds:
         from carmel.services.dispatcher import _apply_action_budget
 
         deps, _, config = _make_deps([])
-        assert deps.config.budget.max_cost_usd != 0.25
-        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 0.25})
+        assert deps.config.budget.max_tokens != 5_000
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 5_000})
 
         bound = _apply_action_budget(deps, action)
 
-        assert bound.config.budget.max_cost_usd == 0.25
+        assert bound.config.budget.max_tokens == 5_000
         # The ledger must actually refuse above the operator's number, not merely
         # carry it: this is the assertion that would fail if the budget were wired
         # into the config and not into the thing that does the gating.
         with pytest.raises(BudgetExceededError):
-            bound.ledger.reserve_model_call(estimated_tokens=1000, estimated_cost_usd=0.30)
+            bound.ledger.reserve_model_call(estimated_tokens=6_000, estimated_cost_usd=0.01)
         # Session and daily ceilings are machine-wide protections; one operator
         # authorising one action does not authorise breaching them.
         assert bound.config.budget.session_max_cost_usd == deps.config.budget.session_max_cost_usd
@@ -2117,7 +2194,7 @@ class TestOperatorBudgetBinds:
     def test_an_absent_budget_is_refused_rather_than_defaulted(self, campaign: Campaign) -> None:
         """Spar round 7, P1. This used to fall back to the config file's ceiling.
 
-        For a corpus pass the operator's ``--budget-usd`` IS the authorisation, so an
+        For a corpus pass the operator's ``--budget-tokens`` IS the authorisation, so an
         action that reached the handler without one did not come from
         ``append_corpus_pass_action`` (which refuses it) -- it came from a hand-edited
         or tampered plan. Spending up to a ceiling nobody named is the wrong direction
@@ -2127,7 +2204,7 @@ class TestOperatorBudgetBinds:
         from carmel.services.dispatcher import _apply_action_budget
 
         deps, _, _ = _make_deps([])
-        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 0.0})
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 0})
 
         with pytest.raises(ValueError, match="no positive budget"):
             _apply_action_budget(deps, action)
@@ -2150,11 +2227,11 @@ class TestOperatorBudgetBinds:
         deps, _, _ = _make_deps([])
         daily = campaign.workspace_root / "daily_ledger.json"
         deps = dataclasses.replace(deps, ledger=BudgetLedger(deps.config.budget, daily_ledger_path=daily))
-        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 2.5})
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 250_000})
 
         bound = _apply_action_budget(deps, action)
 
-        assert bound.config.budget.max_cost_usd == 2.5, "the operator ceiling did not bind"
+        assert bound.config.budget.max_tokens == 250_000, "the operator ceiling did not bind"
         assert bound.ledger.daily_ledger_path == daily, "the daily cap was silently dropped"
         assert bound.ledger.session is deps.ledger.session, "the session cap was silently dropped"
 
