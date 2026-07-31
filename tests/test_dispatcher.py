@@ -1,5 +1,6 @@
 """Tests for the multi-action dispatcher: cursor, states, approvals, locks."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -42,6 +43,7 @@ from carmel.schemas import (
     TargetObservable,
 )
 from carmel.schemas.campaign import Campaign
+from carmel.schemas.literature import LiteraturePassMode
 from carmel.services import execution
 from carmel.services.campaigns import (
     create_campaign,
@@ -58,7 +60,11 @@ from carmel.services.dispatcher import (
     recover_workspace,
     validate_plan_shape,
 )
-from carmel.services.literature import LITERATURE_REPORT_NAME, LiteratureDeps
+from carmel.services.literature import (
+    LITERATURE_REPORT_NAME,
+    LiteratureDeps,
+    ReportSchemaTooNewError,
+)
 from carmel.services.plan_progress import (
     DISPATCH_LOCK_DIR_NAME,
     ActionInFlightError,
@@ -1262,6 +1268,205 @@ class TestDefaultLiteratureHandler:
         assert result.outcome == ActionOutcome.FAILED_NONBLOCKING
         assert result.run_record.failure_code == FailureCode.AGENT_ERROR
         assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+
+
+class _SpySearchTool:
+    """A search tool that records every call instead of answering one.
+
+    ``MockSearchTool`` returns canned results and keeps no record, so a corpus
+    pass that searched would look identical to one that did not. This records
+    the queries so "the corpus pass never searches" is an assertion rather than
+    an assumption.
+    """
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def search(self, query: str, *, limit: int = 10) -> list[Any]:
+        self.queries.append(query)
+        return []
+
+
+def _corpus_deps(responses: list[dict[str, Any]], search: _SpySearchTool | None = None) -> LiteratureDeps:
+    """Like ``_literature_deps`` but with an observable search tool."""
+    config = AgentConfig()
+    return LiteratureDeps(
+        config=config,
+        model=MockModel(responses),
+        search=search or _SpySearchTool(),  # type: ignore[arg-type]
+        fetch=MockFetchTool({}),
+        ledger=BudgetLedger(config.budget),
+        verifier_model=MockModel(responses),
+    )
+
+
+def _store_document(workspace_root: Path, *, text: str, url: str) -> str:
+    """Put one real artifact into the workspace's evidence store."""
+    from carmel.agents.tools.extract import extract_text
+    from carmel.agents.tools.fetch import FetchedArtifact
+    from carmel.schemas.literature import ArtifactProvenance
+    from carmel.services.evidence import store_artifact
+
+    data = text.encode()
+    stored = store_artifact(
+        workspace_root,
+        data=data,
+        artifact=FetchedArtifact(
+            url=url,
+            final_url=url,
+            sha256=hashlib.sha256(data).hexdigest(),
+            content_type="text/plain",
+            n_bytes=len(data),
+            fetched_at=datetime.now(UTC),
+        ),
+        extracted=extract_text(data, "text/plain"),
+        provenance=ArtifactProvenance.MANUAL,
+        max_bytes=10_000_000,
+    )
+    return stored.sha256
+
+
+_CORPUS_DOC = (
+    "A shock tube study of syngas ignition\n"
+    "J. Smith and R. Jones (2020)\n"
+    "doi: 10.1000/corpus.doi\n\n"
+    "Results\n\n"
+    "The measured ignition delay time was 1.25 ms at 1000 K behind reflected shock waves.\n"
+)
+
+
+class TestCorpusVersusSearchRouting:
+    """The handler must run the pass the action's KIND names.
+
+    ``make_literature_handler`` serves both literature kinds and picks the pass
+    from ``action.kind`` on a single line. Nothing pinned that line: mutating it
+    to always call ``run_literature_research`` left the whole suite green, which
+    would silently convert the offline, reproducible, network-free corpus pass
+    into a live search pass -- the PR's central claim.
+    """
+
+    def _corpus_action(self, action_id: str = "corpus") -> PlannedAction:
+        # A positive token budget is the operator's authorisation; the handler
+        # refuses a corpus action without one before it ever picks a pass.
+        return _action(action_id, kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False).model_copy(
+            update={"estimated_tokens": 50_000}
+        )
+
+    def test_a_corpus_action_runs_a_corpus_pass_not_a_search(self, tmp_path: Path) -> None:
+        ws, campaign = _ready_campaign(tmp_path, [self._corpus_action(), _action("t3")])
+        _store_document(ws, text=_CORPUS_DOC, url="https://example.org/corpus.pdf")
+        # A CorpusProposal, which forbids the `queries` channel a search pass uses.
+        deps = _corpus_deps([{"findings": [], "done": True}])
+
+        result = _dispatch(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert result is not None
+        assert result.literature_report is not None
+        assert result.literature_report.latest.mode == LiteraturePassMode.CORPUS
+
+    def test_a_corpus_dispatch_reaches_neither_search_nor_fetch(self, tmp_path: Path) -> None:
+        """Guards the other direction: a search added *inside* the corpus loop.
+
+        The mode assertion above catches mis-routing. This catches the corpus
+        loop itself growing a network call, which mode alone would not show.
+        """
+        ws, campaign = _ready_campaign(tmp_path, [self._corpus_action(), _action("t3")])
+        _store_document(ws, text=_CORPUS_DOC, url="https://example.org/corpus.pdf")
+        search = _SpySearchTool()
+        deps = _corpus_deps([{"findings": [], "done": True}], search=search)
+
+        result = _dispatch(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert result is not None and result.literature_report is not None
+        assert search.queries == [], f"corpus pass searched: {search.queries}"
+        # Read usage off the report: the handler REBUILDS the ledger from the
+        # action's token budget, so the injected ledger records nothing.
+        assert result.literature_report.latest.usage.fetches == 0
+
+    def test_a_corpus_action_without_a_budget_never_reaches_a_pass(self, tmp_path: Path) -> None:
+        ws, campaign = _ready_campaign(
+            tmp_path,
+            [_action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False), _action("t3")],
+        )
+        deps = _corpus_deps([{"findings": [], "done": True}])
+
+        result = _dispatch(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert result is not None
+        assert result.outcome == ActionOutcome.FAILED_NONBLOCKING
+        assert "names no positive budget" in (result.run_record.error_message or "")
+        assert not (ws / LITERATURE_REPORT_NAME).exists()  # nothing ran
+
+
+class TestAReportFromANewerCarmel:
+    """``ReportSchemaTooNewError`` exists to be caught HERE, and nothing checked.
+
+    The subclass is the whole contract: an incompatible-version report is an
+    operator-actionable refusal ("upgrade Carmel") surfaced as a typed unrunnable
+    action, while genuine corruption -- also a ``ValueError`` -- must keep failing
+    loudly. Only the raise site was exercised; the catch, and therefore the
+    distinction the subclass exists for, was unverified.
+    """
+
+    def _write_report(self, ws: Path, payload: dict[str, Any]) -> None:
+        (ws / LITERATURE_REPORT_NAME).write_text(json.dumps(payload), encoding="utf-8")
+
+    def test_it_is_a_typed_refusal_rather_than_a_handler_crash(self, tmp_path: Path) -> None:
+        ws, campaign = _ready_campaign(
+            tmp_path,
+            [_action("lit", kind=ActionKind.LITERATURE_SEARCH, blocking=False), _action("t3")],
+        )
+        self._write_report(ws, {"schema_version": 99, "report_id": "r1", "campaign_id": campaign.campaign_id})
+        deps = _literature_deps([{"queries": [], "findings": [], "done": True}])
+
+        result = _dispatch(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert result is not None, "an incompatible report must not crash the dispatch"
+        assert result.outcome == ActionOutcome.FAILED_NONBLOCKING
+        assert result.run_record.failure_code == FailureCode.AGENT_ERROR
+        message = result.run_record.error_message or ""
+        assert "schema version 99" in message and "Upgrade Carmel" in message
+        # T3 is not stopped by a report this Carmel cannot read.
+        assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+
+    def test_the_newer_report_is_never_overwritten(self, tmp_path: Path) -> None:
+        """The refusal exists to protect the file; a rewrite would defeat it."""
+        ws, campaign = _ready_campaign(
+            tmp_path,
+            [_action("lit", kind=ActionKind.LITERATURE_SEARCH, blocking=False), _action("t3")],
+        )
+        payload = {"schema_version": 99, "report_id": "r1", "campaign_id": campaign.campaign_id}
+        self._write_report(ws, payload)
+        deps = _literature_deps([{"queries": [], "findings": [], "done": True}])
+
+        _dispatch(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert json.loads((ws / LITERATURE_REPORT_NAME).read_text(encoding="utf-8")) == payload
+
+    def test_genuine_corruption_still_fails_loudly(self, tmp_path: Path) -> None:
+        """A ``ValueError`` that is NOT the typed refusal must propagate.
+
+        If the handler caught plain ``ValueError`` instead of the subclass, a
+        corrupt report would be reported as a tidy "cannot run" and the operator
+        would never learn their evidence file is damaged.
+        """
+        ws, campaign = _ready_campaign(
+            tmp_path,
+            [_action("lit", kind=ActionKind.LITERATURE_SEARCH, blocking=False), _action("t3")],
+        )
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+
+        # Current version, so migration passes it straight through to a
+        # validator that cannot make sense of it.
+        self._write_report(ws, {"schema_version": CURRENT_REPORT_SCHEMA_VERSION, "passes": "not-a-list"})
+        deps = _literature_deps([{"queries": [], "findings": [], "done": True}])
+
+        ticket = execute_next_action(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert ticket is not None
+        assert ticket.wait(timeout=60) is None, "corruption must not produce a tidy result"
+        assert isinstance(ticket.error, ValueError)
+        assert not isinstance(ticket.error, ReportSchemaTooNewError)
 
 
 # --------------------------- campaign-creation hook ---------------------------
