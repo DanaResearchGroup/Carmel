@@ -53,8 +53,6 @@ from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.grounding import (
-    MARKER_SCAN_CHARS,
-    SECONDARY_DOCUMENT_MARKERS,
     secondary_document_marker,
 )
 
@@ -87,14 +85,11 @@ DOI_CORROBORATION_THRESHOLD = 0.4
 #: -- this one at store entry, grounding at attribution time -- share ONE vocabulary.
 #: Adding a marker to only one of them would silently reopen the hole in the other.
 #:
-#: Matched against the first :data:`_MARKER_SCAN_CHARS` characters, where a journal prints
+#: Matched against the first :data:`MARKER_SCAN_CHARS` characters, where a journal prints
 #: the article type -- much shorter than :data:`IDENTITY_SEARCH_CHARS`, since scanning
 #: further would match a mere mention of an erratum in the body or a footnote. Suppressed
 #: when the requested title itself contains the word (a paper genuinely titled "Comment
 #: on ..." is a legitimate request).
-_SECONDARY_DOCUMENT_MARKERS = SECONDARY_DOCUMENT_MARKERS
-_MARKER_SCAN_CHARS = MARKER_SCAN_CHARS
-
 #: Words too generic to distinguish one combustion paper from another.
 _TITLE_STOPWORDS = frozenset(
     {
@@ -362,17 +357,18 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
        the paper they concern. So a DOI match additionally requires
        :data:`DOI_CORROBORATION_THRESHOLD` of the title's significant words, and is
        refused outright when the front matter announces the document as a secondary one
-       (see :data:`_SECONDARY_DOCUMENT_MARKERS`).
+       (see :data:`SECONDARY_DOCUMENT_MARKERS`).
     2. **Title overlap alone.** Fallback when no DOI is known or the DOI is not printed.
        Requires the stricter :data:`TITLE_MATCH_THRESHOLD`, since nothing corroborates it.
 
     This mirrors the conjunction that :func:`carmel.services.grounding.check_identity`
-    documents as load-bearing (``doi_ok and (title_ok or author_ok)``). The two functions
-    answer the same question and must not disagree: this one gates the MANUAL acquisition
-    path, and once a document is admitted the stricter rule never re-runs -- the
-    quote-grounding gate only ever asks whether a quote appears in the supplied bytes,
-    never whether those bytes are the right paper. The author half of the conjunction is
-    unavailable here because :class:`AcquisitionRequest` carries no author list.
+    documents as load-bearing. That rule is now ``doi_ok and title_ok``: the
+    surname-based escape from the title requirement was removed, because a review or
+    discussion article can carry every weak signal it rested on honestly. The two
+    functions answer the same question and must not disagree: this one gates the MANUAL
+    acquisition path, and once a document is admitted the stricter rule never re-runs --
+    the quote-grounding gate only ever asks whether a quote appears in the supplied
+    bytes, never whether those bytes are the right paper.
 
     Only the first :data:`IDENTITY_SEARCH_CHARS` characters are searched, so that a mere
     *citation* of the requested paper inside a different paper's reference list cannot
@@ -421,13 +417,12 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
         #
         # So require corroboration, matching the conjunction that
         # :func:`carmel.services.grounding.check_identity` documents as load-bearing
-        # (``doi_ok and (title_ok or author_ok)``). The threshold is lower than
+        # (``doi_ok and title_ok``). The threshold is lower than
         # TITLE_MATCH_THRESHOLD because it is corroborating an already-strong signal
         # rather than standing alone: a genuine paper reprints its own title verbatim in
         # its front matter, while a publisher landing page saved as PDF carries mostly
         # navigation chrome. NOT calibrated against a corpus; chosen as half of the
-        # standalone bar. AcquisitionRequest carries no author list, so the author route
-        # that grounding.check_identity can take is not available here.
+        # standalone bar.
         if ratio >= DOI_CORROBORATION_THRESHOLD:
             return _gate_on_secondary_document_marker(
                 True,

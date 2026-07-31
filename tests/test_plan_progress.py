@@ -1104,6 +1104,12 @@ class TestConcurrentCorpusPassAppend:
             t.start()
         for t in threads:
             t.join(timeout=10)
+        # Assert they actually finished. Without this a self-deadlock regression --
+        # the exact failure the non-reentrant workspace lock makes possible -- would
+        # time out here and then surface below as "an append was lost from the plan",
+        # sending a reader after a phantom correctness bug instead of the hang.
+        alive = [t for t in threads if t.is_alive()]
+        assert not alive, f"{len(alive)} append thread(s) did not finish within 10s: deadlock"
 
         # Exactly one append wins. The other is refused by the already-queued guard
         # (spar round 8) rather than lost to a race: a refusal the operator can read is
@@ -1298,6 +1304,53 @@ class TestAnInsertionNeverDisplacesARunningAction:
         progress = load_progress(ws)
         assert [state.action_id for state in progress.actions] == ["lit", "corpus", "t3"]
         assert progress.cursor == 1  # the corpus pass runs next, ahead of T3
+
+
+class TestThePublicAppendWrapper:
+    """``append_action_to_progress`` takes the lock itself and had no caller and no
+    test -- production goes through the ``_locked`` variant. An untested public entry
+    point is one an operator script can reach and nobody has run; it also has to stay
+    honest about the workspace lock, which is NOT re-entrant (calling it while holding
+    the lock blocks forever)."""
+
+    def test_it_takes_the_lock_itself_and_inserts(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+
+        progress = append_action_to_progress(
+            ws, _action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False), index=1
+        )
+
+        assert [state.action_id for state in progress.actions] == ["lit", "corpus", "t3"]
+        assert load_progress(ws).actions[1].action_id == "corpus"
+
+    def test_it_appends_at_the_end_when_no_index_is_given(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+
+        progress = append_action_to_progress(
+            ws, _action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False)
+        )
+
+        assert [state.action_id for state in progress.actions] == ["lit", "t3", "corpus"]
+
+    def test_it_refuses_an_insertion_behind_the_cursor(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+        mark_running(ws, "lit", "a1")
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws, "lit")
+
+        with pytest.raises(ValueError, match="already progressed"):
+            append_action_to_progress(
+                ws, _action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False), index=0
+            )
 
 
 class TestAppendingACorpusPassIsAllOrNothing:

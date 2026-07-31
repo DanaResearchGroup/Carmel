@@ -1472,7 +1472,7 @@ class TestCorpusPassCommand:
         # Retire the literature search that precedes the corpus pass in the plan, so
         # the cursor actually reaches the appended action. Without this the dispatcher
         # correctly runs the SEARCH instead -- which the command reports, and which is
-        # covered by the sibling test below.
+        # covered by test_it_refuses_rather_than_dispatching_a_different_action above.
         search = load_progress(ws).actions[0]
         mark_running(ws, search.action_id, "attempt-1")
         mark_finished(

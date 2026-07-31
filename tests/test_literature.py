@@ -1949,6 +1949,11 @@ class TestCorpusPass:
 
         assert report.findings == [], "a quote from a different document must never ground"
         assert len(report.rejected) == 1
+        # Pin the DEFENCE, not merely the refusal. Asserting a rejection alone also
+        # passes via NO_ARTIFACT -- a different mechanism entirely (the named sha is
+        # not held) -- so a regression that stopped checking the quote against the
+        # named document's bytes would still have shown green here.
+        assert report.rejected[0].grounding.status == GroundingStatus.QUOTE_NOT_FOUND
 
     def test_a_finding_naming_an_unheld_document_is_rejected_not_dropped(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch

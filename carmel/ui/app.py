@@ -23,7 +23,7 @@ from werkzeug.wrappers.response import Response
 
 from carmel.config import AgentConfig
 from carmel.logger import get_logger
-from carmel.paths import default_workspaces_root
+from carmel.paths import resolve_workspaces_root
 from carmel.schemas.approval import ActionKind, ApprovalStatus
 from carmel.schemas.campaign import (
     Budgets,
@@ -118,18 +118,12 @@ _PER_ACTION_REJECT_STATES = frozenset(
 def _resolve_workspaces_root(workspaces_root: Path | None) -> Path:
     """Resolve the workspaces root directory.
 
-    Preference order:
-        1. explicit ``workspaces_root`` argument
-        2. ``$CARMEL_WORKSPACES`` env var
-        3. the packaged default (see :func:`carmel.paths.default_workspaces_root`)
-
-    Steps 2 and 3 are delegated rather than reimplemented here: the CLI resolves the
-    same root, and two copies of this rule would let the UI and the CLI disagree about
-    where a campaign lives -- which an operator experiences as a campaign that vanished.
+    Thin alias for :func:`carmel.paths.resolve_workspaces_root`, kept so existing
+    UI call sites read unchanged. The rule itself lives in ``carmel.paths`` because
+    the CLI resolves the same root, and two copies of it would let the UI and the
+    CLI disagree about where a campaign lives.
     """
-    if workspaces_root is not None:
-        return Path(workspaces_root).expanduser()
-    return default_workspaces_root()
+    return resolve_workspaces_root(workspaces_root)
 
 
 def _safe_workspace_dirname(name: str) -> str:

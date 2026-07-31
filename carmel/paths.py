@@ -157,6 +157,30 @@ def default_workspaces_root() -> Path:
     return Path.home().joinpath(*DEFAULT_WORKSPACES_SUBPATH)
 
 
+def resolve_workspaces_root(workspaces_root: Path | str | None) -> Path:
+    """Resolve the workspaces root, preferring an explicit value over the default.
+
+    Preference order:
+
+    1. ``workspaces_root`` when given (an explicit ``--workspaces`` or constructor
+       argument always wins).
+    2. :func:`default_workspaces_root` — ``$CARMEL_WORKSPACES``, then the packaged
+       default.
+
+    Lives here rather than in the UI because the CLI and the web UI must resolve the
+    SAME root: two copies of this rule let them disagree about where a campaign
+    lives, which an operator experiences as a campaign that vanished. Two CLI
+    subcommands were reaching into ``carmel.ui.app`` for the private helper that used
+    to hold it, which made a UI-internal detail load-bearing for the CLI.
+
+    Returns:
+        Absolute path to the workspaces root. The directory is NOT created here.
+    """
+    if workspaces_root is not None:
+        return Path(workspaces_root).expanduser()
+    return default_workspaces_root()
+
+
 def default_daily_ledger_path() -> Path:
     """Resolve the machine-wide daily cost ledger path.
 

@@ -27,7 +27,6 @@ import os
 import shutil
 import socket
 import uuid
-from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1556,14 +1555,22 @@ def estimated_tokens_for(prompt: str) -> int:
     return max(8000, len(prompt) // _CHARS_PER_TOKEN + _RESPONSE_TOKEN_ALLOWANCE)
 
 
-def _corpus_prompt(campaign: Campaign, corpus: Sequence[tuple[StoredArtifact, ExtractedText]]) -> str:
-    """Present the held corpus to the agent, whole.
+def _corpus_prompt(campaign: Campaign, artifact: StoredArtifact, extracted: ExtractedText) -> str:
+    """Present ONE held document to the agent, whole.
 
-    The documents are included in full rather than summarized or chunked. A finding
+    Takes a single document rather than a sequence, and the signature is the point.
+    It previously accepted the whole corpus, which invited exactly the call this
+    design exists to avoid: handing all 8 papers of the live syngas campaign over in
+    one 116k-token prompt produced ZERO proposed findings, where the same papers one
+    at a time produced findings. A ``Sequence`` parameter with one caller passing a
+    one-element list documents an option that measurement has already refuted.
+
+    The document is included in full rather than summarized or chunked. A finding
     requires a quote copied character-for-character out of the source, so anything
     the agent is not shown verbatim, it cannot ground a finding in -- and a summary
     would actively invite paraphrase, which the gate then rejects.
     """
+    corpus = [(artifact, extracted)]
     blocks = []
     for artifact, extracted in corpus:
         blocks.append(
@@ -1635,7 +1642,7 @@ def _corpus_loop(
         # paper, so a digest naming any other is a mistake worth surfacing, even when
         # that other paper happens to be in the store.
         by_sha = {artifact.sha256: (artifact, extracted)}
-        corpus_prompt = _corpus_prompt(campaign, [(artifact, extracted)])
+        corpus_prompt = _corpus_prompt(campaign, artifact, extracted)
         result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
         proposal = CorpusProposal.model_validate(result.output)
         append_typed_event(

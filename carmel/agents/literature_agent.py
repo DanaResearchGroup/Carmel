@@ -185,8 +185,15 @@ class CorpusProposal(BaseModel):
 
     findings: list[CorpusFinding] = Field(default_factory=list)
     done: bool = False
-    """The agent's self-stop signal: True means it has nothing further to extract
-    from the corpus."""
+    """Accepted but NOT acted on, unlike :attr:`LiteratureProposal.done`.
+
+    A corpus pass makes exactly one call per document and runs no rounds, so there
+    is no next round for the agent to stop: coverage is decided by what the evidence
+    store holds, not by the agent's judgement. The field is kept rather than removed
+    because ``extra="forbid"`` would turn a model that volunteers ``done`` -- the
+    natural thing to emit, given the sibling schema -- into a validation failure that
+    costs the whole document's extraction.
+    """
 
 
 CORPUS_SYSTEM_PROMPT = """\

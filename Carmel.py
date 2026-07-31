@@ -207,12 +207,12 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     (:func:`carmel.services.campaigns.start_literature_at_creation`);
     the CLI never owns its own copy of the auto-run logic.
     """
+    from carmel.paths import resolve_workspaces_root
     from carmel.services.campaigns import (
         find_campaign_workspace,
         load_campaign,
         start_literature_at_creation,
     )
-    from carmel.ui.app import _resolve_workspaces_root
 
     try:
         agent_config = _load_agent_config(config)
@@ -227,7 +227,7 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
         )
         return 1
 
-    workspaces_root = _resolve_workspaces_root(workspaces)
+    workspaces_root = resolve_workspaces_root(workspaces)
     ws = find_campaign_workspace(workspaces_root, campaign_id)
     if ws is None:
         print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
@@ -267,11 +267,11 @@ def _cmd_corpus_pass(
     succeeds, so a failed run leaves an approved action to retry rather than
     vanishing without trace.
     """
+    from carmel.paths import resolve_workspaces_root
     from carmel.schemas.action_state import ActionOutcome
     from carmel.services.campaigns import find_campaign_workspace, load_campaign
     from carmel.services.dispatcher import default_handlers, execute_next_action
     from carmel.services.planner import append_corpus_pass_action
-    from carmel.ui.app import _resolve_workspaces_root
 
     try:
         agent_config = _load_agent_config(config)
@@ -286,7 +286,7 @@ def _cmd_corpus_pass(
         )
         return 1
 
-    workspaces_root = _resolve_workspaces_root(workspaces)
+    workspaces_root = resolve_workspaces_root(workspaces)
     ws = find_campaign_workspace(workspaces_root, campaign_id)
     if ws is None:
         print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
