@@ -209,10 +209,66 @@ _SPACE_LOSS_BLOCK_FRACTION = 0.25
 #: does not occur exactly. This exists for the real case the old surname+year fallback
 #: was reaching for: a title line that extracts imperfectly (ligatures, a hyphen broken
 #: across a line, a dropped subtitle colon, an OCR slip) is still unmistakably the same
-#: title. Set high deliberately -- at 0.85 a genuine title survives typical extraction
-#: damage, while two DIFFERENT combustion titles, which share a great deal of stock
-#: vocabulary ("ignition delay times of ... in a shock tube"), do not reach it.
+#: title.
+#:
+#: This ratio is NECESSARY BUT NOT SUFFICIENT, and the reason is worth stating plainly
+#: because an earlier version of this comment claimed the opposite. It asserted that two
+#: DIFFERENT combustion titles "do not reach" 0.85. That was never measured, and it is
+#: false (spar round 7 P0). Measured character ratios between titles that differ only in
+#: the fuel studied -- the single most common confusion in this literature:
+#:
+#:     methanol vs methane oxidation ........ 0.974
+#:     n-heptane vs n-heptene ............... 0.984
+#:     methane vs ethane .................... 0.992
+#:     "Erratum to: <title>" vs "<title>" ... 0.905
+#:
+#: Every one clears 0.85 comfortably. Character similarity is simply the wrong metric
+#: for titles: the discriminating word is a few characters inside a long, otherwise
+#: identical string, so its contribution to the ratio is negligible -- exactly backwards
+#: from its contribution to identity. Raising the threshold does not fix this (it would
+#: reject genuine damaged titles long before it rejects 0.974), which is why the fix is
+#: a second, orthogonal check -- :func:`_substituted_token` -- rather than a bigger
+#: number here.
 _TITLE_IDENTITY_FUZZY_THRESHOLD = 0.85
+
+#: Shortest token that carries identity. Below this, tokens are stock connective words
+#: and fragments of damaged extraction ("of", "in", "h2", a stray "ame" from a broken
+#: "flame"), which are neither discriminating nor reliable enough to reject on.
+_TITLE_TOKEN_MIN_LENGTH = 4
+
+#: How similar two tokens must be before one is read as a SUBSTITUTION of the other
+#: rather than an unrelated word. Deliberately well below the pairs it must catch
+#: ("methane"/"methanol" 0.93, "heptane"/"heptene" 0.86, "ethane"/"methane" 0.92) so
+#: the check does not depend on a knife-edge, and well above the similarity of two
+#: genuinely different words that happen to share a stem.
+_TITLE_TOKEN_SUBSTITUTION_RATIO = 0.7
+
+#: Tokens within a normalized string. Unlike :data:`_WORD_RE` this keeps digits, because
+#: a species or condition token is frequently alphanumeric ("co2", "h2o2", "gri30").
+_IDENTITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+#: Phrases by which a document announces itself as being *about* another paper rather
+#: than being it. Each reprints the original's title, and usually its DOI, so neither
+#: the title route nor the DOI route can separate them -- only the announcement can.
+#:
+#: Shared with :mod:`carmel.services.acquisition`, which gates documents ENTERING the
+#: evidence store, so that the vocabulary has exactly one definition. Two copies would
+#: drift: adding "retraction" to one and not the other would silently reopen the hole
+#: in whichever layer was missed.
+SECONDARY_DOCUMENT_MARKERS: tuple[str, ...] = (
+    "erratum",
+    "corrigendum",
+    "correction to",
+    "comment on",
+    "reply to",
+    "retraction",
+    "editorial expression of concern",
+)
+
+#: How far into the front matter to look for an article-type announcement. Journals
+#: print the article type in the header; scanning further would match a mere mention of
+#: an erratum in the body or a footnote.
+MARKER_SCAN_CHARS = 600
 
 #: Minimum length of a quote AFTER normalization (whitespace/punctuation collapse).
 #: verbatim_quote already has a raw min_length=40 floor (literature_agent.py), but a
@@ -652,6 +708,62 @@ def _present_outside_references(extracted: ExtractedText, term_normalized: str) 
     return False
 
 
+def _identity_tokens(text_normalized: str) -> set[str]:
+    """Identity-bearing tokens of an already-normalized string."""
+    return {t for t in _IDENTITY_TOKEN_RE.findall(text_normalized) if len(t) >= _TITLE_TOKEN_MIN_LENGTH}
+
+
+def _substituted_token(window_normalized: str, title_normalized: str) -> str | None:
+    """Return a title token this window CONTRADICTS, or None if it contradicts none.
+
+    This is the check that makes fuzzy title matching safe, and it is deliberately a
+    *discrepancy* detector rather than a stricter similarity bar -- the same shape as
+    :func:`_has_semantic_discrepancy` for quotes, and for the same reason.
+
+    A title token is contradicted when it is absent from the window AND the window
+    contains a near-variant of it: "methane" absent, "methanol" present. That is a
+    substitution, and a substitution means this is a different paper, however high the
+    character ratio.
+
+    A token that is simply absent with no near-variant is NOT a contradiction. That
+    distinction is what preserves the case fuzzy matching exists for: real extraction
+    damage drops and mangles tokens, but it does not replace a fuel name with a
+    different fuel name. Measured against the 8-paper live corpus, requiring every
+    title token to be *present* would have been too strict -- a title carrying clean
+    publisher metadata ("H2/CO/O2") against a document whose subscripts extracted as
+    "H 2eCOeO2" shares almost no short tokens -- while this check passes it, because
+    the window offers no near-variant to contradict anything.
+    """
+    window_tokens = _identity_tokens(window_normalized)
+    for token in _identity_tokens(title_normalized):
+        if token in window_tokens:
+            continue
+        for other in window_tokens:
+            if SequenceMatcher(None, token, other).ratio() >= _TITLE_TOKEN_SUBSTITUTION_RATIO:
+                return token
+    return None
+
+
+def secondary_document_marker(head: str, requested_title: str) -> str | None:
+    """Return the phrase marking ``head`` as a document *about* the requested paper.
+
+    Args:
+        head: Lowercased front matter of the document.
+        requested_title: Lowercased title being checked against, used to suppress the
+            check for papers whose own title contains a marker phrase (a paper
+            genuinely titled "Comment on ..." is a legitimate document).
+
+    Returns:
+        The matched marker, or None when the document does not announce itself as a
+        secondary document.
+    """
+    window = head[:MARKER_SCAN_CHARS]
+    for marker in SECONDARY_DOCUMENT_MARKERS:
+        if marker in window and marker not in requested_title:
+            return marker
+    return None
+
+
 def _title_confirmed(extracted: ExtractedText, title_normalized: str) -> bool:
     """True if the cited work's title corroborates this document's identity.
 
@@ -686,9 +798,21 @@ def _title_confirmed(extracted: ExtractedText, title_normalized: str) -> bool:
         window = haystack[pos : pos + n]
         if SequenceMatcher(None, window, title_normalized).ratio() < _TITLE_IDENTITY_FUZZY_THRESHOLD:
             continue
-        raw_start, _ = raw_span(index_map, pos, pos + n, len(extracted.text))
-        label, _ = _section_for(extracted.sections, raw_start)
-        if label != "references":
+        # A high ratio is not enough: see _TITLE_IDENTITY_FUZZY_THRESHOLD. Skip this
+        # window rather than rejecting outright, because a document can legitimately
+        # contain both a contradicting window (a neighbouring paper named in the body)
+        # and an honest one (its own title on page 1).
+        if _substituted_token(window, title_normalized) is not None:
+            continue
+        raw_start, raw_end = raw_span(index_map, pos, pos + n, len(extracted.text))
+        # Classify by BOTH ends, not just the start (spar round 7). A window is n chars
+        # long and the scan is strided, so one can begin just before the references
+        # boundary and extend into the first reference entry. Labelling it by raw_start
+        # alone would call that window "body" and confirm a title that occurs only in
+        # the bibliography -- the precise confusion this section check exists to catch.
+        start_label, _ = _section_for(extracted.sections, raw_start)
+        end_label, _ = _section_for(extracted.sections, max(raw_start, raw_end - 1))
+        if start_label != "references" and end_label != "references":
             return True
     return False
 
@@ -749,6 +873,23 @@ def check_identity(extracted: ExtractedText, citation: Citation) -> bool:
     Returns:
         True only if identity is confirmed by the strict rule above.
     """
+    # Gate every acceptance path on the article-type announcement FIRST. An erratum,
+    # corrigendum, comment or reply reprints the original's full title by construction
+    # ("Erratum to: <title>", measured ratio 0.905) and prints the original's DOI in its
+    # own front matter, so BOTH conjuncts of the DOI rule are satisfied honestly and
+    # neither identity route can separate the two documents. Only this announcement can.
+    #
+    # acquisition.check_identity already runs this gate, but it guards documents
+    # ENTERING the store, against the request they were dropped for. That does not cover
+    # the corpus pass, which is the reachable case: an erratum LEGITIMATELY held on its
+    # own merits, whose text the agent then cites as the original paper it concerns. A
+    # quote from the erratum's prose would be recorded as fully grounded under the
+    # original's citation. Returning False here dominates every accept path below, so
+    # the gate holds for any route added in future (spar round 7 P0).
+    marker = secondary_document_marker(extracted.text[:MARKER_SCAN_CHARS].lower(), citation.title.lower())
+    if marker is not None:
+        return False
+
     title_norm = normalize_for_match(citation.title)
     title_ok = _present_outside_references(extracted, title_norm)
 

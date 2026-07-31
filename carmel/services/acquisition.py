@@ -52,6 +52,11 @@ from carmel.schemas.acquisition import (
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.evidence import artifact_dir, store_artifact
+from carmel.services.grounding import (
+    MARKER_SCAN_CHARS,
+    SECONDARY_DOCUMENT_MARKERS,
+    secondary_document_marker,
+)
 
 logger = get_logger("services.acquisition")
 
@@ -77,25 +82,18 @@ TITLE_MATCH_THRESHOLD = 0.8
 DOI_CORROBORATION_THRESHOLD = 0.4
 
 #: Front-matter phrases that mark a document as being *about* the requested paper rather
-#: than being it. Each of these reprints the original's DOI and usually its full title,
-#: so neither the DOI route nor the title route can separate them -- only the announcement
-#: can. Matched against the first :data:`_MARKER_SCAN_CHARS` characters, where a journal
-#: prints the article type, and suppressed when the requested title itself contains the
-#: word (a paper genuinely titled "Comment on ..." is a legitimate request).
-_SECONDARY_DOCUMENT_MARKERS: tuple[str, ...] = (
-    "erratum",
-    "corrigendum",
-    "correction to",
-    "comment on",
-    "reply to",
-    "retraction",
-    "editorial expression of concern",
-)
-
-#: How far into the front matter to look for an article-type announcement. Much shorter
-#: than :data:`IDENTITY_SEARCH_CHARS`: journals print the article type in the header, and
-#: scanning further would match a mere mention of an erratum in the body or a footnote.
-_MARKER_SCAN_CHARS = 600
+#: than being it. Defined in :mod:`carmel.services.grounding` and re-exported here under
+#: the names this module already used, so the two layers that gate on secondary documents
+#: -- this one at store entry, grounding at attribution time -- share ONE vocabulary.
+#: Adding a marker to only one of them would silently reopen the hole in the other.
+#:
+#: Matched against the first :data:`_MARKER_SCAN_CHARS` characters, where a journal prints
+#: the article type -- much shorter than :data:`IDENTITY_SEARCH_CHARS`, since scanning
+#: further would match a mere mention of an erratum in the body or a footnote. Suppressed
+#: when the requested title itself contains the word (a paper genuinely titled "Comment
+#: on ..." is a legitimate request).
+_SECONDARY_DOCUMENT_MARKERS = SECONDARY_DOCUMENT_MARKERS
+_MARKER_SCAN_CHARS = MARKER_SCAN_CHARS
 
 #: Words too generic to distinguish one combustion paper from another.
 _TITLE_STOPWORDS = frozenset(
@@ -281,23 +279,10 @@ def record_request(
     return request
 
 
-def _secondary_document_marker(head: str, requested_title: str) -> str | None:
-    """Return the phrase marking ``head`` as a document *about* the requested paper.
-
-    Args:
-        head: Lowercased front matter of the dropped document.
-        requested_title: Lowercased title of the request, used to suppress the check for
-            papers whose own title contains one of the marker phrases.
-
-    Returns:
-        The matched marker, or ``None`` when the document does not announce itself as a
-        secondary document.
-    """
-    window = head[:_MARKER_SCAN_CHARS]
-    for marker in _SECONDARY_DOCUMENT_MARKERS:
-        if marker in window and marker not in requested_title:
-            return marker
-    return None
+#: Alias of :func:`carmel.services.grounding.secondary_document_marker`, kept under this
+#: module's original private name so the call sites below read unchanged. The detector
+#: itself now lives beside the marker vocabulary it consults.
+_secondary_document_marker = secondary_document_marker
 
 
 def _gate_on_secondary_document_marker(ok: bool, note: str, *, marker: str | None) -> tuple[bool, str]:

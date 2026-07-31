@@ -8,6 +8,8 @@ regex (which is a separate, already-tested concern).
 
 from __future__ import annotations
 
+from difflib import SequenceMatcher
+
 import pytest
 from pydantic import ValidationError
 
@@ -352,6 +354,105 @@ def test_check_identity_rejects_a_different_title_sharing_stock_vocabulary() -> 
     )
 
     assert check_identity(extracted, citation) is False
+
+
+def test_check_identity_rejects_a_title_that_differs_only_in_the_fuel_studied() -> None:
+    """Spar round 7, P0. The previous test's two titles are far enough apart that the
+    0.85 character ratio rejects them on its own. These two are NOT: they differ by two
+    characters in one word, and the same group publishes both.
+
+    The first assertion is the point of the test. It pins the measurement that showed
+    the character ratio cannot carry this check -- the discriminating word is a few
+    characters inside a long, otherwise identical string -- so that anyone who later
+    deletes the token guard sees immediately that the ratio does NOT catch this.
+    """
+    cited = "Ignition delay times of methane oxidation in a shock tube"
+    held = "Ignition delay times of methanol oxidation in a shock tube"
+    ratio = SequenceMatcher(None, normalize_for_match(held), normalize_for_match(cited)).ratio()
+    assert ratio > 0.95, "the fuzzy ratio alone admits this pair; the token guard is what refuses it"
+
+    text = (
+        "Journal of Combustion\n\n"
+        f"{held}\n\n"
+        "DOI: 10.1000/xyz123\n\nAbstract\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    citation = Citation(title=cited, authors=[], doi="10.1000/xyz123")
+
+    assert check_identity(_extracted(text), citation) is False
+
+
+def test_check_identity_rejects_an_erratum_that_reprints_the_original_title_and_doi() -> None:
+    """Spar round 7, P0. An erratum satisfies BOTH conjuncts of the DOI rule honestly:
+    it prints the original's DOI, and it reprints the original's full title by
+    construction. Neither identity route can separate it from the paper it concerns.
+
+    The reachable case is the corpus pass, not a mis-drop: an erratum legitimately held
+    on its own merits, whose prose the agent then cites as the original paper. Without
+    the marker gate a quote from the erratum's own text grounds under the original's
+    citation.
+    """
+    text = (
+        "Erratum to: Ignition delay times of methane oxidation in a shock tube\n"
+        "[Combust. Flame 190 (2018) 100-110]\n\n"
+        "DOI: 10.1000/xyz123\n\nCorrection\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds, not 950.\n"
+    )
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube",
+        authors=[],
+        doi="10.1000/xyz123",
+    )
+
+    assert check_identity(_extracted(text, front_matter_title=None), citation) is False
+
+
+def test_check_identity_confirms_a_paper_whose_own_title_announces_a_comment() -> None:
+    """The marker gate must not swallow a paper genuinely titled "Comment on ...".
+
+    Such papers are real, citable documents. The marker is suppressed when the CITED
+    title contains it, so the gate distinguishes "this document is a comment on the
+    paper you asked for" from "the paper you asked for is itself a comment".
+    """
+    title = "Comment on 'Laminar flame speeds of syngas mixtures'"
+    text = (
+        f"{title}\n\n"
+        "DOI: 10.1000/xyz123\n\nAbstract\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    citation = Citation(title=title, authors=[], doi="10.1000/xyz123")
+
+    assert check_identity(_extracted(text, front_matter_title=None), citation) is True
+
+
+def test_check_identity_ignores_a_title_whose_window_spans_into_the_references() -> None:
+    """Spar round 7. The companion to the test below, for the case that defeats it.
+
+    A fuzzy window is exactly as long as the title and the scan is strided, so when a
+    reference entry LEADS with the title, a window can begin in the body and run into
+    the bibliography. Classifying that window by its start alone calls it "body" and
+    confirms a title that occurs nowhere but the reference list -- the precise
+    confusion the section check exists to catch. Both ends must be checked.
+    """
+    body = (
+        "A Survey of Combustion Chemistry\n\n"
+        "This review cites DOI: 10.1000/xyz123 among many other works.\n\n"
+        "References\n"
+    )
+    references = "Ignition delay times of methane oxidation in a shock tube. Smith, J. (2019).\n"
+    text = body + references
+    sections = [
+        TextSection(label="body", start=0, end=len(body)),
+        TextSection(label="references", start=len(body), end=len(text)),
+    ]
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube",
+        authors=["Smith, J."],
+        year=2019,
+        doi="10.1000/xyz123",
+    )
+
+    assert check_identity(_extracted(text, sections), citation) is False
 
 
 def test_check_identity_ignores_a_title_that_matches_only_in_the_references() -> None:
