@@ -67,7 +67,8 @@ def create_parser() -> argparse.ArgumentParser:
             "immediately and the verdict reported. A directory is swept non-recursively: every "
             "direct-child file is admitted by content (filenames are irrelevant), one failure "
             "does not abort the rest, and a per-file report plus a summary line is printed. "
-            "Exit code is 0 only if at least one file was admitted and none were rejected."
+            "Exit code is 0 only if at least one file was admitted or was already held, "
+            "and none were rejected."
         ),
     )
     requests_cmd.add_argument(
@@ -295,9 +296,11 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
     file's failure never aborts the batch: every entry is attempted and its outcome
     printed before moving on.
 
-    Exit code: 0 if at least one file was admitted and none were rejected; 1
-    otherwise -- including an empty directory, which is reported rather than treated
-    as a silent success.
+    Exit code: 0 if at least one file was admitted (or was already held, which means the
+    operator's intent is already satisfied) and none were rejected; 1 otherwise --
+    including an empty directory, and including one holding nothing but dotfiles,
+    partial downloads or subdirectories. Those are reported rather than treated as a
+    silent success: a run that admitted nothing must not look like one that worked.
     """
     from carmel.schemas.acquisition import AcquisitionStatus
     from carmel.services.acquisition import AlreadyAcquired, admit_file
@@ -315,6 +318,7 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
     accepted = 0
     rejected = 0
     skipped = 0
+    already = 0
 
     for entry in entries:
         if entry.is_dir():
@@ -339,9 +343,11 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
         except AlreadyAcquired as exc:
             # Caught BEFORE ValueError, which it subclasses. Re-offering a paper the
             # store already holds is the ordinary shape of re-running an ingest over a
-            # download folder, so it is a skip: it must not count as a rejection, and
-            # must not by itself turn a successful run into a non-zero exit.
-            skipped += 1
+            # download folder, so it is a skip rather than a rejection. Counted
+            # SEPARATELY from `skipped`, which covers junk (dotfiles, partial downloads,
+            # subdirectories): only an already-held PAPER means the operator's intent was
+            # satisfied, so only it may stand in for an acceptance in the exit code.
+            already += 1
             print(f"SKIPPED   {entry.name} (already acquired as {exc.slug})")
             continue
         except (OSError, ValueError) as exc:
@@ -358,13 +364,15 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
         print(f"          {request.identity_note}")
         print()
 
-    print(f"{accepted} accepted, {rejected} rejected, {skipped} skipped")
+    print(f"{accepted} accepted, {rejected} rejected, {already} already acquired, {skipped} skipped")
     # A folder in which every paper was already acquired is a success, not a failure --
     # requiring `accepted` outright would fail the second run of an ingest that fully
-    # succeeded the first time.
+    # succeeded the first time. `skipped` deliberately does NOT count: a directory holding
+    # nothing but dotfiles, partial downloads or subdirectories did no useful work, and
+    # exiting 0 on it would report success for a run that admitted nothing at all.
     if rejected:
         return 1
-    return 0 if (accepted or skipped) else 1
+    return 0 if (accepted or already) else 1
 
 
 def _cmd_requests(

@@ -13,6 +13,7 @@ whether those bytes are the right paper.
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -892,3 +893,51 @@ class TestInferencePrefersTheStrongerSignal:
 
         evidence = tmp_path / "evidence" / "literature"
         assert not evidence.exists() or not any(evidence.iterdir())
+
+
+class TestAlreadyAcquiredVerifiesTheStore:
+    """A skip must be justified by the evidence store, not by the manifest's claim.
+
+    `fulfilled_sha256` is a record written when the paper was admitted; the evidence
+    store is what actually holds the bytes. They can diverge -- a pruned evidence
+    directory, a workspace copied without its artifacts, a restored manifest. Skipping on
+    the claim alone would report "already acquired" for a paper Carmel no longer has, and
+    because the skip is silent the operator would never find out.
+    """
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_a_missing_evidence_directory_makes_the_file_be_re_admitted(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        source = _source(tmp_path, "paper.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        first = admit_file(tmp_path, source, max_bytes=10_000_000)
+        assert first.status == AcquisitionStatus.FULFILLED
+        sha = first.fulfilled_sha256
+        assert sha
+
+        # The manifest still claims the paper is held; the bytes are gone.
+        shutil.rmtree(artifact_dir(tmp_path, sha))
+
+        # Must NOT raise AlreadyAcquired -- it must fall through and re-store.
+        again = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert again.status == AcquisitionStatus.FULFILLED
+        assert again.fulfilled_sha256 == sha
+        assert artifact_dir(tmp_path, sha).is_dir()
+
+    def test_an_intact_store_still_short_circuits(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """The store check must not defeat the skip it guards."""
+        source = _source(tmp_path, "paper.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        with pytest.raises(AlreadyAcquired):
+            admit_file(tmp_path, source, max_bytes=10_000_000)

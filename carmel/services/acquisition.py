@@ -51,7 +51,7 @@ from carmel.schemas.acquisition import (
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.artifacts import read_json, write_json, write_text
-from carmel.services.evidence import store_artifact
+from carmel.services.evidence import artifact_dir, store_artifact
 
 logger = get_logger("services.acquisition")
 
@@ -633,10 +633,22 @@ def _admit_one(
         return None
 
 
-def _already_stored_slug(source: Path, acquired: Sequence[AcquisitionRequest], *, max_bytes: int) -> str | None:
-    """The slug whose stored artifact is byte-for-byte ``source``, if any.
+def _already_stored_slug(
+    workspace_root: Path, source: Path, acquired: Sequence[AcquisitionRequest], *, max_bytes: int
+) -> tuple[str, bool] | None:
+    """Match ``source``'s bytes against the artifacts fulfilled requests claim to hold.
+
+    The manifest alone is NOT taken as proof that the paper is present.
+    ``fulfilled_sha256`` is a record written when the paper was admitted; the evidence
+    store is what actually holds the bytes, and the two can diverge -- a pruned evidence
+    directory, a workspace copied without its artifacts, a manifest restored from backup.
+    Reporting "already acquired" off the record alone would tell the operator Carmel has
+    a paper it no longer has, and because the report is a silent skip they would have no
+    way to find out. So presence in the store is checked separately and returned, rather
+    than folded into the match.
 
     Args:
+        workspace_root: Root of the campaign workspace, for locating the evidence store.
         source: The operator's file, not yet copied anywhere.
         acquired: Fulfilled requests, each carrying its artifact's ``fulfilled_sha256``.
         max_bytes: Same cap the admission path enforces. A file over the cap is not
@@ -644,10 +656,12 @@ def _already_stored_slug(source: Path, acquired: Sequence[AcquisitionRequest], *
             reading oversized operator input into memory at all.
 
     Returns:
-        The matching slug, or ``None`` when the file is over the cap, unreadable, or
-        simply not one of the stored artifacts. Never raises: this is an optimisation on
-        the way to the real checks, so any difficulty here must fall through to them
-        rather than becoming the operator's error message.
+        ``(slug, present_in_store)`` when the file's bytes are exactly the artifact that
+        request recorded, or ``None`` when the file is over the cap, unreadable, or not
+        one of them. ``present_in_store=False`` means the record is there but the bytes
+        are gone, which the caller repairs by re-admitting. Never raises: this is a
+        shortcut on the way to the real checks, so any difficulty must fall through to
+        them rather than becoming the operator's error message.
     """
     by_sha = {r.fulfilled_sha256: r.slug for r in acquired if r.fulfilled_sha256}
     if not by_sha:
@@ -658,7 +672,14 @@ def _already_stored_slug(source: Path, acquired: Sequence[AcquisitionRequest], *
         digest = hashlib.sha256(source.read_bytes()).hexdigest()
     except OSError:
         return None
-    return by_sha.get(digest)
+    slug = by_sha.get(digest)
+    if slug is None:
+        return None
+    try:
+        present = artifact_dir(workspace_root, digest).is_dir()
+    except OSError:
+        present = False
+    return slug, present
 
 
 def _infer_slug(
@@ -852,12 +873,22 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
         # decisive and costs one hash, with no text extraction and no thresholds. Only
         # when the bytes differ (the same paper re-downloaded from another source, so a
         # different PDF of the same work) does the content-based check below get a say.
-        already = _already_stored_slug(source, acquired, max_bytes=max_bytes)
+        already = _already_stored_slug(workspace_root, source, acquired, max_bytes=max_bytes)
         if already is not None:
-            raise AlreadyAcquired(already, "byte-for-byte identical to the stored artifact")
-
-        pending = [r for r in manifest.requests if r.status in _PENDING_STATUSES]
-        slug, matched_on_evidence = _infer_slug(source, pending, max_bytes=max_bytes, acquired=acquired)
+            stored_slug, present = already
+            if present:
+                raise AlreadyAcquired(stored_slug, "byte-for-byte identical to the stored artifact")
+            # The manifest records this paper as held but the evidence store no longer
+            # has it. Re-admit under the same request to repair the gap rather than
+            # falling through: the request is FULFILLED, so it is not pending, and
+            # inference would report "nothing is pending" about a file whose identity is
+            # in fact established beyond doubt -- these are the exact bytes that request
+            # recorded. Identical bytes are the strongest evidence available, so this is
+            # a match, not a fallback.
+            slug, matched_on_evidence = stored_slug, True
+        else:
+            pending = [r for r in manifest.requests if r.status in _PENDING_STATUSES]
+            slug, matched_on_evidence = _infer_slug(source, pending, max_bytes=max_bytes, acquired=acquired)
 
     request = by_slug.get(slug)
     if request is None:

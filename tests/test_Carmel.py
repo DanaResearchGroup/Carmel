@@ -820,7 +820,7 @@ class TestRequestsCommandAddDirectory:
 
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 0
         out = capsys.readouterr().out
-        assert "2 accepted, 0 rejected, 0 skipped" in out
+        assert "2 accepted, 0 rejected, 0 already acquired, 0 skipped" in out
         assert out.count("ACCEPTED") == 2
 
         manifest = load_manifest(ws)
@@ -846,7 +846,7 @@ class TestRequestsCommandAddDirectory:
         out = capsys.readouterr().out
         assert "ACCEPTED  good.pdf" in out
         assert "REJECTED  bad.pdf" in out
-        assert "1 accepted, 1 rejected, 0 skipped" in out
+        assert "1 accepted, 1 rejected, 0 already acquired, 0 skipped" in out
 
         manifest = load_manifest(ws)
         assert any(r.status == AcquisitionStatus.FULFILLED for r in manifest.requests)
@@ -876,7 +876,7 @@ class TestRequestsCommandAddDirectory:
         out = capsys.readouterr().out
         assert "ACCEPTED  good.pdf" in out
         assert "REJECTED  bad.pdf: cannot tell which pending request this file is for" in out
-        assert "1 accepted, 1 rejected, 0 skipped" in out
+        assert "1 accepted, 1 rejected, 0 already acquired, 0 skipped" in out
 
         manifest = load_manifest(ws)
         assert any(r.status == AcquisitionStatus.FULFILLED for r in manifest.requests)
@@ -901,7 +901,7 @@ class TestRequestsCommandAddDirectory:
 
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 0
         out = capsys.readouterr().out
-        assert "1 accepted, 0 rejected, 5 skipped" in out
+        assert "1 accepted, 0 rejected, 0 already acquired, 5 skipped" in out
         assert "SKIPPED   subdir (subdirectory" in out
         assert "SKIPPED   .hidden.pdf (dotfile)" in out
         assert "SKIPPED   downloading.pdf.part (partial download)" in out
@@ -1033,3 +1033,44 @@ class TestRequestsCommandReIngest:
         out = capsys.readouterr().out
         assert "already acquired" in out
         assert "REJECTED" not in out
+
+
+class TestRequestsCommandDirectoryExitCode:
+    """A run that admitted nothing must not look like one that worked.
+
+    `skipped` covers junk -- dotfiles, partial downloads, subdirectories. Letting it
+    stand in for an acceptance would make a folder of pure noise exit 0, which is the
+    signal a script or a CI lane reads as "the papers are in".
+    """
+
+    def _campaign(self, tmp_path: Path) -> str:
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import record_request
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        record_request(
+            ws,
+            title="Shock tube ammonia oxidation ignition delay times",
+            doi="10.1016/j.test.2019.01.001",
+            landing_url="https://doi.org/10.1016/j.test.2019.01.001",
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+        return load_campaign(ws).campaign_id
+
+    def test_a_directory_of_only_junk_exits_nonzero(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from Carmel import main
+
+        cid = self._campaign(tmp_path)
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        (lit / ".hidden.pdf").write_text("x", encoding="utf-8")
+        (lit / "half.crdownload").write_text("x", encoding="utf-8")
+        (lit / "subdir").mkdir()
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 1
+        out = capsys.readouterr().out
+        assert "0 accepted" in out

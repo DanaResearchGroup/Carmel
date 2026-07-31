@@ -609,3 +609,61 @@ class TestPypdfNoiseIsMuted:
             assert pypdf_logger.level == logging.WARNING
         finally:
             pypdf_logger.setLevel(logging.NOTSET)
+
+
+class TestPypdfMuteIsConcurrencySafe:
+    """The pypdf logger level is process-global; extraction can run concurrently.
+
+    A bare save/restore pair races two ways: the first thread to finish restores the
+    original level while the second is still extracting (unmuting it mid-run), or the
+    second thread's "previous" is the already-muted ERROR and it restores that forever.
+    Extraction is reachable concurrently through the Flask UI, so this is a live path.
+    """
+
+    def test_one_extraction_finishing_does_not_unmute_another_still_running(self) -> None:
+        """The interleaving is forced, not raced, so this fails deterministically against
+        a bare save/restore pair rather than only sometimes.
+
+        Order: T1 enters the mute, T2 enters while T1 holds it, T1 exits, T2 looks at the
+        level while it is still inside. Unsynchronised, T1 saved the caller's WARNING and
+        restores it on the way out -- unmuting T2 mid-extraction -- and T2 then saved the
+        already-muted ERROR and restores THAT, leaving pypdf silenced for the rest of the
+        process. Both halves are asserted.
+        """
+        import threading
+
+        from carmel.agents.tools import extract as extract_mod
+
+        pypdf_logger = logging.getLogger("pypdf")
+        pypdf_logger.setLevel(logging.WARNING)
+        first_inside = threading.Event()
+        second_inside = threading.Event()
+        first_exited = threading.Event()
+        observed: dict[str, int] = {}
+
+        def first() -> None:
+            with extract_mod._quiet_pypdf():
+                first_inside.set()
+                second_inside.wait(timeout=10)
+            first_exited.set()
+
+        def second() -> None:
+            first_inside.wait(timeout=10)
+            with extract_mod._quiet_pypdf():
+                second_inside.set()
+                first_exited.wait(timeout=10)
+                observed["while_still_inside"] = pypdf_logger.level
+
+        try:
+            threads = [threading.Thread(target=first), threading.Thread(target=second)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=15)
+
+            # T1 leaving must not unmute T2, which is still extracting.
+            assert observed["while_still_inside"] == logging.ERROR
+            # And the last one out restores the CALLER's level, not the muted one.
+            assert pypdf_logger.level == logging.WARNING
+        finally:
+            pypdf_logger.setLevel(logging.NOTSET)

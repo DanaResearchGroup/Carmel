@@ -17,6 +17,7 @@ import contextlib
 import io
 import logging
 import re
+import threading
 import unicodedata
 from collections.abc import Callable, Iterator
 from html.parser import HTMLParser
@@ -523,6 +524,18 @@ def _cap_text(text: str, sections: list[TextSection]) -> tuple[str, list[TextSec
     return capped, clipped_sections, True
 
 
+#: Guards the process-global ``pypdf`` logger level against concurrent extractions.
+#: A bare save/restore pair races: two threads extracting at once can interleave so that
+#: the first to finish restores the original level while the second is still extracting
+#: (unmuting it), or the second's "previous" is the already-muted ERROR and it restores
+#: that permanently. Extraction is reachable concurrently through the Flask UI, so this
+#: is a live path, not a theoretical one. The depth counter makes the mute reentrant:
+#: only the outermost holder restores.
+_pypdf_mute_lock = threading.Lock()
+_pypdf_mute_depth = 0
+_pypdf_mute_previous: int | None = None
+
+
 @contextlib.contextmanager
 def _quiet_pypdf() -> Iterator[None]:
     """Mute ``pypdf``'s per-object repair chatter for the duration of one extraction.
@@ -542,15 +555,27 @@ def _quiet_pypdf() -> Iterator[None]:
     is never hidden.
 
     Restores the previous level on the way out, including on exception, so this never
-    permanently reconfigures logging for a caller that embeds Carmel as a library.
+    permanently reconfigures logging for a caller that embeds Carmel as a library. The
+    save/restore is refcounted under :data:`_pypdf_mute_lock` because the level is
+    process-global state and extraction can run concurrently; see that lock's comment for
+    the interleavings a bare save/restore pair would corrupt.
     """
+    global _pypdf_mute_depth, _pypdf_mute_previous
+
     pypdf_logger = logging.getLogger("pypdf")
-    previous = pypdf_logger.level
-    pypdf_logger.setLevel(logging.ERROR)
+    with _pypdf_mute_lock:
+        if _pypdf_mute_depth == 0:
+            _pypdf_mute_previous = pypdf_logger.level
+            pypdf_logger.setLevel(logging.ERROR)
+        _pypdf_mute_depth += 1
     try:
         yield
     finally:
-        pypdf_logger.setLevel(previous)
+        with _pypdf_mute_lock:
+            _pypdf_mute_depth -= 1
+            if _pypdf_mute_depth == 0 and _pypdf_mute_previous is not None:
+                pypdf_logger.setLevel(_pypdf_mute_previous)
+                _pypdf_mute_previous = None
 
 
 def _extract_pdf(data: bytes) -> ExtractedText:
