@@ -253,6 +253,8 @@ def _artifact_intact(raw_path: Path, text_path: Path, extracted_path: Path, dige
         ExtractedText.model_validate(raw_extracted)
     except FileNotFoundError, ValueError, OSError:
         return False
+    if not _extracted_sidecar_intact(extracted_path, meta):
+        return False
     try:
         on_disk = read_bytes(raw_path)
     except FileNotFoundError, OSError:
@@ -260,6 +262,34 @@ def _artifact_intact(raw_path: Path, text_path: Path, extracted_path: Path, dige
     if len(on_disk) != meta.n_bytes:
         return False
     return hashlib.sha256(on_disk).hexdigest() == digest
+
+
+def _extracted_sidecar_intact(extracted_path: Path, meta: StoredArtifact) -> bool:
+    """Check ``extracted.json`` against the digest recorded in ``meta.json``.
+
+    Validating that the sidecar PARSES is not enough. A write interrupted at a buffer
+    boundary, or a file truncated by a full disk, can leave JSON that still parses and
+    still validates as an :class:`ExtractedText` while holding only part of the
+    document -- at which point the grounding gate happily confirms quotes against a
+    fragment and reports them as grounded in the stored bytes.
+
+    Args:
+        extracted_path: Path of the stored ``extracted.json``.
+        meta: Metadata for the artifact, carrying the expected digest.
+
+    Returns:
+        True when the sidecar matches its recorded digest, or when no digest was
+        recorded. ``None`` means the artifact predates this field, NOT that it is
+        corrupt: refusing those would make every artifact stored before this change
+        unreadable, discarding good evidence to enforce a check that could not have
+        run when it was written. They keep the guarantees they were stored with.
+    """
+    if meta.extracted_sha256 is None:
+        return True
+    try:
+        return hashlib.sha256(extracted_path.read_bytes()).hexdigest() == meta.extracted_sha256
+    except FileNotFoundError, OSError:
+        return False
 
 
 def _load_meta(meta_path: Path) -> StoredArtifact | None:
@@ -292,6 +322,10 @@ def _write_all(
     write_bytes(raw_path, data)
     write_text(text_path, extracted.text)
     write_json(extracted_path, extracted)
+    # Hash the file AFTER writing rather than re-serialising the model: the digest has
+    # to describe the bytes actually on disk, and re-deriving them here would silently
+    # drift the moment `write_json`'s formatting changed.
+    extracted_digest = hashlib.sha256(extracted_path.read_bytes()).hexdigest()
     stored = StoredArtifact(
         sha256=digest,
         source_url=artifact.url,
@@ -300,6 +334,7 @@ def _write_all(
         n_bytes=len(data),
         stored_at=datetime.now(UTC),
         extractor=extracted.extractor,
+        extracted_sha256=extracted_digest,
         lossy=extracted.lossy,
         license_note=license_note,
         provenance=provenance,
@@ -423,19 +458,28 @@ def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | Non
 
 
 def verify_artifact(workspace_root: Path, sha256: str) -> bool:
-    """Re-read ``raw.bin`` and confirm its digest still equals the directory name.
+    """Re-read the stored bytes and confirm they still match their recorded digests.
 
     This is what makes the stored provenance auditable rather than merely
     claimed: a caller can, at any later time, prove that the bytes under
     ``sha256`` have not been altered on disk.
+
+    BOTH ``raw.bin`` and ``extracted.json`` are checked. Verifying only ``raw.bin``
+    would leave the guarantee pointing at the wrong file: the grounding gate never
+    reads ``raw.bin``, it reads ``extracted.json``, so an intact-but-unverified
+    sidecar is the one that can actually corrupt a result. Artifacts stored before
+    ``extracted_sha256`` existed carry no sidecar digest and are judged on
+    ``raw.bin`` alone, exactly as they were when written.
 
     Args:
         workspace_root: Root of the campaign workspace.
         sha256: Hex digest identifying the artifact (and its directory name).
 
     Returns:
-        True if ``raw.bin`` exists and its sha256 matches ``sha256``; False
-        if the artifact is absent or the bytes have been corrupted/tampered.
+        True if ``raw.bin`` exists, its sha256 matches ``sha256``, and the
+        ``extracted.json`` sidecar matches its recorded digest (when one exists);
+        False if the artifact is absent or any of those bytes have been
+        corrupted/tampered.
 
     Raises:
         ValueError: If ``sha256`` is not a well-formed 64-character lowercase hex
@@ -448,4 +492,11 @@ def verify_artifact(workspace_root: Path, sha256: str) -> bool:
         data = read_bytes(raw_path)
     except FileNotFoundError:
         return False
-    return hashlib.sha256(data).hexdigest() == sha256
+    if hashlib.sha256(data).hexdigest() != sha256:
+        return False
+    meta = _load_meta(dest_dir / _META_NAME)
+    if meta is None:
+        # No metadata to check against; the raw bytes verified, which is all this
+        # artifact ever promised.
+        return True
+    return _extracted_sidecar_intact(dest_dir / _EXTRACTED_NAME, meta)

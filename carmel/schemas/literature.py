@@ -374,6 +374,22 @@ class StoredArtifact(BaseModel):
     n_bytes: int = Field(ge=0)
     stored_at: datetime
     extractor: str = Field(min_length=1)
+    #: sha256 of the ``extracted.json`` bytes, or ``None`` for artifacts stored before
+    #: this field existed.
+    #:
+    #: ``raw.bin`` is content-addressed and re-hashed on every read, but the grounding
+    #: gate does not read ``raw.bin`` -- it reads ``extracted.json``, which until now
+    #: carried no integrity check at all. So the file the whole "grounded in the
+    #: stored bytes" claim rests on was the one file in the store nothing verified.
+    #:
+    #: This is NOT a tamper defence: anyone who can write into the evidence store can
+    #: rewrite ``meta.json`` and the report alongside it, so this is no privilege
+    #: boundary. It closes the NON-adversarial case, which is the one that actually
+    #: happens -- a sidecar truncated by a full disk or an interrupted write, which
+    #: can still parse as valid JSON and silently ground quotes against a partial
+    #: document. ``raw.bin`` was already protected against exactly that; this extends
+    #: the same guarantee to the file that matters.
+    extracted_sha256: str | None = None
     lossy: bool
     license_note: str | None = None
     provenance: ArtifactProvenance = ArtifactProvenance.FETCHED
