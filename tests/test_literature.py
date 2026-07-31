@@ -2383,3 +2383,33 @@ class TestCorpusPassReadsOneDocumentPerCall:
 
         assert len(report.findings) == 1, "the first document's grounded finding must survive"
         assert report.latest.stop_reason == StopReason.ERROR
+
+
+class TestTheReservationMatchesThePromptSize:
+    """The bridge reserves a flat 8000 tokens by default. That was sized for a short
+    search prompt and is badly wrong for a corpus prompt that embeds a whole paper --
+    a single document ran ~25k tokens on the live corpus.
+
+    This matters more since tokens became the operator's authorisation unit: the
+    reservation IS the enforcement point, checked BEFORE the call. An understated
+    reservation means the ceiling does not bind until after the call that breached it,
+    which is the one moment it needed to.
+    """
+
+    def test_a_whole_document_prompt_reserves_far_more_than_the_flat_default(self) -> None:
+        from carmel.services.literature import estimated_tokens_for
+
+        # ~100k characters, the scale of one extracted paper.
+        assert estimated_tokens_for("x" * 100_000) > 8000 * 3
+
+    def test_a_short_prompt_never_reserves_below_the_bridge_default(self) -> None:
+        """Sizing DOWN would be a regression: the default is also a floor covering the
+        response, which the prompt length cannot predict."""
+        from carmel.services.literature import estimated_tokens_for
+
+        assert estimated_tokens_for("short") == 8000
+
+    def test_the_estimate_grows_with_the_prompt(self) -> None:
+        from carmel.services.literature import estimated_tokens_for
+
+        assert estimated_tokens_for("x" * 200_000) > estimated_tokens_for("x" * 100_000)

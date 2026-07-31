@@ -892,12 +892,14 @@ def _ground_and_record(
     proposed, canonical_ok = _canonicalize_payload(proposed)
 
     verifier = build_verifier_agent(model=deps.verifier_model, ledger=deps.ledger)
+    verifier_prompt = _verifier_prompt(
+        proposed,
+        evidence_window=evidence_window,
+        grounding_dict=verdict.model_dump(mode="json"),
+    )
     result = verifier.run(
-        _verifier_prompt(
-            proposed,
-            evidence_window=evidence_window,
-            grounding_dict=verdict.model_dump(mode="json"),
-        )
+        verifier_prompt,
+        estimated_tokens=estimated_tokens_for(verifier_prompt),
     )
     assessment = VerifierAssessment.model_validate(result.output)
 
@@ -1371,7 +1373,7 @@ def _research_loop(
             search_results=search_results,
             reported_keys=[f"{src} :: {quote[:80]}" for src, quote in sorted(seen_keys)],
         )
-        result = literature.run(prompt)
+        result = literature.run(prompt, estimated_tokens=estimated_tokens_for(prompt))
         proposal = LiteratureProposal.model_validate(result.output)
 
         # Truncate FIRST: only queries we actually execute get recorded into
@@ -1506,6 +1508,38 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     return corpus, skipped
 
 
+#: Characters per token, used to size a budget reservation from a prompt.
+#:
+#: Deliberately conservative (real English is ~4 chars/token, and the technical text and
+#: chemical formulae in these prompts tokenise WORSE than English, not better). Under-
+#: reserving is the dangerous direction: the ledger checks the reservation BEFORE the
+#: call, so a reservation smaller than the true cost lets a run sail past the operator's
+#: ceiling and only discover it when settling, after the money is spent.
+_CHARS_PER_TOKEN = 3
+#: Headroom for the model's own response, which the prompt length cannot predict.
+_RESPONSE_TOKEN_ALLOWANCE = 4000
+
+
+def estimated_tokens_for(prompt: str) -> int:
+    """Size a budget reservation from the prompt actually being sent.
+
+    The bridge defaults to a flat 8000-token reservation, which was fine for a short
+    search prompt and badly wrong for a corpus prompt that embeds an entire paper: a
+    single document ran ~25k tokens on the live corpus, so the reservation understated
+    the real call by roughly three times. That matters more now that tokens are the
+    operator's authorisation unit, because the reservation IS the enforcement point --
+    an understated one means the cap does not bind until after the call that breached
+    it.
+
+    Args:
+        prompt: The prompt about to be sent.
+
+    Returns:
+        A conservative worst-case token estimate, never below the bridge default.
+    """
+    return max(8000, len(prompt) // _CHARS_PER_TOKEN + _RESPONSE_TOKEN_ALLOWANCE)
+
+
 def _corpus_prompt(campaign: Campaign, corpus: Sequence[tuple[StoredArtifact, ExtractedText]]) -> str:
     """Present the held corpus to the agent, whole.
 
@@ -1585,7 +1619,8 @@ def _corpus_loop(
         # paper, so a digest naming any other is a mistake worth surfacing, even when
         # that other paper happens to be in the store.
         by_sha = {artifact.sha256: (artifact, extracted)}
-        result = agent.run(_corpus_prompt(campaign, [(artifact, extracted)]))
+        corpus_prompt = _corpus_prompt(campaign, [(artifact, extracted)])
+        result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
         proposal = CorpusProposal.model_validate(result.output)
         append_typed_event(
             log_path,

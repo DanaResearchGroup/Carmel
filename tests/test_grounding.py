@@ -312,6 +312,63 @@ def test_check_identity_doi_surname_and_year_without_any_title_is_not_confirmed(
     assert check_identity(extracted, citation) is False
 
 
+@pytest.mark.parametrize(
+    ("document_title", "cited_title"),
+    [
+        (
+            "Ignition delay of toluene oxidation in a shock tube",
+            "Ignition delay of benzene oxidation in a shock tube",
+        ),
+        (
+            "Laminar flame speed of syngas mixtures at elevated pressure",
+            "Laminar flame speed of biogas mixtures at elevated pressure",
+        ),
+        (
+            "Autoignition of kerosene surrogates in a rapid compression machine",
+            "Autoignition of gasoline surrogates in a rapid compression machine",
+        ),
+        ("Pyrolysis of ethanol at high temperature", "Pyrolysis of ammonia at high temperature"),
+    ],
+)
+def test_check_identity_refuses_a_title_differing_by_one_dissimilar_word(document_title: str, cited_title: str) -> None:
+    """The identity gate confirmed a DIFFERENT paper for every one of these.
+
+    The old rule only refused when the missing token had a NEAR-VARIANT in the window,
+    which was calibrated on three similar pairs (methane/methanol, heptane/heptene,
+    ethane/methane) and does not generalise: most titles that differ by one
+    discriminating word differ in DISSIMILAR words. With no near-variant found nothing
+    contradicted, and the 0.85 character ratio decided alone -- a ratio these pairs
+    clear easily, since one word in a fifty-character title is a small fraction of the
+    characters and none of the meaning.
+
+    The DOI matches in each case, which is the point: DOI corroboration cannot save
+    this, because a citation carrying the right DOI and the wrong title is exactly what
+    a hallucinating proposer produces.
+    """
+    text = f"Journal of Combustion\n\n{document_title}\n\nDOI: 10.1000/xyz123\n\nAbstract\n\nText.\n"
+    citation = Citation(title=cited_title, authors=[], doi="10.1000/xyz123")
+
+    assert check_identity(_extracted(text), citation) is False
+
+
+def test_check_identity_verdict_does_not_depend_on_where_the_stride_lands() -> None:
+    """The fuzzy scan walks fixed-length windows at a stride, so an edge lands
+    mid-token and the window reads as missing a word the document plainly contains.
+
+    Padding the title occurrence shifts every window boundary relative to it. The
+    verdict must come from what the document says, not from where the stride happened
+    to fall, so every offset must agree.
+    """
+    title = "Ignition delay times of methane oxidation in a shock tube"
+    verdicts = set()
+    for pad in range(12):
+        text = f"{'x' * pad}\n\nJournal of Combustion\n\n{title}\n\nDOI: 10.1000/xyz123\n\nAbstract\n\nText.\n"
+        citation = Citation(title=title, authors=[], doi="10.1000/xyz123")
+        verdicts.add(check_identity(_extracted(text), citation))
+
+    assert verdicts == {True}, "the same document produced different verdicts at different stride offsets"
+
+
 def test_check_identity_confirms_a_title_damaged_by_extraction() -> None:
     """The case the removed surname+year fallback was actually reaching for.
 
@@ -1811,3 +1868,47 @@ class TestQuoteMissReasonsAreDistinguishable:
         }
         assert len(explanations) == 3
         assert "NOT evidence that the quote was fabricated" in _QUOTE_MISS_EXPLANATIONS[QuoteMissReason.TOO_SHORT]
+
+
+def test_an_erratum_behind_publisher_front_matter_is_still_caught() -> None:
+    """The marker scan was 600 characters, calibrated on a clean title-first layout.
+
+    Real publisher front matter is longer: an Elsevier ScienceDirect preamble measured
+    816 characters before the title on a paper in the live corpus. The marker sat past
+    the window, nothing matched, and the erratum passed as the original -- with the
+    original's DOI and title quoted verbatim inside it, which is exactly why this gate
+    exists rather than relying on title matching.
+    """
+    front_matter = (
+        "Contents lists available at ScienceDirect\n\n"
+        "Combustion and Flame\n\n"
+        "journal homepage: www.elsevier.com/locate/combustflame\n\n"
+        "Volume 231, September 2026, Pages 1-14  ISSN 0010-2180\n\n" + "filler metadata line\n" * 40
+    )
+    assert len(front_matter) > 600, "fixture must exceed the old window to be meaningful"
+    text = (
+        f"{front_matter}\n"
+        "Erratum to: Ignition delay times of methane oxidation in a shock tube\n\n"
+        "DOI: 10.1000/xyz123\n\nAbstract\n\nText.\n"
+    )
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube", authors=[], doi="10.1000/xyz123"
+    )
+
+    assert check_identity(_extracted(text), citation) is False
+
+
+def test_a_marker_broken_across_a_line_is_still_caught() -> None:
+    """Markers are headings, and headings are where extraction puts line breaks. A
+    literal substring search missed "correction\\nto" on precisely the documents this
+    gate is for."""
+    text = (
+        "Journal of Combustion\n\n"
+        "Correction\nto: Ignition delay times of methane oxidation in a shock tube\n\n"
+        "DOI: 10.1000/xyz123\n\nAbstract\n\nText.\n"
+    )
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube", authors=[], doi="10.1000/xyz123"
+    )
+
+    assert check_identity(_extracted(text), citation) is False

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from carmel.schemas.action_state import PlanProgress
 
 from carmel.schemas.approval import (
+    LITERATURE_ACTION_KINDS,
     ActionKind,
     ApprovalDecision,
     ApprovalPolicy,
@@ -89,7 +90,12 @@ def evaluate_action(
         if policy.require_approval_for_experiments:
             return ApprovalRequirement.REQUIRES_APPROVAL
         return ApprovalRequirement.AUTO_APPROVED
-    if action.kind == ActionKind.LITERATURE_SEARCH:
+    # BOTH literature kinds, not just the search. The policy's fields are named for
+    # "literature", and a corpus pass is the more expensive of the two -- it is the one
+    # an operator names a budget for. Matching only LITERATURE_SEARCH sent a corpus
+    # pass to the catch-all below, so `require_approval_for_literature: false` and
+    # `auto_approve_literature_under_usd` were both inert for it.
+    if action.kind in LITERATURE_ACTION_KINDS:
         if policy.require_approval_for_literature:
             return ApprovalRequirement.REQUIRES_APPROVAL
         if action.estimated_spend_usd > policy.auto_approve_literature_under_usd:

@@ -1174,3 +1174,72 @@ class TestCorpusPassAppendIsNotRepeatable:
         assert second.action_id != first.action_id
         kinds = [a.kind for a in load_progress(ws).actions]
         assert kinds.count(ActionKind.LITERATURE_CORPUS_PASS) == 2
+
+
+class TestTheCorpusPassObeysTheApprovalPolicy:
+    """The corpus pass was created with a hardcoded AUTO_APPROVED and never re-evaluated.
+
+    An operator who set `require_approval_for_literature: true` to hold every
+    literature action for review got a corpus pass that ran immediately -- having set
+    the exact option meant to prevent it. The corpus pass is also the more expensive of
+    the two literature kinds (it is the one an operator names a budget for), so it was
+    the wrong one to exempt.
+
+    Two layers had to change together: the action is now re-evaluated against the
+    policy, AND `evaluate_action` matches both literature kinds. Matching only
+    LITERATURE_SEARCH sent a corpus pass to the catch-all, where it required approval
+    unconditionally -- inert policy in the other direction.
+    """
+
+    def test_require_approval_for_literature_holds_a_corpus_pass(self, ws: Path) -> None:
+        from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
+        from carmel.services.approvals import save_policy
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        save_policy(ws, ApprovalPolicy(require_approval_for_literature=True))
+
+        action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        assert action.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_a_pass_under_the_threshold_is_auto_approved(self, ws: Path) -> None:
+        """The other direction: the policy must be able to let one through, or the fix
+        would simply have replaced one hardcoded verdict with the opposite one."""
+        from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
+        from carmel.services.approvals import save_policy
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        save_policy(ws, ApprovalPolicy(require_approval_for_literature=False, auto_approve_literature_under_usd=1e6))
+
+        action = append_corpus_pass_action(ws, budget_tokens=1_000, model_name="gemini-2.5-flash")
+
+        assert action.approval_requirement == ApprovalRequirement.AUTO_APPROVED
+
+    def test_an_unpriceable_pass_fails_closed(self, ws: Path) -> None:
+        """No model configured means no dollar estimate, and `estimated_spend_usd` is
+        then 0.0 -- below every threshold. "We cannot price this" must not reach the
+        policy as "this is free"."""
+        from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
+        from carmel.services.approvals import save_policy
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        save_policy(ws, ApprovalPolicy(require_approval_for_literature=False, auto_approve_literature_under_usd=1e6))
+
+        action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name=None)
+
+        assert action.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL

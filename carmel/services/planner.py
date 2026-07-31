@@ -452,9 +452,28 @@ def _append_corpus_pass_action_locked(
             "Operator-appended second pass over the acquired corpus. Reads the "
             "evidence store only: no search, no fetching."
         ),
+        # Provisional. Re-evaluated against the campaign's policy below -- a hardcoded
+        # AUTO_APPROVED here is what let a corpus pass bypass the approval gate.
         approval_requirement=ApprovalRequirement.AUTO_APPROVED,
         parameters={},
     )
+    # Run the SAME policy gate the search action goes through. Without this,
+    # `require_approval_for_literature: true` and `auto_approve_literature_under_usd`
+    # were silently inert for corpus passes: an operator who had configured their
+    # campaign to hold every literature action for review got one that ran
+    # immediately, having set the exact option meant to prevent it. The corpus pass is
+    # also the MORE expensive of the two -- it is the one an operator names a budget
+    # for -- so it was the wrong one to exempt.
+    #
+    # An unknown cost fails CLOSED. `estimated_spend_usd` is 0.0 when no model is
+    # configured, and 0.0 is below every threshold, so "we cannot price this" would
+    # otherwise read to the policy as "this is free".
+    if action.estimated_spend_usd <= 0:
+        action = action.model_copy(update={"approval_requirement": ApprovalRequirement.REQUIRES_APPROVAL})
+    else:
+        action = action.model_copy(
+            update={"approval_requirement": evaluate_action(action, load_policy(workspace_root))}
+        )
 
     # Inserted BEFORE the T3 run rather than at the end of the plan. `save_plan`
     # requires T3_RUN to be the last executable action, and appending past it would

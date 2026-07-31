@@ -246,6 +246,17 @@ _TITLE_TOKEN_SUBSTITUTION_RATIO = 0.7
 #: Tokens within a normalized string. Unlike :data:`_WORD_RE` this keeps digits, because
 #: a species or condition token is frequently alphanumeric ("co2", "h2o2", "gri30").
 _IDENTITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
+#: Everything that is not an identity character; used to collapse a window so a token
+#: split across a line break still matches.
+_SEPARATOR_RE = re.compile(r"[^a-z0-9]+")
+#: Whether a single character can be part of an identity token.
+_IS_IDENTITY_CHAR = re.compile(r"[a-z0-9]").match
+
+#: Most characters extraction may drop from one token before it stops being a damaged
+#: rendering of that token and starts being a different word.
+_MAX_DAMAGED_CHARS = 2
+#: Shortest token accepted as a damaged rendering, so noise cannot satisfy a title word.
+_MIN_DAMAGED_TOKEN_LENGTH = 3
 
 #: Short words that are grammar, not chemistry. Excluded from the must-be-present rule
 #: for short tokens, which otherwise exists to pin formulas like "h2" and "co". These
@@ -275,7 +286,20 @@ SECONDARY_DOCUMENT_MARKERS: tuple[str, ...] = (
 #: How far into the front matter to look for an article-type announcement. Journals
 #: print the article type in the header; scanning further would match a mere mention of
 #: an erratum in the body or a footnote.
-MARKER_SCAN_CHARS = 600
+#: How far into the document to look for a secondary-document marker.
+#:
+#: 600 was calibrated on a clean title-first layout and is too small for a real
+#: publisher front matter block. An Elsevier ScienceDirect preamble (journal name,
+#: volume, page range, ISSN, DOI banner, "Contents lists available at", the running
+#: header) measured 816 characters BEFORE the title on a paper in the live corpus, so
+#: the marker sat outside the window and an erratum passed as the original.
+#:
+#: Raised well past that rather than to it: front matter varies by publisher and this
+#: window is the only thing standing between an erratum and a confirmed identity. The
+#: cost of scanning further is a substring search over a few thousand characters, which
+#: is nothing next to the fuzzy scan that follows; the cost of scanning too little is a
+#: misattributed finding.
+MARKER_SCAN_CHARS = 4000
 
 #: Minimum length of a quote AFTER normalization (whitespace/punctuation collapse).
 #: verbatim_quote already has a raw min_length=40 floor (literature_agent.py), but a
@@ -738,45 +762,122 @@ def _formula_tokens(text_normalized: str) -> set[str]:
     }
 
 
+def _is_damaged_form_of(candidate: str, token: str) -> bool:
+    """Whether ``candidate`` looks like ``token`` with characters lost in extraction.
+
+    Extraction damage REMOVES characters -- a dropped ligature glyph leaves "tue" for
+    "tube", "ame" for "flame" -- so a damaged token is a subsequence of the original. A
+    substituted word is not: "benzene" is not a subsequence of "toluene".
+
+    This is the test that character similarity could not do. On similarity alone
+    "tube"/"tue" scores 0.86 and "methane"/"methanol" scores 0.93, so any threshold
+    admitting the damage also admits the different paper. Subsequence separates them
+    cleanly, because "methanol" is not "methane" with letters dropped -- it has an "o"
+    that "methane" never had.
+
+    Args:
+        candidate: A token found in the document window.
+        token: The token from the cited title it might be a damaged rendering of.
+
+    Returns:
+        True if ``candidate`` is a subsequence of ``token`` and lost at most
+        :data:`_MAX_DAMAGED_CHARS` characters. The length bound stops a short token
+        waving through a long one: "in" is a subsequence of "ignition", and without it
+        any title word containing common letters in order would be satisfied by noise.
+    """
+    if len(candidate) < _MIN_DAMAGED_TOKEN_LENGTH or len(token) - len(candidate) > _MAX_DAMAGED_CHARS:
+        return False
+    if len(candidate) >= len(token):
+        return False
+    remaining = iter(token)
+    return all(character in remaining for character in candidate)
+
+
+def _expand_to_token_boundaries(haystack: str, start: int, end: int) -> str:
+    """Widen a character slice outward until neither edge cuts a token in half.
+
+    The fuzzy scan walks fixed-length windows at a stride, so an edge routinely lands
+    mid-token: a title occurrence one character longer than the citation (an inserted
+    line break, a ligature expanded to two characters) leaves the window ending at
+    "tub" where the document says "tube". Judged as a character slice that reads as a
+    missing token and refuses a paper that is in fact the right one -- and at a
+    different stride offset the same document confirms, which made the verdict depend
+    on where the stride happened to land rather than on what the document says.
+
+    Args:
+        haystack: Normalised document text.
+        start: Slice start, possibly mid-token.
+        end: Slice end, possibly mid-token.
+
+    Returns:
+        The widened slice. Never narrower than the input, so this cannot hide a
+        discrepancy that the unexpanded window would have caught.
+    """
+    while start > 0 and _IS_IDENTITY_CHAR(haystack[start - 1]):
+        start -= 1
+    while end < len(haystack) and _IS_IDENTITY_CHAR(haystack[end]):
+        end += 1
+    return haystack[start:end]
+
+
 def _substituted_token(window_normalized: str, title_normalized: str) -> str | None:
-    """Return a title token this window CONTRADICTS, or None if it contradicts none.
+    """Return a title token this window fails to carry, or None if it carries them all.
 
-    This is the check that makes fuzzy title matching safe. Two rules, because short
-    and long tokens fail in different ways (spar rounds 7 and 8):
+    This is the check that makes fuzzy title matching safe. EVERY identity token of the
+    cited title must be present in the window -- long and short alike.
 
-    LONG tokens (>= :data:`_TITLE_TOKEN_MIN_LENGTH`) use a *discrepancy* test, the same
-    shape as :func:`_has_semantic_discrepancy` for quotes: contradicted when absent from
-    the window AND the window holds a near-variant. "methane" absent, "methanol"
-    present, is a substitution, and a substitution means a different paper however high
-    the character ratio. A long token merely absent, with no near-variant, is damage --
-    extraction drops and mangles tokens, but it does not replace one fuel name with
-    another.
+    It previously used a *discrepancy* test for long tokens: contradicted only when a
+    token was absent AND the window held a near-variant of it, on the reasoning that a
+    merely-absent token is extraction damage while a substituted one is a different
+    paper. That rule was calibrated on three near-variant pairs (methane/methanol 0.93,
+    heptane/heptene 0.86, ethane/methane 0.92) and does not generalise, because most of
+    the class it has to cover -- titles differing in one discriminating word -- differ
+    in DISSIMILAR words. Executed against the real code, it confirmed a different paper
+    for toluene/benzene, syngas/biogas, kerosene/gasoline, ethanol/ammonia and
+    gasoline-surrogate/diesel-surrogate: the discriminating word is not a near-variant,
+    nothing contradicted, and the 0.85 character ratio decided alone.
 
-    SHORT tokens must simply be PRESENT. The near-variant test cannot see substitutions
-    at this length, so applying it here would wave through two titles differing only in
-    "H2" versus "D2", or "CO" versus "CO2" -- which in this literature is the whole
-    difference between two papers. They are excluded from the damage tolerance above
-    deliberately: this is the strictest rule in the function and it is the right place
-    for strictness, because the tokens are both the shortest and the most decisive.
+    The premise underneath it was also false in the other direction. Near-variant
+    similarity cannot separate damage from substitution, because the two overlap:
+    "methane"/"methanol" scores 0.93 and IS a different paper, while a ligature-mangled
+    "flame"/"ame" scores 0.75 and is damage. The old rule therefore refused the damage
+    it meant to tolerate and admitted the substitution it meant to catch.
 
-    Calibration note: measured against the 8-paper live corpus, EVERY real grounded
-    finding confirms identity through the exact-match path, never through the fuzzy
-    fallback this guards. The fuzzy path carries no real traffic; it is a safety net for
-    a citation whose title comes from clean publisher metadata while the document's own
-    title extracted badly. Erring strict here therefore costs nothing observed, and what
-    it does cost is a fail-closed ``identity_not_confirmed`` the operator can see --
-    which is the correct direction for a gate that exists to prevent misattribution.
+    Requiring presence resolves this without needing to tell the two apart. Damage now
+    fails closed, which is the correct direction for a gate against misattribution --
+    and it costs nothing observed: measured against the 8-paper live corpus, EVERY real
+    grounded finding confirms identity through the exact-match path, never through this
+    fuzzy fallback. What the fuzzy path still buys is tolerance of word order, spacing
+    and punctuation differences, which is real; what it no longer buys is tolerance of a
+    missing content word, which was never safe.
+
+    Tokens the window holds but the title does not are IGNORED. The window is a slice of
+    document text bracketing the title, so it legitimately overruns into neighbouring
+    words; requiring set equality in both directions would refuse on alignment, not on
+    identity.
     """
     window_long = _identity_tokens(window_normalized)
-    for token in _identity_tokens(title_normalized):
-        if token in window_long:
+    # Separators stripped, so a token split across a PDF line break ("Igni\ntion")
+    # still matches. That split is the damage-tolerance case the fuzzy path exists for
+    # and it is ubiquitous in real extractions, so whole-token presence alone is too
+    # strict. Crucially this still refuses a SUBSTITUTION: "benzene" does not occur
+    # anywhere inside a toluene window, and "methane" is not a substring of "methanol".
+    window_collapsed = _SEPARATOR_RE.sub("", window_normalized)
+    for token in sorted(_identity_tokens(title_normalized)):
+        if token in window_long or token in window_collapsed:
             continue
-        for other in window_long:
-            if SequenceMatcher(None, token, other).ratio() >= _TITLE_TOKEN_SUBSTITUTION_RATIO:
-                return token
+        # Candidates come from ALL window tokens, not just the long ones: damage
+        # SHORTENS a token, so the damaged form of a long title word is frequently
+        # short enough to fall below the long-token threshold ("tube" -> "tue").
+        if any(_is_damaged_form_of(candidate, token) for candidate in _all_tokens(window_normalized)):
+            continue
+        return token
 
+    # Short formula tokens must match WHOLE. No collapsed fallback for these: "co" is a
+    # substring of "combustion", so substring matching would wave through exactly the
+    # H2/D2 and CO/CO2 distinctions these tokens exist to enforce.
     window_short = _formula_tokens(window_normalized)
-    for token in _formula_tokens(title_normalized):
+    for token in sorted(_formula_tokens(title_normalized)):
         if token not in window_short:
             return token
     return None
@@ -795,9 +896,17 @@ def secondary_document_marker(head: str, requested_title: str) -> str | None:
         The matched marker, or None when the document does not announce itself as a
         secondary document.
     """
-    window = head[:MARKER_SCAN_CHARS]
+    # Normalise before matching. The raw text carries the line breaks, hyphenation and
+    # runs of whitespace that extraction leaves behind, so "correction to" arrives as
+    # "correction\nto" or "correc- tion to" and a literal substring search misses it --
+    # on exactly the documents this gate exists to catch, since a marker is a heading
+    # and headings are where line breaks land.
+    window = _SEPARATOR_RE.sub(" ", head[:MARKER_SCAN_CHARS]).strip()
     for marker in SECONDARY_DOCUMENT_MARKERS:
-        if marker in window and marker not in requested_title:
+        # The requested title gets the same normalisation, so the "genuinely titled
+        # 'Comment on ...'" exemption still fires when the citation's own spacing is
+        # irregular.
+        if marker in window and marker not in _SEPARATOR_RE.sub(" ", requested_title):
             return marker
     return None
 
@@ -840,7 +949,11 @@ def _title_confirmed(extracted: ExtractedText, title_normalized: str) -> bool:
         # window rather than rejecting outright, because a document can legitimately
         # contain both a contradicting window (a neighbouring paper named in the body)
         # and an honest one (its own title on page 1).
-        if _substituted_token(window, title_normalized) is not None:
+        # Compare against a TOKEN-ALIGNED widening of this window, not the raw slice:
+        # a half-token at either edge is an artefact of where the stride landed, not a
+        # statement about the document (F2).
+        aligned = _expand_to_token_boundaries(haystack, pos, pos + n)
+        if _substituted_token(aligned, title_normalized) is not None:
             continue
         raw_start, raw_end = raw_span(index_map, pos, pos + n, len(extracted.text))
         # Classify by BOTH ends, not just the start (spar round 7). A window is n chars

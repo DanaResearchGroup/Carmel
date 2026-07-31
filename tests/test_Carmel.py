@@ -1394,6 +1394,15 @@ class TestCorpusPassCommand:
         )
 
         cid, ws = self._campaign(tmp_path, dispatchable=True)
+        # Widen the auto-approve threshold. Since the corpus pass started going through
+        # the approval gate, the default $2 would hold this action for review: the mock
+        # model has no pricing entry and is charged a punitive fallback rate, so the
+        # worst-case estimate for this token cap lands far above it. That is the gate
+        # working; this test is about the cursor, so let the action through.
+        from carmel.schemas.approval import ApprovalPolicy
+        from carmel.services.approvals import save_policy
+
+        save_policy(ws, ApprovalPolicy(auto_approve_literature_under_usd=10_000.0))
         # Retire the literature search that precedes the corpus pass in the plan, so
         # the cursor actually reaches the appended action. Without this the dispatcher
         # correctly runs the SEARCH instead -- which the command reports, and which is
