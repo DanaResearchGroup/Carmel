@@ -1323,6 +1323,58 @@ class TestCorpusPassCommand:
         assert code == 1
         assert "not found" in capsys.readouterr().err
 
+    def test_it_refuses_rather_than_dispatching_a_different_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`corpus-pass` dispatches the plan's NEXT runnable action, which is not
+        necessarily the corpus pass it just appended.
+
+        With a LITERATURE_SEARCH still pending ahead of it, the command used to run
+        THAT -- an outward-facing pass that reaches the network and spends money -- and
+        only report the mismatch afterwards, once it had already happened. The operator
+        asked for an offline pass over papers already held, under a budget named for
+        that pass. Reporting after the fact is not a guard.
+
+        Asserting the handler was never built is the load-bearing part: an assertion on
+        the message alone would pass even if the search had run.
+        """
+        import carmel.services.dispatcher as dispatcher
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path, dispatchable=True)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+        called = False
+
+        def _spy(**kwargs: Any) -> Any:
+            nonlocal called
+            called = True
+            return dispatcher.default_handlers(**kwargs)
+
+        monkeypatch.setattr(dispatcher, "default_handlers", _spy)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "100000",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+            ]
+        )
+
+        assert code == 1
+        assert called is False, "an action other than the corpus pass was dispatched"
+        assert "Refusing to dispatch" in capsys.readouterr().err
+
     def test_the_agent_config_reaches_the_handler(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Regression: the command loaded --config and then dispatched without it, so
         the literature handler was built with nothing to run on and returned a typed
@@ -1332,8 +1384,22 @@ class TestCorpusPassCommand:
         """
         import carmel.services.dispatcher as dispatcher
         from Carmel import main
+        from carmel.schemas import ActionExecutionStatus, ActionOutcome
+        from carmel.services.plan_progress import advance_cursor, load_progress, mark_finished, mark_running
 
-        cid, _ = self._campaign(tmp_path, dispatchable=True)
+        cid, ws = self._campaign(tmp_path, dispatchable=True)
+        # Retire the literature search sitting ahead of the corpus pass. The command
+        # now refuses to dispatch when the cursor points at a different action, so
+        # without this it never reaches the handler at all.
+        search = load_progress(ws).actions[0]
+        mark_running(ws, search.action_id, "attempt-1")
+        mark_finished(
+            ws,
+            search.action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+        advance_cursor(ws, search.action_id)
         config_path = tmp_path / "agents.yaml"
         config_path.write_text(
             (tmp_path / "nh3.yaml").read_text(encoding="utf-8")

@@ -268,7 +268,11 @@ def migrate_report_payload(payload: object) -> object:
             else item
             for item in items
         ]
-    migrated["schema_version"] = 2
+    # Not a literal 2. This migration produces whatever the CURRENT schema is, so
+    # hardcoding the number here means the next version bump silently stamps migrated
+    # v1 reports with a stale version -- and the `version == CURRENT` early return
+    # above then treats them as already migrated.
+    migrated["schema_version"] = CURRENT_REPORT_SCHEMA_VERSION
     return migrated
 
 

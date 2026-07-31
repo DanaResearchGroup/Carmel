@@ -362,6 +362,26 @@ def _cmd_corpus_pass(
         # it the literature handler is built with nothing to run on and returns a
         # typed "no agent config available" failure -- which looks like a failed run
         # rather than a command that never started one.
+        # Check WHAT the cursor points at before dispatching, not after. The
+        # dispatcher runs the plan's next runnable action, which is not necessarily the
+        # corpus pass just appended -- an earlier LITERATURE_SEARCH still pending sits
+        # ahead of it. Reporting the mismatch afterwards is too late: by then the
+        # search has already run, reached the network and spent the operator's money on
+        # a pass they did not ask for, under a budget they named for something else.
+        from carmel.services.plan_progress import load_progress
+
+        progress = load_progress(ws)
+        next_state = progress.actions[progress.cursor] if progress.cursor < len(progress.actions) else None
+        if next_state is not None and next_state.action_id != action.action_id:
+            print(
+                f"Refusing to dispatch: the plan's next action is {next_state.kind.value} "
+                f"({next_state.action_id}), not the corpus pass just appended "
+                f"({action.action_id}). The corpus pass stays queued. Run or retire the "
+                f"earlier action first, then dispatch again.",
+                file=sys.stderr,
+            )
+            return 1
+
         ticket = execute_next_action(
             ws,
             campaign,
