@@ -247,6 +247,13 @@ _TITLE_TOKEN_SUBSTITUTION_RATIO = 0.7
 #: a species or condition token is frequently alphanumeric ("co2", "h2o2", "gri30").
 _IDENTITY_TOKEN_RE = re.compile(r"[a-z0-9]+")
 
+#: Short words that are grammar, not chemistry. Excluded from the must-be-present rule
+#: for short tokens, which otherwise exists to pin formulas like "h2" and "co". These
+#: carry no identity, and demanding them would fail a title over a dropped preposition.
+_TITLE_SHORT_STOPWORDS = frozenset(
+    {"a", "an", "and", "as", "at", "by", "for", "from", "in", "of", "on", "or", "the", "to", "vs", "via", "with"}
+)  # fmt: skip
+
 #: Phrases by which a document announces itself as being *about* another paper rather
 #: than being it. Each reprints the original's title, and usually its DOI, so neither
 #: the title route nor the DOI route can separate them -- only the announcement can.
@@ -708,39 +715,70 @@ def _present_outside_references(extracted: ExtractedText, term_normalized: str) 
     return False
 
 
+def _all_tokens(text_normalized: str) -> list[str]:
+    """Every token of an already-normalized string, in order."""
+    return _IDENTITY_TOKEN_RE.findall(text_normalized)
+
+
 def _identity_tokens(text_normalized: str) -> set[str]:
-    """Identity-bearing tokens of an already-normalized string."""
-    return {t for t in _IDENTITY_TOKEN_RE.findall(text_normalized) if len(t) >= _TITLE_TOKEN_MIN_LENGTH}
+    """Long, identity-bearing tokens of an already-normalized string."""
+    return {t for t in _all_tokens(text_normalized) if len(t) >= _TITLE_TOKEN_MIN_LENGTH}
+
+
+def _formula_tokens(text_normalized: str) -> set[str]:
+    """Short non-stopword tokens: overwhelmingly chemical formulas and their kin.
+
+    "h2", "co", "o2", "no2", "n2o", "ch4". In a combustion title these are the most
+    discriminating tokens there are, and they are far too short for
+    :func:`_substituted_token`'s near-variant test to see a substitution in them --
+    ratio("h2", "d2") is 0.5, well under any usable threshold.
+    """
+    return {
+        t for t in _all_tokens(text_normalized) if len(t) < _TITLE_TOKEN_MIN_LENGTH and t not in _TITLE_SHORT_STOPWORDS
+    }
 
 
 def _substituted_token(window_normalized: str, title_normalized: str) -> str | None:
     """Return a title token this window CONTRADICTS, or None if it contradicts none.
 
-    This is the check that makes fuzzy title matching safe, and it is deliberately a
-    *discrepancy* detector rather than a stricter similarity bar -- the same shape as
-    :func:`_has_semantic_discrepancy` for quotes, and for the same reason.
+    This is the check that makes fuzzy title matching safe. Two rules, because short
+    and long tokens fail in different ways (spar rounds 7 and 8):
 
-    A title token is contradicted when it is absent from the window AND the window
-    contains a near-variant of it: "methane" absent, "methanol" present. That is a
-    substitution, and a substitution means this is a different paper, however high the
-    character ratio.
+    LONG tokens (>= :data:`_TITLE_TOKEN_MIN_LENGTH`) use a *discrepancy* test, the same
+    shape as :func:`_has_semantic_discrepancy` for quotes: contradicted when absent from
+    the window AND the window holds a near-variant. "methane" absent, "methanol"
+    present, is a substitution, and a substitution means a different paper however high
+    the character ratio. A long token merely absent, with no near-variant, is damage --
+    extraction drops and mangles tokens, but it does not replace one fuel name with
+    another.
 
-    A token that is simply absent with no near-variant is NOT a contradiction. That
-    distinction is what preserves the case fuzzy matching exists for: real extraction
-    damage drops and mangles tokens, but it does not replace a fuel name with a
-    different fuel name. Measured against the 8-paper live corpus, requiring every
-    title token to be *present* would have been too strict -- a title carrying clean
-    publisher metadata ("H2/CO/O2") against a document whose subscripts extracted as
-    "H 2eCOeO2" shares almost no short tokens -- while this check passes it, because
-    the window offers no near-variant to contradict anything.
+    SHORT tokens must simply be PRESENT. The near-variant test cannot see substitutions
+    at this length, so applying it here would wave through two titles differing only in
+    "H2" versus "D2", or "CO" versus "CO2" -- which in this literature is the whole
+    difference between two papers. They are excluded from the damage tolerance above
+    deliberately: this is the strictest rule in the function and it is the right place
+    for strictness, because the tokens are both the shortest and the most decisive.
+
+    Calibration note: measured against the 8-paper live corpus, EVERY real grounded
+    finding confirms identity through the exact-match path, never through the fuzzy
+    fallback this guards. The fuzzy path carries no real traffic; it is a safety net for
+    a citation whose title comes from clean publisher metadata while the document's own
+    title extracted badly. Erring strict here therefore costs nothing observed, and what
+    it does cost is a fail-closed ``identity_not_confirmed`` the operator can see --
+    which is the correct direction for a gate that exists to prevent misattribution.
     """
-    window_tokens = _identity_tokens(window_normalized)
+    window_long = _identity_tokens(window_normalized)
     for token in _identity_tokens(title_normalized):
-        if token in window_tokens:
+        if token in window_long:
             continue
-        for other in window_tokens:
+        for other in window_long:
             if SequenceMatcher(None, token, other).ratio() >= _TITLE_TOKEN_SUBSTITUTION_RATIO:
                 return token
+
+    window_short = _formula_tokens(window_normalized)
+    for token in _formula_tokens(title_normalized):
+        if token not in window_short:
+            return token
     return None
 
 

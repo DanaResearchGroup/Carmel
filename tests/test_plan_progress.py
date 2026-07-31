@@ -1076,7 +1076,7 @@ class TestConcurrentCorpusPassAppend:
     read-modify-write of both files is what makes them agree.
     """
 
-    def test_two_concurrent_appends_both_survive_in_plan_and_progress(self, ws: Path) -> None:
+    def test_concurrent_appends_leave_plan_and_progress_aligned(self, ws: Path) -> None:
         import threading
 
         from carmel.schemas.approval import ActionKind
@@ -1105,13 +1105,72 @@ class TestConcurrentCorpusPassAppend:
         for t in threads:
             t.join(timeout=10)
 
-        assert not errors, f"an append failed: {errors}"
+        # Exactly one append wins. The other is refused by the already-queued guard
+        # (spar round 8) rather than lost to a race: a refusal the operator can read is
+        # a correct outcome, a silently dropped action is not. Any OTHER exception is a
+        # real failure.
+        unexpected = [e for e in errors if not isinstance(e, ValueError)]
+        assert not unexpected, f"an append failed for the wrong reason: {unexpected}"
+        assert len(errors) <= 1, f"both appends were refused: {errors}"
         plan_ids = [a.action_id for a in _load_plan(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS]
         progress_ids = [a.action_id for a in load_progress(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS]
-        assert len(plan_ids) == 2, f"an append was lost from the plan: {plan_ids}"
+        assert len(plan_ids) == 2 - len(errors), f"an append was lost from the plan: {plan_ids}"
         assert sorted(plan_ids) == sorted(progress_ids), (
             f"plan and progress disagree: plan={sorted(plan_ids)} progress={sorted(progress_ids)}"
         )
         assert [a.action_id for a in _load_plan(ws).actions] == [a.action_id for a in load_progress(ws).actions], (
             "plan and progress are no longer index-aligned"
         )
+
+
+class TestCorpusPassAppendIsNotRepeatable:
+    """Spar round 8, P1. Appending happens BEFORE the run, and the run can legitimately
+    not reach the new action -- the dispatcher executes the plan's next action, which
+    may be an earlier one still pending.
+
+    An operator who retries the command then appends another pass every time. Each one
+    eventually runs, and since findings are deliberately never deduped across passes,
+    each adds its findings to the accumulated report again.
+    """
+
+    def test_a_second_append_is_refused_while_one_is_still_queued(self, ws: Path) -> None:
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        first = append_corpus_pass_action(ws, budget_usd=1.0)
+
+        with pytest.raises(ValueError, match="already queued"):
+            append_corpus_pass_action(ws, budget_usd=1.0)
+
+        kinds = [a.kind for a in load_progress(ws).actions]
+        assert kinds.count(ActionKind.LITERATURE_CORPUS_PASS) == 1, "a duplicate pass was queued"
+        assert first.action_id in [a.action_id for a in load_progress(ws).actions]
+
+    def test_a_new_append_is_allowed_once_the_previous_one_has_run(self, ws: Path) -> None:
+        """The guard must bound duplicates, not prevent a legitimate second pass: an
+        operator re-reading the corpus after dropping new papers is the normal case."""
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        first = append_corpus_pass_action(ws, budget_usd=1.0)
+        mark_running(ws, first.action_id, "a1")
+        mark_finished(
+            ws,
+            first.action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+
+        second = append_corpus_pass_action(ws, budget_usd=1.0)
+
+        assert second.action_id != first.action_id
+        kinds = [a.kind for a in load_progress(ws).actions]
+        assert kinds.count(ActionKind.LITERATURE_CORPUS_PASS) == 2

@@ -382,6 +382,39 @@ def test_check_identity_rejects_a_title_that_differs_only_in_the_fuel_studied() 
     assert check_identity(_extracted(text), citation) is False
 
 
+@pytest.mark.parametrize(
+    ("held", "cited", "what"),
+    [
+        (
+            "Laminar burning velocity of H2/CO/O2 mixtures at elevated pressure",
+            "Laminar burning velocity of D2/CO/O2 mixtures at elevated pressure",
+            "H2 vs D2",
+        ),
+        (
+            "Laminar burning velocity of CO/air mixtures at elevated pressure",
+            "Laminar burning velocity of CO2/air mixtures at elevated pressure",
+            "CO vs CO2",
+        ),
+    ],
+)
+def test_check_identity_rejects_a_title_differing_only_in_a_short_formula(held: str, cited: str, what: str) -> None:
+    """Spar round 8, P0. The round-7 guard dropped every token under 4 characters, so
+    it could not see a substitution in exactly the tokens that decide a combustion
+    paper's identity: H2, D2, CO, CO2, N2, O2.
+
+    Nor could its near-variant test have caught them if it had -- ratio("h2", "d2") is
+    0.5, far under any threshold that is not itself a false-positive machine. Short
+    tokens are therefore required to be PRESENT rather than merely un-contradicted.
+    """
+    ratio = SequenceMatcher(None, normalize_for_match(held), normalize_for_match(cited)).ratio()
+    assert ratio > 0.9, f"{what}: the fuzzy ratio alone admits this pair"
+
+    text = f"Journal of Combustion\n\n{held}\n\nDOI: 10.1000/xyz123\n\nAbstract\n\nThe flame speed was 45 cm/s.\n"
+    citation = Citation(title=cited, authors=[], doi="10.1000/xyz123")
+
+    assert check_identity(_extracted(text, front_matter_title=None), citation) is False
+
+
 def test_check_identity_rejects_an_erratum_that_reprints_the_original_title_and_doi() -> None:
     """Spar round 7, P0. An erratum satisfies BOTH conjuncts of the DOI rule honestly:
     it prints the original's DOI, and it reprints the original's full title by

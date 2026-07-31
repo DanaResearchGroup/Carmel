@@ -2026,6 +2026,34 @@ class TestCorpusPass:
         )
         assert any("NOT covered" in w for w in report.latest.warnings)
 
+    def test_an_artifact_whose_bytes_no_longer_match_its_digest_is_not_read(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spar round 8, P0. The search pass fetches and extracts in one breath, so its
+        text is necessarily fresh. A corpus pass re-reads sidecars of arbitrary age --
+        the one place where "the gate runs against content-addressed bytes" can quietly
+        stop being true.
+
+        Truncated raw bytes (a full disk, an interrupted write) no longer hash to the
+        directory naming them, and such an artifact must be refused and reported, not
+        silently grounded against.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        tampered = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/tampered")
+        raw = campaign.workspace_root / "evidence" / "literature" / tampered / "raw.bin"
+        raw.write_bytes(b"these are not the bytes this digest names")
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert any(tampered[:12] in w for w in report.latest.warnings), (
+            f"the artifact failed verification but was not reported: {report.latest.warnings}"
+        )
+        assert all(f.evidence.artifact_sha256 != tampered for f in report.findings), (
+            "a finding was grounded against bytes that do not match their digest"
+        )
+
     def test_an_empty_corpus_stops_without_calling_the_model(self, campaign: Campaign) -> None:
         """Nothing to read is an honest outcome, and must not cost a model call."""
         deps, model, config = _make_deps([])

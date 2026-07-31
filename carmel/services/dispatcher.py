@@ -441,7 +441,13 @@ def make_literature_handler(
                 workspace_root, action, "no agent config available; literature run skipped"
             )
         # Lazy import: keeps the dispatcher importable without the agents stack.
-        from carmel.services.literature import build_deps, run_corpus_pass, run_literature_research, run_record_for
+        from carmel.services.literature import (
+            ReportSchemaTooNewError,
+            build_deps,
+            run_corpus_pass,
+            run_literature_research,
+            run_record_for,
+        )
 
         deps = literature_deps if literature_deps is not None else build_deps(agent_config)  # type: ignore[arg-type]
         if action.kind == ActionKind.LITERATURE_CORPUS_PASS:
@@ -453,7 +459,13 @@ def make_literature_handler(
                 # operator sees why nothing ran and the plan keeps the action.
                 return _literature_unavailable_result(workspace_root, action, str(exc))
         run_pass = run_corpus_pass if action.kind == ActionKind.LITERATURE_CORPUS_PASS else run_literature_research
-        report = run_pass(workspace_root, campaign, action, deps, config=deps.config)
+        try:
+            report = run_pass(workspace_root, campaign, action, deps, config=deps.config)
+        except ReportSchemaTooNewError as exc:
+            # An incompatible-version refusal is operator-actionable ("upgrade Carmel"),
+            # so surface it as a typed unrunnable action rather than a handler crash.
+            # Genuine report corruption raises a plain ValueError and still fails loudly.
+            return _literature_unavailable_result(workspace_root, action, str(exc))
         run_record = run_record_for(report, action)
         save_run_record(workspace_root, run_record)
         outcome = _literature_outcome(report, action)

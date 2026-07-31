@@ -8,13 +8,14 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from carmel.schemas.action_state import ActionExecutionStatus
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.plan import Plan, PlannedAction
 from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.authorization import ExecutionEnvelope, decide_requirement
-from carmel.services.plan_progress import append_action_to_progress_locked, init_progress
+from carmel.services.plan_progress import append_action_to_progress_locked, init_progress, load_progress
 from carmel.services.spend import compute_spend
 from carmel.services.state_machine import workspace_lock
 
@@ -400,6 +401,26 @@ def append_corpus_pass_action(
 def _append_corpus_pass_action_locked(workspace_root: Path, budget_usd: float, rationale: str) -> PlannedAction:
     """Body of :func:`append_corpus_pass_action`, with the workspace lock held."""
     plan = load_plan(workspace_root)
+
+    # Refuse a second corpus pass while one is still queued (spar round 8, P1).
+    # Appending happens before the run, and the run can legitimately not reach the new
+    # action -- the dispatcher executes the plan's next action, which may be an earlier
+    # one. An operator who retries the command then appends another pass every time,
+    # silently queueing N identical passes that will each eventually run and each add
+    # their findings to the accumulated report. Checking inside the lock makes the
+    # refusal race-safe against a concurrent append.
+    pending = [
+        state
+        for state in load_progress(workspace_root).actions
+        if state.kind == ActionKind.LITERATURE_CORPUS_PASS and state.execution_status == ActionExecutionStatus.PENDING
+    ]
+    if pending:
+        raise ValueError(
+            f"a corpus pass is already queued and has not run yet "
+            f"(action {pending[0].action_id}). Dispatch that one rather than adding "
+            f"another; re-running this command would queue a second identical pass."
+        )
+
     action = PlannedAction(
         action_id=str(uuid4()),
         kind=ActionKind.LITERATURE_CORPUS_PASS,

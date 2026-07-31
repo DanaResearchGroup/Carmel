@@ -106,7 +106,7 @@ from carmel.services import chem
 from carmel.services.acquisition import collect_inbox, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
-from carmel.services.evidence import list_artifacts, load_artifact_text, store_artifact
+from carmel.services.evidence import list_artifacts, load_artifact_text, store_artifact, verify_artifact
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
     DEFAULT_LOCK_GRACE_S,
@@ -201,6 +201,15 @@ def load_literature_report(workspace_root: Path) -> LiteratureReport:
     return LiteratureReport.model_validate(migrate_report_payload(read_json(workspace_root / LITERATURE_REPORT_NAME)))
 
 
+class ReportSchemaTooNewError(ValueError):
+    """A persisted report was written by a NEWER Carmel than this one.
+
+    A distinct type so the dispatcher can turn it into a clean, actionable refusal
+    ("upgrade Carmel") instead of a generic handler crash, while genuine corruption --
+    which also raises ValueError -- keeps failing loudly (spar round 8, P2).
+    """
+
+
 def migrate_report_payload(payload: object) -> object:
     """Bring a persisted report payload up to the current schema version.
 
@@ -225,7 +234,7 @@ def migrate_report_payload(payload: object) -> object:
         # field the operator has never heard of. Worse, a future version that only
         # ADDED optional fields would validate cleanly and silently drop them on the
         # next write -- a newer Carmel's report quietly downgraded by an older one.
-        raise ValueError(
+        raise ReportSchemaTooNewError(
             f"literature report is schema version {version}, but this Carmel understands "
             f"at most {CURRENT_REPORT_SCHEMA_VERSION}. Upgrade Carmel rather than letting "
             f"an older version rewrite (and silently truncate) a newer report."
@@ -1461,10 +1470,34 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     that read all 8 and found nothing, and the two call for opposite responses -- fix
     the corrupt sidecar, or accept that the corpus is exhausted. Coverage the operator
     cannot see is coverage they will assume.
+
+    Every artifact is VERIFIED against its digest before it is read (spar round 8). The
+    search pass fetches and extracts in the same breath, so its text is necessarily
+    fresh; a corpus pass re-reads sidecars of arbitrary age, which is the one place
+    where "the gate runs against content-addressed bytes" can quietly stop being true.
+    :func:`verify_artifact` re-hashes ``raw.bin`` and refuses the artifact if the stored
+    bytes no longer match the directory naming them.
+
+    What this does NOT prove, stated plainly rather than left implied: ``extracted.json``
+    is a DERIVED cache, and verifying ``raw.bin`` does not establish that the cache was
+    derived from those bytes. Someone able to rewrite the sidecar in place could still
+    present text that the raw bytes do not contain. Closing that would mean re-extracting
+    every document on every pass, and it buys little here -- anyone who can write into
+    the evidence store can equally rewrite the report, so this is not a privilege
+    boundary. The realistic failure this DOES catch is the non-adversarial one: bytes
+    truncated by a full disk or an interrupted write.
     """
     corpus: list[tuple[StoredArtifact, ExtractedText]] = []
     skipped: list[str] = []
     for artifact in list_artifacts(workspace_root):
+        try:
+            intact = verify_artifact(workspace_root, artifact.sha256)
+        except ValueError:
+            intact = False
+        if not intact:
+            logger.warning("evidence store: %s failed digest verification and was not read", artifact.sha256)
+            skipped.append(artifact.sha256)
+            continue
         extracted = load_artifact_text(workspace_root, artifact.sha256)
         if extracted is None:
             skipped.append(artifact.sha256)
