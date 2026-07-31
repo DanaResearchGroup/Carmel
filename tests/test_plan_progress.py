@@ -1063,3 +1063,55 @@ class TestLockIsLive:
         assert "pid_start" in info
         assert info["action_id"] == "a1"
         assert lock_is_live(lock, stale_after_s=10.0)
+
+
+class TestConcurrentCorpusPassAppend:
+    """Spar round 7, P1. ``append_corpus_pass_action`` loaded, edited and saved the
+    plan outside any lock, while progress took its own lock internally.
+
+    Two operators appending at once would therefore each read the same plan, and the
+    second ``save_plan`` would drop the first's action -- while progress, correctly
+    serialized, kept both. The two files then described different plans, with progress
+    naming an action the plan did not contain. Holding one lock across the whole
+    read-modify-write of both files is what makes them agree.
+    """
+
+    def test_two_concurrent_appends_both_survive_in_plan_and_progress(self, ws: Path) -> None:
+        import threading
+
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import append_corpus_pass_action
+        from carmel.services.planner import load_plan as _load_plan
+        from carmel.services.planner import save_plan as _save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        _save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _append() -> None:
+            try:
+                barrier.wait(timeout=5)
+                append_corpus_pass_action(ws, budget_usd=1.0)
+            except BaseException as exc:  # noqa: BLE001 - recorded and re-raised below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_append) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"an append failed: {errors}"
+        plan_ids = [a.action_id for a in _load_plan(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS]
+        progress_ids = [a.action_id for a in load_progress(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS]
+        assert len(plan_ids) == 2, f"an append was lost from the plan: {plan_ids}"
+        assert sorted(plan_ids) == sorted(progress_ids), (
+            f"plan and progress disagree: plan={sorted(plan_ids)} progress={sorted(progress_ids)}"
+        )
+        assert [a.action_id for a in _load_plan(ws).actions] == [a.action_id for a in load_progress(ws).actions], (
+            "plan and progress are no longer index-aligned"
+        )

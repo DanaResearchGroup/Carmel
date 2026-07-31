@@ -84,6 +84,7 @@ from carmel.logger import get_logger
 from carmel.schemas.acquisition import AcquisitionReason
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
+    CURRENT_REPORT_SCHEMA_VERSION,
     STOP_REASON_FOR_DIMENSION,
     CredenceVerdict,
     EvidenceRef,
@@ -216,7 +217,20 @@ def migrate_report_payload(payload: object) -> object:
     """
     if not isinstance(payload, dict):
         return payload
-    if int(payload.get("schema_version", 1)) >= 2:
+    version = int(payload.get("schema_version", 1))
+    if version > CURRENT_REPORT_SCHEMA_VERSION:
+        # Fail closed on a report from the FUTURE (spar round 7, P2). Passing it
+        # through unmigrated hands it to a validator that does not know the fields it
+        # carries, and `extra="forbid"` would reject it with a schema error naming a
+        # field the operator has never heard of. Worse, a future version that only
+        # ADDED optional fields would validate cleanly and silently drop them on the
+        # next write -- a newer Carmel's report quietly downgraded by an older one.
+        raise ValueError(
+            f"literature report is schema version {version}, but this Carmel understands "
+            f"at most {CURRENT_REPORT_SCHEMA_VERSION}. Upgrade Carmel rather than letting "
+            f"an older version rewrite (and silently truncate) a newer report."
+        )
+    if version == CURRENT_REPORT_SCHEMA_VERSION:
         return payload
 
     migrated = dict(payload)
@@ -1435,19 +1449,28 @@ def _research_loop(
             return
 
 
-def _load_corpus(workspace_root: Path) -> list[tuple[StoredArtifact, ExtractedText]]:
-    """Every held artifact paired with its extracted text.
+def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, ExtractedText]], list[str]]:
+    """Every held artifact paired with its extracted text, and the shas that were not.
 
     An artifact whose text cannot be loaded is skipped: it cannot be quoted from, so
     including it in the listing would only invite the agent to propose a finding that
     the gate must then reject.
+
+    The skipped shas are RETURNED rather than dropped (spar round 7, P2). A pass that
+    silently reads 6 of 8 held papers and reports nothing looks exactly like a pass
+    that read all 8 and found nothing, and the two call for opposite responses -- fix
+    the corrupt sidecar, or accept that the corpus is exhausted. Coverage the operator
+    cannot see is coverage they will assume.
     """
     corpus: list[tuple[StoredArtifact, ExtractedText]] = []
+    skipped: list[str] = []
     for artifact in list_artifacts(workspace_root):
         extracted = load_artifact_text(workspace_root, artifact.sha256)
-        if extracted is not None:
+        if extracted is None:
+            skipped.append(artifact.sha256)
+        else:
             corpus.append((artifact, extracted))
-    return corpus
+    return corpus, skipped
 
 
 def _corpus_prompt(campaign: Campaign, corpus: Sequence[tuple[StoredArtifact, ExtractedText]]) -> str:
@@ -1504,7 +1527,19 @@ def _corpus_loop(
     here the document is in front of the agent immediately, and a second round would
     re-read identical input at full cost.
     """
-    corpus = _load_corpus(workspace_root)
+    corpus, skipped = _load_corpus(workspace_root)
+    if skipped:
+        state.warnings.append(
+            f"{len(skipped)} held artifact(s) could not be read and were NOT covered by this pass: "
+            + ", ".join(sha[:12] for sha in skipped)
+        )
+        append_typed_event(
+            log_path,
+            event="literature.corpus_artifacts_unreadable",
+            action_id=action_id,
+            run_id=run_id,
+            payload={"sha256": skipped, "n_skipped": len(skipped)},
+        )
     if not corpus:
         state.stop_reason = StopReason.NO_NEW_INFORMATION
         state.warnings.append("the evidence store holds no readable artifacts, so there was nothing to read")

@@ -1691,6 +1691,41 @@ class TestWantedPaperOpenAccessResolution:
         assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
 
 
+class TestReportSchemaVersionGate:
+    """Spar round 7, P2. The migration accepted any ``schema_version >= 2`` unchanged.
+
+    A report from a FUTURE Carmel would then be handed to a validator that does not
+    know its fields. Either it fails with a schema error naming a field the operator
+    has never heard of, or -- worse, if the newer version only added optional fields --
+    it validates cleanly and the next write silently drops them, downgrading a newer
+    report in place. Refuse it instead and say what to do.
+    """
+
+    def test_a_future_schema_version_is_refused(self) -> None:
+        from carmel.services.literature import migrate_report_payload
+
+        with pytest.raises(ValueError, match="schema version 3"):
+            migrate_report_payload({"schema_version": 3, "report_id": "r1"})
+
+    def test_the_current_version_passes_through_untouched(self) -> None:
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        payload = {"schema_version": CURRENT_REPORT_SCHEMA_VERSION, "report_id": "r1"}
+
+        assert migrate_report_payload(payload) is payload
+
+    def test_a_v1_report_is_still_migrated(self) -> None:
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        migrated = migrate_report_payload({"schema_version": 1, "run_id": "r", "action_id": "a", "queries": []})
+
+        assert isinstance(migrated, dict)
+        assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION
+        assert len(migrated["passes"]) == 1
+
+
 class TestReportAccumulatesAcrossPasses:
     """Decision 0004/D1: one report per campaign, appended to, with every finding and
     query carrying the pass that produced it."""
@@ -1958,6 +1993,38 @@ class TestCorpusPass:
         assert load_manifest(campaign.workspace_root).requests == [], (
             "a corpus pass must never queue acquisition for a paper the workspace already holds"
         )
+
+    def test_a_held_artifact_that_cannot_be_read_is_named_in_the_warnings(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spar round 7, P2. An artifact whose text will not load is correctly skipped,
+        but skipping it silently makes a partial pass indistinguishable from a complete
+        one that found nothing -- and the two call for opposite responses.
+
+        Coverage the operator cannot see is coverage they will assume.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        broken = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/broken")
+        # Remove the text sidecars but KEEP meta.json: list_artifacts still yields the
+        # artifact (it is genuinely held), while load_artifact_text returns None. That
+        # is exactly the shape of a corrupt or half-written extraction, and the shape
+        # the pass must not paper over. Deleting meta.json instead would make the
+        # artifact vanish from the listing entirely, which tests nothing.
+        for name in ("extracted.json", "text.txt"):
+            path = campaign.workspace_root / "evidence" / "literature" / broken / name
+            if path.exists():
+                path.unlink()
+        # No proposed findings, so the run needs no verifier response: this test is
+        # about coverage reporting, not about grounding.
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert any(broken[:12] in w for w in report.latest.warnings), (
+            f"the unreadable artifact was skipped without saying so: {report.latest.warnings}"
+        )
+        assert any("NOT covered" in w for w in report.latest.warnings)
 
     def test_an_empty_corpus_stops_without_calling_the_model(self, campaign: Campaign) -> None:
         """Nothing to read is an honest outcome, and must not cost a model call."""

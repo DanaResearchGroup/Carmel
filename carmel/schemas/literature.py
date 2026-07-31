@@ -28,6 +28,7 @@ __all__ = [
     "FindingPayload",
     "GroundingStatus",
     "GroundingVerdict",
+    "CURRENT_REPORT_SCHEMA_VERSION",
     "LiteratureFinding",
     "LiteratureReport",
     "ObservableKind",
@@ -424,6 +425,13 @@ class PassRecord(BaseModel):
     warnings: list[str] = Field(default_factory=list)
 
 
+#: Highest report schema version this build understands. Anything higher is refused
+#: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
+#: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
+#: truncate) a report written by a newer one.
+CURRENT_REPORT_SCHEMA_VERSION = 2
+
+
 class LiteratureReport(BaseModel):
     """The campaign's literature record, accumulated across every pass.
 
@@ -447,7 +455,7 @@ class LiteratureReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 2
+    schema_version: int = CURRENT_REPORT_SCHEMA_VERSION
     report_id: str = Field(min_length=1)
     campaign_id: str = Field(min_length=1)
     created_at: datetime

@@ -157,26 +157,41 @@ def append_action_to_progress(workspace_root: Path, action: PlannedAction, *, in
         ValueError: If the plan has already progressed past the insertion point.
     """
     with workspace_lock(workspace_root):
-        progress = load_progress(workspace_root)
-        at = len(progress.actions) if index is None else index
-        if at < progress.cursor:
-            raise ValueError(
-                f"cannot insert an action at position {at}: the plan has already progressed "
-                f"past it (cursor is at {progress.cursor}), so it would never run"
-            )
-        progress.actions.insert(
-            at,
-            ActionState(
-                action_id=action.action_id,
-                kind=action.kind,
-                approval_status=_approval_from_requirement(action.approval_requirement),
-                blocking=action.blocking,
-                updated_at=_now(),
-            ),
+        return append_action_to_progress_locked(workspace_root, action, index=index)
+
+
+def append_action_to_progress_locked(
+    workspace_root: Path, action: PlannedAction, *, index: int | None = None
+) -> PlanProgress:
+    """:func:`append_action_to_progress` with the workspace lock ALREADY held.
+
+    Exists so a caller that must update the plan and progress together can hold one
+    lock across both writes. ``workspace_lock`` is an ``fcntl.flock``, which conflicts
+    with itself even within a single process, so such a caller cannot simply wrap the
+    locking version -- it would deadlock against itself.
+
+    Call this ONLY from inside ``with workspace_lock(workspace_root):``.
+    """
+    progress = load_progress(workspace_root)
+    at = len(progress.actions) if index is None else index
+    if at < progress.cursor:
+        raise ValueError(
+            f"cannot insert an action at position {at}: the plan has already progressed "
+            f"past it (cursor is at {progress.cursor}), so it would never run"
         )
-        progress.updated_at = _now()
-        save_progress(workspace_root, progress)
-        return progress
+    progress.actions.insert(
+        at,
+        ActionState(
+            action_id=action.action_id,
+            kind=action.kind,
+            approval_status=_approval_from_requirement(action.approval_requirement),
+            blocking=action.blocking,
+            updated_at=_now(),
+        ),
+    )
+    progress.updated_at = _now()
+    save_progress(workspace_root, progress)
+    return progress
 
 
 def _require_action(progress: PlanProgress, action_id: str) -> int:

@@ -14,8 +14,9 @@ from carmel.schemas.plan import Plan, PlannedAction
 from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.authorization import ExecutionEnvelope, decide_requirement
-from carmel.services.plan_progress import append_action_to_progress, init_progress
+from carmel.services.plan_progress import append_action_to_progress_locked, init_progress
 from carmel.services.spend import compute_spend
+from carmel.services.state_machine import workspace_lock
 
 PLAN_JSON_NAME = "plan.json"
 PLAN_MD_NAME = "plan.md"
@@ -385,6 +386,19 @@ def append_corpus_pass_action(
     if budget_usd <= 0:
         raise ValueError(f"budget_usd must be positive, got {budget_usd!r}")
 
+    # ONE lock across the whole read-modify-write of BOTH files (spar round 7, P1).
+    # The plan was previously loaded, edited and saved outside any lock while progress
+    # took its own lock internally, so two concurrent appends could each read the same
+    # plan and the second save would drop the first operator's action -- while progress
+    # kept both, leaving the two files describing different plans. Holding the lock for
+    # the whole sequence also closes the window in which progress had been written and
+    # the plan had not.
+    with workspace_lock(workspace_root):
+        return _append_corpus_pass_action_locked(workspace_root, budget_usd, rationale)
+
+
+def _append_corpus_pass_action_locked(workspace_root: Path, budget_usd: float, rationale: str) -> PlannedAction:
+    """Body of :func:`append_corpus_pass_action`, with the workspace lock held."""
     plan = load_plan(workspace_root)
     action = PlannedAction(
         action_id=str(uuid4()),
@@ -415,7 +429,7 @@ def append_corpus_pass_action(
     # Progress first: it is the component that can legitimately REFUSE (an insertion
     # behind the cursor would never run). Saving the plan first would leave the plan
     # naming an action that progress does not know about.
-    append_action_to_progress(workspace_root, action, index=at)
+    append_action_to_progress_locked(workspace_root, action, index=at)
     save_plan(workspace_root, plan.model_copy(update={"actions": actions}))
     return action
 
