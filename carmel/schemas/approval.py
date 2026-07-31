@@ -15,7 +15,16 @@ class ActionKind(StrEnum):
     T3_RUN = "t3_run"
     ARC_RUN = "arc_run"
     EXPERIMENT = "experiment"  # reserved for future
-    LITERATURE_SEARCH = "literature_search"  # reserved for future
+    LITERATURE_SEARCH = "literature_search"
+    LITERATURE_CORPUS_PASS = "literature_corpus_pass"
+    """Re-read the papers the workspace already holds and ground findings in them.
+
+    A distinct kind rather than a flag on ``LITERATURE_SEARCH`` because the two differ
+    in what they are permitted to do -- one may reach the network and spend on
+    fetches, the other may not -- and that is exactly the sort of thing the approval
+    and authorization layers key off. A flag would make the permitted behaviour
+    invisible to every reader that switches on kind.
+    """
 
 
 class ApprovalRequirement(StrEnum):

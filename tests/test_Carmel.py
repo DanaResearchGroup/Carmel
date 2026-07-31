@@ -1074,3 +1074,109 @@ class TestRequestsCommandDirectoryExitCode:
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 1
         out = capsys.readouterr().out
         assert "0 accepted" in out
+
+
+class TestCorpusPassCommand:
+    """The operator-facing half of the second pass.
+
+    Appending is the authorisation: it names an explicit budget, and it is recorded
+    in the plan whether or not the run then succeeds.
+    """
+
+    def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
+        from Carmel import main
+        from carmel.services.campaigns import load_campaign
+        from carmel.services.planner import plan_and_save
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        campaign = load_campaign(ws)
+        plan_and_save(ws, campaign, include_literature=True)
+        return campaign.campaign_id, ws
+
+    def test_a_campaign_with_no_plan_is_told_what_is_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The raw failure is 'JSON file not found: .../plan.json', which tells an
+        operator nothing about the remedy."""
+        from Carmel import main
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        cid = load_campaign(tmp_path / "ws").campaign_id
+
+        code = main(["corpus-pass", "--campaign", cid, "--budget-usd", "1", "--workspaces", str(tmp_path), "--dry-run"])
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "no plan yet" in err
+        assert "plan.json" not in err
+
+    def test_dry_run_appends_the_action_before_the_t3_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """T3 must stay the last executable action, and the ordering is the honest
+        one anyway: corpus findings are context for the T3 run."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = self._campaign(tmp_path)
+
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-usd", "2.50", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "$2.50" in out
+        kinds = [a.kind for a in load_plan(ws).actions]
+        assert ActionKind.LITERATURE_CORPUS_PASS in kinds
+        assert kinds.index(ActionKind.LITERATURE_CORPUS_PASS) < kinds.index(ActionKind.T3_RUN)
+
+    def test_progress_gains_the_action_at_the_same_position_as_the_plan(self, tmp_path: Path) -> None:
+        """Plan and progress are index-aligned; drifting them apart would make the
+        cursor point at a different action than the plan says."""
+        from Carmel import main
+        from carmel.services.plan_progress import load_progress
+        from carmel.services.planner import load_plan
+
+        cid, ws = self._campaign(tmp_path)
+        assert (
+            main(["corpus-pass", "--campaign", cid, "--budget-usd", "1", "--workspaces", str(tmp_path), "--dry-run"])
+            == 0
+        )
+
+        plan_ids = [a.action_id for a in load_plan(ws).actions]
+        progress_ids = [a.action_id for a in load_progress(ws).actions]
+        assert plan_ids == progress_ids
+
+    def test_a_non_positive_budget_is_refused(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The budget is the authorisation. A zero or negative one authorises
+        nothing, and silently appending an action that can never run would be worse
+        than refusing."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = self._campaign(tmp_path)
+
+        code = main(["corpus-pass", "--campaign", cid, "--budget-usd", "0", "--workspaces", str(tmp_path), "--dry-run"])
+
+        assert code == 1
+        assert "must be positive" in capsys.readouterr().err
+        assert ActionKind.LITERATURE_CORPUS_PASS not in [a.kind for a in load_plan(ws).actions]
+
+    def test_an_unknown_campaign_is_reported_not_crashed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from Carmel import main
+
+        self._campaign(tmp_path)
+
+        code = main(
+            ["corpus-pass", "--campaign", "no-such-id", "--budget-usd", "1", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 1
+        assert "not found" in capsys.readouterr().err

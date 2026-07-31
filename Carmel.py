@@ -102,6 +102,34 @@ def create_parser() -> argparse.ArgumentParser:
         help="Carmel config file with an 'agents' section (required for a real run)",
     )
 
+    corpus = subparsers.add_parser(
+        "corpus-pass",
+        help="Append a second literature pass over the papers this campaign already holds",
+    )
+    corpus.add_argument("--campaign", type=str, required=True, help="Campaign ID")
+    corpus.add_argument(
+        "--budget-usd",
+        type=float,
+        required=True,
+        help=(
+            "What this pass may spend on model calls. Required and explicit: an "
+            "operator-authorised action names its own budget rather than drawing on "
+            "the campaign's autonomous-spend ceiling."
+        ),
+    )
+    corpus.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    corpus.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Carmel config file with an 'agents' section (required for a real run)",
+    )
+    corpus.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Append the action and stop, without running it",
+    )
+
     return parser
 
 
@@ -219,6 +247,78 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     result = outcome.result
     print(f"Literature action {result.action_id} finished with outcome {result.outcome.value}")
     return 0
+
+
+def _cmd_corpus_pass(
+    campaign_id: str,
+    budget_usd: float,
+    workspaces: Path | None,
+    config: Path | None,
+    *,
+    dry_run: bool,
+) -> int:
+    """Append a corpus pass to a campaign's plan and run it.
+
+    Two steps, deliberately separable by ``--dry-run``: appending the action is the
+    operator's authorisation and is recorded in the plan whether or not the run then
+    succeeds, so a failed run leaves an approved action to retry rather than
+    vanishing without trace.
+    """
+    from carmel.schemas.action_state import ActionOutcome
+    from carmel.services.campaigns import find_campaign_workspace, load_campaign
+    from carmel.services.dispatcher import execute_action
+    from carmel.services.planner import append_corpus_pass_action
+    from carmel.ui.app import _resolve_workspaces_root
+
+    try:
+        agent_config = _load_agent_config(config)
+    except (OSError, ValueError) as e:
+        print(f"Failed to load config: {e}", file=sys.stderr)
+        return 1
+    if agent_config is None and not dry_run:
+        print(
+            "No agent config available: pass --config FILE whose 'agents' section "
+            "sets provider, consent and API key env vars.",
+            file=sys.stderr,
+        )
+        return 1
+
+    workspaces_root = _resolve_workspaces_root(workspaces)
+    ws = find_campaign_workspace(workspaces_root, campaign_id)
+    if ws is None:
+        print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
+        return 1
+    campaign = load_campaign(ws)
+
+    try:
+        action = append_corpus_pass_action(ws, budget_usd=budget_usd)
+    except FileNotFoundError:
+        # Distinguished from the generic OSError below because the remedy is
+        # specific and the raw message ("JSON file not found: .../plan.json") tells
+        # an operator nothing about what to do.
+        print(
+            f"Campaign {campaign_id!r} has no plan yet, so there is nothing to append to. "
+            "Run the literature step (or create a plan) first.",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, ValueError) as e:
+        print(f"Could not append the corpus pass: {e}", file=sys.stderr)
+        return 1
+    print(f"Appended corpus-pass action {action.action_id} with a budget of ${budget_usd:.2f}")
+    if dry_run:
+        print("--dry-run: the action was appended but not run.")
+        return 0
+
+    from carmel.agents.bridge import AgentBridgeError
+
+    try:
+        result = execute_action(ws, campaign, action)
+    except AgentBridgeError as e:
+        print(f"Corpus pass unavailable (consent/API key): {e}", file=sys.stderr)
+        return 1
+    print(f"Corpus pass {action.action_id} finished with outcome {result.outcome.value}")
+    return 0 if result.outcome == ActionOutcome.SUCCEEDED else 1
 
 
 def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
@@ -521,6 +621,15 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_serve(args.workspaces, args.host, args.port, args.debug, args.config)
     if args.command == "literature":
         return _cmd_literature(args.campaign, args.workspaces, args.config)
+
+    if args.command == "corpus-pass":
+        return _cmd_corpus_pass(
+            args.campaign,
+            args.budget_usd,
+            args.workspaces,
+            args.config,
+            dry_run=args.dry_run,
+        )
 
     if args.command == "new-campaign":
         return _cmd_new_campaign(args.config, args.workspaces)

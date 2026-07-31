@@ -14,7 +14,7 @@ from carmel.schemas.plan import Plan, PlannedAction
 from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.authorization import ExecutionEnvelope, decide_requirement
-from carmel.services.plan_progress import init_progress
+from carmel.services.plan_progress import append_action_to_progress, init_progress
 from carmel.services.spend import compute_spend
 
 PLAN_JSON_NAME = "plan.json"
@@ -344,6 +344,80 @@ def plan_and_save(workspace_root: Path, campaign: Campaign, *, include_literatur
     save_plan(workspace_root, plan)
     init_progress(workspace_root, plan)
     return plan
+
+
+def append_corpus_pass_action(
+    workspace_root: Path,
+    *,
+    budget_usd: float,
+    rationale: str = "",
+) -> PlannedAction:
+    """Append a corpus-pass action to the campaign's plan, on operator command.
+
+    The second pass is a plan action rather than a standalone verb, because budget
+    reservation, the approval gate, per-action state and the append-only decision log
+    all hang off actions. A command that ran the agent outside the plan would create
+    a second, unsupervised way to spend money on model calls, bypassing the entire
+    safety envelope.
+
+    This does NOT reopen the infinite-cycle risk that kept a
+    ``LITERATURE_READY -> APPROVED_FOR_EXECUTION`` edge out of the state machine.
+    That risk came from an AUTOMATIC edge re-dispatching literature forever. Nothing
+    automatic creates this action -- a human does, once, deliberately, naming what it
+    may spend. The absent edge is preserved; supervision is gained.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        budget_usd: What this pass may spend. Required and explicit: the ledger
+            bounds AUTONOMOUS spend, whereas an operator typing a command with a
+            number in it is AUTHORISED spend, and the two should not be conflated.
+            Note this means there is no campaign-lifetime hard stop -- cumulative
+            spend across passes is reported, not enforced.
+        rationale: Optional operator note recorded on the action.
+
+    Returns:
+        The appended action.
+
+    Raises:
+        ValueError: If ``budget_usd`` is not positive, or if the resulting plan would
+            not be executable.
+    """
+    if budget_usd <= 0:
+        raise ValueError(f"budget_usd must be positive, got {budget_usd!r}")
+
+    plan = load_plan(workspace_root)
+    action = PlannedAction(
+        action_id=str(uuid4()),
+        kind=ActionKind.LITERATURE_CORPUS_PASS,
+        description="Literature corpus pass — ground findings in the papers already held",
+        estimated_cpu_hours=0.0,
+        estimated_cost=0.0,
+        estimated_spend_usd=budget_usd,
+        blocking=False,
+        rationale=rationale
+        or (
+            "Operator-appended second pass over the acquired corpus. Reads the "
+            "evidence store only: no search, no fetching."
+        ),
+        approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        parameters={},
+    )
+
+    # Inserted BEFORE the T3 run rather than at the end of the plan. `save_plan`
+    # requires T3_RUN to be the last executable action, and appending past it would
+    # make the plan unsaveable -- but the ordering is also the honest one: findings
+    # from the corpus are context for the T3 run, so they belong ahead of it.
+    actions = list(plan.actions)
+    t3_index = next((i for i, a in enumerate(actions) if a.kind == ActionKind.T3_RUN), None)
+    at = len(actions) if t3_index is None else t3_index
+    actions.insert(at, action)
+
+    # Progress first: it is the component that can legitimately REFUSE (an insertion
+    # behind the cursor would never run). Saving the plan first would leave the plan
+    # naming an action that progress does not know about.
+    append_action_to_progress(workspace_root, action, index=at)
+    save_plan(workspace_root, plan.model_copy(update={"actions": actions}))
+    return action
 
 
 def plan_and_save_arc(

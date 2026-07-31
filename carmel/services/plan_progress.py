@@ -25,7 +25,7 @@ from carmel.schemas.action_state import (
     PlanProgress,
 )
 from carmel.schemas.approval import ActionKind, ApprovalRequirement, ApprovalStatus
-from carmel.schemas.plan import Plan
+from carmel.schemas.plan import Plan, PlannedAction
 from carmel.schemas.state import CampaignStateValue
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
@@ -133,6 +133,45 @@ def load_or_init_progress(workspace_root: Path, plan: Plan) -> PlanProgress:
         )
         return init_progress(workspace_root, plan)
     return progress
+
+
+def append_action_to_progress(workspace_root: Path, action: PlannedAction, *, index: int | None = None) -> PlanProgress:
+    """Add state for an action inserted into an already-initialised plan.
+
+    Used when an operator appends work to a live campaign. The state is inserted at
+    the SAME position the action occupies in the plan, so progress and plan stay
+    index-aligned; ``index=None`` appends at the end.
+
+    Refuses to insert BEHIND the cursor. The cursor only ever moves forward (see
+    :func:`advance_cursor`, which never rewinds), so an action placed behind it would
+    be silently skipped forever -- a new action that never runs is worse than a
+    refused command, because the operator has no way to tell the two apart from the
+    plan alone.
+
+    Raises:
+        ValueError: If the plan has already progressed past the insertion point.
+    """
+    with workspace_lock(workspace_root):
+        progress = load_progress(workspace_root)
+        at = len(progress.actions) if index is None else index
+        if at < progress.cursor:
+            raise ValueError(
+                f"cannot insert an action at position {at}: the plan has already progressed "
+                f"past it (cursor is at {progress.cursor}), so it would never run"
+            )
+        progress.actions.insert(
+            at,
+            ActionState(
+                action_id=action.action_id,
+                kind=action.kind,
+                approval_status=_approval_from_requirement(action.approval_requirement),
+                blocking=action.blocking,
+                updated_at=_now(),
+            ),
+        )
+        progress.updated_at = _now()
+        save_progress(workspace_root, progress)
+        return progress
 
 
 def _require_action(progress: PlanProgress, action_id: str) -> int:

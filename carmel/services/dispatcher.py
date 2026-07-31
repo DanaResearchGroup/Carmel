@@ -86,7 +86,11 @@ _log = get_logger("services.dispatcher")
 
 #: Action kinds THIS dispatcher can execute. EXPERIMENT is deliberately absent —
 #: the planner and schema can still construct it, so the dispatcher refuses it.
-SUPPORTED_ACTION_KINDS = frozenset({ActionKind.T3_RUN, ActionKind.LITERATURE_SEARCH})
+SUPPORTED_ACTION_KINDS = frozenset({ActionKind.T3_RUN, ActionKind.LITERATURE_SEARCH, ActionKind.LITERATURE_CORPUS_PASS})
+
+#: The kinds the literature handler accepts. Both run the Literature Agent through the
+#: same envelope; they differ only in whether the pass may reach the network.
+_LITERATURE_ACTION_KINDS = frozenset({ActionKind.LITERATURE_SEARCH, ActionKind.LITERATURE_CORPUS_PASS})
 
 #: Action kinds that are executable SOMEWHERE, which is not the same question.
 #:
@@ -370,17 +374,18 @@ def make_literature_handler(
         # run lock. This handler does not advertise ``wants_supervision``, so
         # execute_action never hands it one (and closes any it was given).
         del supervision
-        if action.kind != ActionKind.LITERATURE_SEARCH:  # fail closed on mis-routing
+        if action.kind not in _LITERATURE_ACTION_KINDS:  # fail closed on mis-routing
             raise UnsupportedActionKindError(f"literature handler cannot execute kind {action.kind.value!r}")
         if literature_deps is None and agent_config is None:
             return _literature_unavailable_result(
                 workspace_root, action, "no agent config available; literature run skipped"
             )
         # Lazy import: keeps the dispatcher importable without the agents stack.
-        from carmel.services.literature import build_deps, run_literature_research, run_record_for
+        from carmel.services.literature import build_deps, run_corpus_pass, run_literature_research, run_record_for
 
         deps = literature_deps if literature_deps is not None else build_deps(agent_config)  # type: ignore[arg-type]
-        report = run_literature_research(workspace_root, campaign, action, deps, config=deps.config)
+        run_pass = run_corpus_pass if action.kind == ActionKind.LITERATURE_CORPUS_PASS else run_literature_research
+        report = run_pass(workspace_root, campaign, action, deps, config=deps.config)
         run_record = run_record_for(report, action)
         save_run_record(workspace_root, run_record)
         outcome = _literature_outcome(report, action)
@@ -410,6 +415,7 @@ def default_handlers(
     return {
         ActionKind.T3_RUN: make_t3_handler(t3_adapter),
         ActionKind.LITERATURE_SEARCH: make_literature_handler(agent_config, literature_deps),
+        ActionKind.LITERATURE_CORPUS_PASS: make_literature_handler(agent_config, literature_deps),
     }
 
 
@@ -449,12 +455,16 @@ def validate_plan_shape(plan: Plan) -> list[str]:
     literature_indices = [i for i, a in enumerate(plan.actions) if a.kind == ActionKind.LITERATURE_SEARCH]
     if len(literature_indices) > 1:
         problems.append(f"plan contains {len(literature_indices)} LITERATURE_SEARCH actions; at most one is allowed")
+    # LITERATURE_CORPUS_PASS is deliberately NOT capped. A search pass reaches the
+    # network, so running two is duplicated spend on the same discovery; a corpus pass
+    # re-reads what is already held, and an operator may legitimately append one after
+    # each batch of papers they supply.
     if t3_indices:
         first_t3 = t3_indices[0]
         for i, action in enumerate(plan.actions):
             if i <= first_t3:
                 continue
-            if action.kind == ActionKind.LITERATURE_SEARCH:
+            if action.kind in _LITERATURE_ACTION_KINDS:
                 problems.append(
                     f"literature action {action.action_id!r} follows the T3_RUN action; literature must precede T3"
                 )
