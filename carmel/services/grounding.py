@@ -205,6 +205,15 @@ _SPACE_LOSS_BLOCK_CHARS = 2000
 _SPACE_LOSS_BLOCK_MEAN_TOKEN = 12.0
 _SPACE_LOSS_BLOCK_FRACTION = 0.25
 
+#: Character-similarity floor for accepting a title as corroborating identity when it
+#: does not occur exactly. This exists for the real case the old surname+year fallback
+#: was reaching for: a title line that extracts imperfectly (ligatures, a hyphen broken
+#: across a line, a dropped subtitle colon, an OCR slip) is still unmistakably the same
+#: title. Set high deliberately -- at 0.85 a genuine title survives typical extraction
+#: damage, while two DIFFERENT combustion titles, which share a great deal of stock
+#: vocabulary ("ignition delay times of ... in a shock tube"), do not reach it.
+_TITLE_IDENTITY_FUZZY_THRESHOLD = 0.85
+
 #: Minimum length of a quote AFTER normalization (whitespace/punctuation collapse).
 #: verbatim_quote already has a raw min_length=40 floor (literature_agent.py), but a
 #: quote that is mostly whitespace/punctuation can normalize down to almost nothing,
@@ -643,6 +652,47 @@ def _present_outside_references(extracted: ExtractedText, term_normalized: str) 
     return False
 
 
+def _title_confirmed(extracted: ExtractedText, title_normalized: str) -> bool:
+    """True if the cited work's title corroborates this document's identity.
+
+    Exact-first, then a bounded fuzzy fallback. The fuzzy pass is NOT a loosening of
+    the identity rule -- it is what makes the rule affordable to enforce everywhere.
+    The surname+year fallback it replaces existed only because a title can extract
+    imperfectly; matching the title fuzzily serves that same case directly, and far
+    more specifically than a surname and a four-digit year ever could.
+
+    Every candidate window clearing the threshold is checked, not merely the single
+    best one, because the best-scoring occurrence of a title is very often the one in
+    a review's *reference list* -- and that occurrence is precisely the one that must
+    not count. Stopping at the best window would therefore reject the honest case
+    (title on page 1 AND in a bibliography) for the wrong reason.
+    """
+    if len(title_normalized) < MIN_IDENTITY_TERM_LENGTH:
+        return False
+    if _present_outside_references(extracted, title_normalized):
+        return True
+
+    haystack = extracted.normalized
+    n = len(title_normalized)
+    if not haystack or n == 0:
+        return False
+    _, index_map = normalize_with_map(extracted.text)
+    last = max(len(haystack) - n, 0)
+    stride = max(1, n // 8)
+    positions = list(range(0, last + 1, stride))
+    if positions[-1] != last:
+        positions.append(last)
+    for pos in positions:
+        window = haystack[pos : pos + n]
+        if SequenceMatcher(None, window, title_normalized).ratio() < _TITLE_IDENTITY_FUZZY_THRESHOLD:
+            continue
+        raw_start, _ = raw_span(index_map, pos, pos + n, len(extracted.text))
+        label, _ = _section_for(extracted.sections, raw_start)
+        if label != "references":
+            return True
+    return False
+
+
 def _surname(author: str) -> str:
     """Best-effort first-author surname extraction from a free-text author string."""
     if "," in author:
@@ -661,23 +711,28 @@ def check_identity(extracted: ExtractedText, citation: Citation) -> bool:
     work — exactly the misattribution this function exists to catch.
 
     Rule:
-      - If ``citation.doi`` is set, the normalized DOI MUST occur literally in the
-        text (necessary) -- but a DOI mentioned in a review article's body text does
-        not, by itself, make that article the cited paper (spar round N, P1-2), so
-        DOI presence alone is never sufficient. The primary corroboration is the
-        title: ``doi_ok and title_ok``. A surname-based fallback exists only for the
-        realistic case where the title is OCR-mangled or absent, and (spar round 5,
-        P0) that fallback now requires BOTH the first author's surname AND the
-        citation year, never the surname alone: a bare surname is far too weak a
-        signal on its own, because (a) a common surname (e.g. "Smith", "Wang")
-        appears in huge numbers of unrelated documents, and (b) review articles
-        routinely quote/restate measurements from primary literature, so
-        DOI-in-body-text plus an incidental surname match (e.g. a different paper by
-        an author with the same surname, or the author merely being discussed in
-        passing) could previously "confirm" identity against the wrong source
-        document and let a quoted span be misattributed to it. Requiring the year
-        alongside the surname closes that gap without over-tightening the OCR/
-        title-mangled case this fallback exists for.
+      - If ``citation.doi`` is set, BOTH the normalized DOI and the title must
+        corroborate: ``doi_ok and _title_confirmed(...)``. A DOI mentioned in a
+        review article's body text does not, by itself, make that article the cited
+        paper (spar round N, P1-2), so DOI presence alone is never sufficient.
+
+        There is deliberately NO surname-based escape from the title requirement any
+        more (spar round 5 P0, carried through round 6). The previous rule accepted
+        ``doi_ok and (title_ok or (author_ok and doi_year_ok))``, and a review or
+        discussion article can carry all three of those weak signals honestly: it
+        cites the primary DOI, names the first author while discussing the work, and
+        -- being a review -- contains a great many four-digit years, of which the
+        citation's is almost certainly one. Such an article would then be confirmed
+        as the cited paper, and a quote lifted from the REVIEW's own prose would be
+        recorded as fully grounded under the PRIMARY paper's citation. That is the
+        exact misattribution this function exists to prevent, and no amount of
+        conjoining weak signals fixes it, because each of them is individually
+        satisfied by the wrong document for entirely innocent reasons.
+
+        The case the surname fallback was actually reaching for -- a title that
+        extracts imperfectly -- is served directly and much more specifically by
+        :func:`_title_confirmed`, which accepts a high-similarity fuzzy title match
+        outside the references section.
       - Otherwise (no DOI), ALL of the following must hold: the normalized title
         occurs, the first author's surname occurs, and (if ``citation.year`` is
         set) the year occurs. If no authors are given there is nothing to confirm
@@ -705,10 +760,7 @@ def check_identity(extracted: ExtractedText, citation: Citation) -> bool:
     if citation.doi:
         doi_norm = normalize_for_match(citation.doi)
         doi_ok = _present_outside_references(extracted, doi_norm)
-        doi_year_ok = citation.year is not None and _present_outside_references(
-            extracted, normalize_for_match(str(citation.year))
-        )
-        return doi_ok and (title_ok or (author_ok and doi_year_ok))
+        return doi_ok and _title_confirmed(extracted, title_norm)
 
     if not citation.authors:
         return False

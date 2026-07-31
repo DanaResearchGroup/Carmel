@@ -51,8 +51,30 @@ from carmel.services.grounding import (
     unreadable_reason,
 )
 
+#: The title carried by the citation almost every fixture below cites.
+DEFAULT_FIXTURE_TITLE = "Ignition delay times study"
 
-def _extracted(text: str, sections: list[TextSection] | None = None) -> ExtractedText:
+
+def _extracted(
+    text: str,
+    sections: list[TextSection] | None = None,
+    *,
+    front_matter_title: str | None = DEFAULT_FIXTURE_TITLE,
+) -> ExtractedText:
+    """Build an ``ExtractedText`` for a synthetic paper.
+
+    A real paper states its own title on the front page, and :func:`check_identity`
+    requires that -- the title is the corroboration that this document IS the cited
+    work, with no surname-based escape from it. These fixtures exist to exercise
+    *quote grounding*, not identity, so the title is supplied by default and only the
+    identity tests vary it (``front_matter_title=None`` to omit it).
+
+    Only prepended when the caller did not supply explicit ``sections``: those
+    callers compute section offsets against the text they passed, and shifting it
+    underneath them would silently mislabel every span.
+    """
+    if front_matter_title and sections is None and front_matter_title not in text:
+        text = f"{front_matter_title}\n\n{text}"
     if sections is None:
         sections = [TextSection(label="body", start=0, end=len(text))]
     return ExtractedText(
@@ -236,7 +258,7 @@ def test_check_identity_doi_and_bare_surname_no_year_no_title_is_not_confirmed()
         "kinetics in a completely different context.\n\n"
         "The measured ignition delay time at 1200 K was 850 microseconds.\n"
     )
-    extracted = _extracted(text)
+    extracted = _extracted(text, front_matter_title=None)
     # The review's own title ("A Survey of Combustion Chemistry") never appears, and
     # the citation year (2019) is absent from the text entirely.
     citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
@@ -258,17 +280,26 @@ def test_check_identity_doi_and_title_confirms_with_no_author_info() -> None:
     assert check_identity(extracted, citation) is True
 
 
-def test_check_identity_doi_author_and_year_fallback_confirms_without_title() -> None:
-    """Fallback case: when the title is absent/OCR-mangled but the DOI, first-author
-    surname, AND the citation year are all corroborated outside references, identity
-    is confirmed -- the fallback requires surname AND year together, never surname
-    alone."""
+def test_check_identity_doi_surname_and_year_without_any_title_is_not_confirmed() -> None:
+    """Spar round 5 P0, carried through round 6, now closed.
+
+    A review article honestly carries every weak signal the old fallback accepted: it
+    cites the primary work's DOI, it names the first author while discussing that
+    work, and -- being a review -- it contains many four-digit years, of which the
+    citation's is one. Under the old ``doi_ok and (title_ok or (author_ok and
+    doi_year_ok))`` rule this returned True, so a quote taken from the REVIEW's own
+    prose would have been recorded as fully grounded under the PRIMARY paper's
+    citation.
+
+    The cited title appears nowhere in this document, which is the whole point: the
+    document is not that paper.
+    """
     text = (
         "Abstract\n\nSmith and Jones (2019) present new shock tube combustion "
         "results. DOI: 10.1000/xyz123\n\n"
         "The measured ignition delay time at 1200 K was 850 microseconds.\n"
     )
-    extracted = _extracted(text)
+    extracted = _extracted(text, front_matter_title=None)
     citation = Citation(
         title="A title that never appears anywhere in this text",
         authors=["Smith, J."],
@@ -276,7 +307,77 @@ def test_check_identity_doi_author_and_year_fallback_confirms_without_title() ->
         doi="10.1000/xyz123",
     )
 
+    assert check_identity(extracted, citation) is False
+
+
+def test_check_identity_confirms_a_title_damaged_by_extraction() -> None:
+    """The case the removed surname+year fallback was actually reaching for.
+
+    A title line that extracts imperfectly -- here a ligature lost and a hyphen
+    broken across a line -- is still unmistakably the same title, so identity is
+    confirmed by the fuzzy title path without any surname or year involvement.
+    """
+    text = (
+        "Journal of Combustion\n\n"
+        "Igni\ntion delay times of methane oxidation in a shock tue\n\n"
+        "DOI: 10.1000/xyz123\n\nAbstract\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    extracted = _extracted(text)
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube",
+        authors=[],
+        doi="10.1000/xyz123",
+    )
+
     assert check_identity(extracted, citation) is True
+
+
+def test_check_identity_rejects_a_different_title_sharing_stock_vocabulary() -> None:
+    """The fuzzy title path must not become a back door. Two different combustion
+    papers share a great deal of boilerplate ("ignition delay times of ... in a shock
+    tube"), so a near-miss on the distinguishing words is a DIFFERENT paper, not a
+    damaged rendering of this one."""
+    text = (
+        "Journal of Combustion\n\n"
+        "Ignition delay times of propane oxidation in a rapid compression machine\n\n"
+        "DOI: 10.1000/xyz123\n\nAbstract\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n"
+    )
+    extracted = _extracted(text)
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube",
+        authors=[],
+        doi="10.1000/xyz123",
+    )
+
+    assert check_identity(extracted, citation) is False
+
+
+def test_check_identity_ignores_a_title_that_matches_only_in_the_references() -> None:
+    """A review's reference list contains the primary paper's title EXACTLY, which is
+    the highest-scoring window in the document. Identity must still be refused, and
+    the fuzzy scan must not settle for that best window and stop."""
+    body = (
+        "A Survey of Combustion Chemistry\n\n"
+        "This review cites DOI: 10.1000/xyz123 among many other works.\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds.\n\n"
+    )
+    references = "References\nSmith, J. (2019). Ignition delay times of methane oxidation in a shock tube.\n"
+    text = body + references
+    sections = [
+        TextSection(label="body", start=0, end=len(body)),
+        TextSection(label="references", start=len(body), end=len(text)),
+    ]
+    extracted = _extracted(text, sections)
+    citation = Citation(
+        title="Ignition delay times of methane oxidation in a shock tube",
+        authors=["Smith, J."],
+        year=2019,
+        doi="10.1000/xyz123",
+    )
+
+    assert check_identity(extracted, citation) is False
 
 
 def test_ground_finding_identity_mismatch_when_citation_only_in_references() -> None:
@@ -354,7 +455,7 @@ def test_ground_finding_value_present_but_far_from_quote_is_spans_missing() -> N
         + filler
         + "\nElsewhere, far from the quote, the value 42.5 kcal/mol appears in an unrelated table.\n"
     )
-    extracted = _extracted(text)
+    extracted = _extracted(text, front_matter_title="QM barrier heights")
     quote = "The barrier height was computed using CCSD(T)/cc-pVTZ level of theory for reaction R1"
     citation = Citation(title="QM barrier heights", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
     payload = QMCalculationPayload(
@@ -581,6 +682,12 @@ def test_ground_finding_grounded_fuzzy_status() -> None:
         "The measured ignition delay time was found to be quite substantial under these conditions, "
         "using the ignition delay time model with 53 species, per Smith and Jones (2019) combustion "
         "results. DOI: 10.1000/xyz123\n"
+        # Title placed AFTER the quote rather than as front matter: this fixture turns
+        # on the fuzzy quote scan, whose sliding window is strided from offset 0, so
+        # shifting the quote's offset re-aligns the windows and changes what the scan
+        # finds. Identity needs the title present somewhere outside references; it does
+        # not care where.
+        f"\n{DEFAULT_FIXTURE_TITLE}\n"
     )
     extracted = _extracted(text)
     quote = "The measured ignition delay time was found to be quite significant under these conditions,"
@@ -840,7 +947,7 @@ def test_review_article_dois_mention_without_title_or_author_fails_identity() ->
         "One relevant dataset carries DOI: 10.1000/xyz123, reporting an ignition delay "
         "time of 850 microseconds at 1200 K.\n"
     )
-    extracted = _extracted(text)
+    extracted = _extracted(text, front_matter_title=None)
     citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
 
     assert check_identity(extracted, citation) is False
@@ -1089,6 +1196,7 @@ def test_ground_finding_lossy_but_sections_retained_is_not_degraded() -> None:
         "The measured ignition delay time at 1200 K was 850 microseconds in these shock "
         "tube experiments using O2 under stoichiometric conditions.\n"
     )
+    text = f"{DEFAULT_FIXTURE_TITLE}\n\n{text}"
     extracted = ExtractedText(
         text=text,
         normalized=normalize_for_match(text),
