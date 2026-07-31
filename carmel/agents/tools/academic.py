@@ -1240,7 +1240,12 @@ class OpenAccessResolver(_KeylessSearchTool):
                 # line for the whole run, not one per paper resolved.
                 if name not in self._warned_failures:
                     self._warned_failures.add(name)
-                    logger.warning("%s OA lookup failed: %s", name, exc)
+                    # State the status explicitly rather than leaving it embedded in
+                    # the message: 403 (entitlement -- a human must act), 429 (back
+                    # off), 5xx (provider unwell) and "no HTTP status" (timeout, DNS)
+                    # each call for a different response and otherwise read alike.
+                    status = "no HTTP status" if exc.status is None else f"HTTP {exc.status}"
+                    logger.warning("%s OA lookup failed (%s): %s", name, status, exc)
                 notes.append(f"{name}: lookup failed ({exc})")
                 complete = False
                 continue
@@ -1346,7 +1351,11 @@ class OpenAccessResolver(_KeylessSearchTool):
                     "full text -- set agents.elsevier_insttoken or the "
                     "CARMEL_ELSEVIER_INSTTOKEN environment variable, or contact your "
                     "librarian to associate this key's entitlements; this is not "
-                    "fixable in code"
+                    "fixable in code",
+                    # Carry the status through the re-raise. Dropping it here would
+                    # blank out the status on the ONE provider whose 403 is a known,
+                    # expected, actionable state.
+                    status=getattr(exc, "status", None) or 403,
                 ) from exc
             raise
         return elsevier_oa_candidates(payload, doi=doi)

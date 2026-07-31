@@ -220,6 +220,46 @@ class TestHttpSearchToolRequest:
         assert usage.fetches == 0
         assert usage.fetch_bytes == 0
 
+    def test_an_http_failure_carries_its_status_as_a_field(self) -> None:
+        """The status is usually in the message too, but only as urllib's prose.
+
+        Operators need to tell 403 (entitlement -- a human must act) from 429 (back
+        off) from 5xx (provider unwell). As unstructured text embedded in a sentence
+        those look alike and nothing can branch on them.
+        """
+        import urllib.error
+
+        ledger = make_ledger()
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float):
+            raise urllib.error.HTTPError(url, 403, "Forbidden", {}, None)  # type: ignore[arg-type]
+
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
+
+        with pytest.raises(SearchError) as caught:
+            tool.search("q")
+
+        assert caught.value.status == 403
+
+    def test_a_transport_failure_with_no_response_has_no_status(self) -> None:
+        """``None`` is diagnostic in its own right: the call never got far enough to
+        receive a status, which is a different problem from one the provider reported."""
+        ledger = make_ledger()
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float):
+            raise TimeoutError("timed out")
+
+        tool = HttpSearchTool(
+            external_provider_consent=True, endpoint="https://search.example", api_key="k", ledger=ledger, opener=opener
+        )
+
+        with pytest.raises(SearchError) as caught:
+            tool.search("q")
+
+        assert caught.value.status is None
+
     def test_oversized_response_trips_mid_read_not_after_full_buffering(self) -> None:
         # Regression test for the defect where `raw = response.read()` buffered the
         # entire body before any size check ran. A hostile/oversized response must be

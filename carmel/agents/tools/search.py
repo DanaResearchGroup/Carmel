@@ -42,7 +42,28 @@ class SearchError(RuntimeError):
     ``BudgetExceededError`` nor ``AgentBridgeError``) and crash the entire literature
     run, discarding every finding/artifact already paid for in earlier rounds instead
     of producing the documented PARTIAL report.
+
+    Carries the HTTP ``status`` when the failure had one. The status usually appears
+    in the message anyway, because the underlying ``HTTPError`` is interpolated into
+    it -- but only as prose, produced by urllib's formatting, and absent entirely for
+    a timeout or DNS failure. That is too weak for the distinction operators actually
+    need: 403 means an entitlement problem a human must resolve, 429 means back off
+    and retry, and 5xx or ``None`` means the provider is simply unwell. Those call for
+    three different responses and, as unstructured text, look alike.
     """
+
+    def __init__(self, message: str, *, status: int | None = None) -> None:
+        """Initialise the error.
+
+        Args:
+            message: Human-readable description of the failure.
+            status: HTTP status code, when the failure carried one. ``None`` means
+                the call never got far enough to receive one (timeout, DNS, refused
+                connection) -- which is itself diagnostic, and distinct from a
+                provider that answered with an error.
+        """
+        super().__init__(message)
+        self.status = status
 
 
 class SearchNotFound(SearchError):
@@ -295,8 +316,11 @@ def budgeted_get_raw(
                     # incomplete resolution. See SearchNotFound's docstring for the
                     # full tradeoff, including which callers this is safest for.
                     logger.warning("search request for %r returned HTTP 404 (no record)", url)
-                    raise SearchNotFound(f"search request for {url!r} returned HTTP 404 (no record)") from exc
-                raise SearchError(f"search request failed for {url!r}: {exc}") from exc
+                    raise SearchNotFound(
+                        f"search request for {url!r} returned HTTP 404 (no record)", status=404
+                    ) from exc
+                status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
+                raise SearchError(f"search request failed for {url!r}: {exc}", status=status) from exc
             try:
                 chunks: list[bytes] = []
                 while True:
