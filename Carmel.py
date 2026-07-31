@@ -62,7 +62,13 @@ def create_parser() -> argparse.ArgumentParser:
         "--add",
         type=Path,
         default=None,
-        help="A downloaded paper to admit. Carmel identity-checks it immediately and reports the verdict.",
+        help=(
+            "A downloaded paper to admit, or a directory of them. A file is identity-checked "
+            "immediately and the verdict reported. A directory is swept non-recursively: every "
+            "direct-child file is admitted by content (filenames are irrelevant), one failure "
+            "does not abort the rest, and a per-file report plus a summary line is printed. "
+            "Exit code is 0 only if at least one file was admitted and none were rejected."
+        ),
     )
     requests_cmd.add_argument(
         "--collect",
@@ -276,6 +282,78 @@ def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
     return 0
 
 
+def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
+    """Admit every direct-child file of ``directory`` by content-based matching.
+
+    Loops :func:`carmel.services.acquisition.admit_file` with ``slug=None`` over each
+    entry, so a folder of publisher-named downloads (spaces, parentheses and all) can
+    be handed to Carmel in one command instead of one ``--add`` per paper -- filenames
+    are irrelevant, matching is on document content via ``_infer_slug``. Non-recursive:
+    only direct children are considered, and subdirectories are reported, not entered.
+    Dotfiles, non-regular files, and obvious partial-download junk (``.part``,
+    ``.crdownload``, ``.tmp``) are skipped and reported, not treated as papers. One
+    file's failure never aborts the batch: every entry is attempted and its outcome
+    printed before moving on.
+
+    Exit code: 0 if at least one file was admitted and none were rejected; 1
+    otherwise -- including an empty directory, which is reported rather than treated
+    as a silent success.
+    """
+    from carmel.schemas.acquisition import AcquisitionStatus
+    from carmel.services.acquisition import admit_file
+
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError as exc:
+        print(f"Could not read directory {directory}: {exc}")
+        return 1
+
+    if not entries:
+        print(f"{directory} is empty; nothing to admit.")
+        return 1
+
+    accepted = 0
+    rejected = 0
+    skipped = 0
+
+    for entry in entries:
+        if entry.is_dir():
+            skipped += 1
+            print(f"SKIPPED   {entry.name} (subdirectory; --add on a directory is non-recursive)")
+            continue
+        if entry.name.startswith("."):
+            skipped += 1
+            print(f"SKIPPED   {entry.name} (dotfile)")
+            continue
+        if entry.suffix.lower() in {".part", ".crdownload", ".tmp"}:
+            skipped += 1
+            print(f"SKIPPED   {entry.name} (partial download)")
+            continue
+        if not entry.is_file():
+            skipped += 1
+            print(f"SKIPPED   {entry.name} (not a regular file)")
+            continue
+
+        try:
+            request = admit_file(ws, entry, slug=None, max_bytes=max_bytes)
+        except (OSError, ValueError) as exc:
+            rejected += 1
+            print(f"REJECTED  {entry.name}: {exc}")
+            continue
+
+        if request.status == AcquisitionStatus.FULFILLED:
+            accepted += 1
+            print(f"ACCEPTED  {entry.name} -> {request.slug}")
+        else:
+            rejected += 1
+            print(f"REJECTED  {entry.name} -> {request.slug}")
+        print(f"          {request.identity_note}")
+        print()
+
+    print(f"{accepted} accepted, {rejected} rejected, {skipped} skipped")
+    return 0 if accepted and not rejected else 1
+
+
 def _cmd_requests(
     campaign_id: str,
     workspaces: Path | None,
@@ -286,12 +364,15 @@ def _cmd_requests(
 ) -> int:
     """List papers awaiting a human, or admit one (or all) that have been obtained.
 
-    Without ``--add``/``--collect`` this prints the queue. With ``--add`` it copies a
-    single file into the inbox under the right name AND runs the identity check
-    immediately. With ``--collect`` it instead sweeps every file already dropped into
-    the inbox directory in one shot, so the operator can download several papers into
-    one folder and admit them all with a single command -- the long feedback loop and
-    the per-paper typing were both what made this step painful.
+    Without ``--add``/``--collect`` this prints the queue. With ``--add`` pointed at a
+    file, it copies that single file into the inbox under the right name AND runs the
+    identity check immediately. With ``--add`` pointed at a directory, it instead
+    admits every direct-child file by content (see :func:`_admit_directory`) -- so the
+    operator can download several publisher-named papers into one arbitrary folder and
+    hand Carmel the whole folder in a single command, without renaming anything. With
+    ``--collect`` it instead sweeps every file already dropped into the workspace's own
+    inbox directory in one shot. The long feedback loop and the per-paper typing were
+    both what made this step painful.
     """
     if add is not None and collect:
         print("--collect and --add are mutually exclusive. Use one or the other.")
@@ -340,6 +421,11 @@ def _cmd_requests(
         return 1 if rejected else 0
 
     if add is not None:
+        if add.is_dir():
+            if slug is not None:
+                print("--slug identifies a single request; it cannot be combined with a directory --add.")
+                return 1
+            return _admit_directory(ws, add, max_bytes=max_bytes)
         try:
             request = admit_file(ws, add, slug=slug, max_bytes=max_bytes)
         except (OSError, ValueError) as exc:

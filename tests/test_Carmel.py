@@ -763,3 +763,195 @@ class TestRequestsCommand:
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path)]) == 0
         out = capsys.readouterr().out
         assert "--collect" in out
+
+
+class TestRequestsCommandAddDirectory:
+    """`--add` pointed at a directory of publisher-named downloads. The operator's real
+    pain: filenames like ``Experimental studies of the fundamental flame speeds of
+    syngas (H2-CO)-air mixtures.pdf`` need shell quoting for every single paper when
+    typed one at a time. Handing Carmel the whole folder must match by CONTENT
+    (`_infer_slug`), never by filename, and one bad file must never abort the batch.
+    """
+
+    _FIRST_TITLE = "Experimental studies of the fundamental flame speeds of syngas H2 CO air mixtures"
+    _FIRST_DOI = "10.1016/j.combustflame.2010.09.004"
+    _SECOND_TITLE = "Shock tube study of ammonia oxidation ignition delay times"
+    _SECOND_DOI = "10.1016/j.test.2019.01.001"
+
+    def _campaign_with_requests(self, tmp_path: Path, titles_dois: list[tuple[str, str]]) -> tuple[str, Path]:
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import record_request
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        for title, doi in titles_dois:
+            record_request(
+                ws,
+                title=title,
+                doi=doi,
+                landing_url=f"https://doi.org/{doi}",
+                reason=AcquisitionReason.PAYWALLED,
+            )
+        return load_campaign(ws).campaign_id, ws
+
+    def test_a_directory_of_matching_papers_is_all_admitted(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cid, ws = self._campaign_with_requests(
+            tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI), (self._SECOND_TITLE, self._SECOND_DOI)]
+        )
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        # Real publisher filenames: spaces, parentheses, hyphens -- the whole point is
+        # that these are irrelevant to matching, which happens on document content.
+        (lit / "Experimental studies of the fundamental flame speeds of syngas (H2-CO)-air mixtures.pdf").write_text(
+            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+        )
+        (lit / "Shock tube study (ammonia oxidation) - ignition delay times [2019].pdf").write_text(
+            f"{self._SECOND_TITLE}\nDOI: {self._SECOND_DOI}\nAbstract: we report ignition delay times.\n",
+            encoding="utf-8",
+        )
+
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionStatus
+        from carmel.services.acquisition import load_manifest
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 0
+        out = capsys.readouterr().out
+        assert "2 accepted, 0 rejected, 0 skipped" in out
+        assert out.count("ACCEPTED") == 2
+
+        manifest = load_manifest(ws)
+        assert all(r.status == AcquisitionStatus.FULFILLED for r in manifest.requests)
+
+    def test_one_bad_file_does_not_abort_the_batch(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """With a single pending request, an unrelated file still resolves to that one
+        slug (nothing else to infer) and is REJECTED by the identity check itself --
+        exercising the `else` branch of the per-file loop."""
+        cid, ws = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        (lit / "good.pdf").write_text(
+            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+        )
+        (lit / "bad.pdf").write_text("An entirely unrelated document about catalytic converters.\n", encoding="utf-8")
+
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionStatus
+        from carmel.services.acquisition import load_manifest
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 1
+        out = capsys.readouterr().out
+        assert "ACCEPTED  good.pdf" in out
+        assert "REJECTED  bad.pdf" in out
+        assert "1 accepted, 1 rejected, 0 skipped" in out
+
+        manifest = load_manifest(ws)
+        assert any(r.status == AcquisitionStatus.FULFILLED for r in manifest.requests)
+
+    def test_a_file_matching_no_pending_request_does_not_abort_the_batch(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """With two-or-more pending requests, a file matching neither makes
+        `_infer_slug` raise `ValueError` (zero candidates) instead of resolving to a
+        request at all -- exercising the `except (OSError, ValueError)` branch of the
+        per-file loop, distinct from the identity-mismatch case above."""
+        cid, ws = self._campaign_with_requests(
+            tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI), (self._SECOND_TITLE, self._SECOND_DOI)]
+        )
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        (lit / "good.pdf").write_text(
+            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+        )
+        (lit / "bad.pdf").write_text("An entirely unrelated document about catalytic converters.\n", encoding="utf-8")
+
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionStatus
+        from carmel.services.acquisition import load_manifest
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 1
+        out = capsys.readouterr().out
+        assert "ACCEPTED  good.pdf" in out
+        assert "REJECTED  bad.pdf: cannot tell which pending request this file is for" in out
+        assert "1 accepted, 1 rejected, 0 skipped" in out
+
+        manifest = load_manifest(ws)
+        assert any(r.status == AcquisitionStatus.FULFILLED for r in manifest.requests)
+
+    def test_subdirectories_dotfiles_and_partial_downloads_are_skipped_and_reported(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        (lit / "good.pdf").write_text(
+            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+        )
+        (lit / "subdir").mkdir()
+        (lit / "subdir" / "nested.pdf").write_text("should never be seen\n", encoding="utf-8")
+        (lit / ".hidden.pdf").write_text("should never be seen\n", encoding="utf-8")
+        (lit / "downloading.pdf.part").write_text("partial\n", encoding="utf-8")
+        (lit / "downloading.pdf.crdownload").write_text("partial\n", encoding="utf-8")
+        (lit / "scratch.tmp").write_text("partial\n", encoding="utf-8")
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 0
+        out = capsys.readouterr().out
+        assert "1 accepted, 0 rejected, 5 skipped" in out
+        assert "SKIPPED   subdir (subdirectory" in out
+        assert "SKIPPED   .hidden.pdf (dotfile)" in out
+        assert "SKIPPED   downloading.pdf.part (partial download)" in out
+        assert "SKIPPED   downloading.pdf.crdownload (partial download)" in out
+        assert "SKIPPED   scratch.tmp (partial download)" in out
+
+    def test_slug_with_a_directory_is_rejected(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        (lit / "good.pdf").write_text(f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\n", encoding="utf-8")
+
+        from Carmel import main
+
+        assert (
+            main(
+                ["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit), "--slug", "whatever"]
+            )
+            == 1
+        )
+        out = capsys.readouterr().out
+        assert "--slug" in out
+        assert "directory" in out
+
+    def test_single_file_add_is_unchanged(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """Regression: pointing `--add` at a plain file must behave exactly as before
+        directory support was added."""
+        cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
+        right = tmp_path / "right.pdf"
+        right.write_text(
+            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+        )
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(right)]) == 0
+        out = capsys.readouterr().out
+        assert "ACCEPTED" in out
+        assert "Re-run `carmel literature`" in out
+
+    def test_empty_directory_is_reported_not_silently_successful(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
+        lit = tmp_path / "lit"
+        lit.mkdir()
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 1
+        out = capsys.readouterr().out
+        assert "empty" in out.lower()
+        assert "nothing to admit" in out.lower()
