@@ -9,6 +9,7 @@ URL is what ends up in access logs and browser history.
 from __future__ import annotations
 
 import json
+import urllib.error
 from collections.abc import Callable
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -41,6 +42,52 @@ class SearchError(RuntimeError):
     ``BudgetExceededError`` nor ``AgentBridgeError``) and crash the entire literature
     run, discarding every finding/artifact already paid for in earlier rounds instead
     of producing the documented PARTIAL report.
+    """
+
+
+class SearchNotFound(SearchError):
+    """Raised when a provider answered normally and reported no record (HTTP 404).
+
+    Deliberately a *subclass* of :class:`SearchError`, not a sibling: every existing
+    ``except SearchError`` handler in this codebase keeps working unchanged, and only
+    a caller that specifically wants to distinguish "the index has nothing under this
+    identifier" from "the index could not be reached" needs to catch this narrower
+    type first.
+
+    Collapsing every non-2xx status into one :class:`SearchError` overstated failure
+    the other way from the defect :attr:`~carmel.schemas.acquisition.AcquisitionReason
+    .OA_LOOKUP_INCOMPLETE` was introduced to fix: a live run saw Semantic Scholar
+    answer ``/paper/DOI:10.1115/1.4007737`` with a plain HTTP 404 (observed
+    2026-07-30 and again 2026-07-31), and that got reported to the operator as
+    ``oa_lookup_incomplete`` -- "resolution was cut short" -- when what had actually
+    happened was a normal, complete answer of "no record for this DOI". Only HTTP 404
+    is treated this way; every other non-2xx status (500/502/503/429), a timeout, a
+    DNS failure, and connection-refused all still raise the plain :class:`SearchError`
+    above and still mean "this provider's contribution to resolution is unknown".
+
+    Risk this narrowing accepts: a 404 caused by a bug in OUR OWN URL construction
+    (rather than the provider genuinely having no record) will now be silently
+    reported as "provider has no record" instead of surfacing as a failure. This is
+    mitigated by always logging the URL at WARNING (see the raise site in
+    :func:`budgeted_get_raw`) so a systematic own-bug 404 is still operator-visible,
+    just not mistaken for an incomplete resolution.
+
+    ``budgeted_get_raw`` is the single shared choke point for every OA-lookup
+    provider (see :class:`carmel.agents.tools.academic.OpenAccessResolver`), so this
+    mapping applies uniformly to all of them, not just Semantic Scholar. Most of
+    those providers are identifier-addressed -- the DOI sits directly in the URL
+    path or as an exact-match query parameter (OpenAlex, Unpaywall, Crossref,
+    Semantic Scholar, CORE, DOAJ, Europe PMC, Elsevier) -- where a 404 is each
+    provider's documented "unknown identifier" response and this tradeoff is safe.
+    Two providers (ChemRxiv, arXiv) instead run a genuine free-text TITLE search
+    (``?term=``/``?search_query=``); for those a 404 is more ambiguous -- a
+    no-match search conventionally answers 200 with an empty result set, so an
+    actual 404 there is somewhat more likely to indicate a malformed query or a
+    dead endpoint than "no record". This module has no way to distinguish
+    identifier-addressed from query-style callers without threading a per-call
+    opt-in flag through every provider, which was judged out of scope for this
+    fix; flagging the risk here (and in the fix's report) rather than silently
+    narrowing which callers benefit.
     """
 
 
@@ -238,6 +285,17 @@ def budgeted_get_raw(
             try:
                 response = opener(url, headers=headers, timeout_s=timeout_s)
             except Exception as exc:  # noqa: BLE001 - normalize all transport errors (P1-12)
+                if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
+                    # A 404 is not "transport failed" -- the provider was reached and
+                    # answered normally, it just has no record for this identifier.
+                    # Logged at WARNING (not DEBUG) specifically because the one risk
+                    # this narrower exception accepts is a 404 caused by OUR OWN
+                    # malformed URL rather than a genuine "no record"; that must stay
+                    # operator-visible even though it is no longer treated as an
+                    # incomplete resolution. See SearchNotFound's docstring for the
+                    # full tradeoff, including which callers this is safest for.
+                    logger.warning("search request for %r returned HTTP 404 (no record)", url)
+                    raise SearchNotFound(f"search request for {url!r} returned HTTP 404 (no record)") from exc
                 raise SearchError(f"search request failed for {url!r}: {exc}") from exc
             try:
                 chunks: list[bytes] = []

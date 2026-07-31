@@ -1147,6 +1147,56 @@ class TestFamilyFallbackPricing:
         assert self._cost("gemini-3.1-pro-preview") == pytest.approx(4.00 + 18.00)
 
 
+class TestCredentialConflictWarningOnce:
+    """`google.genai._api_client.get_env_api_key()` (third-party) logs "Both
+    GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY." on every
+    `google.genai.Client` construction when both env vars are set -- unconditionally,
+    regardless of the explicit `api_key=` Carmel already passes. `build_model` builds
+    an independent `PydanticAIModel` per agent (Literature Agent and Verifier), each of
+    which constructs its own client on first use, so a campaign with both env vars set
+    saw the line twice. `_warn_credential_conflict_once` (models.py) redirects it
+    through Carmel's own `@cache`-guarded once-per-process idiom instead.
+    """
+
+    def test_warning_is_emitted_once_across_multiple_build_model_calls(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        pytest.importorskip("pydantic_ai")
+        import pydantic_ai
+
+        from carmel.agents.models import clear_credential_conflict_warning_cache
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "sk-fake-google-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "sk-fake-gemini-key")
+
+        clear_credential_conflict_warning_cache()
+        try:
+            with caplog.at_level(logging.WARNING):
+                # A concrete model_name (not an `auto:` sentinel) so resolving the
+                # ladder never reaches the network -- this test asserts on the
+                # credential-conflict warning alone.
+                for _ in range(2):
+                    config = AgentConfig(
+                        tier=ModelTier.DEV,
+                        provider=AgentProvider.GOOGLE,
+                        model_name="gemini-2.5-flash",
+                        api_key_env="GOOGLE_API_KEY",
+                        external_provider_consent=True,
+                    )
+                    model = build_model(config)
+                    assert isinstance(model, PydanticAIModel)
+                    # Constructs the underlying google.genai.Client, which is what
+                    # actually triggers the third-party warning -- mirrors what
+                    # `complete()` does on its first real call.
+                    model._infer_model(pydantic_ai, "gemini-2.5-flash")
+
+            hits = [r for r in caplog.records if "Both GOOGLE_API_KEY and GEMINI_API_KEY are set" in r.getMessage()]
+            assert len(hits) == 1, f"expected exactly one warning, got {len(hits)}"
+            assert hits[0].name == "carmel.agents.models"
+        finally:
+            clear_credential_conflict_warning_cache()
+
+
 class TestPydanticAIModelApiKeyThreading:
     """The explicit api_key passed to PydanticAIModel must reach the provider directly
     -- never fall back to an ambient environment variable. This is the root-cause fix

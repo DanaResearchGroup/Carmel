@@ -14,6 +14,7 @@ a mock. A caller who wants MockModel must ask for it explicitly via
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections.abc import Sequence
 from functools import cache
@@ -155,6 +156,70 @@ def _warn_family_fallback_once(model_name: str, input_rate: float, output_rate: 
         input_rate,
         output_rate,
     )
+
+
+#: The exact literal `google.genai._api_client.get_env_api_key()` logs (via
+#: `logging.getLogger("google_genai._api_client")`) whenever both `GOOGLE_API_KEY` and
+#: `GEMINI_API_KEY` are set in the environment. Kept as a named constant, not just
+#: inlined in the filter below, so the "is this THAT message" check and the message
+#: Carmel re-emits under its own logger can never silently drift apart.
+_CREDENTIAL_CONFLICT_MESSAGE = "Both GOOGLE_API_KEY and GEMINI_API_KEY are set. Using GOOGLE_API_KEY."
+
+
+@cache
+def _warn_credential_conflict_once() -> None:
+    """Emit Carmel's own once-per-process notice for the GOOGLE_API_KEY/GEMINI_API_KEY
+    conflict, mirroring `_warn_family_fallback_once`'s idiom: `@cache` on a
+    no-argument function IS the process-wide "have we already said this" flag.
+
+    `build_model` constructs an independent `PydanticAIModel` for both the Literature
+    Agent and the Verifier -- deliberately, they must never share state -- and each
+    one's first real call builds its own `google.genai.Client` inside `_infer_model`.
+    That client's `BaseApiClient.__init__` unconditionally calls
+    `google.genai._api_client.get_env_api_key()` regardless of the explicit `api_key=`
+    Carmel already passes in, and that THIRD-PARTY function is what actually logs
+    `_CREDENTIAL_CONFLICT_MESSAGE` (via `logging.getLogger("google_genai._api_client")`)
+    whenever both env vars are set. A live campaign with both vars set therefore saw
+    this line printed twice -- once per agent -- which reads as two separate conflicts
+    instead of one ambient environment fact.
+
+    There is no Carmel-authored call site for that message to wrap in `@cache` the way
+    `_warn_family_fallback_once` wraps its own `logger.warning(...)` call (confirmed:
+    the message is emitted entirely inside `google.genai`, not Carmel). So instead
+    `_CredentialConflictDedupFilter` (installed once, at import time, on that
+    third-party logger -- see below) intercepts every occurrence of the message and
+    redirects it here, dropping the original record. Carmel now owns exactly one
+    emission of the fact per process, through Carmel's own logger, rather than the
+    third-party module's one-per-construction emission.
+    """
+    logger.warning(_CREDENTIAL_CONFLICT_MESSAGE)
+
+
+class _CredentialConflictDedupFilter(logging.Filter):
+    """Reroutes `google_genai._api_client`'s GOOGLE_API_KEY/GEMINI_API_KEY conflict
+    warning through `_warn_credential_conflict_once` instead of letting it print once
+    per `google.genai.Client` construction (see that function's docstring for why)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.getMessage() == _CREDENTIAL_CONFLICT_MESSAGE:
+            _warn_credential_conflict_once()
+            return False
+        return True
+
+
+# Installed once at import time (not lazily inside `_infer_model`) because
+# `logging.getLogger("google_genai._api_client")` always returns the same process-wide
+# logger object -- a module-level `addFilter` call is naturally idempotent-per-process
+# without needing its own `@cache` guard, so only the warning itself needs one.
+logging.getLogger("google_genai._api_client").addFilter(_CredentialConflictDedupFilter())
+
+
+def clear_credential_conflict_warning_cache() -> None:
+    """Test-only reset for `_warn_credential_conflict_once`, mirroring
+    `clear_dead_model_cache()`. Call between tests that assert on the
+    GOOGLE_API_KEY/GEMINI_API_KEY conflict warning so one test's emission doesn't
+    silence it for the next."""
+    _warn_credential_conflict_once.cache_clear()
 
 
 def _table_cost_usd(model_name: str, input_tokens: int, output_tokens: int) -> float:

@@ -46,14 +46,23 @@ class AcquisitionReason(StrEnum):
     OA_LOOKUP_INCOMPLETE = "oa_lookup_incomplete"
     """Open-access resolution was CUT SHORT, so nothing is established about whether a
     copy exists: the per-paper lookup cap was reached, or a provider's lookup failed in
-    transit (a live run saw an arXiv read timeout and a Semantic Scholar HTTP 404 in the
-    same campaign). ``detail`` carries the resolver's per-provider note saying which.
+    transit -- a real request could not be completed at all (a live run saw an arXiv
+    read timeout in this campaign). ``detail`` carries the resolver's per-provider note
+    saying which.
 
     Exists because :attr:`NO_OPEN_ACCESS_COPY` was being used for this case too, which
     overstated what had actually been established -- the same asserted-vs-observed
     defect already fixed once for :attr:`PAYWALLED`, one level down. A provider merely
     declining for a missing optional API key does NOT count as incomplete; that is a
-    stable configuration fact reported in ``detail``, not an unknown."""
+    stable configuration fact reported in ``detail``, not an unknown.
+
+    A provider that was reached and answered normally with "no record for this
+    identifier" (HTTP 404, e.g. a live run saw Semantic Scholar 404 on
+    ``/paper/DOI:10.1115/1.4007737``, observed 2026-07-30 and 2026-07-31) does NOT
+    count as incomplete either: that provider's own lookup completed, it simply
+    contributed nothing, so it counts toward :attr:`NO_OPEN_ACCESS_COPY` instead --
+    the mirror image of the same overstatement this reason was introduced to fix. See
+    :class:`carmel.agents.tools.search.SearchNotFound`."""
     NOT_A_DOCUMENT = "not_a_document"
     """A full-text URL was advertised but served something other than a document --
     in the probe, an HTML landing page five times out of eleven."""

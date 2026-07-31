@@ -13,6 +13,7 @@ alongside the article they belong to.
 from __future__ import annotations
 
 import json
+import urllib.error
 from typing import Any
 
 import pytest
@@ -441,7 +442,12 @@ class TestOpenAccessResolverCompleteness:
     """
 
     def test_a_provider_lookup_failing_in_transit_marks_the_resolution_incomplete(self, ledger: BudgetLedger) -> None:
-        """Observed live: an arXiv read timeout and a Semantic Scholar 404 in one run."""
+        """Observed live: an arXiv read timeout in one run.
+
+        A Semantic Scholar HTTP 404 used to be lumped in with this case too, but a
+        404 is a normal "no record for this identifier" answer, not a transport
+        failure -- see ``test_a_provider_404_does_not_mark_the_resolution_incomplete``
+        below and ``SearchNotFound`` in ``carmel.agents.tools.search``."""
         resolver = OpenAccessResolver(
             ledger=ledger,
             external_provider_consent=True,
@@ -478,6 +484,81 @@ class TestOpenAccessResolverCompleteness:
 
         assert resolution.candidates == ()
         assert resolution.complete is True
+
+    def test_a_provider_404_does_not_mark_the_resolution_incomplete(self, ledger: BudgetLedger) -> None:
+        """A 404 means the provider was reached and answered normally with "no record
+        for this identifier" -- e.g. a live run saw Semantic Scholar 404 on
+        ``/paper/DOI:10.1115/1.4007737`` (observed 2026-07-30 and 2026-07-31). That
+        provider simply contributes nothing; resolution is NOT cut short on its
+        account, unlike a genuine transport failure (500/timeout/etc, see the
+        transit-failure test above)."""
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            contact_email="ops@example.org",
+            unpaywall_email="ops@example.org",
+            opener=_routing_opener(
+                {
+                    OPENALEX_ENDPOINT: _OPENALEX_NO_OA,
+                    UNPAYWALL_ENDPOINT: urllib.error.HTTPError(UNPAYWALL_ENDPOINT, 404, "Not Found", None, None),
+                    **_QUIET_PROVIDER_ROUTES,
+                }
+            ),
+        )
+
+        resolution = resolver.resolve(_RESOLVER_DOI)
+
+        assert resolution.candidates == ()
+        assert resolution.complete is True
+        assert "Unpaywall: no record" in resolution.note
+
+    def test_a_provider_500_still_marks_the_resolution_incomplete(self, ledger: BudgetLedger) -> None:
+        """A 500 (or any non-404 transport failure) is genuinely ambiguous -- the
+        provider was NOT reached and answered, so it must keep marking the
+        resolution incomplete exactly as before this fix."""
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            contact_email="ops@example.org",
+            unpaywall_email="ops@example.org",
+            opener=_routing_opener(
+                {
+                    OPENALEX_ENDPOINT: _OPENALEX_NO_OA,
+                    UNPAYWALL_ENDPOINT: urllib.error.HTTPError(
+                        UNPAYWALL_ENDPOINT, 500, "Internal Server Error", None, None
+                    ),
+                    **_QUIET_PROVIDER_ROUTES,
+                }
+            ),
+        )
+
+        resolution = resolver.resolve(_RESOLVER_DOI)
+
+        assert resolution.candidates == ()
+        assert resolution.complete is False
+        assert "lookup failed" in resolution.note
+
+    def test_404_and_transient_failure_produce_visibly_different_notes(self, ledger: BudgetLedger) -> None:
+        """The operator-facing note must distinguish "no record" from "lookup
+        failed (...)" -- they mean very different things about what is known."""
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            contact_email="ops@example.org",
+            unpaywall_email="ops@example.org",
+            opener=_routing_opener(
+                {
+                    OPENALEX_ENDPOINT: TimeoutError("read operation timed out"),
+                    UNPAYWALL_ENDPOINT: urllib.error.HTTPError(UNPAYWALL_ENDPOINT, 404, "Not Found", None, None),
+                    **_QUIET_PROVIDER_ROUTES,
+                }
+            ),
+        )
+
+        resolution = resolver.resolve(_RESOLVER_DOI)
+
+        assert "OpenAlex: lookup failed" in resolution.note
+        assert "Unpaywall: no record" in resolution.note
 
     def test_a_provider_declining_for_a_missing_api_key_does_not_mark_it_incomplete(self, ledger: BudgetLedger) -> None:
         """A missing optional key is a stable configuration fact, not an unknown.

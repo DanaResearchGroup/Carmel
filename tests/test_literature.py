@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import types
+import urllib.error
 from collections.abc import Iterator
 from collections.abc import Sequence as AbcSequence
 from datetime import UTC, datetime, timedelta
@@ -1649,3 +1650,33 @@ class TestWantedPaperOpenAccessResolution:
         requests = load_manifest(campaign.workspace_root).requests
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
         assert "consent" in requests[0].detail
+
+    def test_every_provider_answering_404_is_no_open_access_copy_not_incomplete(self, campaign: Campaign) -> None:
+        """Ties Fix 1 (HTTP 404 as a definitive "no record", not a cut-short lookup)
+        to the operator-facing outcome end to end, through the REAL resolver.
+
+        A live run saw Semantic Scholar answer a DOI lookup with a plain HTTP 404
+        (observed 2026-07-30 and again 2026-07-31); before ``SearchNotFound`` existed,
+        that 404 was indistinguishable from a transport failure and got reported to
+        the operator as ``oa_lookup_incomplete`` -- "resolution was cut short" -- when
+        every provider had, in fact, answered. If every enabled provider answers 404,
+        the resolution completed and found nothing, so the queued reason must be the
+        honest negative ``NO_OPEN_ACCESS_COPY``, never ``OA_LOOKUP_INCOMPLETE``.
+        """
+
+        def _always_404(url: str, **kwargs: Any) -> Any:
+            raise urllib.error.HTTPError(url, 404, "Not Found", None, None)
+
+        deps, _, config = _make_deps([_wanted_proposal()])
+        deps.oa_resolver = OpenAccessResolver(
+            ledger=deps.ledger,
+            external_provider_consent=True,
+            unpaywall_email="ops@example.org",
+            opener=_always_404,
+        )
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE

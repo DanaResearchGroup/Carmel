@@ -43,6 +43,7 @@ from xml.etree import ElementTree
 from carmel.agents.budget import BudgetLedger
 from carmel.agents.tools.search import (
     SearchError,
+    SearchNotFound,
     SearchResult,
     budgeted_get_json,
     budgeted_get_raw,
@@ -1223,6 +1224,15 @@ class OpenAccessResolver(_KeylessSearchTool):
                 found = lookup(doi, title)
             except _ProviderSkip as skip:
                 notes.append(f"{name}: skipped ({skip})")
+                continue
+            except SearchNotFound:
+                # The provider was reached and answered normally with "no record for
+                # this identifier" (HTTP 404) -- distinct from a transport failure.
+                # This provider contributes no candidates, but nothing about
+                # resolution was cut short on its account, so `complete` stays
+                # exactly as it was going into this provider. Must be caught before
+                # the plain `SearchError` branch below, since it is a subclass.
+                notes.append(f"{name}: no record")
                 continue
             except SearchError as exc:
                 # Warn at most once per provider per resolver instance -- not once per
