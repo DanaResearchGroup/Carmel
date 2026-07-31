@@ -13,10 +13,12 @@ before recording an offset.
 
 from __future__ import annotations
 
+import contextlib
 import io
+import logging
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from html.parser import HTMLParser
 
 from pydantic import BaseModel, ConfigDict
@@ -521,6 +523,36 @@ def _cap_text(text: str, sections: list[TextSection]) -> tuple[str, list[TextSec
     return capped, clipped_sections, True
 
 
+@contextlib.contextmanager
+def _quiet_pypdf() -> Iterator[None]:
+    """Mute ``pypdf``'s per-object repair chatter for the duration of one extraction.
+
+    A malformed-but-recoverable cross-reference table makes ``pypdf`` emit one WARNING
+    record per fixed-up object ("Ignoring wrong pointing object 3 0 (offset 641)").
+    Real publisher PDFs hit this constantly -- a single 9-page paper produced ~70 such
+    lines -- and since the CLI installs no logging configuration they land on the root
+    logger's last-resort stderr handler and bury the one line the operator is actually
+    reading (ACCEPTED/REJECTED and why).
+
+    They are muted rather than reformatted because they are not actionable: each one
+    reports a repair that SUCCEEDED. Whether the extracted text is trustworthy is
+    already answered, on our own evidence rather than ``pypdf``'s commentary, by
+    ``ExtractedText.lossy`` and the grounding gate's degraded-artifact path -- both of
+    which fail closed. ERROR and above still pass through, so a genuine parse failure
+    is never hidden.
+
+    Restores the previous level on the way out, including on exception, so this never
+    permanently reconfigures logging for a caller that embeds Carmel as a library.
+    """
+    pypdf_logger = logging.getLogger("pypdf")
+    previous = pypdf_logger.level
+    pypdf_logger.setLevel(logging.ERROR)
+    try:
+        yield
+    finally:
+        pypdf_logger.setLevel(previous)
+
+
 def _extract_pdf(data: bytes) -> ExtractedText:
     """Extract text from a PDF via the optional ``pypdf`` dependency.
 
@@ -538,11 +570,12 @@ def _extract_pdf(data: bytes) -> ExtractedText:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:unavailable", lossy=True)
 
     try:
-        reader = pypdf.PdfReader(io.BytesIO(data))
-        # `len(reader.pages)` is cheap (it reads the page tree, not page content), so
-        # checking it before calling any `extract_text()` bounds the page count up
-        # front rather than after the fact.
-        page_count = len(reader.pages)
+        with _quiet_pypdf():
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            # `len(reader.pages)` is cheap (it reads the page tree, not page content), so
+            # checking it before calling any `extract_text()` bounds the page count up
+            # front rather than after the fact.
+            page_count = len(reader.pages)
     except Exception:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
 
@@ -558,24 +591,25 @@ def _extract_pdf(data: bytes) -> ExtractedText:
     truncated = page_count > MAX_PDF_PAGES
     pages_to_process = min(page_count, MAX_PDF_PAGES)
     try:
-        for i in range(pages_to_process):
-            # Stop calling `extract_text()` -- the expensive, memory-allocating step --
-            # the moment the running character count would already exceed the cap,
-            # rather than materializing every remaining page and trimming only the
-            # RETURNED value afterwards. That "trim after the fact" ordering is exactly
-            # the gap this fix closes: it let a compression-bomb PDF blow past peak
-            # memory before `_cap_text` (below) ever got a chance to run.
-            if cursor >= MAX_EXTRACTED_TEXT_CHARS:
-                truncated = True
-                break
-            page_text = reader.pages[i].extract_text() or ""
-            start = cursor
-            parts.append(page_text)
-            cursor += len(page_text)
-            sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
-            if i < pages_to_process - 1:
-                parts.append(separator)
-                cursor += len(separator)
+        with _quiet_pypdf():
+            for i in range(pages_to_process):
+                # Stop calling `extract_text()` -- the expensive, memory-allocating step
+                # -- the moment the running character count would already exceed the cap,
+                # rather than materializing every remaining page and trimming only the
+                # RETURNED value afterwards. That "trim after the fact" ordering is
+                # exactly the gap this fix closes: it let a compression-bomb PDF blow past
+                # peak memory before `_cap_text` (below) ever got a chance to run.
+                if cursor >= MAX_EXTRACTED_TEXT_CHARS:
+                    truncated = True
+                    break
+                page_text = reader.pages[i].extract_text() or ""
+                start = cursor
+                parts.append(page_text)
+                cursor += len(page_text)
+                sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
+                if i < pages_to_process - 1:
+                    parts.append(separator)
+                    cursor += len(separator)
     except Exception:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
 

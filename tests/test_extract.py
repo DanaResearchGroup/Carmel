@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from pathlib import Path
@@ -544,3 +545,67 @@ def _build_tiny_pdf(text: bytes) -> bytes:
         out += f"{off:010d} 00000 n \n".encode()
     out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode()
     return bytes(out)
+
+
+class TestPypdfNoiseIsMuted:
+    """A malformed-but-recoverable PDF must not bury the operator's verdict in repair logs.
+
+    Real publisher PDFs make pypdf emit one WARNING per fixed-up cross-reference entry;
+    a single 9-page paper produced ~70 lines of "Ignoring wrong pointing object ...".
+    The CLI installs no logging configuration, so those land on the root logger's
+    last-resort stderr handler, on top of the one ACCEPTED/REJECTED line being read.
+    """
+
+    def test_the_pypdf_logger_is_muted_during_extraction(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.agents.tools import extract as extract_mod
+
+        observed: list[int] = []
+
+        class _SpyReader:
+            def __init__(self, _stream: object) -> None:
+                observed.append(logging.getLogger("pypdf").getEffectiveLevel())
+                self.pages: list[object] = []
+
+        monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_SpyReader))
+        extract_mod._extract_pdf(b"%PDF-1.4 whatever")
+
+        assert observed == [logging.ERROR]
+
+    def test_the_previous_level_is_restored_afterwards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Carmel is importable as a library; muting a third party's logger permanently
+        would be reconfiguring logging behind the embedding application's back."""
+        from carmel.agents.tools import extract as extract_mod
+
+        pypdf_logger = logging.getLogger("pypdf")
+        pypdf_logger.setLevel(logging.DEBUG)
+        try:
+            monkeypatch.setitem(
+                sys.modules,
+                "pypdf",
+                types.SimpleNamespace(PdfReader=lambda _stream: types.SimpleNamespace(pages=[])),
+            )
+            extract_mod._extract_pdf(b"%PDF-1.4 whatever")
+
+            assert pypdf_logger.level == logging.DEBUG
+        finally:
+            pypdf_logger.setLevel(logging.NOTSET)
+
+    def test_the_level_is_restored_even_when_the_pdf_fails_to_parse(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The failure path is the one that matters: a parse error is exactly when a
+        naive implementation leaks the muted level and hides every later warning."""
+        from carmel.agents.tools import extract as extract_mod
+
+        pypdf_logger = logging.getLogger("pypdf")
+        pypdf_logger.setLevel(logging.WARNING)
+
+        def _boom(_stream: object) -> object:
+            raise ValueError("corrupt xref")
+
+        try:
+            monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=_boom))
+            result = extract_mod._extract_pdf(b"%PDF-1.4 broken")
+
+            assert result.lossy is True
+            assert pypdf_logger.level == logging.WARNING
+        finally:
+            pypdf_logger.setLevel(logging.NOTSET)
