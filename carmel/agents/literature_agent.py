@@ -220,6 +220,16 @@ deterministic gate that checks your claims against the actual stored bytes:
 4. TYPED NUMERIC VALUES WITH UNITS. Every quantity must be reported as a typed numeric
    value with its unit (e.g. value=1.25, unit="ms"). The quoted text must contain the
    same numbers.
+5. THE QUOTE MUST CARRY ITS OWN CONTEXT. The gate looks for the finding's defining
+   details -- the measured value, its unit, the species, the reactor -- in the SAME
+   SENTENCE as your quote, not merely somewhere nearby. A sentence that says only
+   "the maximum difference was 17.6 cm/s" will be rejected even when the surrounding
+   paragraph makes the species and reactor perfectly clear to a human reader.
+   Prefer a longer quote that spans the full statement, and prefer passages that name
+   what was measured, in what, and in what apparatus. If no single passage in the
+   document states all of it together, that document does not support the finding as
+   a quotable claim -- report nothing rather than stitching a quote together from
+   separate sentences.
 
 Extracting nothing is a valid and honest outcome. If the corpus does not support a
 finding relevant to this campaign, set `done` to true and report no findings. A
