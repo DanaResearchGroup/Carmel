@@ -266,7 +266,7 @@ def _cmd_corpus_pass(
     """
     from carmel.schemas.action_state import ActionOutcome
     from carmel.services.campaigns import find_campaign_workspace, load_campaign
-    from carmel.services.dispatcher import default_handlers, execute_action
+    from carmel.services.dispatcher import default_handlers, execute_next_action
     from carmel.services.planner import append_corpus_pass_action
     from carmel.ui.app import _resolve_workspaces_root
 
@@ -313,18 +313,60 @@ def _cmd_corpus_pass(
     from carmel.agents.bridge import AgentBridgeError
 
     try:
+        # Go through the DISPATCHER, not execute_action (spar round 7 P1).
+        # execute_action is only the by-kind router: it runs the handler and nothing
+        # else. Calling it directly skipped reconcile, the approval gate, the exclusive
+        # dispatch lease, the campaign pre/post state transitions, attempt recording,
+        # and -- the damaging one -- the cursor advance. A corpus pass would complete
+        # and write its report while plan_progress.json still showed the action
+        # pending, so the next dispatcher run would execute it a second time. Since
+        # findings are deliberately never deduped across passes, that silently doubles
+        # them in the accumulated report.
+        #
         # The agent config MUST be threaded through to the handler registry. Without
         # it the literature handler is built with nothing to run on and returns a
         # typed "no agent config available" failure -- which looks like a failed run
         # rather than a command that never started one.
-        result = execute_action(
+        ticket = execute_next_action(
             ws,
             campaign,
-            action,
             handlers=default_handlers(agent_config=agent_config),  # type: ignore[arg-type]
         )
     except AgentBridgeError as e:
         print(f"Corpus pass unavailable (consent/API key): {e}", file=sys.stderr)
+        return 1
+
+    if ticket is None:
+        print(
+            f"The corpus-pass action {action.action_id} was appended but the dispatcher "
+            "did not start it. The plan has no runnable action right now -- most often "
+            "the action is still awaiting approval. It stays in the plan; approve it "
+            "and dispatch again.",
+            file=sys.stderr,
+        )
+        return 1
+    if ticket.action_id != action.action_id:
+        # The dispatcher runs the plan's next executable action, which is the correct
+        # behaviour and is deliberately not overridden here: jumping the queue would
+        # run the corpus pass out of the order the plan records. Say plainly that
+        # something else ran, rather than reporting another action's outcome as though
+        # it were the corpus pass.
+        print(
+            f"The corpus-pass action {action.action_id} was appended, but the next "
+            f"action due in the plan is {ticket.action_id} ({ticket.kind.value}), which "
+            "ran instead. The corpus pass remains queued; dispatch again to reach it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = ticket.wait()
+    if result is None:
+        print(
+            f"Corpus pass {action.action_id} failed before producing a result"
+            + (f": {ticket.error}" if ticket.error is not None else "")
+            + ". The failure is recorded in the workspace.",
+            file=sys.stderr,
+        )
         return 1
     print(f"Corpus pass {action.action_id} finished with outcome {result.outcome.value}")
     return 0 if result.outcome == ActionOutcome.SUCCEEDED else 1

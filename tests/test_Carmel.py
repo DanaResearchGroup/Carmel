@@ -1083,15 +1083,35 @@ class TestCorpusPassCommand:
     in the plan whether or not the run then succeeds.
     """
 
-    def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
+    def _campaign(self, tmp_path: Path, *, dispatchable: bool = False) -> tuple[str, Path]:
+        """A campaign with a plan; optionally advanced to a state that can dispatch.
+
+        ``dispatchable`` walks the campaign up the real state ladder to
+        APPROVED_FOR_EXECUTION. A corpus pass is a SECOND pass over papers a campaign
+        already holds, so by the time an operator appends one the campaign has long
+        since left DRAFT -- a draft campaign has not run the literature search whose
+        results the corpus pass re-reads. Tests that only append (``--dry-run``) do not
+        need it, because appending is authorisation and deliberately works regardless
+        of whether the run then succeeds.
+        """
         from Carmel import main
+        from carmel.schemas import CampaignStateValue
         from carmel.services.campaigns import load_campaign
         from carmel.services.planner import plan_and_save
+        from carmel.services.state_machine import update_state
 
         assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
         ws = tmp_path / "ws"
         campaign = load_campaign(ws)
         plan_and_save(ws, campaign, include_literature=True)
+        if dispatchable:
+            for target in (
+                CampaignStateValue.VALIDATED,
+                CampaignStateValue.READY_FOR_PLANNING,
+                CampaignStateValue.PLAN_PENDING_APPROVAL,
+                CampaignStateValue.APPROVED_FOR_EXECUTION,
+            ):
+                update_state(ws, target)
         return campaign.campaign_id, ws
 
     def test_a_campaign_with_no_plan_is_told_what_is_missing(
@@ -1191,7 +1211,7 @@ class TestCorpusPassCommand:
         import carmel.services.dispatcher as dispatcher
         from Carmel import main
 
-        cid, _ = self._campaign(tmp_path)
+        cid, _ = self._campaign(tmp_path, dispatchable=True)
         config_path = tmp_path / "agents.yaml"
         config_path.write_text(
             (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
@@ -1224,3 +1244,72 @@ class TestCorpusPassCommand:
 
         assert "agent_config" in seen, "the command dispatched without handing over a handler registry"
         assert seen["agent_config"] is not None, "the loaded --config never reached the handler"
+
+    def test_the_run_advances_the_plan_cursor_past_the_corpus_action(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spar round 7, P1. The command used to call execute_action, the by-kind
+        router, which runs the handler and NOTHING else -- no approval gate, no state
+        transitions, no attempt record, and no cursor advance.
+
+        A corpus pass therefore completed and wrote its report while plan_progress.json
+        still showed the action pending, so the next dispatcher run would execute it a
+        second time. Findings are deliberately never deduped across passes, so that
+        silently doubles them in the accumulated report.
+
+        Asserting on the CURSOR rather than on the outcome is deliberate: the run
+        itself fails here (consent is off, so there is no model to call), and the
+        bookkeeping must be correct regardless of how the run turns out. An assertion
+        that only held for a successful run would not have caught this.
+        """
+        from Carmel import main
+        from carmel.schemas import ActionExecutionStatus, ActionKind, ActionOutcome
+        from carmel.services.plan_progress import (
+            advance_cursor,
+            load_progress,
+            mark_finished,
+            mark_running,
+        )
+
+        cid, ws = self._campaign(tmp_path, dispatchable=True)
+        # Retire the literature search that precedes the corpus pass in the plan, so
+        # the cursor actually reaches the appended action. Without this the dispatcher
+        # correctly runs the SEARCH instead -- which the command reports, and which is
+        # covered by the sibling test below.
+        search = load_progress(ws).actions[0]
+        mark_running(ws, search.action_id, "attempt-1")
+        mark_finished(
+            ws,
+            search.action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+        advance_cursor(ws, search.action_id)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+
+        main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-usd",
+                "1",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+            ]
+        )
+
+        progress = load_progress(ws)
+        corpus = next(a for a in progress.actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert corpus.execution_status != ActionExecutionStatus.PENDING, (
+            "the corpus pass ran but progress still shows it PENDING, so the next "
+            "dispatcher run would execute it a second time and double the findings"
+        )
+        assert corpus.attempt_ids, "the dispatcher recorded no attempt for the corpus pass"
