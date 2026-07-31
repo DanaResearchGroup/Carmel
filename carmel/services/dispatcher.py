@@ -42,7 +42,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from carmel.config import AgentConfig
 from carmel.logger import get_logger
 from carmel.schemas.action_state import ActionExecutionStatus, ActionOutcome, PlanProgress
-from carmel.schemas.approval import ActionKind, ApprovalStatus
+from carmel.schemas.approval import LITERATURE_ACTION_KINDS, ActionKind, ApprovalStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.diagnostics import DiagnosticsV1
 from carmel.schemas.literature import STOP_REASON_FOR_DIMENSION, LiteratureReport, StopReason
@@ -90,7 +90,9 @@ SUPPORTED_ACTION_KINDS = frozenset({ActionKind.T3_RUN, ActionKind.LITERATURE_SEA
 
 #: The kinds the literature handler accepts. Both run the Literature Agent through the
 #: same envelope; they differ only in whether the pass may reach the network.
-_LITERATURE_ACTION_KINDS = frozenset({ActionKind.LITERATURE_SEARCH, ActionKind.LITERATURE_CORPUS_PASS})
+#: Re-exported under this module's original private name; defined in the schemas
+#: package so crash recovery and the dispatcher cannot drift apart on it.
+_LITERATURE_ACTION_KINDS = LITERATURE_ACTION_KINDS
 
 #: Action kinds that are executable SOMEWHERE, which is not the same question.
 #:
@@ -342,11 +344,19 @@ def _literature_unavailable_result(workspace_root: Path, action: PlannedAction, 
 
 
 def _literature_outcome(report: LiteratureReport, action: PlannedAction) -> ActionOutcome:
+    """Classify the outcome of THIS pass, not of the accumulated report.
+
+    ``report.findings`` accumulates across every pass the campaign has run (schema v2),
+    so testing it would let one finding from an earlier search make every later corpus
+    pass report SUCCEEDED -- including a pass that ran the whole corpus and grounded
+    nothing (spar round 7, P1). That is precisely the signal an operator needs, because
+    a barren pass is the one that says the corpus is exhausted or the prompt is wrong.
+    """
     if report.stop_reason in _BUDGET_STOP_REASONS:
         return ActionOutcome.BUDGET_EXCEEDED
     if report.stop_reason == StopReason.ERROR:
         return _failure_outcome(action)
-    if not report.findings:
+    if not report.findings_for(report.run_id):
         return ActionOutcome.NO_GROUNDED_FINDINGS
     return ActionOutcome.SUCCEEDED
 
@@ -362,11 +372,30 @@ def _apply_action_budget(deps: LiteratureDeps, action: PlannedAction) -> Literat
 
     Only ``max_cost_usd`` is replaced. The session and daily ceilings are process-
     and machine-wide protections against many runs in aggregate, and one operator
-    authorising one action does not authorise breaching those.
+    authorising one action does not authorise breaching those -- so the rebuilt
+    ledger CARRIES THEM OVER (spar round 7, P1). Constructing ``BudgetLedger(budget)``
+    bare leaves ``daily_ledger_path=None``, which silently switches the file-backed
+    daily cap off for exactly the runs an operator has just authorised extra money
+    for. That is the opposite of what the paragraph above promises, and the promise is
+    the dangerous half: a ceiling believed to hold is worse than one known to be
+    absent.
+
+    Raises:
+        ValueError: If the action names no usable budget. Only a corpus pass reaches
+            here, and for a corpus pass the operator's ``--budget-usd`` IS the
+            authorisation -- appending one without a positive budget is refused at
+            :func:`~carmel.services.planner.append_corpus_pass_action`. Falling back to
+            the config ceiling for an action that reached this point some other way
+            (a hand-edited or tampered plan) would spend up to a limit nobody
+            authorised, so fail closed instead.
     """
     budget_usd = action.estimated_spend_usd
     if budget_usd is None or budget_usd <= 0:
-        return deps
+        raise ValueError(
+            f"corpus-pass action {action.action_id} names no positive budget "
+            f"(estimated_spend_usd={budget_usd!r}); the operator budget is the "
+            f"authorisation for this action and there is no safe default"
+        )
 
     import dataclasses
 
@@ -374,7 +403,12 @@ def _apply_action_budget(deps: LiteratureDeps, action: PlannedAction) -> Literat
 
     budget = deps.config.budget.model_copy(update={"max_cost_usd": budget_usd})
     config = deps.config.model_copy(update={"budget": budget})
-    return dataclasses.replace(deps, config=config, ledger=BudgetLedger(budget))
+    ledger = BudgetLedger(
+        budget,
+        session=deps.ledger.session,
+        daily_ledger_path=deps.ledger.daily_ledger_path,
+    )
+    return dataclasses.replace(deps, config=config, ledger=ledger)
 
 
 def make_literature_handler(
@@ -411,7 +445,13 @@ def make_literature_handler(
 
         deps = literature_deps if literature_deps is not None else build_deps(agent_config)  # type: ignore[arg-type]
         if action.kind == ActionKind.LITERATURE_CORPUS_PASS:
-            deps = _apply_action_budget(deps, action)
+            try:
+                deps = _apply_action_budget(deps, action)
+            except ValueError as exc:
+                # A refused budget is an unrunnable action, not a crashed dispatch:
+                # surface it the same way a missing agent config is surfaced, so the
+                # operator sees why nothing ran and the plan keeps the action.
+                return _literature_unavailable_result(workspace_root, action, str(exc))
         run_pass = run_corpus_pass if action.kind == ActionKind.LITERATURE_CORPUS_PASS else run_literature_research
         report = run_pass(workspace_root, campaign, action, deps, config=deps.config)
         run_record = run_record_for(report, action)

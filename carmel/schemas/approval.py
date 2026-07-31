@@ -27,6 +27,16 @@ class ActionKind(StrEnum):
     """
 
 
+#: Every kind that executes as a literature run. Defined here, beside the enum, because
+#: several layers must agree on it: the dispatcher routes on it, and crash recovery uses
+#: it to decide which lock vouches for a live attempt and which finished action satisfies
+#: a pending post-transition. When it lived as a private set in one module, the others
+#: hard-coded ``LITERATURE_SEARCH`` and silently excluded the corpus pass (spar round 7).
+LITERATURE_ACTION_KINDS: frozenset[ActionKind] = frozenset(
+    {ActionKind.LITERATURE_SEARCH, ActionKind.LITERATURE_CORPUS_PASS}
+)
+
+
 class ApprovalRequirement(StrEnum):
     """Whether an action is auto-approvable or requires human approval."""
 

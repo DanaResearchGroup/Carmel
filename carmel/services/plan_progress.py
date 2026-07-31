@@ -24,7 +24,12 @@ from carmel.schemas.action_state import (
     ActionState,
     PlanProgress,
 )
-from carmel.schemas.approval import ActionKind, ApprovalRequirement, ApprovalStatus
+from carmel.schemas.approval import (
+    LITERATURE_ACTION_KINDS,
+    ActionKind,
+    ApprovalRequirement,
+    ApprovalStatus,
+)
 from carmel.schemas.plan import Plan, PlannedAction
 from carmel.schemas.state import CampaignStateValue
 from carmel.services.artifacts import read_json, write_json
@@ -631,7 +636,11 @@ def _attempt_is_live(
     """
     if action.kind == ActionKind.T3_RUN and not probe_run_liveness(workspace_root).is_finished:
         return True
-    if action.kind == ActionKind.LITERATURE_SEARCH and lock_is_live(
+    # EVERY literature kind, not just the search (spar round 7, P1). A corpus pass takes
+    # the same literature run lock, so excluding it meant a live corpus pass could be
+    # judged dead and marked FAILED while it was still writing -- and then re-run. That
+    # is the silent second run this whole function exists to prevent.
+    if action.kind in LITERATURE_ACTION_KINDS and lock_is_live(
         workspace_root / LITERATURE_RUN_LOCK_DIR, stale_after_s=stale_after_s
     ):
         return True
@@ -810,10 +819,13 @@ def reconcile(
     return progress
 
 
-#: The RUNNING_* campaign state each action kind executes under.
-_KIND_FOR_RUNNING_STATE: dict[CampaignStateValue, ActionKind] = {
-    CampaignStateValue.RUNNING_T3: ActionKind.T3_RUN,
-    CampaignStateValue.RUNNING_LITERATURE: ActionKind.LITERATURE_SEARCH,
+#: The action kinds each RUNNING_* campaign state covers. RUNNING_LITERATURE covers ALL
+#: literature kinds, not just the search (spar round 7, P1): a crashed corpus pass would
+#: otherwise leave the campaign wedged in RUNNING_LITERATURE forever, because the replay
+#: below looked only for a finished LITERATURE_SEARCH and never found one.
+_KINDS_FOR_RUNNING_STATE: dict[CampaignStateValue, frozenset[ActionKind]] = {
+    CampaignStateValue.RUNNING_T3: frozenset({ActionKind.T3_RUN}),
+    CampaignStateValue.RUNNING_LITERATURE: LITERATURE_ACTION_KINDS,
 }
 
 
@@ -845,13 +857,13 @@ def _replay_missing_post_transition(workspace_root: Path, progress: PlanProgress
     restoring a legal intermediate state.
     """
     current = load_state(workspace_root).state
-    kind = _KIND_FOR_RUNNING_STATE.get(current)
-    if kind is None:
+    kinds = _KINDS_FOR_RUNNING_STATE.get(current)
+    if kinds is None:
         return
     finished = [
         a
         for a in progress.actions
-        if a.kind == kind and a.is_terminal() and a.execution_status != ActionExecutionStatus.SKIPPED
+        if a.kind in kinds and a.is_terminal() and a.execution_status != ActionExecutionStatus.SKIPPED
     ]
     if not finished:
         return

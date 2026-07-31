@@ -202,6 +202,25 @@ class BudgetLedger:
         self._index_lookups: int = 0
         self._fetch_bytes: int = 0
 
+    # -- aggregate protections ---------------------------------------------
+
+    @property
+    def session(self) -> SessionBudget:
+        """The process-wide session budget this ledger charges against."""
+        return self._session
+
+    @property
+    def daily_ledger_path(self) -> Path | None:
+        """Path of the file-backed daily cost ledger, or None if unwired.
+
+        Exposed so a caller that must REBUILD a ledger -- to bind a per-action cost
+        ceiling, say -- can carry the aggregate protections across instead of silently
+        constructing a ledger that enforces neither. The session and daily ceilings
+        guard against many runs adding up; re-deriving a ledger for one action is not
+        authorisation to breach them.
+        """
+        return self._daily_ledger_path
+
     # -- reservations ------------------------------------------------------
 
     def reserve_model_call(self, *, estimated_tokens: int, estimated_cost_usd: float) -> Reservation:

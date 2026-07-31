@@ -2019,14 +2019,137 @@ class TestOperatorBudgetBinds:
         assert bound.config.budget.session_max_cost_usd == deps.config.budget.session_max_cost_usd
         assert bound.config.budget.daily_max_cost_usd == deps.config.budget.daily_max_cost_usd
 
-    def test_an_absent_budget_leaves_the_configured_ceiling_alone(self, campaign: Campaign) -> None:
+    def test_an_absent_budget_is_refused_rather_than_defaulted(self, campaign: Campaign) -> None:
+        """Spar round 7, P1. This used to fall back to the config file's ceiling.
+
+        For a corpus pass the operator's ``--budget-usd`` IS the authorisation, so an
+        action that reached the handler without one did not come from
+        ``append_corpus_pass_action`` (which refuses it) -- it came from a hand-edited
+        or tampered plan. Spending up to a ceiling nobody named is the wrong direction
+        to fail for a control whose entire purpose is to bound spend.
+        """
         from carmel.schemas.approval import ActionKind
         from carmel.services.dispatcher import _apply_action_budget
 
         deps, _, _ = _make_deps([])
         action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 0.0})
 
-        assert _apply_action_budget(deps, action) is deps
+        with pytest.raises(ValueError, match="no positive budget"):
+            _apply_action_budget(deps, action)
+
+    def test_the_rebuilt_ledger_keeps_the_daily_and_session_ceilings(self, campaign: Campaign) -> None:
+        """Spar round 7, P1. Binding the operator's per-action ceiling must not switch
+        the aggregate ones off.
+
+        ``BudgetLedger(budget)`` built bare leaves ``daily_ledger_path=None``, silently
+        disabling the file-backed daily cap for exactly the runs an operator has just
+        authorised extra money for -- while the function's docstring promised the
+        opposite. A ceiling believed to hold is worse than one known to be absent.
+        """
+        import dataclasses
+
+        from carmel.agents.budget import BudgetLedger
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _apply_action_budget
+
+        deps, _, _ = _make_deps([])
+        daily = campaign.workspace_root / "daily_ledger.json"
+        deps = dataclasses.replace(deps, ledger=BudgetLedger(deps.config.budget, daily_ledger_path=daily))
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 2.5})
+
+        bound = _apply_action_budget(deps, action)
+
+        assert bound.config.budget.max_cost_usd == 2.5, "the operator ceiling did not bind"
+        assert bound.ledger.daily_ledger_path == daily, "the daily cap was silently dropped"
+        assert bound.ledger.session is deps.ledger.session, "the session cap was silently dropped"
+
+
+class TestOutcomeReflectsThisPassOnly:
+    """Spar round 7, P1. ``report.findings`` accumulates across every pass, so judging
+    the outcome on it lets one old finding make every later barren pass look SUCCEEDED.
+
+    A barren pass is exactly the signal an operator needs -- it says the corpus is
+    exhausted or the prompt is wrong -- so it must not be masked by history.
+    """
+
+    def _report(self, *, old: int, new: int) -> LiteratureReport:
+        from carmel.schemas.literature import (
+            GroundingStatus,
+            LiteratureFinding,
+            LiteraturePassMode,
+            PassRecord,
+            QueryRecord,
+        )
+
+        now = datetime.now(UTC)
+
+        def _pass(run_id: str, mode: LiteraturePassMode) -> PassRecord:
+            return PassRecord(
+                run_id=run_id,
+                action_id=f"act-{run_id}",
+                created_at=now,
+                mode=mode,
+                model_name="mock",
+                stop_reason=StopReason.SELF_TERMINATED,
+                usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+            )
+
+        def _f(run_id: str, n: int) -> LiteratureFinding:
+            return LiteratureFinding.model_validate(
+                {
+                    **{k: v for k, v in _finding_dict().items() if k != "source_url"},
+                    "finding_id": f"{run_id}-{n}",
+                    "run_id": run_id,
+                    "action_id": f"act-{run_id}",
+                    "evidence": {
+                        "artifact_sha256": "a" * 64,
+                        "quote_start": 0,
+                        "quote_end": len(QUOTE),
+                    },
+                    "grounding": {
+                        "status": GroundingStatus.GROUNDED_EXACT,
+                        "grounded": True,
+                        "match_ratio": 1.0,
+                        "identity_ok": True,
+                    },
+                }
+            )
+
+        findings = [_f("run-old", i) for i in range(old)] + [_f("run-new", i) for i in range(new)]
+        return LiteratureReport(
+            report_id="r1",
+            campaign_id="c1",
+            created_at=now,
+            passes=[
+                _pass("run-old", LiteraturePassMode.SEARCH),
+                _pass("run-new", LiteraturePassMode.CORPUS),
+            ],
+            queries=[QueryRecord(text="q", run_id="run-old", action_id="act-run-old")],
+            artifacts=[],
+            findings=findings,
+            rejected=[],
+        )
+
+    def test_a_barren_pass_after_a_productive_one_reports_no_grounded_findings(self) -> None:
+        from carmel.schemas.action_state import ActionOutcome
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _literature_outcome
+
+        report = self._report(old=1, new=0)
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS})
+
+        assert report.findings, "fixture is wrong: the accumulated report must not be empty"
+        assert _literature_outcome(report, action) == ActionOutcome.NO_GROUNDED_FINDINGS
+
+    def test_a_pass_that_grounds_something_still_reports_success(self) -> None:
+        from carmel.schemas.action_state import ActionOutcome
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _literature_outcome
+
+        report = self._report(old=1, new=1)
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS})
+
+        assert _literature_outcome(report, action) == ActionOutcome.SUCCEEDED
 
 
 class TestCorpusPassReadsOneDocumentPerCall:

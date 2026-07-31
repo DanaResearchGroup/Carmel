@@ -462,6 +462,44 @@ class TestReconcile:
         with pytest.raises(ActionInFlightError):
             reconcile(ws, in_dispatch_lock=True)
 
+    def test_live_literature_lock_covers_a_corpus_pass_too(self, ws: Path) -> None:
+        """Spar round 7, P1. The liveness check named LITERATURE_SEARCH explicitly, so
+        a corpus pass -- which takes the very same literature run lock -- was invisible
+        to it. A running corpus pass could therefore be judged dead, marked FAILED, and
+        re-run while the first was still writing: the silent second run reconcile
+        exists to prevent.
+        """
+        _to_approved_for_execution(ws)
+        init_progress(
+            ws,
+            _plan(
+                [
+                    _action(
+                        "corpus",
+                        kind=ActionKind.LITERATURE_CORPUS_PASS,
+                        requirement=ApprovalRequirement.AUTO_APPROVED,
+                        blocking=False,
+                    ),
+                    _action("t3"),
+                ]
+            ),
+        )
+        mark_running(ws, "corpus", "a1")
+        _age_action(ws, 0)
+        lock_dir = ws / LITERATURE_RUN_LOCK_DIR
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "info.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getppid(),  # a live pid that is not ours
+                    "hostname": socket.gethostname(),
+                    "started_at": datetime.now(UTC).isoformat(),
+                }
+            )
+        )
+        with pytest.raises(ActionInFlightError):
+            reconcile(ws, in_dispatch_lock=True)
+
     def test_in_dispatch_lock_repairs_fresh_lease_without_live_lock(self, ws: Path) -> None:
         """Holding the exclusive dispatch lock proves no dispatcher attempt is live."""
         _to_approved_for_execution(ws)
@@ -601,6 +639,38 @@ class TestReconcile:
 
         assert progress.cursor == 1  # advanced past the finished lit action
         assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+
+    def test_crash_window_corpus_pass_post_transition_replayed(self, ws: Path) -> None:
+        """Spar round 7, P1. The state-to-kind map named LITERATURE_SEARCH alone, so a
+        crashed CORPUS pass left the campaign in RUNNING_LITERATURE with no finished
+        action the replay would accept. It wedged there permanently: the next T3
+        pre-transition is illegal from RUNNING_LITERATURE, and nothing else ever
+        revisits it.
+        """
+        _to_approved_for_execution(ws)
+        update_state(ws, CampaignStateValue.RUNNING_LITERATURE)
+        init_progress(
+            ws,
+            _plan(
+                [
+                    _action(
+                        "corpus",
+                        kind=ActionKind.LITERATURE_CORPUS_PASS,
+                        requirement=ApprovalRequirement.AUTO_APPROVED,
+                        blocking=False,
+                    ),
+                    _action("t3"),
+                ]
+            ),
+        )
+        mark_finished(ws, "corpus", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+
+        progress = reconcile(ws)
+
+        assert progress.cursor == 1, "the cursor never advanced past the finished corpus pass"
+        assert load_state(ws).state == CampaignStateValue.LITERATURE_READY, (
+            "the campaign is still wedged in RUNNING_LITERATURE"
+        )
 
     def test_post_transition_replay_loses_a_race_without_crashing(
         self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
