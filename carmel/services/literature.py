@@ -106,7 +106,12 @@ from carmel.services import chem
 from carmel.services.acquisition import collect_inbox, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
-from carmel.services.evidence import list_artifacts, load_artifact_text, store_artifact, verify_artifact
+from carmel.services.evidence import (
+    list_artifacts_with_unreadable,
+    load_artifact_text,
+    store_artifact,
+    verify_artifact,
+)
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
     DEFAULT_LOCK_GRACE_S,
@@ -1477,6 +1482,10 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     the corrupt sidecar, or accept that the corpus is exhausted. Coverage the operator
     cannot see is coverage they will assume.
 
+    "Skipped" therefore spans all three ways a held document can go unread: an
+    unreadable ``meta.json`` (which never yields a StoredArtifact at all), a failed
+    digest verification, and missing extracted text.
+
     Every artifact is VERIFIED against its digest before it is read (spar round 8). The
     search pass fetches and extracts in the same breath, so its text is necessarily
     fresh; a corpus pass re-reads sidecars of arbitrary age, which is the one place
@@ -1494,8 +1503,11 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     truncated by a full disk or an interrupted write.
     """
     corpus: list[tuple[StoredArtifact, ExtractedText]] = []
-    skipped: list[str] = []
-    for artifact in list_artifacts(workspace_root):
+    # An artifact directory with no readable meta.json never becomes a StoredArtifact,
+    # so it cannot be skipped by the loop below -- it would vanish from the corpus AND
+    # from the coverage this function reports. Seed the skipped list with those (F11).
+    artifacts, skipped = list_artifacts_with_unreadable(workspace_root)
+    for artifact in artifacts:
         try:
             intact = verify_artifact(workspace_root, artifact.sha256)
         except ValueError:

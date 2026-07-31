@@ -55,6 +55,7 @@ __all__ = [
     "EVIDENCE_LITERATURE_DIR",
     "artifact_dir",
     "list_artifacts",
+    "list_artifacts_with_unreadable",
     "load_artifact_text",
     "store_artifact",
     "verify_artifact",
@@ -371,8 +372,8 @@ def _validate_sha256(workspace_root: Path, sha256: str) -> Path:
     return _assert_contained(root, artifact_dir(root, sha256))
 
 
-def list_artifacts(workspace_root: Path) -> list[StoredArtifact]:
-    """Every artifact currently held in this workspace's evidence store.
+def list_artifacts_with_unreadable(workspace_root: Path) -> tuple[list[StoredArtifact], list[str]]:
+    """Every held artifact, AND the sha-named directories that would not parse as one.
 
     Returned in a stable order (``stored_at``, then ``sha256``) so a corpus pass
     presents the same corpus in the same order on every run: the whole point of
@@ -383,24 +384,44 @@ def list_artifacts(workspace_root: Path) -> list[StoredArtifact]:
     store is content-addressed and append-only, but a crashed write or a partially
     copied workspace can leave a directory without usable ``meta.json``; that is a
     reason to ignore one artifact, never to make the whole corpus unreadable.
+
+    Skipping them is right; skipping them SILENTLY is not. A ``logger.warning`` does
+    not reach the operator where it matters: a corpus pass reports "N held artifact(s)
+    not covered by this pass" from the shas its loader skipped, and an artifact dropped
+    here never reaches that loader — so it was absent from the corpus and absent from
+    the count of what the pass missed. That reads as full coverage of a smaller store,
+    which is the one reading that makes a barren pass look conclusive. Returning the
+    names lets the caller fold them into the coverage it reports (F11).
     """
     root = Path(workspace_root) / EVIDENCE_LITERATURE_DIR
     try:
         entries = sorted(root.iterdir())
     except OSError:
-        return []
+        return [], []
 
     artifacts: list[StoredArtifact] = []
+    unreadable: list[str] = []
     for entry in entries:
         if not entry.is_dir() or not _SHA256_RE.match(entry.name):
             continue
         meta = _load_meta(entry / _META_NAME)
         if meta is None:
             logger.warning("evidence store: skipping %s (no readable meta.json)", entry.name)
+            unreadable.append(entry.name)
             continue
         artifacts.append(meta)
     artifacts.sort(key=lambda a: (a.stored_at, a.sha256))
-    return artifacts
+    return artifacts, sorted(unreadable)
+
+
+def list_artifacts(workspace_root: Path) -> list[StoredArtifact]:
+    """Every artifact currently held in this workspace's evidence store.
+
+    Thin view over :func:`list_artifacts_with_unreadable` for callers that only
+    want the readable artifacts. Anything reporting COVERAGE to an operator should
+    use that function instead and account for what it could not read.
+    """
+    return list_artifacts_with_unreadable(workspace_root)[0]
 
 
 def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | None:

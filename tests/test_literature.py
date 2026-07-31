@@ -2009,8 +2009,8 @@ class TestCorpusPass:
         # Remove the text sidecars but KEEP meta.json: list_artifacts still yields the
         # artifact (it is genuinely held), while load_artifact_text returns None. That
         # is exactly the shape of a corrupt or half-written extraction, and the shape
-        # the pass must not paper over. Deleting meta.json instead would make the
-        # artifact vanish from the listing entirely, which tests nothing.
+        # the pass must not paper over. Destroying meta.json is a DIFFERENT skip path
+        # (the artifact never enters the listing at all); the test below covers it.
         for name in ("extracted.json", "text.txt"):
             path = campaign.workspace_root / "evidence" / "literature" / broken / name
             if path.exists():
@@ -2023,6 +2023,31 @@ class TestCorpusPass:
 
         assert any(broken[:12] in w for w in report.latest.warnings), (
             f"the unreadable artifact was skipped without saying so: {report.latest.warnings}"
+        )
+        assert any("NOT covered" in w for w in report.latest.warnings)
+
+    def test_an_artifact_with_no_readable_meta_is_reported_as_uncovered_too(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F11. The quietest way for a held paper to disappear.
+
+        A directory whose ``meta.json`` will not parse never becomes a
+        ``StoredArtifact``, so it cannot be skipped by the corpus loader -- it was
+        missing from the corpus AND from the count of what the pass could not read.
+        That reads to an operator as complete coverage of a smaller store, which is
+        exactly the reading that makes a barren pass look conclusive.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        broken = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/nometa")
+        meta_path = campaign.workspace_root / "evidence" / "literature" / broken / "meta.json"
+        meta_path.write_text("{not json at all", encoding="utf-8")
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert any(broken[:12] in w for w in report.latest.warnings), (
+            f"an artifact with unreadable meta.json vanished silently: {report.latest.warnings}"
         )
         assert any("NOT covered" in w for w in report.latest.warnings)
 

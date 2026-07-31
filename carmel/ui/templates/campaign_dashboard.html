@@ -287,14 +287,36 @@
   <article class="card">
     <div class="card-head"><h2>Literature report</h2></div>
     {% if literature_report %}
+      {#
+        Every row states its own scope. The report accumulates across passes while
+        `run_id`, `stop_reason` and `warnings` describe only the LATEST one, so an
+        unlabelled panel silently reported one pass's identity beside every pass's
+        counts -- which reads as "this run found N" and inflates a barren pass with
+        earlier work (F13). The dispatcher took this same fix in `_literature_outcome`.
+      #}
       <dl>
-        <dt>Run ID</dt><dd><code>{{ literature_report.run_id }}</code></dd>
-        <dt>Created</dt><dd>{{ literature_report.created_at | format_datetime }}</dd>
+        <dt>Latest pass</dt>
+        <dd>
+          <code>{{ literature_report.run_id }}</code> · {{ literature_report.latest.mode.value }}
+          ({{ literature_report.latest.created_at | format_datetime }})
+        </dd>
         <dt>Stop reason</dt><dd>{{ literature_report.stop_reason.value }}</dd>
-        <dt>Findings</dt><dd>{{ literature_report.findings | length }} grounded · {{ literature_report.rejected | length }} rejected</dd>
-        <dt>Queries</dt><dd>{{ literature_report.queries | length }}</dd>
+        <dt>This pass</dt>
+        <dd>
+          {{ literature_report.findings_for(literature_report.run_id) | length }} grounded ·
+          {{ literature_report.rejected_for(literature_report.run_id) | length }} rejected ·
+          {{ literature_report.queries_for(literature_report.run_id) | length }} queries
+        </dd>
+        <dt>All {{ literature_report.passes | length }} pass(es)</dt>
+        <dd>
+          {{ literature_report.findings | length }} grounded ·
+          {{ literature_report.rejected | length }} rejected ·
+          {{ literature_report.queries | length }} queries
+          <span class="muted">since {{ literature_report.created_at | format_datetime }}</span>
+        </dd>
       </dl>
       {% if literature_report.findings %}
+        <p class="muted"><small>Most recent findings, across all passes:</small></p>
         <ul style="padding-left:1.1rem; margin:0.5rem 0">
           {% for finding in literature_report.findings[:5] %}
             <li>
@@ -307,7 +329,7 @@
         </ul>
       {% endif %}
       {% if literature_report.warnings %}
-        <p class="muted"><small>{{ literature_report.warnings | length }} warning(s): {{ literature_report.warnings[0] }}</small></p>
+        <p class="muted"><small>Latest pass: {{ literature_report.warnings | length }} warning(s) &mdash; {{ literature_report.warnings[0] }}</small></p>
       {% endif %}
     {% else %}
       <p class="empty">No literature report yet.</p>

@@ -513,3 +513,17 @@ class LiteratureReport(BaseModel):
 
     def findings_for(self, run_id: str) -> list[LiteratureFinding]:
         return [f for f in self.findings if f.run_id == run_id]
+
+    def rejected_for(self, run_id: str) -> list[RejectedFinding]:
+        """The rejections from ONE pass.
+
+        Sibling of :meth:`findings_for`, and needed for the same reason: any surface
+        reporting "this pass" must scope all of its counts, not just the grounded
+        one. A panel that scopes findings but leaves rejections accumulated states
+        an acceptance rate that is not any pass's (F13).
+        """
+        return [r for r in self.rejected if r.run_id == run_id]
+
+    def queries_for(self, run_id: str) -> list[QueryRecord]:
+        """The queries issued by ONE pass. A corpus pass issues none, by design."""
+        return [q for q in self.queries if q.run_id == run_id]
