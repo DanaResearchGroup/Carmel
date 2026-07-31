@@ -20,6 +20,7 @@ import re
 import threading
 import unicodedata
 from collections.abc import Callable, Iterator
+from functools import lru_cache
 from html.parser import HTMLParser
 
 from pydantic import BaseModel, ConfigDict
@@ -259,7 +260,17 @@ def normalize_with_map(s: str) -> tuple[str, list[int]]:
     function together with :func:`raw_span`.
 
     Note: this map is deliberately not persisted anywhere (e.g. on
-    ``ExtractedText``) — it must be recomputed on demand from the raw text.
+    ``ExtractedText``) — it must be recomputed on demand from the raw text. The
+    small cache below does not weaken that: it is keyed on the exact raw text, so
+    a cached map can never belong to different text than the caller passed. What
+    it removes is only repetition — one ``check_identity`` normalizes the same
+    document up to five times, and ``find_quote_with_reason`` again after it, each
+    a full pass over the whole document (F10).
+
+    A fresh copy of the index map is returned each call. The map is a mutable list
+    and the cache is shared, so handing out the cached object would let one caller's
+    edit silently rewrite every later caller's mapping. Copying is O(n) against a
+    recomputation that is several passes of O(n) with per-character work.
 
     Args:
         s: Raw text to normalize.
@@ -267,6 +278,20 @@ def normalize_with_map(s: str) -> tuple[str, list[int]]:
     Returns:
         A ``(normalized, index_map)`` pair, where ``len(index_map) ==
         len(normalized)``.
+    """
+    normalized, index_map = _normalize_with_map_cached(s)
+    return normalized, list(index_map)
+
+
+@lru_cache(maxsize=8)
+def _normalize_with_map_cached(s: str) -> tuple[str, tuple[int, ...]]:
+    """Memoized core of :func:`normalize_with_map`.
+
+    Bounded at 8 entries: the access pattern is repeated calls against the SAME
+    document (several per finding), so a tiny cache captures effectively all of the
+    reuse while keeping worst-case retention to a handful of documents rather than
+    every artifact a long corpus pass touches. Returns an immutable map so a cached
+    entry cannot be mutated in place by a caller.
     """
     chars = list(s)
     idx_map = list(range(len(s)))
@@ -286,7 +311,7 @@ def normalize_with_map(s: str) -> tuple[str, list[int]]:
     end = len(result) - rstrip_n
     result = result[lstrip_n:end]
     idx_map = idx_map[lstrip_n:end]
-    return result, idx_map
+    return result, tuple(idx_map)
 
 
 def raw_span(index_map: list[int], start: int, end: int, raw_len: int) -> tuple[int, int]:

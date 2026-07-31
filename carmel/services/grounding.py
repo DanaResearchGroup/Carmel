@@ -552,6 +552,49 @@ def _has_semantic_discrepancy(window: str, needle: str) -> bool:
     return any(pair <= diff_words for pair in _ANTONYM_PAIRS)
 
 
+def _scan_best_window(haystack: str, needle: str, threshold: float) -> tuple[int, int, float] | None:
+    """The best-scoring window of ``needle``'s length, or None if none clears ``threshold``.
+
+    Shared by :func:`_fuzzy_search` and :func:`_best_fuzzy_window`, which ran
+    character-for-character identical scans and differed only in what they did with
+    the winner.
+
+    ``difflib``'s ``real_quick_ratio`` and ``quick_ratio`` are documented UPPER BOUNDS
+    on ``ratio``, so a window whose bound falls under ``threshold`` cannot reach it and
+    is skipped without the quadratic matching pass. This cannot change the answer
+    (F9): every window that would have cleared the threshold still does, the global
+    maximum is therefore unchanged whenever it clears the threshold, and when it does
+    not both the old and new code return None. Ties still resolve to the earliest
+    window, because the surviving windows keep their original order.
+
+    One matcher is reused with the needle installed as seq2, so ``difflib``'s
+    b2j index is built once for the whole scan instead of once per window.
+    """
+    n = len(needle)
+    h = len(haystack)
+    if n == 0 or h == 0 or h < n:
+        return None
+    last = max(h - n, 0)
+    stride = max(1, n // 8)
+    positions = list(range(0, last + 1, stride))
+    if positions and positions[-1] != last:
+        positions.append(last)
+
+    matcher = SequenceMatcher(None)
+    matcher.set_seq2(needle)
+    best: tuple[int, int, float] | None = None
+    for pos in positions:
+        matcher.set_seq1(haystack[pos : pos + n])
+        if matcher.real_quick_ratio() < threshold or matcher.quick_ratio() < threshold:
+            continue
+        ratio = matcher.ratio()
+        if best is None or ratio > best[2]:
+            best = (pos, pos + n, ratio)
+    if best is None or best[2] < threshold:
+        return None
+    return best
+
+
 def _fuzzy_search(haystack: str, needle: str, threshold: float) -> tuple[int, int, float] | None:
     """Sliding-window ``difflib`` search for the best-matching span of ``needle``'s
     length within ``haystack``, accepted only when its ratio clears ``threshold`` AND
@@ -564,26 +607,11 @@ def _fuzzy_search(haystack: str, needle: str, threshold: float) -> tuple[int, in
     single offset — a best-effort tradeoff appropriate for a fallback path that only
     runs after an exact match has already failed.
     """
-    n = len(needle)
-    h = len(haystack)
-    if n == 0 or h == 0:
-        return None
-    last = max(h - n, 0)
-    stride = max(1, n // 8)
-    positions = list(range(0, last + 1, stride))
-    if positions[-1] != last:
-        positions.append(last)
-
-    best: tuple[int, int, float] | None = None
-    for pos in positions:
-        window = haystack[pos : pos + n]
-        ratio = SequenceMatcher(None, window, needle).ratio()
-        if best is None or ratio > best[2]:
-            best = (pos, pos + n, ratio)
-    if best is None or best[2] < threshold:
+    best = _scan_best_window(haystack, needle, threshold)
+    if best is None:
         return None
 
-    pos, end, ratio = best
+    pos, end, _ratio = best
     if _has_semantic_discrepancy(haystack[pos:end], needle):
         return None
     return best
@@ -606,25 +634,7 @@ def _best_fuzzy_window(haystack: str, needle: str, threshold: float) -> tuple[in
     Returns:
         ``(start, end, ratio)`` of the best window clearing ``threshold``, else None.
     """
-    n = len(needle)
-    h = len(haystack)
-    if n == 0 or h < n:
-        return None
-    last = max(h - n, 0)
-    stride = max(1, n // 8)
-    positions = list(range(0, last + 1, stride))
-    if positions and positions[-1] != last:
-        positions.append(last)
-
-    best: tuple[int, int, float] | None = None
-    for pos in positions:
-        window = haystack[pos : pos + n]
-        ratio = SequenceMatcher(None, window, needle).ratio()
-        if best is None or ratio > best[2]:
-            best = (pos, pos + n, ratio)
-    if best is None or best[2] < threshold:
-        return None
-    return best
+    return _scan_best_window(haystack, needle, threshold)
 
 
 def find_quote(
@@ -941,9 +951,22 @@ def _title_confirmed(extracted: ExtractedText, title_normalized: str) -> bool:
     positions = list(range(0, last + 1, stride))
     if positions[-1] != last:
         positions.append(last)
+    # One matcher for the whole scan, with the title installed as seq2 so difflib
+    # indexes it once rather than once per window, and the two documented upper bounds
+    # on ratio() used as a prefilter. A window whose bound is under the threshold
+    # cannot reach it, so this skips the quadratic pass without changing which windows
+    # are accepted (F9) -- the same reasoning as _scan_best_window, and the reason the
+    # threshold appears in the prefilter rather than some looser proxy.
+    matcher = SequenceMatcher(None)
+    matcher.set_seq2(title_normalized)
     for pos in positions:
         window = haystack[pos : pos + n]
-        if SequenceMatcher(None, window, title_normalized).ratio() < _TITLE_IDENTITY_FUZZY_THRESHOLD:
+        matcher.set_seq1(window)
+        if matcher.real_quick_ratio() < _TITLE_IDENTITY_FUZZY_THRESHOLD:
+            continue
+        if matcher.quick_ratio() < _TITLE_IDENTITY_FUZZY_THRESHOLD:
+            continue
+        if matcher.ratio() < _TITLE_IDENTITY_FUZZY_THRESHOLD:
             continue
         # A high ratio is not enough: see _TITLE_IDENTITY_FUZZY_THRESHOLD. Skip this
         # window rather than rejecting outright, because a document can legitimately

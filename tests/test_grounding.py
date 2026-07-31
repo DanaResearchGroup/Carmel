@@ -37,6 +37,7 @@ from carmel.services.grounding import (
     MIN_NORMALIZED_QUOTE_LENGTH,
     QuoteMissReason,
     UnsupportedFindingPayloadError,
+    _best_fuzzy_window,
     _bounded_window,
     _find_all_normalized,
     _fuzzy_search,
@@ -936,6 +937,27 @@ def test_section_for_defaults_to_body_when_uncovered() -> None:
 def test_fuzzy_search_returns_none_for_empty_needle_or_haystack() -> None:
     assert _fuzzy_search("", "something", 0.92) is None
     assert _fuzzy_search("something", "", 0.92) is None
+
+
+def test_a_quote_longer_than_the_whole_document_is_never_grounded() -> None:
+    """A document cannot contain a quote longer than itself.
+
+    ``_fuzzy_search`` had no length guard while ``_best_fuzzy_window`` did, so the
+    ACCEPT path was looser than the diagnostic path that only explains rejections.
+    A haystack that is a truncated prefix of the claimed quote scores by
+    ``2*M/(h+n)``, which for a document 92% of the quote's length reaches ~0.95 --
+    comfortably past every threshold. A truncated PDF would therefore have grounded
+    a claim quoting text it does not contain.
+
+    Both paths now refuse, which is the fail-closed direction and the one the
+    diagnostic path always took.
+    """
+    quote = "the measured ignition delay time was 1.25 ms at 1000 k behind reflected shock waves in argon"
+    truncated_document = quote[: int(len(quote) * 0.92)]
+    assert len(truncated_document) < len(quote)
+
+    assert _fuzzy_search(truncated_document, quote, 0.85) is None
+    assert _best_fuzzy_window(truncated_document, quote, 0.85) is None
 
 
 def test_has_semantic_discrepancy_false_when_diff_has_no_digits_or_negation() -> None:

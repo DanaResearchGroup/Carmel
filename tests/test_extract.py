@@ -85,6 +85,40 @@ class TestNormalizeWithMap:
         for idx in index_map:
             assert 0 <= idx < len(s) if s else True
 
+    def test_each_call_returns_an_independent_index_map(self) -> None:
+        """F10. The map is memoized, and the map is a mutable list.
+
+        Handing out the cached object would let one caller's edit silently rewrite
+        the mapping every later caller sees -- and this map is what translates a
+        grounding match back into raw-document offsets, so a corrupted one
+        misattributes evidence rather than failing loudly.
+        """
+        raw = "The combus-\ntion   of ﬁre was studied."
+        first_normalized, first_map = normalize_with_map(raw)
+        # The declared return type is list[int]; the cache holds an immutable tuple,
+        # so a caller can never reach the cached object to begin with.
+        assert isinstance(first_map, list)
+        untouched = list(first_map)
+        first_map[0] = 9999
+
+        second_normalized, second_map = normalize_with_map(raw)
+
+        assert second_normalized == first_normalized
+        assert second_map == untouched
+
+    @pytest.mark.parametrize("s", _TRICKY_INPUTS)
+    def test_the_cache_returns_what_a_cold_call_returns(self, s: str) -> None:
+        """A memoized answer must equal the recomputed one for every tricky input."""
+        from carmel.agents.tools.extract import _normalize_with_map_cached
+
+        _normalize_with_map_cached.cache_clear()
+        cold = normalize_with_map(s)
+        warm = normalize_with_map(s)
+        _normalize_with_map_cached.cache_clear()
+        recomputed = normalize_with_map(s)
+
+        assert cold == warm == recomputed
+
     def test_round_trip_recovers_matching_raw_slice(self) -> None:
         raw = "The combus-\ntion   of ﬁre was studied."
         normalized, index_map = normalize_with_map(raw)
