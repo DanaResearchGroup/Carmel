@@ -54,6 +54,7 @@ from carmel.services.artifacts import read_bytes, read_json, write_bytes, write_
 __all__ = [
     "EVIDENCE_LITERATURE_DIR",
     "artifact_dir",
+    "list_artifacts",
     "load_artifact_text",
     "store_artifact",
     "verify_artifact",
@@ -333,6 +334,38 @@ def _validate_sha256(workspace_root: Path, sha256: str) -> Path:
         raise ValueError(f"invalid sha256 digest: {sha256!r} (expected 64 lowercase hex characters)")
     root = normalize_path(workspace_root)
     return _assert_contained(root, artifact_dir(root, sha256))
+
+
+def list_artifacts(workspace_root: Path) -> list[StoredArtifact]:
+    """Every artifact currently held in this workspace's evidence store.
+
+    Returned in a stable order (``stored_at``, then ``sha256``) so a corpus pass
+    presents the same corpus in the same order on every run: the whole point of
+    reading the store rather than the web is that the input is reproducible, and an
+    order that varied with directory iteration would undermine that for no benefit.
+
+    Directories that do not parse as artifacts are skipped rather than raising. The
+    store is content-addressed and append-only, but a crashed write or a partially
+    copied workspace can leave a directory without usable ``meta.json``; that is a
+    reason to ignore one artifact, never to make the whole corpus unreadable.
+    """
+    root = Path(workspace_root) / EVIDENCE_LITERATURE_DIR
+    try:
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+
+    artifacts: list[StoredArtifact] = []
+    for entry in entries:
+        if not entry.is_dir() or not _SHA256_RE.match(entry.name):
+            continue
+        meta = _load_meta(entry / _META_NAME)
+        if meta is None:
+            logger.warning("evidence store: skipping %s (no readable meta.json)", entry.name)
+            continue
+        artifacts.append(meta)
+    artifacts.sort(key=lambda a: (a.stored_at, a.sha256))
+    return artifacts
 
 
 def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | None:

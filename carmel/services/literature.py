@@ -27,6 +27,7 @@ import os
 import shutil
 import socket
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,10 +43,12 @@ from carmel.agents.budget import (
     session_budget,
 )
 from carmel.agents.literature_agent import (
+    CorpusProposal,
     LiteratureProposal,
     ProposedFinding,
     RequestedPaper,
     VerifierAssessment,
+    build_corpus_agent,
     build_literature_agent,
     build_verifier_agent,
 )
@@ -102,7 +105,7 @@ from carmel.services import chem
 from carmel.services.acquisition import collect_inbox, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
-from carmel.services.evidence import store_artifact
+from carmel.services.evidence import list_artifacts, load_artifact_text, store_artifact
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
     DEFAULT_LOCK_GRACE_S,
@@ -124,6 +127,10 @@ VERIFIER_EVIDENCE_WINDOW = 600
 
 #: Credence ceiling applied when any species failed canonicalization.
 NON_CANONICAL_CREDENCE_CAP = 0.7
+
+#: Why a corpus finding naming a document Carmel does not hold is refused. Stated
+#: once so the report's ``reason`` text and the grounding verdict cannot drift apart.
+_UNHELD_ARTIFACT_REASON = "the agent named a document that is not in this workspace's evidence store"
 
 #: Max queries actually executed (and recorded in ``report.queries``/provenance) per
 #: Literature Agent round. Anything beyond this is dropped -- loudly, via a warning
@@ -155,6 +162,8 @@ __all__ = [
     "LiteratureRunLockedError",
     "build_deps",
     "load_literature_report",
+    "migrate_report_payload",
+    "run_corpus_pass",
     "run_literature_research",
     "run_record_for",
     "save_literature_report",
@@ -771,13 +780,54 @@ def _process_finding(
     Order is the design: fetch -> extract -> store -> ground, and ONLY a grounded
     finding is ever shown to the Verifier.
     """
-    finding_id = uuid.uuid4().hex
     url = proposed.source_url
 
     if url not in artifact_cache:
         artifact_cache[url] = _fetch_and_store(workspace_root, url, deps, config=config, state=state)
     cached = artifact_cache[url]
     stored, extracted = cached if cached is not None else (None, None)
+    _ground_and_record(
+        workspace_root,
+        proposed,
+        deps,
+        config=config,
+        state=state,
+        stored=stored,
+        extracted=extracted,
+        log_path=log_path,
+        action_id=action_id,
+        run_id=run_id,
+        queue_acquisition=True,
+    )
+
+
+def _ground_and_record(
+    workspace_root: Path,
+    proposed: ProposedFinding,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    stored: StoredArtifact | None,
+    extracted: ExtractedText | None,
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+    queue_acquisition: bool,
+) -> None:
+    """Ground one proposed finding against resolved bytes; verify and record it only
+    if it survives.
+
+    Shared by both passes, and deliberately so: a corpus finding must clear exactly
+    the same gate as a fetched one. The only difference between the two callers is
+    how the artifact was resolved -- fetched from a URL, or looked up in the store --
+    and that difference is settled before this function is entered.
+
+    ``queue_acquisition`` is False for a corpus pass. There, a failed grounding means
+    the quote is not in a document Carmel already holds, so asking a human to go and
+    obtain that same document would be nonsense.
+    """
+    finding_id = uuid.uuid4().hex
     if stored is not None and all(a.sha256 != stored.sha256 for a in state.artifacts):
         state.artifacts.append(stored)
 
@@ -789,7 +839,8 @@ def _process_finding(
     )
     if not verdict.grounded or stored is None or extracted is None:
         reason = "; ".join(verdict.reasons) or f"grounding failed with status {verdict.status.value}"
-        _maybe_queue_acquisition(workspace_root, proposed, verdict=verdict, state=state)
+        if queue_acquisition:
+            _maybe_queue_acquisition(workspace_root, proposed, verdict=verdict, state=state)
         state.rejected.append(
             RejectedFinding(
                 finding_id=finding_id,
@@ -1384,6 +1435,138 @@ def _research_loop(
             return
 
 
+def _load_corpus(workspace_root: Path) -> list[tuple[StoredArtifact, ExtractedText]]:
+    """Every held artifact paired with its extracted text.
+
+    An artifact whose text cannot be loaded is skipped: it cannot be quoted from, so
+    including it in the listing would only invite the agent to propose a finding that
+    the gate must then reject.
+    """
+    corpus: list[tuple[StoredArtifact, ExtractedText]] = []
+    for artifact in list_artifacts(workspace_root):
+        extracted = load_artifact_text(workspace_root, artifact.sha256)
+        if extracted is not None:
+            corpus.append((artifact, extracted))
+    return corpus
+
+
+def _corpus_prompt(campaign: Campaign, corpus: Sequence[tuple[StoredArtifact, ExtractedText]]) -> str:
+    """Present the held corpus to the agent, whole.
+
+    The documents are included in full rather than summarized or chunked. A finding
+    requires a quote copied character-for-character out of the source, so anything
+    the agent is not shown verbatim, it cannot ground a finding in -- and a summary
+    would actively invite paraphrase, which the gate then rejects.
+    """
+    blocks = []
+    for artifact, extracted in corpus:
+        blocks.append(
+            f"--- DOCUMENT {artifact.sha256} "
+            f"(provenance: {artifact.provenance.value}, source: {artifact.source_url}) ---\n"
+            f"{extracted.text}\n--- END DOCUMENT {artifact.sha256} ---"
+        )
+    documents = "\n\n".join(blocks)
+    return (
+        f"{_campaign_context(campaign)}\n\n"
+        f"You hold {len(corpus)} document(s). Extract every finding relevant to this "
+        f"campaign that is supported by a verbatim quote from one of them, and set "
+        f"`artifact_sha256` to the digest in that document's header.\n\n"
+        f"{documents}"
+    )
+
+
+def _corpus_loop(
+    workspace_root: Path,
+    campaign: Campaign,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+) -> None:
+    """The corpus-only pass: read what is held, propose, ground, verify.
+
+    A single round, not the search loop's repeated propose->search->read cycle. That
+    loop exists because search results are only fed back on the NEXT round, so a
+    finding is impossible in round one. Here the agent is shown the entire corpus up
+    front, so a second round would re-read identical input at full cost and could
+    only produce what the first round already had the information to produce.
+    """
+    corpus = _load_corpus(workspace_root)
+    if not corpus:
+        state.stop_reason = StopReason.NO_NEW_INFORMATION
+        state.warnings.append("the evidence store holds no readable artifacts, so there was nothing to read")
+        return
+
+    by_sha = {artifact.sha256: (artifact, extracted) for artifact, extracted in corpus}
+    deps.ledger.check_wall_clock()
+    agent = build_corpus_agent(model=deps.model, ledger=deps.ledger)
+    result = agent.run(_corpus_prompt(campaign, corpus))
+    proposal = CorpusProposal.model_validate(result.output)
+
+    append_typed_event(
+        log_path,
+        event="literature.corpus_pass_proposed",
+        action_id=action_id,
+        run_id=run_id,
+        payload={"n_documents": len(corpus), "n_proposed": len(proposal.findings)},
+    )
+
+    seen: set[tuple[str, str]] = set()
+    for proposed in proposal.findings:
+        resolved = by_sha.get(proposed.artifact_sha256)
+        if resolved is None:
+            # The agent named a document that is not in the corpus it was shown. The
+            # sha256 pattern already rejects a malformed handle, so this is a
+            # well-formed digest for something Carmel does not hold -- recorded as a
+            # rejection rather than dropped, because a reader of the report must be
+            # able to see that the agent claimed evidence which does not exist.
+            state.rejected.append(
+                RejectedFinding(
+                    finding_id=uuid.uuid4().hex,
+                    run_id=run_id,
+                    action_id=action_id,
+                    category=proposed.payload.category,
+                    citation_title=proposed.citation.title,
+                    grounding=GroundingVerdict(
+                        status=GroundingStatus.NO_ARTIFACT,
+                        grounded=False,
+                        match_ratio=0.0,
+                        reasons=[_UNHELD_ARTIFACT_REASON],
+                    ),
+                    reason=f"{_UNHELD_ARTIFACT_REASON}: {proposed.artifact_sha256}",
+                )
+            )
+            continue
+
+        artifact, extracted = resolved
+        key = (proposed.artifact_sha256, proposed.verbatim_quote.strip()[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        _ground_and_record(
+            workspace_root,
+            ProposedFinding(
+                payload=proposed.payload,
+                citation=proposed.citation,
+                verbatim_quote=proposed.verbatim_quote,
+                source_url=artifact.source_url,
+            ),
+            deps,
+            config=config,
+            state=state,
+            stored=artifact,
+            extracted=extracted,
+            log_path=log_path,
+            action_id=action_id,
+            run_id=run_id,
+            queue_acquisition=False,
+        )
+
+
 def _collect_manual_acquisitions(
     workspace_root: Path,
     *,
@@ -1403,10 +1586,12 @@ def _collect_manual_acquisitions(
     mis-filed PDF would otherwise attach one paper's bytes to another paper's citation
     and quietly corrupt the evidence chain.
 
-    NOTE: admission makes the document available in the evidence store with
-    :attr:`ArtifactProvenance.MANUAL`; it does not yet re-run grounding to extract
-    findings from it. That further step is not wired, and the operator-visible warning
-    below deliberately says only what actually happened.
+    Admission makes the document available in the evidence store with
+    :attr:`ArtifactProvenance.MANUAL`. It does not, by itself, extract any finding
+    from that document: grounding runs against the corpus in a separate pass
+    (:func:`run_corpus_pass`), which an operator appends deliberately. The
+    operator-visible warning below therefore says only that the paper was admitted,
+    which is all that has happened at this point.
 
     A failure here must never take down the run: an unreadable inbox is an operator
     problem to be reported, not a reason to lose a literature search.
@@ -1496,6 +1681,60 @@ def run_literature_research(
     Raises:
         LiteratureRunLockedError: If another literature run holds the workspace lock.
     """
+    return _run_pass(workspace_root, campaign, action, deps, config=config, mode=LiteraturePassMode.SEARCH)
+
+
+def run_corpus_pass(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+) -> LiteratureReport:
+    """Re-read the papers this workspace already holds and ground findings in them.
+
+    The second pass. Carmel could previously acquire a paper and never use it: manual
+    admission stored an identity-checked document and stopped, and the state machine
+    has no edge back into a literature run, so a completed action could not re-run.
+    This closes that gap.
+
+    Reads the evidence store ONLY. No search, no fetching, no acquisition requests.
+    That is a deliberate restriction rather than a missing feature:
+
+    - **Reproducibility.** The input is a fixed set of sha256-addressed files, so a
+      reviewer re-running a benchmark gets the same input every time. A live search
+      cannot offer that.
+    - **Isolating what is under test.** This pass is the first time the deterministic
+      grounding gate runs against real downloaded bytes. Adding search would inject
+      fresh cost and nondeterminism into the very step being validated.
+
+    It cannot discover a finding that needs a paper not yet acquired. That is
+    accepted: discovery is what the search pass and the acquisition queue already do.
+
+    Raises:
+        LiteratureRunLockedError: If another literature run holds the workspace lock.
+    """
+    return _run_pass(workspace_root, campaign, action, deps, config=config, mode=LiteraturePassMode.CORPUS)
+
+
+def _run_pass(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    mode: LiteraturePassMode,
+) -> LiteratureReport:
+    """Shared scaffolding for one pass of either mode.
+
+    The run lock, the budget-to-stop-reason mapping, the decision-log events and the
+    fold into the accumulated report are identical for both, and must stay identical:
+    a corpus pass that could bypass the lock, or that mapped budget exhaustion to a
+    crash instead of a partial report, would be a second and weaker safety envelope.
+    Only the loop in the middle differs.
+    """
     workspace_root = Path(workspace_root)
     run_id = uuid.uuid4().hex
     report_id = uuid.uuid4().hex
@@ -1517,7 +1756,7 @@ def run_literature_research(
             event="literature.search_started",
             action_id=action.action_id,
             run_id=run_id,
-            payload={"campaign_id": campaign.campaign_id, "model_name": deps.model.name},
+            payload={"campaign_id": campaign.campaign_id, "model_name": deps.model.name, "mode": mode.value},
         )
         _collect_manual_acquisitions(
             workspace_root, config=config, state=state, log_path=log_path, action_id=action.action_id, run_id=run_id
@@ -1527,7 +1766,8 @@ def run_literature_research(
         try:
             session_budget().acquire_run_slot(config.budget.max_concurrent_runs)
             slot_acquired = True
-            _research_loop(
+            loop = _corpus_loop if mode == LiteraturePassMode.CORPUS else _research_loop
+            loop(
                 workspace_root,
                 campaign,
                 deps,
@@ -1566,7 +1806,7 @@ def run_literature_research(
                 run_id=run_id,
                 action_id=action.action_id,
                 created_at=created_at,
-                mode=LiteraturePassMode.SEARCH,
+                mode=mode,
                 model_name=deps.model.name,
                 stop_reason=state.stop_reason,
                 usage=deps.ledger.usage(),

@@ -33,7 +33,11 @@ __all__ = [
     "VERIFIER_SYSTEM_PROMPT",
     "LiteratureProposal",
     "ProposedFinding",
+    "CORPUS_SYSTEM_PROMPT",
+    "CorpusFinding",
+    "CorpusProposal",
     "VerifierAssessment",
+    "build_corpus_agent",
     "build_literature_agent",
     "build_verifier_agent",
 ]
@@ -144,6 +148,87 @@ class VerifierAssessment(CredenceVerdict):
     """
 
 
+class CorpusFinding(BaseModel):
+    """One finding the agent CLAIMS to have found in an already-held document.
+
+    Differs from :class:`ProposedFinding` in exactly one way, and it is the point of
+    the whole corpus pass: the evidence is named by ``artifact_sha256``, a document
+    Carmel already possesses, rather than by a URL it would have to go and fetch.
+    Nothing else about the evidentiary contract changes -- the quote is still checked
+    against the real bytes by the same deterministic gate, and identity is still
+    checked against the document's own text.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    payload: FindingPayload
+    citation: Citation
+    verbatim_quote: str = Field(min_length=40)
+    """Same 40-character floor as :class:`ProposedFinding`, for the same reason: a
+    degenerate quote matches almost any document and skips the gate's downstream
+    fuzzy-mismatch and numeric-discrepancy defenses."""
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    """Which held document contains the quote. Constrained to a sha256 digest so a
+    hallucinated handle fails validation immediately rather than being looked up."""
+
+
+class CorpusProposal(BaseModel):
+    """The Corpus Agent's structured output for one round.
+
+    There is no ``queries`` channel and no ``wanted`` channel. A corpus pass cannot
+    search and cannot request papers -- it reads what is already held. Omitting those
+    fields entirely, rather than accepting and discarding them, means the schema
+    itself states the boundary instead of relying on the orchestrator to enforce it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    findings: list[CorpusFinding] = Field(default_factory=list)
+    done: bool = False
+    """The agent's self-stop signal: True means it has nothing further to extract
+    from the corpus."""
+
+
+CORPUS_SYSTEM_PROMPT = """\
+You are Carmel's Literature Agent, working in CORPUS mode.
+
+You are given the full text of papers Carmel already holds. Your job is to extract
+experimental benchmarks, prior kinetic models, and quantum-chemistry calculation
+results relevant to the campaign, as structured findings grounded in those papers.
+
+You have NO search and NO web access, and you need none: every document you may use is
+already in front of you. Do not report a finding about any paper not listed below, and
+never speculate about what an unlisted paper might contain.
+
+Non-negotiable evidentiary rules — findings that break them WILL be rejected by a
+deterministic gate that checks your claims against the actual stored bytes:
+
+1. VERBATIM QUOTES ONLY. `verbatim_quote` must be copied EXACTLY, character for
+   character, from the document text shown to you. Never paraphrase, never summarize,
+   never "clean up" a sentence, and never repair what looks like an extraction error.
+   The quote must be at least 40 characters long.
+2. `artifact_sha256` must be the digest of the document the quote actually came from,
+   copied from the corpus listing. Quoting document A while naming document B is the
+   single worst error you can make here: it attaches one paper's evidence to another
+   paper's citation.
+3. REAL CITATIONS, taken from the document itself. The citation must describe the
+   paper the quote came from -- the DOI and title as that paper states them. Do not
+   cite a work that the document merely references. If the document is a review that
+   quotes a measurement from elsewhere, the finding belongs to whatever the review
+   itself is, not to the primary source it cites, and the identity check will refuse
+   it if you claim otherwise.
+4. TYPED NUMERIC VALUES WITH UNITS. Every quantity must be reported as a typed numeric
+   value with its unit (e.g. value=1.25, unit="ms"). The quoted text must contain the
+   same numbers.
+
+Extracting nothing is a valid and honest outcome. If the corpus does not support a
+finding relevant to this campaign, set `done` to true and report no findings. A
+fabricated or loosely-grounded finding is far worse than an empty result: the entire
+point of this system is that a claim which cannot be traced to real bytes does not
+survive.
+"""
+
+
 LITERATURE_SYSTEM_PROMPT = """\
 You are Carmel's Literature Agent: a combustion-chemistry literature researcher.
 
@@ -242,6 +327,32 @@ def build_literature_agent(
         tools=tools,
         ledger=ledger,
         output_schema=LiteratureProposal,
+    )
+
+
+def build_corpus_agent(*, model: ModelProtocol, ledger: BudgetLedger) -> CarmelAgent:
+    """Build the Literature Agent's corpus persona.
+
+    Takes no ``tools`` parameter at all, where :func:`build_literature_agent` accepts
+    one. A corpus pass performs no search and no fetching, so there is nothing a tool
+    could legitimately do; making that unrepresentable here means a future caller
+    cannot quietly hand this agent web access and turn a reproducible pass into a
+    live one.
+
+    Args:
+        model: The model to call (mock or real).
+        ledger: Budget ledger gating this agent's model calls.
+
+    Returns:
+        A configured :class:`CarmelAgent` producing :class:`CorpusProposal`.
+    """
+    return CarmelAgent(
+        name="literature_corpus",
+        system_prompt=CORPUS_SYSTEM_PROMPT,
+        model=model,
+        tools=(),
+        ledger=ledger,
+        output_schema=CorpusProposal,
     )
 
 

@@ -29,7 +29,8 @@ from carmel.agents.literature_agent import (
 )
 from carmel.agents.models import AgentBridgeError, MockModel
 from carmel.agents.tools.academic import OaResolution, OpenAccessResolver
-from carmel.agents.tools.fetch import FetchError, HttpFetchTool, MockFetchTool
+from carmel.agents.tools.extract import extract_text
+from carmel.agents.tools.fetch import FetchedArtifact, FetchError, HttpFetchTool, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
 from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
 from carmel.schemas import (
@@ -48,13 +49,19 @@ from carmel.schemas import (
 )
 from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
-from carmel.schemas.literature import GroundingStatus, LiteraturePassMode, LiteratureReport, StopReason
+from carmel.schemas.literature import (
+    ArtifactProvenance,
+    GroundingStatus,
+    LiteraturePassMode,
+    LiteratureReport,
+    StopReason,
+)
 from carmel.services import chem
 from carmel.services import literature as literature_module
 from carmel.services.acquisition import inbox_dir, load_manifest, record_request
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
-from carmel.services.evidence import EVIDENCE_LITERATURE_DIR
+from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
 from carmel.services.literature import (
     LITERATURE_REPORT_NAME,
     LOCK_GRACE_S,
@@ -64,6 +71,7 @@ from carmel.services.literature import (
     LiteratureRunLockedError,
     build_deps,
     load_literature_report,
+    run_corpus_pass,
     run_literature_research,
     run_record_for,
 )
@@ -1764,3 +1772,215 @@ class TestReportAccumulatesAcrossPasses:
         assert all(item.action_id == "lit-a1" for item in produced)
         assert report.findings_for(report.run_id) == report.findings
         assert report.findings_for("a-run-that-never-happened") == []
+
+
+SECOND_QUOTE = "The measured ignition delay time was 3.40 ms at 900 K in the same shock tube."
+SECOND_DOI = "10.1000/second.doi"
+SECOND_DOC = (
+    "A second shock tube study of argon-diluted ignition\n"
+    "R. Jones and K. Lee (2021)\n"
+    f"doi: {SECOND_DOI}\n\n"
+    "Results\n\n"
+    f"{SECOND_QUOTE}\n"
+    "Further discussion here.\n"
+)
+
+
+def _store(workspace_root: Path, *, text: str, url: str) -> str:
+    """Put one document into the workspace's evidence store, as a real artifact."""
+    data = text.encode()
+    stored = store_artifact(
+        workspace_root,
+        data=data,
+        artifact=FetchedArtifact(
+            url=url,
+            final_url=url,
+            sha256=hashlib.sha256(data).hexdigest(),
+            content_type="text/plain",
+            n_bytes=len(data),
+            fetched_at=datetime.now(UTC),
+        ),
+        extracted=extract_text(data, "text/plain"),
+        provenance=ArtifactProvenance.MANUAL,
+        max_bytes=10_000_000,
+    )
+    return stored.sha256
+
+
+def _corpus_finding(
+    *, sha256: str, quote: str = QUOTE, doi: str = DOI, title: str = "A shock tube study of oxygen ignition"
+) -> dict[str, Any]:
+    return {
+        "payload": {
+            "category": "experimental_benchmark",
+            "reactor_type": "shock_tube",
+            "observable": "ignition_delay_time",
+            "observable_raw": "ignition delay time",
+            "species": [{"raw_name": "O2"}],
+            "measured": [{"value": 1.25, "unit": "ms"}],
+        },
+        "citation": {"title": title, "authors": ["J. Smith"], "year": 2020, "doi": doi},
+        "verbatim_quote": quote,
+        "artifact_sha256": sha256,
+    }
+
+
+def _corpus_proposal(findings: list[dict[str, Any]] | None = None, *, done: bool = True) -> dict[str, Any]:
+    return {"findings": findings or [], "done": done}
+
+
+class TestCorpusPass:
+    """The second pass: re-read what the workspace already holds.
+
+    Closes the gap where Carmel could acquire a paper and never use it, and is the
+    first time the deterministic grounding gate runs against real stored bytes.
+    """
+
+    def test_a_grounded_corpus_finding_lands_in_the_report(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.latest.mode == LiteraturePassMode.CORPUS
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        finding = report.findings[0]
+        assert finding.evidence.artifact_sha256 == sha
+        assert finding.grounding.grounded is True
+        assert finding.run_id == report.run_id
+
+    def test_the_pass_never_searches_and_never_fetches(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reproducibility is the whole point: the input must be exactly the stored
+        bytes, so a corpus pass that quietly reached the network would defeat it."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        def _forbidden(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a corpus pass reached the network")
+
+        monkeypatch.setattr(deps.search, "search", _forbidden)
+        monkeypatch.setattr(deps.fetch, "fetch", _forbidden)
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, "the pass must still work with the network forbidden"
+        assert deps.ledger.usage().fetches == 0
+        assert deps.ledger.usage().index_lookups == 0
+        assert report.queries == []
+
+    def test_a_quote_absent_from_the_named_document_is_rejected(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate running against real stored bytes, which is the thing this whole
+        increment exists to exercise."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        fabricated = "The measured ignition delay time was 9.99 ms at 2500 K under these conditions."
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha, quote=fabricated)])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.grounded is False
+
+    def test_quoting_one_document_while_naming_another_is_rejected(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worst error available in corpus mode: real quote, real document, wrong
+        pairing. It would attach one paper's evidence to another paper's citation,
+        producing a finding that looks fully grounded and is entirely false."""
+        _patch_chem_success(monkeypatch)
+        sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        sha_two = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        assert sha_one != sha_two
+        # A verbatim quote from document TWO, attributed to document ONE.
+        deps, _, config = _make_deps(
+            [_corpus_proposal([_corpus_finding(sha256=sha_one, quote=SECOND_QUOTE)]), _assessment()]
+        )
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == [], "a quote from a different document must never ground"
+        assert len(report.rejected) == 1
+
+    def test_a_finding_naming_an_unheld_document_is_rejected_not_dropped(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reader of the report must be able to see that the agent claimed evidence
+        which does not exist. Silently discarding it would hide that."""
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        absent = "0" * 64
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=absent)])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.status == GroundingStatus.NO_ARTIFACT
+        assert absent in report.rejected[0].reason
+
+    def test_an_unreadable_held_document_does_not_queue_an_acquisition(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one rejection reason that DOES queue an acquisition in a search pass --
+        an artifact Carmel could not read -- must not do so here.
+
+        In a search pass, "unreadable" means the fetched copy was bad and a human with
+        a subscription might obtain a better one. In a corpus pass the document is
+        already in the workspace, so asking a human to go and get it is nonsense: the
+        remedy is mechanical re-extraction, not acquisition. Without this, a corpus
+        pass would refill the operator's queue with papers they already supplied.
+        """
+        _patch_chem_success(monkeypatch)
+        # Extraction that lost word spacing: real bytes, genuinely unreadable text.
+        run_together = "Mechanismandkineticsoftheisothermaloxidationofoxygeninshocktubesatelevatedpressure" * 40
+        sha = _store(campaign.workspace_root, text=run_together, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.status == GroundingStatus.ARTIFACT_UNREADABLE
+        assert load_manifest(campaign.workspace_root).requests == [], (
+            "a corpus pass must never queue acquisition for a paper the workspace already holds"
+        )
+
+    def test_an_empty_corpus_stops_without_calling_the_model(self, campaign: Campaign) -> None:
+        """Nothing to read is an honest outcome, and must not cost a model call."""
+        deps, model, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+        assert report.findings == []
+        assert deps.ledger.usage().model_calls == 0
+        assert any("nothing to read" in w for w in report.latest.warnings)
+
+    def test_a_corpus_pass_appends_to_an_existing_search_report(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 0004/D1 end to end: the second pass adds to the record rather
+        than replacing it, and the two passes are distinguishable by mode."""
+        _patch_chem_success(monkeypatch)
+        search_deps, _, search_config = _make_deps([_proposal(queries=["first query"], done=True)])
+        first = run_literature_research(campaign.workspace_root, campaign, _action(), search_deps, config=search_config)
+
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, second_action, deps, config=config)
+
+        assert [p.mode for p in report.passes] == [LiteraturePassMode.SEARCH, LiteraturePassMode.CORPUS]
+        assert [p.run_id for p in report.passes] == [first.run_id, report.run_id]
+        assert [q.text for q in report.queries] == ["first query"], "a corpus pass contributes no queries"
+        assert report.findings_for(report.run_id) == report.findings
