@@ -300,7 +300,7 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
     as a silent success.
     """
     from carmel.schemas.acquisition import AcquisitionStatus
-    from carmel.services.acquisition import admit_file
+    from carmel.services.acquisition import AlreadyAcquired, admit_file
 
     try:
         entries = sorted(directory.iterdir())
@@ -336,6 +336,14 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
 
         try:
             request = admit_file(ws, entry, slug=None, max_bytes=max_bytes)
+        except AlreadyAcquired as exc:
+            # Caught BEFORE ValueError, which it subclasses. Re-offering a paper the
+            # store already holds is the ordinary shape of re-running an ingest over a
+            # download folder, so it is a skip: it must not count as a rejection, and
+            # must not by itself turn a successful run into a non-zero exit.
+            skipped += 1
+            print(f"SKIPPED   {entry.name} (already acquired as {exc.slug})")
+            continue
         except (OSError, ValueError) as exc:
             rejected += 1
             print(f"REJECTED  {entry.name}: {exc}")
@@ -351,7 +359,12 @@ def _admit_directory(ws: Path, directory: Path, *, max_bytes: int) -> int:
         print()
 
     print(f"{accepted} accepted, {rejected} rejected, {skipped} skipped")
-    return 0 if accepted and not rejected else 1
+    # A folder in which every paper was already acquired is a success, not a failure --
+    # requiring `accepted` outright would fail the second run of an ingest that fully
+    # succeeded the first time.
+    if rejected:
+        return 1
+    return 0 if (accepted or skipped) else 1
 
 
 def _cmd_requests(
@@ -381,7 +394,14 @@ def _cmd_requests(
     from carmel.config import AgentBudgetConfig, load_config
     from carmel.paths import default_workspaces_root
     from carmel.schemas.acquisition import AcquisitionStatus
-    from carmel.services.acquisition import admit_file, collect_inbox, drop_path_for, inbox_dir, pending_requests
+    from carmel.services.acquisition import (
+        AlreadyAcquired,
+        admit_file,
+        collect_inbox,
+        drop_path_for,
+        inbox_dir,
+        pending_requests,
+    )
     from carmel.services.campaigns import find_campaign_workspace
 
     root = workspaces.expanduser() if workspaces is not None else default_workspaces_root()
@@ -428,6 +448,11 @@ def _cmd_requests(
             return _admit_directory(ws, add, max_bytes=max_bytes)
         try:
             request = admit_file(ws, add, slug=slug, max_bytes=max_bytes)
+        except AlreadyAcquired as exc:
+            # Exit 0: the operator asked for this paper to be in the store, and it is.
+            print(f"SKIPPED   {add.name}")
+            print(f"          already acquired as {exc.slug}; the evidence store is unchanged.")
+            return 0
         except (OSError, ValueError) as exc:
             print(f"Could not admit {add}: {exc}")
             return 1

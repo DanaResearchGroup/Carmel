@@ -27,6 +27,7 @@ from carmel.schemas.acquisition import (
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.acquisition import (
+    AlreadyAcquired,
     admit_file,
     check_identity,
     collect_inbox,
@@ -677,3 +678,217 @@ class TestAdmitFile:
         assert second.fulfilled_sha256
         drop_path = drop_path_for(tmp_path, queued.slug)
         assert drop_path.read_bytes() == correct.read_bytes()
+
+
+class TestAlreadyAcquired:
+    """Re-offering a paper Carmel already holds is a no-op, not a rejection.
+
+    The batch case this covers was observed live: an ingest re-run over a download
+    folder produced five "rejections" of papers that were in fact already in the
+    evidence store, three of them with a note accusing a correct paper of not looking
+    like itself. Every outcome was ultimately right, but the report was actively
+    misleading, which is how an operator learns to stop trusting the verdicts.
+    """
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def _fulfil(self, tmp_path: Path, queued: AcquisitionRequest) -> Path:
+        source = _source(tmp_path, "paper.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+        assert request.status == AcquisitionStatus.FULFILLED
+        return source
+
+    def test_the_same_bytes_offered_twice_are_reported_as_already_acquired(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        source = self._fulfil(tmp_path, queued)
+
+        with pytest.raises(AlreadyAcquired) as caught:
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert caught.value.slug == queued.slug
+
+    def test_already_acquired_is_a_valueerror_so_untaught_callers_do_not_crash(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """Callers that predate this distinction catch ValueError around admit_file. The
+        new signal must refine their behaviour, never turn it into an unhandled crash."""
+        source = self._fulfil(tmp_path, queued)
+
+        with pytest.raises(ValueError):
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+
+    def test_a_different_copy_of_an_acquired_paper_is_recognised_by_content(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The same work re-downloaded from another source has different bytes, so the
+        hash check cannot see it; the identity check must."""
+        self._fulfil(tmp_path, queued)
+        second = record_request(
+            tmp_path,
+            title=SECOND_TITLE,
+            doi=SECOND_DOI,
+            landing_url="https://doi.org/" + SECOND_DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        assert second.status == AcquisitionStatus.REQUESTED
+        other_copy = _source(tmp_path, "other-copy.pdf", f"{TITLE}\nDOI: {DOI}\nA different rendering entirely.")
+
+        with pytest.raises(AlreadyAcquired) as caught:
+            admit_file(tmp_path, other_copy, max_bytes=10_000_000)
+
+        assert caught.value.slug == queued.slug
+        # The unrelated outstanding request must be untouched -- not rejected, not noted.
+        reloaded = {r.slug: r for r in load_manifest(tmp_path).requests}
+        assert reloaded[second.slug].status == AcquisitionStatus.REQUESTED
+        assert not reloaded[second.slug].identity_note
+
+    def test_an_already_acquired_paper_never_displaces_the_stored_artifact(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        source = self._fulfil(tmp_path, queued)
+        fulfilled = {r.slug: r for r in load_manifest(tmp_path).requests}[queued.slug]
+        before = fulfilled.fulfilled_sha256
+
+        with pytest.raises(AlreadyAcquired):
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        after = {r.slug: r for r in load_manifest(tmp_path).requests}[queued.slug]
+        assert after.status == AcquisitionStatus.FULFILLED
+        assert after.fulfilled_sha256 == before
+
+
+class TestSoleRequestAttributionIsLabelled:
+    """A file attributed to the last outstanding request must say that is why.
+
+    Live defect this closes: with one request left pending, four unrelated files were
+    each attributed to it and each flipped it to REJECTED, the surviving note describing
+    whichever file happened to sort last. The attribution is kept -- it is what produces
+    a real diagnostic instead of a bare "matched nothing" -- but it must not read as an
+    assertion the operator never made.
+    """
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_an_unrelated_file_is_rejected_but_the_note_says_it_was_never_offered(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        unrelated = _source(tmp_path, "unrelated.pdf", "Micron sized aluminium particle combustion in a shock tube")
+
+        request = admit_file(tmp_path, unrelated, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "sole one left" in request.identity_note
+        # The underlying diagnostic survives the prefix; it is what tells the operator
+        # WHY, and losing it was the regression that made a blunter fix unacceptable.
+        assert "does not look like this paper" in request.identity_note
+
+    def test_an_explicitly_slugged_mismatch_is_not_labelled_that_way(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """Passing slug= IS the operator asserting this file is for that paper, so the
+        note must report the mismatch plainly rather than excusing it."""
+        unrelated = _source(tmp_path, "unrelated.pdf", "Micron sized aluminium particle combustion in a shock tube")
+
+        request = admit_file(tmp_path, unrelated, slug=queued.slug, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "sole one left" not in request.identity_note
+
+    def test_a_matching_file_is_not_labelled_as_a_fallback(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        correct = _source(tmp_path, "correct.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+
+        request = admit_file(tmp_path, correct, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.FULFILLED
+        assert "sole one left" not in (request.identity_note or "")
+
+
+class TestInferencePrefersTheStrongerSignal:
+    """When several outstanding papers match, a printed DOI outranks title overlap.
+
+    A focused campaign queues papers from one subfield, whose titles overlap by
+    construction, so title-only collisions are the normal case rather than an edge one.
+    This narrows an already-passing set -- it can never admit something check_identity
+    refused, which is the only safe direction: an erratum scores ~0.95 against its own
+    paper's title, so any fuzzy similarity score would reopen the defect the
+    secondary-document gate exists to close.
+    """
+
+    def test_the_doi_bearing_candidate_wins_over_a_title_only_collision(self, tmp_path: Path) -> None:
+        shared = "Laminar flame speeds of syngas hydrogen carbon monoxide air mixtures"
+        first = record_request(
+            tmp_path,
+            title=shared,
+            doi="10.1016/j.first.2020.01.001",
+            landing_url="https://doi.org/10.1016/j.first.2020.01.001",
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        second = record_request(
+            tmp_path,
+            title=shared + " at elevated pressure",
+            doi="10.1016/j.second.2020.01.002",
+            landing_url="https://doi.org/10.1016/j.second.2020.01.002",
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        # Text matching BOTH titles by word overlap, but printing only the second's DOI.
+        source = _source(
+            tmp_path,
+            "ambiguous.pdf",
+            f"{shared} at elevated pressure\nDOI: {second.doi}\nAbstract: measurements follow.",
+        )
+
+        request = admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        assert request.slug == second.slug
+        assert request.status == AcquisitionStatus.FULFILLED
+        reloaded = {r.slug: r for r in load_manifest(tmp_path).requests}
+        assert reloaded[first.slug].status == AcquisitionStatus.REQUESTED
+
+    def test_two_candidates_with_neither_doi_present_still_refuse_to_guess(self, tmp_path: Path) -> None:
+        """The tie-break is a preference among stronger evidence, not a licence to pick
+        one when no stronger evidence exists.
+
+        The two titles must differ (a title-derived slug makes identical titles one
+        request, not two) while both being fully contained in the document, which is
+        exactly the shape a paper and its extended companion study take.
+        """
+        narrower = "Laminar flame speeds of syngas hydrogen carbon monoxide air mixtures"
+        broader = narrower + " at elevated pressure"
+        record_request(
+            tmp_path,
+            title=narrower,
+            doi=None,
+            landing_url="https://example.org/first",
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        record_request(
+            tmp_path,
+            title=broader,
+            doi=None,
+            landing_url="https://example.org/second",
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = _source(tmp_path, "ambiguous.pdf", f"{broader}\nAbstract: measurements follow.")
+
+        with pytest.raises(ValueError, match="cannot tell which pending request"):
+            admit_file(tmp_path, source, max_bytes=10_000_000)
+
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())

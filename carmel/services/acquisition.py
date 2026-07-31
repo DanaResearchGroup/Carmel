@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -326,6 +327,45 @@ def _gate_on_secondary_document_marker(ok: bool, note: str, *, marker: str | Non
     return ok, note
 
 
+class AlreadyAcquired(ValueError):
+    """A dropped file is a paper the evidence store already holds.
+
+    Deliberately a :class:`ValueError` subclass: every existing caller catches
+    ``ValueError`` around :func:`admit_file`, and this must not become a crash for one
+    that has not been taught the distinction. Callers that HAVE been taught it catch this
+    first and report a skip, because re-offering a paper Carmel already has is a no-op,
+    not an error -- reporting it as a rejection tells the operator their download was bad
+    when it was in fact accepted on an earlier pass.
+
+    Attributes:
+        slug: The request this file was already acquired for.
+    """
+
+    def __init__(self, slug: str, detail: str) -> None:
+        super().__init__(f"already acquired as {slug} ({detail}); nothing to do")
+        self.slug = slug
+
+
+def _doi_in_front_matter(extracted: ExtractedText, request: AcquisitionRequest) -> bool:
+    """Whether ``request``'s DOI is printed in the document's own front matter.
+
+    Split out of :func:`check_identity` so that the *strength* of a match can be asked
+    about separately from whether it passed, with exactly one implementation of the
+    whitespace-tolerant comparison. A DOI can be broken across lines by PDF extraction
+    ("10.1016/j.ijhy\\ndene.2012.10.075"), so the collapsed form is compared too.
+
+    This answers a strictly narrower question than :func:`check_identity` and must never
+    be used in its place: on its own a DOI hit does NOT establish identity (an erratum or
+    a landing page prints the DOI of the paper it concerns). It is only ever used to rank
+    candidates that have ALREADY passed the full check.
+    """
+    if not request.doi:
+        return False
+    head = extracted.text[:IDENTITY_SEARCH_CHARS].lower()
+    doi = request.doi.lower()
+    return doi in head or re.sub(r"\s+", "", doi) in re.sub(r"\s+", "", head)
+
+
 def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tuple[bool, str]:
     """Verify that a dropped document really is the requested paper.
 
@@ -368,7 +408,6 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
         )
 
     head = extracted.text[:IDENTITY_SEARCH_CHARS].lower()
-    collapsed = re.sub(r"\s+", "", head)
 
     title_words = [
         word for word in _WORD_RE.findall(request.title.lower()) if len(word) > 2 and word not in _TITLE_STOPWORDS
@@ -376,10 +415,7 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
     present = sum(1 for word in set(title_words) if word in head) if title_words else 0
     ratio = present / len(set(title_words)) if title_words else 0.0
 
-    doi_found = False
-    if request.doi:
-        doi = request.doi.lower()
-        doi_found = doi in head or re.sub(r"\s+", "", doi) in collapsed
+    doi_found = _doi_in_front_matter(extracted, request)
 
     # Computed ONCE, ahead of both accept branches below, and both branches' ``True``
     # returns are routed through :func:`_gate_on_secondary_document_marker` -- see that
@@ -597,11 +633,56 @@ def _admit_one(
         return None
 
 
-def _infer_slug(source: Path, pending: list[AcquisitionRequest], *, max_bytes: int) -> str:
+def _already_stored_slug(source: Path, acquired: Sequence[AcquisitionRequest], *, max_bytes: int) -> str | None:
+    """The slug whose stored artifact is byte-for-byte ``source``, if any.
+
+    Args:
+        source: The operator's file, not yet copied anywhere.
+        acquired: Fulfilled requests, each carrying its artifact's ``fulfilled_sha256``.
+        max_bytes: Same cap the admission path enforces. A file over the cap is not
+            hashed -- it cannot be admitted anyway, and the point of the cap is to avoid
+            reading oversized operator input into memory at all.
+
+    Returns:
+        The matching slug, or ``None`` when the file is over the cap, unreadable, or
+        simply not one of the stored artifacts. Never raises: this is an optimisation on
+        the way to the real checks, so any difficulty here must fall through to them
+        rather than becoming the operator's error message.
+    """
+    by_sha = {r.fulfilled_sha256: r.slug for r in acquired if r.fulfilled_sha256}
+    if not by_sha:
+        return None
+    try:
+        if source.stat().st_size > max_bytes:
+            return None
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return by_sha.get(digest)
+
+
+def _infer_slug(
+    source: Path,
+    pending: list[AcquisitionRequest],
+    *,
+    max_bytes: int,
+    acquired: Sequence[AcquisitionRequest] = (),
+) -> tuple[str, bool]:
     """Work out which pending request ``source`` is meant to fulfil, when the caller
     did not say. NEVER guesses between two plausible papers: a wrong guess attaches
     one paper's bytes to another paper's citation, exactly the failure this whole
     subsystem exists to prevent.
+
+    When exactly one request is outstanding and nothing matched, the file is still
+    attributed to it -- but the second element of the return value says so, so the
+    caller can label the resulting rejection honestly. That distinction is the fix for
+    an observed batch-ingest defect: attributing on "it is the only one left" alone let
+    four unrelated files each flip one innocent request to ``REJECTED``, leaving a note
+    accusing it of not looking like itself, and it survived only because the file that
+    genuinely matched it happened to sort last. The attribution is kept because it is
+    what produces the precise diagnostic an operator needs ("this is an erratum", "the
+    file is over the cap") instead of a bare "matched nothing"; what changes is that the
+    note no longer claims the operator offered this file for that paper.
 
     Args:
         source: The operator's file, not yet copied anywhere.
@@ -609,32 +690,47 @@ def _infer_slug(source: Path, pending: list[AcquisitionRequest], *, max_bytes: i
         max_bytes: Hard cap on the file read for inference -- the same cap
             :func:`_admit_one` enforces on the file actually admitted, applied here too
             since this reads the same untrusted operator-dropped bytes.
+        acquired: Already-fulfilled requests, consulted ONLY when no pending request
+            matches, so that re-offering a paper Carmel already holds is reported as
+            such instead of as an unresolvable file.
 
     Returns:
-        The one slug this file can be confidently matched to.
+        ``(slug, matched_on_evidence)``. ``matched_on_evidence`` is ``True`` when the
+        document's own text identified the request, and ``False`` when it was attributed
+        to the sole outstanding request without matching it.
 
     Raises:
-        ValueError: no requests are pending, the file is over ``max_bytes``, or the
-            file's extracted text does not let :func:`check_identity` settle on exactly
-            one candidate.
+        AlreadyAcquired: the file is a paper already in the evidence store.
+        ValueError: no requests are pending, or -- with more than one outstanding -- the
+            file could not be read or its text does not settle on exactly one candidate.
     """
     if not pending:
         raise ValueError("no acquisition requests are pending; there is nothing to admit this file against")
-    if len(pending) == 1:
-        return pending[0].slug
 
     candidates = ", ".join(sorted(r.slug for r in pending))
+    # With one request outstanding there is no ambiguity to resolve, so a file we cannot
+    # read is still attributed to it and rejected with a real reason ("over the cap",
+    # "no extractable text"). With several, an unreadable file is genuinely unresolvable
+    # and must raise rather than pick one.
+    sole = pending[0].slug if len(pending) == 1 else None
+
+    def _unresolvable(detail: str) -> ValueError:
+        return ValueError(
+            f"could not read {source} well enough to infer which request it is for: {detail}. "
+            f"Pass slug= explicitly. Candidates: {candidates}"
+        )
 
     # Stat before reading, same reasoning as in `_admit_one`: a huge file must be
     # rejected without being pulled fully into memory first.
     try:
         st_size = source.stat().st_size
     except OSError as exc:
-        raise ValueError(
-            f"could not read {source} well enough to infer which request it is for: {exc}. "
-            f"Pass slug= explicitly. Candidates: {candidates}"
-        ) from exc
+        if sole is not None:
+            return sole, False
+        raise _unresolvable(str(exc)) from exc
     if st_size > max_bytes:
+        if sole is not None:
+            return sole, False
         raise ValueError(
             f"{source} is {st_size} bytes, over the {max_bytes} cap, so it cannot be read to "
             f"infer which request it is for. Pass slug= explicitly. Candidates: {candidates}"
@@ -643,13 +739,14 @@ def _infer_slug(source: Path, pending: list[AcquisitionRequest], *, max_bytes: i
     try:
         data = source.read_bytes()
     except OSError as exc:
-        raise ValueError(
-            f"could not read {source} well enough to infer which request it is for: {exc}. "
-            f"Pass slug= explicitly. Candidates: {candidates}"
-        ) from exc
+        if sole is not None:
+            return sole, False
+        raise _unresolvable(str(exc)) from exc
 
     # TOCTOU: enforce the cap again against what was actually read.
     if len(data) > max_bytes:
+        if sole is not None:
+            return sole, False
         raise ValueError(
             f"{source} is {len(data)} bytes, over the {max_bytes} cap, so it cannot be read to "
             f"infer which request it is for. Pass slug= explicitly. Candidates: {candidates}"
@@ -658,14 +755,46 @@ def _infer_slug(source: Path, pending: list[AcquisitionRequest], *, max_bytes: i
     try:
         extracted = extract_text(data, _sniff_content_type(data))
     except Exception as exc:  # noqa: BLE001 - inference failing must not crash, just refuse to guess
-        raise ValueError(
-            f"could not read {source} well enough to infer which request it is for: {exc}. "
-            f"Pass slug= explicitly. Candidates: {candidates}"
-        ) from exc
+        if sole is not None:
+            return sole, False
+        raise _unresolvable(str(exc)) from exc
 
-    matches = [r.slug for r in pending if check_identity(extracted, r)[0]]
+    matches = [r for r in pending if check_identity(extracted, r)[0]]
+
+    if len(matches) > 1:
+        # Break the tie by preferring the STRONGER signal, never a weaker one: a
+        # candidate whose DOI is printed in this document's own front matter beats
+        # candidates that matched on title words alone. Papers in one focused campaign
+        # share a subfield vocabulary heavily enough that title-only overlap collides by
+        # construction ("laminar flame speeds of ... syngas ... mixtures" describes
+        # several of them), while a DOI is unique to the work.
+        #
+        # This only ever narrows a set that ALREADY passed the full check, so it cannot
+        # admit anything :func:`check_identity` refused. That direction is the whole
+        # discipline: the fix for an ambiguous match is to demand a stronger signal, and
+        # NEVER to lower a threshold or blend the checks into a fuzzy similarity score --
+        # an erratum scores ~0.95 against its own paper's title and would sail through
+        # any such score, reopening precisely the defect the secondary-document marker
+        # gate exists to close.
+        doi_matches = [r for r in matches if _doi_in_front_matter(extracted, r)]
+        if len(doi_matches) == 1:
+            matches = doi_matches
+
     if len(matches) == 1:
-        return matches[0]
+        return matches[0].slug, True
+
+    if not matches:
+        # Nothing pending matched. Before treating this as a mismatch, ask whether it is a
+        # paper already in the store -- the common, entirely benign case of re-running an
+        # ingest over a download folder whose earlier files were accepted on a previous
+        # pass. Reporting that as a failure trains the operator to distrust correct
+        # verdicts. Checked ahead of the sole-request fallback below so that an
+        # already-held paper is never re-blamed on whatever is still outstanding.
+        for request in acquired:
+            if check_identity(extracted, request)[0]:
+                raise AlreadyAcquired(request.slug, "its content matches a request already fulfilled")
+        if sole is not None:
+            return sole, False
 
     raise ValueError(
         f"cannot tell which pending request this file is for ({len(matches)} matched); "
@@ -711,9 +840,24 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
     manifest = load_manifest(workspace_root)
     by_slug = {r.slug: r for r in manifest.requests}
 
+    # An explicitly passed slug IS the operator's assertion that this file is for that
+    # paper, so a mismatch is theirs to hear about plainly; only inference can attribute
+    # a file to a request the operator never named.
+    matched_on_evidence = True
+
     if slug is None:
+        acquired = [r for r in manifest.requests if r.status == AcquisitionStatus.FULFILLED]
+
+        # Exact bytes first: if this file IS an artifact already in the store, that is
+        # decisive and costs one hash, with no text extraction and no thresholds. Only
+        # when the bytes differ (the same paper re-downloaded from another source, so a
+        # different PDF of the same work) does the content-based check below get a say.
+        already = _already_stored_slug(source, acquired, max_bytes=max_bytes)
+        if already is not None:
+            raise AlreadyAcquired(already, "byte-for-byte identical to the stored artifact")
+
         pending = [r for r in manifest.requests if r.status in _PENDING_STATUSES]
-        slug = _infer_slug(source, pending, max_bytes=max_bytes)
+        slug, matched_on_evidence = _infer_slug(source, pending, max_bytes=max_bytes, acquired=acquired)
 
     request = by_slug.get(slug)
     if request is None:
@@ -735,6 +879,16 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
     if stored is not None:
         request.status = AcquisitionStatus.FULFILLED
         request.fulfilled_sha256 = stored.sha256
+    elif not matched_on_evidence:
+        # The operator never said this file was for this paper -- it was the only one
+        # outstanding. Say that in the note, so the record does not read as "the operator
+        # offered this paper and it was wrong" when it is really "nothing else was left to
+        # check it against". Without this the manifest's account of a batch ingest depends
+        # on the alphabetical order of the operator's filenames.
+        request.identity_note = (
+            f"this file matched no outstanding request and was checked against "
+            f"{request.slug} only because it was the sole one left: {request.identity_note}"
+        )
     save_manifest(workspace_root, manifest)
     return request
 

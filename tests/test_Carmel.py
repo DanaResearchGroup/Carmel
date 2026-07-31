@@ -955,3 +955,81 @@ class TestRequestsCommandAddDirectory:
         out = capsys.readouterr().out
         assert "empty" in out.lower()
         assert "nothing to admit" in out.lower()
+
+
+class TestRequestsCommandReIngest:
+    """Re-running an ingest over the same download folder must be a clean no-op.
+
+    Reproduces the live shape that motivated this: an operator re-runs the folder
+    ingest, and the papers accepted on the first pass come back as "REJECTED", some of
+    them with a note accusing a correct paper of not looking like itself. Every outcome
+    was right and the report was wrong, which is the failure mode that teaches an
+    operator to stop reading the verdicts.
+    """
+
+    _TITLE = "Shock tube ammonia oxidation ignition delay times"
+    _DOI = "10.1016/j.test.2019.01.001"
+
+    def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import record_request
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        record_request(
+            ws,
+            title=self._TITLE,
+            doi=self._DOI,
+            landing_url=f"https://doi.org/{self._DOI}",
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+        return load_campaign(ws).campaign_id, ws
+
+    def _folder(self, tmp_path: Path) -> Path:
+        lit = tmp_path / "lit"
+        lit.mkdir()
+        (lit / "publisher-named-download.txt").write_text(
+            f"{self._TITLE}\nDOI: {self._DOI}\nAbstract: ignition delay times.\n", encoding="utf-8"
+        )
+        return lit
+
+    def test_the_second_ingest_reports_skipped_not_rejected_and_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path)
+        lit = self._folder(tmp_path)
+        args = ["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]
+
+        assert main(args) == 0
+        capsys.readouterr()
+
+        # Exit 0 is the load-bearing half: a folder in which every paper is already held
+        # is a success. Requiring a fresh acceptance would fail the second run of an
+        # ingest that fully succeeded the first time.
+        assert main(args) == 0
+        out = capsys.readouterr().out
+        assert "SKIPPED" in out
+        assert "already acquired" in out
+        assert "REJECTED" not in out
+
+    def test_a_single_add_of_an_already_held_paper_also_exits_zero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path)
+        paper = self._folder(tmp_path) / "publisher-named-download.txt"
+        args = ["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(paper)]
+
+        assert main(args) == 0
+        capsys.readouterr()
+
+        assert main(args) == 0
+        out = capsys.readouterr().out
+        assert "already acquired" in out
+        assert "REJECTED" not in out
