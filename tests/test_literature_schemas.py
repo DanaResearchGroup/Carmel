@@ -21,10 +21,12 @@ from carmel.schemas.literature import (
     LiteratureFinding,
     LiteratureReport,
     ObservableKind,
+    PassRecord,
     PriorModelPayload,
     QMCalculationPayload,
     QMProperty,
     Quantity,
+    QueryRecord,
     RejectedFinding,
     SpeciesRef,
     StopReason,
@@ -264,24 +266,29 @@ class TestLiteratureReportRoundTrip:
         report = LiteratureReport(
             report_id="r1",
             campaign_id="c1",
-            action_id="a1",
-            run_id="run1",
             created_at=now,
-            queries=["ethanol ignition delay shock tube"],
+            passes=[
+                PassRecord(
+                    run_id="run1",
+                    action_id="a1",
+                    created_at=now,
+                    model_name="mock",
+                    stop_reason=StopReason.SELF_TERMINATED,
+                    usage=BudgetUsage(
+                        model_calls=3,
+                        tokens=1200,
+                        cost_usd=0.05,
+                        fetches=2,
+                        fetch_bytes=50000,
+                        elapsed_s=12.5,
+                    ),
+                    warnings=["one species could not be canonicalized"],
+                )
+            ],
+            queries=[QueryRecord(text="ethanol ignition delay shock tube", run_id="run1", action_id="a1")],
             artifacts=[artifact],
             findings=[finding],
             rejected=[rejected],
-            stop_reason=StopReason.SELF_TERMINATED,
-            model_name="mock",
-            usage=BudgetUsage(
-                model_calls=3,
-                tokens=1200,
-                cost_usd=0.05,
-                fetches=2,
-                fetch_bytes=50000,
-                elapsed_s=12.5,
-            ),
-            warnings=["one species could not be canonicalized"],
         )
 
         path = tmp_path / "literature_report.json"

@@ -87,7 +87,10 @@ from carmel.schemas.literature import (
     GroundingStatus,
     GroundingVerdict,
     LiteratureFinding,
+    LiteraturePassMode,
     LiteratureReport,
+    PassRecord,
+    QueryRecord,
     RejectedFinding,
     SpeciesRef,
     StopReason,
@@ -185,7 +188,71 @@ def load_literature_report(workspace_root: Path) -> LiteratureReport:
     Raises:
         FileNotFoundError: If no report has been saved for this workspace yet.
     """
-    return LiteratureReport.model_validate(read_json(workspace_root / LITERATURE_REPORT_NAME))
+    return LiteratureReport.model_validate(migrate_report_payload(read_json(workspace_root / LITERATURE_REPORT_NAME)))
+
+
+def migrate_report_payload(payload: object) -> object:
+    """Bring a persisted report payload up to the current schema version.
+
+    v1 held exactly one run, with that run's identifiers and outcome at the top
+    level. v2 accumulates passes, so the migration lifts those top-level fields into
+    a single :class:`PassRecord` and stamps every finding, rejection and query with
+    that run's identity -- the attribution was always true of a v1 report, it simply
+    had nowhere to be written down.
+
+    A live campaign already holds a v1 report on disk (the first real run), and it
+    contains the only existing evidence that the grounding gate refuses ungrounded
+    claims. Migrating rather than discarding is therefore not a courtesy to old
+    files; it preserves the demonstration.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if int(payload.get("schema_version", 1)) >= 2:
+        return payload
+
+    migrated = dict(payload)
+    run_id = str(migrated.pop("run_id", "") or "")
+    action_id = str(migrated.pop("action_id", "") or "")
+    created_at = migrated.get("created_at")
+    pass_record: dict[str, object] = {
+        "run_id": run_id,
+        "action_id": action_id,
+        "created_at": created_at,
+        "mode": LiteraturePassMode.SEARCH.value,
+        "model_name": migrated.pop("model_name", ""),
+        "stop_reason": migrated.pop("stop_reason", StopReason.ERROR.value),
+        "usage": migrated.pop("usage", None),
+        "warnings": migrated.pop("warnings", []),
+    }
+    migrated["passes"] = [pass_record]
+    migrated["queries"] = [
+        {"text": q, "run_id": run_id, "action_id": action_id} for q in migrated.get("queries", []) if q
+    ]
+    for key in ("findings", "rejected"):
+        items = migrated.get(key) or []
+        migrated[key] = [
+            {**item, "run_id": item.get("run_id") or run_id, "action_id": item.get("action_id") or action_id}
+            if isinstance(item, dict)
+            else item
+            for item in items
+        ]
+    migrated["schema_version"] = 2
+    return migrated
+
+
+def _load_previous_report(workspace_root: Path) -> LiteratureReport | None:
+    """The report this run will append to, or None on the first pass.
+
+    Deliberately called BEFORE the run does any work. If an existing report cannot
+    be read, the correct outcome is to refuse to start -- discovering it afterwards
+    would leave a finished run holding results it can only persist by overwriting
+    the record it failed to parse, which is how accumulated evidence gets destroyed
+    by an error handler.
+    """
+    try:
+        return load_literature_report(workspace_root)
+    except FileNotFoundError:
+        return None
 
 
 class LiteratureRunLockedError(RuntimeError):
@@ -680,6 +747,12 @@ class _RunState:
     acquisition_slugs: list[str] = field(default_factory=list)
     """Slugs queued for manual acquisition during this run, for the run summary."""
 
+    def query_records(self, pass_record: PassRecord) -> list[QueryRecord]:
+        """This run's executed queries, attributed to the pass that ran them."""
+        return [
+            QueryRecord(text=text, run_id=pass_record.run_id, action_id=pass_record.action_id) for text in self.queries
+        ]
+
 
 def _process_finding(
     workspace_root: Path,
@@ -720,6 +793,8 @@ def _process_finding(
         state.rejected.append(
             RejectedFinding(
                 finding_id=finding_id,
+                run_id=run_id,
+                action_id=action_id,
                 category=proposed.payload.category,
                 citation_title=proposed.citation.title,
                 grounding=verdict,
@@ -770,6 +845,8 @@ def _process_finding(
     state.findings.append(
         LiteratureFinding(
             finding_id=finding_id,
+            run_id=run_id,
+            action_id=action_id,
             payload=proposed.payload,
             citation=proposed.citation,
             verbatim_quote=proposed.verbatim_quote,
@@ -1357,6 +1434,49 @@ def _collect_manual_acquisitions(
     )
 
 
+def _report_with_pass(
+    previous: LiteratureReport | None,
+    *,
+    pass_record: PassRecord,
+    state: _RunState,
+    report_id: str,
+    campaign_id: str,
+    created_at: datetime,
+) -> LiteratureReport:
+    """Fold one finished pass into the campaign's accumulated literature report.
+
+    Artifacts are deduplicated by ``sha256`` because the evidence store is
+    content-addressed: the same paper re-encountered in a later pass is the same
+    bytes, and listing it twice would overstate how much evidence the campaign
+    holds. Findings and rejections are NOT deduplicated -- two passes reaching the
+    same conclusion independently is a real signal, and each carries its own
+    ``run_id`` so a reader can see that is what happened.
+    """
+    if previous is None:
+        return LiteratureReport(
+            report_id=report_id,
+            campaign_id=campaign_id,
+            created_at=created_at,
+            passes=[pass_record],
+            queries=state.query_records(pass_record),
+            artifacts=list(state.artifacts),
+            findings=list(state.findings),
+            rejected=list(state.rejected),
+        )
+
+    seen = {artifact.sha256 for artifact in previous.artifacts}
+    artifacts = list(previous.artifacts) + [a for a in state.artifacts if a.sha256 not in seen]
+    return previous.model_copy(
+        update={
+            "passes": [*previous.passes, pass_record],
+            "queries": [*previous.queries, *state.query_records(pass_record)],
+            "artifacts": artifacts,
+            "findings": [*previous.findings, *state.findings],
+            "rejected": [*previous.rejected, *state.rejected],
+        }
+    )
+
+
 def run_literature_research(
     workspace_root: Path,
     campaign: Campaign,
@@ -1390,6 +1510,7 @@ def run_literature_research(
         log_path=log_path,
     )
     try:
+        previous = _load_previous_report(workspace_root)
         state = _RunState(queries=[], artifacts=[], findings=[], rejected=[], warnings=[])
         append_typed_event(
             log_path,
@@ -1439,20 +1560,22 @@ def run_literature_research(
             if slot_acquired:
                 session_budget().release_run_slot()
 
-        report = LiteratureReport(
+        report = _report_with_pass(
+            previous,
+            pass_record=PassRecord(
+                run_id=run_id,
+                action_id=action.action_id,
+                created_at=created_at,
+                mode=LiteraturePassMode.SEARCH,
+                model_name=deps.model.name,
+                stop_reason=state.stop_reason,
+                usage=deps.ledger.usage(),
+                warnings=state.warnings,
+            ),
+            state=state,
             report_id=report_id,
             campaign_id=campaign.campaign_id,
-            action_id=action.action_id,
-            run_id=run_id,
             created_at=created_at,
-            queries=state.queries,
-            artifacts=state.artifacts,
-            findings=state.findings,
-            rejected=state.rejected,
-            stop_reason=state.stop_reason,
-            model_name=deps.model.name,
-            usage=deps.ledger.usage(),
-            warnings=state.warnings,
         )
         save_literature_report(workspace_root, report)
         append_typed_event(
@@ -1461,14 +1584,17 @@ def run_literature_research(
             action_id=action.action_id,
             run_id=run_id,
             payload={
-                "stop_reason": report.stop_reason.value,
-                "n_findings": len(report.findings),
-                "n_rejected": len(report.rejected),
+                "stop_reason": state.stop_reason.value,
+                "n_findings": len(state.findings),
+                "n_rejected": len(state.rejected),
             },
         )
+        # Counts describe THIS run, not the campaign's accumulated total. The report
+        # now spans every pass, so reading them off ``report`` would silently restate
+        # earlier passes' work as this one's each time a new pass is appended.
         grounding_summary: dict[str, int] = {}
-        for status in [f.grounding.status.value for f in report.findings] + [
-            r.grounding.status.value for r in report.rejected
+        for status in [f.grounding.status.value for f in state.findings] + [
+            r.grounding.status.value for r in state.rejected
         ]:
             grounding_summary[status] = grounding_summary.get(status, 0) + 1
         record_agent_provenance(
@@ -1482,12 +1608,12 @@ def run_literature_research(
                 "model_name": deps.model.name,
                 "provider": config.provider.value,
                 "tier": config.tier.value,
-                "queries": report.queries,
-                "artifacts": [a.sha256 for a in report.artifacts],
-                "usage": report.usage.model_dump(mode="json"),
-                "stop_reason": report.stop_reason.value,
-                "n_findings": len(report.findings),
-                "n_rejected": len(report.rejected),
+                "queries": list(state.queries),
+                "artifacts": [a.sha256 for a in state.artifacts],
+                "usage": deps.ledger.usage().model_dump(mode="json"),
+                "stop_reason": state.stop_reason.value,
+                "n_findings": len(state.findings),
+                "n_rejected": len(state.rejected),
                 "grounding_summary": grounding_summary,
                 "created_at": created_at.isoformat(),
             },

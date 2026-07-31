@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 import carmel.services.literature
 from carmel.agents.bridge import AgentTool, ModelResponse
-from carmel.agents.budget import BudgetLedger, session_budget
+from carmel.agents.budget import BudgetLedger, BudgetUsage, session_budget
 from carmel.agents.literature_agent import (
     LITERATURE_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
@@ -48,7 +48,7 @@ from carmel.schemas import (
 )
 from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
-from carmel.schemas.literature import GroundingStatus, LiteratureReport, StopReason
+from carmel.schemas.literature import GroundingStatus, LiteraturePassMode, LiteratureReport, StopReason
 from carmel.services import chem
 from carmel.services import literature as literature_module
 from carmel.services.acquisition import inbox_dir, load_manifest, record_request
@@ -263,7 +263,8 @@ class TestHappyPath:
         assert finding.credence.credence == pytest.approx(0.9)
         assert finding.payload.species[0].canonicalized is True  # type: ignore[union-attr]
         assert report.rejected == []
-        assert report.queries == ["oxygen ignition delay shock tube"]
+        assert [q.text for q in report.queries] == ["oxygen ignition delay shock tube"]
+        assert [q.run_id for q in report.queries] == [report.run_id]
         assert report.model_name == model.name
 
     def test_report_persisted_and_artifact_stored(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -542,7 +543,7 @@ class TestLoopTermination:
 
         report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
-        assert report.queries == many_queries[:MAX_QUERIES_PER_ROUND]
+        assert [q.text for q in report.queries] == many_queries[:MAX_QUERIES_PER_ROUND]
         assert any("dropped" in w and str(len(many_queries) - MAX_QUERIES_PER_ROUND) in w for w in report.warnings)
         events = read_events(campaign.workspace_root / "decision_log.jsonl")
         truncated = [e for e in events if e["event"] == "literature.queries_truncated"]
@@ -919,7 +920,7 @@ class TestSearchTransportFailure:
         assert report.stop_reason == StopReason.ERROR
         assert len(report.findings) == 1, "round 1's finding must survive round 2's search failure"
         assert any("search failed" in warning for warning in report.warnings)
-        assert "q1" in report.queries
+        assert "q1" in [q.text for q in report.queries]
 
 
 class TestCredencePenalties:
@@ -1680,3 +1681,86 @@ class TestWantedPaperOpenAccessResolution:
         requests = load_manifest(campaign.workspace_root).requests
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
         assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
+
+
+class TestReportAccumulatesAcrossPasses:
+    """Decision 0004/D1: one report per campaign, appended to, with every finding and
+    query carrying the pass that produced it."""
+
+    def test_a_v1_report_migrates_into_a_single_search_pass(self, campaign: Campaign) -> None:
+        """A v1 report predates the notion of a pass, but its attribution was always
+        true -- it simply had nowhere to be written down. Migration must recover it
+        rather than discard the record, because the existing live report holds the
+        only evidence that the grounding gate refuses ungrounded claims."""
+        v1 = {
+            "schema_version": 1,
+            "report_id": "rep1",
+            "campaign_id": campaign.campaign_id,
+            "action_id": "act-1",
+            "run_id": "run-1",
+            "created_at": datetime.now(UTC).isoformat(),
+            "queries": ["syngas ignition delay"],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+            "stop_reason": StopReason.SELF_TERMINATED.value,
+            "model_name": "mock",
+            "usage": BudgetUsage(
+                model_calls=2, tokens=12238, cost_usd=0.048843, fetches=6, fetch_bytes=772351, elapsed_s=127.5
+            ).model_dump(mode="json"),
+            "warnings": ["a warning worth keeping"],
+        }
+        (campaign.workspace_root / "literature_report.json").write_text(json.dumps(v1))
+
+        report = load_literature_report(campaign.workspace_root)
+
+        assert report.schema_version == 2
+        assert len(report.passes) == 1
+        assert report.passes[0].mode == LiteraturePassMode.SEARCH
+        assert report.run_id == "run-1"
+        assert report.action_id == "act-1"
+        assert report.stop_reason == StopReason.SELF_TERMINATED
+        assert report.warnings == ["a warning worth keeping"]
+        assert report.usage.cost_usd == pytest.approx(0.048843)
+        assert [(q.text, q.run_id, q.action_id) for q in report.queries] == [
+            ("syngas ignition delay", "run-1", "act-1")
+        ]
+
+    def test_a_second_pass_appends_and_never_destroys_the_first(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reason overwriting is forbidden: the first pass's rejections are the
+        record of the safety design working. A second pass must not erase them."""
+        deps, _, config = _make_deps([_proposal(queries=["first query"], done=True)])
+        first = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+        first_run_id = first.run_id
+        n_first_rejected = len(first.rejected)
+
+        deps2, _, config2 = _make_deps([_proposal(queries=["second query"], done=True)])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        second = run_literature_research(campaign.workspace_root, campaign, second_action, deps2, config=config2)
+
+        assert len(second.passes) == 2
+        assert [p.run_id for p in second.passes] == [first_run_id, second.run_id]
+        assert second.run_id != first_run_id
+        assert len(second.rejected) >= n_first_rejected, "the first pass's rejections must survive"
+        assert [q.text for q in second.queries] == ["first query", "second query"]
+        assert [q.run_id for q in second.queries] == [first_run_id, second.run_id]
+
+        reloaded = load_literature_report(campaign.workspace_root)
+        assert len(reloaded.passes) == 2
+
+    def test_findings_carry_the_pass_that_produced_them(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Attribution lives on the finding, not on its position in a list, so it
+        survives any later reordering, filtering or merge."""
+        deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        produced = report.findings + report.rejected
+        assert produced, "the fixture must produce something to attribute"
+        assert all(item.run_id == report.run_id for item in produced)
+        assert all(item.action_id == "lit-a1" for item in produced)
+        assert report.findings_for(report.run_id) == report.findings
+        assert report.findings_for("a-run-that-never-happened") == []

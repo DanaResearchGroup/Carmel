@@ -279,6 +279,11 @@ class LiteratureFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     finding_id: str = Field(min_length=1)
+    run_id: str = ""
+    action_id: str = ""
+    """Which pass produced this finding. Carried on the finding itself, not inferred
+    from position in the report, so attribution survives any later reordering,
+    filtering or merge."""
     payload: FindingPayload
     citation: Citation
     verbatim_quote: str = Field(min_length=1)
@@ -293,6 +298,8 @@ class RejectedFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     finding_id: str = Field(min_length=1)
+    run_id: str = ""
+    action_id: str = ""
     category: FindingCategory | None = None
     citation_title: str | None = None
     grounding: GroundingVerdict
@@ -373,22 +380,112 @@ class StoredArtifact(BaseModel):
     their (correct) meaning: at that time fetching was the only way in."""
 
 
-class LiteratureReport(BaseModel):
-    """The persisted output of a single literature-research run."""
+class LiteraturePassMode(StrEnum):
+    """How one pass over the literature was conducted.
+
+    ``SEARCH`` is the original outward-facing loop: propose queries, search, fetch,
+    ground. ``CORPUS`` re-reads the artifacts already in the evidence store and
+    performs no search and no fetching at all. A reader must be able to tell which
+    produced a finding, because the two have materially different reproducibility:
+    a corpus pass runs against a fixed set of sha256-addressed files and will see
+    exactly the same input every time, while a search pass depends on what the live
+    web returned that day.
+    """
+
+    SEARCH = "search"
+    CORPUS = "corpus"
+
+
+class QueryRecord(BaseModel):
+    """One executed search query, attributed to the pass that ran it."""
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 1
+    text: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    action_id: str = Field(min_length=1)
+
+
+class PassRecord(BaseModel):
+    """The per-pass envelope: everything that describes ONE run rather than the
+    accumulated body of evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+    action_id: str = Field(min_length=1)
+    created_at: datetime
+    mode: LiteraturePassMode = LiteraturePassMode.SEARCH
+    """Defaults to ``SEARCH`` so a v1 report migrated forward keeps its (correct)
+    meaning: at that time searching was the only kind of pass there was."""
+    model_name: str = ""
+    stop_reason: StopReason
+    usage: BudgetUsage
+    warnings: list[str] = Field(default_factory=list)
+
+
+class LiteratureReport(BaseModel):
+    """The campaign's literature record, accumulated across every pass.
+
+    One report per campaign, appended to rather than replaced. A second pass adds a
+    :class:`PassRecord` and tags everything it produces with its own ``run_id`` and
+    ``action_id``, so a reader can always state which pass produced a given finding
+    -- required of the methods paper, and required for a reviewer to reproduce a
+    single pass in isolation.
+
+    Overwriting instead of appending was considered and rejected: the first pass's
+    record is the current best evidence that the safety design works (findings
+    correctly refused for lacking an artifact, i.e. the deterministic gate killing a
+    claim before the Verifier ever saw it), and overwriting would destroy it.
+
+    The single-run accessors below (``run_id``, ``stop_reason``, ``usage``, ...)
+    report the MOST RECENT pass. They exist because a great deal of surrounding code
+    -- the dispatcher's success/failure mapping, the operator dashboard -- is asking
+    about the run that just happened, and that question stays well-posed under
+    accumulation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = 2
     report_id: str = Field(min_length=1)
     campaign_id: str = Field(min_length=1)
-    action_id: str = Field(min_length=1)
-    run_id: str = Field(min_length=1)
     created_at: datetime
-    queries: list[str] = Field(default_factory=list)
+    """When the FIRST pass started. Per-pass timestamps live on each ``PassRecord``."""
+    passes: list[PassRecord] = Field(min_length=1)
+    queries: list[QueryRecord] = Field(default_factory=list)
     artifacts: list[StoredArtifact] = Field(default_factory=list)
     findings: list[LiteratureFinding] = Field(default_factory=list)
     rejected: list[RejectedFinding] = Field(default_factory=list)
-    stop_reason: StopReason
-    model_name: str = ""
-    usage: BudgetUsage
-    warnings: list[str] = Field(default_factory=list)
+
+    @property
+    def latest(self) -> PassRecord:
+        """The most recent pass. ``passes`` is non-empty by construction."""
+        return self.passes[-1]
+
+    @property
+    def run_id(self) -> str:
+        return self.latest.run_id
+
+    @property
+    def action_id(self) -> str:
+        return self.latest.action_id
+
+    @property
+    def stop_reason(self) -> StopReason:
+        return self.latest.stop_reason
+
+    @property
+    def model_name(self) -> str:
+        return self.latest.model_name
+
+    @property
+    def usage(self) -> BudgetUsage:
+        return self.latest.usage
+
+    @property
+    def warnings(self) -> list[str]:
+        return self.latest.warnings
+
+    def findings_for(self, run_id: str) -> list[LiteratureFinding]:
+        return [f for f in self.findings if f.run_id == run_id]

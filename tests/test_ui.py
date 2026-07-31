@@ -2209,7 +2209,7 @@ class TestDashboardAgenticCards:
         from datetime import datetime
 
         from carmel.agents.budget import BudgetUsage
-        from carmel.schemas.literature import LiteratureReport, StopReason
+        from carmel.schemas.literature import LiteratureReport, PassRecord, StopReason
         from carmel.services.campaigns import find_campaign_workspace
 
         cid = _create_via_form(client)
@@ -2218,11 +2218,16 @@ class TestDashboardAgenticCards:
         report = LiteratureReport(
             report_id="rep1",
             campaign_id=cid,
-            action_id="lit1",
-            run_id="run1",
             created_at=datetime.now(UTC),
-            stop_reason=StopReason.SELF_TERMINATED,
-            usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+            passes=[
+                PassRecord(
+                    run_id="run1",
+                    action_id="lit1",
+                    created_at=datetime.now(UTC),
+                    stop_reason=StopReason.SELF_TERMINATED,
+                    usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+                )
+            ],
         )
         (ws / "literature_report.json").write_text(report.model_dump_json())
 
