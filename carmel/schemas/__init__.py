@@ -3,6 +3,12 @@
 
 """Phase 1 domain schemas for Carmel."""
 
+from carmel.schemas.action_state import (
+    ActionExecutionStatus,
+    ActionOutcome,
+    ActionState,
+    PlanProgress,
+)
 from carmel.schemas.approval import (
     ActionKind,
     ApprovalDecision,
@@ -29,12 +35,39 @@ from carmel.schemas.diagnostics import (
     SensitivityEntry,
     SpeciesSelection,
 )
-from carmel.schemas.plan import Plan, PlannedAction
+from carmel.schemas.literature import (
+    STOP_REASON_FOR_DIMENSION,
+    Citation,
+    CredenceVerdict,
+    EvidenceRef,
+    ExperimentalBenchmarkPayload,
+    FindingCategory,
+    FindingPayload,
+    GroundingStatus,
+    GroundingVerdict,
+    LiteratureFinding,
+    LiteratureReport,
+    ObservableKind,
+    PriorModelPayload,
+    QMCalculationPayload,
+    QMProperty,
+    Quantity,
+    RejectedFinding,
+    SpeciesRef,
+    StopReason,
+    StoredArtifact,
+)
+from carmel.schemas.plan import PLAN_SCHEMA_VERSION, Plan, PlannedAction
 from carmel.schemas.run import ActiveRun, FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.schemas.state import CampaignState, CampaignStateValue
 
 __all__ = [
+    "PLAN_SCHEMA_VERSION",
+    "STOP_REASON_FOR_DIMENSION",
+    "ActionExecutionStatus",
     "ActionKind",
+    "ActionOutcome",
+    "ActionState",
     "ApprovalDecision",
     "ApprovalPolicy",
     "ApprovalRequirement",
@@ -44,23 +77,43 @@ __all__ = [
     "CampaignInput",
     "CampaignState",
     "CampaignStateValue",
+    "Citation",
+    "CredenceVerdict",
     "DiagnosticsV1",
     "EntryMode",
+    "EvidenceRef",
+    "ExperimentalBenchmarkPayload",
     "FailureCode",
+    "FindingCategory",
+    "FindingPayload",
+    "GroundingStatus",
+    "GroundingVerdict",
     "InitialMixture",
+    "LiteratureFinding",
+    "LiteratureReport",
     "MixtureComponent",
+    "ObservableKind",
     "ObservableSummary",
     "PDepNetworkSelection",
     "Plan",
+    "PlanProgress",
     "PlannedAction",
+    "PriorModelPayload",
+    "QMCalculationPayload",
+    "QMProperty",
+    "Quantity",
     "ReactionSelection",
     "ReactorSystem",
     "ReactorType",
     "ActiveRun",
+    "RejectedFinding",
     "RunRecord",
     "RunStatus",
     "SensitivityEntry",
+    "SpeciesRef",
     "SpeciesSelection",
+    "StopReason",
+    "StoredArtifact",
     "SubmissionMode",
     "TargetObservable",
 ]

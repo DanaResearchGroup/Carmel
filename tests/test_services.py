@@ -124,6 +124,7 @@ from carmel.services.recovery import (
     supervisor_is_alive,
 )
 from carmel.services.state_machine import (
+    RECOVERY_TARGETS,
     VALID_TRANSITIONS,
     InvalidTransitionError,
     can_transition,
@@ -450,11 +451,13 @@ class TestStateMachine:
 
         Before recovery edges existed, 7 of the 8 states that could reach
         FAILED had zero legal exits from it: the campaign was unrecoverable
-        and every UI action raised. The ARC states RUNNING_ARC and
-        RESULTS_READY bring the count of FAILED-reaching origins to 10.
+        and every UI action raised.
         """
         origins = [state for state, targets in VALID_TRANSITIONS.items() if CampaignStateValue.FAILED in targets]
-        assert len(origins) == 10
+        # 8 originally; the ARC states (RUNNING_ARC, RESULTS_READY) and the agentic
+        # layer's literature states (RUNNING_LITERATURE, LITERATURE_READY) each add two,
+        # and the loop below holds all of them to the same rule.
+        assert len(origins) == 12
         for origin in [*origins, None]:
             exits = [
                 target
@@ -523,6 +526,12 @@ class TestStateMachine:
                 {
                     CampaignStateValue.RUNNING_T3,
                     CampaignStateValue.RUNNING_ARC,
+                    # Finding P1-8: RUNNING_LITERATURE was missing from
+                    # RECOVERY_TARGETS -- the only RUNNING_* origin without a
+                    # direct resume -- so a campaign that failed during
+                    # literature could never retry, only /replan (discarding
+                    # any approvals it already held).
+                    CampaignStateValue.RUNNING_LITERATURE,
                     CampaignStateValue.APPROVED_FOR_EXECUTION,
                 },
             ),
@@ -531,6 +540,23 @@ class TestStateMachine:
         ]:
             for origin in CampaignStateValue:
                 assert can_transition(CampaignStateValue.FAILED, target, failed_from=origin) == (origin in unlocked_by)
+
+    def test_every_running_state_has_a_recovery_target(self) -> None:
+        """Finding P1-8: every ``RUNNING_*`` state must be a recoverable origin.
+
+        ``RECOVERY_TARGETS`` is the allowlist ``can_transition`` consults to
+        let a campaign resume directly out of ``FAILED`` rather than being
+        forced back through ``READY_FOR_PLANNING``. A ``RUNNING_*`` member
+        missing from it (as ``RUNNING_LITERATURE`` was) is not merely an
+        inconvenience -- ``/retry`` 409s forever for that origin, and only
+        ``/replan`` can recover it, discarding whatever approvals the
+        campaign already held. This is a standing guard against a repeat of
+        that omission for any ``RUNNING_*`` member added in the future.
+        """
+        running_states = {state for state in CampaignStateValue if state.name.startswith("RUNNING_")}
+        assert running_states, "expected at least one RUNNING_* state to exist"
+        for state in running_states:
+            assert state in RECOVERY_TARGETS, f"{state} has no entry in RECOVERY_TARGETS"
 
     def test_a_plan_approved_but_never_launched_resumes_without_re_planning(self, tmp_path: Path) -> None:
         """Failing between approval and launch must not discard the approval.
@@ -690,6 +716,29 @@ class TestStateMachine:
             update_state(ws, target)
         assert load_state(ws).state == CampaignStateValue.COMPLETED_PHASE1
 
+    def test_literature_happy_path_edges(self) -> None:
+        for current, target in [
+            (CampaignStateValue.APPROVED_FOR_EXECUTION, CampaignStateValue.RUNNING_LITERATURE),
+            (CampaignStateValue.APPROVED_FOR_EXECUTION, CampaignStateValue.BLOCKED),
+            (CampaignStateValue.RUNNING_LITERATURE, CampaignStateValue.LITERATURE_READY),
+            (CampaignStateValue.RUNNING_LITERATURE, CampaignStateValue.FAILED),
+            (CampaignStateValue.RUNNING_LITERATURE, CampaignStateValue.BLOCKED),
+            (CampaignStateValue.LITERATURE_READY, CampaignStateValue.RUNNING_T3),
+            (CampaignStateValue.LITERATURE_READY, CampaignStateValue.COMPLETED_PHASE1),
+            (CampaignStateValue.LITERATURE_READY, CampaignStateValue.BLOCKED),
+            (CampaignStateValue.LITERATURE_READY, CampaignStateValue.FAILED),
+            (CampaignStateValue.DIAGNOSTICS_READY, CampaignStateValue.RUNNING_LITERATURE),
+        ]:
+            assert can_transition(current, target), f"{current} -> {target} must be allowed"
+
+    def test_forbidden_literature_edges(self) -> None:
+        # The re-dispatch cycle (P1-9) and the zero-work completion (P1-10):
+        assert not can_transition(CampaignStateValue.LITERATURE_READY, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        assert not can_transition(CampaignStateValue.APPROVED_FOR_EXECUTION, CampaignStateValue.COMPLETED_PHASE1)
+        # RUNNING_* states cannot re-enter APPROVED_FOR_EXECUTION:
+        assert not can_transition(CampaignStateValue.RUNNING_LITERATURE, CampaignStateValue.APPROVED_FOR_EXECUTION)
+        assert not can_transition(CampaignStateValue.RUNNING_T3, CampaignStateValue.APPROVED_FOR_EXECUTION)
+
 
 # ----------------------- approvals ------------------------------
 
@@ -803,6 +852,51 @@ class TestApprovals:
         loaded = load_policy(ws)
         assert loaded.auto_approve_t3_under_cpu_hours == 99.0
 
+    def _literature_action(self, spend: float) -> PlannedAction:
+        return PlannedAction(
+            action_id="lit1",
+            kind=ActionKind.LITERATURE_SEARCH,
+            description="literature search",
+            estimated_cpu_hours=0.0,
+            estimated_spend_usd=spend,
+            blocking=False,
+            rationale="testing",
+            approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        )
+
+    def test_literature_under_spend_threshold_auto_approved(self) -> None:
+        result = evaluate_action(self._literature_action(1.0), ApprovalPolicy())
+        assert result == ApprovalRequirement.AUTO_APPROVED
+
+    def test_literature_over_spend_threshold_requires_approval(self) -> None:
+        result = evaluate_action(self._literature_action(5.0), ApprovalPolicy())
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_literature_policy_flag_forces_approval(self) -> None:
+        policy = ApprovalPolicy(require_approval_for_literature=True)
+        result = evaluate_action(self._literature_action(0.0), policy)
+        assert result == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_record_action_decision_updates_progress(self, tmp_path: Path) -> None:
+        from carmel.services.approvals import record_action_decision
+        from carmel.services.plan_progress import init_progress
+
+        ws = tmp_path / "ws"
+        c = create_campaign(ws, _make_input())
+        plan = generate_initial_plan(c, ApprovalPolicy(auto_approve_t3_under_cpu_hours=0.1))
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+        action_id = plan.actions[0].action_id
+
+        decision, progress = record_action_decision(
+            ws, action_id, ApprovalStatus.APPROVED, decided_by="user", rationale="ok"
+        )
+
+        assert decision.action_id == action_id
+        assert progress.actions[0].approval_status == ApprovalStatus.APPROVED
+        events = read_events(ws / "decision_log.jsonl")
+        assert any(e.get("event") == "approval_decision" for e in events)
+
 
 # ----------------------- campaigns ------------------------------
 
@@ -911,6 +1005,16 @@ class TestCampaigns:
         found = find_campaign_workspace(tmp_path, target.campaign_id)
         assert found == tmp_path / "zzz_real"
 
+    def test_find_workspace_returns_discovered_path_on_mismatch(self, tmp_path: Path) -> None:
+        """A moved/copied workspace resolves to the DISCOVERED child, with a warning."""
+        import shutil
+
+        c = create_campaign(tmp_path / "original", _make_input("moved"))
+        shutil.move(str(tmp_path / "original"), str(tmp_path / "relocated"))
+        found = find_campaign_workspace(tmp_path, c.campaign_id)
+        assert found is not None
+        assert found.name == "relocated"  # not the stale recorded workspace_root
+
 
 # ----------------------- planner --------------------------------
 
@@ -987,6 +1091,47 @@ class TestPlanner:
         c = create_campaign(ws, _make_input())
         plan = plan_and_save(ws, c)
         assert plan.actions[0].approval_requirement == ApprovalRequirement.AUTO_APPROVED
+
+    def test_plan_and_save_initialises_progress(self, tmp_path: Path) -> None:
+        from carmel.services.plan_progress import PLAN_PROGRESS_NAME, load_progress
+
+        ws = tmp_path / "ws"
+        c = create_campaign(ws, _make_input())
+        plan = plan_and_save(ws, c)
+        assert (ws / PLAN_PROGRESS_NAME).exists()
+        progress = load_progress(ws)
+        assert progress.plan_id == plan.plan_id
+        assert progress.actions[0].approval_status == ApprovalStatus.AUTO_APPROVED
+
+    def test_include_literature_plan_shape(self, tmp_path: Path) -> None:
+        c = create_campaign(tmp_path / "ws", _make_input())
+        policy = ApprovalPolicy()
+        plan = generate_initial_plan(c, policy, include_literature=True)
+        assert [a.kind for a in plan.actions] == [ActionKind.LITERATURE_SEARCH, ActionKind.T3_RUN]
+        literature = plan.actions[0]
+        assert literature.blocking is False
+        assert literature.estimated_cpu_hours == 0.0
+        assert literature.estimated_spend_usd == policy.auto_approve_literature_under_usd
+        assert plan.actions[1].blocking is True
+
+    def test_literature_rationale_is_honest(self, tmp_path: Path) -> None:
+        """The literature action must state findings are advisory only."""
+        c = create_campaign(tmp_path / "ws", _make_input())
+        plan = generate_initial_plan(c, ApprovalPolicy(), include_literature=True)
+        rationale = plan.actions[0].rationale.lower()
+        assert "advisory" in rationale
+        assert "not parameterise" in rationale.replace("do not", "not")
+
+    def test_include_literature_default_auto_approved(self, tmp_path: Path) -> None:
+        c = create_campaign(tmp_path / "ws", _make_input())
+        plan = generate_initial_plan(c, ApprovalPolicy(), include_literature=True)
+        assert plan.actions[0].approval_requirement == ApprovalRequirement.AUTO_APPROVED
+
+    def test_include_literature_requires_approval_when_policy_says_so(self, tmp_path: Path) -> None:
+        c = create_campaign(tmp_path / "ws", _make_input())
+        plan = generate_initial_plan(c, ApprovalPolicy(require_approval_for_literature=True), include_literature=True)
+        assert plan.actions[0].approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+        assert plan.requires_approval is True
 
 
 # ----------------------- drawing --------------------------------

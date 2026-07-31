@@ -29,6 +29,8 @@ class FailureCode(StrEnum):
     TOOL_NOT_FOUND = "tool_not_found"
     INPUT_BUILD_ERROR = "input_build_error"
     ABANDONED = "abandoned"
+    BUDGET_EXCEEDED = "budget_exceeded"
+    AGENT_ERROR = "agent_error"
     UNKNOWN = "unknown"
 
 

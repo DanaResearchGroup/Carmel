@@ -34,6 +34,16 @@ reports a `SyntaxError` during collection rather than anything about
 versions. The floor is declared once, in `requires-python`; `mypy` and the
 CI workflows are held against it by a test.
 
+The specific 3.14 feature that trips reviewers and tooling is [PEP 758][pep758]:
+`except TypeError, ValueError:` without parentheses. It is valid on 3.14 and
+appears in roughly eight modules. An older interpreter — including a default
+`anaconda3` base env on 3.12 — reports it as a `SyntaxError` at the `except`
+line. Those reports are false: the code is correct and must not be
+"fixed" by adding parentheses. If a linter, IDE, type checker, or code-review
+tool flags one, check which interpreter it is running before changing anything.
+
+[pep758]: https://peps.python.org/pep-0758/
+
 ### Three-env deployment model
 
 Carmel, T3, and RMG have mutually exclusive Python requirements and
@@ -203,6 +213,48 @@ make typecheck   # Run mypy in strict mode
 Carmel uses mypy in strict mode. All public functions require complete
 type annotations and Google-style docstrings.
 
+### `make typecheck` requires the `agents` extra
+
+`make typecheck` refuses to run (and prints an error pointing at
+`make install-agents-dev`) unless `pydantic_ai`, `pypdf`, and `rdkit` are all
+importable in the active environment. This isn't an arbitrary restriction —
+the two environments (with and without the `agents` extra) produce mypy
+results that genuinely **contradict** each other, and no single mypy
+invocation can satisfy both:
+
+- `carmel/services/chem.py` calls `Chem.MolToInchiKey(mol)` under a
+  `# type: ignore[no-untyped-call]`. That comment is *required* when
+  `rdkit-stubs` is installed, because the stub leaves `MolToInchiKey`
+  completely unannotated. But with `rdkit` absent entirely (no `agents`
+  extra), mypy never resolves the `rdkit` import in the first place, so the
+  same `type: ignore` is flagged `[unused-ignore]` — and `strict = true`
+  turns on `warn_unused_ignores`, making that a hard error.
+- Conversely, running mypy *without* the extra reports `import-not-found`
+  for `rdkit`, `pypdf`, `pydantic_ai`, and `genai_prices` — real errors in
+  that environment, but not ones that reflect the environment Carmel is
+  actually meant to run in.
+
+Weakening strictness to paper over this (blanket `ignore_missing_imports`,
+or `warn_unused_ignores = false`) was rejected as a fix: it would hide real
+type errors project-wide just to reconcile two environments that were never
+both "correct" at once. Instead, the agents-installed environment is the
+single supported mypy target: CI's `agents` job installs the extra and owns
+typecheck; CI's `lint` job installs only the base `dev` extras and runs
+`ruff` alone, deliberately skipping `make typecheck` for the same reason.
+
+**Enforcement gap (admin action needed):** the `agents` job's display name
+is `Agents extra — tests + typecheck (required)`, but that job is **not**
+actually present in the repo's "Protect Main" ruleset
+(`gh api repos/DanaResearchGroup/Carmel/rulesets/14702943`). Only
+`Lint + format + typecheck (required)`,
+`Tests + packaging smoke (required) (3.14)`, `Check CLA signature`, and
+`build` are listed as required status checks. That means, as of this
+change, a failing mypy run in the `agents` job can go red without blocking
+any PR — typecheck is no longer an enforced merge gate anywhere, only a job
+that must pass *if it runs and is looked at*. Fixing this requires a repo
+admin to add the `agents` job to the ruleset's required status checks; it
+is not something a contributor or this doc can do unilaterally.
+
 ## Full Verification
 
 ```bash
@@ -211,13 +263,20 @@ make check       # lint + typecheck + test
 
 ## CI
 
-GitHub Actions has **two lanes** that run on every push to `main` and
-on pull requests.
+GitHub Actions has **three** relevant jobs that run on every push to `main`
+and on pull requests: two required by the "Protect Main" ruleset, and one
+("agents") that runs typecheck but is not (yet) wired into that ruleset —
+see the enforcement-gap note above.
 
 ### Required lane (must pass for merge)
 
-- **`lint`** — `make lint` (ruff check + ruff format check) and
-  `make typecheck` (mypy strict).
+- **`lint`** (job name `Lint + format + typecheck (required)`) — runs
+  `make lint` (ruff check + ruff format check) only. It installs the base
+  `dev` extras (no `agents`) and deliberately does **not** run
+  `make typecheck` any more — see "`make typecheck` requires the `agents`
+  extra" above for why. The job's display name is now slightly inaccurate
+  as a result; renaming it requires updating the ruleset's required-check
+  string in lockstep, so it was left as-is.
 - **`test`** — pytest with branch coverage, plus a **packaging smoke
   step** that exercises:
   - `carmel version`
@@ -227,6 +286,15 @@ on pull requests.
 
   This catches console-script regressions (e.g. broken entrypoints,
   missing template folder) without spinning up the full server.
+
+### Typecheck lane (`agents`, not currently a required check)
+
+- **`agents`** (job name `Agents extra — tests + typecheck (required)`) —
+  installs the `agents` extra and runs both the test suite and
+  `make typecheck` in that environment. It is the only job that ever runs
+  mypy. Despite the "(required)" in its display name, it is **not** listed
+  in the "Protect Main" ruleset's required status checks, so a red result
+  here does not currently block a merge. See the enforcement-gap note above.
 
 ### Best-effort lane (`tools`)
 

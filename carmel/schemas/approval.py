@@ -48,6 +48,7 @@ class ApprovalPolicy(BaseModel):
     auto_approve_arc_under_cpu_hours: float = Field(default=5.0, ge=0)
     require_approval_for_experiments: bool = True
     require_approval_for_literature: bool = False
+    auto_approve_literature_under_usd: float = Field(default=2.0, ge=0)
 
 
 class ApprovalDecision(BaseModel):

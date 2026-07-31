@@ -7,7 +7,11 @@ import pytest
 from pydantic import ValidationError
 
 from carmel.schemas import (
+    PLAN_SCHEMA_VERSION,
+    ActionExecutionStatus,
     ActionKind,
+    ActionOutcome,
+    ActionState,
     ApprovalDecision,
     ApprovalPolicy,
     ApprovalRequirement,
@@ -26,6 +30,7 @@ from carmel.schemas import (
     PDepNetworkSelection,
     Plan,
     PlannedAction,
+    PlanProgress,
     ReactionSelection,
     ReactorSystem,
     ReactorType,
@@ -313,6 +318,155 @@ class TestPlan:
             requires_approval=False,
         )
         assert len(p.actions) == 1
+
+    def test_schema_version_defaults_to_current(self) -> None:
+        assert PLAN_SCHEMA_VERSION == 2
+        action = PlannedAction(
+            action_id="a1",
+            kind=ActionKind.T3_RUN,
+            description="run T3",
+            estimated_cpu_hours=5.0,
+            rationale="baseline",
+            approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        )
+        p = Plan(
+            plan_id="p1",
+            campaign_id="c1",
+            created_at=datetime.now(UTC),
+            actions=[action],
+            rationale="initial",
+            total_estimated_cpu_hours=5.0,
+            requires_approval=False,
+        )
+        assert p.schema_version == PLAN_SCHEMA_VERSION
+
+    def test_planned_action_new_fields_have_defaults(self) -> None:
+        action = PlannedAction(
+            action_id="a1",
+            kind=ActionKind.T3_RUN,
+            description="run T3",
+            estimated_cpu_hours=5.0,
+            rationale="baseline",
+            approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        )
+        assert action.blocking is True
+        assert action.estimated_spend_usd == 0.0
+
+    def test_negative_spend_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            PlannedAction(
+                action_id="a1",
+                kind=ActionKind.LITERATURE_SEARCH,
+                description="lit",
+                estimated_cpu_hours=0.0,
+                estimated_spend_usd=-1.0,
+                rationale="x",
+                approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+            )
+
+    def test_phase1_plan_dict_still_validates(self) -> None:
+        """A v1 plan.json (no schema_version/blocking/spend) survives extra='forbid'."""
+        v1 = {
+            "plan_id": "p1",
+            "campaign_id": "c1",
+            "created_at": datetime.now(UTC).isoformat(),
+            "actions": [
+                {
+                    "action_id": "a1",
+                    "kind": "t3_run",
+                    "description": "Initial T3 handshake",
+                    "estimated_cpu_hours": 3.0,
+                    "estimated_cost": 0.0,
+                    "rationale": "Phase 1 baseline",
+                    "approval_requirement": "auto_approved",
+                    "parameters": {},
+                }
+            ],
+            "rationale": "Deterministic Phase 1 baseline plan",
+            "total_estimated_cpu_hours": 3.0,
+            "requires_approval": False,
+        }
+        plan = Plan.model_validate(v1)
+        assert plan.actions[0].blocking is True
+        assert plan.actions[0].estimated_spend_usd == 0.0
+        assert plan.schema_version == PLAN_SCHEMA_VERSION
+
+
+class TestActionState:
+    def _state(self, **overrides: object) -> ActionState:
+        data: dict[str, object] = {
+            "action_id": "a1",
+            "kind": ActionKind.T3_RUN,
+            "updated_at": datetime.now(UTC),
+        }
+        data.update(overrides)
+        return ActionState.model_validate(data)
+
+    def test_defaults(self) -> None:
+        s = self._state()
+        assert s.approval_status == ApprovalStatus.PENDING
+        assert s.execution_status == ActionExecutionStatus.PENDING
+        assert s.outcome == ActionOutcome.NONE
+        assert s.attempt_ids == []
+        assert s.blocking is True
+
+    def test_is_terminal(self) -> None:
+        assert not self._state().is_terminal()
+        assert not self._state(execution_status=ActionExecutionStatus.RUNNING).is_terminal()
+        for status in (
+            ActionExecutionStatus.SUCCEEDED,
+            ActionExecutionStatus.FAILED,
+            ActionExecutionStatus.SKIPPED,
+        ):
+            assert self._state(execution_status=status).is_terminal()
+
+    def test_is_executable(self) -> None:
+        assert self._state().is_executable()
+        assert not self._state(approval_status=ApprovalStatus.REJECTED).is_executable()
+        assert not self._state(execution_status=ActionExecutionStatus.SUCCEEDED).is_executable()
+
+
+class TestPlanProgressSchema:
+    def _progress(self, cursor: int = 0) -> PlanProgress:
+        now = datetime.now(UTC)
+        return PlanProgress(
+            plan_id="p1",
+            campaign_id="c1",
+            actions=[
+                ActionState(action_id="a1", kind=ActionKind.LITERATURE_SEARCH, updated_at=now),
+                ActionState(action_id="a2", kind=ActionKind.T3_RUN, updated_at=now),
+            ],
+            cursor=cursor,
+            updated_at=now,
+        )
+
+    def test_next_action_id(self) -> None:
+        assert self._progress().next_action_id() == "a1"
+        assert self._progress(cursor=1).next_action_id() == "a2"
+        assert self._progress(cursor=2).next_action_id() is None
+
+    def test_is_complete(self) -> None:
+        assert not self._progress().is_complete()
+        assert self._progress(cursor=2).is_complete()
+
+    def test_negative_cursor_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            PlanProgress.model_validate(self._progress().model_dump() | {"cursor": -1})
+
+
+class TestNewCampaignStates:
+    def test_literature_states_exist(self) -> None:
+        assert CampaignStateValue.RUNNING_LITERATURE.value == "running_literature"
+        assert CampaignStateValue.LITERATURE_READY.value == "literature_ready"
+
+
+class TestApprovalPolicyLiterature:
+    def test_default_spend_threshold(self) -> None:
+        assert ApprovalPolicy().auto_approve_literature_under_usd == 2.0
+
+    def test_negative_threshold_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            ApprovalPolicy(auto_approve_literature_under_usd=-0.5)
 
 
 class TestRunRecord:

@@ -11,9 +11,10 @@ from uuid import uuid4
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.plan import Plan, PlannedAction
-from carmel.services.approvals import load_policy
+from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.authorization import ExecutionEnvelope, decide_requirement
+from carmel.services.plan_progress import init_progress
 from carmel.services.spend import compute_spend
 
 PLAN_JSON_NAME = "plan.json"
@@ -56,11 +57,15 @@ def generate_initial_plan(
     campaign: Campaign,
     policy: ApprovalPolicy,
     workspace_root: Path | None = None,
+    *,
+    include_literature: bool = False,
 ) -> Plan:
     """Generate the deterministic Phase 1 initial plan.
 
-    The Phase 1 initial plan always contains exactly one action: a T3
-    handshake to produce a baseline mechanism and diagnostics.
+    By default the plan contains exactly one action: a T3 handshake to
+    produce a baseline mechanism and diagnostics. With
+    ``include_literature=True`` a non-blocking LITERATURE_SEARCH action
+    precedes the T3 action.
 
     The action is gated by the single combined gate
     (:func:`carmel.services.authorization.decide_requirement`): the policy
@@ -77,12 +82,53 @@ def generate_initial_plan(
         workspace_root: The campaign workspace root. When given, spend
             already recorded there reduces the remaining budget, and the
             gate's decisions are recorded to the decision log.
+        include_literature: Whether to prepend a literature-search action.
 
     Returns:
-        A Plan with a single T3-handshake action.
+        The generated Plan.
     """
     estimated = estimate_t3_cpu_hours(campaign)
-    action = PlannedAction(
+    actions: list[PlannedAction] = []
+
+    if include_literature:
+        literature = PlannedAction(
+            action_id=str(uuid4()),
+            kind=ActionKind.LITERATURE_SEARCH,
+            description="Literature search — collect grounded experimental/model/QM findings",
+            estimated_cpu_hours=0.0,
+            estimated_cost=0.0,
+            estimated_spend_usd=policy.auto_approve_literature_under_usd,
+            blocking=False,
+            rationale=(
+                "Advisory context only: grounded literature findings inform the scientist "
+                "reviewing this campaign. In this increment they do NOT parameterise the "
+                "T3 action."
+            ),
+            approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+            parameters={},
+        )
+        # Deliberately the POLICY-only gate (`evaluate_action`), not the combined
+        # `decide_requirement` used for T3 below.
+        #
+        # `decide_requirement` adds a per-adapter ExecutionEnvelope check, and
+        # `authorize_action` conservatively escalates any kind with no registered
+        # envelope. DEFAULT_ENVELOPES maps T3_RUN and ARC_RUN only, so sending a
+        # LITERATURE_SEARCH action through it would return REQUIRES_APPROVAL for every
+        # campaign and silently disable the literature auto-run.
+        #
+        # That escalation is right for what envelopes measure and wrong for this action:
+        # an envelope bounds an adapter's CPU-hours per subprocess run, and a literature
+        # search launches no subprocess and consumes 0.0 CPU-hours. Its real resource is
+        # money-and-tokens, bounded by the agent BudgetLedger at run time and gated here
+        # by the policy's `auto_approve_literature_under_usd` threshold.
+        #
+        # If LITERATURE_SEARCH ever gains an envelope in carmel/services/authorization.py
+        # (owned by the ARC workstream), this should move to `decide_requirement` so
+        # there is once again exactly one gate.
+        literature = literature.model_copy(update={"approval_requirement": evaluate_action(literature, policy)})
+        actions.append(literature)
+
+    t3_action = PlannedAction(
         action_id=str(uuid4()),
         kind=ActionKind.T3_RUN,
         description="Initial T3 handshake — generate baseline mechanism and diagnostics",
@@ -95,22 +141,25 @@ def generate_initial_plan(
         approval_requirement=ApprovalRequirement.AUTO_APPROVED,
         parameters={},
     )
-    requirement, _rationale = decide_requirement(
-        action,
+    t3_requirement, _rationale = decide_requirement(
+        t3_action,
         policy=policy,
         remaining_cpu_hours=_remaining_cpu_hours(campaign, workspace_root),
         budgets=campaign.input.budgets,
         workspace_root=workspace_root,
     )
-    action = action.model_copy(update={"approval_requirement": requirement})
+    t3_action = t3_action.model_copy(update={"approval_requirement": t3_requirement})
+    actions.append(t3_action)
+
+    requires_approval = any(a.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL for a in actions)
     return Plan(
         plan_id=str(uuid4()),
         campaign_id=campaign.campaign_id,
         created_at=datetime.now(UTC),
-        actions=[action],
+        actions=actions,
         rationale="Deterministic Phase 1 baseline plan",
-        total_estimated_cpu_hours=estimated,
-        requires_approval=requirement == ApprovalRequirement.REQUIRES_APPROVAL,
+        total_estimated_cpu_hours=sum(a.estimated_cpu_hours for a in actions),
+        requires_approval=requires_approval,
     )
 
 
@@ -257,7 +306,19 @@ def render_plan_markdown(plan: Plan) -> str:
 
 
 def save_plan(workspace_root: Path, plan: Plan) -> None:
-    """Persist plan.json and plan.md."""
+    """Persist plan.json and plan.md.
+
+    Raises:
+        ValueError: If the plan fails
+            :func:`carmel.services.dispatcher.validate_plan_shape` — an
+            unexecutable plan is rejected at save time, fail closed.
+    """
+    # Function-level import: the dispatcher imports this module for load_plan.
+    from carmel.services.dispatcher import validate_plan_shape
+
+    problems = validate_plan_shape(plan)
+    if problems:
+        raise ValueError("plan shape is not executable: " + "; ".join(problems))
     write_json(workspace_root / PLAN_JSON_NAME, plan)
     write_text(workspace_root / PLAN_MD_NAME, render_plan_markdown(plan))
 
@@ -267,19 +328,21 @@ def load_plan(workspace_root: Path) -> Plan:
     return Plan.model_validate(read_json(workspace_root / PLAN_JSON_NAME))
 
 
-def plan_and_save(workspace_root: Path, campaign: Campaign) -> Plan:
-    """Generate the Phase 1 plan and persist it.
+def plan_and_save(workspace_root: Path, campaign: Campaign, *, include_literature: bool = False) -> Plan:
+    """Generate the Phase 1 plan, persist it, and initialise plan progress.
 
     Args:
         workspace_root: The campaign workspace root.
         campaign: The campaign to plan for.
+        include_literature: Whether to prepend a literature-search action.
 
     Returns:
         The generated and saved Plan.
     """
     policy = load_policy(workspace_root)
-    plan = generate_initial_plan(campaign, policy, workspace_root)
+    plan = generate_initial_plan(campaign, policy, workspace_root, include_literature=include_literature)
     save_plan(workspace_root, plan)
+    init_progress(workspace_root, plan)
     return plan
 
 

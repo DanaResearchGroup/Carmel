@@ -7,7 +7,8 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from carmel.config import BudgetsConfig, CarmelConfig, load_config, validate_config_file
+from carmel.config import BudgetsConfig, CampaignConfig, CarmelConfig, load_config, validate_config_file
+from carmel.schemas.campaign import ReactorType
 
 
 class TestBudgetsConfig:
@@ -171,3 +172,110 @@ class TestValidateConfigFile:
         path.write_text(yaml.dump({}))
         errors = validate_config_file(path)
         assert len(errors) >= 2  # missing workspace_name and workspace_root
+
+
+def _valid_campaign_section() -> dict[str, Any]:
+    """A minimal, physically valid ``campaign:`` section as a plain dict.
+
+    Kept separate from the NH3/O2/argon fixture file below: this one is the
+    smallest thing that passes every validator, used to isolate individual
+    validation failures; the fixture file is the realistic end-to-end case.
+    """
+    return {
+        "initial_mixture": {
+            "components": [
+                {"species": "O2", "mole_fraction": 0.21},
+                {"species": "N2", "mole_fraction": 0.79},
+            ]
+        },
+        "target_observables": [{"name": "ignition_delay_time"}],
+        "target_reactor_systems": [
+            {
+                "reactor_type": "shock_tube",
+                "temperature_range_K": [1400.0, 2000.0],
+                "pressure_range_bar": [1.0, 30.0],
+            }
+        ],
+        "budgets": {"cpu_hours": 10.0, "experiment_budget": 0.0},
+    }
+
+
+class TestCampaignConfig:
+    """The optional ``campaign:`` section: schema, reuse of campaign schemas, validation."""
+
+    def test_full_campaign_section_parses(self) -> None:
+        cc = CampaignConfig(**_valid_campaign_section())
+        assert len(cc.initial_mixture.components) == 2
+        assert cc.target_reactor_systems[0].reactor_type == ReactorType.SHOCK_TUBE
+        assert cc.budgets.cpu_hours == 10.0
+
+    def test_to_campaign_input_inherits_workspace_name(self) -> None:
+        cc = CampaignConfig(**_valid_campaign_section())
+        campaign_input = cc.to_campaign_input("inherited-name")
+        assert campaign_input.workspace_name == "inherited-name"
+        assert campaign_input.initial_mixture == cc.initial_mixture
+        assert campaign_input.target_observables == cc.target_observables
+        assert campaign_input.target_reactor_systems == cc.target_reactor_systems
+        assert campaign_input.budgets == cc.budgets
+
+    def test_campaign_section_is_optional_on_carmel_config(self, valid_config_data: dict[str, Any]) -> None:
+        """Existing configs with no `campaign:` section must still load (backcompat)."""
+        config = CarmelConfig(**valid_config_data)
+        assert config.campaign is None
+
+    def test_campaign_section_embeds_in_carmel_config(self, valid_config_data: dict[str, Any]) -> None:
+        data = {**valid_config_data, "campaign": _valid_campaign_section()}
+        config = CarmelConfig(**data)
+        assert config.campaign is not None
+        assert config.campaign.budgets.cpu_hours == 10.0
+
+    def test_load_config_with_campaign_section_from_yaml(
+        self, tmp_path: Path, valid_config_data: dict[str, Any]
+    ) -> None:
+        data = {**valid_config_data, "campaign": _valid_campaign_section()}
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump(data))
+        config = load_config(path)
+        assert config.campaign is not None
+        assert config.campaign.target_reactor_systems[0].reactor_type == ReactorType.SHOCK_TUBE
+
+    def test_mole_fractions_not_summing_to_one_rejected(self) -> None:
+        section = _valid_campaign_section()
+        section["initial_mixture"]["components"] = [{"species": "O2", "mole_fraction": 0.5}]
+        with pytest.raises(ValidationError, match="sum to 1.0"):
+            CampaignConfig(**section)
+
+    def test_empty_component_list_rejected(self) -> None:
+        section = _valid_campaign_section()
+        section["initial_mixture"]["components"] = []
+        with pytest.raises(ValidationError):
+            CampaignConfig(**section)
+
+    def test_inverted_temperature_range_rejected(self) -> None:
+        section = _valid_campaign_section()
+        section["target_reactor_systems"][0]["temperature_range_K"] = [2000.0, 1400.0]
+        with pytest.raises(ValidationError):
+            CampaignConfig(**section)
+
+    def test_negative_pressure_rejected(self) -> None:
+        section = _valid_campaign_section()
+        section["target_reactor_systems"][0]["pressure_range_bar"] = [-1.0, 30.0]
+        with pytest.raises(ValidationError):
+            CampaignConfig(**section)
+
+    def test_nh3_o2_ar_fixture_loads(self, tmp_path: Path) -> None:
+        """The realistic acceptance-test fixture: stoichiometric NH3/O2 in argon."""
+        fixture_path = Path(__file__).parent / "fixtures" / "campaign_nh3_o2_ar.yaml"
+        data = yaml.safe_load(fixture_path.read_text())
+        data["workspace_root"] = str(tmp_path / "ws")
+        path = tmp_path / "config.yaml"
+        path.write_text(yaml.dump(data))
+
+        config = load_config(path)
+
+        assert config.campaign is not None
+        species = {c.species for c in config.campaign.initial_mixture.components}
+        assert species == {"NH3", "O2", "AR"}
+        assert config.campaign.target_reactor_systems[0].reactor_type == ReactorType.SHOCK_TUBE
+        assert config.campaign.target_reactor_systems[0].temperature_range_K == (1400.0, 2000.0)
+        assert config.campaign.target_reactor_systems[0].pressure_range_bar == (1.0, 30.0)

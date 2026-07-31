@@ -10,6 +10,7 @@ lives in :mod:`carmel.services`.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import secrets
 from datetime import UTC, datetime
@@ -20,10 +21,13 @@ from uuid import uuid4
 from flask import Flask, abort, flash, redirect, render_template, request, url_for
 from werkzeug.wrappers.response import Response
 
+from carmel.config import AgentConfig
 from carmel.logger import get_logger
+from carmel.paths import default_workspaces_root
 from carmel.schemas.approval import ActionKind, ApprovalStatus
 from carmel.schemas.campaign import (
     Budgets,
+    Campaign,
     CampaignInput,
     EntryMode,
     InitialMixture,
@@ -35,6 +39,7 @@ from carmel.schemas.campaign import (
 from carmel.schemas.plan import Plan
 from carmel.schemas.state import CampaignState, CampaignStateValue
 from carmel.services.approvals import (
+    record_action_decision,
     record_decision,
 )
 from carmel.services.authorization import BudgetExceededError
@@ -45,6 +50,11 @@ from carmel.services.campaigns import (
     load_campaign,
 )
 from carmel.services.decision_log import append_event, read_events
+from carmel.services.dispatcher import (
+    UnsupportedActionKindError,
+    default_handlers,
+    execute_next_action,
+)
 from carmel.services.execution import (
     ARC_DIAGNOSTICS_FILE_NAME,
     ARC_MODELS_SUBDIR_NAME,
@@ -56,9 +66,16 @@ from carmel.services.execution import (
     load_arc_diagnostics,
     load_diagnostics,
     start_arc_action,
-    start_t3_action,
 )
 from carmel.services.intake import StubIntakeParser, write_intake_review
+from carmel.services.plan_progress import (
+    PLAN_PROGRESS_NAME,
+    ActionInFlightError,
+    aggregate_state,
+    load_or_init_progress,
+    load_progress,
+    reconcile,
+)
 from carmel.services.planner import load_plan, plan_and_save, plan_and_save_arc
 from carmel.services.recovery import (
     LockStateUnknownError,
@@ -70,6 +87,33 @@ from carmel.ui.csrf import init_csrf
 
 _log = get_logger("ui")
 
+#: Campaign states in which a PER-ACTION approval decision may still be
+#: recorded. A blanket (whole-plan) approve/reject keeps main's strict guard —
+#: it is only meaningful while the plan as a whole is pending approval — but
+#: the multi-action flow legitimately needs more for single actions: a T3
+#: action may still await its decision after an auto-approved literature
+#: action already ran (LITERATURE_READY / APPROVED_FOR_EXECUTION), and a
+#: BLOCKED campaign may still record an action-level un-skip (although the
+#: campaign itself can no longer be un-rejected — see campaign_approve).
+_PER_ACTION_APPROVE_STATES = frozenset(
+    {
+        CampaignStateValue.PLAN_PENDING_APPROVAL,
+        CampaignStateValue.APPROVED_FOR_EXECUTION,
+        CampaignStateValue.LITERATURE_READY,
+        CampaignStateValue.BLOCKED,
+    }
+)
+
+#: Per-action reject: as above, minus BLOCKED — with the campaign already
+#: blocked there is nothing left that a further rejection could stop.
+_PER_ACTION_REJECT_STATES = frozenset(
+    {
+        CampaignStateValue.PLAN_PENDING_APPROVAL,
+        CampaignStateValue.APPROVED_FOR_EXECUTION,
+        CampaignStateValue.LITERATURE_READY,
+    }
+)
+
 
 def _resolve_workspaces_root(workspaces_root: Path | None) -> Path:
     """Resolve the workspaces root directory.
@@ -77,14 +121,15 @@ def _resolve_workspaces_root(workspaces_root: Path | None) -> Path:
     Preference order:
         1. explicit ``workspaces_root`` argument
         2. ``$CARMEL_WORKSPACES`` env var
-        3. ``~/carmel_workspaces`` (user-level default, repo-independent)
+        3. the packaged default (see :func:`carmel.paths.default_workspaces_root`)
+
+    Steps 2 and 3 are delegated rather than reimplemented here: the CLI resolves the
+    same root, and two copies of this rule would let the UI and the CLI disagree about
+    where a campaign lives -- which an operator experiences as a campaign that vanished.
     """
     if workspaces_root is not None:
         return Path(workspaces_root).expanduser()
-    env = os.environ.get("CARMEL_WORKSPACES")
-    if env:
-        return Path(env).expanduser()
-    return Path.home() / "carmel_workspaces"
+    return default_workspaces_root()
 
 
 def _safe_workspace_dirname(name: str) -> str:
@@ -166,12 +211,23 @@ def _build_input_from_form(form: dict[str, Any]) -> CampaignInput:
 def _plan_tool(plan: Plan | None) -> str | None:
     """Name the tool the current plan's action runs: ``"t3"``, ``"arc"``, or None.
 
-    Used for tool-correct button labels and flashes. A plan is Phase 1
-    single-action, so the first action's kind is the plan's tool.
+    Used for tool-correct button labels and flashes.
+
+    Keyed on the first action that actually runs a TOOL, not simply the first action.
+    This helper was written when a Phase 1 plan held exactly one action, so "the first
+    action's kind is the plan's tool" was true by construction. The agentic layer makes
+    plans multi-action, and a literature-first plan would otherwise be read as an ARC/T3
+    plan purely by position -- a literature search runs no adapter and is not a tool in
+    this sense.
     """
-    if plan is None or not plan.actions:
+    if plan is None:
         return None
-    return "arc" if plan.actions[0].kind == ActionKind.ARC_RUN else "t3"
+    for action in plan.actions:
+        if action.kind == ActionKind.ARC_RUN:
+            return "arc"
+        if action.kind == ActionKind.T3_RUN:
+            return "t3"
+    return None
 
 
 _ARC_RESULT_STATES = frozenset({CampaignStateValue.RUNNING_ARC, CampaignStateValue.RESULTS_READY})
@@ -215,12 +271,18 @@ def _results_tool(state: CampaignState, plan: Plan | None) -> str | None:
     return None
 
 
-def create_app(workspaces_root: Path | None = None) -> Flask:
+def create_app(
+    workspaces_root: Path | None = None,
+    agent_config: AgentConfig | None = None,
+) -> Flask:
     """Create and configure the Carmel Flask application.
 
     Args:
         workspaces_root: Optional override for the parent workspaces directory.
             Defaults to ``$CARMEL_WORKSPACES`` or ``./workspaces``.
+        agent_config: Optional agentic-layer configuration (``carmel serve
+            --config``). ``None`` means the UI creates campaigns with no
+            literature auto-run — the UI cannot spend money by default.
 
     Returns:
         A configured Flask app.
@@ -261,9 +323,24 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         if ws.exists() and (ws / "campaign.yaml").exists():
             flash(f"A campaign already exists at {ws}", "error")
             return render_template("campaign_create.html", form=request.form), 400  # type: ignore[return-value]
-        campaign = create_campaign(ws, campaign_input)
-        update_state(ws, CampaignStateValue.VALIDATED, notes="form-validated")
-        update_state(ws, CampaignStateValue.READY_FOR_PLANNING)
+        # `literature_wait_timeout_s=None` means "dispatch and return, never block".
+        # The synchronous default is right for the CLI but wrong here: it pins one
+        # Flask worker for an entire literature run (many model calls, fetches and PDF
+        # extractions), so a couple of concurrent campaign creations make the UI
+        # unresponsive, and a client-side timeout would abandon a run that keeps going
+        # with nobody left to read its result.
+        campaign = create_campaign(
+            ws,
+            campaign_input,
+            agent_config=agent_config,
+            literature_wait_timeout_s=None,
+        )
+        # With an agent config, literature-at-creation may already have
+        # advanced the campaign past DRAFT; only apply the manual
+        # transitions when it has not.
+        if load_state(ws).state == CampaignStateValue.DRAFT:
+            update_state(ws, CampaignStateValue.VALIDATED, notes="form-validated")
+            update_state(ws, CampaignStateValue.READY_FOR_PLANNING)
         return redirect(url_for("campaign_dashboard", campaign_id=campaign.campaign_id))
 
     @app.route("/campaigns/<campaign_id>")
@@ -293,8 +370,47 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         # Only probed while the campaign claims to be running: it is the
         # one state whose truth cannot be read off disk, and the answer
         # decides whether the page shows progress or a way out.
+        # RUNNING_LITERATURE is deliberately NOT probed here: `probe_run_liveness`
+        # inspects an adapter's subprocess run lock, and a literature run holds its own
+        # in-process lock under evidence/literature/ instead. Probing it would report
+        # "unknown" for a run that is perfectly healthy.
         running_states = (CampaignStateValue.RUNNING_T3, CampaignStateValue.RUNNING_ARC)
         liveness = probe_run_liveness(ws) if state.state in running_states else None
+        progress = load_progress(ws) if (ws / PLAN_PROGRESS_NAME).exists() else None
+        progress_by_action = {a.action_id: a for a in progress.actions} if progress else {}
+        state_mismatch = None
+        if progress is not None:
+            projection = aggregate_state(progress)
+            if projection is not None and projection != state.state:
+                state_mismatch = projection.value
+        # Deferred import: `carmel.services.literature` pulls in the agents
+        # stack at module level, which the UI otherwise avoids importing
+        # eagerly (mirrors the same deferred-import pattern the dispatcher
+        # uses for this module).
+        from carmel.services.literature import load_literature_report
+
+        literature_report = None
+        try:
+            literature_report = load_literature_report(ws)
+        except FileNotFoundError:
+            pass  # No literature run has happened yet for this campaign.
+        except ValueError as e:
+            # Distinct from "absent" (Finding 24): the file exists but is
+            # corrupt/unparseable, which is worth its own log signal rather
+            # than degrading silently to the same "no report" UI state.
+            _log.warning("literature report for %s is present but corrupt: %s", ws, e)
+        # Papers awaiting the operator. This is the ONE part of a literature run that
+        # asks the user to do something, so it must be visible on the dashboard rather
+        # than only in a README on disk: most papers in this field cannot be fetched, so
+        # an empty-looking report with a full acquisition queue is the normal outcome and
+        # would otherwise read as "the agent found nothing".
+        from carmel.schemas.acquisition import AcquisitionStatus
+        from carmel.services.acquisition import inbox_dir, load_manifest
+
+        acquisition = load_manifest(ws)
+        pending_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REQUESTED]
+        rejected_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REJECTED]
+
         return render_template(
             "campaign_dashboard.html",
             campaign=campaign,
@@ -302,6 +418,13 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
             plan=plan,
             plan_tool=_plan_tool(plan),
             results_tool=results_tool,
+            progress=progress,
+            progress_by_action=progress_by_action,
+            state_mismatch=state_mismatch,
+            literature_report=literature_report,
+            pending_papers=pending_papers,
+            rejected_papers=rejected_papers,
+            inbox_path=str(inbox_dir(ws)),
             diagnostics=diagnostics,
             arc_diagnostics=arc_diagnostics,
             diagnostics_on_disk=(ws / DIAGNOSTICS_FILE_NAME).exists(),
@@ -335,24 +458,45 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
                 record_decision(ws, action.action_id, ApprovalStatus.AUTO_APPROVED, decided_by="auto")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
+    def _decision_targets(ws: Path, action_id: str | None) -> list[str]:
+        """The action ids a decision applies to: one, or all still-pending."""
+        plan = load_plan(ws)
+        progress = load_or_init_progress(ws, plan)  # migrates a Phase-1 plan
+        if action_id:
+            if all(a.action_id != action_id for a in progress.actions):
+                abort(404)
+            return [action_id]
+        return [a.action_id for a in progress.actions if a.approval_status == ApprovalStatus.PENDING]
+
     @app.route("/campaigns/<campaign_id>/approve", methods=["POST"])
     def campaign_approve(campaign_id: str) -> Response:
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
         state = load_state(ws)
-        if state.state != CampaignStateValue.PLAN_PENDING_APPROVAL:
+        action_id = request.form.get("action_id")
+        allowed = _PER_ACTION_APPROVE_STATES if action_id else {CampaignStateValue.PLAN_PENDING_APPROVAL}
+        if state.state not in allowed:
             abort(409, description=f"Cannot approve a campaign in state {state.state.value!r}.")
-        plan = load_plan(ws)
-        update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="user-approved")
-        for action in plan.actions:
-            record_decision(
+        progress = None
+        for target in _decision_targets(ws, action_id):
+            _, progress = record_action_decision(
                 ws,
-                action.action_id,
+                target,
                 ApprovalStatus.APPROVED,
                 decided_by="user",
                 rationale="approved via UI",
             )
+        # Approving a previously-rejected action un-skips it at the action
+        # level (see plan_progress.set_approval), but a BLOCKED campaign can
+        # no longer be un-rejected: main deliberately removed the
+        # BLOCKED -> APPROVED_FOR_EXECUTION edge (a rejected plan should be
+        # re-planned, not un-rejected), so only a campaign still awaiting
+        # approval may advance to execution here.
+        if progress is not None and progress.has_executable_remaining():
+            state = load_state(ws)
+            if state.state == CampaignStateValue.PLAN_PENDING_APPROVAL:
+                update_state(ws, CampaignStateValue.APPROVED_FOR_EXECUTION, notes="user-approved")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/reject", methods=["POST"])
@@ -361,30 +505,60 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         if ws is None:
             abort(404)
         state = load_state(ws)
-        if state.state != CampaignStateValue.PLAN_PENDING_APPROVAL:
+        action_id = request.form.get("action_id")
+        allowed = _PER_ACTION_REJECT_STATES if action_id else {CampaignStateValue.PLAN_PENDING_APPROVAL}
+        if state.state not in allowed:
             abort(409, description=f"Cannot reject a campaign in state {state.state.value!r}.")
-        plan = load_plan(ws)
-        update_state(ws, CampaignStateValue.BLOCKED, notes="user-rejected")
-        for action in plan.actions:
-            record_decision(
+        progress = None
+        for target in _decision_targets(ws, action_id):
+            _, progress = record_action_decision(
                 ws,
-                action.action_id,
+                target,
                 ApprovalStatus.REJECTED,
                 decided_by="user",
                 rationale="rejected via UI",
             )
+        # Rejecting one action of several must not blanket-BLOCK the
+        # campaign: only block when nothing executable remains.
+        if progress is not None and not progress.has_executable_remaining():
+            current = load_state(ws).state
+            if current != CampaignStateValue.BLOCKED and can_transition(current, CampaignStateValue.BLOCKED):
+                update_state(ws, CampaignStateValue.BLOCKED, notes="user-rejected")
+        elif progress is not None:
+            remaining = [a for a in progress.actions if a.is_executable()]
+            if remaining and all(
+                a.approval_status in (ApprovalStatus.APPROVED, ApprovalStatus.AUTO_APPROVED) for a in remaining
+            ):
+                state = load_state(ws)
+                if state.state == CampaignStateValue.PLAN_PENDING_APPROVAL:
+                    update_state(
+                        ws,
+                        CampaignStateValue.APPROVED_FOR_EXECUTION,
+                        notes="remaining actions approved",
+                    )
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
-    @app.route("/campaigns/<campaign_id>/run", methods=["POST"])
-    def campaign_run(campaign_id: str) -> Response:
-        ws = find_campaign_workspace(workspaces, campaign_id)
-        if ws is None:
-            abort(404)
-        campaign = load_campaign(ws)
-        plan = load_plan(ws)
-        if not plan.actions:
-            abort(400)
-        action = plan.actions[0]
+    def _start_arc_run(ws: Path, campaign: Campaign, plan: Plan, campaign_id: str) -> Response:
+        """Start an ARC run on the pre-dispatcher, single-action path.
+
+        Kept byte-for-byte equivalent to the flow ARC was built and tested against
+        (approval check from the decision log, transition preflight, identical
+        launch-time error mapping) rather than folded into the multi-action dispatcher
+        beside it. ARC_RUN has no registered handler and is rejected by
+        ``validate_plan_shape``, so the dispatcher cannot run it, and quietly rewiring
+        another workstream's execution path during a rebase is exactly the kind of
+        change that looks harmless and is not.
+        """
+        # Finding P1-14: select the ARC action by kind, not by position. Plans
+        # are multi-action now (planner.py appends LITERATURE_SEARCH before
+        # ARC_RUN), so `plan.actions[0]` is the literature action, not ARC --
+        # reading its approval would let a literature approval stand in for
+        # ARC's. One selection is used for both the launch call below and the
+        # approval check, so the two can never disagree about which action
+        # this route is launching.
+        action = next((a for a in plan.actions if a.kind == ActionKind.ARC_RUN), None)
+        if action is None:
+            abort(400, description="Plan has no ARC_RUN action.")
         decisions = [
             event
             for event in read_events(ws / "decision_log.jsonl")
@@ -393,27 +567,15 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         approved = {ApprovalStatus.APPROVED.value, ApprovalStatus.AUTO_APPROVED.value}
         if not decisions or decisions[-1].get("status") not in approved:
             abort(409, description="Action has no recorded approval decision.")
-        # The plan decides the tool: an approved run_arc action must start
-        # ARC, never T3. Both branches share the guards below — approval
-        # check above, transition preflight, and the identical launch-time
-        # error mapping — so neither tool path is softer than the other.
-        if action.kind == ActionKind.ARC_RUN:
-            running_state = CampaignStateValue.RUNNING_ARC
-            start_action = start_arc_action
-        elif action.kind == ActionKind.T3_RUN:
-            running_state = CampaignStateValue.RUNNING_T3
-            start_action = start_t3_action
-        else:
-            abort(409, description=f"Action kind {action.kind.value!r} is not executable from the UI.")
         # Preflight the transition rather than letting it raise out of the
         # service layer as a 500. Re-clicking Run — which the auto-refreshing
         # running dashboard now makes easy to do — must read as a conflict,
         # not a crash.
         current = load_state(ws).state
-        if not can_transition(current, running_state):
+        if not can_transition(current, CampaignStateValue.RUNNING_ARC):
             abort(409, description=f"Cannot start a run for a campaign in state {current.value!r}.")
         try:
-            start_action(ws, campaign, action)
+            start_arc_action(ws, campaign, action)
         except BudgetExceededError as e:
             # The launch-time re-check found the campaign's remaining budget
             # (or the live gate generally) no longer covers this action and
@@ -428,10 +590,119 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
             # both must read as a conflict rather than a 500.
             abort(409, description="A run for this campaign was started concurrently.")
         except LockStateUnknownError as e:
+            abort(503, description=f"Cannot determine run-lock state for this workspace: {e}")
+        return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
+
+    @app.route("/campaigns/<campaign_id>/run", methods=["POST"])
+    def campaign_run(campaign_id: str) -> Response:
+        ws = find_campaign_workspace(workspaces, campaign_id)
+        if ws is None:
+            abort(404)
+        campaign = load_campaign(ws)
+        plan = load_plan(ws)
+        if not plan.actions:
+            abort(400)
+        # TWO execution paths, because ARC has not been migrated onto the
+        # multi-action dispatcher yet: `default_handlers` deliberately omits
+        # ARC_RUN, so an ARC plan cannot go through `execute_next_action` at
+        # all. It stays on the single-action flow it was built with, and that
+        # branch is taken BEFORE the plan-progress reconcile below -- ARC
+        # predates plan_progress entirely and recovers through its own
+        # liveness probe and abandon route instead. Unifying the two is the
+        # ARC workstream's call, not something to force here.
+        if plan.actions[0].kind == ActionKind.ARC_RUN:
+            return _start_arc_run(ws, campaign, plan, campaign_id)
+
+        # Finding P1-1: initialise plan_progress.json BEFORE reconcile, not
+        # after. `reconcile` -> `load_progress` -> `read_json` raises
+        # FileNotFoundError (an OSError) when the progress file does not yet
+        # exist, and every campaign workspace created by `main` lacks one
+        # until this call creates it. With the two calls in the other order
+        # that FileNotFoundError was caught below and turned into a 503 on
+        # EVERY first `/run` of EVERY campaign -- permanently, since retrying
+        # repeats the identical failure. `load_or_init_progress` is
+        # idempotent (a no-op once the file exists), so calling it first is
+        # always safe.
+        progress = load_or_init_progress(ws, plan)
+
+        # Crash recovery (Finding 1): replay any missing post-transition or
+        # adopt any persisted attempt result BEFORE the preflight below looks
+        # at campaign state. Every UI route otherwise refuses while the
+        # campaign reads RUNNING_* (no self-edge in the state machine), so
+        # without this a campaign left there by a crash could only be
+        # recovered by hand-editing JSON. A still-live attempt
+        # (ActionInFlightError) means the run genuinely is in progress, not
+        # stuck -- leave it alone and let the existing preflight/dispatcher
+        # report the conflict.
+        try:
+            with contextlib.suppress(ActionInFlightError):
+                reconcile(ws, in_dispatch_lock=False)
+        except OSError as e:
+            # The progress file itself is now guaranteed to exist (see
+            # above), so this is a genuine filesystem fault acquiring the
+            # workspace's advisory lock (e.g. permissions), not a missing
+            # file misread as a lock problem. Either way it is an
+            # environment fault (503), not a crash.
+            abort(503, description=f"Cannot determine plan-progress/run-lock state for this workspace: {e}")
+
+        progress = load_or_init_progress(ws, plan)
+        next_id = progress.next_action_id()
+        if next_id is not None:
+            action = next((a for a in plan.actions if a.action_id == next_id), None)
+            if action is None:
+                abort(409, description="Plan progress references an action missing from the plan.")
+            # Finding 18: `plan_progress.json` is the single source of truth
+            # for authorization here, not the append-only decision log.
+            # `record_action_decision` writes the two in separate lock
+            # windows, so re-deriving "approved" from the log (which
+            # `record_decision`/`record_action_decision` write to purely as
+            # an audit trail) could disagree with the executable state the
+            # dispatcher itself reads. The log is still written on every
+            # decision -- it is just no longer queried for authorization.
+            next_action_state = next((a for a in progress.actions if a.action_id == next_id), None)
+            approved_statuses = {ApprovalStatus.APPROVED, ApprovalStatus.AUTO_APPROVED}
+            if next_action_state is None or next_action_state.approval_status not in approved_statuses:
+                abort(409, description="Action has no recorded approval decision.")
+            # Preflight the transition rather than letting it raise out of the
+            # service layer as a 500. Re-clicking Run — which the auto-refreshing
+            # running dashboard now makes easy to do — must read as a conflict,
+            # not a crash.
+            running_state = (
+                CampaignStateValue.RUNNING_LITERATURE
+                if action.kind == ActionKind.LITERATURE_SEARCH
+                else CampaignStateValue.RUNNING_T3
+            )
+            current = load_state(ws).state
+            if not can_transition(current, running_state):
+                abort(409, description=f"Cannot start a run for a campaign in state {current.value!r}.")
+        try:
+            result = execute_next_action(ws, campaign, handlers=default_handlers(agent_config=agent_config))
+        except ActionInFlightError:
+            # A run for this workspace is already in flight; a re-click must
+            # read as a conflict, not a crash.
+            abort(409, description="A run for this campaign is already in progress.")
+        except BudgetExceededError as e:
+            # The dispatcher's live launch gate refused: the campaign's remaining
+            # budget no longer covers this action and no human approval stands, or a
+            # human explicitly rejected it. Nothing was started and the dashboard state
+            # is unchanged -- a conflict, not a crash. Mirrors the ARC path above.
+            abort(409, description=str(e))
+        except InvalidTransitionError, RunAlreadySupervisedError:
+            # The preflight above is a read, so it cannot be authoritative:
+            # a concurrent POST can win the race between it and the locked
+            # transition inside the dispatcher. The loser must still see a
+            # conflict rather than a 500.
+            abort(409, description="A run for this campaign was started concurrently.")
+        except LockStateUnknownError as e:
             # The workspace's filesystem cannot answer whether a run lock is
             # held (no working flock). That is an environment fault, not the
-            # caller's — a 503, not a 500 or a 409.
+            # caller's -- a 503, not a 500 or a 409.
             abort(503, description=f"Cannot determine run-lock state for this workspace: {e}")
+        except UnsupportedActionKindError as e:
+            flash(f"Plan cannot be executed: {e}", "error")
+            return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
+        if result is None:
+            flash("Nothing to run: the plan is complete or the next action awaits approval.", "info")
         return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
 
     @app.route("/campaigns/<campaign_id>/replan", methods=["POST"])
@@ -535,12 +806,46 @@ def create_app(workspaces_root: Path | None = None) -> Flask:
         :func:`~carmel.services.execution.abandon_t3_run` /
         :func:`~carmel.services.execution.abandon_arc_run`, which stop an
         orphaned tool tree before they let the campaign be called failed.
+
+        ``RUNNING_LITERATURE`` (Finding 1) has no supervised process tree to
+        stop -- literature crash recovery is entirely lock-file based (see
+        :func:`~carmel.services.plan_progress.reconcile`) -- so it is handled
+        separately from the adapter paths rather than by generalising
+        :func:`~carmel.services.execution.abandon_t3_run`, which is
+        T3-specific by design.
         """
         ws = find_campaign_workspace(workspaces, campaign_id)
         if ws is None:
             abort(404)
         campaign = load_campaign(ws)
         state = load_state(ws)
+        if state.state == CampaignStateValue.RUNNING_LITERATURE:
+            # Literature has no supervised process tree, so "abandon" here means
+            # lock-file reconciliation rather than killing an adapter.
+            #
+            # Finding P1-1: as in `campaign_run`, initialise plan_progress.json
+            # BEFORE reconcile, not after. A campaign cannot legitimately reach
+            # RUNNING_LITERATURE without one (`/run` creates it before making
+            # that transition), but a defensive `load_or_init_progress` here
+            # is a cheap, idempotent no-op in the normal case and closes the
+            # same FileNotFoundError-as-503 trap for any workspace left
+            # inconsistent by hand-editing or an older bug.
+            plan = load_plan(ws)
+            load_or_init_progress(ws, plan)
+            try:
+                reconcile(ws, in_dispatch_lock=False)
+            except ActionInFlightError as e:
+                abort(409, description=str(e))
+            except OSError as e:
+                abort(503, description=f"Cannot determine plan-progress/run-lock state for this workspace: {e}")
+            state = load_state(ws)
+            if state.state == CampaignStateValue.RUNNING_LITERATURE:
+                # No stale lock and no live attempt, yet still RUNNING_LITERATURE:
+                # nothing for reconcile to repair (e.g. the RUNNING action's
+                # lease has not yet aged past the staleness horizon).
+                abort(409, description="Cannot abandon a run for a campaign in state 'RUNNING_LITERATURE'.")
+            flash("Run abandoned via crash recovery.", "info")
+            return redirect(url_for("campaign_dashboard", campaign_id=campaign_id))
         if state.state == CampaignStateValue.RUNNING_T3:
             abandon_run = abandon_t3_run
         elif state.state == CampaignStateValue.RUNNING_ARC:

@@ -1,0 +1,35 @@
+# Realistic acceptance-test fixture: stoichiometric NH3/O2 combustion diluted in
+# argon, targeted at a shock-tube ignition-delay measurement. This is the live
+# acceptance-test topic (see PR review notes), so keeping the fixture honest about
+# the real use case -- rather than a toy single-species mixture -- is deliberate.
+#
+# Stoichiometry: 4 NH3 + 3 O2 -> 2 N2 + 6 H2O, so NH3:O2 = 4:3. Diluted in argon so
+# the mixture is representative of a real shock-tube charge rather than an
+# undiluted, unrealistically fast-burning one.
+#
+# `workspace_root` below is a placeholder -- tests overwrite it with a tmp_path
+# before loading, since the value must point at a real, test-local directory.
+workspace_name: nh3-o2-ar-shock-tube
+workspace_root: /tmp/carmel-nh3-o2-ar-placeholder
+logging_level: INFO
+campaign:
+  initial_mixture:
+    components:
+      - species: NH3
+        mole_fraction: 0.20
+        smiles: N
+      - species: O2
+        mole_fraction: 0.15
+        smiles: "[O][O]"
+      - species: AR
+        mole_fraction: 0.65
+  target_observables:
+    - name: ignition_delay_time
+      description: Time to peak OH* / pressure rise following reflected-shock heating.
+  target_reactor_systems:
+    - reactor_type: shock_tube
+      temperature_range_K: [1400.0, 2000.0]
+      pressure_range_bar: [1.0, 30.0]
+  budgets:
+    cpu_hours: 10.0
+    experiment_budget: 0.0
