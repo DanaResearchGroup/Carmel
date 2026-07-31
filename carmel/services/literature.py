@@ -1488,11 +1488,21 @@ def _corpus_loop(
 ) -> None:
     """The corpus-only pass: read what is held, propose, ground, verify.
 
-    A single round, not the search loop's repeated propose->search->read cycle. That
-    loop exists because search results are only fed back on the NEXT round, so a
-    finding is impossible in round one. Here the agent is shown the entire corpus up
-    front, so a second round would re-read identical input at full cost and could
-    only produce what the first round already had the information to produce.
+    ONE MODEL CALL PER DOCUMENT, not one call holding the whole corpus. This is not a
+    stylistic choice -- it was measured. Handing the model all 8 papers of the live
+    syngas campaign in a single 116k-token prompt produced ZERO proposed findings;
+    handing it one of those same papers alone produced two, from the same prompt and
+    the same model. A corpus large enough to be worth re-reading is large enough to
+    bury the instruction to quote from it.
+
+    Per-document calls also make partial work survivable: exhausting the budget on
+    document six keeps the findings from documents one to five, where a single call
+    would have lost everything.
+
+    No repeated rounds per document. The search loop iterates because search results
+    are only fed back on the NEXT round, so a finding is impossible in round one;
+    here the document is in front of the agent immediately, and a second round would
+    re-read identical input at full cost.
     """
     corpus = _load_corpus(workspace_root)
     if not corpus:
@@ -1500,20 +1510,48 @@ def _corpus_loop(
         state.warnings.append("the evidence store holds no readable artifacts, so there was nothing to read")
         return
 
-    by_sha = {artifact.sha256: (artifact, extracted) for artifact, extracted in corpus}
-    deps.ledger.check_wall_clock()
     agent = build_corpus_agent(model=deps.model, ledger=deps.ledger)
-    result = agent.run(_corpus_prompt(campaign, corpus))
-    proposal = CorpusProposal.model_validate(result.output)
+    for artifact, extracted in corpus:
+        deps.ledger.check_wall_clock()
+        # Only the document actually shown is resolvable. The agent is looking at one
+        # paper, so a digest naming any other is a mistake worth surfacing, even when
+        # that other paper happens to be in the store.
+        by_sha = {artifact.sha256: (artifact, extracted)}
+        result = agent.run(_corpus_prompt(campaign, [(artifact, extracted)]))
+        proposal = CorpusProposal.model_validate(result.output)
+        append_typed_event(
+            log_path,
+            event="literature.corpus_pass_proposed",
+            action_id=action_id,
+            run_id=run_id,
+            payload={"sha256": artifact.sha256, "n_proposed": len(proposal.findings)},
+        )
+        _process_corpus_proposal(
+            workspace_root,
+            proposal,
+            deps,
+            config=config,
+            state=state,
+            by_sha=by_sha,
+            log_path=log_path,
+            action_id=action_id,
+            run_id=run_id,
+        )
 
-    append_typed_event(
-        log_path,
-        event="literature.corpus_pass_proposed",
-        action_id=action_id,
-        run_id=run_id,
-        payload={"n_documents": len(corpus), "n_proposed": len(proposal.findings)},
-    )
 
+def _process_corpus_proposal(
+    workspace_root: Path,
+    proposal: CorpusProposal,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    by_sha: dict[str, tuple[StoredArtifact, ExtractedText]],
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+) -> None:
+    """Ground every finding one document's proposal claimed."""
     seen: set[tuple[str, str]] = set()
     for proposed in proposal.findings:
         resolved = by_sha.get(proposed.artifact_sha256)

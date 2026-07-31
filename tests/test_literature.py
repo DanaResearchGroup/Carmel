@@ -1900,9 +1900,14 @@ class TestCorpusPass:
         sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         sha_two = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
         assert sha_one != sha_two
-        # A verbatim quote from document TWO, attributed to document ONE.
+        # A verbatim quote from document TWO, attributed to document ONE. One
+        # proposal per document, since the pass makes one model call per document.
         deps, _, config = _make_deps(
-            [_corpus_proposal([_corpus_finding(sha256=sha_one, quote=SECOND_QUOTE)]), _assessment()]
+            [
+                _corpus_proposal([_corpus_finding(sha256=sha_one, quote=SECOND_QUOTE)]),
+                _corpus_proposal([]),
+                _assessment(),
+            ]
         )
 
         report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
@@ -2022,3 +2027,64 @@ class TestOperatorBudgetBinds:
         action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_spend_usd": 0.0})
 
         assert _apply_action_budget(deps, action) is deps
+
+
+class TestCorpusPassReadsOneDocumentPerCall:
+    """Measured, not stylistic.
+
+    Handing the model all 8 papers of the live syngas campaign in one 116k-token
+    prompt produced ZERO proposed findings. The same model, same prompt, one of those
+    papers alone: two proposals. A corpus big enough to be worth re-reading is big
+    enough to bury the instruction to quote from it.
+    """
+
+    def test_each_document_gets_its_own_model_call(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        deps, model, config = _make_deps([_corpus_proposal([]), _corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 2, "one call per document, not one call for the corpus"
+        assert report.latest.stop_reason != StopReason.ERROR
+
+    def test_a_prompt_shows_exactly_one_document(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The isolation is the point: if both documents appeared in every prompt,
+        per-document calls would cost twice as much and change nothing."""
+        _patch_chem_success(monkeypatch)
+        sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        sha_two = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        deps, _, config = _make_deps([_corpus_proposal([]), _corpus_proposal([])])
+
+        prompts: list[str] = []
+        original = deps.model.complete
+
+        def _spy(**kwargs: Any) -> Any:
+            prompts.append(kwargs["user_prompt"])
+            return original(**kwargs)
+
+        monkeypatch.setattr(deps.model, "complete", _spy)
+        run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(prompts) == 2
+        for prompt in prompts:
+            shown = [s for s in (sha_one, sha_two) if s in prompt]
+            assert len(shown) == 1, "each call must show exactly one document"
+
+    def test_findings_from_earlier_documents_survive_a_later_failure(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other reason for per-document calls: exhausting the budget on document
+        six keeps documents one to five. A single call would lose everything."""
+        _patch_chem_success(monkeypatch)
+        sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        # Only ONE proposal queued: the second document's call exhausts the mock and
+        # raises, standing in for a budget or provider failure partway through.
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha_one)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, "the first document's grounded finding must survive"
+        assert report.latest.stop_reason == StopReason.ERROR

@@ -266,7 +266,7 @@ def _cmd_corpus_pass(
     """
     from carmel.schemas.action_state import ActionOutcome
     from carmel.services.campaigns import find_campaign_workspace, load_campaign
-    from carmel.services.dispatcher import execute_action
+    from carmel.services.dispatcher import default_handlers, execute_action
     from carmel.services.planner import append_corpus_pass_action
     from carmel.ui.app import _resolve_workspaces_root
 
@@ -313,7 +313,16 @@ def _cmd_corpus_pass(
     from carmel.agents.bridge import AgentBridgeError
 
     try:
-        result = execute_action(ws, campaign, action)
+        # The agent config MUST be threaded through to the handler registry. Without
+        # it the literature handler is built with nothing to run on and returns a
+        # typed "no agent config available" failure -- which looks like a failed run
+        # rather than a command that never started one.
+        result = execute_action(
+            ws,
+            campaign,
+            action,
+            handlers=default_handlers(agent_config=agent_config),  # type: ignore[arg-type]
+        )
     except AgentBridgeError as e:
         print(f"Corpus pass unavailable (consent/API key): {e}", file=sys.stderr)
         return 1

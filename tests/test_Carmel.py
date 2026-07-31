@@ -1180,3 +1180,47 @@ class TestCorpusPassCommand:
 
         assert code == 1
         assert "not found" in capsys.readouterr().err
+
+    def test_the_agent_config_reaches_the_handler(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression: the command loaded --config and then dispatched without it, so
+        the literature handler was built with nothing to run on and returned a typed
+        "no agent config available" failure. That reads as a failed RUN rather than a
+        command that never started one, and no test using injected deps could see it
+        -- only the real dispatch path does.
+        """
+        import carmel.services.dispatcher as dispatcher
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+
+        seen: dict[str, object] = {}
+        real_default_handlers = dispatcher.default_handlers
+
+        def _spy(**kwargs: Any) -> Any:
+            seen.update(kwargs)
+            return real_default_handlers(**kwargs)
+
+        monkeypatch.setattr(dispatcher, "default_handlers", _spy)
+
+        main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-usd",
+                "1",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+            ]
+        )
+
+        assert "agent_config" in seen, "the command dispatched without handing over a handler registry"
+        assert seen["agent_config"] is not None, "the loaded --config never reached the handler"
