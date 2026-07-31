@@ -1243,3 +1243,118 @@ class TestTheCorpusPassObeysTheApprovalPolicy:
         action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name=None)
 
         assert action.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+
+
+class TestAnInsertionNeverDisplacesARunningAction:
+    """F17. Refusing only *strictly* behind the cursor is not enough.
+
+    ``at == cursor`` passed that guard even when the action sitting there was
+    RUNNING. Inserting there shifts the running action to ``at+1`` while the cursor
+    stays put, and its own ``advance_cursor`` then refuses to move (it requires the
+    id at the cursor to match) -- so the inserted action inherits the slot and is
+    scheduled AFTER the run it was inserted to precede. The caller's ordering intent
+    is inverted, and nothing raises.
+    """
+
+    def _corpus_action(self, action_id: str = "corpus") -> PlannedAction:
+        return _action(action_id, kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False)
+
+    def test_inserting_where_a_running_action_sits_is_refused(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress_locked
+        from carmel.services.state_machine import workspace_lock
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+        mark_running(ws, "lit", "a1")
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws, "lit")
+        mark_running(ws, "t3", "a2")  # the cursor now sits on a RUNNING action
+        assert load_progress(ws).cursor == 1
+
+        with workspace_lock(ws), pytest.raises(ValueError, match="RUNNING"):
+            append_action_to_progress_locked(ws, self._corpus_action(), index=1)
+
+        # Untouched: the running action still owns its slot.
+        progress = load_progress(ws)
+        assert [state.action_id for state in progress.actions] == ["lit", "t3"]
+        assert progress.cursor == 1
+
+    def test_inserting_at_the_cursor_is_still_allowed_when_nothing_is_running(self, ws: Path) -> None:
+        """The guard must not over-refuse: inserting ahead of a PENDING action is the
+        normal case, and is exactly how a corpus pass gets placed before the T3 run."""
+        from carmel.services.plan_progress import append_action_to_progress_locked
+        from carmel.services.state_machine import workspace_lock
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+        mark_running(ws, "lit", "a1")
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws, "lit")
+        assert load_progress(ws).cursor == 1
+
+        with workspace_lock(ws):
+            append_action_to_progress_locked(ws, self._corpus_action(), index=1)
+
+        progress = load_progress(ws)
+        assert [state.action_id for state in progress.actions] == ["lit", "corpus", "t3"]
+        assert progress.cursor == 1  # the corpus pass runs next, ahead of T3
+
+
+class TestAppendingACorpusPassIsAllOrNothing:
+    """F15. The workspace lock excludes concurrent writers; it does not make two
+    writes one.
+
+    Progress was written, then the plan, with no rollback. A ``save_plan`` failure
+    left progress permanently naming an action the plan does not contain, and every
+    later ``execute_next_action`` then refuses the workspace outright. There is no
+    repair path short of hand-editing: ``load_or_init_progress`` re-initialises only
+    when ``plan_id`` differs, and the edited copy preserves it.
+    """
+
+    def test_a_failed_plan_write_leaves_progress_untouched(self, ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.services import planner
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+        before = load_progress(ws)
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(planner, "save_plan", _boom)
+
+        with pytest.raises(OSError, match="no space left"):
+            append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        after = load_progress(ws)
+        assert [state.action_id for state in after.actions] == [state.action_id for state in before.actions]
+        assert after.cursor == before.cursor
+
+    def test_the_workspace_is_still_dispatchable_afterwards(self, ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The point of the rollback, stated as the symptom it prevents."""
+        from carmel.services import planner
+        from carmel.services.campaigns import load_campaign
+        from carmel.services.dispatcher import default_handlers, execute_next_action
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(planner, "save_plan", _boom)
+        with pytest.raises(OSError):
+            append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+        monkeypatch.undo()
+
+        # Before the fix this raised UnsupportedActionKindError: "progress references
+        # action ... missing from the plan".
+        ticket = execute_next_action(ws, load_campaign(ws), handlers=default_handlers())
+        assert ticket is not None
+        ticket.wait(timeout=60)

@@ -16,7 +16,12 @@ from carmel.schemas.plan import Plan, PlannedAction
 from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.authorization import ExecutionEnvelope, decide_requirement
-from carmel.services.plan_progress import append_action_to_progress_locked, init_progress, load_progress
+from carmel.services.plan_progress import (
+    append_action_to_progress_locked,
+    init_progress,
+    load_progress,
+    save_progress,
+)
 from carmel.services.spend import compute_spend
 from carmel.services.state_machine import workspace_lock
 
@@ -484,11 +489,38 @@ def _append_corpus_pass_action_locked(
     at = len(actions) if t3_index is None else t3_index
     actions.insert(at, action)
 
+    new_plan = plan.model_copy(update={"actions": actions})
+
+    # Validate the plan BEFORE writing anything (F15). The workspace lock excludes
+    # concurrent writers; it does not make two writes one. `save_plan` re-runs
+    # `validate_plan_shape` and raises on a shape it will not persist, and
+    # discovering that AFTER progress has been written leaves progress permanently
+    # naming an action the plan does not contain -- which every later
+    # `execute_next_action` refuses with UnsupportedActionKindError. There is no
+    # repair path short of hand-editing: `load_or_init_progress` re-initialises only
+    # when `plan_id` differs, and this copy preserves it.
+    #
+    # Function-level import for the same reason `save_plan` uses one: the dispatcher
+    # imports this module.
+    from carmel.services.dispatcher import validate_plan_shape
+
+    problems = validate_plan_shape(new_plan)
+    if problems:
+        raise ValueError("appending this corpus pass would make the plan unexecutable: " + "; ".join(problems))
+
     # Progress first: it is the component that can legitimately REFUSE (an insertion
     # behind the cursor would never run). Saving the plan first would leave the plan
     # naming an action that progress does not know about.
+    progress_before = load_progress(workspace_root)
     append_action_to_progress_locked(workspace_root, action, index=at)
-    save_plan(workspace_root, plan.model_copy(update={"actions": actions}))
+    try:
+        save_plan(workspace_root, new_plan)
+    except Exception:
+        # Validation above rules out the shape failures; what remains is I/O (a full
+        # disk, a permission change mid-write). Put progress back rather than leaving
+        # the workspace in the un-dispatchable state described above.
+        save_progress(workspace_root, progress_before)
+        raise
     return action
 
 

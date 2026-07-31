@@ -179,6 +179,20 @@ def append_action_to_progress_locked(
             f"cannot insert an action at position {at}: the plan has already progressed "
             f"past it (cursor is at {progress.cursor}), so it would never run"
         )
+    # Strictly-behind is not enough (F17). `at == cursor` is legal by that test alone,
+    # including when the action sitting there is RUNNING -- and inserting there
+    # DISPLACES it to at+1 while the cursor stays put. The running action's own
+    # `advance_cursor` then refuses to move (it requires the id at the cursor to
+    # match), so the inserted action silently inherits the slot and is scheduled
+    # AFTER the run it was inserted to precede: the exact inversion of the caller's
+    # intent, reached without any error.
+    occupant = progress.actions[at] if at < len(progress.actions) else None
+    if occupant is not None and occupant.execution_status == ActionExecutionStatus.RUNNING:
+        raise ValueError(
+            f"cannot insert an action at position {at}: {occupant.action_id} is RUNNING there. "
+            f"Inserting ahead of a run already in flight cannot put the new action first, "
+            f"and would strand the running action's cursor. Wait for it to finish."
+        )
     progress.actions.insert(
         at,
         ActionState(
