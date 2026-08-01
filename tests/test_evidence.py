@@ -274,6 +274,43 @@ class TestTheExtractedSidecarIsVerifiedToo:
             "the recorded digest must describe the bytes actually written to disk"
         )
 
+    def test_an_artifact_with_unreadable_meta_is_not_reported_as_verified(self, tmp_path: Path) -> None:
+        """Copilot review. "Could not check" must not read as "intact".
+
+        Without ``meta.json`` there is no recorded ``extracted_sha256``, so whether
+        this artifact ever had a verifiable sidecar is unknown -- and the grounding
+        gate quotes from ``extracted.json``. Returning True here reported a check that
+        could not run as a check that passed: the same assertion-for-observation
+        conflation already fixed twice on the acquisition side.
+        """
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        assert verify_artifact(tmp_path, stored.sha256) is True
+
+        (artifact_dir(tmp_path, stored.sha256) / "meta.json").write_text("{not json", encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256) is False
+
+    def test_a_legacy_artifact_with_no_recorded_sidecar_digest_still_verifies(self, tmp_path: Path) -> None:
+        """Failing closed on unreadable meta must not fail closed on OLD meta.
+
+        An artifact stored before ``extracted_sha256`` existed has READABLE metadata
+        that simply records no sidecar digest. That is a known, benign state -- not an
+        unknown one -- so it still verifies on ``raw.bin`` alone.
+        """
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        del payload["extracted_sha256"]
+        meta_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256) is True
+
     def test_a_truncated_sidecar_that_still_parses_is_refused(self, tmp_path: Path) -> None:
         """The failure this exists for. Truncation that breaks JSON was already caught
         by the parse check; truncation that leaves VALID JSON was not, and that is the

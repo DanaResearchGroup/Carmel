@@ -1353,6 +1353,53 @@ class TestThePublicAppendWrapper:
             )
 
 
+class TestAppendingACorpusPassRealignsProgress:
+    """Copilot review. The append inspected progress with ``load_progress``.
+
+    Two workspaces break that: one with a plan and no ``plan_progress.json`` at all
+    (a Phase-1 workspace predating per-action progress), and one whose progress file
+    belongs to a DIFFERENT plan. The first raised FileNotFoundError, which the CLI
+    then reported as "Campaign has no plan yet" -- the opposite of true. The second
+    inspected another plan's progress as though it described this one, misaligning
+    the very index the append is about to insert at.
+    """
+
+    def test_a_workspace_with_a_plan_but_no_progress_file_still_appends(self, ws: Path) -> None:
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+        from carmel.services.planner import load_plan as _load_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+        (ws / PLAN_PROGRESS_NAME).unlink()
+
+        action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        progress = load_progress(ws)
+        assert action.action_id in [state.action_id for state in progress.actions]
+        # Plan and progress must still line up index for index.
+        assert [a.action_id for a in _load_plan(ws).actions] == [s.action_id for s in progress.actions]
+
+    def test_progress_from_a_different_plan_is_reinitialised_not_trusted(self, ws: Path) -> None:
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+        from carmel.services.planner import load_plan as _load_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        # Progress left over from some other plan entirely.
+        init_progress(ws, _plan([_action("stale-a"), _action("stale-b")], plan_id="other-plan"))
+        assert load_progress(ws).plan_id == "other-plan"
+
+        append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        progress = load_progress(ws)
+        assert progress.plan_id == plan.plan_id
+        assert "stale-a" not in [state.action_id for state in progress.actions]
+        assert [a.action_id for a in _load_plan(ws).actions] == [s.action_id for s in progress.actions]
+
+
 class TestAppendingACorpusPassIsAllOrNothing:
     """F15. The workspace lock excludes concurrent writers; it does not make two
     writes one.

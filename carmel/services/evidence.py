@@ -517,7 +517,16 @@ def verify_artifact(workspace_root: Path, sha256: str) -> bool:
         return False
     meta = _load_meta(dest_dir / _META_NAME)
     if meta is None:
-        # No metadata to check against; the raw bytes verified, which is all this
-        # artifact ever promised.
-        return True
+        # Fail CLOSED. Without metadata there is no recorded `extracted_sha256`, so
+        # whether this artifact ever had a verifiable sidecar is unknown -- and
+        # returning True would report "verified" for a check that could not run. That
+        # is the assertion-for-observation conflation this codebase has already fixed
+        # twice on the acquisition side (PAYWALLED vs NO_OPEN_ACCESS_COPY, then
+        # NO_OPEN_ACCESS_COPY vs OA_LOOKUP_INCOMPLETE); the grounding gate quotes from
+        # `extracted.json`, so "could not check" must not read as "intact".
+        #
+        # Legacy artifacts are unaffected: they have READABLE meta with
+        # `extracted_sha256=None`, which _extracted_sidecar_intact still accepts.
+        logger.warning("evidence store: %s has no readable meta.json; cannot verify", sha256)
+        return False
     return _extracted_sidecar_intact(dest_dir / _EXTRACTED_NAME, meta)

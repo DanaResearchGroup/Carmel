@@ -19,6 +19,7 @@ from carmel.services.authorization import ExecutionEnvelope, decide_requirement
 from carmel.services.plan_progress import (
     append_action_to_progress_locked,
     init_progress,
+    load_or_init_progress,
     load_progress,
     save_progress,
 )
@@ -427,9 +428,17 @@ def _append_corpus_pass_action_locked(
     # silently queueing N identical passes that will each eventually run and each add
     # their findings to the accumulated report. Checking inside the lock makes the
     # refusal race-safe against a concurrent append.
+    # load_or_init_progress, NOT load_progress: a Phase-1 workspace may hold a plan
+    # and no plan_progress.json at all (the file raised FileNotFoundError, which the
+    # CLI then reported as "Campaign has no plan yet" -- the opposite of true), and a
+    # progress file left over from a DIFFERENT plan would have been inspected as
+    # though it described this one, silently misaligning the index this function is
+    # about to insert at. Neither it nor init_progress takes the workspace lock, so
+    # calling it here is safe: the lock is NOT re-entrant.
+    progress = load_or_init_progress(workspace_root, plan)
     pending = [
         state
-        for state in load_progress(workspace_root).actions
+        for state in progress.actions
         if state.kind == ActionKind.LITERATURE_CORPUS_PASS and state.execution_status == ActionExecutionStatus.PENDING
     ]
     if pending:
