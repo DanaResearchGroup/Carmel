@@ -199,6 +199,31 @@ class TestThornPlus:
             assert "e_to_dash" not in repair
 
 
+class TestUnicodeMinusAndLeadingEnDash:
+    def test_unicode_minus_sign_1_0_is_scalar_negative_one_with_the_repair_recorded(self) -> None:
+        result = parse_numeric_span("−1.0", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Scalar)
+        assert result.value == -1.0
+        assert "unicode_minus_to_ascii" in result.repairs
+
+    def test_leading_en_dash_1_0_is_scalar_negative_one_with_the_repair_recorded(self) -> None:
+        result = parse_numeric_span("–1.0", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Scalar)
+        assert result.value == -1.0
+        assert "leading_en_dash_to_minus" in result.repairs
+
+    def test_mid_token_en_dash_range_is_still_a_range_not_a_leading_sign(self) -> None:
+        """The leading-en-dash-as-sign repair must never disturb the existing
+        mid-token en-dash-as-range-separator behavior: '1–2' still splits into the
+        range [1.0, 2.0], since the en dash there is consumed by
+        '_find_range_separator' before '_parse_single_value' ever sees either
+        half."""
+        result = parse_numeric_span("1–2", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Range)
+        assert result.low == 1.0
+        assert result.high == 2.0
+
+
 class TestRangeVsScalarVsExponentGrammar:
     def test_ascii_hyphen_range_1_2(self) -> None:
         result = parse_numeric_span("1-2", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
@@ -230,6 +255,25 @@ class TestRangeVsScalarVsExponentGrammar:
         assert isinstance(result, Scalar)
         assert result.value == -1.0
 
+    def test_range_with_low_greater_than_high_is_refused_not_silently_swapped(self) -> None:
+        """A hyphen-separated span whose first bound is numerically larger than its
+        second ('9-2') is never a legitimate low-high range as printed. This module's
+        fail-closed posture (already used for '_' digit separators and comma
+        thousands separators) is to REFUSE outright rather than silently swap the
+        bounds into a shape that was never actually printed -- swapping would
+        fabricate an ordering the source text does not state."""
+        result = parse_numeric_span("9-2", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Unresolvable)
+
+    def test_range_with_equal_low_and_high_is_accepted(self) -> None:
+        """A degenerate range where both bounds print the same value ('5-5') is not
+        an ordering violation -- low <= high still holds -- so it must still resolve
+        as an ordinary Range rather than being refused."""
+        result = parse_numeric_span("5-5", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Range)
+        assert result.low == 5.0
+        assert result.high == 5.0
+
 
 class TestStrictLexerSemantics:
     def test_bare_nan_literal_is_unresolvable(self) -> None:
@@ -255,6 +299,17 @@ class TestStrictLexerSemantics:
     def test_python_float_would_accept_1_0_underscore_but_this_module_refuses_it(self) -> None:
         assert float("1_0") == 10.0  # pins the premise: Python's bare float() is lenient here
         result = parse_numeric_span("1_0", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Unresolvable)
+
+    def test_thousands_separator_comma_is_unresolvable(self) -> None:
+        """'1,000' is refused outright (fail closed) rather than parsed as 1000.0 or
+        split into the fragments '1' and '000' -- a comma-bearing span is never a
+        single clean numeral, the same posture this module already takes for '_'."""
+        result = parse_numeric_span("1,000", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Unresolvable)
+
+    def test_thousands_separator_comma_is_unresolvable_even_with_a_decimal_tail(self) -> None:
+        result = parse_numeric_span("12,345.6", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
         assert isinstance(result, Unresolvable)
 
 

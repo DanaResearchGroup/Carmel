@@ -114,14 +114,20 @@ _DISALLOWED_LITERALS = frozenset(
 #: pattern is ever tried, so this pattern only ever has to describe one signed value.
 #:
 #: - ``lead_sign``: ``/C0`` (+ optional trailing whitespace) repairs to a leading
-#:   minus; ASCII ``-``/``+`` are taken as literal signs.
+#:   minus; ASCII ``-``/``+`` are taken as literal signs; U+2212 MINUS SIGN and a
+#:   leading U+2013 EN DASH also repair to a leading minus (NFKC does not decompose
+#:   either into an ASCII hyphen, so without this they would otherwise never be
+#:   recognized as a sign at all). A leading en dash is unambiguous as a sign here:
+#:   :func:`_find_range_separator` only ever treats a dash at position ``i > 0`` as a
+#:   range separator, so this pattern is only ever handed a span whose leading
+#:   character (if any) is genuinely a sign, not a separator.
 #: - ``exp_sign``: ``þ`` (+ optional trailing whitespace) repairs to an exponent
 #:   plus; ASCII ``-``/``+`` are literal exponent signs.
 #: - ``exponent`` intentionally accepts an illegal ``\d+\.\d+`` shape too, purely so
 #:   :func:`_parse_single_value` can DETECT and reject it explicitly (Case A: illegal
 #:   float literals like ``0.6e1.0`` must never be salvaged into anything).
 _CORE_VALUE_RE = re.compile(
-    r"(?P<lead_sign>/C0\s*|[-+])?"
+    r"(?P<lead_sign>/C0\s*|[-+−]|–)?"
     r"(?P<mantissa>\d+(?:\.\d+)?)"
     r"(?:(?P<emarker>[eE])(?P<exp_sign>þ\s*|[-+])?(?P<exponent>\d+(?:\.\d+)?))?"
 )
@@ -284,6 +290,12 @@ def _parse_single_value(
             repairs.append("slash_c0_to_minus")
         elif lead_sign == "-":
             lead_negative = True
+        elif lead_sign == "−":
+            lead_negative = True
+            repairs.append("unicode_minus_to_ascii")
+        elif lead_sign == "–":
+            lead_negative = True
+            repairs.append("leading_en_dash_to_minus")
         # "+" needs no repair and no sign flip.
 
     exp_negative = False
@@ -376,6 +388,20 @@ def parse_numeric_span(
             return Unresolvable(raw=span, reason=f"range high bound unresolvable: {high_result}")
         low_value, low_repairs = low_result
         high_value, high_repairs = high_result
+        if low_value > high_value:
+            # Fail closed rather than silently swap: a printed "9-2" never actually
+            # states the ordering "2-9", so accepting it (by re-ordering the bounds)
+            # would fabricate an ordering the source text does not contain. This
+            # matches the module's existing posture toward every other
+            # not-quite-a-clean-numeral shape (digit separators, comma-grouped
+            # thousands): refuse outright rather than guess what was meant.
+            return Unresolvable(
+                raw=span,
+                reason=(
+                    f"range low bound ({low_value}) is greater than its high bound "
+                    f"({high_value}); refused rather than silently swapped"
+                ),
+            )
         return Range(raw=span, low=low_value, high=high_value, repairs=low_repairs + high_repairs)
 
     single_result = _parse_single_value(work, source_context=source_context, glyph_health=glyph_health)

@@ -9,11 +9,12 @@ directly comparable.
 
 from __future__ import annotations
 
+import math
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from carmel.agents.budget import BudgetDimension, BudgetUsage
 from carmel.schemas.campaign import ReactorType
@@ -99,10 +100,17 @@ class Quantity(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    value: float
+    value: float = Field(allow_inf_nan=False)
+    """Finite by construction (``allow_inf_nan=False``): a non-finite value can never
+    be a trustworthy measured quantity, and a stored inf/nan would later surface in
+    the grounding gate as the str(float) required anchor ``'inf'``/``'nan'``, which no
+    source text can ever corroborate."""
     unit: str = Field(min_length=1)
     """Normalized SI-ish unit string."""
-    uncertainty: float | None = None
+    uncertainty: float | None = Field(default=None, allow_inf_nan=False)
+    """Same finite-by-construction guard as ``value``, for the same reason: a
+    stored inf/nan uncertainty would surface as an ungroundable str(float)
+    anchor."""
     raw_text: str | None = None
     """Verbatim text as printed in the source, for grounding checks."""
 
@@ -161,7 +169,15 @@ class ExperimentalBenchmarkPayload(BaseModel):
     temperature_range_K: tuple[float, float] | None = None
     pressure_range_bar: tuple[float, float] | None = None
     equivalence_ratio_range: tuple[float, float] | None = None
-    residence_time_s: float | None = None
+    #: Same finite-by-construction rationale as `Quantity.value`: a stored
+    #: inf/nan bound would surface as an ungroundable str(float) anchor. NOT
+    #: expressed as `Field(allow_inf_nan=False)` on the tuple-typed fields above
+    #: -- probed empirically first (see `_reject_non_finite_range` below) and
+    #: pydantic's `allow_inf_nan` check assumes a bare float/int input; handed a
+    #: tuple it raises an unconditional `TypeError` (a crash, not a clean
+    #: `ValidationError`) even for an ordinary finite tuple. So the three range
+    #: fields instead get an explicit `field_validator` that checks each bound.
+    residence_time_s: float | None = Field(default=None, allow_inf_nan=False)
     species: list[SpeciesRef] = Field(default_factory=list, max_length=20)
     measured: list[Quantity] = Field(default_factory=list, max_length=8)
     apparatus: str | None = None
@@ -172,6 +188,16 @@ class ExperimentalBenchmarkPayload(BaseModel):
     #: 8/20 are not calibrated against the 69-paper corpus -- generous ceilings
     #: chosen to comfortably exceed any legitimate single-finding benchmark report
     #: while still bounding the anchor-checking cost.
+
+    @field_validator("temperature_range_K", "pressure_range_bar", "equivalence_ratio_range")
+    @classmethod
+    def _reject_non_finite_range(cls, value: tuple[float, float] | None) -> tuple[float, float] | None:
+        """Both bounds of a range must be finite, for the same reason
+        `Quantity.value` is finite by construction: a stored inf/nan bound would
+        surface as an ungroundable str(float) anchor in the grounding gate."""
+        if value is not None and not all(math.isfinite(bound) for bound in value):
+            raise ValueError(f"range bounds must be finite, got {value!r}")
+        return value
 
 
 class PriorModelPayload(BaseModel):

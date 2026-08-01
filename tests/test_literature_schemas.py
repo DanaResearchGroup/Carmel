@@ -197,6 +197,91 @@ class TestExtraForbid:
             Quantity(value=1.0, unit="K", bogus_field=1)  # type: ignore[call-arg]
 
 
+class TestQuantityFiniteGuard:
+    """A non-finite value can never be a trustworthy measured quantity, and a stored
+    inf/nan would later become an ungroundable str(float) anchor ('inf'/'nan') in the
+    grounding gate -- so it is rejected at construction."""
+
+    def test_rejects_an_infinite_value(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=float("inf"), unit="K")
+
+    def test_rejects_a_negative_infinite_value(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=float("-inf"), unit="K")
+
+    def test_rejects_a_nan_value(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=float("nan"), unit="K")
+
+    def test_accepts_an_ordinary_finite_value(self) -> None:
+        quantity = Quantity(value=850.0, unit="microseconds")
+        assert quantity.value == 850.0
+
+    def test_rejects_a_non_finite_uncertainty(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=850.0, unit="microseconds", uncertainty=float("inf"))
+
+    def test_accepts_an_ordinary_finite_uncertainty(self) -> None:
+        quantity = Quantity(value=850.0, unit="microseconds", uncertainty=10.0)
+        assert quantity.uncertainty == 10.0
+
+
+class TestExperimentalBenchmarkPayloadFiniteGuard:
+    """The same non-finite-value posture as :class:`TestQuantityFiniteGuard`, applied
+    to every range/scalar condition field: a stored inf/nan here would likewise
+    become an ungroundable str(float) anchor in the grounding gate."""
+
+    def test_rejects_a_non_finite_temperature_range_bound(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                temperature_range_K=(1000.0, float("inf")),
+            )
+
+    def test_rejects_a_non_finite_pressure_range_bound(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                pressure_range_bar=(float("nan"), 2.0),
+            )
+
+    def test_rejects_a_non_finite_equivalence_ratio_range_bound(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                equivalence_ratio_range=(0.5, float("-inf")),
+            )
+
+    def test_rejects_a_non_finite_residence_time(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                residence_time_s=float("inf"),
+            )
+
+    def test_accepts_ordinary_finite_ranges_and_residence_time(self) -> None:
+        payload = ExperimentalBenchmarkPayload(
+            reactor_type=ReactorType.SHOCK_TUBE,
+            observable=ObservableKind.IGNITION_DELAY_TIME,
+            observable_raw="ignition delay time",
+            temperature_range_K=(1000.0, 1500.0),
+            pressure_range_bar=(1.0, 2.0),
+            equivalence_ratio_range=(0.5, 1.5),
+            residence_time_s=2.0,
+        )
+        assert payload.temperature_range_K == (1000.0, 1500.0)
+        assert payload.residence_time_s == 2.0
+
+
 class TestStopReasonForDimension:
     def test_covers_every_budget_dimension(self) -> None:
         for dimension in BudgetDimension:

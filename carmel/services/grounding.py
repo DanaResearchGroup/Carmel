@@ -84,6 +84,15 @@ from carmel.schemas.literature import (
     QMCalculationPayload,
     QMProperty,
 )
+from carmel.services.numeric import (
+    GlyphHealth,
+    Range,
+    Scalar,
+    SourceContext,
+    Unresolvable,
+    assess_glyph_health,
+    parse_numeric_span,
+)
 
 __all__ = [
     "QuoteMatch",
@@ -98,7 +107,64 @@ __all__ = [
     "unreadable_reason",
 ]
 
-_NUMBER_RE = re.compile(r"[-+]?\d+\.?\d*(?:[eE][-+]?\d+)?")
+
+#: Candidate numeric spans inside a normalized evidence window, for
+#: :func:`_window_numeric_values`. The window is running prose/table text (never an
+#: already-scoped cell), so this scanner's ONLY job is to find candidate spans with
+#: proper boundaries -- every candidate is then validated by the strict numeric core
+#: (:func:`carmel.services.numeric.parse_numeric_span`), which owns the definition of
+#: "a trustworthy number". Design points:
+#:
+#: - Boundaries: a candidate may not touch a letter, digit, or dot on either side, so
+#:   digits embedded in identifiers ("h2o", "gri30") are no longer salvaged the way an
+#:   unanchored ``findall`` used to salvage them.
+#: - The exponent branch deliberately over-captures a decimal point (``1.0`` in
+#:   ``0.6e1.0``) so a corrupt token is captured WHOLE and refused by the strict core,
+#:   instead of being split into salvageable fragments (``0.6e1`` == 6.0 and ``0``).
+#: - An optional second half after a hyphen/en dash captures a printed range
+#:   ("1200-1500", "0.5–2.0") as ONE candidate, which the strict core parses as a
+#:   Range contributing both bounds -- not as the tokens ``1200`` and ``-1500``.
+#: - A trailing sentence period is NOT part of the candidate ("... was 850." yields
+#:   ``850``), but a letter directly after the span disqualifies it.
+#: - A comma directly touching either end of the span ALSO disqualifies it: a
+#:   comma-grouped thousands number ("1,000") is neither a single clean numeral
+#:   nor two legitimate standalone values, so the boundary must reject it rather
+#:   than let an unanchored digit run either side of the comma slip through as a
+#:   spurious candidate ("1" and "000" out of "1,000") -- the strict core (see
+#:   ``numeric.py``) already refuses a comma-bearing span outright when it is
+#:   handed one whole, but that refusal only helps if the scanner stops carving
+#:   the comma-adjacent digits into candidates in the first place.
+#:
+#: The window text is already casefolded by ``normalize_for_match``, so only a
+#: lowercase ``e`` exponent marker can occur.
+def _is_percent_adjacent_exponent(window_norm: str, match: re.Match[str]) -> bool:
+    """Whether ``match`` is an exponent-form token immediately touching a ``%``.
+
+    Only exponent-form tokens are judged: a plain number beside a percent sign is
+    an ordinary percentage ("50%") and must stay readable. See the call site for
+    why the exponent form is treated as corruption instead of a value.
+    """
+    if "e" not in match.group(0).casefold():
+        return False
+    before = window_norm[match.start() - 1] if match.start() > 0 else ""
+    after = window_norm[match.end()] if match.end() < len(window_norm) else ""
+    return before == "%" or after == "%"
+
+
+_WINDOW_NUMBER_CANDIDATE_RE = re.compile(
+    r"(?<![0-9a-z.,])"
+    r"(?:/c0\s*|[-+−]|–(?=\d))?\d+(?:\.\d+)?(?:e[-+]?\d+(?:\.\d+)?)?"
+    r"(?:[-–]\d+(?:\.\d+)?(?:e[-+]?\d+(?:\.\d+)?)?)?"
+    r"(?![0-9a-z,])"
+)
+
+#: Shapes that mark a required anchor as numeric IN INTENT even when bare ``float()``
+#: rejects it (e.g. the corrupt ``0.6e1.0``): an optional sign followed by a digit and
+#: then only number-ish characters. Together with :func:`_is_numeric_literal` (which
+#: additionally catches ``float()``-accepted forms like ``inf``/``nan``), this decides
+#: that an anchor must be VALUE-compared -- a numeric-intent anchor that cannot be
+#: strictly resolved is a hard missing-anchor result, never a substring search.
+_NUMERIC_INTENT_RE = re.compile(r"[-+]?\d[\d.eE+-]*")
 
 #: Word tokenizer used by :func:`_has_semantic_discrepancy` to compare the fuzzy
 #: window and the claimed quote on WORD boundaries (a symmetric difference of word
@@ -1096,6 +1162,138 @@ def _is_numeric_literal(s: str) -> bool:
     return True
 
 
+def _numeric_anchor_intent(req: str) -> bool:
+    """True when required anchor ``req`` is numeric in intent.
+
+    A numeric-intent anchor is ALWAYS value-compared against the strict numeric
+    values found in the evidence window; if it cannot itself be strictly resolved to
+    a value, it is a hard missing-anchor result. It is never demoted to a substring
+    search -- the old behaviour for ``float()``-rejected shapes, which silently
+    turned a numeric comparison into a text comparison that corrupt or coincidental
+    characters could satisfy.
+
+    Args:
+        req: The required anchor string (typically ``str()`` of a typed float/int, or
+            a free-text payload field such as a unit or species name).
+
+    Returns:
+        True if ``req`` must go through strict numeric resolution and value
+        comparison; False if it is an ordinary text anchor.
+    """
+    if _is_numeric_literal(req):
+        # Covers everything bare float() accepts, including the non-finite literals
+        # ('inf', 'nan', 'infinity') that must hard-fail rather than text-match.
+        return True
+    return _NUMERIC_INTENT_RE.fullmatch(req.strip()) is not None
+
+
+#: Maps :attr:`ExtractedText.extractor` values known to come from a flattened PDF
+#: text layer -- the only source known to exhibit the en-dash-as-ASCII-``e``
+#: substitution -- to :attr:`~carmel.services.numeric.SourceContext.FLAT_PDF_TEXT`.
+#: Every other extractor value (``"html"``, ``"text"``, ``"pdf:unavailable"``,
+#: ``"unknown"``, or anything unrecognized) maps to
+#: :attr:`~carmel.services.numeric.SourceContext.OPERATOR_RAW`: none of those
+#: sources are known to carry that specific corruption, and OPERATOR_RAW is the
+#: strict core's "no special quarantine" context. This is a real, documented
+#: distinction (``ExtractedText.extractor`` enumerates exactly these string
+#: values), not an invented heuristic.
+_PDF_EXTRACTOR_PREFIX = "pdf:pypdf"
+
+
+def _source_context_for(extracted: ExtractedText) -> SourceContext:
+    """The strict core's :class:`SourceContext` for text extracted into ``extracted``.
+
+    Derived from ``extracted.extractor`` rather than hardcoded, so only artifacts
+    that actually came from a flattened PDF text layer are ever subject to the
+    dash-corruption quarantine rule.
+    """
+    if extracted.extractor == _PDF_EXTRACTOR_PREFIX:
+        return SourceContext.FLAT_PDF_TEXT
+    return SourceContext.OPERATOR_RAW
+
+
+def _window_numeric_values(raw_window: str, *, glyph_health: GlyphHealth, source_context: SourceContext) -> list[float]:
+    """Every strictly-validated numeric value present in the window text.
+
+    Candidate BOUNDARIES are located by running :data:`_WINDOW_NUMBER_CANDIDATE_RE`
+    against the CASEFOLDED window text (which owns the boundary rules for scanning
+    running prose -- the strict core never widens its own window), but each matched
+    span is then mapped back to the window's ORIGINAL-CASE text (via
+    :func:`~carmel.agents.tools.extract.normalize_with_map` and
+    :func:`~carmel.agents.tools.extract.raw_span`) before being handed to
+    :func:`carmel.services.numeric.parse_numeric_span`. Casefolding is needed to find
+    a lowercase-cased repair prefix like ``/c0`` regardless of how the source text
+    capitalized it, but casefolding the text handed to the CORE would erase the very
+    case distinction the core relies on (e.g. an uppercase ``E`` exponent marker is
+    never quarantined as dash-corruption, only a lowercase ``e`` is -- see
+    :mod:`carmel.services.numeric`'s dash-corruption quarantine rule). Each candidate
+    is validated under the caller-supplied ``source_context`` (see
+    :func:`_source_context_for`) with the glyph health of the document being grounded
+    against. A candidate the strict core refuses (corrupt shapes like ``0.6e1.0``,
+    quarantined bare-exponent tokens in a dash-corrupted PDF document, non-finite
+    results) contributes NOTHING -- corrupt text must never corroborate a claim. A
+    candidate parsed as a Range contributes both bounds.
+
+    Args:
+        raw_window: The evidence window, in its ORIGINAL case (NOT passed through
+            ``normalize_for_match``).
+        glyph_health: Glyph-corruption context computed from the FULL document text
+            (not just the window), via
+            :func:`carmel.services.numeric.assess_glyph_health`.
+        source_context: Where this window's text originated (see
+            :func:`_source_context_for`); only
+            :attr:`~carmel.services.numeric.SourceContext.FLAT_PDF_TEXT` is ever
+            subject to the dash-corruption quarantine rule.
+
+    Returns:
+        The usable numeric values, in window order (Ranges contribute low then high).
+    """
+    window_norm, index_map = normalize_with_map(raw_window)
+    values: list[float] = []
+    for m in _WINDOW_NUMBER_CANDIDATE_RE.finditer(window_norm):
+        raw_start, raw_end = raw_span(index_map, m.start(), m.end(), len(raw_window))
+        candidate = raw_window[raw_start:raw_end]
+        if _is_percent_adjacent_exponent(window_norm, m):
+            # A percent sign cannot be a blanket boundary-breaker: "50%" is an
+            # ordinary percentage and must stay readable. But an EXPONENT-form
+            # token touching a '%' is the corrupted-range shape, not a value --
+            # "50%H 2e50%CO" is "50% H2 - 50% CO" with the subscript flattened
+            # and the en-dash encoded as ASCII 'e'. Emitting 2e50 there invents a
+            # magnitude that is nowhere in the paper. Refusing costs only the rare
+            # legitimate "1e-3%", and fails closed.
+            continue
+        result = parse_numeric_span(
+            candidate,
+            source_context=source_context,
+            glyph_health=glyph_health,
+        )
+        if isinstance(result, Scalar):
+            values.append(result.value)
+        elif isinstance(result, Range):
+            values.append(result.low)
+            values.append(result.high)
+    return values
+
+
+def _numeric_isclose(target: float, tok: float) -> bool:
+    """Value-equality for a required numeric anchor vs. a window-scanned token.
+
+    Plain ``math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)`` has a sharp edge here:
+    the unconditional ``abs_tol=1e-9`` makes ANY value within 1e-9 of zero compare
+    equal to zero (``math.isclose(1e-12, 0.0, rel_tol=1e-9, abs_tol=1e-9)`` is
+    ``True``), so a claimed value as small as ``1e-12`` would be wrongly
+    "corroborated" by a literal ``0`` anywhere in the window. Zero must only ever
+    match zero, and two nonzero values are compared by relative tolerance alone (no
+    absolute floor at all, so this never re-introduces the same near-zero collapse
+    from the other direction).
+    """
+    if target == 0.0 and tok == 0.0:
+        return True
+    if target == 0.0 or tok == 0.0:
+        return False
+    return math.isclose(target, tok, rel_tol=1e-9)
+
+
 #: A required anchor is either a single literal string, or a tuple of surface-form
 #: synonyms of which ANY ONE satisfies the requirement (used for reactor-type terms
 #: and "at least one of species/reaction label" groups).
@@ -1232,10 +1430,16 @@ def check_evidence_spans(
     string anchors keep the original substring/numeric-literal check.
 
     Numeric requirements are value-normalized so ``1.0``, ``1``, ``1.00``, and
-    ``1e0`` all compare equal (parsed as floats and compared with
-    ``math.isclose``), rather than requiring an exact string match. Non-numeric
-    string requirements are compared via ``normalize_for_match``, which is
-    already case- and whitespace-insensitive.
+    ``1e0`` all compare equal (compared with ``math.isclose``), rather than
+    requiring an exact string match. BOTH sides of that comparison now go through
+    the strict numeric core (:mod:`carmel.services.numeric`): window text is
+    tokenized by :func:`_window_numeric_values` (corrupt shapes like ``0.6e1.0``
+    contribute nothing, rather than being salvaged as ``6.0``), and a required
+    anchor that is numeric in intent (:func:`_numeric_anchor_intent`) but cannot be
+    strictly resolved -- ``inf``, ``nan``, corrupt shapes -- is a HARD missing
+    anchor with an explanatory suffix in the returned entry, never a fallback
+    substring search. Non-numeric string requirements are compared via
+    ``normalize_for_match``, which is already case- and whitespace-insensitive.
 
     Args:
         extracted: The fetched artifact's extracted text.
@@ -1251,8 +1455,11 @@ def check_evidence_spans(
         form, for a stable, readable ``missing_spans`` value.
     """
     start, end = _bounded_window(extracted.text, match.start, match.end, fallback=window)
-    window_norm = normalize_for_match(extracted.text[start:end])
-    window_numbers = [float(tok) for tok in _NUMBER_RE.findall(window_norm)]
+    raw_window = extracted.text[start:end]
+    window_norm = normalize_for_match(raw_window)
+    glyph_health = assess_glyph_health(extracted.text)
+    source_context = _source_context_for(extracted)
+    window_numbers = _window_numeric_values(raw_window, glyph_health=glyph_health, source_context=source_context)
 
     missing: list[str] = []
     for req in required:
@@ -1260,9 +1467,22 @@ def check_evidence_spans(
             if not any(_term_present_boundary(normalize_for_match(alt), window_norm) for alt in req):
                 missing.append(req[0])
             continue
-        if _is_numeric_literal(req):
-            value = float(req)
-            if not any(math.isclose(value, tok, rel_tol=1e-9, abs_tol=1e-9) for tok in window_numbers):
+        if _numeric_anchor_intent(req):
+            # The anchor is machine-side text (typically str() of a typed value), not
+            # PDF-extracted prose, so it parses under OPERATOR_RAW with its own glyph
+            # health -- the document's corruption state must not affect how the
+            # REQUIREMENT is read.
+            resolved = parse_numeric_span(
+                req, source_context=SourceContext.OPERATOR_RAW, glyph_health=assess_glyph_health(req)
+            )
+            if isinstance(resolved, Unresolvable):
+                # Numeric in intent but not strictly resolvable (inf, nan, corrupt
+                # shapes): hard missing-anchor result, NEVER a substring search that
+                # might coincidentally succeed ('inf' inside 'infinite').
+                missing.append(f"{req} (numeric anchor could not be strictly resolved: {resolved.reason})")
+                continue
+            targets = [resolved.value] if isinstance(resolved, Scalar) else [resolved.low, resolved.high]
+            if not all(any(_numeric_isclose(target, tok) for tok in window_numbers) for target in targets):
                 missing.append(req)
             continue
         if normalize_for_match(req) not in window_norm:

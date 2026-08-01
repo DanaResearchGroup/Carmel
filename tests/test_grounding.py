@@ -710,6 +710,353 @@ def test_check_evidence_spans_numeric_value_normalization_reverse() -> None:
     assert missing == []
 
 
+def test_check_evidence_spans_trailing_zero_and_exponent_zero_anchor_forms_remain_value_equal() -> None:
+    text = "The yield was measured to be 1 percent under these conditions, consistent with theory.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The yield was measured to be 1 percent under these conditions")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["1.00", "1e0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_str_float_scientific_anchor_forms_match_their_values_in_text() -> None:
+    text = "A rate constant of 1e-07 and a pre-exponential factor of 1e+16 were reported for this system.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "A rate constant of 1e-07 and a pre-exponential factor of 1e+16")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["1e-07", "1e+16"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_corrupt_exponent_token_in_window_does_not_corroborate_a_numeric_anchor() -> None:
+    """The old unanchored window scanner salvaged '0.6e1' (= 6.0) and '0' out of the
+    corrupt token '0.6e1.0', so glyph-damaged text could corroborate a claimed value.
+    The strict numeric core refuses that shape outright, so the corrupt token must
+    contribute NO usable number to the window."""
+    text = "The measured yield was printed as 0.6e1.0 percent by the damaged text extraction.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The measured yield was printed as 0.6e1.0 percent")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["6.0", "percent"])
+
+    assert len(missing) == 1
+    assert "6.0" in missing[0]
+
+
+def test_check_evidence_spans_numeric_anchor_that_float_rejects_never_falls_through_to_substring_matching() -> None:
+    """A required anchor that is numeric in intent but not strictly resolvable used to
+    fall through to a plain substring search when bare float() raised on it -- so a
+    corrupt anchor could be 'corroborated' by the same corrupt characters appearing in
+    the window. It must instead hard-fail as a missing anchor with a clear reason."""
+    text = "The corrupt token 0.6e1.0 appears verbatim in this sentence of the artifact text.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The corrupt token 0.6e1.0 appears verbatim in this sentence")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["0.6e1.0"])
+
+    assert len(missing) == 1
+    assert "0.6e1.0" in missing[0]
+
+
+def test_check_evidence_spans_infinite_required_anchor_hard_fails_with_a_non_finite_reason() -> None:
+    """'inf' must be treated as a numeric anchor that can never be corroborated, with
+    an explicit non-finite reason -- NOT as text that could coincidentally match the
+    'inf' inside 'infinite' in the window."""
+    text = "The residence time was reported as effectively infinite in these experiments.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The residence time was reported as effectively infinite")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["inf"])
+
+    assert len(missing) == 1
+    assert "inf" in missing[0]
+    assert "non-finite" in missing[0]
+
+
+def test_check_evidence_spans_nan_required_anchor_hard_fails_with_a_non_finite_reason() -> None:
+    """'nan' must hard-fail as a numeric anchor with an explicit non-finite reason --
+    NOT text-match the 'nan' hiding inside 'resonance' in the window."""
+    text = "A strong resonance feature was observed in the measured spectrum near this band.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "A strong resonance feature was observed in the measured spectrum")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["nan"])
+
+    assert len(missing) == 1
+    assert "nan" in missing[0]
+    assert "non-finite" in missing[0]
+
+
+def test_check_evidence_spans_number_at_a_sentence_end_still_corroborates_its_anchor() -> None:
+    text = "In these experiments the measured ignition delay in microseconds was 850.\nMore text follows here.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "the measured ignition delay in microseconds was 850")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["850.0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_en_dash_range_in_text_corroborates_both_bound_anchors() -> None:
+    text = "Ignition delay times were measured over 1200–1500 K in this shock tube study.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "Ignition delay times were measured over 1200–1500 K")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["1200.0", "1500.0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_ascii_hyphen_range_is_a_range_not_a_salvaged_negative_number() -> None:
+    """'1200-1500' in running text is a range whose bounds are 1200 and 1500; the old
+    unanchored scanner instead salvaged the tokens 1200 and -1500, so the upper bound
+    of a plainly-printed range could never be corroborated."""
+    text = "Ignition delay times were measured over 1200-1500 K in this shock tube study.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "Ignition delay times were measured over 1200-1500 K")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["1200.0", "1500.0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_comma_thousands_separator_does_not_fabricate_two_values() -> None:
+    """The old unanchored candidate regex split '1,000' into the two spurious
+    candidates '1' and '000', so a claimed value of 1.0 (or 0.0) could be
+    'corroborated' by a comma-grouped thousands number that never actually
+    appeared as either fragment. Neither fragment is a legitimate standalone
+    value here, so neither must corroborate."""
+    text = "The total yield was 1,000 units measured under these conditions.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The total yield was 1,000 units measured")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["1.0"])
+
+    assert len(missing) == 1
+    assert "1.0" in missing[0]
+
+
+def test_check_evidence_spans_source_context_derived_from_pdf_extractor_quarantines_bare_exponent() -> None:
+    """A bare lowercase digit-e-digit token (no decimal point, no explicit sign) is
+    only quarantined under SourceContext.FLAT_PDF_TEXT, and only when the document
+    is suspected of en-dash-as-'e' corruption. `check_evidence_spans` must derive
+    that source context from `extracted.extractor` ('pdf:pypdf') rather than
+    hardcoding FLAT_PDF_TEXT for every source -- so this quarantine correctly fires
+    for a PDF-derived artifact."""
+    text = (
+        "The measured value was 2e50 percent under these conditions. "
+        "A separate reading nearby also showed 3e10 for comparison.\n"
+    )
+    extracted = _pdf_extracted(text, pages=1)
+    match = find_quote(extracted, "The measured value was 2e50 percent under these conditions")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["2e+50"])
+
+    assert len(missing) == 1
+
+
+def test_check_evidence_spans_percent_adjacent_exponent_never_corroborates_even_in_a_healthy_document() -> None:
+    """ "50%H 2e50%CO" is "50% H2 - 50% CO" with the subscript flattened and the
+    en-dash encoded as ASCII 'e'. The 2e50 that falls out is a magnitude that appears
+    nowhere in the paper, so it must never corroborate a numeric anchor.
+
+    This is the WINDOW SCANNER path, which is distinct from parsing that string as a
+    single already-scoped span: the scanner pulls a candidate out of surrounding text,
+    where the token is bounded by a space and a '%' and so looks clean. It must be
+    refused here without the dash-corruption quarantine's help, because a document
+    carrying both intact en-dashes and this corruption would not be flagged suspect."""
+    text = (
+        "The blend was 50%H 2e50%CO for every run in this series of experiments. "
+        "Conditions were otherwise held constant throughout the campaign.\n"
+    )
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The blend was 50%H 2e50%CO for every run in this series")
+    assert match is not None
+
+    assert check_evidence_spans(extracted, match, ["2e+50"]) == ["2e+50"]
+    # The ordinary percentage in the same window stays readable -- '%' is not a
+    # blanket boundary-breaker, only exponent-form tokens touching it are refused.
+    assert check_evidence_spans(extracted, match, ["50.0"]) == []
+
+
+def test_check_evidence_spans_source_context_derived_from_non_pdf_extractor_does_not_quarantine() -> None:
+    """The same bare-exponent shape in the same dash-corruption-suspect document
+    must NOT be quarantined when the artifact did not come from a PDF (extractor
+    'text' rather than 'pdf:pypdf') -- non-PDF sources never carry FLAT_PDF_TEXT's
+    en-dash-as-'e' failure mode, so OPERATOR_RAW is the correct context and the
+    value must corroborate normally."""
+    text = (
+        "The measured value was 2e50 percent under these conditions. "
+        "A separate reading nearby also showed 3e10 for comparison.\n"
+    )
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The measured value was 2e50 percent under these conditions")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["2e+50"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_slash_c0_prefixed_value_in_text_corroborates_its_negative_anchor() -> None:
+    """'/C0' is a known glyph-corruption stand-in for a minus sign (see
+    'slash_c0_to_minus' in the strict numeric core). The window scanner must widen
+    its candidate span to include the '/C0' prefix, and the ORIGINAL-CASE text
+    (not the casefolded '/c0' the window comparison otherwise runs on) must reach
+    the strict core, or the repair never fires and the negative anchor is
+    reported missing even though the corrupted-but-recoverable value is right
+    there in the text."""
+    text = "The computed correction factor was /C0 1.0 in this analysis.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The computed correction factor was /C0 1.0 in this analysis")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["-1.0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_unicode_minus_sign_in_text_corroborates_its_negative_anchor() -> None:
+    """U+2212 MINUS SIGN is not decomposed by NFKC to an ASCII hyphen, so it survives
+    'normalize_for_match' unchanged; the window scanner's leading-sign group must
+    still recognize it as a sign, or a plainly negative value typeset with the
+    proper Unicode minus glyph can never corroborate its anchor."""
+    text = "The temperature change measured was −1.0 K in this trial.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The temperature change measured was −1.0 K in this trial")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["-1.0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_leading_en_dash_in_text_corroborates_its_negative_anchor() -> None:
+    """A leading en dash (U+2013) at the very start of a numeric candidate is a sign,
+    not a range separator -- 'test_check_evidence_spans_en_dash_range_in_text_
+    corroborates_both_bound_anchors' below covers the MID-token range-separator use
+    of the same character, which this must not disturb."""
+    text = "The temperature change measured was –1.0 K in this trial.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The temperature change measured was –1.0 K in this trial")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["-1.0"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_uppercase_e_scientific_notation_in_pdf_text_is_never_quarantined() -> None:
+    """The dash-corruption quarantine rule only ever fires for a LOWERCASE bare 'e'
+    exponent marker (see 'test_uppercase_e_scientific_notation_is_never_quarantined'
+    in test_numeric.py) -- but the window scanner used to feed the strict core
+    already-casefolded text, so a legitimately uppercase '2E50' lost its case
+    before the core ever saw it and was wrongly quarantined alongside genuine
+    lowercase bare-exponent corruption. The uppercase anchor must corroborate even
+    though this document is otherwise dash-corruption suspect (via the separate
+    lowercase '3e10' token, mirroring
+    'test_check_evidence_spans_source_context_derived_from_pdf_extractor_quarantines_bare_exponent')."""
+    text = (
+        "The measured value was 2E50 percent under these conditions. "
+        "A separate reading nearby also showed 3e10 for comparison.\n"
+    )
+    extracted = _pdf_extracted(text, pages=1)
+    match = find_quote(extracted, "The measured value was 2E50 percent under these conditions")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["2e+50"])
+
+    assert missing == []
+
+
+def test_check_evidence_spans_tiny_nonzero_required_anchor_does_not_spuriously_match_a_literal_zero() -> None:
+    """math.isclose's unconditional abs_tol=1e-9 makes any value within 1e-9 of zero
+    compare equal to zero -- so a claimed value as small as 1e-12 would be wrongly
+    'corroborated' by a literal '0' anywhere in the window. Zero must only ever
+    match zero."""
+    text = "The residual error reported was 0 in this measurement.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "The residual error reported was 0 in this measurement")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["1e-12"])
+
+    assert missing == ["1e-12"]
+
+
+def test_ground_finding_non_finite_residence_time_is_spans_missing_with_a_non_finite_reason() -> None:
+    """An inf-valued payload field produces the required anchor str(inf) == 'inf'.
+    That anchor must hard-fail the finding as SPANS_MISSING with a non-finite reason,
+    even though the word 'infinite' (which contains 'inf') sits right in the window."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) discuss ignition. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time at 1200 K was 850 microseconds in these shock tube "
+        "experiments using O2 at an effectively infinite residence time.\n"
+    )
+    extracted = _extracted(text)
+    quote = "The measured ignition delay time at 1200 K was 850 microseconds"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    # The schema now rejects a non-finite residence time at CONSTRUCTION -- that is the
+    # outer defense, pinned separately in tests/test_literature_schemas.py. This test
+    # exercises the INNER one: grounding's own refusal to let str(inf) corroborate
+    # anything. Both layers are load-bearing, because the schema guard cannot protect a
+    # payload rebuilt from stored JSON or built by a future caller that skips validation.
+    # So validation is bypassed deliberately here, rather than deleting a real
+    # defense-in-depth case merely because a new outer guard now shadows it.
+    payload = ExperimentalBenchmarkPayload.model_construct(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=850.0, unit="microseconds")],
+        residence_time_s=float("inf"),
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.SPANS_MISSING
+    assert verdict.grounded is False
+    assert any("non-finite" in reason for reason in verdict.reasons)
+
+
+def test_ground_finding_scientific_notation_measured_value_grounds_normally() -> None:
+    """Positive case: a genuinely-present scientific-notation value (whose required
+    anchor is the str(float) form '1e-07') must still ground, end to end."""
+    text = (
+        "Abstract\n\nSmith and Jones (2019) report rate measurements. DOI: 10.1000/xyz123\n\n"
+        "The measured ignition delay time was 1e-07 s for O2 in these shock tube experiments.\n"
+    )
+    extracted = _extracted(text)
+    quote = "The measured ignition delay time was 1e-07 s for O2"
+    citation = Citation(title="Ignition delay times study", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
+    payload = ExperimentalBenchmarkPayload(
+        reactor_type=ReactorType.SHOCK_TUBE,
+        observable=ObservableKind.IGNITION_DELAY_TIME,
+        observable_raw="ignition delay time",
+        species=[SpeciesRef(raw_name="O2")],
+        measured=[Quantity(value=1e-07, unit="s")],
+    )
+
+    verdict = ground_finding(payload=payload, citation=citation, quote=quote, extracted=extracted)
+
+    assert verdict.status == GroundingStatus.GROUNDED_EXACT
+    assert verdict.grounded is True
+    assert verdict.missing_spans == []
+
+
 def test_ground_finding_no_artifact() -> None:
     citation = Citation(title="Some paper", authors=["Smith, J."], year=2019, doi="10.1000/xyz123")
     payload = PriorModelPayload(model_name="GRI-Mech 3.0", n_species=53)
