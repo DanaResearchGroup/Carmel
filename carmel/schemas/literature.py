@@ -28,6 +28,7 @@ __all__ = [
     "FindingPayload",
     "GroundingStatus",
     "GroundingVerdict",
+    "CURRENT_REPORT_SCHEMA_VERSION",
     "LiteratureFinding",
     "LiteratureReport",
     "ObservableKind",
@@ -279,6 +280,11 @@ class LiteratureFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     finding_id: str = Field(min_length=1)
+    run_id: str = ""
+    action_id: str = ""
+    """Which pass produced this finding. Carried on the finding itself, not inferred
+    from position in the report, so attribution survives any later reordering,
+    filtering or merge."""
     payload: FindingPayload
     citation: Citation
     verbatim_quote: str = Field(min_length=1)
@@ -293,6 +299,8 @@ class RejectedFinding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     finding_id: str = Field(min_length=1)
+    run_id: str = ""
+    action_id: str = ""
     category: FindingCategory | None = None
     citation_title: str | None = None
     grounding: GroundingVerdict
@@ -366,6 +374,22 @@ class StoredArtifact(BaseModel):
     n_bytes: int = Field(ge=0)
     stored_at: datetime
     extractor: str = Field(min_length=1)
+    #: sha256 of the ``extracted.json`` bytes, or ``None`` for artifacts stored before
+    #: this field existed.
+    #:
+    #: ``raw.bin`` is content-addressed and re-hashed on every read, but the grounding
+    #: gate does not read ``raw.bin`` -- it reads ``extracted.json``, which until now
+    #: carried no integrity check at all. So the file the whole "grounded in the
+    #: stored bytes" claim rests on was the one file in the store nothing verified.
+    #:
+    #: This is NOT a tamper defence: anyone who can write into the evidence store can
+    #: rewrite ``meta.json`` and the report alongside it, so this is no privilege
+    #: boundary. It closes the NON-adversarial case, which is the one that actually
+    #: happens -- a sidecar truncated by a full disk or an interrupted write, which
+    #: can still parse as valid JSON and silently ground quotes against a partial
+    #: document. ``raw.bin`` was already protected against exactly that; this extends
+    #: the same guarantee to the file that matters.
+    extracted_sha256: str | None = None
     lossy: bool
     license_note: str | None = None
     provenance: ArtifactProvenance = ArtifactProvenance.FETCHED
@@ -373,22 +397,144 @@ class StoredArtifact(BaseModel):
     their (correct) meaning: at that time fetching was the only way in."""
 
 
-class LiteratureReport(BaseModel):
-    """The persisted output of a single literature-research run."""
+class LiteraturePassMode(StrEnum):
+    """How one pass over the literature was conducted.
+
+    ``SEARCH`` is the original outward-facing loop: propose queries, search, fetch,
+    ground. ``CORPUS`` re-reads the artifacts already in the evidence store and
+    performs no search and no fetching at all. A reader must be able to tell which
+    produced a finding, because the two have materially different reproducibility:
+    a corpus pass runs against a fixed set of sha256-addressed files and will see
+    exactly the same input every time, while a search pass depends on what the live
+    web returned that day.
+    """
+
+    SEARCH = "search"
+    CORPUS = "corpus"
+
+
+class QueryRecord(BaseModel):
+    """One executed search query, attributed to the pass that ran it."""
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: int = 1
+    text: str = Field(min_length=1)
+    run_id: str = Field(min_length=1)
+    action_id: str = Field(min_length=1)
+
+
+class PassRecord(BaseModel):
+    """The per-pass envelope: everything that describes ONE run rather than the
+    accumulated body of evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: str = Field(min_length=1)
+    action_id: str = Field(min_length=1)
+    created_at: datetime
+    mode: LiteraturePassMode = LiteraturePassMode.SEARCH
+    """Defaults to ``SEARCH`` so a v1 report migrated forward keeps its (correct)
+    meaning: at that time searching was the only kind of pass there was."""
+    model_name: str = ""
+    stop_reason: StopReason
+    usage: BudgetUsage
+    warnings: list[str] = Field(default_factory=list)
+    covered_sha256: list[str] = Field(default_factory=list)
+    """The artifacts this pass actually READ, whether or not they yielded a finding.
+
+    Recorded so a later corpus pass can skip what has already been mined. Findings
+    alone cannot answer that: a document read and found barren produces nothing to
+    attribute, and is exactly the document a later pass must not pay to re-read.
+
+    Empty on a search pass, and on any v2 report migrated forward -- for those, what
+    was covered was never written down, so the honest value is "nothing recorded"
+    rather than a guess reconstructed from findings.
+    """
+
+
+#: Highest report schema version this build understands. Anything higher is refused
+#: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
+#: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
+#: truncate) a report written by a newer one.
+CURRENT_REPORT_SCHEMA_VERSION = 3
+
+
+class LiteratureReport(BaseModel):
+    """The campaign's literature record, accumulated across every pass.
+
+    One report per campaign, appended to rather than replaced. A second pass adds a
+    :class:`PassRecord` and tags everything it produces with its own ``run_id`` and
+    ``action_id``, so a reader can always state which pass produced a given finding
+    -- required of the methods paper, and required for a reviewer to reproduce a
+    single pass in isolation.
+
+    Overwriting instead of appending was considered and rejected: the first pass's
+    record is the current best evidence that the safety design works (findings
+    correctly refused for lacking an artifact, i.e. the deterministic gate killing a
+    claim before the Verifier ever saw it), and overwriting would destroy it.
+
+    The single-run accessors below (``run_id``, ``stop_reason``, ``usage``, ...)
+    report the MOST RECENT pass. They exist because a great deal of surrounding code
+    -- the dispatcher's success/failure mapping, the operator dashboard -- is asking
+    about the run that just happened, and that question stays well-posed under
+    accumulation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int = CURRENT_REPORT_SCHEMA_VERSION
     report_id: str = Field(min_length=1)
     campaign_id: str = Field(min_length=1)
-    action_id: str = Field(min_length=1)
-    run_id: str = Field(min_length=1)
     created_at: datetime
-    queries: list[str] = Field(default_factory=list)
+    """When the FIRST pass started. Per-pass timestamps live on each ``PassRecord``."""
+    passes: list[PassRecord] = Field(min_length=1)
+    queries: list[QueryRecord] = Field(default_factory=list)
     artifacts: list[StoredArtifact] = Field(default_factory=list)
     findings: list[LiteratureFinding] = Field(default_factory=list)
     rejected: list[RejectedFinding] = Field(default_factory=list)
-    stop_reason: StopReason
-    model_name: str = ""
-    usage: BudgetUsage
-    warnings: list[str] = Field(default_factory=list)
+
+    @property
+    def latest(self) -> PassRecord:
+        """The most recent pass. ``passes`` is non-empty by construction."""
+        return self.passes[-1]
+
+    @property
+    def run_id(self) -> str:
+        return self.latest.run_id
+
+    @property
+    def action_id(self) -> str:
+        return self.latest.action_id
+
+    @property
+    def stop_reason(self) -> StopReason:
+        return self.latest.stop_reason
+
+    @property
+    def model_name(self) -> str:
+        return self.latest.model_name
+
+    @property
+    def usage(self) -> BudgetUsage:
+        return self.latest.usage
+
+    @property
+    def warnings(self) -> list[str]:
+        return self.latest.warnings
+
+    def findings_for(self, run_id: str) -> list[LiteratureFinding]:
+        return [f for f in self.findings if f.run_id == run_id]
+
+    def rejected_for(self, run_id: str) -> list[RejectedFinding]:
+        """The rejections from ONE pass.
+
+        Sibling of :meth:`findings_for`, and needed for the same reason: any surface
+        reporting "this pass" must scope all of its counts, not just the grounded
+        one. A panel that scopes findings but leaves rejections accumulated states
+        an acceptance rate that is not any pass's (F13).
+        """
+        return [r for r in self.rejected if r.run_id == run_id]
+
+    def queries_for(self, run_id: str) -> list[QueryRecord]:
+        """The queries issued by ONE pass. A corpus pass issues none, by design."""
+        return [q for q in self.queries if q.run_id == run_id]

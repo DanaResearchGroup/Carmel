@@ -41,8 +41,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from carmel.config import AgentConfig
 from carmel.logger import get_logger
+from carmel.paths import default_daily_ledger_path
 from carmel.schemas.action_state import ActionExecutionStatus, ActionOutcome, PlanProgress
-from carmel.schemas.approval import ActionKind, ApprovalStatus
+from carmel.schemas.approval import LITERATURE_ACTION_KINDS, ActionKind, ApprovalStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.diagnostics import DiagnosticsV1
 from carmel.schemas.literature import STOP_REASON_FOR_DIMENSION, LiteratureReport, StopReason
@@ -86,7 +87,13 @@ _log = get_logger("services.dispatcher")
 
 #: Action kinds THIS dispatcher can execute. EXPERIMENT is deliberately absent —
 #: the planner and schema can still construct it, so the dispatcher refuses it.
-SUPPORTED_ACTION_KINDS = frozenset({ActionKind.T3_RUN, ActionKind.LITERATURE_SEARCH})
+SUPPORTED_ACTION_KINDS = frozenset({ActionKind.T3_RUN, ActionKind.LITERATURE_SEARCH, ActionKind.LITERATURE_CORPUS_PASS})
+
+#: The kinds the literature handler accepts. Both run the Literature Agent through the
+#: same envelope; they differ only in whether the pass may reach the network.
+#: Re-exported under this module's original private name; defined in the schemas
+#: package so crash recovery and the dispatcher cannot drift apart on it.
+_LITERATURE_ACTION_KINDS = LITERATURE_ACTION_KINDS
 
 #: Action kinds that are executable SOMEWHERE, which is not the same question.
 #:
@@ -338,13 +345,84 @@ def _literature_unavailable_result(workspace_root: Path, action: PlannedAction, 
 
 
 def _literature_outcome(report: LiteratureReport, action: PlannedAction) -> ActionOutcome:
+    """Classify the outcome of THIS pass, not of the accumulated report.
+
+    ``report.findings`` accumulates across every pass the campaign has run (schema v2),
+    so testing it would let one finding from an earlier search make every later corpus
+    pass report SUCCEEDED -- including a pass that ran the whole corpus and grounded
+    nothing (spar round 7, P1). That is precisely the signal an operator needs, because
+    a barren pass is the one that says the corpus is exhausted or the prompt is wrong.
+    """
     if report.stop_reason in _BUDGET_STOP_REASONS:
         return ActionOutcome.BUDGET_EXCEEDED
     if report.stop_reason == StopReason.ERROR:
         return _failure_outcome(action)
-    if not report.findings:
+    if not report.findings_for(report.run_id):
         return ActionOutcome.NO_GROUNDED_FINDINGS
     return ActionOutcome.SUCCEEDED
+
+
+def _apply_action_budget(deps: LiteratureDeps, action: PlannedAction) -> LiteratureDeps:
+    """Bind a corpus pass to the budget the operator named when appending it.
+
+    Without this the operator's ``--budget-tokens`` would be recorded on the action and
+    read only by the approval gate, while the run itself consumed up to whatever the
+    config file's ``max_tokens`` happened to be -- a control that looks like a
+    ceiling in the plan and is not one at run time. A safety number that does not
+    bind is worse than none, because it is believed.
+
+    **Tokens, not dollars, are the authorisation unit.** They are what the run
+    consumes and what the provider meters, so the number the operator typed is the
+    number enforced. A dollar ceiling would put the pricing table in between, and a
+    stale or wrong per-token rate then moves the real limit without anyone editing it
+    -- the same class of silently-non-binding control this function exists to prevent.
+    A live run made the cost of getting this backwards concrete: authorised at $3, it
+    stopped on an unrelated 200k-token cap having spent $0.40, delivering 13% of what
+    the operator granted while appearing to respect their number.
+
+    Only ``max_tokens`` is replaced. The session and daily ceilings are process-
+    and machine-wide protections against many runs in aggregate, and one operator
+    authorising one action does not authorise breaching those -- so the rebuilt
+    ledger CARRIES THEM OVER (spar round 7, P1). Constructing ``BudgetLedger(budget)``
+    bare leaves ``daily_ledger_path=None``, which silently switches the file-backed
+    daily cap off for exactly the runs an operator has just authorised extra work
+    for. That is the opposite of what the paragraph above promises, and the promise is
+    the dangerous half: a ceiling believed to hold is worse than one known to be
+    absent.
+
+    ``max_cost_usd`` is deliberately left at the config value. It is no longer the
+    operator's authorisation, so it reverts to being an ordinary autonomous-spend
+    guard, and whichever of the two dimensions binds first stops the run.
+
+    Raises:
+        ValueError: If the action names no usable budget. Only a corpus pass reaches
+            here, and for a corpus pass the operator's ``--budget-tokens`` IS the
+            authorisation -- appending one without a positive budget is refused at
+            :func:`~carmel.services.planner.append_corpus_pass_action`. Falling back to
+            the config ceiling for an action that reached this point some other way
+            (a hand-edited or tampered plan) would consume up to a limit nobody
+            authorised, so fail closed instead.
+    """
+    budget_tokens = action.estimated_tokens
+    if budget_tokens is None or budget_tokens <= 0:
+        raise ValueError(
+            f"corpus-pass action {action.action_id} names no positive budget "
+            f"(estimated_tokens={budget_tokens!r}); the operator budget is the "
+            f"authorisation for this action and there is no safe default"
+        )
+
+    import dataclasses
+
+    from carmel.agents.budget import BudgetLedger
+
+    budget = deps.config.budget.model_copy(update={"max_tokens": budget_tokens})
+    config = deps.config.model_copy(update={"budget": budget})
+    ledger = BudgetLedger(
+        budget,
+        session=deps.ledger.session,
+        daily_ledger_path=deps.ledger.daily_ledger_path,
+    )
+    return dataclasses.replace(deps, config=config, ledger=ledger)
 
 
 def make_literature_handler(
@@ -370,17 +448,48 @@ def make_literature_handler(
         # run lock. This handler does not advertise ``wants_supervision``, so
         # execute_action never hands it one (and closes any it was given).
         del supervision
-        if action.kind != ActionKind.LITERATURE_SEARCH:  # fail closed on mis-routing
+        if action.kind not in _LITERATURE_ACTION_KINDS:  # fail closed on mis-routing
             raise UnsupportedActionKindError(f"literature handler cannot execute kind {action.kind.value!r}")
         if literature_deps is None and agent_config is None:
             return _literature_unavailable_result(
                 workspace_root, action, "no agent config available; literature run skipped"
             )
         # Lazy import: keeps the dispatcher importable without the agents stack.
-        from carmel.services.literature import build_deps, run_literature_research, run_record_for
+        from carmel.services.literature import (
+            ReportSchemaTooNewError,
+            build_deps,
+            run_corpus_pass,
+            run_literature_research,
+            run_record_for,
+        )
 
-        deps = literature_deps if literature_deps is not None else build_deps(agent_config)  # type: ignore[arg-type]
-        report = run_literature_research(workspace_root, campaign, action, deps, config=deps.config)
+        # Pass the daily ledger path explicitly. `build_deps` defaults it to None, and
+        # `BudgetLedger` reads None as "no daily cap", so this -- the ONLY production
+        # call site -- was silently running every literature action with the
+        # configured `daily_max_cost_usd` unenforced. `_apply_action_budget` below
+        # carefully carries the path over when it rebuilds the ledger, but it was
+        # faithfully carrying over None.
+        deps = (
+            literature_deps
+            if literature_deps is not None
+            else build_deps(agent_config, daily_ledger_path=default_daily_ledger_path())  # type: ignore[arg-type]
+        )
+        if action.kind == ActionKind.LITERATURE_CORPUS_PASS:
+            try:
+                deps = _apply_action_budget(deps, action)
+            except ValueError as exc:
+                # A refused budget is an unrunnable action, not a crashed dispatch:
+                # surface it the same way a missing agent config is surfaced, so the
+                # operator sees why nothing ran and the plan keeps the action.
+                return _literature_unavailable_result(workspace_root, action, str(exc))
+        run_pass = run_corpus_pass if action.kind == ActionKind.LITERATURE_CORPUS_PASS else run_literature_research
+        try:
+            report = run_pass(workspace_root, campaign, action, deps, config=deps.config)
+        except ReportSchemaTooNewError as exc:
+            # An incompatible-version refusal is operator-actionable ("upgrade Carmel"),
+            # so surface it as a typed unrunnable action rather than a handler crash.
+            # Genuine report corruption raises a plain ValueError and still fails loudly.
+            return _literature_unavailable_result(workspace_root, action, str(exc))
         run_record = run_record_for(report, action)
         save_run_record(workspace_root, run_record)
         outcome = _literature_outcome(report, action)
@@ -410,6 +519,7 @@ def default_handlers(
     return {
         ActionKind.T3_RUN: make_t3_handler(t3_adapter),
         ActionKind.LITERATURE_SEARCH: make_literature_handler(agent_config, literature_deps),
+        ActionKind.LITERATURE_CORPUS_PASS: make_literature_handler(agent_config, literature_deps),
     }
 
 
@@ -449,12 +559,16 @@ def validate_plan_shape(plan: Plan) -> list[str]:
     literature_indices = [i for i, a in enumerate(plan.actions) if a.kind == ActionKind.LITERATURE_SEARCH]
     if len(literature_indices) > 1:
         problems.append(f"plan contains {len(literature_indices)} LITERATURE_SEARCH actions; at most one is allowed")
+    # LITERATURE_CORPUS_PASS is deliberately NOT capped. A search pass reaches the
+    # network, so running two is duplicated spend on the same discovery; a corpus pass
+    # re-reads what is already held, and an operator may legitimately append one after
+    # each batch of papers they supply.
     if t3_indices:
         first_t3 = t3_indices[0]
         for i, action in enumerate(plan.actions):
             if i <= first_t3:
                 continue
-            if action.kind == ActionKind.LITERATURE_SEARCH:
+            if action.kind in _LITERATURE_ACTION_KINDS:
                 problems.append(
                     f"literature action {action.action_id!r} follows the T3_RUN action; literature must precede T3"
                 )

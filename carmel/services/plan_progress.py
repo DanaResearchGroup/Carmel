@@ -24,8 +24,13 @@ from carmel.schemas.action_state import (
     ActionState,
     PlanProgress,
 )
-from carmel.schemas.approval import ActionKind, ApprovalRequirement, ApprovalStatus
-from carmel.schemas.plan import Plan
+from carmel.schemas.approval import (
+    LITERATURE_ACTION_KINDS,
+    ActionKind,
+    ApprovalRequirement,
+    ApprovalStatus,
+)
+from carmel.schemas.plan import Plan, PlannedAction
 from carmel.schemas.state import CampaignStateValue
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
@@ -132,6 +137,74 @@ def load_or_init_progress(workspace_root: Path, plan: Plan) -> PlanProgress:
             plan.plan_id,
         )
         return init_progress(workspace_root, plan)
+    return progress
+
+
+def append_action_to_progress(workspace_root: Path, action: PlannedAction, *, index: int | None = None) -> PlanProgress:
+    """Add state for an action inserted into an already-initialised plan.
+
+    Used when an operator appends work to a live campaign. The state is inserted at
+    the SAME position the action occupies in the plan, so progress and plan stay
+    index-aligned; ``index=None`` appends at the end.
+
+    Refuses to insert BEHIND the cursor. The cursor only ever moves forward (see
+    :func:`advance_cursor`, which never rewinds), so an action placed behind it would
+    be silently skipped forever -- a new action that never runs is worse than a
+    refused command, because the operator has no way to tell the two apart from the
+    plan alone.
+
+    Raises:
+        ValueError: If the plan has already progressed past the insertion point.
+    """
+    with workspace_lock(workspace_root):
+        return append_action_to_progress_locked(workspace_root, action, index=index)
+
+
+def append_action_to_progress_locked(
+    workspace_root: Path, action: PlannedAction, *, index: int | None = None
+) -> PlanProgress:
+    """:func:`append_action_to_progress` with the workspace lock ALREADY held.
+
+    Exists so a caller that must update the plan and progress together can hold one
+    lock across both writes. ``workspace_lock`` is an ``fcntl.flock``, which conflicts
+    with itself even within a single process, so such a caller cannot simply wrap the
+    locking version -- it would deadlock against itself.
+
+    Call this ONLY from inside ``with workspace_lock(workspace_root):``.
+    """
+    progress = load_progress(workspace_root)
+    at = len(progress.actions) if index is None else index
+    if at < progress.cursor:
+        raise ValueError(
+            f"cannot insert an action at position {at}: the plan has already progressed "
+            f"past it (cursor is at {progress.cursor}), so it would never run"
+        )
+    # Strictly-behind is not enough (F17). `at == cursor` is legal by that test alone,
+    # including when the action sitting there is RUNNING -- and inserting there
+    # DISPLACES it to at+1 while the cursor stays put. The running action's own
+    # `advance_cursor` then refuses to move (it requires the id at the cursor to
+    # match), so the inserted action silently inherits the slot and is scheduled
+    # AFTER the run it was inserted to precede: the exact inversion of the caller's
+    # intent, reached without any error.
+    occupant = progress.actions[at] if at < len(progress.actions) else None
+    if occupant is not None and occupant.execution_status == ActionExecutionStatus.RUNNING:
+        raise ValueError(
+            f"cannot insert an action at position {at}: {occupant.action_id} is RUNNING there. "
+            f"Inserting ahead of a run already in flight cannot put the new action first, "
+            f"and would strand the running action's cursor. Wait for it to finish."
+        )
+    progress.actions.insert(
+        at,
+        ActionState(
+            action_id=action.action_id,
+            kind=action.kind,
+            approval_status=_approval_from_requirement(action.approval_requirement),
+            blocking=action.blocking,
+            updated_at=_now(),
+        ),
+    )
+    progress.updated_at = _now()
+    save_progress(workspace_root, progress)
     return progress
 
 
@@ -592,7 +665,11 @@ def _attempt_is_live(
     """
     if action.kind == ActionKind.T3_RUN and not probe_run_liveness(workspace_root).is_finished:
         return True
-    if action.kind == ActionKind.LITERATURE_SEARCH and lock_is_live(
+    # EVERY literature kind, not just the search (spar round 7, P1). A corpus pass takes
+    # the same literature run lock, so excluding it meant a live corpus pass could be
+    # judged dead and marked FAILED while it was still writing -- and then re-run. That
+    # is the silent second run this whole function exists to prevent.
+    if action.kind in LITERATURE_ACTION_KINDS and lock_is_live(
         workspace_root / LITERATURE_RUN_LOCK_DIR, stale_after_s=stale_after_s
     ):
         return True
@@ -771,10 +848,13 @@ def reconcile(
     return progress
 
 
-#: The RUNNING_* campaign state each action kind executes under.
-_KIND_FOR_RUNNING_STATE: dict[CampaignStateValue, ActionKind] = {
-    CampaignStateValue.RUNNING_T3: ActionKind.T3_RUN,
-    CampaignStateValue.RUNNING_LITERATURE: ActionKind.LITERATURE_SEARCH,
+#: The action kinds each RUNNING_* campaign state covers. RUNNING_LITERATURE covers ALL
+#: literature kinds, not just the search (spar round 7, P1): a crashed corpus pass would
+#: otherwise leave the campaign wedged in RUNNING_LITERATURE forever, because the replay
+#: below looked only for a finished LITERATURE_SEARCH and never found one.
+_KINDS_FOR_RUNNING_STATE: dict[CampaignStateValue, frozenset[ActionKind]] = {
+    CampaignStateValue.RUNNING_T3: frozenset({ActionKind.T3_RUN}),
+    CampaignStateValue.RUNNING_LITERATURE: LITERATURE_ACTION_KINDS,
 }
 
 
@@ -806,13 +886,13 @@ def _replay_missing_post_transition(workspace_root: Path, progress: PlanProgress
     restoring a legal intermediate state.
     """
     current = load_state(workspace_root).state
-    kind = _KIND_FOR_RUNNING_STATE.get(current)
-    if kind is None:
+    kinds = _KINDS_FOR_RUNNING_STATE.get(current)
+    if kinds is None:
         return
     finished = [
         a
         for a in progress.actions
-        if a.kind == kind and a.is_terminal() and a.execution_status != ActionExecutionStatus.SKIPPED
+        if a.kind in kinds and a.is_terminal() and a.execution_status != ActionExecutionStatus.SKIPPED
     ]
     if not finished:
         return

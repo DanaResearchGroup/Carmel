@@ -10,6 +10,7 @@ from carmel.schemas.action_state import (
     PlanProgress,
 )
 from carmel.schemas.approval import (
+    LITERATURE_ACTION_KINDS,
     ActionKind,
     ApprovalDecision,
     ApprovalPolicy,
@@ -65,6 +66,7 @@ __all__ = [
     "PLAN_SCHEMA_VERSION",
     "STOP_REASON_FOR_DIMENSION",
     "ActionExecutionStatus",
+    "LITERATURE_ACTION_KINDS",
     "ActionKind",
     "ActionOutcome",
     "ActionState",

@@ -103,9 +103,27 @@ VALID_TRANSITIONS: dict[CampaignStateValue, frozenset[CampaignStateValue]] = {
     # -> RUNNING_T3 (a second T3 after literature), which increment 1
     # rejects in `validate_plan_shape`, not here: the edges stay general for
     # a future Revision Agent.
+    #
+    # LITERATURE_READY -> RUNNING_LITERATURE, by contrast, is REQUIRED and was
+    # the omission that made `carmel corpus-pass` inert (found by live run
+    # 2026.08.01, not by the suite). A corpus pass is defined as a second pass
+    # "over the papers this campaign already holds", and a campaign that holds
+    # papers is in LITERATURE_READY and nothing else — so without this edge the
+    # feature's only real use case raised InvalidTransitionError from BOTH the
+    # CLI and the UI, and appending one WEDGED the campaign: the cursor parked
+    # on an undispatchable action and the T3 run behind it became unreachable.
+    #
+    # This does NOT reintroduce the P1-9 cycle. That concern is about re-entering
+    # APPROVED_FOR_EXECUTION, which re-dispatches the WHOLE plan from the top.
+    # This edge re-enters only the running state for one already-appended action
+    # that the cursor consumes exactly once, under a token budget the operator
+    # named for it specifically. Appending the action is the authorisation; the
+    # loop it could form is bounded by the plan, which `validate_plan_shape`
+    # owns — consistent with the note above that these edges stay general.
     CampaignStateValue.LITERATURE_READY: frozenset(
         {
             CampaignStateValue.RUNNING_T3,
+            CampaignStateValue.RUNNING_LITERATURE,
             CampaignStateValue.COMPLETED_PHASE1,
             CampaignStateValue.BLOCKED,
             CampaignStateValue.FAILED,

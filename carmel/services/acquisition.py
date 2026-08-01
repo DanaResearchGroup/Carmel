@@ -34,9 +34,10 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -52,6 +53,9 @@ from carmel.schemas.acquisition import (
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.evidence import artifact_dir, store_artifact
+from carmel.services.grounding import (
+    secondary_document_marker,
+)
 
 logger = get_logger("services.acquisition")
 
@@ -77,27 +81,119 @@ TITLE_MATCH_THRESHOLD = 0.8
 DOI_CORROBORATION_THRESHOLD = 0.4
 
 #: Front-matter phrases that mark a document as being *about* the requested paper rather
-#: than being it. Each of these reprints the original's DOI and usually its full title,
-#: so neither the DOI route nor the title route can separate them -- only the announcement
-#: can. Matched against the first :data:`_MARKER_SCAN_CHARS` characters, where a journal
-#: prints the article type, and suppressed when the requested title itself contains the
-#: word (a paper genuinely titled "Comment on ..." is a legitimate request).
-_SECONDARY_DOCUMENT_MARKERS: tuple[str, ...] = (
-    "erratum",
-    "corrigendum",
-    "correction to",
-    "comment on",
-    "reply to",
-    "retraction",
-    "editorial expression of concern",
+#: than being it. Defined in :mod:`carmel.services.grounding` and re-exported here under
+#: the names this module already used, so the two layers that gate on secondary documents
+#: -- this one at store entry, grounding at attribution time -- share ONE vocabulary.
+#: Adding a marker to only one of them would silently reopen the hole in the other.
+#:
+#: Matched against the first :data:`MARKER_SCAN_CHARS` characters, where a journal prints
+#: the article type -- much shorter than :data:`IDENTITY_SEARCH_CHARS`, since scanning
+#: further would match a mere mention of an erratum in the body or a footnote. Suppressed
+#: when the requested title itself contains the word (a paper genuinely titled "Comment
+#: on ..." is a legitimate request).
+#: Words too generic to distinguish one combustion paper from another.
+#: Hosts whose documents may enter the evidence store AUTOMATICALLY.
+#:
+#: The identity gate asks whether a document contains the cited title and DOI outside
+#: its reference list. A document that merely PRINTS another paper's title and DOI in
+#: its body satisfies that too, so its own prose can be recorded as grounded under the
+#: impersonated citation (provenance survives -- ``EvidenceRef`` and ``source_url``
+#: still name the true artifact -- but attribution does not).
+#:
+#: Measured on the 8-paper live corpus, this does not happen by accident: every DOI
+#: appearing outside a references section was the document's OWN front-matter DOI, and
+#: each testable citation was confirmed only by its own document. It needs a document
+#: that prints a foreign title and DOI in its body -- which an attacker-controlled page
+#: reached through a poisoned search result can do deliberately.
+#:
+#: Tightening the gate instead would mean a "front matter only" window, and the same
+#: corpus says a paper's own DOI sits 2.6k-5.1k characters in (5.8%-15.1%) and is
+#: labelled ``body``, never ``abstract``. A threshold with that little headroom,
+#: calibrated on eight documents, is the shape that produced the F1 identity bug. So
+#: the control lives here instead, where it costs nothing to be strict.
+#:
+#: Matching is on the registrable suffix: an entry matches the host itself and any
+#: subdomain of it. A non-matching host is not a failure -- the paper is queued for
+#: MANUAL acquisition, which runs its own identity check on admission.
+DEFAULT_ADMISSIBLE_HOSTS: frozenset[str] = frozenset(
+    {
+        # Resolvers and registries
+        "doi.org",
+        "crossref.org",
+        "openalex.org",
+        "unpaywall.org",
+        "semanticscholar.org",
+        "core.ac.uk",
+        # Publishers
+        "sciencedirect.com",
+        "elsevier.com",
+        "els-cdn.com",
+        "springer.com",
+        "springernature.com",
+        "wiley.com",
+        "tandfonline.com",
+        "acs.org",
+        "rsc.org",
+        "aip.org",
+        "iop.org",
+        "nature.com",
+        "science.org",
+        "pnas.org",
+        "cambridge.org",
+        "oup.com",
+        "sagepub.com",
+        "mdpi.com",
+        "frontiersin.org",
+        "plos.org",
+        "hindawi.com",
+        "degruyter.com",
+        "aiaa.org",
+        "asme.org",
+        # Preprints, repositories, government
+        "arxiv.org",
+        "chemrxiv.org",
+        "biorxiv.org",
+        "medrxiv.org",
+        "osf.io",
+        "zenodo.org",
+        "figshare.com",
+        "osti.gov",
+        "nih.gov",
+        "nasa.gov",
+    }
 )
 
-#: How far into the front matter to look for an article-type announcement. Much shorter
-#: than :data:`IDENTITY_SEARCH_CHARS`: journals print the article type in the header, and
-#: scanning further would match a mere mention of an erratum in the body or a footnote.
-_MARKER_SCAN_CHARS = 600
 
-#: Words too generic to distinguish one combustion paper from another.
+def host_is_admissible(url: str, additional_hosts: Iterable[str] = ()) -> bool:
+    """Whether a document from ``url`` may enter the evidence store automatically.
+
+    Fail-closed by construction: anything that does not parse, carries no host, or
+    does not match an allowed suffix is refused. ``additional_hosts`` is the operator's
+    extension point (an institutional proxy, a lab mirror) -- there is deliberately no
+    switch that disables the check, because "allow everything" is the configuration
+    this exists to prevent, and adding the one host you need is never harder.
+
+    Matching is on the registrable suffix, never a substring: ``sciencedirect.com``
+    admits ``www.sciencedirect.com`` but NOT ``sciencedirect.com.evil.net``, which a
+    substring test would wave through.
+
+    Args:
+        url: The candidate URL.
+        additional_hosts: Extra admissible hosts from configuration.
+
+    Returns:
+        True if the URL's host is, or is a subdomain of, an admissible host.
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower().strip(".")
+    except ValueError:
+        return False
+    if not host:
+        return False
+    allowed = {h.lower().strip(".") for h in (*DEFAULT_ADMISSIBLE_HOSTS, *additional_hosts) if h}
+    return any(host == entry or host.endswith("." + entry) for entry in allowed)
+
+
 _TITLE_STOPWORDS = frozenset(
     {
         "a", "an", "and", "at", "by", "for", "from", "in", "of", "on", "the", "to",
@@ -281,23 +377,10 @@ def record_request(
     return request
 
 
-def _secondary_document_marker(head: str, requested_title: str) -> str | None:
-    """Return the phrase marking ``head`` as a document *about* the requested paper.
-
-    Args:
-        head: Lowercased front matter of the dropped document.
-        requested_title: Lowercased title of the request, used to suppress the check for
-            papers whose own title contains one of the marker phrases.
-
-    Returns:
-        The matched marker, or ``None`` when the document does not announce itself as a
-        secondary document.
-    """
-    window = head[:_MARKER_SCAN_CHARS]
-    for marker in _SECONDARY_DOCUMENT_MARKERS:
-        if marker in window and marker not in requested_title:
-            return marker
-    return None
+#: Alias of :func:`carmel.services.grounding.secondary_document_marker`, kept under this
+#: module's original private name so the call sites below read unchanged. The detector
+#: itself now lives beside the marker vocabulary it consults.
+_secondary_document_marker = secondary_document_marker
 
 
 def _gate_on_secondary_document_marker(ok: bool, note: str, *, marker: str | None) -> tuple[bool, str]:
@@ -377,17 +460,18 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
        the paper they concern. So a DOI match additionally requires
        :data:`DOI_CORROBORATION_THRESHOLD` of the title's significant words, and is
        refused outright when the front matter announces the document as a secondary one
-       (see :data:`_SECONDARY_DOCUMENT_MARKERS`).
+       (see :data:`SECONDARY_DOCUMENT_MARKERS`).
     2. **Title overlap alone.** Fallback when no DOI is known or the DOI is not printed.
        Requires the stricter :data:`TITLE_MATCH_THRESHOLD`, since nothing corroborates it.
 
     This mirrors the conjunction that :func:`carmel.services.grounding.check_identity`
-    documents as load-bearing (``doi_ok and (title_ok or author_ok)``). The two functions
-    answer the same question and must not disagree: this one gates the MANUAL acquisition
-    path, and once a document is admitted the stricter rule never re-runs -- the
-    quote-grounding gate only ever asks whether a quote appears in the supplied bytes,
-    never whether those bytes are the right paper. The author half of the conjunction is
-    unavailable here because :class:`AcquisitionRequest` carries no author list.
+    documents as load-bearing. That rule is now ``doi_ok and title_ok``: the
+    surname-based escape from the title requirement was removed, because a review or
+    discussion article can carry every weak signal it rested on honestly. The two
+    functions answer the same question and must not disagree: this one gates the MANUAL
+    acquisition path, and once a document is admitted the stricter rule never re-runs --
+    the quote-grounding gate only ever asks whether a quote appears in the supplied
+    bytes, never whether those bytes are the right paper.
 
     Only the first :data:`IDENTITY_SEARCH_CHARS` characters are searched, so that a mere
     *citation* of the requested paper inside a different paper's reference list cannot
@@ -436,13 +520,12 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
         #
         # So require corroboration, matching the conjunction that
         # :func:`carmel.services.grounding.check_identity` documents as load-bearing
-        # (``doi_ok and (title_ok or author_ok)``). The threshold is lower than
+        # (``doi_ok and title_ok``). The threshold is lower than
         # TITLE_MATCH_THRESHOLD because it is corroborating an already-strong signal
         # rather than standing alone: a genuine paper reprints its own title verbatim in
         # its front matter, while a publisher landing page saved as PDF carries mostly
         # navigation chrome. NOT calibrated against a corpus; chosen as half of the
-        # standalone bar. AcquisitionRequest carries no author list, so the author route
-        # that grounding.check_identity can take is not available here.
+        # standalone bar.
         if ratio >= DOI_CORROBORATION_THRESHOLD:
             return _gate_on_secondary_document_marker(
                 True,

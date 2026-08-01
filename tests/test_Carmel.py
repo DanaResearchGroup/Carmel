@@ -622,6 +622,48 @@ class TestRequestsCommand:
         )
         return load_campaign(ws).campaign_id, ws
 
+    def test_config_workspace_root_is_honoured_without_an_explicit_workspaces_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--config` names a workspace_root; this command used to ignore it.
+
+        It resolved the root before the config was even loaded, then read the config
+        only for max_artifact_bytes -- so it scanned the DEFAULT workspaces directory
+        while the operator had just handed it a config naming a different one. The
+        failure is quiet in the worst way: "No campaign <id> under <dir>", naming a
+        directory the operator never asked about, for a campaign that exists.
+
+        `new-campaign --workspaces` already advertises "default: the config's
+        workspace_root"; only this command disagreed.
+        """
+        cid, _ = self._campaign_with_request(tmp_path)
+        from Carmel import main
+
+        # Point the default elsewhere and leave it empty: if the config's
+        # workspace_root were ignored, the campaign could only be found by accident.
+        empty_default = tmp_path / "not-here"
+        empty_default.mkdir()
+        monkeypatch.setenv("CARMEL_WORKSPACES", str(empty_default))
+
+        code = main(["requests", "--campaign", cid, "--config", str(tmp_path / "nh3.yaml")])
+
+        assert code == 0, "the campaign named by the config's workspace_root was not found"
+        assert "Shock tube" in capsys.readouterr().out
+
+    def test_an_explicit_workspaces_flag_still_wins_over_the_config(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Precedence must not invert: an operator who types --workspaces means it."""
+        cid, _ = self._campaign_with_request(tmp_path)
+        from Carmel import main
+
+        code = main(
+            ["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--config", str(tmp_path / "nh3.yaml")]
+        )
+
+        assert code == 0
+        assert "Shock tube" in capsys.readouterr().out
+
     def test_listing_prints_the_next_command_for_each_pending_paper(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -1074,3 +1116,475 @@ class TestRequestsCommandDirectoryExitCode:
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--add", str(lit)]) == 1
         out = capsys.readouterr().out
         assert "0 accepted" in out
+
+
+class TestCorpusPassCommand:
+    """The operator-facing half of the second pass.
+
+    Appending is the authorisation: it names an explicit budget, and it is recorded
+    in the plan whether or not the run then succeeds.
+    """
+
+    def _campaign(self, tmp_path: Path, *, dispatchable: bool = False) -> tuple[str, Path]:
+        """A campaign with a plan; optionally advanced to a state that can dispatch.
+
+        ``dispatchable`` walks the campaign up the real state ladder to
+        APPROVED_FOR_EXECUTION. A corpus pass is a SECOND pass over papers a campaign
+        already holds, so by the time an operator appends one the campaign has long
+        since left DRAFT -- a draft campaign has not run the literature search whose
+        results the corpus pass re-reads. Tests that only append (``--dry-run``) do not
+        need it, because appending is authorisation and deliberately works regardless
+        of whether the run then succeeds.
+        """
+        from Carmel import main
+        from carmel.schemas import CampaignStateValue
+        from carmel.services.campaigns import load_campaign
+        from carmel.services.planner import plan_and_save
+        from carmel.services.state_machine import update_state
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        campaign = load_campaign(ws)
+        plan_and_save(ws, campaign, include_literature=True)
+        if dispatchable:
+            for target in (
+                CampaignStateValue.VALIDATED,
+                CampaignStateValue.READY_FOR_PLANNING,
+                CampaignStateValue.PLAN_PENDING_APPROVAL,
+                CampaignStateValue.APPROVED_FOR_EXECUTION,
+            ):
+                update_state(ws, target)
+        return campaign.campaign_id, ws
+
+    def test_a_campaign_with_no_plan_is_told_what_is_missing(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The raw failure is 'JSON file not found: .../plan.json', which tells an
+        operator nothing about the remedy."""
+        from Carmel import main
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        cid = load_campaign(tmp_path / "ws").campaign_id
+
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "100000", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 1
+        err = capsys.readouterr().err
+        assert "no plan yet" in err
+        assert "plan.json" not in err
+
+    def test_dry_run_appends_the_action_before_the_t3_run(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """T3 must stay the last executable action, and the ordering is the honest
+        one anyway: corpus findings are context for the T3 run."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = self._campaign(tmp_path)
+
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "250000", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        # The cap is reported in the unit that binds. With no --config there is no
+        # model to price against, so the dollar cost is declared unavailable rather
+        # than defaulted to a number that would read as free.
+        assert "250,000 tokens" in out
+        assert "cannot be estimated" in out
+        kinds = [a.kind for a in load_plan(ws).actions]
+        assert ActionKind.LITERATURE_CORPUS_PASS in kinds
+        assert kinds.index(ActionKind.LITERATURE_CORPUS_PASS) < kinds.index(ActionKind.T3_RUN)
+
+    def test_the_dollar_cost_is_reported_as_an_estimate_beside_the_binding_token_cap(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Tokens are the authorisation unit; dollars are derived and REPORTED.
+
+        The operator still needs to know roughly what a token number costs, or the
+        cap is unusable in practice -- but the moment a dollar figure is printed it
+        invites being read as the ceiling. That is precisely the confusion that cost a
+        live run 87% of its authorised budget: it stopped on a token cap nobody had
+        looked at while the dollar figure sat there looking authoritative.
+
+        So the output must carry BOTH, and must say which one binds. Asserting on the
+        disambiguating phrase, not merely on the number, is the point of this test.
+        """
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "250000",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+                "--dry-run",
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "250,000 tokens" in out, "the binding cap must be stated in the unit that binds"
+        assert "at most ~$" in out, "an operator cannot use a token cap without knowing its cost"
+        assert "estimated ~$" not in out, (
+            "the figure is a worst-case bound (unpriced models get a punitive fallback rate), "
+            "so printing it as a point estimate would mislead in the same way a non-binding "
+            "dollar ceiling did"
+        )
+        assert "the token cap is what binds" in out, (
+            "a bare dollar figure beside a token cap reads as the ceiling; it must say which one binds"
+        )
+
+    def test_progress_gains_the_action_at_the_same_position_as_the_plan(self, tmp_path: Path) -> None:
+        """Plan and progress are index-aligned; drifting them apart would make the
+        cursor point at a different action than the plan says."""
+        from Carmel import main
+        from carmel.services.plan_progress import load_progress
+        from carmel.services.planner import load_plan
+
+        cid, ws = self._campaign(tmp_path)
+        assert (
+            main(
+                [
+                    "corpus-pass",
+                    "--campaign",
+                    cid,
+                    "--budget-tokens",
+                    "100000",
+                    "--workspaces",
+                    str(tmp_path),
+                    "--dry-run",
+                ]
+            )
+            == 0
+        )
+
+        plan_ids = [a.action_id for a in load_plan(ws).actions]
+        progress_ids = [a.action_id for a in load_progress(ws).actions]
+        assert plan_ids == progress_ids
+
+    def test_a_non_positive_budget_is_refused(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """The budget is the authorisation. A zero or negative one authorises
+        nothing, and silently appending an action that can never run would be worse
+        than refusing."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = self._campaign(tmp_path)
+
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "0", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 1
+        assert "must be positive" in capsys.readouterr().err
+        assert ActionKind.LITERATURE_CORPUS_PASS not in [a.kind for a in load_plan(ws).actions]
+
+    def test_an_unknown_campaign_is_reported_not_crashed(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from Carmel import main
+
+        self._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                "no-such-id",
+                "--budget-tokens",
+                "100000",
+                "--workspaces",
+                str(tmp_path),
+                "--dry-run",
+            ]
+        )
+
+        assert code == 1
+        assert "not found" in capsys.readouterr().err
+
+    def test_it_refuses_rather_than_dispatching_a_different_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`corpus-pass` dispatches the plan's NEXT runnable action, which is not
+        necessarily the corpus pass it just appended.
+
+        With a LITERATURE_SEARCH still pending ahead of it, the command used to run
+        THAT -- an outward-facing pass that reaches the network and spends money -- and
+        only report the mismatch afterwards, once it had already happened. The operator
+        asked for an offline pass over papers already held, under a budget named for
+        that pass. Reporting after the fact is not a guard.
+
+        Asserting the handler was never built is the load-bearing part: an assertion on
+        the message alone would pass even if the search had run.
+        """
+        import carmel.services.dispatcher as dispatcher
+        from Carmel import main
+
+        cid, _ = self._campaign(tmp_path, dispatchable=True)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+        called = False
+
+        def _spy(**kwargs: Any) -> Any:
+            nonlocal called
+            called = True
+            return dispatcher.default_handlers(**kwargs)
+
+        monkeypatch.setattr(dispatcher, "default_handlers", _spy)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "100000",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+            ]
+        )
+
+        assert code == 1
+        assert called is False, "an action other than the corpus pass was dispatched"
+        assert "Refusing to dispatch" in capsys.readouterr().err
+
+    def test_the_agent_config_reaches_the_handler(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Regression: the command loaded --config and then dispatched without it, so
+        the literature handler was built with nothing to run on and returned a typed
+        "no agent config available" failure. That reads as a failed RUN rather than a
+        command that never started one, and no test using injected deps could see it
+        -- only the real dispatch path does.
+        """
+        import carmel.services.dispatcher as dispatcher
+        from Carmel import main
+        from carmel.schemas import ActionExecutionStatus, ActionOutcome
+        from carmel.services.plan_progress import advance_cursor, load_progress, mark_finished, mark_running
+
+        cid, ws = self._campaign(tmp_path, dispatchable=True)
+        # Retire the literature search sitting ahead of the corpus pass. The command
+        # now refuses to dispatch when the cursor points at a different action, so
+        # without this it never reaches the handler at all.
+        search = load_progress(ws).actions[0]
+        mark_running(ws, search.action_id, "attempt-1")
+        mark_finished(
+            ws,
+            search.action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+        advance_cursor(ws, search.action_id)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+
+        seen: dict[str, object] = {}
+        real_default_handlers = dispatcher.default_handlers
+
+        def _spy(**kwargs: Any) -> Any:
+            seen.update(kwargs)
+            return real_default_handlers(**kwargs)
+
+        monkeypatch.setattr(dispatcher, "default_handlers", _spy)
+
+        main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "100000",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+            ]
+        )
+
+        assert "agent_config" in seen, "the command dispatched without handing over a handler registry"
+        assert seen["agent_config"] is not None, "the loaded --config never reached the handler"
+
+    def test_the_run_advances_the_plan_cursor_past_the_corpus_action(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spar round 7, P1. The command used to call execute_action, the by-kind
+        router, which runs the handler and NOTHING else -- no approval gate, no state
+        transitions, no attempt record, and no cursor advance.
+
+        A corpus pass therefore completed and wrote its report while plan_progress.json
+        still showed the action pending, so the next dispatcher run would execute it a
+        second time. Findings are deliberately never deduped across passes, so that
+        silently doubles them in the accumulated report.
+
+        Asserting on the CURSOR rather than on the outcome is deliberate: the run
+        itself fails here (consent is off, so there is no model to call), and the
+        bookkeeping must be correct regardless of how the run turns out. An assertion
+        that only held for a successful run would not have caught this.
+        """
+        from Carmel import main
+        from carmel.schemas import ActionExecutionStatus, ActionKind, ActionOutcome
+        from carmel.services.plan_progress import (
+            advance_cursor,
+            load_progress,
+            mark_finished,
+            mark_running,
+        )
+
+        cid, ws = self._campaign(tmp_path, dispatchable=True)
+        # Widen the auto-approve threshold. Since the corpus pass started going through
+        # the approval gate, the default $2 would hold this action for review: the mock
+        # model has no pricing entry and is charged a punitive fallback rate, so the
+        # worst-case estimate for this token cap lands far above it. That is the gate
+        # working; this test is about the cursor, so let the action through.
+        from carmel.schemas.approval import ApprovalPolicy
+        from carmel.services.approvals import save_policy
+
+        save_policy(ws, ApprovalPolicy(auto_approve_literature_under_usd=10_000.0))
+        # Retire the literature search that precedes the corpus pass in the plan, so
+        # the cursor actually reaches the appended action. Without this the dispatcher
+        # correctly runs the SEARCH instead -- which the command reports, and which is
+        # covered by test_it_refuses_rather_than_dispatching_a_different_action above.
+        search = load_progress(ws).actions[0]
+        mark_running(ws, search.action_id, "attempt-1")
+        mark_finished(
+            ws,
+            search.action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+        advance_cursor(ws, search.action_id)
+        config_path = tmp_path / "agents.yaml"
+        config_path.write_text(
+            (tmp_path / "nh3.yaml").read_text(encoding="utf-8")
+            + "\nagents:\n  tier: test\n  external_provider_consent: false\n",
+            encoding="utf-8",
+        )
+
+        main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "100000",
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(config_path),
+            ]
+        )
+
+        progress = load_progress(ws)
+        corpus = next(a for a in progress.actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert corpus.execution_status != ActionExecutionStatus.PENDING, (
+            "the corpus pass ran but progress still shows it PENDING, so the next "
+            "dispatcher run would execute it a second time and double the findings"
+        )
+        assert corpus.attempt_ids, "the dispatcher recorded no attempt for the corpus pass"
+
+
+class TestDispatchingAnAlreadyQueuedCorpusPass:
+    """The escape from a dead end where two correct guards contradicted each other.
+
+    A corpus pass that requires approval is appended by one command and can only
+    run once a human approves it. But the dispatcher's own advice was "approve it
+    and dispatch again", while re-running the plain command correctly refused --
+    it would have queued a second identical pass. There was no third command, so
+    an approval-gated corpus pass could never be run at all (found by live run
+    2026.08.01, invisible to the suite because nothing re-ran the command after a
+    refusal). ``--dispatch-queued`` is that third command.
+    """
+
+    def test_the_refusal_names_the_command_that_actually_dispatches(self, tmp_path: Path) -> None:
+        """A refusal that does not name the way forward is the dead end itself."""
+        from carmel.services.planner import append_corpus_pass_action
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+        append_corpus_pass_action(ws, budget_tokens=100_000, model_name="m")
+
+        with pytest.raises(ValueError) as excinfo:
+            append_corpus_pass_action(ws, budget_tokens=100_000, model_name="m")
+
+        assert "--dispatch-queued" in str(excinfo.value)
+        assert cid  # the campaign id is what the operator passes to that command
+
+    def test_dispatching_when_nothing_is_queued_is_a_typed_refusal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """'I ran nothing' must never be indistinguishable from 'I ran your pass'."""
+        from Carmel import main
+
+        cid, _ = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(["corpus-pass", "--campaign", cid, "--workspaces", str(tmp_path), "--dispatch-queued", "--dry-run"])
+
+        assert code == 1
+        assert "No corpus pass is queued" in capsys.readouterr().err
+
+    def test_a_budget_may_not_be_renamed_at_dispatch_time(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The approver agreed to a specific cap; running under another defeats that."""
+        from Carmel import main
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--dispatch-queued",
+                "--budget-tokens",
+                "999999",
+            ]
+        )
+
+        assert code == 1
+        assert "cannot be combined" in capsys.readouterr().err
+        assert ws  # nothing was appended under the rejected budget
+
+    def test_a_plain_run_still_requires_an_explicit_budget(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Making --budget-tokens optional for --dispatch-queued must not make it
+        optional for the append path, where it is the operator's authorisation."""
+        from Carmel import main
+
+        cid, _ = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(["corpus-pass", "--campaign", cid, "--workspaces", str(tmp_path), "--dry-run"])
+
+        assert code == 1
+        assert "--budget-tokens is required" in capsys.readouterr().err

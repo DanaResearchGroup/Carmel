@@ -8,14 +8,23 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from carmel.agents.models import estimate_worst_case_model_cost_usd
+from carmel.schemas.action_state import ActionExecutionStatus
 from carmel.schemas.approval import ActionKind, ApprovalPolicy, ApprovalRequirement
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.plan import Plan, PlannedAction
 from carmel.services.approvals import evaluate_action, load_policy
 from carmel.services.artifacts import read_json, write_json, write_text
 from carmel.services.authorization import ExecutionEnvelope, decide_requirement
-from carmel.services.plan_progress import init_progress
+from carmel.services.plan_progress import (
+    append_action_to_progress_locked,
+    init_progress,
+    load_or_init_progress,
+    load_progress,
+    save_progress,
+)
 from carmel.services.spend import compute_spend
+from carmel.services.state_machine import workspace_lock
 
 PLAN_JSON_NAME = "plan.json"
 PLAN_MD_NAME = "plan.md"
@@ -344,6 +353,193 @@ def plan_and_save(workspace_root: Path, campaign: Campaign, *, include_literatur
     save_plan(workspace_root, plan)
     init_progress(workspace_root, plan)
     return plan
+
+
+def append_corpus_pass_action(
+    workspace_root: Path,
+    *,
+    budget_tokens: int,
+    model_name: str | None = None,
+    rationale: str = "",
+    reread_all: bool = False,
+) -> PlannedAction:
+    """Append a corpus-pass action to the campaign's plan, on operator command.
+
+    The second pass is a plan action rather than a standalone verb, because budget
+    reservation, the approval gate, per-action state and the append-only decision log
+    all hang off actions. A command that ran the agent outside the plan would create
+    a second, unsupervised way to spend money on model calls, bypassing the entire
+    safety envelope.
+
+    This does NOT reopen the infinite-cycle risk that kept a
+    ``LITERATURE_READY -> APPROVED_FOR_EXECUTION`` edge out of the state machine.
+    That risk came from an AUTOMATIC edge re-dispatching literature forever. Nothing
+    automatic creates this action -- a human does, once, deliberately, naming what it
+    may spend. The absent edge is preserved; supervision is gained.
+
+    Args:
+        workspace_root: The campaign workspace root.
+        budget_tokens: How many model tokens this pass may consume. Required and
+            explicit: the ledger bounds AUTONOMOUS spend, whereas an operator typing a
+            command with a number in it is AUTHORISED spend, and the two should not be
+            conflated. Note this means there is no campaign-lifetime hard stop --
+            cumulative consumption across passes is reported, not enforced.
+
+            Tokens rather than dollars because tokens are what the run consumes and
+            what the provider meters. A dollar ceiling puts a pricing table between
+            the number the operator typed and the quantity that actually binds, so a
+            stale price moves the real limit without anyone editing it.
+        model_name: Model the pass will run against, used ONLY to derive the reported
+            dollar estimate. ``None`` records an estimate of 0.0, which reads as
+            "unknown", never as "free".
+        rationale: Optional operator note recorded on the action.
+
+    Returns:
+        The appended action.
+
+    Raises:
+        ValueError: If ``budget_tokens`` is not positive, or if the resulting plan
+            would not be executable.
+    """
+    if budget_tokens <= 0:
+        raise ValueError(f"budget_tokens must be positive, got {budget_tokens!r}")
+
+    # ONE lock across the whole read-modify-write of BOTH files (spar round 7, P1).
+    # The plan was previously loaded, edited and saved outside any lock while progress
+    # took its own lock internally, so two concurrent appends could each read the same
+    # plan and the second save would drop the first operator's action -- while progress
+    # kept both, leaving the two files describing different plans. Holding the lock for
+    # the whole sequence also closes the window in which progress had been written and
+    # the plan had not.
+    with workspace_lock(workspace_root):
+        return _append_corpus_pass_action_locked(workspace_root, budget_tokens, model_name, rationale, reread_all)
+
+
+def _append_corpus_pass_action_locked(
+    workspace_root: Path, budget_tokens: int, model_name: str | None, rationale: str, reread_all: bool = False
+) -> PlannedAction:
+    """Body of :func:`append_corpus_pass_action`, with the workspace lock held."""
+    plan = load_plan(workspace_root)
+
+    # Refuse a second corpus pass while one is still queued (spar round 8, P1).
+    # Appending happens before the run, and the run can legitimately not reach the new
+    # action -- the dispatcher executes the plan's next action, which may be an earlier
+    # one. An operator who retries the command then appends another pass every time,
+    # silently queueing N identical passes that will each eventually run and each add
+    # their findings to the accumulated report. Checking inside the lock makes the
+    # refusal race-safe against a concurrent append.
+    # load_or_init_progress, NOT load_progress: a Phase-1 workspace may hold a plan
+    # and no plan_progress.json at all (the file raised FileNotFoundError, which the
+    # CLI then reported as "Campaign has no plan yet" -- the opposite of true), and a
+    # progress file left over from a DIFFERENT plan would have been inspected as
+    # though it described this one, silently misaligning the index this function is
+    # about to insert at. Neither it nor init_progress takes the workspace lock, so
+    # calling it here is safe: the lock is NOT re-entrant.
+    progress = load_or_init_progress(workspace_root, plan)
+    pending = [
+        state
+        for state in progress.actions
+        if state.kind == ActionKind.LITERATURE_CORPUS_PASS and state.execution_status == ActionExecutionStatus.PENDING
+    ]
+    if pending:
+        # Name the command that dispatches it. Without that the two guards contradict
+        # each other -- the dispatcher tells an operator to "approve it and dispatch
+        # again", and this one refuses the only command they have -- which left an
+        # approval-requiring corpus pass with no way to run at all (found by live run
+        # 2026.08.01).
+        raise ValueError(
+            f"a corpus pass is already queued and has not run yet "
+            f"(action {pending[0].action_id}). Dispatch that one rather than adding "
+            f"another; re-running this command would queue a second identical pass. "
+            f"Run it with: carmel corpus-pass --campaign <id> --dispatch-queued"
+        )
+
+    action = PlannedAction(
+        action_id=str(uuid4()),
+        kind=ActionKind.LITERATURE_CORPUS_PASS,
+        description="Literature corpus pass — ground findings in the papers already held",
+        estimated_cpu_hours=0.0,
+        estimated_cost=0.0,
+        estimated_tokens=budget_tokens,
+        # DERIVED and reported, never enforced: `_apply_action_budget` binds
+        # `estimated_tokens`. Recording the estimate next to the cap is what lets an
+        # operator see what a token number costs without letting a price move the cap.
+        estimated_spend_usd=(
+            estimate_worst_case_model_cost_usd(model_name, budget_tokens) if model_name is not None else 0.0
+        ),
+        blocking=False,
+        rationale=rationale
+        or (
+            "Operator-appended second pass over the acquired corpus. Reads the "
+            "evidence store only: no search, no fetching."
+        ),
+        # Provisional. Re-evaluated against the campaign's policy below -- a hardcoded
+        # AUTO_APPROVED here is what let a corpus pass bypass the approval gate.
+        approval_requirement=ApprovalRequirement.AUTO_APPROVED,
+        # Carried on the action, not passed at dispatch: the operator authorised THIS
+        # pass to re-read, and the action is the record of what they authorised.
+        parameters={"reread_all": True} if reread_all else {},
+    )
+    # Run the SAME policy gate the search action goes through. Without this,
+    # `require_approval_for_literature: true` and `auto_approve_literature_under_usd`
+    # were silently inert for corpus passes: an operator who had configured their
+    # campaign to hold every literature action for review got one that ran
+    # immediately, having set the exact option meant to prevent it. The corpus pass is
+    # also the MORE expensive of the two -- it is the one an operator names a budget
+    # for -- so it was the wrong one to exempt.
+    #
+    # An unknown cost fails CLOSED. `estimated_spend_usd` is 0.0 when no model is
+    # configured, and 0.0 is below every threshold, so "we cannot price this" would
+    # otherwise read to the policy as "this is free".
+    if action.estimated_spend_usd <= 0:
+        action = action.model_copy(update={"approval_requirement": ApprovalRequirement.REQUIRES_APPROVAL})
+    else:
+        action = action.model_copy(
+            update={"approval_requirement": evaluate_action(action, load_policy(workspace_root))}
+        )
+
+    # Inserted BEFORE the T3 run rather than at the end of the plan. `save_plan`
+    # requires T3_RUN to be the last executable action, and appending past it would
+    # make the plan unsaveable -- but the ordering is also the honest one: findings
+    # from the corpus are context for the T3 run, so they belong ahead of it.
+    actions = list(plan.actions)
+    t3_index = next((i for i, a in enumerate(actions) if a.kind == ActionKind.T3_RUN), None)
+    at = len(actions) if t3_index is None else t3_index
+    actions.insert(at, action)
+
+    new_plan = plan.model_copy(update={"actions": actions})
+
+    # Validate the plan BEFORE writing anything (F15). The workspace lock excludes
+    # concurrent writers; it does not make two writes one. `save_plan` re-runs
+    # `validate_plan_shape` and raises on a shape it will not persist, and
+    # discovering that AFTER progress has been written leaves progress permanently
+    # naming an action the plan does not contain -- which every later
+    # `execute_next_action` refuses with UnsupportedActionKindError. There is no
+    # repair path short of hand-editing: `load_or_init_progress` re-initialises only
+    # when `plan_id` differs, and this copy preserves it.
+    #
+    # Function-level import for the same reason `save_plan` uses one: the dispatcher
+    # imports this module.
+    from carmel.services.dispatcher import validate_plan_shape
+
+    problems = validate_plan_shape(new_plan)
+    if problems:
+        raise ValueError("appending this corpus pass would make the plan unexecutable: " + "; ".join(problems))
+
+    # Progress first: it is the component that can legitimately REFUSE (an insertion
+    # behind the cursor would never run). Saving the plan first would leave the plan
+    # naming an action that progress does not know about.
+    progress_before = load_progress(workspace_root)
+    append_action_to_progress_locked(workspace_root, action, index=at)
+    try:
+        save_plan(workspace_root, new_plan)
+    except Exception:
+        # Validation above rules out the shape failures; what remains is I/O (a full
+        # disk, a permission change mid-write). Put progress back rather than leaving
+        # the workspace in the un-dispatchable state described above.
+        save_progress(workspace_root, progress_before)
+        raise
+    return action
 
 
 def plan_and_save_arc(

@@ -320,7 +320,7 @@ class TestPlan:
         assert len(p.actions) == 1
 
     def test_schema_version_defaults_to_current(self) -> None:
-        assert PLAN_SCHEMA_VERSION == 2
+        assert PLAN_SCHEMA_VERSION == 3
         action = PlannedAction(
             action_id="a1",
             kind=ActionKind.T3_RUN,

@@ -15,7 +15,26 @@ class ActionKind(StrEnum):
     T3_RUN = "t3_run"
     ARC_RUN = "arc_run"
     EXPERIMENT = "experiment"  # reserved for future
-    LITERATURE_SEARCH = "literature_search"  # reserved for future
+    LITERATURE_SEARCH = "literature_search"
+    LITERATURE_CORPUS_PASS = "literature_corpus_pass"
+    """Re-read the papers the workspace already holds and ground findings in them.
+
+    A distinct kind rather than a flag on ``LITERATURE_SEARCH`` because the two differ
+    in what they are permitted to do -- one may reach the network and spend on
+    fetches, the other may not -- and that is exactly the sort of thing the approval
+    and authorization layers key off. A flag would make the permitted behaviour
+    invisible to every reader that switches on kind.
+    """
+
+
+#: Every kind that executes as a literature run. Defined here, beside the enum, because
+#: several layers must agree on it: the dispatcher routes on it, and crash recovery uses
+#: it to decide which lock vouches for a live attempt and which finished action satisfies
+#: a pending post-transition. When it lived as a private set in one module, the others
+#: hard-coded ``LITERATURE_SEARCH`` and silently excluded the corpus pass (spar round 7).
+LITERATURE_ACTION_KINDS: frozenset[ActionKind] = frozenset(
+    {ActionKind.LITERATURE_SEARCH, ActionKind.LITERATURE_CORPUS_PASS}
+)
 
 
 class ApprovalRequirement(StrEnum):

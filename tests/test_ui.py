@@ -2209,7 +2209,7 @@ class TestDashboardAgenticCards:
         from datetime import datetime
 
         from carmel.agents.budget import BudgetUsage
-        from carmel.schemas.literature import LiteratureReport, StopReason
+        from carmel.schemas.literature import LiteratureReport, PassRecord, StopReason
         from carmel.services.campaigns import find_campaign_workspace
 
         cid = _create_via_form(client)
@@ -2218,11 +2218,16 @@ class TestDashboardAgenticCards:
         report = LiteratureReport(
             report_id="rep1",
             campaign_id=cid,
-            action_id="lit1",
-            run_id="run1",
             created_at=datetime.now(UTC),
-            stop_reason=StopReason.SELF_TERMINATED,
-            usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+            passes=[
+                PassRecord(
+                    run_id="run1",
+                    action_id="lit1",
+                    created_at=datetime.now(UTC),
+                    stop_reason=StopReason.SELF_TERMINATED,
+                    usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+                )
+            ],
         )
         (ws / "literature_report.json").write_text(report.model_dump_json())
 
@@ -2231,6 +2236,81 @@ class TestDashboardAgenticCards:
         assert response.status_code == 200
         assert b"Literature report" in response.data
         assert b"self_terminated" in response.data
+
+    def test_dashboard_scopes_per_pass_counts_to_the_latest_pass(
+        self, client: FlaskClient, workspaces_root: Path
+    ) -> None:
+        """F13. The panel must not attribute earlier passes' work to the latest one.
+
+        Schema v2 accumulates, but ``run_id``/``stop_reason``/``warnings`` describe
+        only the newest pass. Rendering accumulated totals under that heading made a
+        barren pass look productive -- exactly the signal an operator needs to see,
+        because a pass that grounded nothing is the one saying the corpus is
+        exhausted or the prompt is wrong. No test rendered a multi-pass report.
+        """
+        from datetime import datetime
+
+        from carmel.agents.budget import BudgetUsage
+        from carmel.schemas.literature import (
+            GroundingStatus,
+            GroundingVerdict,
+            LiteraturePassMode,
+            LiteratureReport,
+            PassRecord,
+            QueryRecord,
+            RejectedFinding,
+            StopReason,
+        )
+        from carmel.services.campaigns import find_campaign_workspace
+
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(workspaces_root, cid)
+        assert ws is not None
+        usage = BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0)
+
+        def _pass(run_id: str, mode: LiteraturePassMode) -> PassRecord:
+            return PassRecord(
+                run_id=run_id,
+                action_id=f"act-{run_id}",
+                created_at=datetime.now(UTC),
+                mode=mode,
+                stop_reason=StopReason.SELF_TERMINATED,
+                usage=usage,
+            )
+
+        def _rejection(finding_id: str, run_id: str) -> RejectedFinding:
+            return RejectedFinding(
+                finding_id=finding_id,
+                run_id=run_id,
+                action_id=f"act-{run_id}",
+                grounding=GroundingVerdict(status=GroundingStatus.SPANS_MISSING, grounded=False, match_ratio=0.0),
+                reason="quote not found in the artifact",
+            )
+
+        # An earlier SEARCH pass that did real work, then a barren CORPUS pass.
+        report = LiteratureReport(
+            report_id="rep-multi",
+            campaign_id=cid,
+            created_at=datetime.now(UTC),
+            passes=[_pass("run-old", LiteraturePassMode.SEARCH), _pass("run-new", LiteraturePassMode.CORPUS)],
+            queries=[
+                QueryRecord(text="syngas ignition delay", run_id="run-old", action_id="act-run-old"),
+                QueryRecord(text="hydrogen laminar flame speed", run_id="run-old", action_id="act-run-old"),
+            ],
+            rejected=[_rejection("rej-1", "run-old"), _rejection("rej-2", "run-old")],
+        )
+        (ws / "literature_report.json").write_text(report.model_dump_json())
+
+        body = client.get(f"/campaigns/{cid}").get_data(as_text=True)
+
+        assert "run-new" in body  # the latest pass identifies the panel
+        # The latest pass did nothing; its own row must say so rather than
+        # borrowing the search pass's two queries and two rejections.
+        this_pass = body.split("This pass")[1].split("</dd>")[0]
+        assert "0 grounded" in this_pass and "0 rejected" in this_pass and "0 queries" in this_pass
+        # The accumulated totals are still shown, but labelled as spanning passes.
+        accumulated = body.split("pass(es)")[1].split("</dd>")[0]
+        assert "2 rejected" in accumulated and "2 queries" in accumulated
 
     def test_dashboard_shows_progress_state_mismatch_warning(self, client: FlaskClient, workspaces_root: Path) -> None:
         from carmel.schemas import ActionExecutionStatus, ActionOutcome

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -250,6 +251,133 @@ class TestVerifyArtifact:
         raw_path.write_bytes(b"corrupted!!")
 
         assert verify_artifact(tmp_path, stored.sha256) is False
+
+
+class TestTheExtractedSidecarIsVerifiedToo:
+    """``raw.bin`` was content-addressed and re-hashed on every read; the sidecar was
+    not checked at all -- and the sidecar is the file the grounding gate reads.
+
+    Not a tamper defence: anyone who can write into the store can rewrite meta.json
+    and the report beside it. It closes the non-adversarial case that actually
+    happens -- a sidecar truncated by a full disk or an interrupted write, which can
+    still parse as valid JSON while holding only part of the document.
+    """
+
+    def test_a_stored_artifact_records_its_sidecar_digest(self, tmp_path: Path) -> None:
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+
+        extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+        assert stored.extracted_sha256 == hashlib.sha256(extracted_path.read_bytes()).hexdigest(), (
+            "the recorded digest must describe the bytes actually written to disk"
+        )
+
+    def test_an_artifact_with_unreadable_meta_is_not_reported_as_verified(self, tmp_path: Path) -> None:
+        """Copilot review. "Could not check" must not read as "intact".
+
+        Without ``meta.json`` there is no recorded ``extracted_sha256``, so whether
+        this artifact ever had a verifiable sidecar is unknown -- and the grounding
+        gate quotes from ``extracted.json``. Returning True here reported a check that
+        could not run as a check that passed: the same assertion-for-observation
+        conflation already fixed twice on the acquisition side.
+        """
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        assert verify_artifact(tmp_path, stored.sha256) is True
+
+        (artifact_dir(tmp_path, stored.sha256) / "meta.json").write_text("{not json", encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256) is False
+
+    def test_a_legacy_artifact_with_no_recorded_sidecar_digest_still_verifies(self, tmp_path: Path) -> None:
+        """Failing closed on unreadable meta must not fail closed on OLD meta.
+
+        An artifact stored before ``extracted_sha256`` existed has READABLE metadata
+        that simply records no sidecar digest. That is a known, benign state -- not an
+        unknown one -- so it still verifies on ``raw.bin`` alone.
+        """
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        del payload["extracted_sha256"]
+        meta_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256) is True
+
+    def test_a_truncated_sidecar_that_still_parses_is_refused(self, tmp_path: Path) -> None:
+        """The failure this exists for. Truncation that breaks JSON was already caught
+        by the parse check; truncation that leaves VALID JSON was not, and that is the
+        one that silently grounds quotes against a fragment of the document."""
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path,
+            data=data,
+            artifact=_artifact(data),
+            extracted=_extracted("the full text of the paper, all of it"),
+            max_bytes=MAX_BYTES,
+        )
+        extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+
+        # Still valid JSON, still a valid ExtractedText -- just not the whole document.
+        payload = json.loads(extracted_path.read_text(encoding="utf-8"))
+        payload["text"] = "the full text"
+        extracted_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        assert ExtractedText.model_validate(json.loads(extracted_path.read_text(encoding="utf-8")))
+
+        assert verify_artifact(tmp_path, stored.sha256) is False, (
+            "a sidecar that parses but no longer matches its digest must not verify"
+        )
+
+    def test_raw_bytes_intact_is_not_enough_on_its_own(self, tmp_path: Path) -> None:
+        """Guards against a fix that checks the sidecar only when raw.bin is damaged.
+        raw.bin is untouched here; the sidecar alone diverges."""
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        raw_path = artifact_dir(tmp_path, stored.sha256) / "raw.bin"
+        extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+
+        extracted_path.write_text(
+            json.dumps(
+                {
+                    "text": "different",
+                    "normalized": "different",
+                    "sections": [],
+                    "extractor": "pdf:pypdf",
+                    "lossy": False,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        assert hashlib.sha256(raw_path.read_bytes()).hexdigest() == stored.sha256, "raw.bin must be untouched"
+        assert verify_artifact(tmp_path, stored.sha256) is False
+
+    def test_an_artifact_stored_before_the_digest_existed_still_verifies(self, tmp_path: Path) -> None:
+        """Backward compatibility, and the direction that matters. ``None`` means "this
+        predates the field", NOT "corrupt". Refusing these would make every previously
+        stored paper unreadable -- discarding good evidence to enforce a check that
+        could not have run when it was written."""
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        del payload["extracted_sha256"]
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256) is True
 
 
 class TestCorruptionDetectionAndRepair:

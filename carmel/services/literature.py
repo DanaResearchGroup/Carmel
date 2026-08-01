@@ -42,10 +42,12 @@ from carmel.agents.budget import (
     session_budget,
 )
 from carmel.agents.literature_agent import (
+    CorpusProposal,
     LiteratureProposal,
     ProposedFinding,
     RequestedPaper,
     VerifierAssessment,
+    build_corpus_agent,
     build_literature_agent,
     build_verifier_agent,
 )
@@ -81,13 +83,17 @@ from carmel.logger import get_logger
 from carmel.schemas.acquisition import AcquisitionReason
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
+    CURRENT_REPORT_SCHEMA_VERSION,
     STOP_REASON_FOR_DIMENSION,
     CredenceVerdict,
     EvidenceRef,
     GroundingStatus,
     GroundingVerdict,
     LiteratureFinding,
+    LiteraturePassMode,
     LiteratureReport,
+    PassRecord,
+    QueryRecord,
     RejectedFinding,
     SpeciesRef,
     StopReason,
@@ -96,10 +102,15 @@ from carmel.schemas.literature import (
 from carmel.schemas.plan import PlannedAction
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services import chem
-from carmel.services.acquisition import collect_inbox, record_request
+from carmel.services.acquisition import collect_inbox, host_is_admissible, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
-from carmel.services.evidence import store_artifact
+from carmel.services.evidence import (
+    list_artifacts_with_unreadable,
+    load_artifact_text,
+    store_artifact,
+    verify_artifact,
+)
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
     DEFAULT_LOCK_GRACE_S,
@@ -121,6 +132,10 @@ VERIFIER_EVIDENCE_WINDOW = 600
 
 #: Credence ceiling applied when any species failed canonicalization.
 NON_CANONICAL_CREDENCE_CAP = 0.7
+
+#: Why a corpus finding naming a document Carmel does not hold is refused. Stated
+#: once so the report's ``reason`` text and the grounding verdict cannot drift apart.
+_UNHELD_ARTIFACT_REASON = "the agent named a document that is not in this workspace's evidence store"
 
 #: Max queries actually executed (and recorded in ``report.queries``/provenance) per
 #: Literature Agent round. Anything beyond this is dropped -- loudly, via a warning
@@ -152,6 +167,8 @@ __all__ = [
     "LiteratureRunLockedError",
     "build_deps",
     "load_literature_report",
+    "migrate_report_payload",
+    "run_corpus_pass",
     "run_literature_research",
     "run_record_for",
     "save_literature_report",
@@ -185,7 +202,137 @@ def load_literature_report(workspace_root: Path) -> LiteratureReport:
     Raises:
         FileNotFoundError: If no report has been saved for this workspace yet.
     """
-    return LiteratureReport.model_validate(read_json(workspace_root / LITERATURE_REPORT_NAME))
+    return LiteratureReport.model_validate(migrate_report_payload(read_json(workspace_root / LITERATURE_REPORT_NAME)))
+
+
+class ReportSchemaTooNewError(ValueError):
+    """A persisted report was written by a NEWER Carmel than this one.
+
+    A distinct type so the dispatcher can turn it into a clean, actionable refusal
+    ("upgrade Carmel") instead of a generic handler crash, while genuine corruption --
+    which also raises ValueError -- keeps failing loudly (spar round 8, P2).
+    """
+
+
+def migrate_report_payload(payload: object) -> object:
+    """Bring a persisted report payload up to the current schema version.
+
+    v1 held exactly one run, with that run's identifiers and outcome at the top
+    level. v2 accumulates passes, so the migration lifts those top-level fields into
+    a single :class:`PassRecord` and stamps every finding, rejection and query with
+    that run's identity -- the attribution was always true of a v1 report, it simply
+    had nowhere to be written down.
+
+    v3 adds ``covered_sha256`` to each pass, so a corpus pass can skip documents an
+    earlier pass already mined. Nothing can be reconstructed for an older report --
+    what a v1/v2 pass covered was never written down -- so migrated passes carry an
+    empty list, which reads as "not recorded" and makes the first v3 pass re-read
+    the corpus once. That is the conservative direction: re-reading costs tokens,
+    while inventing coverage would silently skip documents nobody has mined.
+
+    This is a CHAIN, applied step by step from the payload's own version. It used to
+    be a single branch that ran the v1 lift for ANY version below current, which was
+    correct only while current was 2: at v3 a v2 payload would have been fed through
+    the v1 lift, whose `pop("run_id")` finds nothing and whose rebuilt `passes` would
+    have overwritten the real ones (the review flagged this as latent).
+
+    A live campaign already holds a v1 report on disk (the first real run), and it
+    contains the only existing evidence that the grounding gate refuses ungrounded
+    claims. Migrating rather than discarding is therefore not a courtesy to old
+    files; it preserves the demonstration.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    version = int(payload.get("schema_version", 1))
+    if version > CURRENT_REPORT_SCHEMA_VERSION:
+        # Fail closed on a report from the FUTURE (spar round 7, P2). Passing it
+        # through unmigrated hands it to a validator that does not know the fields it
+        # carries, and `extra="forbid"` would reject it with a schema error naming a
+        # field the operator has never heard of. Worse, a future version that only
+        # ADDED optional fields would validate cleanly and silently drop them on the
+        # next write -- a newer Carmel's report quietly downgraded by an older one.
+        raise ReportSchemaTooNewError(
+            f"literature report is schema version {version}, but this Carmel understands "
+            f"at most {CURRENT_REPORT_SCHEMA_VERSION}. Upgrade Carmel rather than letting "
+            f"an older version rewrite (and silently truncate) a newer report."
+        )
+    if version == CURRENT_REPORT_SCHEMA_VERSION:
+        return payload
+
+    migrated = dict(payload)
+    if version < 2:
+        migrated = _migrate_v1_to_v2(migrated)
+    if version < 3:
+        migrated = _migrate_v2_to_v3(migrated)
+    # Not a literal. This produces whatever the CURRENT schema is, so hardcoding the
+    # number means the next version bump silently stamps migrated reports with a
+    # stale version -- and the `version == CURRENT` early return above then treats
+    # them as already migrated.
+    migrated["schema_version"] = CURRENT_REPORT_SCHEMA_VERSION
+    return migrated
+
+
+def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    """Lift v1's single flat run into a one-element ``passes`` list."""
+    migrated = dict(payload)
+    run_id = str(migrated.pop("run_id", "") or "")
+    action_id = str(migrated.pop("action_id", "") or "")
+    created_at = migrated.get("created_at")
+    pass_record: dict[str, Any] = {
+        "run_id": run_id,
+        "action_id": action_id,
+        "created_at": created_at,
+        "mode": LiteraturePassMode.SEARCH.value,
+        "model_name": migrated.pop("model_name", ""),
+        "stop_reason": migrated.pop("stop_reason", StopReason.ERROR.value),
+        "usage": migrated.pop("usage", None),
+        "warnings": migrated.pop("warnings", []),
+    }
+    migrated["passes"] = [pass_record]
+    migrated["queries"] = [
+        {"text": q, "run_id": run_id, "action_id": action_id} for q in migrated.get("queries", []) if q
+    ]
+    for key in ("findings", "rejected"):
+        items = migrated.get(key) or []
+        migrated[key] = [
+            {**item, "run_id": item.get("run_id") or run_id, "action_id": item.get("action_id") or action_id}
+            if isinstance(item, dict)
+            else item
+            for item in items
+        ]
+    return migrated
+
+
+def _migrate_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
+    """Give every pass an explicit empty ``covered_sha256``.
+
+    The field defaults to empty anyway, so this changes no value. It is written
+    out because a migration that silently relies on a default is indistinguishable
+    from a migration step somebody forgot to write, and the next bump has to be able
+    to tell those apart.
+    """
+    migrated = dict(payload)
+    passes = migrated.get("passes")
+    if isinstance(passes, list):
+        migrated["passes"] = [
+            {**p, "covered_sha256": p.get("covered_sha256", [])} if isinstance(p, dict) else p for p in passes
+        ]
+    return migrated
+
+
+def _load_previous_report(workspace_root: Path) -> LiteratureReport | None:
+    """The report this run will append to, or None on the first pass.
+
+    Deliberately called BEFORE the run does any work. If an existing report cannot
+    be read, the correct outcome is to refuse to start -- discovering it afterwards
+    would leave a finished run holding results it can only persist by overwriting
+    the record it failed to parse, which is how accumulated evidence gets destroyed
+    by an error handler.
+    """
+    try:
+        return load_literature_report(workspace_root)
+    except FileNotFoundError:
+        return None
 
 
 class LiteratureRunLockedError(RuntimeError):
@@ -679,6 +826,18 @@ class _RunState:
     parsing warning text."""
     acquisition_slugs: list[str] = field(default_factory=list)
     """Slugs queued for manual acquisition during this run, for the run summary."""
+    covered: list[str] = field(default_factory=list)
+    """Artifact shas this pass actually READ, whether or not they yielded a finding.
+
+    Appended BEFORE the model call, not after: a document the budget cut short was
+    still paid for and partially processed, and recording it only on success would
+    make the next pass re-read exactly the documents that already proved expensive."""
+
+    def query_records(self, pass_record: PassRecord) -> list[QueryRecord]:
+        """This run's executed queries, attributed to the pass that ran them."""
+        return [
+            QueryRecord(text=text, run_id=pass_record.run_id, action_id=pass_record.action_id) for text in self.queries
+        ]
 
 
 def _process_finding(
@@ -698,13 +857,54 @@ def _process_finding(
     Order is the design: fetch -> extract -> store -> ground, and ONLY a grounded
     finding is ever shown to the Verifier.
     """
-    finding_id = uuid.uuid4().hex
     url = proposed.source_url
 
     if url not in artifact_cache:
         artifact_cache[url] = _fetch_and_store(workspace_root, url, deps, config=config, state=state)
     cached = artifact_cache[url]
     stored, extracted = cached if cached is not None else (None, None)
+    _ground_and_record(
+        workspace_root,
+        proposed,
+        deps,
+        config=config,
+        state=state,
+        stored=stored,
+        extracted=extracted,
+        log_path=log_path,
+        action_id=action_id,
+        run_id=run_id,
+        queue_acquisition=True,
+    )
+
+
+def _ground_and_record(
+    workspace_root: Path,
+    proposed: ProposedFinding,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    stored: StoredArtifact | None,
+    extracted: ExtractedText | None,
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+    queue_acquisition: bool,
+) -> None:
+    """Ground one proposed finding against resolved bytes; verify and record it only
+    if it survives.
+
+    Shared by both passes, and deliberately so: a corpus finding must clear exactly
+    the same gate as a fetched one. The only difference between the two callers is
+    how the artifact was resolved -- fetched from a URL, or looked up in the store --
+    and that difference is settled before this function is entered.
+
+    ``queue_acquisition`` is False for a corpus pass. There, a failed grounding means
+    the quote is not in a document Carmel already holds, so asking a human to go and
+    obtain that same document would be nonsense.
+    """
+    finding_id = uuid.uuid4().hex
     if stored is not None and all(a.sha256 != stored.sha256 for a in state.artifacts):
         state.artifacts.append(stored)
 
@@ -716,10 +916,13 @@ def _process_finding(
     )
     if not verdict.grounded or stored is None or extracted is None:
         reason = "; ".join(verdict.reasons) or f"grounding failed with status {verdict.status.value}"
-        _maybe_queue_acquisition(workspace_root, proposed, verdict=verdict, state=state)
+        if queue_acquisition:
+            _maybe_queue_acquisition(workspace_root, proposed, verdict=verdict, state=state)
         state.rejected.append(
             RejectedFinding(
                 finding_id=finding_id,
+                run_id=run_id,
+                action_id=action_id,
                 category=proposed.payload.category,
                 citation_title=proposed.citation.title,
                 grounding=verdict,
@@ -743,12 +946,14 @@ def _process_finding(
     proposed, canonical_ok = _canonicalize_payload(proposed)
 
     verifier = build_verifier_agent(model=deps.verifier_model, ledger=deps.ledger)
+    verifier_prompt = _verifier_prompt(
+        proposed,
+        evidence_window=evidence_window,
+        grounding_dict=verdict.model_dump(mode="json"),
+    )
     result = verifier.run(
-        _verifier_prompt(
-            proposed,
-            evidence_window=evidence_window,
-            grounding_dict=verdict.model_dump(mode="json"),
-        )
+        verifier_prompt,
+        estimated_tokens=estimated_tokens_for(verifier_prompt),
     )
     assessment = VerifierAssessment.model_validate(result.output)
 
@@ -770,6 +975,8 @@ def _process_finding(
     state.findings.append(
         LiteratureFinding(
             finding_id=finding_id,
+            run_id=run_id,
+            action_id=action_id,
             payload=proposed.payload,
             citation=proposed.citation,
             verbatim_quote=proposed.verbatim_quote,
@@ -882,6 +1089,13 @@ def _attempt_oa_fetch(
             not a per-candidate outcome.
     """
     host = urlsplit(url).hostname or url
+    if not host_is_admissible(url, config.additional_admissible_hosts):
+        # An OA index advertised this URL, which is not the same as vouching for it.
+        return (
+            None,
+            AcquisitionReason.HOST_NOT_ADMISSIBLE,
+            f"{host} is not on the admissible-source list",
+        )
     try:
         artifact, data = deps.fetch.fetch(url)
     except FetchError as exc:
@@ -1136,6 +1350,19 @@ def _fetch_and_store(
     campaign ``5b766b4b-bf72-4db9-bb28-4229b037bf07`` shows what that produces (see
     :func:`_validate_document`'s docstring for the observed artifacts).
     """
+    if not host_is_admissible(url, config.additional_admissible_hosts):
+        # Refused BEFORE the fetch: an inadmissible host is never contacted, so a
+        # poisoned search result cannot even be told which campaign is reading it.
+        host = urlsplit(url).hostname or url
+        state.warnings.append(
+            f"not auto-admitted from {host}: not a recognised publisher, repository or "
+            f"resolver. Queued for manual acquisition instead."
+        )
+        state.fetch_failures[url] = (
+            AcquisitionReason.HOST_NOT_ADMISSIBLE,
+            f"host {host!r} is not on the admissible-source list",
+        )
+        return None
     try:
         artifact, data = deps.fetch.fetch(url)
     except FetchError as exc:
@@ -1195,8 +1422,12 @@ def _research_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
+    already_covered: frozenset[str] = frozenset(),
 ) -> None:
     """The bounded propose->ground->verify loop. Mutates ``state`` in place."""
+    # A search pass discovers documents rather than re-reading held ones, so prior
+    # corpus coverage says nothing about what it should fetch.
+    del already_covered
     # No live search tool is handed to the agent: the deterministic round-trip below is the
     # *only* path that ever calls ``deps.search.search``. Handing the agent its own live
     # search tool as well would let it re-query out-of-band, double-billing a real provider
@@ -1220,7 +1451,7 @@ def _research_loop(
             search_results=search_results,
             reported_keys=[f"{src} :: {quote[:80]}" for src, quote in sorted(seen_keys)],
         )
-        result = literature.run(prompt)
+        result = literature.run(prompt, estimated_tokens=estimated_tokens_for(prompt))
         proposal = LiteratureProposal.model_validate(result.output)
 
         # Truncate FIRST: only queries we actually execute get recorded into
@@ -1307,6 +1538,317 @@ def _research_loop(
             return
 
 
+def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, ExtractedText]], list[str]]:
+    """Every held artifact paired with its extracted text, and the shas that were not.
+
+    An artifact whose text cannot be loaded is skipped: it cannot be quoted from, so
+    including it in the listing would only invite the agent to propose a finding that
+    the gate must then reject.
+
+    The skipped shas are RETURNED rather than dropped (spar round 7, P2). A pass that
+    silently reads 6 of 8 held papers and reports nothing looks exactly like a pass
+    that read all 8 and found nothing, and the two call for opposite responses -- fix
+    the corrupt sidecar, or accept that the corpus is exhausted. Coverage the operator
+    cannot see is coverage they will assume.
+
+    "Skipped" therefore spans all three ways a held document can go unread: an
+    unreadable ``meta.json`` (which never yields a StoredArtifact at all), a failed
+    digest verification, and missing extracted text.
+
+    Every artifact is VERIFIED against its digest before it is read (spar round 8). The
+    search pass fetches and extracts in the same breath, so its text is necessarily
+    fresh; a corpus pass re-reads sidecars of arbitrary age, which is the one place
+    where "the gate runs against content-addressed bytes" can quietly stop being true.
+    :func:`verify_artifact` re-hashes ``raw.bin`` and refuses the artifact if the stored
+    bytes no longer match the directory naming them.
+
+    What this does NOT prove, stated plainly rather than left implied: ``extracted.json``
+    is a DERIVED cache, and verifying ``raw.bin`` does not establish that the cache was
+    derived from those bytes. Someone able to rewrite the sidecar in place could still
+    present text that the raw bytes do not contain. Closing that would mean re-extracting
+    every document on every pass, and it buys little here -- anyone who can write into
+    the evidence store can equally rewrite the report, so this is not a privilege
+    boundary. The realistic failure this DOES catch is the non-adversarial one: bytes
+    truncated by a full disk or an interrupted write.
+    """
+    corpus: list[tuple[StoredArtifact, ExtractedText]] = []
+    # An artifact directory with no readable meta.json never becomes a StoredArtifact,
+    # so it cannot be skipped by the loop below -- it would vanish from the corpus AND
+    # from the coverage this function reports. Seed the skipped list with those (F11).
+    artifacts, skipped = list_artifacts_with_unreadable(workspace_root)
+    for artifact in artifacts:
+        try:
+            intact = verify_artifact(workspace_root, artifact.sha256)
+        except ValueError:
+            intact = False
+        if not intact:
+            logger.warning("evidence store: %s failed digest verification and was not read", artifact.sha256)
+            skipped.append(artifact.sha256)
+            continue
+        extracted = load_artifact_text(workspace_root, artifact.sha256)
+        if extracted is None:
+            skipped.append(artifact.sha256)
+        else:
+            corpus.append((artifact, extracted))
+    return corpus, skipped
+
+
+#: Characters per token, used to size a budget reservation from a prompt.
+#:
+#: Deliberately conservative (real English is ~4 chars/token, and the technical text and
+#: chemical formulae in these prompts tokenise WORSE than English, not better). Under-
+#: reserving is the dangerous direction: the ledger checks the reservation BEFORE the
+#: call, so a reservation smaller than the true cost lets a run sail past the operator's
+#: ceiling and only discover it when settling, after the money is spent.
+_CHARS_PER_TOKEN = 3
+#: Headroom for the model's own response, which the prompt length cannot predict.
+_RESPONSE_TOKEN_ALLOWANCE = 4000
+
+
+def estimated_tokens_for(prompt: str) -> int:
+    """Size a budget reservation from the prompt actually being sent.
+
+    The bridge defaults to a flat 8000-token reservation, which was fine for a short
+    search prompt and badly wrong for a corpus prompt that embeds an entire paper: a
+    single document ran ~25k tokens on the live corpus, so the reservation understated
+    the real call by roughly three times. That matters more now that tokens are the
+    operator's authorisation unit, because the reservation IS the enforcement point --
+    an understated one means the cap does not bind until after the call that breached
+    it.
+
+    Args:
+        prompt: The prompt about to be sent.
+
+    Returns:
+        A conservative worst-case token estimate, never below the bridge default.
+    """
+    return max(8000, len(prompt) // _CHARS_PER_TOKEN + _RESPONSE_TOKEN_ALLOWANCE)
+
+
+def _corpus_prompt(campaign: Campaign, artifact: StoredArtifact, extracted: ExtractedText) -> str:
+    """Present ONE held document to the agent, whole.
+
+    Takes a single document rather than a sequence, and the signature is the point.
+    It previously accepted the whole corpus, which invited exactly the call this
+    design exists to avoid: handing all 8 papers of the live syngas campaign over in
+    one 116k-token prompt produced ZERO proposed findings, where the same papers one
+    at a time produced findings. A ``Sequence`` parameter with one caller passing a
+    one-element list documents an option that measurement has already refuted.
+
+    The document is included in full rather than summarized or chunked. A finding
+    requires a quote copied character-for-character out of the source, so anything
+    the agent is not shown verbatim, it cannot ground a finding in -- and a summary
+    would actively invite paraphrase, which the gate then rejects.
+    """
+    corpus = [(artifact, extracted)]
+    blocks = []
+    for artifact, extracted in corpus:
+        blocks.append(
+            f"--- DOCUMENT {artifact.sha256} "
+            f"(provenance: {artifact.provenance.value}, source: {artifact.source_url}) ---\n"
+            f"{extracted.text}\n--- END DOCUMENT {artifact.sha256} ---"
+        )
+    documents = "\n\n".join(blocks)
+    return (
+        f"{_campaign_context(campaign)}\n\n"
+        f"You hold {len(corpus)} document(s). Extract every finding relevant to this "
+        f"campaign that is supported by a verbatim quote from one of them, and set "
+        f"`artifact_sha256` to the digest in that document's header.\n\n"
+        f"{documents}"
+    )
+
+
+def _corpus_loop(
+    workspace_root: Path,
+    campaign: Campaign,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+    already_covered: frozenset[str] = frozenset(),
+) -> None:
+    """The corpus-only pass: read what is held, propose, ground, verify.
+
+    Documents in ``already_covered`` are SKIPPED. Without that, every pass re-read
+    the whole store: five passes over a corpus growing 8->40 papers is 120 document
+    reads to mine 40 papers, and the prompt for a given document is byte-identical
+    between passes (it carries no prior findings and no pass number), so the repeat
+    asks the same question and pays again for the same answer.
+
+    Cost is the smaller half. Because the corpus is presented in a deliberately
+    stable order and a pass stops when the token budget runs out, an unscoped pass
+    always re-read the same prefix and stopped -- so under a fixed budget, papers
+    acquired later were never reached at all, and the operator saw a completed pass
+    rather than an unread tail (F14).
+
+    ONE MODEL CALL PER DOCUMENT, not one call holding the whole corpus. This is not a
+    stylistic choice -- it was measured. Handing the model all 8 papers of the live
+    syngas campaign in a single 116k-token prompt produced ZERO proposed findings;
+    handing it one of those same papers alone produced two, from the same prompt and
+    the same model. A corpus large enough to be worth re-reading is large enough to
+    bury the instruction to quote from it.
+
+    Per-document calls also make partial work survivable: exhausting the budget on
+    document six keeps the findings from documents one to five, where a single call
+    would have lost everything.
+
+    No repeated rounds per document. The search loop iterates because search results
+    are only fed back on the NEXT round, so a finding is impossible in round one;
+    here the document is in front of the agent immediately, and a second round would
+    re-read identical input at full cost.
+    """
+    corpus, skipped = _load_corpus(workspace_root)
+    if already_covered:
+        before = len(corpus)
+        corpus = [(a, e) for a, e in corpus if a.sha256 not in already_covered]
+        n_skipped = before - len(corpus)
+        if n_skipped:
+            state.warnings.append(
+                f"{n_skipped} document(s) already mined by an earlier pass were not re-read; "
+                f"{len(corpus)} new document(s) in this pass"
+            )
+            append_typed_event(
+                log_path,
+                event="literature.corpus_already_covered",
+                action_id=action_id,
+                run_id=run_id,
+                payload={"n_skipped": n_skipped, "n_new": len(corpus)},
+            )
+    if skipped:
+        state.warnings.append(
+            f"{len(skipped)} held artifact(s) could not be read and were NOT covered by this pass: "
+            + ", ".join(sha[:12] for sha in skipped)
+        )
+        append_typed_event(
+            log_path,
+            event="literature.corpus_artifacts_unreadable",
+            action_id=action_id,
+            run_id=run_id,
+            payload={"sha256": skipped, "n_skipped": len(skipped)},
+        )
+    if not corpus:
+        state.stop_reason = StopReason.NO_NEW_INFORMATION
+        # Distinguish the two, because they call for opposite responses: acquire
+        # papers, versus stop paying for passes over a corpus already mined.
+        state.warnings.append(
+            "every held document has already been mined by an earlier pass; nothing new to read"
+            if already_covered
+            else "the evidence store holds no readable artifacts, so there was nothing to read"
+        )
+        return
+
+    agent = build_corpus_agent(model=deps.model, ledger=deps.ledger)
+    for artifact, extracted in corpus:
+        deps.ledger.check_wall_clock()
+        # Only the document actually shown is resolvable. The agent is looking at one
+        # paper, so a digest naming any other is a mistake worth surfacing, even when
+        # that other paper happens to be in the store.
+        by_sha = {artifact.sha256: (artifact, extracted)}
+        corpus_prompt = _corpus_prompt(campaign, artifact, extracted)
+        result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
+        # Recorded once the call has RETURNED, which is the moment the tokens are
+        # definitely spent -- not before it is attempted. Both halves matter:
+        #
+        #   * After the call, so a document whose reservation the ledger REFUSED is
+        #     not marked covered. Recording it first meant a budget-truncated pass
+        #     silently dropped the document it stopped on: nothing was paid for it,
+        #     it was never read, and every later pass skipped it while reporting
+        #     "every held document has already been mined". Observed live
+        #     2026.08.01 -- 8 documents recorded as covered by 7 model calls.
+        #   * Before the proposal is processed, so a document that WAS paid for and
+        #     then failed downstream (grounding, validation) is not re-bought. That
+        #     is the case the original ordering was reaching for, and it is kept.
+        state.covered.append(artifact.sha256)
+        proposal = CorpusProposal.model_validate(result.output)
+        append_typed_event(
+            log_path,
+            event="literature.corpus_pass_proposed",
+            action_id=action_id,
+            run_id=run_id,
+            payload={"sha256": artifact.sha256, "n_proposed": len(proposal.findings)},
+        )
+        _process_corpus_proposal(
+            workspace_root,
+            proposal,
+            deps,
+            config=config,
+            state=state,
+            by_sha=by_sha,
+            log_path=log_path,
+            action_id=action_id,
+            run_id=run_id,
+        )
+
+
+def _process_corpus_proposal(
+    workspace_root: Path,
+    proposal: CorpusProposal,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    state: _RunState,
+    by_sha: dict[str, tuple[StoredArtifact, ExtractedText]],
+    log_path: Path,
+    action_id: str,
+    run_id: str,
+) -> None:
+    """Ground every finding one document's proposal claimed."""
+    seen: set[tuple[str, str]] = set()
+    for proposed in proposal.findings:
+        resolved = by_sha.get(proposed.artifact_sha256)
+        if resolved is None:
+            # The agent named a document that is not in the corpus it was shown. The
+            # sha256 pattern already rejects a malformed handle, so this is a
+            # well-formed digest for something Carmel does not hold -- recorded as a
+            # rejection rather than dropped, because a reader of the report must be
+            # able to see that the agent claimed evidence which does not exist.
+            state.rejected.append(
+                RejectedFinding(
+                    finding_id=uuid.uuid4().hex,
+                    run_id=run_id,
+                    action_id=action_id,
+                    category=proposed.payload.category,
+                    citation_title=proposed.citation.title,
+                    grounding=GroundingVerdict(
+                        status=GroundingStatus.NO_ARTIFACT,
+                        grounded=False,
+                        match_ratio=0.0,
+                        reasons=[_UNHELD_ARTIFACT_REASON],
+                    ),
+                    reason=f"{_UNHELD_ARTIFACT_REASON}: {proposed.artifact_sha256}",
+                )
+            )
+            continue
+
+        artifact, extracted = resolved
+        key = (proposed.artifact_sha256, proposed.verbatim_quote.strip()[:200])
+        if key in seen:
+            continue
+        seen.add(key)
+
+        _ground_and_record(
+            workspace_root,
+            ProposedFinding(
+                payload=proposed.payload,
+                citation=proposed.citation,
+                verbatim_quote=proposed.verbatim_quote,
+                source_url=artifact.source_url,
+            ),
+            deps,
+            config=config,
+            state=state,
+            stored=artifact,
+            extracted=extracted,
+            log_path=log_path,
+            action_id=action_id,
+            run_id=run_id,
+            queue_acquisition=False,
+        )
+
+
 def _collect_manual_acquisitions(
     workspace_root: Path,
     *,
@@ -1326,10 +1868,12 @@ def _collect_manual_acquisitions(
     mis-filed PDF would otherwise attach one paper's bytes to another paper's citation
     and quietly corrupt the evidence chain.
 
-    NOTE: admission makes the document available in the evidence store with
-    :attr:`ArtifactProvenance.MANUAL`; it does not yet re-run grounding to extract
-    findings from it. That further step is not wired, and the operator-visible warning
-    below deliberately says only what actually happened.
+    Admission makes the document available in the evidence store with
+    :attr:`ArtifactProvenance.MANUAL`. It does not, by itself, extract any finding
+    from that document: grounding runs against the corpus in a separate pass
+    (:func:`run_corpus_pass`), which an operator appends deliberately. The
+    operator-visible warning below therefore says only that the paper was admitted,
+    which is all that has happened at this point.
 
     A failure here must never take down the run: an unreadable inbox is an operator
     problem to be reported, not a reason to lose a literature search.
@@ -1357,6 +1901,49 @@ def _collect_manual_acquisitions(
     )
 
 
+def _report_with_pass(
+    previous: LiteratureReport | None,
+    *,
+    pass_record: PassRecord,
+    state: _RunState,
+    report_id: str,
+    campaign_id: str,
+    created_at: datetime,
+) -> LiteratureReport:
+    """Fold one finished pass into the campaign's accumulated literature report.
+
+    Artifacts are deduplicated by ``sha256`` because the evidence store is
+    content-addressed: the same paper re-encountered in a later pass is the same
+    bytes, and listing it twice would overstate how much evidence the campaign
+    holds. Findings and rejections are NOT deduplicated -- two passes reaching the
+    same conclusion independently is a real signal, and each carries its own
+    ``run_id`` so a reader can see that is what happened.
+    """
+    if previous is None:
+        return LiteratureReport(
+            report_id=report_id,
+            campaign_id=campaign_id,
+            created_at=created_at,
+            passes=[pass_record],
+            queries=state.query_records(pass_record),
+            artifacts=list(state.artifacts),
+            findings=list(state.findings),
+            rejected=list(state.rejected),
+        )
+
+    seen = {artifact.sha256 for artifact in previous.artifacts}
+    artifacts = list(previous.artifacts) + [a for a in state.artifacts if a.sha256 not in seen]
+    return previous.model_copy(
+        update={
+            "passes": [*previous.passes, pass_record],
+            "queries": [*previous.queries, *state.query_records(pass_record)],
+            "artifacts": artifacts,
+            "findings": [*previous.findings, *state.findings],
+            "rejected": [*previous.rejected, *state.rejected],
+        }
+    )
+
+
 def run_literature_research(
     workspace_root: Path,
     campaign: Campaign,
@@ -1376,6 +1963,60 @@ def run_literature_research(
     Raises:
         LiteratureRunLockedError: If another literature run holds the workspace lock.
     """
+    return _run_pass(workspace_root, campaign, action, deps, config=config, mode=LiteraturePassMode.SEARCH)
+
+
+def run_corpus_pass(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+) -> LiteratureReport:
+    """Re-read the papers this workspace already holds and ground findings in them.
+
+    The second pass. Carmel could previously acquire a paper and never use it: manual
+    admission stored an identity-checked document and stopped, and the state machine
+    has no edge back into a literature run, so a completed action could not re-run.
+    This closes that gap.
+
+    Reads the evidence store ONLY. No search, no fetching, no acquisition requests.
+    That is a deliberate restriction rather than a missing feature:
+
+    - **Reproducibility.** The input is a fixed set of sha256-addressed files, so a
+      reviewer re-running a benchmark gets the same input every time. A live search
+      cannot offer that.
+    - **Isolating what is under test.** This pass is the first time the deterministic
+      grounding gate runs against real downloaded bytes. Adding search would inject
+      fresh cost and nondeterminism into the very step being validated.
+
+    It cannot discover a finding that needs a paper not yet acquired. That is
+    accepted: discovery is what the search pass and the acquisition queue already do.
+
+    Raises:
+        LiteratureRunLockedError: If another literature run holds the workspace lock.
+    """
+    return _run_pass(workspace_root, campaign, action, deps, config=config, mode=LiteraturePassMode.CORPUS)
+
+
+def _run_pass(
+    workspace_root: Path,
+    campaign: Campaign,
+    action: PlannedAction,
+    deps: LiteratureDeps,
+    *,
+    config: AgentConfig,
+    mode: LiteraturePassMode,
+) -> LiteratureReport:
+    """Shared scaffolding for one pass of either mode.
+
+    The run lock, the budget-to-stop-reason mapping, the decision-log events and the
+    fold into the accumulated report are identical for both, and must stay identical:
+    a corpus pass that could bypass the lock, or that mapped budget exhaustion to a
+    crash instead of a partial report, would be a second and weaker safety envelope.
+    Only the loop in the middle differs.
+    """
     workspace_root = Path(workspace_root)
     run_id = uuid.uuid4().hex
     report_id = uuid.uuid4().hex
@@ -1390,23 +2031,33 @@ def run_literature_research(
         log_path=log_path,
     )
     try:
+        previous = _load_previous_report(workspace_root)
         state = _RunState(queries=[], artifacts=[], findings=[], rejected=[], warnings=[])
         append_typed_event(
             log_path,
             event="literature.search_started",
             action_id=action.action_id,
             run_id=run_id,
-            payload={"campaign_id": campaign.campaign_id, "model_name": deps.model.name},
+            payload={"campaign_id": campaign.campaign_id, "model_name": deps.model.name, "mode": mode.value},
         )
         _collect_manual_acquisitions(
             workspace_root, config=config, state=state, log_path=log_path, action_id=action.action_id, run_id=run_id
         )
 
+        # What earlier passes already mined. `reread_all` is the operator's escape
+        # hatch: coverage is recorded per document, so re-reading is otherwise never
+        # automatic, and a changed prompt or a newer model is a real reason to want it.
+        reread_all = bool(action.parameters.get("reread_all", False))
+        already_covered: frozenset[str] = frozenset()
+        if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
+            already_covered = frozenset(sha for record in previous.passes for sha in record.covered_sha256)
+
         slot_acquired = False
         try:
             session_budget().acquire_run_slot(config.budget.max_concurrent_runs)
             slot_acquired = True
-            _research_loop(
+            loop = _corpus_loop if mode == LiteraturePassMode.CORPUS else _research_loop
+            loop(
                 workspace_root,
                 campaign,
                 deps,
@@ -1415,6 +2066,7 @@ def run_literature_research(
                 log_path=log_path,
                 action_id=action.action_id,
                 run_id=run_id,
+                already_covered=already_covered,
             )
         except BudgetExceededError as exc:
             state.stop_reason = STOP_REASON_FOR_DIMENSION[exc.dimension]
@@ -1439,20 +2091,23 @@ def run_literature_research(
             if slot_acquired:
                 session_budget().release_run_slot()
 
-        report = LiteratureReport(
+        report = _report_with_pass(
+            previous,
+            pass_record=PassRecord(
+                run_id=run_id,
+                action_id=action.action_id,
+                created_at=created_at,
+                mode=mode,
+                model_name=deps.model.name,
+                stop_reason=state.stop_reason,
+                usage=deps.ledger.usage(),
+                warnings=state.warnings,
+                covered_sha256=list(state.covered),
+            ),
+            state=state,
             report_id=report_id,
             campaign_id=campaign.campaign_id,
-            action_id=action.action_id,
-            run_id=run_id,
             created_at=created_at,
-            queries=state.queries,
-            artifacts=state.artifacts,
-            findings=state.findings,
-            rejected=state.rejected,
-            stop_reason=state.stop_reason,
-            model_name=deps.model.name,
-            usage=deps.ledger.usage(),
-            warnings=state.warnings,
         )
         save_literature_report(workspace_root, report)
         append_typed_event(
@@ -1461,14 +2116,17 @@ def run_literature_research(
             action_id=action.action_id,
             run_id=run_id,
             payload={
-                "stop_reason": report.stop_reason.value,
-                "n_findings": len(report.findings),
-                "n_rejected": len(report.rejected),
+                "stop_reason": state.stop_reason.value,
+                "n_findings": len(state.findings),
+                "n_rejected": len(state.rejected),
             },
         )
+        # Counts describe THIS run, not the campaign's accumulated total. The report
+        # now spans every pass, so reading them off ``report`` would silently restate
+        # earlier passes' work as this one's each time a new pass is appended.
         grounding_summary: dict[str, int] = {}
-        for status in [f.grounding.status.value for f in report.findings] + [
-            r.grounding.status.value for r in report.rejected
+        for status in [f.grounding.status.value for f in state.findings] + [
+            r.grounding.status.value for r in state.rejected
         ]:
             grounding_summary[status] = grounding_summary.get(status, 0) + 1
         record_agent_provenance(
@@ -1482,12 +2140,12 @@ def run_literature_research(
                 "model_name": deps.model.name,
                 "provider": config.provider.value,
                 "tier": config.tier.value,
-                "queries": report.queries,
-                "artifacts": [a.sha256 for a in report.artifacts],
-                "usage": report.usage.model_dump(mode="json"),
-                "stop_reason": report.stop_reason.value,
-                "n_findings": len(report.findings),
-                "n_rejected": len(report.rejected),
+                "queries": list(state.queries),
+                "artifacts": [a.sha256 for a in state.artifacts],
+                "usage": deps.ledger.usage().model_dump(mode="json"),
+                "stop_reason": state.stop_reason.value,
+                "n_findings": len(state.findings),
+                "n_rejected": len(state.rejected),
                 "grounding_summary": grounding_summary,
                 "created_at": created_at.isoformat(),
             },

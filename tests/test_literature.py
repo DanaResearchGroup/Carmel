@@ -20,7 +20,7 @@ from pydantic import BaseModel
 
 import carmel.services.literature
 from carmel.agents.bridge import AgentTool, ModelResponse
-from carmel.agents.budget import BudgetLedger, session_budget
+from carmel.agents.budget import BudgetExceededError, BudgetLedger, BudgetUsage, session_budget
 from carmel.agents.literature_agent import (
     LITERATURE_SYSTEM_PROMPT,
     VERIFIER_SYSTEM_PROMPT,
@@ -29,7 +29,8 @@ from carmel.agents.literature_agent import (
 )
 from carmel.agents.models import AgentBridgeError, MockModel
 from carmel.agents.tools.academic import OaResolution, OpenAccessResolver
-from carmel.agents.tools.fetch import FetchError, HttpFetchTool, MockFetchTool
+from carmel.agents.tools.extract import extract_text
+from carmel.agents.tools.fetch import FetchedArtifact, FetchError, HttpFetchTool, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
 from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
 from carmel.schemas import (
@@ -48,13 +49,19 @@ from carmel.schemas import (
 )
 from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
-from carmel.schemas.literature import GroundingStatus, LiteratureReport, StopReason
+from carmel.schemas.literature import (
+    ArtifactProvenance,
+    GroundingStatus,
+    LiteraturePassMode,
+    LiteratureReport,
+    StopReason,
+)
 from carmel.services import chem
 from carmel.services import literature as literature_module
 from carmel.services.acquisition import inbox_dir, load_manifest, record_request
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
-from carmel.services.evidence import EVIDENCE_LITERATURE_DIR
+from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
 from carmel.services.literature import (
     LITERATURE_REPORT_NAME,
     LOCK_GRACE_S,
@@ -64,13 +71,17 @@ from carmel.services.literature import (
     LiteratureRunLockedError,
     build_deps,
     load_literature_report,
+    run_corpus_pass,
     run_literature_research,
     run_record_for,
 )
 from carmel.services.plan_progress import publish_lock_info
 
 DOI = "10.1000/test.doi"
-SOURCE_URL = "https://example.com/papers/secret-paper-url"
+# An admissible host: production refuses to auto-admit documents from hosts
+# that are not recognised publishers/repositories/resolvers, so a fixture on
+# example.com would exercise the refusal rather than the path under test.
+SOURCE_URL = "https://arxiv.org/pdf/2401.00001v1"
 
 #: Title used for manual-acquisition drops; long enough that the identity check has
 #: real signal to match on rather than a couple of common words.
@@ -263,7 +274,8 @@ class TestHappyPath:
         assert finding.credence.credence == pytest.approx(0.9)
         assert finding.payload.species[0].canonicalized is True  # type: ignore[union-attr]
         assert report.rejected == []
-        assert report.queries == ["oxygen ignition delay shock tube"]
+        assert [q.text for q in report.queries] == ["oxygen ignition delay shock tube"]
+        assert [q.run_id for q in report.queries] == [report.run_id]
         assert report.model_name == model.name
 
     def test_report_persisted_and_artifact_stored(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -542,7 +554,7 @@ class TestLoopTermination:
 
         report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
-        assert report.queries == many_queries[:MAX_QUERIES_PER_ROUND]
+        assert [q.text for q in report.queries] == many_queries[:MAX_QUERIES_PER_ROUND]
         assert any("dropped" in w and str(len(many_queries) - MAX_QUERIES_PER_ROUND) in w for w in report.warnings)
         events = read_events(campaign.workspace_root / "decision_log.jsonl")
         truncated = [e for e in events if e["event"] == "literature.queries_truncated"]
@@ -919,7 +931,7 @@ class TestSearchTransportFailure:
         assert report.stop_reason == StopReason.ERROR
         assert len(report.findings) == 1, "round 1's finding must survive round 2's search failure"
         assert any("search failed" in warning for warning in report.warnings)
-        assert "q1" in report.queries
+        assert "q1" in [q.text for q in report.queries]
 
 
 class TestCredencePenalties:
@@ -1440,7 +1452,7 @@ class TestWantedPaperOpenAccessResolution:
         assert not any(e["event"] == "literature.paper_requested" for e in events)
 
     def test_candidates_are_tried_in_order_until_one_succeeds(self, campaign: Campaign) -> None:
-        second = "https://repo.example/green.pdf"
+        second = "https://zenodo.org/records/1/files/green.pdf"
         resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
         fetch = _RoutedFetchTool(ok={second: (DOC.encode(), "text/plain")}, statuses={OA_PDF_URL: 404})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
@@ -1472,6 +1484,46 @@ class TestWantedPaperOpenAccessResolution:
         assert requested[0]["oa_attempts"] == [OA_PDF_URL]
         assert requested[0]["reason"] == "paywalled"
 
+    def test_an_oa_candidate_on_an_unrecognised_host_is_never_fetched(self, campaign: Campaign) -> None:
+        """F18. An OA index advertising a URL is not the same as vouching for it.
+
+        The identity gate confirms a document IS the cited work by finding the title
+        and DOI outside its reference list -- which a document that merely PRINTS
+        another paper's title and DOI also satisfies. Rather than tighten that gate on
+        a threshold calibrated against eight documents, keep documents of unknown
+        provenance out of the store.
+        """
+        hostile = "https://evil.example.net/looks-like-a-paper.pdf"
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(hostile,), note="1 candidate")})
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
+        fetched: list[str] = []
+
+        class _RecordingFetch:
+            def fetch(self, url: str) -> tuple[object, bytes]:
+                fetched.append(url)
+                raise AssertionError(f"an inadmissible host was contacted: {url}")
+
+        deps.fetch = _RecordingFetch()  # type: ignore[assignment]
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert fetched == [], "the host was contacted before being refused"
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.HOST_NOT_ADMISSIBLE]
+        # Queued, not dropped: the human-gated path runs its own identity check.
+        assert requests[0].status == AcquisitionStatus.REQUESTED
+
+    def test_an_operator_can_admit_an_extra_host(self, campaign: Campaign) -> None:
+        """The extension point an institutional proxy or lab mirror needs."""
+        from carmel.services.acquisition import host_is_admissible
+
+        url = "https://proxy.my-university.edu/paper.pdf"
+        assert not host_is_admissible(url)
+        assert host_is_admissible(url, ["proxy.my-university.edu"])
+        # Subdomains of an admitted host are admitted; lookalike suffixes are not.
+        assert host_is_admissible("https://a.b.proxy.my-university.edu/p.pdf", ["proxy.my-university.edu"])
+        assert not host_is_admissible("https://proxy.my-university.edu.evil.net/p.pdf", ["proxy.my-university.edu"])
+
     def test_a_404_on_the_oa_copy_is_queued_as_fetch_failed_not_paywalled(self, campaign: Campaign) -> None:
         resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
@@ -1486,7 +1538,7 @@ class TestWantedPaperOpenAccessResolution:
     def test_an_observed_paywall_wins_over_an_earlier_broken_link(self, campaign: Campaign) -> None:
         """403 is the reason the operator can act on (a subscription): if ANY candidate
         observed one, that is the request's reason, not whichever failure came first."""
-        second = "https://pubs.example/vor.pdf"
+        second = "https://arxiv.org/pdf/2401.00002v1"
         resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _RoutedFetchTool(ok={}, statuses={OA_PDF_URL: 404, second: 403})
@@ -1680,3 +1732,880 @@ class TestWantedPaperOpenAccessResolution:
         requests = load_manifest(campaign.workspace_root).requests
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
         assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
+
+
+class TestReportSchemaVersionGate:
+    """Spar round 7, P2. The migration accepted any ``schema_version >= 2`` unchanged.
+
+    A report from a FUTURE Carmel would then be handed to a validator that does not
+    know its fields. Either it fails with a schema error naming a field the operator
+    has never heard of, or -- worse, if the newer version only added optional fields --
+    it validates cleanly and the next write silently drops them, downgrading a newer
+    report in place. Refuse it instead and say what to do.
+    """
+
+    def test_a_future_schema_version_is_refused(self) -> None:
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        # Relative to the current version, so a bump does not turn this into a test
+        # that the CURRENT version is refused.
+        future = CURRENT_REPORT_SCHEMA_VERSION + 1
+        with pytest.raises(ValueError, match=f"schema version {future}"):
+            migrate_report_payload({"schema_version": future, "report_id": "r1"})
+
+    def test_the_current_version_passes_through_untouched(self) -> None:
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        payload = {"schema_version": CURRENT_REPORT_SCHEMA_VERSION, "report_id": "r1"}
+
+        assert migrate_report_payload(payload) is payload
+
+    def test_a_v1_report_is_still_migrated(self) -> None:
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        migrated = migrate_report_payload({"schema_version": 1, "run_id": "r", "action_id": "a", "queries": []})
+
+        assert isinstance(migrated, dict)
+        assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION
+        assert len(migrated["passes"]) == 1
+
+
+class TestReportAccumulatesAcrossPasses:
+    """Decision 0004/D1: one report per campaign, appended to, with every finding and
+    query carrying the pass that produced it."""
+
+    def test_a_v1_report_migrates_into_a_single_search_pass(self, campaign: Campaign) -> None:
+        """A v1 report predates the notion of a pass, but its attribution was always
+        true -- it simply had nowhere to be written down. Migration must recover it
+        rather than discard the record, because the existing live report holds the
+        only evidence that the grounding gate refuses ungrounded claims."""
+        v1 = {
+            "schema_version": 1,
+            "report_id": "rep1",
+            "campaign_id": campaign.campaign_id,
+            "action_id": "act-1",
+            "run_id": "run-1",
+            "created_at": datetime.now(UTC).isoformat(),
+            "queries": ["syngas ignition delay"],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+            "stop_reason": StopReason.SELF_TERMINATED.value,
+            "model_name": "mock",
+            "usage": BudgetUsage(
+                model_calls=2, tokens=12238, cost_usd=0.048843, fetches=6, fetch_bytes=772351, elapsed_s=127.5
+            ).model_dump(mode="json"),
+            "warnings": ["a warning worth keeping"],
+        }
+        (campaign.workspace_root / "literature_report.json").write_text(json.dumps(v1))
+
+        report = load_literature_report(campaign.workspace_root)
+
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+
+        assert report.schema_version == CURRENT_REPORT_SCHEMA_VERSION
+        assert len(report.passes) == 1
+        assert report.passes[0].mode == LiteraturePassMode.SEARCH
+        # v1 recorded no coverage, so the migration must not invent any -- an empty
+        # list reads as "not recorded" and makes the next corpus pass re-read once,
+        # which is the conservative direction.
+        assert report.passes[0].covered_sha256 == []
+        assert report.run_id == "run-1"
+        assert report.action_id == "act-1"
+        assert report.stop_reason == StopReason.SELF_TERMINATED
+        assert report.warnings == ["a warning worth keeping"]
+        assert report.usage.cost_usd == pytest.approx(0.048843)
+        assert [(q.text, q.run_id, q.action_id) for q in report.queries] == [
+            ("syngas ignition delay", "run-1", "act-1")
+        ]
+
+    def test_a_second_pass_appends_and_never_destroys_the_first(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reason overwriting is forbidden: the first pass's rejections are the
+        record of the safety design working. A second pass must not erase them."""
+        deps, _, config = _make_deps([_proposal(queries=["first query"], done=True)])
+        first = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+        first_run_id = first.run_id
+        n_first_rejected = len(first.rejected)
+
+        deps2, _, config2 = _make_deps([_proposal(queries=["second query"], done=True)])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        second = run_literature_research(campaign.workspace_root, campaign, second_action, deps2, config=config2)
+
+        assert len(second.passes) == 2
+        assert [p.run_id for p in second.passes] == [first_run_id, second.run_id]
+        assert second.run_id != first_run_id
+        assert len(second.rejected) >= n_first_rejected, "the first pass's rejections must survive"
+        assert [q.text for q in second.queries] == ["first query", "second query"]
+        assert [q.run_id for q in second.queries] == [first_run_id, second.run_id]
+
+        reloaded = load_literature_report(campaign.workspace_root)
+        assert len(reloaded.passes) == 2
+
+    def test_findings_carry_the_pass_that_produced_them(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Attribution lives on the finding, not on its position in a list, so it
+        survives any later reordering, filtering or merge."""
+        deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        produced = report.findings + report.rejected
+        assert produced, "the fixture must produce something to attribute"
+        assert all(item.run_id == report.run_id for item in produced)
+        assert all(item.action_id == "lit-a1" for item in produced)
+        assert report.findings_for(report.run_id) == report.findings
+        assert report.findings_for("a-run-that-never-happened") == []
+
+
+SECOND_QUOTE = "The measured ignition delay time was 3.40 ms at 900 K in the same shock tube."
+SECOND_DOI = "10.1000/second.doi"
+SECOND_DOC = (
+    "A second shock tube study of argon-diluted ignition\n"
+    "R. Jones and K. Lee (2021)\n"
+    f"doi: {SECOND_DOI}\n\n"
+    "Results\n\n"
+    f"{SECOND_QUOTE}\n"
+    "Further discussion here.\n"
+)
+
+
+def _store(workspace_root: Path, *, text: str, url: str) -> str:
+    """Put one document into the workspace's evidence store, as a real artifact."""
+    data = text.encode()
+    stored = store_artifact(
+        workspace_root,
+        data=data,
+        artifact=FetchedArtifact(
+            url=url,
+            final_url=url,
+            sha256=hashlib.sha256(data).hexdigest(),
+            content_type="text/plain",
+            n_bytes=len(data),
+            fetched_at=datetime.now(UTC),
+        ),
+        extracted=extract_text(data, "text/plain"),
+        provenance=ArtifactProvenance.MANUAL,
+        max_bytes=10_000_000,
+    )
+    return stored.sha256
+
+
+def _corpus_finding(
+    *, sha256: str, quote: str = QUOTE, doi: str = DOI, title: str = "A shock tube study of oxygen ignition"
+) -> dict[str, Any]:
+    return {
+        "payload": {
+            "category": "experimental_benchmark",
+            "reactor_type": "shock_tube",
+            "observable": "ignition_delay_time",
+            "observable_raw": "ignition delay time",
+            "species": [{"raw_name": "O2"}],
+            "measured": [{"value": 1.25, "unit": "ms"}],
+        },
+        "citation": {"title": title, "authors": ["J. Smith"], "year": 2020, "doi": doi},
+        "verbatim_quote": quote,
+        "artifact_sha256": sha256,
+    }
+
+
+def _corpus_proposal(findings: list[dict[str, Any]] | None = None, *, done: bool = True) -> dict[str, Any]:
+    return {"findings": findings or [], "done": done}
+
+
+class TestCorpusPass:
+    """The second pass: re-read what the workspace already holds.
+
+    Closes the gap where Carmel could acquire a paper and never use it, and is the
+    first time the deterministic grounding gate runs against real stored bytes.
+    """
+
+    def test_a_grounded_corpus_finding_lands_in_the_report(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.latest.mode == LiteraturePassMode.CORPUS
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        finding = report.findings[0]
+        assert finding.evidence.artifact_sha256 == sha
+        assert finding.grounding.grounded is True
+        assert finding.run_id == report.run_id
+
+    def test_the_pass_never_searches_and_never_fetches(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Reproducibility is the whole point: the input must be exactly the stored
+        bytes, so a corpus pass that quietly reached the network would defeat it."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        def _forbidden(*args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("a corpus pass reached the network")
+
+        monkeypatch.setattr(deps.search, "search", _forbidden)
+        monkeypatch.setattr(deps.fetch, "fetch", _forbidden)
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, "the pass must still work with the network forbidden"
+        assert deps.ledger.usage().fetches == 0
+        assert deps.ledger.usage().index_lookups == 0
+        assert report.queries == []
+
+    def test_a_quote_absent_from_the_named_document_is_rejected(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate running against real stored bytes, which is the thing this whole
+        increment exists to exercise."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        fabricated = "The measured ignition delay time was 9.99 ms at 2500 K under these conditions."
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha, quote=fabricated)])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.grounded is False
+
+    def test_quoting_one_document_while_naming_another_is_rejected(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The worst error available in corpus mode: real quote, real document, wrong
+        pairing. It would attach one paper's evidence to another paper's citation,
+        producing a finding that looks fully grounded and is entirely false."""
+        _patch_chem_success(monkeypatch)
+        sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        sha_two = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        assert sha_one != sha_two
+        # A verbatim quote from document TWO, attributed to document ONE. One
+        # proposal per document, since the pass makes one model call per document.
+        deps, _, config = _make_deps(
+            [
+                _corpus_proposal([_corpus_finding(sha256=sha_one, quote=SECOND_QUOTE)]),
+                _corpus_proposal([]),
+                _assessment(),
+            ]
+        )
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == [], "a quote from a different document must never ground"
+        assert len(report.rejected) == 1
+        # Pin the DEFENCE, not merely the refusal. Asserting a rejection alone also
+        # passes via NO_ARTIFACT -- a different mechanism entirely (the named sha is
+        # not held) -- so a regression that stopped checking the quote against the
+        # named document's bytes would still have shown green here.
+        assert report.rejected[0].grounding.status == GroundingStatus.QUOTE_NOT_FOUND
+
+    def test_a_finding_naming_an_unheld_document_is_rejected_not_dropped(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reader of the report must be able to see that the agent claimed evidence
+        which does not exist. Silently discarding it would hide that."""
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        absent = "0" * 64
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=absent)])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.status == GroundingStatus.NO_ARTIFACT
+        assert absent in report.rejected[0].reason
+
+    def test_an_unreadable_held_document_does_not_queue_an_acquisition(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The one rejection reason that DOES queue an acquisition in a search pass --
+        an artifact Carmel could not read -- must not do so here.
+
+        In a search pass, "unreadable" means the fetched copy was bad and a human with
+        a subscription might obtain a better one. In a corpus pass the document is
+        already in the workspace, so asking a human to go and get it is nonsense: the
+        remedy is mechanical re-extraction, not acquisition. Without this, a corpus
+        pass would refill the operator's queue with papers they already supplied.
+        """
+        _patch_chem_success(monkeypatch)
+        # Extraction that lost word spacing: real bytes, genuinely unreadable text.
+        run_together = "Mechanismandkineticsoftheisothermaloxidationofoxygeninshocktubesatelevatedpressure" * 40
+        sha = _store(campaign.workspace_root, text=run_together, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert len(report.rejected) == 1
+        assert report.rejected[0].grounding.status == GroundingStatus.ARTIFACT_UNREADABLE
+        assert load_manifest(campaign.workspace_root).requests == [], (
+            "a corpus pass must never queue acquisition for a paper the workspace already holds"
+        )
+
+    def test_a_held_artifact_that_cannot_be_read_is_named_in_the_warnings(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spar round 7, P2. An artifact whose text will not load is correctly skipped,
+        but skipping it silently makes a partial pass indistinguishable from a complete
+        one that found nothing -- and the two call for opposite responses.
+
+        Coverage the operator cannot see is coverage they will assume.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        broken = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/broken")
+        # Remove the text sidecars but KEEP meta.json: list_artifacts still yields the
+        # artifact (it is genuinely held), while load_artifact_text returns None. That
+        # is exactly the shape of a corrupt or half-written extraction, and the shape
+        # the pass must not paper over. Destroying meta.json is a DIFFERENT skip path
+        # (the artifact never enters the listing at all); the test below covers it.
+        for name in ("extracted.json", "text.txt"):
+            path = campaign.workspace_root / "evidence" / "literature" / broken / name
+            if path.exists():
+                path.unlink()
+        # No proposed findings, so the run needs no verifier response: this test is
+        # about coverage reporting, not about grounding.
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert any(broken[:12] in w for w in report.latest.warnings), (
+            f"the unreadable artifact was skipped without saying so: {report.latest.warnings}"
+        )
+        assert any("NOT covered" in w for w in report.latest.warnings)
+
+    def test_an_artifact_with_no_readable_meta_is_reported_as_uncovered_too(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F11. The quietest way for a held paper to disappear.
+
+        A directory whose ``meta.json`` will not parse never becomes a
+        ``StoredArtifact``, so it cannot be skipped by the corpus loader -- it was
+        missing from the corpus AND from the count of what the pass could not read.
+        That reads to an operator as complete coverage of a smaller store, which is
+        exactly the reading that makes a barren pass look conclusive.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        broken = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/nometa")
+        meta_path = campaign.workspace_root / "evidence" / "literature" / broken / "meta.json"
+        meta_path.write_text("{not json at all", encoding="utf-8")
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert any(broken[:12] in w for w in report.latest.warnings), (
+            f"an artifact with unreadable meta.json vanished silently: {report.latest.warnings}"
+        )
+        assert any("NOT covered" in w for w in report.latest.warnings)
+
+    def test_an_artifact_whose_bytes_no_longer_match_its_digest_is_not_read(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Spar round 8, P0. The search pass fetches and extracts in one breath, so its
+        text is necessarily fresh. A corpus pass re-reads sidecars of arbitrary age --
+        the one place where "the gate runs against content-addressed bytes" can quietly
+        stop being true.
+
+        Truncated raw bytes (a full disk, an interrupted write) no longer hash to the
+        directory naming them, and such an artifact must be refused and reported, not
+        silently grounded against.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        tampered = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/tampered")
+        raw = campaign.workspace_root / "evidence" / "literature" / tampered / "raw.bin"
+        raw.write_bytes(b"these are not the bytes this digest names")
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert any(tampered[:12] in w for w in report.latest.warnings), (
+            f"the artifact failed verification but was not reported: {report.latest.warnings}"
+        )
+        assert all(f.evidence.artifact_sha256 != tampered for f in report.findings), (
+            "a finding was grounded against bytes that do not match their digest"
+        )
+
+    def test_an_empty_corpus_stops_without_calling_the_model(self, campaign: Campaign) -> None:
+        """Nothing to read is an honest outcome, and must not cost a model call."""
+        deps, model, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+        assert report.findings == []
+        assert deps.ledger.usage().model_calls == 0
+        assert any("nothing to read" in w for w in report.latest.warnings)
+
+    def test_a_pass_records_every_document_it_read(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Coverage is per DOCUMENT, not per finding.
+
+        A document read and found barren produces nothing to attribute, and is
+        exactly the document a later pass must not pay to re-read -- so findings
+        cannot serve as the record of what was covered.
+        """
+        _patch_chem_success(monkeypatch)
+        first = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        second = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        # Both proposals empty: neither document yields a finding.
+        deps, _, config = _make_deps([_corpus_proposal([]), _corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert sorted(report.latest.covered_sha256) == sorted([first, second])
+
+    def test_a_second_pass_does_not_re_read_what_the_first_already_mined(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F14. The prompt for a document is byte-identical between passes, so a
+        re-read asks the same question and pays for the same answer twice."""
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        first_deps, _, first_config = _make_deps([_corpus_proposal([])])
+        first = run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
+        assert first_deps.ledger.usage().model_calls == 1
+        assert len(first.latest.covered_sha256) == 1
+
+        # A second pass with NO new documents must make no model call at all.
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        second = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 0, "the second pass re-read an already-mined document"
+        assert second.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+        assert any("already been mined" in w for w in second.latest.warnings)
+
+    def test_a_second_pass_reads_only_the_newly_acquired_document(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The starvation case: under a fixed budget an unscoped pass always re-read
+        the same stable-ordered prefix, so later papers were never reached."""
+        _patch_chem_success(monkeypatch)
+        old = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        first_deps, _, first_config = _make_deps([_corpus_proposal([])])
+        run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
+
+        new = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        report = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 1
+        assert report.latest.covered_sha256 == [new]
+        assert old not in report.latest.covered_sha256
+
+    def test_a_document_the_budget_refused_is_not_recorded_as_covered(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The document a truncated pass stops ON must stay readable.
+
+        Coverage used to be recorded BEFORE the model call, so a pass that ran out
+        of budget marked the document it never reached as covered: nothing was paid
+        for it, it was never read, and every later pass skipped it while reporting
+        that the whole corpus had been mined. Observed live 2026.08.01 -- a pass
+        recorded 8 documents covered using 7 model calls, and the next pass then
+        made zero calls and declared there was nothing new to read.
+
+        This is the F14 skip turned against itself: the optimisation that stops a
+        re-read is only safe if 'covered' means 'actually mined'.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        # One call is affordable; the second document's reservation is refused.
+        deps, _, config = _make_deps(
+            [_corpus_proposal([]), _corpus_proposal([])],
+            budget=AgentBudgetConfig(max_model_calls=1),
+        )
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 1
+        assert report.latest.stop_reason == StopReason.MAX_MODEL_CALLS
+        # The heart of it: one call read one document, so exactly one is covered.
+        assert len(report.latest.covered_sha256) == 1, (
+            f"a refused reservation was recorded as covered: {report.latest.covered_sha256}"
+        )
+
+        # And the refused document is still reachable -- not silently skipped forever.
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        second = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 1, "the unread document was skipped by the next pass"
+        assert len(second.latest.covered_sha256) == 1
+
+    def test_reread_all_overrides_the_scoping(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The operator's escape hatch: a changed model or prompt is a real reason."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        first_deps, _, first_config = _make_deps([_corpus_proposal([])])
+        run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
+
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        forced = _action().model_copy(update={"action_id": "lit-a2", "parameters": {"reread_all": True}})
+        report = run_corpus_pass(campaign.workspace_root, campaign, forced, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 1
+        assert report.latest.covered_sha256 == [sha]
+
+    def test_a_corpus_pass_appends_to_an_existing_search_report(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Decision 0004/D1 end to end: the second pass adds to the record rather
+        than replacing it, and the two passes are distinguishable by mode."""
+        _patch_chem_success(monkeypatch)
+        search_deps, _, search_config = _make_deps([_proposal(queries=["first query"], done=True)])
+        first = run_literature_research(campaign.workspace_root, campaign, _action(), search_deps, config=search_config)
+
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, second_action, deps, config=config)
+
+        assert [p.mode for p in report.passes] == [LiteraturePassMode.SEARCH, LiteraturePassMode.CORPUS]
+        assert [p.run_id for p in report.passes] == [first.run_id, report.run_id]
+        assert [q.text for q in report.queries] == ["first query"], "a corpus pass contributes no queries"
+        assert report.findings_for(report.run_id) == report.findings
+
+
+class TestTheDailyCapIsActuallyWired:
+    """The daily cost cap was configurable but unenforced in production.
+
+    ``build_deps`` defaults ``daily_ledger_path`` to ``None`` and ``BudgetLedger``
+    reads ``None`` as "no daily cap", skipping the check outright. The dispatcher --
+    the only production caller -- passed nothing, so every literature action ran with
+    ``daily_max_cost_usd`` silently inert. The bug was invisible precisely because
+    ``_apply_action_budget`` looks like it protects the daily ceiling: it carries the
+    path over when rebuilding the ledger, but it was carrying over ``None``.
+
+    This asserts the path reaches the ledger, which is the thing that was missing.
+    Asserting only that ``default_daily_ledger_path()`` returns a path would pass
+    against the broken code, since the resolver was never the problem.
+    """
+
+    def test_a_dispatched_literature_run_gets_a_daily_ledger_path(
+        self, monkeypatch: pytest.MonkeyPatch, campaign: Campaign
+    ) -> None:
+        """The load-bearing assertion: the path reaches ``build_deps`` on the real
+        dispatch path. Asserting only that the resolver returns a path would pass
+        against the broken code, because the resolver was never what was missing."""
+        from carmel.config import AgentConfig
+        from carmel.schemas.approval import ActionKind
+        from carmel.services import literature as literature_mod
+        from carmel.services.dispatcher import make_literature_handler
+
+        seen: dict[str, object] = {}
+
+        class _Stop(Exception):
+            pass
+
+        def _spy(config: object, *, daily_ledger_path: object = None) -> object:
+            seen["daily_ledger_path"] = daily_ledger_path
+            raise _Stop  # the wiring is all this test needs; do not build a real stack
+
+        monkeypatch.setattr(literature_mod, "build_deps", _spy)
+
+        handler = make_literature_handler(agent_config=AgentConfig(), literature_deps=None)
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 5_000})
+
+        with pytest.raises(_Stop):
+            handler(campaign.workspace_root, campaign, action)
+
+        assert seen["daily_ledger_path"] is not None, (
+            "the dispatcher built the ledger without a daily path, so daily_max_cost_usd "
+            "is configurable but never enforced"
+        )
+
+    def test_the_resolver_never_returns_none(self) -> None:
+        """A resolver that could return ``None`` would make the cap quietly optional,
+        which is exactly how it came to be unenforced while looking configured."""
+        from carmel.paths import default_daily_ledger_path
+
+        assert default_daily_ledger_path() is not None
+
+    def test_the_env_var_overrides_the_default(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from carmel.paths import DAILY_LEDGER_ENV_VAR, default_daily_ledger_path
+
+        target = tmp_path / "elsewhere" / "ledger.json"
+        monkeypatch.setenv(DAILY_LEDGER_ENV_VAR, str(target))
+
+        assert default_daily_ledger_path() == target
+
+    def test_resolving_the_path_creates_nothing_on_disk(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A read-only query must have no side effect; the ledger creates the file on
+        first write."""
+        from carmel.paths import DAILY_LEDGER_ENV_VAR, default_daily_ledger_path
+
+        target = tmp_path / "untouched" / "ledger.json"
+        monkeypatch.setenv(DAILY_LEDGER_ENV_VAR, str(target))
+
+        default_daily_ledger_path()
+
+        assert not target.exists()
+        assert not target.parent.exists()
+
+
+class TestOperatorBudgetBinds:
+    """Decision 0004/D2: the budget named when appending the action must bound the
+    run, not merely be recorded on it."""
+
+    def test_the_actions_budget_replaces_the_config_ceiling(self, campaign: Campaign) -> None:
+        """Without this the number shows up in the plan as if it were a ceiling while
+        the run spends up to whatever the config file allows. A safety number that
+        does not bind is worse than none, because it is believed."""
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _apply_action_budget
+
+        deps, _, config = _make_deps([])
+        assert deps.config.budget.max_tokens != 5_000
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 5_000})
+
+        bound = _apply_action_budget(deps, action)
+
+        assert bound.config.budget.max_tokens == 5_000
+        # The ledger must actually refuse above the operator's number, not merely
+        # carry it: this is the assertion that would fail if the budget were wired
+        # into the config and not into the thing that does the gating.
+        with pytest.raises(BudgetExceededError):
+            bound.ledger.reserve_model_call(estimated_tokens=6_000, estimated_cost_usd=0.01)
+        # Session and daily ceilings are machine-wide protections; one operator
+        # authorising one action does not authorise breaching them.
+        assert bound.config.budget.session_max_cost_usd == deps.config.budget.session_max_cost_usd
+        assert bound.config.budget.daily_max_cost_usd == deps.config.budget.daily_max_cost_usd
+
+    def test_an_absent_budget_is_refused_rather_than_defaulted(self, campaign: Campaign) -> None:
+        """Spar round 7, P1. This used to fall back to the config file's ceiling.
+
+        For a corpus pass the operator's ``--budget-tokens`` IS the authorisation, so an
+        action that reached the handler without one did not come from
+        ``append_corpus_pass_action`` (which refuses it) -- it came from a hand-edited
+        or tampered plan. Spending up to a ceiling nobody named is the wrong direction
+        to fail for a control whose entire purpose is to bound spend.
+        """
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _apply_action_budget
+
+        deps, _, _ = _make_deps([])
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 0})
+
+        with pytest.raises(ValueError, match="no positive budget"):
+            _apply_action_budget(deps, action)
+
+    def test_the_rebuilt_ledger_keeps_the_daily_and_session_ceilings(self, campaign: Campaign) -> None:
+        """Spar round 7, P1. Binding the operator's per-action ceiling must not switch
+        the aggregate ones off.
+
+        ``BudgetLedger(budget)`` built bare leaves ``daily_ledger_path=None``, silently
+        disabling the file-backed daily cap for exactly the runs an operator has just
+        authorised extra money for -- while the function's docstring promised the
+        opposite. A ceiling believed to hold is worse than one known to be absent.
+        """
+        import dataclasses
+
+        from carmel.agents.budget import BudgetLedger
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _apply_action_budget
+
+        deps, _, _ = _make_deps([])
+        daily = campaign.workspace_root / "daily_ledger.json"
+        deps = dataclasses.replace(deps, ledger=BudgetLedger(deps.config.budget, daily_ledger_path=daily))
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS, "estimated_tokens": 250_000})
+
+        bound = _apply_action_budget(deps, action)
+
+        assert bound.config.budget.max_tokens == 250_000, "the operator ceiling did not bind"
+        assert bound.ledger.daily_ledger_path == daily, "the daily cap was silently dropped"
+        assert bound.ledger.session is deps.ledger.session, "the session cap was silently dropped"
+
+
+class TestOutcomeReflectsThisPassOnly:
+    """Spar round 7, P1. ``report.findings`` accumulates across every pass, so judging
+    the outcome on it lets one old finding make every later barren pass look SUCCEEDED.
+
+    A barren pass is exactly the signal an operator needs -- it says the corpus is
+    exhausted or the prompt is wrong -- so it must not be masked by history.
+    """
+
+    def _report(self, *, old: int, new: int) -> LiteratureReport:
+        from carmel.schemas.literature import (
+            GroundingStatus,
+            LiteratureFinding,
+            LiteraturePassMode,
+            PassRecord,
+            QueryRecord,
+        )
+
+        now = datetime.now(UTC)
+
+        def _pass(run_id: str, mode: LiteraturePassMode) -> PassRecord:
+            return PassRecord(
+                run_id=run_id,
+                action_id=f"act-{run_id}",
+                created_at=now,
+                mode=mode,
+                model_name="mock",
+                stop_reason=StopReason.SELF_TERMINATED,
+                usage=BudgetUsage(model_calls=0, tokens=0, cost_usd=0.0, fetches=0, fetch_bytes=0, elapsed_s=0.0),
+            )
+
+        def _f(run_id: str, n: int) -> LiteratureFinding:
+            return LiteratureFinding.model_validate(
+                {
+                    **{k: v for k, v in _finding_dict().items() if k != "source_url"},
+                    "finding_id": f"{run_id}-{n}",
+                    "run_id": run_id,
+                    "action_id": f"act-{run_id}",
+                    "evidence": {
+                        "artifact_sha256": "a" * 64,
+                        "quote_start": 0,
+                        "quote_end": len(QUOTE),
+                    },
+                    "grounding": {
+                        "status": GroundingStatus.GROUNDED_EXACT,
+                        "grounded": True,
+                        "match_ratio": 1.0,
+                        "identity_ok": True,
+                    },
+                }
+            )
+
+        findings = [_f("run-old", i) for i in range(old)] + [_f("run-new", i) for i in range(new)]
+        return LiteratureReport(
+            report_id="r1",
+            campaign_id="c1",
+            created_at=now,
+            passes=[
+                _pass("run-old", LiteraturePassMode.SEARCH),
+                _pass("run-new", LiteraturePassMode.CORPUS),
+            ],
+            queries=[QueryRecord(text="q", run_id="run-old", action_id="act-run-old")],
+            artifacts=[],
+            findings=findings,
+            rejected=[],
+        )
+
+    def test_a_barren_pass_after_a_productive_one_reports_no_grounded_findings(self) -> None:
+        from carmel.schemas.action_state import ActionOutcome
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _literature_outcome
+
+        report = self._report(old=1, new=0)
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS})
+
+        assert report.findings, "fixture is wrong: the accumulated report must not be empty"
+        assert _literature_outcome(report, action) == ActionOutcome.NO_GROUNDED_FINDINGS
+
+    def test_a_pass_that_grounds_something_still_reports_success(self) -> None:
+        from carmel.schemas.action_state import ActionOutcome
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.dispatcher import _literature_outcome
+
+        report = self._report(old=1, new=1)
+        action = _action().model_copy(update={"kind": ActionKind.LITERATURE_CORPUS_PASS})
+
+        assert _literature_outcome(report, action) == ActionOutcome.SUCCEEDED
+
+
+class TestCorpusPassReadsOneDocumentPerCall:
+    """Measured, not stylistic.
+
+    Handing the model all 8 papers of the live syngas campaign in one 116k-token
+    prompt produced ZERO proposed findings. The same model, same prompt, one of those
+    papers alone: two proposals. A corpus big enough to be worth re-reading is big
+    enough to bury the instruction to quote from it.
+    """
+
+    def test_each_document_gets_its_own_model_call(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        deps, model, config = _make_deps([_corpus_proposal([]), _corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 2, "one call per document, not one call for the corpus"
+        assert report.latest.stop_reason != StopReason.ERROR
+
+    def test_a_prompt_shows_exactly_one_document(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The isolation is the point: if both documents appeared in every prompt,
+        per-document calls would cost twice as much and change nothing."""
+        _patch_chem_success(monkeypatch)
+        sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        sha_two = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        deps, _, config = _make_deps([_corpus_proposal([]), _corpus_proposal([])])
+
+        prompts: list[str] = []
+        original = deps.model.complete
+
+        def _spy(**kwargs: Any) -> Any:
+            prompts.append(kwargs["user_prompt"])
+            return original(**kwargs)
+
+        monkeypatch.setattr(deps.model, "complete", _spy)
+        run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(prompts) == 2
+        for prompt in prompts:
+            shown = [s for s in (sha_one, sha_two) if s in prompt]
+            assert len(shown) == 1, "each call must show exactly one document"
+
+    def test_findings_from_earlier_documents_survive_a_later_failure(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The other reason for per-document calls: exhausting the budget on document
+        six keeps documents one to five. A single call would lose everything."""
+        _patch_chem_success(monkeypatch)
+        sha_one = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        # Only ONE proposal queued: the second document's call exhausts the mock and
+        # raises, standing in for a budget or provider failure partway through.
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha_one)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, "the first document's grounded finding must survive"
+        assert report.latest.stop_reason == StopReason.ERROR
+
+
+class TestTheReservationMatchesThePromptSize:
+    """The bridge reserves a flat 8000 tokens by default. That was sized for a short
+    search prompt and is badly wrong for a corpus prompt that embeds a whole paper --
+    a single document ran ~25k tokens on the live corpus.
+
+    This matters more since tokens became the operator's authorisation unit: the
+    reservation IS the enforcement point, checked BEFORE the call. An understated
+    reservation means the ceiling does not bind until after the call that breached it,
+    which is the one moment it needed to.
+    """
+
+    def test_a_whole_document_prompt_reserves_far_more_than_the_flat_default(self) -> None:
+        from carmel.services.literature import estimated_tokens_for
+
+        # ~100k characters, the scale of one extracted paper.
+        assert estimated_tokens_for("x" * 100_000) > 8000 * 3
+
+    def test_a_short_prompt_never_reserves_below_the_bridge_default(self) -> None:
+        """Sizing DOWN would be a regression: the default is also a floor covering the
+        response, which the prompt length cannot predict."""
+        from carmel.services.literature import estimated_tokens_for
+
+        assert estimated_tokens_for("short") == 8000
+
+    def test_the_estimate_grows_with_the_prompt(self) -> None:
+        from carmel.services.literature import estimated_tokens_for
+
+        assert estimated_tokens_for("x" * 200_000) > estimated_tokens_for("x" * 100_000)

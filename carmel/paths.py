@@ -27,6 +27,17 @@ DEFAULT_WORKSPACES_SUBPATH: tuple[str, ...] = ("carmel_workspaces",)
 #: Environment variable that overrides :func:`default_workspaces_root`.
 WORKSPACES_ROOT_ENV_VAR = "CARMEL_WORKSPACES"
 
+#: Default location of the file-backed daily cost ledger.
+#:
+#: Deliberately NOT inside a campaign workspace. The daily cap exists to bound what
+#: this machine spends in aggregate across every campaign in a day, so a per-workspace
+#: ledger would hand each new workspace a fresh full allowance and silently turn the
+#: cap into a per-campaign one.
+DEFAULT_DAILY_LEDGER_SUBPATH: tuple[str, ...] = (".carmel", "daily_ledger.json")
+
+#: Environment variable that overrides :func:`default_daily_ledger_path`.
+DAILY_LEDGER_ENV_VAR = "CARMEL_DAILY_LEDGER"
+
 WORKSPACE_SUBDIRS: tuple[str, ...] = (
     "benchmarks",
     "evidence",
@@ -144,3 +155,50 @@ def default_workspaces_root() -> Path:
     if env:
         return Path(env).expanduser()
     return Path.home().joinpath(*DEFAULT_WORKSPACES_SUBPATH)
+
+
+def resolve_workspaces_root(workspaces_root: Path | str | None) -> Path:
+    """Resolve the workspaces root, preferring an explicit value over the default.
+
+    Preference order:
+
+    1. ``workspaces_root`` when given (an explicit ``--workspaces`` or constructor
+       argument always wins).
+    2. :func:`default_workspaces_root` — ``$CARMEL_WORKSPACES``, then the packaged
+       default.
+
+    Lives here rather than in the UI because the CLI and the web UI must resolve the
+    SAME root: two copies of this rule let them disagree about where a campaign
+    lives, which an operator experiences as a campaign that vanished. Two CLI
+    subcommands were reaching into ``carmel.ui.app`` for the private helper that used
+    to hold it, which made a UI-internal detail load-bearing for the CLI.
+
+    Returns:
+        Absolute path to the workspaces root. The directory is NOT created here.
+    """
+    if workspaces_root is not None:
+        return Path(workspaces_root).expanduser()
+    return default_workspaces_root()
+
+
+def default_daily_ledger_path() -> Path:
+    """Resolve the machine-wide daily cost ledger path.
+
+    Preference order mirrors :func:`default_workspaces_root`:
+
+    1. ``$CARMEL_DAILY_LEDGER`` when set and non-empty.
+    2. :data:`DEFAULT_DAILY_LEDGER_SUBPATH` under the user's home.
+
+    A path is ALWAYS returned. ``BudgetLedger`` treats ``daily_ledger_path=None`` as
+    "no daily cap at all" and skips the check entirely, so a resolver that could
+    return ``None`` would make the cap quietly optional -- which is how it came to be
+    unenforced in production despite being configurable.
+
+    Returns:
+        The daily ledger path. The file and its parent are NOT created here; the
+        ledger creates them on first write, so a read-only query has no side effect.
+    """
+    env = os.environ.get(DAILY_LEDGER_ENV_VAR)
+    if env:
+        return Path(env).expanduser()
+    return Path.home().joinpath(*DEFAULT_DAILY_LEDGER_SUBPATH)

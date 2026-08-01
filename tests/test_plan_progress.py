@@ -462,6 +462,44 @@ class TestReconcile:
         with pytest.raises(ActionInFlightError):
             reconcile(ws, in_dispatch_lock=True)
 
+    def test_live_literature_lock_covers_a_corpus_pass_too(self, ws: Path) -> None:
+        """Spar round 7, P1. The liveness check named LITERATURE_SEARCH explicitly, so
+        a corpus pass -- which takes the very same literature run lock -- was invisible
+        to it. A running corpus pass could therefore be judged dead, marked FAILED, and
+        re-run while the first was still writing: the silent second run reconcile
+        exists to prevent.
+        """
+        _to_approved_for_execution(ws)
+        init_progress(
+            ws,
+            _plan(
+                [
+                    _action(
+                        "corpus",
+                        kind=ActionKind.LITERATURE_CORPUS_PASS,
+                        requirement=ApprovalRequirement.AUTO_APPROVED,
+                        blocking=False,
+                    ),
+                    _action("t3"),
+                ]
+            ),
+        )
+        mark_running(ws, "corpus", "a1")
+        _age_action(ws, 0)
+        lock_dir = ws / LITERATURE_RUN_LOCK_DIR
+        lock_dir.mkdir(parents=True)
+        (lock_dir / "info.json").write_text(
+            json.dumps(
+                {
+                    "pid": os.getppid(),  # a live pid that is not ours
+                    "hostname": socket.gethostname(),
+                    "started_at": datetime.now(UTC).isoformat(),
+                }
+            )
+        )
+        with pytest.raises(ActionInFlightError):
+            reconcile(ws, in_dispatch_lock=True)
+
     def test_in_dispatch_lock_repairs_fresh_lease_without_live_lock(self, ws: Path) -> None:
         """Holding the exclusive dispatch lock proves no dispatcher attempt is live."""
         _to_approved_for_execution(ws)
@@ -601,6 +639,38 @@ class TestReconcile:
 
         assert progress.cursor == 1  # advanced past the finished lit action
         assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+
+    def test_crash_window_corpus_pass_post_transition_replayed(self, ws: Path) -> None:
+        """Spar round 7, P1. The state-to-kind map named LITERATURE_SEARCH alone, so a
+        crashed CORPUS pass left the campaign in RUNNING_LITERATURE with no finished
+        action the replay would accept. It wedged there permanently: the next T3
+        pre-transition is illegal from RUNNING_LITERATURE, and nothing else ever
+        revisits it.
+        """
+        _to_approved_for_execution(ws)
+        update_state(ws, CampaignStateValue.RUNNING_LITERATURE)
+        init_progress(
+            ws,
+            _plan(
+                [
+                    _action(
+                        "corpus",
+                        kind=ActionKind.LITERATURE_CORPUS_PASS,
+                        requirement=ApprovalRequirement.AUTO_APPROVED,
+                        blocking=False,
+                    ),
+                    _action("t3"),
+                ]
+            ),
+        )
+        mark_finished(ws, "corpus", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+
+        progress = reconcile(ws)
+
+        assert progress.cursor == 1, "the cursor never advanced past the finished corpus pass"
+        assert load_state(ws).state == CampaignStateValue.LITERATURE_READY, (
+            "the campaign is still wedged in RUNNING_LITERATURE"
+        )
 
     def test_post_transition_replay_loses_a_race_without_crashing(
         self, ws: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -993,3 +1063,398 @@ class TestLockIsLive:
         assert "pid_start" in info
         assert info["action_id"] == "a1"
         assert lock_is_live(lock, stale_after_s=10.0)
+
+
+class TestConcurrentCorpusPassAppend:
+    """Spar round 7, P1. ``append_corpus_pass_action`` loaded, edited and saved the
+    plan outside any lock, while progress took its own lock internally.
+
+    Two operators appending at once would therefore each read the same plan, and the
+    second ``save_plan`` would drop the first's action -- while progress, correctly
+    serialized, kept both. The two files then described different plans, with progress
+    naming an action the plan did not contain. Holding one lock across the whole
+    read-modify-write of both files is what makes them agree.
+    """
+
+    def test_concurrent_appends_leave_plan_and_progress_aligned(self, ws: Path) -> None:
+        import threading
+
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import append_corpus_pass_action
+        from carmel.services.planner import load_plan as _load_plan
+        from carmel.services.planner import save_plan as _save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        _save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        barrier = threading.Barrier(2)
+        errors: list[BaseException] = []
+
+        def _append() -> None:
+            try:
+                barrier.wait(timeout=5)
+                append_corpus_pass_action(ws, budget_tokens=100_000)
+            except BaseException as exc:  # noqa: BLE001 - recorded and re-raised below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_append) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        # Assert they actually finished. Without this a self-deadlock regression --
+        # the exact failure the non-reentrant workspace lock makes possible -- would
+        # time out here and then surface below as "an append was lost from the plan",
+        # sending a reader after a phantom correctness bug instead of the hang.
+        alive = [t for t in threads if t.is_alive()]
+        assert not alive, f"{len(alive)} append thread(s) did not finish within 10s: deadlock"
+
+        # Exactly one append wins. The other is refused by the already-queued guard
+        # (spar round 8) rather than lost to a race: a refusal the operator can read is
+        # a correct outcome, a silently dropped action is not. Any OTHER exception is a
+        # real failure.
+        unexpected = [e for e in errors if not isinstance(e, ValueError)]
+        assert not unexpected, f"an append failed for the wrong reason: {unexpected}"
+        assert len(errors) <= 1, f"both appends were refused: {errors}"
+        plan_ids = [a.action_id for a in _load_plan(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS]
+        progress_ids = [a.action_id for a in load_progress(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS]
+        assert len(plan_ids) == 2 - len(errors), f"an append was lost from the plan: {plan_ids}"
+        assert sorted(plan_ids) == sorted(progress_ids), (
+            f"plan and progress disagree: plan={sorted(plan_ids)} progress={sorted(progress_ids)}"
+        )
+        assert [a.action_id for a in _load_plan(ws).actions] == [a.action_id for a in load_progress(ws).actions], (
+            "plan and progress are no longer index-aligned"
+        )
+
+
+class TestCorpusPassAppendIsNotRepeatable:
+    """Spar round 8, P1. Appending happens BEFORE the run, and the run can legitimately
+    not reach the new action -- the dispatcher executes the plan's next action, which
+    may be an earlier one still pending.
+
+    An operator who retries the command then appends another pass every time. Each one
+    eventually runs, and since findings are deliberately never deduped across passes,
+    each adds its findings to the accumulated report again.
+    """
+
+    def test_a_second_append_is_refused_while_one_is_still_queued(self, ws: Path) -> None:
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        first = append_corpus_pass_action(ws, budget_tokens=100_000)
+
+        with pytest.raises(ValueError, match="already queued"):
+            append_corpus_pass_action(ws, budget_tokens=100_000)
+
+        kinds = [a.kind for a in load_progress(ws).actions]
+        assert kinds.count(ActionKind.LITERATURE_CORPUS_PASS) == 1, "a duplicate pass was queued"
+        assert first.action_id in [a.action_id for a in load_progress(ws).actions]
+
+    def test_a_new_append_is_allowed_once_the_previous_one_has_run(self, ws: Path) -> None:
+        """The guard must bound duplicates, not prevent a legitimate second pass: an
+        operator re-reading the corpus after dropping new papers is the normal case."""
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        first = append_corpus_pass_action(ws, budget_tokens=100_000)
+        mark_running(ws, first.action_id, "a1")
+        mark_finished(
+            ws,
+            first.action_id,
+            status=ActionExecutionStatus.SUCCEEDED,
+            outcome=ActionOutcome.SUCCEEDED,
+        )
+
+        second = append_corpus_pass_action(ws, budget_tokens=100_000)
+
+        assert second.action_id != first.action_id
+        kinds = [a.kind for a in load_progress(ws).actions]
+        assert kinds.count(ActionKind.LITERATURE_CORPUS_PASS) == 2
+
+
+class TestTheCorpusPassObeysTheApprovalPolicy:
+    """The corpus pass was created with a hardcoded AUTO_APPROVED and never re-evaluated.
+
+    An operator who set `require_approval_for_literature: true` to hold every
+    literature action for review got a corpus pass that ran immediately -- having set
+    the exact option meant to prevent it. The corpus pass is also the more expensive of
+    the two literature kinds (it is the one an operator names a budget for), so it was
+    the wrong one to exempt.
+
+    Two layers had to change together: the action is now re-evaluated against the
+    policy, AND `evaluate_action` matches both literature kinds. Matching only
+    LITERATURE_SEARCH sent a corpus pass to the catch-all, where it required approval
+    unconditionally -- inert policy in the other direction.
+    """
+
+    def test_require_approval_for_literature_holds_a_corpus_pass(self, ws: Path) -> None:
+        from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
+        from carmel.services.approvals import save_policy
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        save_policy(ws, ApprovalPolicy(require_approval_for_literature=True))
+
+        action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        assert action.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+
+    def test_a_pass_under_the_threshold_is_auto_approved(self, ws: Path) -> None:
+        """The other direction: the policy must be able to let one through, or the fix
+        would simply have replaced one hardcoded verdict with the opposite one."""
+        from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
+        from carmel.services.approvals import save_policy
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        save_policy(ws, ApprovalPolicy(require_approval_for_literature=False, auto_approve_literature_under_usd=1e6))
+
+        action = append_corpus_pass_action(ws, budget_tokens=1_000, model_name="gemini-2.5-flash")
+
+        assert action.approval_requirement == ApprovalRequirement.AUTO_APPROVED
+
+    def test_an_unpriceable_pass_fails_closed(self, ws: Path) -> None:
+        """No model configured means no dollar estimate, and `estimated_spend_usd` is
+        then 0.0 -- below every threshold. "We cannot price this" must not reach the
+        policy as "this is free"."""
+        from carmel.schemas.approval import ApprovalPolicy, ApprovalRequirement
+        from carmel.services.approvals import save_policy
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        save_policy(ws, ApprovalPolicy(require_approval_for_literature=False, auto_approve_literature_under_usd=1e6))
+
+        action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name=None)
+
+        assert action.approval_requirement == ApprovalRequirement.REQUIRES_APPROVAL
+
+
+class TestAnInsertionNeverDisplacesARunningAction:
+    """F17. Refusing only *strictly* behind the cursor is not enough.
+
+    ``at == cursor`` passed that guard even when the action sitting there was
+    RUNNING. Inserting there shifts the running action to ``at+1`` while the cursor
+    stays put, and its own ``advance_cursor`` then refuses to move (it requires the
+    id at the cursor to match) -- so the inserted action inherits the slot and is
+    scheduled AFTER the run it was inserted to precede. The caller's ordering intent
+    is inverted, and nothing raises.
+    """
+
+    def _corpus_action(self, action_id: str = "corpus") -> PlannedAction:
+        return _action(action_id, kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False)
+
+    def test_inserting_where_a_running_action_sits_is_refused(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress_locked
+        from carmel.services.state_machine import workspace_lock
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+        mark_running(ws, "lit", "a1")
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws, "lit")
+        mark_running(ws, "t3", "a2")  # the cursor now sits on a RUNNING action
+        assert load_progress(ws).cursor == 1
+
+        with workspace_lock(ws), pytest.raises(ValueError, match="RUNNING"):
+            append_action_to_progress_locked(ws, self._corpus_action(), index=1)
+
+        # Untouched: the running action still owns its slot.
+        progress = load_progress(ws)
+        assert [state.action_id for state in progress.actions] == ["lit", "t3"]
+        assert progress.cursor == 1
+
+    def test_inserting_at_the_cursor_is_still_allowed_when_nothing_is_running(self, ws: Path) -> None:
+        """The guard must not over-refuse: inserting ahead of a PENDING action is the
+        normal case, and is exactly how a corpus pass gets placed before the T3 run."""
+        from carmel.services.plan_progress import append_action_to_progress_locked
+        from carmel.services.state_machine import workspace_lock
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+        mark_running(ws, "lit", "a1")
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws, "lit")
+        assert load_progress(ws).cursor == 1
+
+        with workspace_lock(ws):
+            append_action_to_progress_locked(ws, self._corpus_action(), index=1)
+
+        progress = load_progress(ws)
+        assert [state.action_id for state in progress.actions] == ["lit", "corpus", "t3"]
+        assert progress.cursor == 1  # the corpus pass runs next, ahead of T3
+
+
+class TestThePublicAppendWrapper:
+    """``append_action_to_progress`` takes the lock itself and had no caller and no
+    test -- production goes through the ``_locked`` variant. An untested public entry
+    point is one an operator script can reach and nobody has run; it also has to stay
+    honest about the workspace lock, which is NOT re-entrant (calling it while holding
+    the lock blocks forever)."""
+
+    def test_it_takes_the_lock_itself_and_inserts(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+
+        progress = append_action_to_progress(
+            ws, _action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False), index=1
+        )
+
+        assert [state.action_id for state in progress.actions] == ["lit", "corpus", "t3"]
+        assert load_progress(ws).actions[1].action_id == "corpus"
+
+    def test_it_appends_at_the_end_when_no_index_is_given(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+
+        progress = append_action_to_progress(
+            ws, _action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False)
+        )
+
+        assert [state.action_id for state in progress.actions] == ["lit", "t3", "corpus"]
+
+    def test_it_refuses_an_insertion_behind_the_cursor(self, ws: Path) -> None:
+        from carmel.services.plan_progress import append_action_to_progress
+
+        _to_approved_for_execution(ws)
+        init_progress(ws, _two_action_plan())
+        mark_running(ws, "lit", "a1")
+        mark_finished(ws, "lit", status=ActionExecutionStatus.SUCCEEDED, outcome=ActionOutcome.SUCCEEDED)
+        advance_cursor(ws, "lit")
+
+        with pytest.raises(ValueError, match="already progressed"):
+            append_action_to_progress(
+                ws, _action("corpus", kind=ActionKind.LITERATURE_CORPUS_PASS, blocking=False), index=0
+            )
+
+
+class TestAppendingACorpusPassRealignsProgress:
+    """Copilot review. The append inspected progress with ``load_progress``.
+
+    Two workspaces break that: one with a plan and no ``plan_progress.json`` at all
+    (a Phase-1 workspace predating per-action progress), and one whose progress file
+    belongs to a DIFFERENT plan. The first raised FileNotFoundError, which the CLI
+    then reported as "Campaign has no plan yet" -- the opposite of true. The second
+    inspected another plan's progress as though it described this one, misaligning
+    the very index the append is about to insert at.
+    """
+
+    def test_a_workspace_with_a_plan_but_no_progress_file_still_appends(self, ws: Path) -> None:
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+        from carmel.services.planner import load_plan as _load_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+        (ws / PLAN_PROGRESS_NAME).unlink()
+
+        action = append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        progress = load_progress(ws)
+        assert action.action_id in [state.action_id for state in progress.actions]
+        # Plan and progress must still line up index for index.
+        assert [a.action_id for a in _load_plan(ws).actions] == [s.action_id for s in progress.actions]
+
+    def test_progress_from_a_different_plan_is_reinitialised_not_trusted(self, ws: Path) -> None:
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+        from carmel.services.planner import load_plan as _load_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        # Progress left over from some other plan entirely.
+        init_progress(ws, _plan([_action("stale-a"), _action("stale-b")], plan_id="other-plan"))
+        assert load_progress(ws).plan_id == "other-plan"
+
+        append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        progress = load_progress(ws)
+        assert progress.plan_id == plan.plan_id
+        assert "stale-a" not in [state.action_id for state in progress.actions]
+        assert [a.action_id for a in _load_plan(ws).actions] == [s.action_id for s in progress.actions]
+
+
+class TestAppendingACorpusPassIsAllOrNothing:
+    """F15. The workspace lock excludes concurrent writers; it does not make two
+    writes one.
+
+    Progress was written, then the plan, with no rollback. A ``save_plan`` failure
+    left progress permanently naming an action the plan does not contain, and every
+    later ``execute_next_action`` then refuses the workspace outright. There is no
+    repair path short of hand-editing: ``load_or_init_progress`` re-initialises only
+    when ``plan_id`` differs, and the edited copy preserves it.
+    """
+
+    def test_a_failed_plan_write_leaves_progress_untouched(self, ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from carmel.services import planner
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+        before = load_progress(ws)
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(planner, "save_plan", _boom)
+
+        with pytest.raises(OSError, match="no space left"):
+            append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+
+        after = load_progress(ws)
+        assert [state.action_id for state in after.actions] == [state.action_id for state in before.actions]
+        assert after.cursor == before.cursor
+
+    def test_the_workspace_is_still_dispatchable_afterwards(self, ws: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The point of the rollback, stated as the symptom it prevents."""
+        from carmel.services import planner
+        from carmel.services.campaigns import load_campaign
+        from carmel.services.dispatcher import default_handlers, execute_next_action
+        from carmel.services.planner import append_corpus_pass_action, save_plan
+
+        _to_approved_for_execution(ws)
+        plan = _plan([_action("t3")])
+        save_plan(ws, plan)
+        init_progress(ws, plan)
+
+        def _boom(*args: object, **kwargs: object) -> None:
+            raise OSError("no space left on device")
+
+        monkeypatch.setattr(planner, "save_plan", _boom)
+        with pytest.raises(OSError):
+            append_corpus_pass_action(ws, budget_tokens=100_000, model_name="gemini-2.5-flash")
+        monkeypatch.undo()
+
+        # Before the fix this raised UnsupportedActionKindError: "progress references
+        # action ... missing from the plan".
+        ticket = execute_next_action(ws, load_campaign(ws), handlers=default_handlers())
+        assert ticket is not None
+        ticket.wait(timeout=60)

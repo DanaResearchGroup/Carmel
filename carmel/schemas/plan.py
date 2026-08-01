@@ -11,9 +11,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from carmel.schemas.approval import ActionKind, ApprovalRequirement
 
 #: Current plan schema version. Version 2 adds per-action ``blocking`` and
-#: ``estimated_spend_usd``; every added field has a default so a Phase-1
-#: (version 1) ``plan.json`` still validates unchanged.
-PLAN_SCHEMA_VERSION = 2
+#: ``estimated_spend_usd``; version 3 adds ``estimated_tokens``. Every added field
+#: has a default so a Phase-1 (version 1) ``plan.json`` still validates unchanged.
+PLAN_SCHEMA_VERSION = 3
 
 
 class PlannedAction(BaseModel):
@@ -26,6 +26,19 @@ class PlannedAction(BaseModel):
     description: str
     estimated_cpu_hours: float = Field(ge=0)
     estimated_cost: float = Field(default=0.0, ge=0)
+    #: What an operator AUTHORISED this action to consume, in model tokens.
+    #:
+    #: Tokens are the authorisation unit rather than dollars because tokens are what
+    #: the run actually consumes and what the provider meters. A dollar ceiling has a
+    #: pricing table between the number the operator typed and the quantity that
+    #: binds, so a stale or wrong price silently moves the real limit. A token ceiling
+    #: has no such indirection: the number typed is the number enforced.
+    #:
+    #: ``estimated_spend_usd`` remains, but is now DERIVED from this via
+    #: :func:`~carmel.agents.models.estimate_worst_case_model_cost_usd` and is
+    #: REPORTED, not enforced -- it exists so an operator can see roughly what a token
+    #: cap costs, and must never be read as a ceiling.
+    estimated_tokens: int = Field(default=0, ge=0)
     estimated_spend_usd: float = Field(default=0.0, ge=0)
     blocking: bool = True
     rationale: str

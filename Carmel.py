@@ -6,10 +6,17 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from carmel.config import validate_config_file
 from carmel.paths import init_workspace
 from carmel.version import __version__
+
+if TYPE_CHECKING:
+    # Type-only: keeps this module importable without eagerly pulling the schema
+    # package at CLI start-up, matching how every other symbol here is imported
+    # inside the function that uses it.
+    from carmel.schemas import Campaign
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -102,6 +109,62 @@ def create_parser() -> argparse.ArgumentParser:
         help="Carmel config file with an 'agents' section (required for a real run)",
     )
 
+    corpus = subparsers.add_parser(
+        "corpus-pass",
+        help="Append a second literature pass over the papers this campaign already holds",
+    )
+    corpus.add_argument("--campaign", type=str, required=True, help="Campaign ID")
+    corpus.add_argument(
+        "--budget-tokens",
+        type=int,
+        default=None,
+        help=(
+            "How many model tokens this pass may consume. Required (except with "
+            "--dispatch-queued, which runs a pass whose budget was named when it was "
+            "appended) and explicit: an operator-authorised action names its own "
+            "budget rather than drawing on the campaign's autonomous-spend ceiling. "
+            "Tokens rather than dollars because tokens are what the run consumes and "
+            "what the provider meters, so this number is the one that binds; the "
+            "equivalent dollar cost is estimated and printed for you."
+        ),
+    )
+    corpus.add_argument(
+        "--dispatch-queued",
+        action="store_true",
+        help=(
+            "Run the corpus pass that is ALREADY queued instead of appending a new "
+            "one. Needed because a pass that requires approval is appended by one "
+            "command and can only be dispatched after a human approves it -- and "
+            "re-running the plain command then refuses, correctly, rather than "
+            "queueing a second identical pass. Its budget is the one named when it "
+            "was appended, so --budget-tokens is not accepted here: silently running "
+            "under a different cap than the approver saw would defeat the approval."
+        ),
+    )
+    corpus.add_argument(
+        "--reread-all",
+        action="store_true",
+        help=(
+            "Re-read documents an earlier pass already mined. By default a corpus "
+            "pass reads only what is new, because the prompt for a given document is "
+            "identical between passes and re-reading it buys the same answer twice. "
+            "Use this when the question has actually changed -- a different model, or "
+            "a revised prompt."
+        ),
+    )
+    corpus.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    corpus.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Carmel config file with an 'agents' section (required for a real run)",
+    )
+    corpus.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Append the action and stop, without running it",
+    )
+
     return parser
 
 
@@ -176,12 +239,12 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     (:func:`carmel.services.campaigns.start_literature_at_creation`);
     the CLI never owns its own copy of the auto-run logic.
     """
+    from carmel.paths import resolve_workspaces_root
     from carmel.services.campaigns import (
         find_campaign_workspace,
         load_campaign,
         start_literature_at_creation,
     )
-    from carmel.ui.app import _resolve_workspaces_root
 
     try:
         agent_config = _load_agent_config(config)
@@ -196,7 +259,7 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
         )
         return 1
 
-    workspaces_root = _resolve_workspaces_root(workspaces)
+    workspaces_root = resolve_workspaces_root(workspaces)
     ws = find_campaign_workspace(workspaces_root, campaign_id)
     if ws is None:
         print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
@@ -219,6 +282,264 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     result = outcome.result
     print(f"Literature action {result.action_id} finished with outcome {result.outcome.value}")
     return 0
+
+
+def _cmd_corpus_pass(
+    campaign_id: str,
+    budget_tokens: int | None,
+    workspaces: Path | None,
+    config: Path | None,
+    *,
+    dry_run: bool,
+    reread_all: bool = False,
+    dispatch_queued: bool = False,
+) -> int:
+    """Append a corpus pass to a campaign's plan and run it.
+
+    Two steps, deliberately separable by ``--dry-run``: appending the action is the
+    operator's authorisation and is recorded in the plan whether or not the run then
+    succeeds, so a failed run leaves an approved action to retry rather than
+    vanishing without trace.
+    """
+    from carmel.paths import resolve_workspaces_root
+    from carmel.schemas.action_state import ActionOutcome
+    from carmel.services.campaigns import find_campaign_workspace, load_campaign
+    from carmel.services.planner import append_corpus_pass_action
+
+    # The two modes are mutually exclusive by construction: --dispatch-queued runs an
+    # action whose budget is already fixed in the plan. Accepting a budget alongside it
+    # would either be ignored (a lie) or silently override what the approver agreed to.
+    if dispatch_queued:
+        if budget_tokens is not None:
+            print(
+                "--budget-tokens cannot be combined with --dispatch-queued: the queued "
+                "pass already carries the budget it was approved under.",
+                file=sys.stderr,
+            )
+            return 1
+        if reread_all:
+            print(
+                "--reread-all cannot be combined with --dispatch-queued: re-read scope is "
+                "fixed when the pass is appended, not when it is dispatched.",
+                file=sys.stderr,
+            )
+            return 1
+    elif budget_tokens is None:
+        print("--budget-tokens is required (or use --dispatch-queued to run an already-queued pass).", file=sys.stderr)
+        return 1
+
+    try:
+        agent_config = _load_agent_config(config)
+    except (OSError, ValueError) as e:
+        print(f"Failed to load config: {e}", file=sys.stderr)
+        return 1
+    if agent_config is None and not dry_run:
+        print(
+            "No agent config available: pass --config FILE whose 'agents' section "
+            "sets provider, consent and API key env vars.",
+            file=sys.stderr,
+        )
+        return 1
+
+    workspaces_root = resolve_workspaces_root(workspaces)
+    ws = find_campaign_workspace(workspaces_root, campaign_id)
+    if ws is None:
+        print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
+        return 1
+    campaign = load_campaign(ws)
+
+    # The model name only shapes the REPORTED dollar estimate; the token cap binds
+    # regardless. A dry run without a config therefore still appends a valid action,
+    # it just cannot say what the tokens would have cost.
+    # `_load_agent_config` returns `object | None` so this module stays importable
+    # without the agents extra, which is why every use site here carries a targeted
+    # ignore rather than a real annotation.
+    model_name = (
+        agent_config.resolved_model_name()  # type: ignore[attr-defined]
+        if agent_config is not None
+        else None
+    )
+
+    if dispatch_queued:
+        # Locate the queued pass rather than appending one. Deliberately reported as a
+        # typed refusal when there is nothing to dispatch: "I ran nothing" must never be
+        # indistinguishable from "I ran your pass".
+        from carmel.schemas.action_state import ActionExecutionStatus
+        from carmel.schemas.approval import ActionKind as _ActionKind
+        from carmel.services.plan_progress import load_progress as _load_progress
+
+        try:
+            queued = [
+                a
+                for a in _load_progress(ws).actions
+                if a.kind == _ActionKind.LITERATURE_CORPUS_PASS
+                and a.execution_status == ActionExecutionStatus.PENDING
+                and a.outcome != ActionOutcome.REJECTED
+            ]
+        except OSError as e:
+            print(f"Could not read plan progress: {e}", file=sys.stderr)
+            return 1
+        if not queued:
+            print(
+                "No corpus pass is queued for this campaign. Run without --dispatch-queued to append one.",
+                file=sys.stderr,
+            )
+            return 1
+        queued_action_id = queued[0].action_id
+        print(f"Dispatching the already-queued corpus-pass action {queued_action_id}.")
+        return _dispatch_corpus_action(ws, campaign, queued_action_id, agent_config=agent_config, dry_run=dry_run)
+
+    # Narrowed by the mutual-exclusion block above: the append path returns early
+    # when no budget was named, so reaching here means one was.
+    assert budget_tokens is not None
+    try:
+        action = append_corpus_pass_action(
+            ws, budget_tokens=budget_tokens, model_name=model_name, reread_all=reread_all
+        )
+    except FileNotFoundError:
+        # Distinguished from the generic OSError below because the remedy is
+        # specific and the raw message ("JSON file not found: .../plan.json") tells
+        # an operator nothing about what to do.
+        print(
+            f"Campaign {campaign_id!r} has no plan yet, so there is nothing to append to. "
+            "Run the literature step (or create a plan) first.",
+            file=sys.stderr,
+        )
+        return 1
+    except (OSError, ValueError) as e:
+        print(f"Could not append the corpus pass: {e}", file=sys.stderr)
+        return 1
+    # Report the cap in the unit that binds, and the dollars as what they are. Naming
+    # the model the estimate came from matters: the same token cap costs different
+    # amounts on different tiers, so a bare figure would invite reading it as fixed.
+    if action.estimated_spend_usd > 0:
+        # "at most", not "about": the figure comes from
+        # `estimate_worst_case_model_cost_usd`, which prices an unknown model at a
+        # deliberately punitive fallback rate so no call can escape the ledger at zero
+        # cost. That is right for a reservation and wrong to print as a point
+        # estimate -- an operator told "~$2.50" who then spends $0.40 has been
+        # misled in exactly the way this whole change exists to stop.
+        print(
+            f"Appended corpus-pass action {action.action_id} with a budget of "
+            f"{budget_tokens:,} tokens (at most ~${action.estimated_spend_usd:.2f} "
+            f"on {model_name}; the token cap is what binds)"
+        )
+    else:
+        print(
+            f"Appended corpus-pass action {action.action_id} with a budget of "
+            f"{budget_tokens:,} tokens (no model configured, so the dollar cost "
+            f"cannot be estimated)"
+        )
+    if dry_run:
+        print("--dry-run: the action was appended but not run.")
+        return 0
+
+    return _dispatch_corpus_action(ws, campaign, action.action_id, agent_config=agent_config, dry_run=dry_run)
+
+
+def _dispatch_corpus_action(
+    ws: Path,
+    campaign: Campaign,
+    action_id: str,
+    *,
+    agent_config: object,
+    dry_run: bool,
+) -> int:
+    """Dispatch one already-appended corpus-pass action through the dispatcher.
+
+    Shared by both entry paths -- appending-then-running, and ``--dispatch-queued``
+    against a pass a human has since approved. It is one function precisely because
+    the guards below are the valuable part: duplicating them for the second path is
+    how one of the two ends up missing the cursor check.
+    """
+    from carmel.agents.bridge import AgentBridgeError
+    from carmel.schemas.action_state import ActionOutcome
+    from carmel.services.dispatcher import default_handlers, execute_next_action
+
+    if dry_run:
+        print("--dry-run: the queued action was not run.")
+        return 0
+
+    try:
+        # Go through the DISPATCHER, not execute_action (spar round 7 P1).
+        # execute_action is only the by-kind router: it runs the handler and nothing
+        # else. Calling it directly skipped reconcile, the approval gate, the exclusive
+        # dispatch lease, the campaign pre/post state transitions, attempt recording,
+        # and -- the damaging one -- the cursor advance. A corpus pass would complete
+        # and write its report while plan_progress.json still showed the action
+        # pending, so the next dispatcher run would execute it a second time. Since
+        # findings are deliberately never deduped across passes, that silently doubles
+        # them in the accumulated report.
+        #
+        # The agent config MUST be threaded through to the handler registry. Without
+        # it the literature handler is built with nothing to run on and returns a
+        # typed "no agent config available" failure -- which looks like a failed run
+        # rather than a command that never started one.
+        # Check WHAT the cursor points at before dispatching, not after. The
+        # dispatcher runs the plan's next runnable action, which is not necessarily the
+        # corpus pass just appended -- an earlier LITERATURE_SEARCH still pending sits
+        # ahead of it. Reporting the mismatch afterwards is too late: by then the
+        # search has already run, reached the network and spent the operator's money on
+        # a pass they did not ask for, under a budget they named for something else.
+        from carmel.services.plan_progress import load_progress
+
+        progress = load_progress(ws)
+        next_state = progress.actions[progress.cursor] if progress.cursor < len(progress.actions) else None
+        if next_state is not None and next_state.action_id != action_id:
+            print(
+                f"Refusing to dispatch: the plan's next action is {next_state.kind.value} "
+                f"({next_state.action_id}), not the corpus pass "
+                f"({action_id}). The corpus pass stays queued. Run or retire the "
+                f"earlier action first, then dispatch again.",
+                file=sys.stderr,
+            )
+            return 1
+
+        ticket = execute_next_action(
+            ws,
+            campaign,
+            handlers=default_handlers(agent_config=agent_config),  # type: ignore[arg-type]
+        )
+    except AgentBridgeError as e:
+        print(f"Corpus pass unavailable (consent/API key): {e}", file=sys.stderr)
+        return 1
+
+    if ticket is None:
+        print(
+            f"The corpus-pass action {action_id} is in the plan but the dispatcher did "
+            "not start it. The plan has no runnable action right now -- most often the "
+            "action is still awaiting approval. It stays in the plan; approve it, then "
+            "run `carmel corpus-pass --campaign <id> --dispatch-queued` to run it "
+            "(re-running the plain command would refuse rather than queue a second "
+            "identical pass).",
+            file=sys.stderr,
+        )
+        return 1
+    if ticket.action_id != action_id:
+        # The dispatcher runs the plan's next executable action, which is the correct
+        # behaviour and is deliberately not overridden here: jumping the queue would
+        # run the corpus pass out of the order the plan records. Say plainly that
+        # something else ran, rather than reporting another action's outcome as though
+        # it were the corpus pass.
+        print(
+            f"The corpus-pass action {action_id} is queued, but the next action due in "
+            f"the plan is {ticket.action_id} ({ticket.kind.value}), which ran instead. "
+            "The corpus pass remains queued; dispatch again to reach it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    result = ticket.wait()
+    if result is None:
+        print(
+            f"Corpus pass {action_id} failed before producing a result"
+            + (f": {ticket.error}" if ticket.error is not None else "")
+            + ". The failure is recorded in the workspace.",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"Corpus pass {action_id} finished with outcome {result.outcome.value}")
+    return 0 if result.outcome == ActionOutcome.SUCCEEDED else 1
 
 
 def _cmd_new_campaign(config_file: Path, workspaces: Path | None) -> int:
@@ -412,13 +733,15 @@ def _cmd_requests(
     )
     from carmel.services.campaigns import find_campaign_workspace
 
-    root = workspaces.expanduser() if workspaces is not None else default_workspaces_root()
-    ws = find_campaign_workspace(root, campaign_id)
-    if ws is None:
-        print(f"No campaign {campaign_id!r} under {root}")
-        return 1
-
+    # Load the config BEFORE resolving the root: it is one of the inputs to that
+    # resolution. This command used to resolve the root first and read the config only
+    # for `max_artifact_bytes`, so `carmel requests --config <file>` silently scanned
+    # the default workspaces directory rather than the one the config named -- while
+    # `new-campaign --workspaces` advertises "default: the config's workspace_root".
+    # The two commands disagreed, and the failure is quiet: you get "no campaign
+    # found" while looking in a directory you never asked about.
     max_bytes = AgentBudgetConfig().max_artifact_bytes
+    config_root: Path | None = None
     if config_file is not None:
         try:
             config = load_config(config_file)
@@ -427,6 +750,22 @@ def _cmd_requests(
             return 1
         if config.agents is not None:
             max_bytes = config.agents.budget.max_artifact_bytes
+        # `--workspaces` means the PARENT directory in every command, whereas
+        # `config.workspace_root` is the campaign's OWN directory -- so its parent is
+        # what `find_campaign_workspace` needs to scan.
+        config_root = config.workspace_root.expanduser().parent
+
+    if workspaces is not None:
+        root = workspaces.expanduser()
+    elif config_root is not None:
+        root = config_root
+    else:
+        root = default_workspaces_root()
+
+    ws = find_campaign_workspace(root, campaign_id)
+    if ws is None:
+        print(f"No campaign {campaign_id!r} under {root}")
+        return 1
 
     if collect:
         changed = collect_inbox(ws, max_bytes=max_bytes)
@@ -521,6 +860,17 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_serve(args.workspaces, args.host, args.port, args.debug, args.config)
     if args.command == "literature":
         return _cmd_literature(args.campaign, args.workspaces, args.config)
+
+    if args.command == "corpus-pass":
+        return _cmd_corpus_pass(
+            args.campaign,
+            args.budget_tokens,
+            args.workspaces,
+            args.config,
+            dry_run=args.dry_run,
+            reread_all=args.reread_all,
+            dispatch_queued=args.dispatch_queued,
+        )
 
     if args.command == "new-campaign":
         return _cmd_new_campaign(args.config, args.workspaces)
