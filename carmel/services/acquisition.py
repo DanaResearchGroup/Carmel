@@ -45,6 +45,7 @@ from carmel.agents.tools.extract import ExtractedText, extract_text
 from carmel.logger import get_logger
 from carmel.paths import normalize_path
 from carmel.schemas.acquisition import (
+    CURRENT_ACQUISITION_MANIFEST_VERSION,
     AcquisitionManifest,
     AcquisitionReason,
     AcquisitionRequest,
@@ -282,32 +283,154 @@ def slug_for(doi: str | None, title: str) -> str:
     return candidate
 
 
+class ManifestUnreadable(ValueError):
+    """The on-disk acquisition manifest exists but could not be loaded.
+
+    A distinct type -- rather than letting the underlying ``OSError``/``ValueError``
+    propagate bare -- so every caller sees the SAME thing regardless of which of the
+    four ways a manifest can fail actually happened, and gets a specific,
+    human-actionable reason rather than a generic traceback. Deliberately a
+    :class:`ValueError` subclass, matching :class:`AlreadyAcquired` and
+    :class:`~carmel.services.literature.ReportSchemaTooNewError`: existing callers that
+    catch ``ValueError`` broadly around acquisition calls still catch this.
+
+    This is never raised for an ABSENT manifest -- that is legitimate first-run
+    behaviour and :func:`load_manifest` still returns an empty manifest for it. It is
+    raised for every other failure precisely because the manifest is the operator's
+    outstanding download queue, not disposable scratch: silently starting fresh over a
+    damaged file used to destroy that queue (and, via :func:`save_manifest`, the
+    ``README.md`` telling the operator what they still needed to go get) the moment the
+    next request was recorded.
+
+    Attributes:
+        path: The manifest file that could not be loaded.
+    """
+
+    def __init__(self, path: Path, reason: str) -> None:
+        super().__init__(f"acquisition manifest at {path} is unreadable: {reason}")
+        self.path = path
+
+
+class _ManifestSchemaTooNew(ValueError):
+    """Internal signal: ``migrate_manifest_payload`` saw a version newer than this
+    build understands. Caught and rewrapped as :class:`ManifestUnreadable` by
+    :func:`load_manifest`, which is the only place that knows the on-disk path -- this
+    type exists purely so :func:`migrate_manifest_payload` (which, like
+    :func:`carmel.services.literature.migrate_report_payload`, only ever sees the raw
+    dict, never the path) does not have to fabricate one."""
+
+
+def migrate_manifest_payload(payload: object) -> object:
+    """Bring a persisted manifest payload up to the current schema version.
+
+    Mirrors :func:`carmel.services.literature.migrate_report_payload`: a chain applied
+    step by step from the payload's own version, so a bump two versions from now does
+    not have to re-derive what an intermediate version looked like. There is exactly
+    one version so far, so the chain is currently empty -- the next bump adds a
+    ``_migrate_v1_to_v2`` step here, matching that module's structure.
+
+    Raises:
+        _ManifestSchemaTooNew: If ``payload``'s ``version`` is newer than
+            :data:`~carmel.schemas.acquisition.CURRENT_ACQUISITION_MANIFEST_VERSION`.
+            Rewrapped as :class:`ManifestUnreadable` by :func:`load_manifest`.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    version = int(payload.get("version", 1))
+    if version > CURRENT_ACQUISITION_MANIFEST_VERSION:
+        # Fail closed on a manifest from the FUTURE, exactly as
+        # ``migrate_report_payload`` does: passing it through unmigrated hands it to a
+        # validator with ``extra="forbid"``, which would reject an unrecognised field
+        # with a schema error naming something the operator has never heard of -- or,
+        # worse, silently validate and then have this older Carmel write back a
+        # truncated version of a newer manifest the next time a request is recorded.
+        raise _ManifestSchemaTooNew(
+            f"written by a newer Carmel (manifest schema version {version}, this build "
+            f"understands at most {CURRENT_ACQUISITION_MANIFEST_VERSION}); upgrade "
+            f"Carmel rather than letting an older version rewrite (and silently "
+            f"truncate) a newer manifest"
+        )
+    if version == CURRENT_ACQUISITION_MANIFEST_VERSION:
+        return payload
+
+    migrated = dict(payload)
+    # No migration steps exist yet -- add them here as ``if version < N:`` blocks,
+    # matching ``migrate_report_payload``, the first time the schema changes.
+    migrated["version"] = CURRENT_ACQUISITION_MANIFEST_VERSION
+    return migrated
+
+
 def load_manifest(workspace_root: Path) -> AcquisitionManifest:
-    """Load the acquisition manifest, returning an empty one when absent or corrupt.
+    """Load the acquisition manifest, or an empty one if none has been written yet.
 
     Args:
         workspace_root: Root of the campaign workspace.
 
     Returns:
-        The manifest; empty (rather than raising) if unreadable, so a damaged manifest
-        never blocks a run -- it only loses queue history, which the run re-files.
+        The manifest -- empty ONLY when no manifest file exists yet (legitimate
+        first-run behaviour).
+
+    Raises:
+        ManifestUnreadable: The manifest file exists but could not be loaded: it is
+            unreadable (permissions, I/O error), not valid JSON, valid JSON that fails
+            schema validation even after migration, or was written by a newer Carmel
+            than this build understands. In every case the on-disk file is left
+            untouched -- this function never writes -- so the operator's queue survives
+            for manual recovery.
     """
     path = manifest_path(workspace_root)
     if not path.exists():
         return AcquisitionManifest()
     try:
-        return AcquisitionManifest.model_validate(read_json(path))
-    # Deliberately NOT a bare ``except Exception``: a catch-all here silently converts a
-    # programming error in this module into the indistinguishable message "your manifest
-    # is corrupt" and loses the whole queue. (It already did exactly that once, hiding a
-    # wrong-arity call to ``read_json``.) Only genuine on-disk damage is tolerated.
-    except OSError, ValueError, ValidationError:
-        logger.warning("acquisition manifest at %s is unreadable; starting a fresh one", path)
-        return AcquisitionManifest()
+        payload = read_json(path)
+    except OSError as exc:
+        raise ManifestUnreadable(path, f"could not be read ({exc})") from exc
+    except ValueError as exc:
+        raise ManifestUnreadable(path, f"is not valid JSON ({exc})") from exc
+    try:
+        migrated = migrate_manifest_payload(payload)
+    except _ManifestSchemaTooNew as exc:
+        raise ManifestUnreadable(path, str(exc)) from exc
+    try:
+        return AcquisitionManifest.model_validate(migrated)
+    except ValidationError as exc:
+        raise ManifestUnreadable(path, f"fails schema validation ({exc})") from exc
 
 
 def save_manifest(workspace_root: Path, manifest: AcquisitionManifest) -> None:
-    """Persist the acquisition manifest and refresh the operator instructions."""
+    """Persist the acquisition manifest and refresh the operator instructions.
+
+    Raises:
+        ValueError: ``manifest`` carries zero requests while an on-disk manifest with
+            at least one request already exists. This is a belt-and-braces invariant
+            independent of :func:`load_manifest`'s own fail-closed behaviour: whatever
+            upstream bug or corrupt read produced an empty manifest in memory, this
+            function refuses to be the thing that overwrites the operator's actual
+            outstanding queue (and regenerates ``README.md`` to say nothing is
+            waiting on them) with it. An empty manifest is only ever a legitimate
+            write when there is nothing on disk to lose.
+    """
+    if not manifest.requests:
+        existing_path = manifest_path(workspace_root)
+        if existing_path.exists():
+            try:
+                on_disk = AcquisitionManifest.model_validate(migrate_manifest_payload(read_json(existing_path)))
+            except OSError, ValueError, ValidationError:
+                # Unreadable is treated as "unknown, possibly populated" -- the same
+                # fail-closed instinct as everywhere else in this module -- rather than
+                # assumed empty just because it could not be parsed.
+                on_disk = None
+            if on_disk is None or on_disk.requests:
+                held = (
+                    "could not be read, so it may still hold requests"
+                    if on_disk is None
+                    else f"holds {len(on_disk.requests)} request(s)"
+                )
+                raise ValueError(
+                    f"refusing to write an empty acquisition manifest over the existing one "
+                    f"at {existing_path}, which {held}; this would silently destroy the "
+                    f"operator's outstanding download queue"
+                )
     directory = requests_dir(workspace_root)
     directory.mkdir(parents=True, exist_ok=True)
     inbox_dir(workspace_root).mkdir(parents=True, exist_ok=True)

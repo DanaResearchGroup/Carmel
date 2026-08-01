@@ -725,6 +725,7 @@ def _cmd_requests(
     from carmel.schemas.acquisition import AcquisitionStatus
     from carmel.services.acquisition import (
         AlreadyAcquired,
+        ManifestUnreadable,
         admit_file,
         collect_inbox,
         drop_path_for,
@@ -768,7 +769,12 @@ def _cmd_requests(
         return 1
 
     if collect:
-        changed = collect_inbox(ws, max_bytes=max_bytes)
+        try:
+            changed = collect_inbox(ws, max_bytes=max_bytes)
+        except ManifestUnreadable as exc:
+            print(f"Could not read the acquisition manifest: {exc}")
+            print("Fix or restore the file above before retrying -- it was left untouched.")
+            return 1
         if not changed:
             print("Nothing new in the inbox.")
             print(f"Drop papers into: {inbox_dir(ws)}")
@@ -815,7 +821,12 @@ def _cmd_requests(
         print("Nothing was admitted to the evidence store. Drop the correct document.")
         return 1
 
-    pending = pending_requests(ws)
+    try:
+        pending = pending_requests(ws)
+    except ManifestUnreadable as exc:
+        print(f"Could not read the acquisition manifest: {exc}")
+        print("Fix or restore the file above before retrying -- it was left untouched.")
+        return 1
     if not pending:
         print("No papers are awaiting acquisition.")
         return 0

@@ -149,10 +149,18 @@ class AcquisitionRequest(BaseModel):
         return value
 
 
+#: The current on-disk shape of :class:`AcquisitionManifest`. Bumped whenever a field is
+#: added or changed in a way that is not simply optional-with-a-default; every bump must
+#: be paired with a migration step in
+#: :func:`carmel.services.acquisition.migrate_manifest_payload`, mirroring
+#: :data:`carmel.schemas.literature.CURRENT_REPORT_SCHEMA_VERSION`.
+CURRENT_ACQUISITION_MANIFEST_VERSION = 1
+
+
 class AcquisitionManifest(BaseModel):
     """The full acquisition queue for one campaign workspace."""
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = 1
+    version: int = CURRENT_ACQUISITION_MANIFEST_VERSION
     requests: list[AcquisitionRequest] = Field(default_factory=list)

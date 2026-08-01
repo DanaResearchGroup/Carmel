@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from carmel.agents.tools.extract import ExtractedText, normalize_for_match
 from carmel.schemas.acquisition import (
+    AcquisitionManifest,
     AcquisitionReason,
     AcquisitionRequest,
     AcquisitionStatus,
@@ -29,15 +30,18 @@ from carmel.schemas.acquisition import (
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services.acquisition import (
     AlreadyAcquired,
+    ManifestUnreadable,
     admit_file,
     check_identity,
     collect_inbox,
     drop_path_for,
     inbox_dir,
     load_manifest,
+    manifest_path,
     pending_requests,
     record_request,
     requests_dir,
+    save_manifest,
     slug_for,
 )
 from carmel.services.evidence import artifact_dir
@@ -201,10 +205,10 @@ class TestRecordRequest:
             )
         assert len(load_manifest(tmp_path).requests) == 1
 
-    def test_a_corrupt_manifest_does_not_break_the_run(self, tmp_path: Path) -> None:
-        requests_dir(tmp_path).mkdir(parents=True)
-        (requests_dir(tmp_path) / "manifest.json").write_text("{not json", encoding="utf-8")
-
+    def test_an_absent_manifest_does_not_break_the_run(self, tmp_path: Path) -> None:
+        """No manifest has ever been written for this workspace: legitimate first-run
+        behaviour, not corruption, so this must still yield an empty manifest rather
+        than raising."""
         record_request(
             tmp_path,
             title=TITLE,
@@ -213,6 +217,105 @@ class TestRecordRequest:
             reason=AcquisitionReason.UNREADABLE,
         )
         assert len(load_manifest(tmp_path).requests) == 1
+
+    def test_a_corrupt_manifest_raises_and_leaves_the_file_untouched(self, tmp_path: Path) -> None:
+        """A manifest that fails to parse is the operator's outstanding download queue,
+        not disposable scratch. Losing it (or silently rewriting it away) destroys the
+        one record of what they still need to go obtain, so the load must raise rather
+        than return empty -- and the on-disk bytes must survive exactly as they were
+        for recovery."""
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text("{not json", encoding="utf-8")
+        before = path.read_bytes()
+
+        with pytest.raises(ManifestUnreadable):
+            load_manifest(tmp_path)
+
+        assert path.read_bytes() == before
+
+    def test_a_manifest_from_a_newer_carmel_names_the_version_problem(self, tmp_path: Path) -> None:
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text(json.dumps({"version": 999, "requests": []}), encoding="utf-8")
+        before = path.read_bytes()
+
+        with pytest.raises(ManifestUnreadable, match="999"):
+            load_manifest(tmp_path)
+
+        assert path.read_bytes() == before
+
+    def test_a_manifest_failing_schema_validation_raises_manifest_unreadable(self, tmp_path: Path) -> None:
+        """Valid JSON, current version, but a value the schema rejects (here an
+        unparseable ``requested_at``) is still an unmigratable manifest, not a fresh
+        workspace."""
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "requests": [
+                        {
+                            "slug": "x",
+                            "title": TITLE,
+                            "doi": DOI,
+                            "landing_url": "https://doi.org/x",
+                            "reason": AcquisitionReason.PAYWALLED.value,
+                            "requested_at": "not-a-timestamp",
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        before = path.read_bytes()
+
+        with pytest.raises(ManifestUnreadable):
+            load_manifest(tmp_path)
+
+        assert path.read_bytes() == before
+
+    def test_an_older_but_migratable_manifest_loads_and_preserves_every_request(self, tmp_path: Path) -> None:
+        """An older on-disk version must migrate cleanly rather than being treated as
+        corrupt, and every request it carried must survive the migration."""
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "requests": [
+                        {
+                            "slug": "x",
+                            "title": TITLE,
+                            "doi": DOI,
+                            "landing_url": "https://doi.org/x",
+                            "reason": AcquisitionReason.PAYWALLED.value,
+                            "requested_at": datetime.now(UTC).isoformat(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = load_manifest(tmp_path)
+        assert len(manifest.requests) == 1
+        assert manifest.requests[0].slug == "x"
+
+    def test_save_manifest_refuses_to_write_an_empty_queue_over_a_populated_one(self, tmp_path: Path) -> None:
+        """A belt-and-braces invariant independent of the loader: whatever produced an
+        empty manifest in memory, writing it out must never be able to erase a
+        populated on-disk queue."""
+        populated = AcquisitionManifest(requests=[_request()])
+        save_manifest(tmp_path, populated)
+        before = manifest_path(tmp_path).read_bytes()
+
+        with pytest.raises(ValueError):
+            save_manifest(tmp_path, AcquisitionManifest())
+
+        assert manifest_path(tmp_path).read_bytes() == before
 
 
 def _drop(tmp_path: Path, slug: str, body: str) -> Path:
