@@ -1747,11 +1747,21 @@ def _corpus_loop(
         # paper, so a digest naming any other is a mistake worth surfacing, even when
         # that other paper happens to be in the store.
         by_sha = {artifact.sha256: (artifact, extracted)}
-        # Recorded before the call, not after: a document the budget cut short was
-        # still paid for, and a later pass must not re-buy it.
-        state.covered.append(artifact.sha256)
         corpus_prompt = _corpus_prompt(campaign, artifact, extracted)
         result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
+        # Recorded once the call has RETURNED, which is the moment the tokens are
+        # definitely spent -- not before it is attempted. Both halves matter:
+        #
+        #   * After the call, so a document whose reservation the ledger REFUSED is
+        #     not marked covered. Recording it first meant a budget-truncated pass
+        #     silently dropped the document it stopped on: nothing was paid for it,
+        #     it was never read, and every later pass skipped it while reporting
+        #     "every held document has already been mined". Observed live
+        #     2026.08.01 -- 8 documents recorded as covered by 7 model calls.
+        #   * Before the proposal is processed, so a document that WAS paid for and
+        #     then failed downstream (grounding, validation) is not re-bought. That
+        #     is the case the original ordering was reaching for, and it is kept.
+        state.covered.append(artifact.sha256)
         proposal = CorpusProposal.model_validate(result.output)
         append_typed_event(
             log_path,

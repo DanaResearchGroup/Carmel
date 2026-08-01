@@ -2206,6 +2206,47 @@ class TestCorpusPass:
         assert report.latest.covered_sha256 == [new]
         assert old not in report.latest.covered_sha256
 
+    def test_a_document_the_budget_refused_is_not_recorded_as_covered(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The document a truncated pass stops ON must stay readable.
+
+        Coverage used to be recorded BEFORE the model call, so a pass that ran out
+        of budget marked the document it never reached as covered: nothing was paid
+        for it, it was never read, and every later pass skipped it while reporting
+        that the whole corpus had been mined. Observed live 2026.08.01 -- a pass
+        recorded 8 documents covered using 7 model calls, and the next pass then
+        made zero calls and declared there was nothing new to read.
+
+        This is the F14 skip turned against itself: the optimisation that stops a
+        re-read is only safe if 'covered' means 'actually mined'.
+        """
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        # One call is affordable; the second document's reservation is refused.
+        deps, _, config = _make_deps(
+            [_corpus_proposal([]), _corpus_proposal([])],
+            budget=AgentBudgetConfig(max_model_calls=1),
+        )
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 1
+        assert report.latest.stop_reason == StopReason.MAX_MODEL_CALLS
+        # The heart of it: one call read one document, so exactly one is covered.
+        assert len(report.latest.covered_sha256) == 1, (
+            f"a refused reservation was recorded as covered: {report.latest.covered_sha256}"
+        )
+
+        # And the refused document is still reachable -- not silently skipped forever.
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        second = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 1, "the unread document was skipped by the next pass"
+        assert len(second.latest.covered_sha256) == 1
+
     def test_reread_all_overrides_the_scoping(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
         """The operator's escape hatch: a changed model or prompt is a real reason."""
         _patch_chem_success(monkeypatch)
