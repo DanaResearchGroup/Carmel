@@ -12,6 +12,7 @@ whether those bytes are the right paper.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from datetime import UTC, datetime
@@ -22,15 +23,18 @@ from pydantic import ValidationError
 
 from carmel.agents.tools.extract import ExtractedText, normalize_for_match
 from carmel.schemas.acquisition import (
+    CURRENT_ACQUISITION_MANIFEST_VERSION,
     AcquisitionManifest,
     AcquisitionReason,
     AcquisitionRequest,
     AcquisitionStatus,
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
+from carmel.services import acquisition
 from carmel.services.acquisition import (
     AlreadyAcquired,
     ManifestUnreadable,
+    _sniff_content_type,
     admit_file,
     check_identity,
     collect_inbox,
@@ -38,6 +42,7 @@ from carmel.services.acquisition import (
     inbox_dir,
     load_manifest,
     manifest_path,
+    migrate_manifest_payload,
     pending_requests,
     record_request,
     requests_dir,
@@ -325,7 +330,45 @@ def _drop(tmp_path: Path, slug: str, body: str) -> Path:
     return path
 
 
+def _patch_text_sniff_to_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Seam for tests whose subject is identity checking, slug inference, size caps or
+    inbox sweeps -- NOT format gating.
+
+    Production now refuses a genuine ``text/plain`` drop as a primary document (see
+    :class:`TestPlainTextLandingPageRefused`), but the helpers above (``_drop`` and
+    ``_source``) write real UTF-8 text bodies so :func:`check_identity` has genuine
+    title/DOI text to find. Relabelling the sniff result to ``application/pdf`` alone
+    is not enough: the real extractor would then hand these bytes to ``pypdf``, which
+    has no PDF magic to parse and fails, turning a FULFILLED-expecting test into a
+    "could not extract text" rejection. So this also teaches ``extract_text`` to fall
+    back to genuine plain-text extraction whenever it is asked to treat a body as a PDF
+    that does not actually start with ``%PDF`` -- the admission gate sees
+    "application/pdf" (clearing the new guard), while the text itself is still read
+    verbatim. Format gating itself is covered separately by ``TestSniffContentType``,
+    ``TestHtmlLandingPageRefused``, ``TestPlainTextLandingPageRefused`` and
+    ``TestXmlDropsAreExtractable``, none of which use this seam.
+    """
+    real_sniff = acquisition._sniff_content_type
+    real_extract = acquisition.extract_text
+
+    def _patched_sniff(data: bytes) -> str:
+        content_type = real_sniff(data)
+        return "application/pdf" if content_type == "text/plain" else content_type
+
+    def _patched_extract(data: bytes, content_type: str) -> ExtractedText:
+        if content_type == "application/pdf" and not data[:5].startswith(b"%PDF"):
+            return real_extract(data, "text/plain")
+        return real_extract(data, content_type)
+
+    monkeypatch.setattr(acquisition, "_sniff_content_type", _patched_sniff)
+    monkeypatch.setattr(acquisition, "extract_text", _patched_extract)
+
+
 class TestCollectInbox:
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     @pytest.fixture
     def queued(self, tmp_path: Path) -> AcquisitionRequest:
         return record_request(
@@ -461,6 +504,10 @@ SECOND_DOI = "10.1016/j.combustflame.2019.01.002"
 
 
 class TestPendingRequests:
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     def test_requested_and_rejected_are_both_pending(self, tmp_path: Path) -> None:
         requested = record_request(
             tmp_path, title=TITLE, doi=DOI, landing_url="https://doi.org/" + DOI, reason=AcquisitionReason.PAYWALLED
@@ -537,6 +584,10 @@ class TestAcquisitionRequestSlugValidation:
 
 
 class TestAdmitFile:
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     @pytest.fixture
     def queued(self, tmp_path: Path) -> AcquisitionRequest:
         return record_request(
@@ -794,6 +845,10 @@ class TestAlreadyAcquired:
     misleading, which is how an operator learns to stop trusting the verdicts.
     """
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     @pytest.fixture
     def queued(self, tmp_path: Path) -> AcquisitionRequest:
         return record_request(
@@ -880,6 +935,10 @@ class TestSoleRequestAttributionIsLabelled:
     assertion the operator never made.
     """
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     @pytest.fixture
     def queued(self, tmp_path: Path) -> AcquisitionRequest:
         return record_request(
@@ -934,6 +993,10 @@ class TestInferencePrefersTheStrongerSignal:
     paper's title, so any fuzzy similarity score would reopen the defect the
     secondary-document gate exists to close.
     """
+
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
 
     def test_the_doi_bearing_candidate_wins_over_a_title_only_collision(self, tmp_path: Path) -> None:
         shared = "Laminar flame speeds of syngas hydrogen carbon monoxide air mixtures"
@@ -1008,6 +1071,10 @@ class TestAlreadyAcquiredVerifiesTheStore:
     because the skip is silent the operator would never find out.
     """
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     @pytest.fixture
     def queued(self, tmp_path: Path) -> AcquisitionRequest:
         return record_request(
@@ -1044,3 +1111,518 @@ class TestAlreadyAcquiredVerifiesTheStore:
 
         with pytest.raises(AlreadyAcquired):
             admit_file(tmp_path, source, max_bytes=10_000_000)
+
+
+#: A minimal byte string carrying the ZIP local-file-header magic. Enough for the
+#: sniffer, which looks only at leading/raw bytes and never unpacks the archive.
+ZIP_BYTES = b"PK\x03\x04" + bytes(64)
+
+#: XLSX is a zip whose raw bytes carry the OOXML content-types member name.
+XLSX_BYTES = b"PK\x03\x04" + bytes(16) + b"[Content_Types].xml" + bytes(32)
+
+JATS_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<article><front><article-title>" + TITLE.encode("utf-8") + b"</article-title>"
+    b"<article-id>" + DOI.encode("utf-8") + b"</article-id></front>"
+    b"<body><p>Ignition delay times were measured behind reflected shocks.</p></body></article>"
+)
+
+LANDING_PAGE_HTML = f"""<!DOCTYPE html>
+<html>
+<head><title>{TITLE} | Some Publisher</title></head>
+<body>
+<nav>Log in | Institutional access | Cart</nav>
+<h1>{TITLE}</h1>
+<p>DOI: {DOI}</p>
+<a href="/pdf">Download PDF</a>
+<p>Abstract: measurements follow.</p>
+</body>
+</html>
+"""
+
+
+class TestSniffContentType:
+    def test_pdf_magic_still_sniffs_as_pdf(self) -> None:
+        assert _sniff_content_type(b"%PDF-1.7 rest") == "application/pdf"
+
+    def test_zip_magic_sniffs_as_zip_not_opaque_bytes(self) -> None:
+        """A zip is not valid UTF-8, so before the magic-byte branch existed it fell
+        into ``application/octet-stream`` and the operator was told the file had no
+        extractable text -- a misleading diagnosis for a perfectly good archive."""
+        assert _sniff_content_type(ZIP_BYTES) == "application/zip"
+
+    def test_xlsx_bytes_sniff_distinctly_from_a_plain_zip(self) -> None:
+        """XLSX is a zip whose raw bytes carry ``[Content_Types].xml``; the sniffer
+        must tell the two apart by that substring alone, without unpacking."""
+        xlsx = _sniff_content_type(XLSX_BYTES)
+        plain = _sniff_content_type(ZIP_BYTES)
+        assert xlsx != plain
+        assert xlsx == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+    def test_an_xml_declaration_sniffs_as_xml_not_html(self) -> None:
+        assert _sniff_content_type(JATS_XML) == "application/xml"
+
+    def test_a_jats_article_root_without_a_declaration_sniffs_as_xml(self) -> None:
+        assert _sniff_content_type(b"<article><body><p>text</p></body></article>") == "application/xml"
+
+    def test_html_still_sniffs_as_html(self) -> None:
+        assert _sniff_content_type(LANDING_PAGE_HTML.encode("utf-8")) == "text/html"
+
+    def test_undecodable_non_zip_bytes_still_sniff_as_opaque(self) -> None:
+        assert _sniff_content_type(bytes(range(128, 256))) == "application/octet-stream"
+
+
+class TestHtmlLandingPageRefused:
+    """P0: a saved publisher landing page carries the paper's own title AND DOI in its
+    first few thousand characters, so the identity check cannot tell it from the paper.
+    HTML must therefore be refused as a primary document before identity is even asked.
+    """
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_a_saved_landing_page_carrying_title_and_doi_is_refused(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The page passes check_identity by construction (title and DOI both present),
+        so only an HTML-specific refusal can keep it out of the evidence store."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.html"
+        path.write_bytes(LANDING_PAGE_HTML.encode("utf-8"))
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert changed[0].fulfilled_sha256 is None
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_the_refusal_is_named_as_html_not_as_the_wrong_paper(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The operator dropped a page that IS about the right paper; telling them it
+        "does not look like this paper" would send them chasing the wrong problem. The
+        note must name the real issue (an HTML landing page) and say what to do
+        instead (download the publisher PDF or XML)."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.html"
+        path.write_bytes(LANDING_PAGE_HTML.encode("utf-8"))
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        note = changed[0].identity_note
+        assert "HTML" in note
+        assert "landing page" in note
+        assert "PDF" in note
+        assert "does not look like this paper" not in note
+
+    def test_admit_file_refuses_html_the_same_way(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        source = downloads / "landing.html"
+        source.write_bytes(LANDING_PAGE_HTML.encode("utf-8"))
+
+        request = admit_file(tmp_path, source, slug=queued.slug, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "HTML" in request.identity_note
+
+
+#: The same landing page as ``LANDING_PAGE_HTML``, but as it lands via a browser's
+#: "Save Page As -> Text" instead of "Webpage, Complete": no markup, chrome only (a
+#: nav/paywall strip, "Get rights and content", "Purchase PDF", "Institutional
+#: access"), and deliberately no article body -- this is an abstract page, not the
+#: paper, and must be refused exactly like the HTML version one format over.
+LANDING_PAGE_TEXT = f"""{TITLE}
+Some Publisher
+
+https://doi.org/{DOI}
+
+Log in | Institutional access | Cart
+
+Abstract
+
+Get rights and content
+
+Purchase PDF
+$39.95
+
+Institutional access
+"""
+
+
+class TestPlainTextLandingPageRefused:
+    """P0, one format over from ``TestHtmlLandingPageRefused``: the same publisher
+    landing page saved via the browser's "Save Page As -> Text" sniffs as
+    ``text/plain`` instead of ``text/html``, but still carries the paper's own title
+    and DOI in its first few thousand characters, so it still passes check_identity by
+    construction. No publisher delivers an article as plain text, so plain text must be
+    refused as a primary document before identity is even asked -- the same guard HTML
+    already gets, one format over.
+    """
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_a_landing_page_saved_as_text_is_refused(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """The reproduction: a chrome-only landing page with no article body, saved as
+        plain text, must not be admitted as the article."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.txt"
+        path.write_bytes(LANDING_PAGE_TEXT.encode("utf-8"))
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert changed[0].fulfilled_sha256 is None
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_the_refusal_is_named_as_plain_text_not_as_the_wrong_paper(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """As with the HTML case, the operator dropped a page that IS about the right
+        paper; telling them it "does not look like this paper" would send them chasing
+        the wrong problem. The note must name the real issue (plain text) and say what
+        to do instead (download the publisher PDF or XML) -- and it must be
+        distinguishable from the wrong-paper identity rejection, which needs a
+        different operator action entirely."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.txt"
+        path.write_bytes(LANDING_PAGE_TEXT.encode("utf-8"))
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        note = changed[0].identity_note
+        assert "plain text" in note
+        assert "PDF" in note
+        assert "does not look like this paper" not in note
+
+    def test_admit_file_refuses_plain_text_the_same_way(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        source = downloads / "landing.txt"
+        source.write_bytes(LANDING_PAGE_TEXT.encode("utf-8"))
+
+        request = admit_file(tmp_path, source, slug=queued.slug, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "plain text" in request.identity_note
+
+    def test_application_xml_is_still_accepted_as_a_primary_document(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """JATS full-text XML is a legitimate primary document -- the acquisition
+        artifact is about to start asking operators for it -- and the plain-text
+        refusal must not catch it in its net."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(JATS_XML)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
+
+    def test_application_pdf_is_still_accepted_as_a_primary_document(
+        self, tmp_path: Path, queued: AcquisitionRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression guard: the new plain-text guard must not catch a real PDF. The
+        PDF-extractor seam used by identity/inference tests elsewhere in this module is
+        reused here rather than shipping a real PDF binary fixture."""
+        _patch_text_sniff_to_pdf(monkeypatch)
+        path = inbox_dir(tmp_path) / f"{queued.slug}.pdf"
+        path.write_bytes(f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.".encode())
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
+
+
+class TestSupplementaryFiles:
+    """P0: SI files dropped as ``<slug>.si.<ext>`` used to have stem ``<slug>.si``,
+    match no request, and be silently ignored. They must bind to their parent request
+    and be held -- received, hashed, staged -- without entering the evidence store.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def _drop_si(self, tmp_path: Path, name: str, data: bytes) -> Path:
+        inbox_dir(tmp_path).mkdir(parents=True, exist_ok=True)
+        path = inbox_dir(tmp_path) / name
+        path.write_bytes(data)
+        return path
+
+    def test_a_si_zip_binds_to_its_parent_and_is_received_not_ingested(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The received file is recorded on the parent request and staged under
+        ``literature_requests/supplementary/<sha256>/<original-filename>``, but no
+        identity check runs and nothing enters the evidence store."""
+        name = f"{queued.slug}.si.zip"
+        self._drop_si(tmp_path, name, ZIP_BYTES)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        request = changed[0]
+        assert request.slug == queued.slug
+        # Received, not ingested: the request's own lifecycle is untouched.
+        assert request.status == AcquisitionStatus.REQUESTED
+        assert request.fulfilled_sha256 is None
+
+        assert len(request.supplementary) == 1
+        si = request.supplementary[0]
+        digest = hashlib.sha256(ZIP_BYTES).hexdigest()
+        assert si.sha256 == digest
+        assert si.original_filename == name
+        assert si.parent_slug == queued.slug
+        assert si.content_type == "application/zip"
+        assert si.received_at is not None
+
+        staged = requests_dir(tmp_path) / "supplementary" / digest / name
+        assert staged.read_bytes() == ZIP_BYTES
+
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_the_received_file_survives_a_manifest_round_trip(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        self._drop_si(tmp_path, f"{queued.slug}.si.zip", ZIP_BYTES)
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        reloaded = {r.slug: r for r in load_manifest(tmp_path).requests}[queued.slug]
+        assert len(reloaded.supplementary) == 1
+        assert reloaded.supplementary[0].sha256 == hashlib.sha256(ZIP_BYTES).hexdigest()
+
+    def test_a_numbered_si_file_binds_to_the_same_parent(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """``<slug>.si.<n>.<ext>`` is the convention for a paper with several SI
+        files; the numbered form must bind exactly like the plain one."""
+        self._drop_si(tmp_path, f"{queued.slug}.si.1.zip", ZIP_BYTES)
+        self._drop_si(tmp_path, f"{queued.slug}.si.2.xlsx", XLSX_BYTES)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        names = {si.original_filename for si in changed[0].supplementary}
+        assert names == {f"{queued.slug}.si.1.zip", f"{queued.slug}.si.2.xlsx"}
+        types = {si.content_type for si in changed[0].supplementary}
+        assert types == {
+            "application/zip",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }
+
+    def test_a_second_sweep_does_not_duplicate_a_received_si_file(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        self._drop_si(tmp_path, f"{queued.slug}.si.zip", ZIP_BYTES)
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
+        reloaded = {r.slug: r for r in load_manifest(tmp_path).requests}[queued.slug]
+        assert len(reloaded.supplementary) == 1
+
+    def test_a_si_file_for_an_unknown_slug_is_left_alone(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        self._drop_si(tmp_path, "no-such-request.si.zip", ZIP_BYTES)
+        assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
+
+    def test_an_oversized_si_file_is_not_read_or_recorded(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        self._drop_si(tmp_path, f"{queued.slug}.si.zip", ZIP_BYTES)
+
+        assert collect_inbox(tmp_path, max_bytes=10) == []
+        reloaded = {r.slug: r for r in load_manifest(tmp_path).requests}[queued.slug]
+        assert reloaded.supplementary == []
+
+    def test_received_si_files_are_listed_in_the_readme_as_not_yet_usable(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The operator must be able to see that the file arrived AND that it is not
+        yet evidence -- otherwise "received and silently unused" is indistinguishable
+        from the silent-ignore bug this replaces."""
+        name = f"{queued.slug}.si.zip"
+        self._drop_si(tmp_path, name, ZIP_BYTES)
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+        assert "Supplementary" in readme
+        assert name in readme
+        assert "not yet" in readme.lower()
+
+    def test_a_si_file_still_binds_after_the_parent_is_fulfilled(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """SI usually arrives with or after the paper itself; a FULFILLED parent must
+        still receive it."""
+        _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        self._drop_si(tmp_path, f"{queued.slug}.si.zip", ZIP_BYTES)
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
+        assert len(changed[0].supplementary) == 1
+
+
+class TestXmlDropsAreExtractable:
+    def test_a_jats_xml_drop_is_admitted_as_the_paper(self, tmp_path: Path) -> None:
+        """Full-text JATS XML is a legitimate primary document: it must sniff as XML
+        (not HTML, which is refused) and its text must be extractable so the identity
+        check can pass."""
+        queued = record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(JATS_XML)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
+        assert changed[0].fulfilled_sha256
+
+
+class TestManifestMigrationV1ToV2:
+    def _v1_request(self, slug: str) -> dict[str, object]:
+        return {
+            "slug": slug,
+            "title": TITLE,
+            "doi": DOI,
+            "landing_url": "https://doi.org/x",
+            "reason": AcquisitionReason.PAYWALLED.value,
+            "requested_at": datetime.now(UTC).isoformat(),
+        }
+
+    def test_migrate_manifest_payload_adds_supplementary_to_every_v1_request(self) -> None:
+        """The first real step in the migration chain: a v1 request has no
+        ``supplementary`` field, and the migration must add it as an empty list."""
+        payload = {"version": 1, "requests": [self._v1_request("a"), self._v1_request("b")]}
+
+        migrated = migrate_manifest_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert migrated["version"] == CURRENT_ACQUISITION_MANIFEST_VERSION
+        requests = migrated["requests"]
+        assert isinstance(requests, list)
+        assert [r.get("supplementary") for r in requests] == [[], []]
+
+    def test_a_version_1_manifest_loads_with_all_requests_preserved(self, tmp_path: Path) -> None:
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text(
+            json.dumps({"version": 1, "requests": [self._v1_request("a"), self._v1_request("b")]}),
+            encoding="utf-8",
+        )
+
+        manifest = load_manifest(tmp_path)
+
+        assert manifest.version == CURRENT_ACQUISITION_MANIFEST_VERSION
+        assert [r.slug for r in manifest.requests] == ["a", "b"]
+        assert all(r.supplementary == [] for r in manifest.requests)
+
+
+class TestRecordRequestMerges:
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_text_sniff_to_pdf(monkeypatch)
+
+    def test_a_repeat_request_with_new_detail_merges_without_resetting_progress(self, tmp_path: Path) -> None:
+        """A second failed fetch for the same paper carries fresher metadata (a new
+        HTTP status, a better landing URL). Merging it must never reset what the
+        operator already achieved: status, fulfilled_sha256, identity_note and the
+        original requested_at all survive."""
+        first = record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+        requested_at = first.requested_at
+        _drop(tmp_path, first.slug, f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+        fulfilled = {r.slug: r for r in load_manifest(tmp_path).requests}[first.slug]
+        assert fulfilled.status == AcquisitionStatus.FULFILLED
+
+        merged = record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://publisher.example/article",
+            reason=AcquisitionReason.FETCH_FAILED,
+            detail="HTTP 402 on retry",
+        )
+
+        assert len(load_manifest(tmp_path).requests) == 1
+        assert merged.detail == "HTTP 402 on retry"
+        assert merged.landing_url == "https://publisher.example/article"
+        assert merged.reason == AcquisitionReason.FETCH_FAILED
+        assert merged.status == AcquisitionStatus.FULFILLED
+        assert merged.fulfilled_sha256 == fulfilled.fulfilled_sha256
+        assert merged.identity_note == fulfilled.identity_note
+        assert merged.requested_at == requested_at
+
+        reloaded = load_manifest(tmp_path).requests[0]
+        assert reloaded.detail == "HTTP 402 on retry"
+        assert reloaded.status == AcquisitionStatus.FULFILLED
+
+    def test_a_repeat_request_with_identical_metadata_still_yields_exactly_one_request(self, tmp_path: Path) -> None:
+        for _ in range(3):
+            record_request(
+                tmp_path,
+                title=TITLE,
+                doi=DOI,
+                landing_url="https://doi.org/" + DOI,
+                reason=AcquisitionReason.PAYWALLED,
+                detail="HTTP 403",
+            )
+
+        manifest = load_manifest(tmp_path)
+        assert len(manifest.requests) == 1
+        assert manifest.requests[0].detail == "HTTP 403"
+
+    def test_a_repeat_request_with_an_empty_detail_does_not_erase_an_informative_one(self, tmp_path: Path) -> None:
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+            detail="HTTP 403",
+        )
+        merged = record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        assert merged.detail == "HTTP 403"

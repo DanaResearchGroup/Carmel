@@ -105,6 +105,33 @@ class AcquisitionStatus(StrEnum):
     was NOT admitted to the evidence store."""
 
 
+class SupplementaryFile(BaseModel):
+    """One supplementary-information file received for a request: held, not ingested.
+
+    A file dropped as ``<slug>.si.<ext>`` (or ``<slug>.si.<n>.<ext>``) is bound to its
+    parent request and staged verbatim, but it is deliberately NOT admitted to the
+    evidence store: no text is extracted, no identity check runs, and nothing here may
+    be cited as evidence. Carmel cannot process these formats yet -- this record exists
+    so a received file is visible (to the operator and to a future ingestion pass)
+    instead of being silently ignored, which is the defect it replaces.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sha256: str
+    """Digest of the received bytes; also names the staging directory the raw file is
+    held in (``literature_requests/supplementary/<sha256>/<original_filename>``)."""
+    original_filename: str
+    """The name the operator dropped the file under, kept verbatim -- it carries the
+    role marker (``.si.``) and the extension, which is all the format information a
+    future ingestion pass will have."""
+    parent_slug: str
+    """Slug of the request this file supplements."""
+    content_type: str
+    """MIME type sniffed from the bytes (never from the filename)."""
+    received_at: datetime
+
+
 class AcquisitionRequest(BaseModel):
     """One paper Carmel needs a human to obtain."""
 
@@ -136,6 +163,10 @@ class AcquisitionRequest(BaseModel):
     identity_note: str = ""
     """Why the identity check passed or failed. Kept for rejected requests too, so a
     puzzled operator can see what the check was looking for."""
+    supplementary: list[SupplementaryFile] = Field(default_factory=list)
+    """Supplementary-information files received for this paper. Received-and-held
+    only: see :class:`SupplementaryFile` -- nothing in this list is usable as
+    evidence."""
 
     @field_validator("landing_url")
     @classmethod
@@ -154,7 +185,7 @@ class AcquisitionRequest(BaseModel):
 #: be paired with a migration step in
 #: :func:`carmel.services.acquisition.migrate_manifest_payload`, mirroring
 #: :data:`carmel.schemas.literature.CURRENT_REPORT_SCHEMA_VERSION`.
-CURRENT_ACQUISITION_MANIFEST_VERSION = 1
+CURRENT_ACQUISITION_MANIFEST_VERSION = 2
 
 
 class AcquisitionManifest(BaseModel):

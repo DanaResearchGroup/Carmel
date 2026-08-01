@@ -10,6 +10,7 @@ import yaml
 from Carmel import main
 from carmel.paths import WORKSPACE_SUBDIRS
 from carmel.version import __version__
+from tests.test_acquisition import _patch_text_sniff_to_pdf
 
 
 class TestVersionCommand:
@@ -604,6 +605,15 @@ class TestRequestsCommand:
     and admitting must report the identity verdict immediately -- waiting for a whole
     literature run to learn whether a file was accepted is what made this painful."""
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # This class's fixtures write plain-text bodies to stand in for "the right
+        # paper" -- these tests are about CLI wiring (exit codes, --collect/--add
+        # reporting), not about format gating, which is exercised on its own in
+        # TestPlainTextLandingPageRefused. Without this seam every "accepted" case here
+        # would now be REJECTED by the new text/plain admission guard.
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     def _campaign_with_request(self, tmp_path: Path) -> tuple[str, Path]:
         from Carmel import main
         from carmel.schemas.acquisition import AcquisitionReason
@@ -820,6 +830,14 @@ class TestRequestsCommandAddDirectory:
     _SECOND_TITLE = "Shock tube study of ammonia oxidation ignition delay times"
     _SECOND_DOI = "10.1016/j.test.2019.01.001"
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same seam as TestRequestsCommand: these fixtures write plain-text bodies
+        # (named .pdf to mirror real publisher filenames, since sniffing is by content,
+        # never filename) and this class is about directory-add wiring, not format
+        # gating.
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     def _campaign_with_requests(self, tmp_path: Path, titles_dois: list[tuple[str, str]]) -> tuple[str, Path]:
         from Carmel import main
         from carmel.schemas.acquisition import AcquisitionReason
@@ -1011,6 +1029,12 @@ class TestRequestsCommandReIngest:
 
     _TITLE = "Shock tube ammonia oxidation ignition delay times"
     _DOI = "10.1016/j.test.2019.01.001"
+
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same seam as TestRequestsCommand: this class is about re-ingest idempotency
+        # (SKIPPED vs REJECTED reporting), not format gating.
+        _patch_text_sniff_to_pdf(monkeypatch)
 
     def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
         from Carmel import main

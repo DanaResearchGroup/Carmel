@@ -76,6 +76,7 @@ from carmel.services.literature import (
     run_record_for,
 )
 from carmel.services.plan_progress import publish_lock_info
+from tests.test_acquisition import _patch_text_sniff_to_pdf
 
 DOI = "10.1000/test.doi"
 # An admissible host: production refuses to auto-admit documents from hosts
@@ -1177,6 +1178,14 @@ class TestManualAcquisitionsAreCollectedByARun:
     was fully unit-tested but had NO caller, so the feature was complete everywhere
     except at the point where it would have been used.
     """
+
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `_queue_and_drop` writes a plain-text body to stand in for "the paper the
+        # operator dropped" -- this class is about the inbox-collection wiring at the
+        # start of a run, not format gating, which is exercised on its own in
+        # tests/test_acquisition.py::TestPlainTextLandingPageRefused.
+        _patch_text_sniff_to_pdf(monkeypatch)
 
     @staticmethod
     def _queue_and_drop(workspace_root: Path, body: str) -> str:

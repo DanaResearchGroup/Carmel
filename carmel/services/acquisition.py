@@ -50,9 +50,10 @@ from carmel.schemas.acquisition import (
     AcquisitionReason,
     AcquisitionRequest,
     AcquisitionStatus,
+    SupplementaryFile,
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
-from carmel.services.artifacts import read_json, write_json, write_text
+from carmel.services.artifacts import read_json, write_bytes, write_json, write_text
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.grounding import (
     secondary_document_marker,
@@ -62,8 +63,19 @@ logger = get_logger("services.acquisition")
 
 REQUESTS_DIR = "literature_requests"
 INBOX_DIR = "inbox"
+SUPPLEMENTARY_DIR = "supplementary"
 MANIFEST_NAME = "manifest.json"
 README_NAME = "README.md"
+
+#: Archive types :func:`_sniff_content_type` can recognise but Carmel cannot yet
+#: process. Kept as data so the two places that care -- the primary-document refusal in
+#: :func:`_admit_one` and the received-SI record -- name the same set.
+ARCHIVE_CONTENT_TYPES = frozenset(
+    {
+        "application/zip",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    }
+)
 
 #: Fraction of a title's significant words that must appear in the document for a
 #: title-only identity match. Deliberately high: title matching is the WEAKER of the two
@@ -224,6 +236,16 @@ def inbox_dir(workspace_root: Path) -> Path:
     return requests_dir(workspace_root) / INBOX_DIR
 
 
+def supplementary_dir(workspace_root: Path) -> Path:
+    """Return the directory received supplementary files are staged under.
+
+    Layout mirrors the evidence store's content addressing without being part of it:
+    ``supplementary/<sha256>/<original-filename>``. Held bytes only -- nothing under
+    this directory is evidence.
+    """
+    return requests_dir(workspace_root) / SUPPLEMENTARY_DIR
+
+
 def manifest_path(workspace_root: Path) -> Path:
     """Return the path of the acquisition manifest."""
     return requests_dir(workspace_root) / MANIFEST_NAME
@@ -320,14 +342,29 @@ class _ManifestSchemaTooNew(ValueError):
     dict, never the path) does not have to fabricate one."""
 
 
+def _migrate_v1_to_v2(payload: dict[str, object]) -> dict[str, object]:
+    """v1 -> v2: every request gains a ``supplementary`` field (received SI files).
+
+    A v1 request has no such field, so the migration adds it as an empty list -- no v1
+    workspace can have received a supplementary file, because v1 had no way to record
+    one. Requests that are not dicts are passed through untouched for the schema
+    validator to reject with its own, better message.
+    """
+    migrated = dict(payload)
+    requests = migrated.get("requests")
+    if isinstance(requests, list):
+        migrated["requests"] = [
+            {"supplementary": [], **request} if isinstance(request, dict) else request for request in requests
+        ]
+    return migrated
+
+
 def migrate_manifest_payload(payload: object) -> object:
     """Bring a persisted manifest payload up to the current schema version.
 
     Mirrors :func:`carmel.services.literature.migrate_report_payload`: a chain applied
     step by step from the payload's own version, so a bump two versions from now does
-    not have to re-derive what an intermediate version looked like. There is exactly
-    one version so far, so the chain is currently empty -- the next bump adds a
-    ``_migrate_v1_to_v2`` step here, matching that module's structure.
+    not have to re-derive what an intermediate version looked like.
 
     Raises:
         _ManifestSchemaTooNew: If ``payload``'s ``version`` is newer than
@@ -354,8 +391,8 @@ def migrate_manifest_payload(payload: object) -> object:
         return payload
 
     migrated = dict(payload)
-    # No migration steps exist yet -- add them here as ``if version < N:`` blocks,
-    # matching ``migrate_report_payload``, the first time the schema changes.
+    if version < 2:
+        migrated = _migrate_v1_to_v2(migrated)
     migrated["version"] = CURRENT_ACQUISITION_MANIFEST_VERSION
     return migrated
 
@@ -477,12 +514,39 @@ def record_request(
 
     Returns:
         The new request, or the existing one when this paper was already queued (a
-        second failed attempt at the same paper must not enqueue it twice).
+        second failed attempt at the same paper must not enqueue it twice). A repeat
+        call merges the metadata it passes -- title, doi, landing_url, reason, and a
+        non-empty detail -- into the existing request, because the later attempt's
+        observation is fresher (a new HTTP status, a better landing URL). The merge
+        never touches the request's PROGRESS: ``status``, ``fulfilled_sha256``,
+        ``identity_note``, ``supplementary`` and the original ``requested_at`` all
+        survive, so re-recording a request cannot undo what the operator already did.
     """
     manifest = load_manifest(workspace_root)
     slug = slug_for(doi, title)
     for existing in manifest.requests:
         if existing.slug == slug:
+            merged = False
+            if existing.title != title:
+                existing.title = title
+                merged = True
+            if doi is not None and existing.doi != doi:
+                existing.doi = doi
+                merged = True
+            if existing.landing_url != landing_url:
+                existing.landing_url = landing_url
+                merged = True
+            if existing.reason != reason:
+                existing.reason = reason
+                merged = True
+            # An empty detail is the caller having nothing to say, not an instruction
+            # to erase what an earlier attempt observed.
+            if detail and existing.detail != detail:
+                existing.detail = detail
+                merged = True
+            if merged:
+                save_manifest(workspace_root, manifest)
+                logger.info("merged fresher metadata into queued acquisition request %s", slug)
             return existing
 
     request = AcquisitionRequest(
@@ -687,6 +751,73 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
     )
 
 
+_SI_STEM_RE = re.compile(r"^(?P<slug>.+?)\.si(?:\.\d+)?$")
+"""Filename-stem convention for supplementary information: ``<slug>.si.<ext>`` or
+``<slug>.si.<n>.<ext>`` for the nth of several SI files. ``path.stem`` strips only the
+final extension, so the stems this sees are ``<slug>.si`` and ``<slug>.si.<n>``."""
+
+
+def _si_parent_slug(stem: str) -> str | None:
+    """Return the parent slug when ``stem`` carries the ``.si`` role marker, else None.
+
+    Only the SHAPE is parsed here; whether the slug names a queued request is the
+    caller's question, so a stem like ``unrelated.si`` for nothing in the queue still
+    falls through to the ordinary "matches no queued request" warning.
+    """
+    match = _SI_STEM_RE.match(stem)
+    return match.group("slug") if match else None
+
+
+def _receive_supplementary(workspace_root: Path, path: Path, parent: AcquisitionRequest, *, max_bytes: int) -> bool:
+    """Record and stage one dropped supplementary file. Mutates ``parent`` on success.
+
+    Received-and-held ONLY: no text extraction, no identity check, no evidence-store
+    artifact. Carmel cannot process these formats yet, so admitting them as evidence
+    would launder unverified bytes into the store; instead the raw bytes are staged at
+    ``literature_requests/supplementary/<sha256>/<original-filename>`` and the receipt
+    is recorded on the parent request, where the README surfaces it.
+
+    Returns:
+        True when ``parent`` changed (a new receipt was recorded); False when the file
+        was already received, over the cap, or unreadable -- in every case the dropped
+        file itself is left untouched.
+    """
+    # Same stat-before-read discipline as _admit_one: an oversized file must be
+    # refused without being pulled into memory, and the post-read re-check closes the
+    # window in which it can grow past the cap.
+    try:
+        if path.stat().st_size > max_bytes:
+            logger.warning("supplementary file %s is over the %d byte cap; leaving it untouched", path.name, max_bytes)
+            return False
+        data = path.read_bytes()
+    except OSError as exc:
+        logger.warning("could not read supplementary file %s: %s", path.name, exc)
+        return False
+    if len(data) > max_bytes:
+        logger.warning("supplementary file %s is over the %d byte cap; leaving it untouched", path.name, max_bytes)
+        return False
+
+    digest = hashlib.sha256(data).hexdigest()
+    if any(si.sha256 == digest and si.original_filename == path.name for si in parent.supplementary):
+        return False  # Already received on an earlier sweep; nothing to change.
+
+    staged = supplementary_dir(workspace_root) / digest / path.name
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes(staged, data)
+
+    parent.supplementary.append(
+        SupplementaryFile(
+            sha256=digest,
+            original_filename=path.name,
+            parent_slug=parent.slug,
+            content_type=_sniff_content_type(data),
+            received_at=datetime.now(UTC),
+        )
+    )
+    logger.info("received supplementary file %s for %s (held, not ingested)", path.name, parent.slug)
+    return True
+
+
 def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRequest]:
     """Admit verified dropped papers into the evidence store.
 
@@ -695,12 +826,17 @@ def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRe
     :attr:`ArtifactProvenance.MANUAL`); a file that fails marks its request
     ``REJECTED`` with the reason, and its bytes are NOT admitted.
 
+    A file dropped as ``<slug>.si.<ext>`` (or ``<slug>.si.<n>.<ext>``) is
+    supplementary information for the request ``<slug>``: it is received and held (see
+    :func:`_receive_supplementary`), never identity-checked or admitted as evidence.
+
     Args:
         workspace_root: Root of the campaign workspace.
         max_bytes: Hard cap on a single artifact's size.
 
     Returns:
-        The requests whose state changed during this sweep.
+        The requests whose state changed during this sweep (including a request that
+        only received a supplementary file).
     """
     inbox = inbox_dir(workspace_root)
     if not inbox.is_dir():
@@ -713,8 +849,16 @@ def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRe
     for path in sorted(inbox.iterdir()):
         if not path.is_file() or path.name.startswith("."):
             continue
-        request = by_slug.get(path.stem.lower())
+        stem = path.stem.lower()
+        request = by_slug.get(stem)
         if request is None:
+            si_slug = _si_parent_slug(stem)
+            parent = by_slug.get(si_slug) if si_slug is not None else None
+            if parent is not None:
+                received = _receive_supplementary(workspace_root, path, parent, max_bytes=max_bytes)
+                if received and all(existing is not parent for existing in changed):
+                    changed.append(parent)
+                continue
             logger.warning("dropped file %s matches no queued request; leaving it untouched", path.name)
             continue
         if request.status == AcquisitionStatus.FULFILLED:
@@ -724,7 +868,10 @@ def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRe
         if stored is not None:
             request.status = AcquisitionStatus.FULFILLED
             request.fulfilled_sha256 = stored.sha256
-        changed.append(request)
+        if all(existing is not request for existing in changed):
+            # One sweep can touch a request twice (its paper AND a supplementary
+            # file); report it once.
+            changed.append(request)
 
     if changed:
         save_manifest(workspace_root, manifest)
@@ -743,15 +890,35 @@ def _sniff_content_type(data: bytes) -> str:
         data: The dropped file's bytes.
 
     Returns:
-        A MIME type understood by :func:`carmel.agents.tools.extract.extract_text`.
+        A MIME type. Textual types are understood by
+        :func:`carmel.agents.tools.extract.extract_text`; the archive types
+        (``application/zip`` and the XLSX type) are recognised so their handling can be
+        honest -- "Carmel cannot process this format yet" rather than the misleading
+        "no extractable text" an opaque-bytes classification used to produce.
     """
     if data[:5].startswith(b"%PDF"):
         return "application/pdf"
+    if data[:4] == b"PK\x03\x04":
+        # ZIP local-file-header magic. XLSX is a zip that carries an OOXML
+        # ``[Content_Types].xml`` member; a raw byte-substring scan is enough to tell
+        # the two apart and deliberately the ONLY inspection performed -- these are
+        # untrusted operator-dropped bytes, and unpacking an archive (zip bombs,
+        # traversal member names) is exactly the attack surface this module refuses
+        # to open.
+        if b"[Content_Types].xml" in data:
+            return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        return "application/zip"
     try:
         head = data[:4096].decode("utf-8").lstrip().lower()
     except UnicodeDecodeError:
         return "application/octet-stream"
-    if head.startswith(("<!doctype html", "<html", "<?xml")):
+    if head.startswith(("<?xml", "<article", "<!doctype article")):
+        # An XML declaration or a JATS-style article root is full-text XML, a
+        # legitimate primary document -- distinct from HTML, which is refused as one
+        # (a browser's "Save Page As" of a landing page), so the two must never share
+        # a classification.
+        return "application/xml"
+    if head.startswith(("<!doctype html", "<html")):
         return "text/html"
     return "text/plain"
 
@@ -798,6 +965,59 @@ def _admit_one(
         return None
 
     content_type = _sniff_content_type(data)
+
+    # HTML is refused as a primary document BEFORE any identity check runs, because
+    # the identity check cannot catch this case: a publisher landing page saved with
+    # the browser's "Save Page As" carries the paper's own title AND DOI in its first
+    # few thousand characters, so it passes :func:`check_identity` by construction and
+    # would be admitted as the article itself. The note deliberately does not say
+    # "wrong paper" -- the page IS about the right paper, and the operator's fix is
+    # different: go back and download the actual document.
+    if content_type == "text/html":
+        request.status = AcquisitionStatus.REJECTED
+        request.identity_note = (
+            "the dropped file is an HTML page -- almost always a browser-saved publisher "
+            "landing page about the paper, not the paper itself, and a landing page "
+            "carries the right title and DOI on the wrong document. Download the "
+            "publisher's PDF (or full-text XML) of the article and drop that instead"
+        )
+        logger.warning("rejected dropped file for %s: HTML is not accepted as a primary document", request.slug)
+        return None
+
+    # Plain text is refused as a primary document for the same reason HTML is, one
+    # format over: a publisher landing page saved via the browser's "Save Page As ->
+    # Text" strips the markup but keeps the paper's own title and DOI in the first few
+    # thousand characters, so it still passes :func:`check_identity` by construction --
+    # an abstract-only page would be admitted as the full article. No publisher
+    # delivers an article as plain text, so a `.txt` in the inbox is always either a
+    # saved landing page or a paste, never the article itself. As with the HTML case,
+    # the note deliberately does not say "wrong paper" -- the operator's fix is to go
+    # get the actual document, not to re-check identity.
+    if content_type == "text/plain":
+        request.status = AcquisitionStatus.REJECTED
+        request.identity_note = (
+            "the dropped file is plain text -- almost always a browser-saved publisher "
+            "landing page about the paper (or a paste), not the paper itself, and a "
+            "landing page carries the right title and DOI on the wrong document. "
+            "Download the publisher's PDF (or full-text XML) of the article and drop "
+            "that instead"
+        )
+        logger.warning("rejected dropped file for %s: plain text is not accepted as a primary document", request.slug)
+        return None
+
+    # Archives are recognised (see :func:`_sniff_content_type`) but not processable:
+    # naming that plainly beats the misleading "no extractable text (an image-only
+    # scan?)" diagnosis an opaque-bytes classification used to produce for a zip.
+    if content_type in ARCHIVE_CONTENT_TYPES:
+        request.status = AcquisitionStatus.REJECTED
+        request.identity_note = (
+            f"the dropped file is an archive ({content_type}); Carmel cannot process this "
+            f"format as a paper yet. If it is the paper's supplementary information, drop "
+            f"it as `{request.slug}.si.<ext>` so it is received and held with the request"
+        )
+        logger.warning("rejected dropped file for %s: archives are not primary documents", request.slug)
+        return None
+
     try:
         extracted = extract_text(data, content_type)
     except Exception as exc:  # noqa: BLE001 - a bad drop must not kill the run
@@ -1175,6 +1395,21 @@ def _readme_text(manifest: AcquisitionManifest) -> str:
         lines.append("")
         for request in rejected:
             lines.append(f"- `{request.slug}.pdf` -- {request.identity_note}")
+        lines.append("")
+
+    received = [(request, si) for request in manifest.requests for si in request.supplementary]
+    if received:
+        lines.append(f"## Supplementary files received ({len(received)})")
+        lines.append("")
+        lines.append("These files arrived as supplementary information (`<slug>.si.<ext>`) and are")
+        lines.append("held with their requests. They are received only -- NOT yet usable as")
+        lines.append("evidence, because Carmel cannot process these formats yet.")
+        lines.append("")
+        for request, si in received:
+            lines.append(
+                f"- `{si.original_filename}` for `{request.slug}` "
+                f"({si.content_type}, sha256 `{si.sha256[:12]}`, received {si.received_at:%Y-%m-%d})"
+            )
         lines.append("")
 
     return "\n".join(lines)

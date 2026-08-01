@@ -199,6 +199,30 @@ class TestExtractHtml:
         assert "Beta" in result.text
 
 
+class TestExtractXml:
+    """Tests for extract_text on application/xml content (JATS full text and the
+    like). ``application/xml`` does not start with ``text/``, so without a dedicated
+    branch it would fall through to the empty ``unknown`` result."""
+
+    def test_jats_xml_text_is_extracted_by_tag_stripping(self) -> None:
+        xml = (
+            b'<?xml version="1.0" encoding="UTF-8"?>'
+            b"<article><front><article-title>Shock tube study of ignition delay</article-title></front>"
+            b"<body><p>Ignition delay times were measured behind reflected shocks.</p></body></article>"
+        )
+        result = extract_text(xml, "application/xml")
+        assert "Shock tube study of ignition delay" in result.text
+        assert "Ignition delay times were measured behind reflected shocks." in result.text
+        assert "article-title" not in result.text
+        assert result.extractor == "xml"
+        assert result.lossy is False
+
+    def test_text_xml_is_routed_to_the_same_extractor(self) -> None:
+        result = extract_text(b"<article><p>Body text.</p></article>", "text/xml")
+        assert "Body text." in result.text
+        assert result.extractor == "xml"
+
+
 class TestDecodeBytes:
     """Tests for the internal UTF-8 decode fallback used by HTML/text extraction."""
 

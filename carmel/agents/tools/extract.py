@@ -721,6 +721,27 @@ def _extract_html(data: bytes) -> ExtractedText:
     )
 
 
+def _extract_xml(data: bytes) -> ExtractedText:
+    """Extract text from XML (e.g. JATS full text) by tag-stripping, exactly as HTML.
+
+    :class:`_HTMLTextExtractor` handles this without change: dropping markup and
+    keeping character data works the same for ``<article-title>`` as for ``<h1>``, and
+    JATS carries no ``<script>``/``<style>`` content for the stripping to miss.
+    Kept as its own function (and ``extractor`` label) rather than reusing
+    :func:`_extract_html` so the two content types remain distinguishable downstream --
+    HTML is refused as a primary document by manual acquisition, XML is not.
+    """
+    parser = _HTMLTextExtractor()
+    parser.feed(_decode_bytes(data))
+    parser.close()
+    text = "".join(parser.parts)
+    text, sections, truncated = _cap_text(text, [TextSection(label="body", start=0, end=len(text))])
+    sections = _label_special_sections(text, sections)
+    return ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=sections, extractor="xml", lossy=truncated
+    )
+
+
 def _extract_plain_text(data: bytes) -> ExtractedText:
     """Take ``text/*`` content verbatim (still section-labeled for references/abstract)."""
     text = _decode_bytes(data)
@@ -742,14 +763,19 @@ def extract_text(data: bytes, content_type: str) -> ExtractedText:
     Returns:
         An :class:`ExtractedText`. PDF extraction is via the optional ``pypdf``
         dependency (``lossy=True`` and ``extractor="pdf:unavailable"`` when it is not
-        installed). HTML is stripped of ``<script>``/``<style>`` content using only the
-        stdlib. Any other ``text/*`` type is taken verbatim. An unrecognized content
-        type yields empty text with ``lossy=True``.
+        installed). HTML and XML are stripped of markup using only the stdlib. Any
+        other ``text/*`` type is taken verbatim. An unrecognized content type yields
+        empty text with ``lossy=True``.
     """
     if content_type == "application/pdf":
         return _extract_pdf(data)
     if content_type == "text/html":
         return _extract_html(data)
+    # Checked BEFORE the generic ``text/*`` prefix: ``application/xml`` does not start
+    # with ``text/`` and would otherwise fall through to the empty ``unknown`` result,
+    # while ``text/xml`` would be taken verbatim, tags and all.
+    if content_type in ("application/xml", "text/xml"):
+        return _extract_xml(data)
     if content_type.startswith("text/"):
         return _extract_plain_text(data)
     return ExtractedText(text="", normalized="", sections=[], extractor="unknown", lossy=True)
