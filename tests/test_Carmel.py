@@ -1510,3 +1510,81 @@ class TestCorpusPassCommand:
             "dispatcher run would execute it a second time and double the findings"
         )
         assert corpus.attempt_ids, "the dispatcher recorded no attempt for the corpus pass"
+
+
+class TestDispatchingAnAlreadyQueuedCorpusPass:
+    """The escape from a dead end where two correct guards contradicted each other.
+
+    A corpus pass that requires approval is appended by one command and can only
+    run once a human approves it. But the dispatcher's own advice was "approve it
+    and dispatch again", while re-running the plain command correctly refused --
+    it would have queued a second identical pass. There was no third command, so
+    an approval-gated corpus pass could never be run at all (found by live run
+    2026.08.01, invisible to the suite because nothing re-ran the command after a
+    refusal). ``--dispatch-queued`` is that third command.
+    """
+
+    def test_the_refusal_names_the_command_that_actually_dispatches(self, tmp_path: Path) -> None:
+        """A refusal that does not name the way forward is the dead end itself."""
+        from carmel.services.planner import append_corpus_pass_action
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+        append_corpus_pass_action(ws, budget_tokens=100_000, model_name="m")
+
+        with pytest.raises(ValueError) as excinfo:
+            append_corpus_pass_action(ws, budget_tokens=100_000, model_name="m")
+
+        assert "--dispatch-queued" in str(excinfo.value)
+        assert cid  # the campaign id is what the operator passes to that command
+
+    def test_dispatching_when_nothing_is_queued_is_a_typed_refusal(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """'I ran nothing' must never be indistinguishable from 'I ran your pass'."""
+        from Carmel import main
+
+        cid, _ = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(["corpus-pass", "--campaign", cid, "--workspaces", str(tmp_path), "--dispatch-queued", "--dry-run"])
+
+        assert code == 1
+        assert "No corpus pass is queued" in capsys.readouterr().err
+
+    def test_a_budget_may_not_be_renamed_at_dispatch_time(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The approver agreed to a specific cap; running under another defeats that."""
+        from Carmel import main
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--dispatch-queued",
+                "--budget-tokens",
+                "999999",
+            ]
+        )
+
+        assert code == 1
+        assert "cannot be combined" in capsys.readouterr().err
+        assert ws  # nothing was appended under the rejected budget
+
+    def test_a_plain_run_still_requires_an_explicit_budget(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Making --budget-tokens optional for --dispatch-queued must not make it
+        optional for the append path, where it is the operator's authorisation."""
+        from Carmel import main
+
+        cid, _ = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(["corpus-pass", "--campaign", cid, "--workspaces", str(tmp_path), "--dry-run"])
+
+        assert code == 1
+        assert "--budget-tokens is required" in capsys.readouterr().err

@@ -6,10 +6,17 @@
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from carmel.config import validate_config_file
 from carmel.paths import init_workspace
 from carmel.version import __version__
+
+if TYPE_CHECKING:
+    # Type-only: keeps this module importable without eagerly pulling the schema
+    # package at CLI start-up, matching how every other symbol here is imported
+    # inside the function that uses it.
+    from carmel.schemas import Campaign
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -110,14 +117,28 @@ def create_parser() -> argparse.ArgumentParser:
     corpus.add_argument(
         "--budget-tokens",
         type=int,
-        required=True,
+        default=None,
         help=(
-            "How many model tokens this pass may consume. Required and explicit: an "
-            "operator-authorised action names its own budget rather than drawing on "
-            "the campaign's autonomous-spend ceiling. Tokens rather than dollars "
-            "because tokens are what the run consumes and what the provider meters, "
-            "so this number is the one that binds; the equivalent dollar cost is "
-            "estimated and printed for you."
+            "How many model tokens this pass may consume. Required (except with "
+            "--dispatch-queued, which runs a pass whose budget was named when it was "
+            "appended) and explicit: an operator-authorised action names its own "
+            "budget rather than drawing on the campaign's autonomous-spend ceiling. "
+            "Tokens rather than dollars because tokens are what the run consumes and "
+            "what the provider meters, so this number is the one that binds; the "
+            "equivalent dollar cost is estimated and printed for you."
+        ),
+    )
+    corpus.add_argument(
+        "--dispatch-queued",
+        action="store_true",
+        help=(
+            "Run the corpus pass that is ALREADY queued instead of appending a new "
+            "one. Needed because a pass that requires approval is appended by one "
+            "command and can only be dispatched after a human approves it -- and "
+            "re-running the plain command then refuses, correctly, rather than "
+            "queueing a second identical pass. Its budget is the one named when it "
+            "was appended, so --budget-tokens is not accepted here: silently running "
+            "under a different cap than the approver saw would defeat the approval."
         ),
     )
     corpus.add_argument(
@@ -265,12 +286,13 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
 
 def _cmd_corpus_pass(
     campaign_id: str,
-    budget_tokens: int,
+    budget_tokens: int | None,
     workspaces: Path | None,
     config: Path | None,
     *,
     dry_run: bool,
     reread_all: bool = False,
+    dispatch_queued: bool = False,
 ) -> int:
     """Append a corpus pass to a campaign's plan and run it.
 
@@ -282,8 +304,29 @@ def _cmd_corpus_pass(
     from carmel.paths import resolve_workspaces_root
     from carmel.schemas.action_state import ActionOutcome
     from carmel.services.campaigns import find_campaign_workspace, load_campaign
-    from carmel.services.dispatcher import default_handlers, execute_next_action
     from carmel.services.planner import append_corpus_pass_action
+
+    # The two modes are mutually exclusive by construction: --dispatch-queued runs an
+    # action whose budget is already fixed in the plan. Accepting a budget alongside it
+    # would either be ignored (a lie) or silently override what the approver agreed to.
+    if dispatch_queued:
+        if budget_tokens is not None:
+            print(
+                "--budget-tokens cannot be combined with --dispatch-queued: the queued "
+                "pass already carries the budget it was approved under.",
+                file=sys.stderr,
+            )
+            return 1
+        if reread_all:
+            print(
+                "--reread-all cannot be combined with --dispatch-queued: re-read scope is "
+                "fixed when the pass is appended, not when it is dispatched.",
+                file=sys.stderr,
+            )
+            return 1
+    elif budget_tokens is None:
+        print("--budget-tokens is required (or use --dispatch-queued to run an already-queued pass).", file=sys.stderr)
+        return 1
 
     try:
         agent_config = _load_agent_config(config)
@@ -317,6 +360,38 @@ def _cmd_corpus_pass(
         else None
     )
 
+    if dispatch_queued:
+        # Locate the queued pass rather than appending one. Deliberately reported as a
+        # typed refusal when there is nothing to dispatch: "I ran nothing" must never be
+        # indistinguishable from "I ran your pass".
+        from carmel.schemas.action_state import ActionExecutionStatus
+        from carmel.schemas.approval import ActionKind as _ActionKind
+        from carmel.services.plan_progress import load_progress as _load_progress
+
+        try:
+            queued = [
+                a
+                for a in _load_progress(ws).actions
+                if a.kind == _ActionKind.LITERATURE_CORPUS_PASS
+                and a.execution_status == ActionExecutionStatus.PENDING
+                and a.outcome != ActionOutcome.REJECTED
+            ]
+        except OSError as e:
+            print(f"Could not read plan progress: {e}", file=sys.stderr)
+            return 1
+        if not queued:
+            print(
+                "No corpus pass is queued for this campaign. Run without --dispatch-queued to append one.",
+                file=sys.stderr,
+            )
+            return 1
+        queued_action_id = queued[0].action_id
+        print(f"Dispatching the already-queued corpus-pass action {queued_action_id}.")
+        return _dispatch_corpus_action(ws, campaign, queued_action_id, agent_config=agent_config, dry_run=dry_run)
+
+    # Narrowed by the mutual-exclusion block above: the append path returns early
+    # when no budget was named, so reaching here means one was.
+    assert budget_tokens is not None
     try:
         action = append_corpus_pass_action(
             ws, budget_tokens=budget_tokens, model_name=model_name, reread_all=reread_all
@@ -359,7 +434,31 @@ def _cmd_corpus_pass(
         print("--dry-run: the action was appended but not run.")
         return 0
 
+    return _dispatch_corpus_action(ws, campaign, action.action_id, agent_config=agent_config, dry_run=dry_run)
+
+
+def _dispatch_corpus_action(
+    ws: Path,
+    campaign: Campaign,
+    action_id: str,
+    *,
+    agent_config: object,
+    dry_run: bool,
+) -> int:
+    """Dispatch one already-appended corpus-pass action through the dispatcher.
+
+    Shared by both entry paths -- appending-then-running, and ``--dispatch-queued``
+    against a pass a human has since approved. It is one function precisely because
+    the guards below are the valuable part: duplicating them for the second path is
+    how one of the two ends up missing the cursor check.
+    """
     from carmel.agents.bridge import AgentBridgeError
+    from carmel.schemas.action_state import ActionOutcome
+    from carmel.services.dispatcher import default_handlers, execute_next_action
+
+    if dry_run:
+        print("--dry-run: the queued action was not run.")
+        return 0
 
     try:
         # Go through the DISPATCHER, not execute_action (spar round 7 P1).
@@ -386,11 +485,11 @@ def _cmd_corpus_pass(
 
         progress = load_progress(ws)
         next_state = progress.actions[progress.cursor] if progress.cursor < len(progress.actions) else None
-        if next_state is not None and next_state.action_id != action.action_id:
+        if next_state is not None and next_state.action_id != action_id:
             print(
                 f"Refusing to dispatch: the plan's next action is {next_state.kind.value} "
-                f"({next_state.action_id}), not the corpus pass just appended "
-                f"({action.action_id}). The corpus pass stays queued. Run or retire the "
+                f"({next_state.action_id}), not the corpus pass "
+                f"({action_id}). The corpus pass stays queued. Run or retire the "
                 f"earlier action first, then dispatch again.",
                 file=sys.stderr,
             )
@@ -407,23 +506,25 @@ def _cmd_corpus_pass(
 
     if ticket is None:
         print(
-            f"The corpus-pass action {action.action_id} was appended but the dispatcher "
-            "did not start it. The plan has no runnable action right now -- most often "
-            "the action is still awaiting approval. It stays in the plan; approve it "
-            "and dispatch again.",
+            f"The corpus-pass action {action_id} is in the plan but the dispatcher did "
+            "not start it. The plan has no runnable action right now -- most often the "
+            "action is still awaiting approval. It stays in the plan; approve it, then "
+            "run `carmel corpus-pass --campaign <id> --dispatch-queued` to run it "
+            "(re-running the plain command would refuse rather than queue a second "
+            "identical pass).",
             file=sys.stderr,
         )
         return 1
-    if ticket.action_id != action.action_id:
+    if ticket.action_id != action_id:
         # The dispatcher runs the plan's next executable action, which is the correct
         # behaviour and is deliberately not overridden here: jumping the queue would
         # run the corpus pass out of the order the plan records. Say plainly that
         # something else ran, rather than reporting another action's outcome as though
         # it were the corpus pass.
         print(
-            f"The corpus-pass action {action.action_id} was appended, but the next "
-            f"action due in the plan is {ticket.action_id} ({ticket.kind.value}), which "
-            "ran instead. The corpus pass remains queued; dispatch again to reach it.",
+            f"The corpus-pass action {action_id} is queued, but the next action due in "
+            f"the plan is {ticket.action_id} ({ticket.kind.value}), which ran instead. "
+            "The corpus pass remains queued; dispatch again to reach it.",
             file=sys.stderr,
         )
         return 1
@@ -431,13 +532,13 @@ def _cmd_corpus_pass(
     result = ticket.wait()
     if result is None:
         print(
-            f"Corpus pass {action.action_id} failed before producing a result"
+            f"Corpus pass {action_id} failed before producing a result"
             + (f": {ticket.error}" if ticket.error is not None else "")
             + ". The failure is recorded in the workspace.",
             file=sys.stderr,
         )
         return 1
-    print(f"Corpus pass {action.action_id} finished with outcome {result.outcome.value}")
+    print(f"Corpus pass {action_id} finished with outcome {result.outcome.value}")
     return 0 if result.outcome == ActionOutcome.SUCCEEDED else 1
 
 
@@ -768,6 +869,7 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             dry_run=args.dry_run,
             reread_all=args.reread_all,
+            dispatch_queued=args.dispatch_queued,
         )
 
     if args.command == "new-campaign":

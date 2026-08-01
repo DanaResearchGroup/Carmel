@@ -442,10 +442,16 @@ def _append_corpus_pass_action_locked(
         if state.kind == ActionKind.LITERATURE_CORPUS_PASS and state.execution_status == ActionExecutionStatus.PENDING
     ]
     if pending:
+        # Name the command that dispatches it. Without that the two guards contradict
+        # each other -- the dispatcher tells an operator to "approve it and dispatch
+        # again", and this one refuses the only command they have -- which left an
+        # approval-requiring corpus pass with no way to run at all (found by live run
+        # 2026.08.01).
         raise ValueError(
             f"a corpus pass is already queued and has not run yet "
             f"(action {pending[0].action_id}). Dispatch that one rather than adding "
-            f"another; re-running this command would queue a second identical pass."
+            f"another; re-running this command would queue a second identical pass. "
+            f"Run it with: carmel corpus-pass --campaign <id> --dispatch-queued"
         )
 
     action = PlannedAction(
