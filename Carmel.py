@@ -120,6 +120,17 @@ def create_parser() -> argparse.ArgumentParser:
             "estimated and printed for you."
         ),
     )
+    corpus.add_argument(
+        "--reread-all",
+        action="store_true",
+        help=(
+            "Re-read documents an earlier pass already mined. By default a corpus "
+            "pass reads only what is new, because the prompt for a given document is "
+            "identical between passes and re-reading it buys the same answer twice. "
+            "Use this when the question has actually changed -- a different model, or "
+            "a revised prompt."
+        ),
+    )
     corpus.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
     corpus.add_argument(
         "--config",
@@ -259,6 +270,7 @@ def _cmd_corpus_pass(
     config: Path | None,
     *,
     dry_run: bool,
+    reread_all: bool = False,
 ) -> int:
     """Append a corpus pass to a campaign's plan and run it.
 
@@ -306,7 +318,9 @@ def _cmd_corpus_pass(
     )
 
     try:
-        action = append_corpus_pass_action(ws, budget_tokens=budget_tokens, model_name=model_name)
+        action = append_corpus_pass_action(
+            ws, budget_tokens=budget_tokens, model_name=model_name, reread_all=reread_all
+        )
     except FileNotFoundError:
         # Distinguished from the generic OSError below because the remedy is
         # specific and the raw message ("JSON file not found: .../plan.json") tells
@@ -753,6 +767,7 @@ def main(argv: list[str] | None = None) -> int:
             args.workspaces,
             args.config,
             dry_run=args.dry_run,
+            reread_all=args.reread_all,
         )
 
     if args.command == "new-campaign":

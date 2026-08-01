@@ -377,6 +377,14 @@ class AgentConfig(BaseModel):
     a single warning. See :meth:`resolved_core_api_key`.
     """
     semantic_scholar_api_key: str | None = None
+    additional_admissible_hosts: list[str] = Field(default_factory=list)
+    """Extra hosts whose documents may enter the evidence store automatically.
+
+    Added to :data:`carmel.services.acquisition.DEFAULT_ADMISSIBLE_HOSTS`, never
+    replacing it, and there is deliberately no switch that turns the check off: an
+    institutional proxy or a lab mirror is one entry here, while "allow everything" is
+    the configuration the check exists to prevent. A document from an unlisted host is
+    queued for manual acquisition, not discarded."""
     """Optional API key for Semantic Scholar (raises their rate limits).
 
     Unlike :attr:`core_api_key` this is never required: without it the lookup still

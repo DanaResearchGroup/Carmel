@@ -439,13 +439,24 @@ class PassRecord(BaseModel):
     stop_reason: StopReason
     usage: BudgetUsage
     warnings: list[str] = Field(default_factory=list)
+    covered_sha256: list[str] = Field(default_factory=list)
+    """The artifacts this pass actually READ, whether or not they yielded a finding.
+
+    Recorded so a later corpus pass can skip what has already been mined. Findings
+    alone cannot answer that: a document read and found barren produces nothing to
+    attribute, and is exactly the document a later pass must not pay to re-read.
+
+    Empty on a search pass, and on any v2 report migrated forward -- for those, what
+    was covered was never written down, so the honest value is "nothing recorded"
+    rather than a guess reconstructed from findings.
+    """
 
 
 #: Highest report schema version this build understands. Anything higher is refused
 #: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
 #: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
 #: truncate) a report written by a newer one.
-CURRENT_REPORT_SCHEMA_VERSION = 2
+CURRENT_REPORT_SCHEMA_VERSION = 3
 
 
 class LiteratureReport(BaseModel):

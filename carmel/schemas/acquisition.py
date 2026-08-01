@@ -63,6 +63,19 @@ class AcquisitionReason(StrEnum):
     contributed nothing, so it counts toward :attr:`NO_OPEN_ACCESS_COPY` instead --
     the mirror image of the same overstatement this reason was introduced to fix. See
     :class:`carmel.agents.tools.search.SearchNotFound`."""
+    HOST_NOT_ADMISSIBLE = "host_not_admissible"
+    """The URL's host is not on the list of sources whose documents may enter the
+    evidence store automatically.
+
+    Not a failure of the source -- a refusal to auto-admit it. The identity gate
+    confirms a document IS the cited work by finding the title and DOI outside its
+    reference list, which a document that merely PRINTS another paper's title and DOI
+    also satisfies. That gate cannot separate "is" from "mentions" without a
+    threshold calibrated on far more documents than exist to calibrate against, so the
+    cheaper control is upstream: keep documents of unknown provenance out of the store.
+
+    The paper is queued for manual acquisition rather than dropped, so the human-gated
+    path -- which runs its own identity check on admission -- still gets it."""
     NOT_A_DOCUMENT = "not_a_document"
     """A full-text URL was advertised but served something other than a document --
     in the probe, an HTML landing page five times out of eleven."""

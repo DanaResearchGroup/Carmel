@@ -102,7 +102,7 @@ from carmel.schemas.literature import (
 from carmel.schemas.plan import PlannedAction
 from carmel.schemas.run import FailureCode, RunRecord, RunStatus, SubmissionMode
 from carmel.services import chem
-from carmel.services.acquisition import collect_inbox, record_request
+from carmel.services.acquisition import collect_inbox, host_is_admissible, record_request
 from carmel.services.artifacts import read_json, write_json
 from carmel.services.decision_log import append_typed_event
 from carmel.services.evidence import (
@@ -223,6 +223,19 @@ def migrate_report_payload(payload: object) -> object:
     that run's identity -- the attribution was always true of a v1 report, it simply
     had nowhere to be written down.
 
+    v3 adds ``covered_sha256`` to each pass, so a corpus pass can skip documents an
+    earlier pass already mined. Nothing can be reconstructed for an older report --
+    what a v1/v2 pass covered was never written down -- so migrated passes carry an
+    empty list, which reads as "not recorded" and makes the first v3 pass re-read
+    the corpus once. That is the conservative direction: re-reading costs tokens,
+    while inventing coverage would silently skip documents nobody has mined.
+
+    This is a CHAIN, applied step by step from the payload's own version. It used to
+    be a single branch that ran the v1 lift for ANY version below current, which was
+    correct only while current was 2: at v3 a v2 payload would have been fed through
+    the v1 lift, whose `pop("run_id")` finds nothing and whose rebuilt `passes` would
+    have overwritten the real ones (the review flagged this as latent).
+
     A live campaign already holds a v1 report on disk (the first real run), and it
     contains the only existing evidence that the grounding gate refuses ungrounded
     claims. Migrating rather than discarding is therefore not a courtesy to old
@@ -247,10 +260,25 @@ def migrate_report_payload(payload: object) -> object:
         return payload
 
     migrated = dict(payload)
+    if version < 2:
+        migrated = _migrate_v1_to_v2(migrated)
+    if version < 3:
+        migrated = _migrate_v2_to_v3(migrated)
+    # Not a literal. This produces whatever the CURRENT schema is, so hardcoding the
+    # number means the next version bump silently stamps migrated reports with a
+    # stale version -- and the `version == CURRENT` early return above then treats
+    # them as already migrated.
+    migrated["schema_version"] = CURRENT_REPORT_SCHEMA_VERSION
+    return migrated
+
+
+def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    """Lift v1's single flat run into a one-element ``passes`` list."""
+    migrated = dict(payload)
     run_id = str(migrated.pop("run_id", "") or "")
     action_id = str(migrated.pop("action_id", "") or "")
     created_at = migrated.get("created_at")
-    pass_record: dict[str, object] = {
+    pass_record: dict[str, Any] = {
         "run_id": run_id,
         "action_id": action_id,
         "created_at": created_at,
@@ -272,11 +300,23 @@ def migrate_report_payload(payload: object) -> object:
             else item
             for item in items
         ]
-    # Not a literal 2. This migration produces whatever the CURRENT schema is, so
-    # hardcoding the number here means the next version bump silently stamps migrated
-    # v1 reports with a stale version -- and the `version == CURRENT` early return
-    # above then treats them as already migrated.
-    migrated["schema_version"] = CURRENT_REPORT_SCHEMA_VERSION
+    return migrated
+
+
+def _migrate_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
+    """Give every pass an explicit empty ``covered_sha256``.
+
+    The field defaults to empty anyway, so this changes no value. It is written
+    out because a migration that silently relies on a default is indistinguishable
+    from a migration step somebody forgot to write, and the next bump has to be able
+    to tell those apart.
+    """
+    migrated = dict(payload)
+    passes = migrated.get("passes")
+    if isinstance(passes, list):
+        migrated["passes"] = [
+            {**p, "covered_sha256": p.get("covered_sha256", [])} if isinstance(p, dict) else p for p in passes
+        ]
     return migrated
 
 
@@ -786,6 +826,12 @@ class _RunState:
     parsing warning text."""
     acquisition_slugs: list[str] = field(default_factory=list)
     """Slugs queued for manual acquisition during this run, for the run summary."""
+    covered: list[str] = field(default_factory=list)
+    """Artifact shas this pass actually READ, whether or not they yielded a finding.
+
+    Appended BEFORE the model call, not after: a document the budget cut short was
+    still paid for and partially processed, and recording it only on success would
+    make the next pass re-read exactly the documents that already proved expensive."""
 
     def query_records(self, pass_record: PassRecord) -> list[QueryRecord]:
         """This run's executed queries, attributed to the pass that ran them."""
@@ -1043,6 +1089,13 @@ def _attempt_oa_fetch(
             not a per-candidate outcome.
     """
     host = urlsplit(url).hostname or url
+    if not host_is_admissible(url, config.additional_admissible_hosts):
+        # An OA index advertised this URL, which is not the same as vouching for it.
+        return (
+            None,
+            AcquisitionReason.HOST_NOT_ADMISSIBLE,
+            f"{host} is not on the admissible-source list",
+        )
     try:
         artifact, data = deps.fetch.fetch(url)
     except FetchError as exc:
@@ -1297,6 +1350,19 @@ def _fetch_and_store(
     campaign ``5b766b4b-bf72-4db9-bb28-4229b037bf07`` shows what that produces (see
     :func:`_validate_document`'s docstring for the observed artifacts).
     """
+    if not host_is_admissible(url, config.additional_admissible_hosts):
+        # Refused BEFORE the fetch: an inadmissible host is never contacted, so a
+        # poisoned search result cannot even be told which campaign is reading it.
+        host = urlsplit(url).hostname or url
+        state.warnings.append(
+            f"not auto-admitted from {host}: not a recognised publisher, repository or "
+            f"resolver. Queued for manual acquisition instead."
+        )
+        state.fetch_failures[url] = (
+            AcquisitionReason.HOST_NOT_ADMISSIBLE,
+            f"host {host!r} is not on the admissible-source list",
+        )
+        return None
     try:
         artifact, data = deps.fetch.fetch(url)
     except FetchError as exc:
@@ -1356,8 +1422,12 @@ def _research_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
+    already_covered: frozenset[str] = frozenset(),
 ) -> None:
     """The bounded propose->ground->verify loop. Mutates ``state`` in place."""
+    # A search pass discovers documents rather than re-reading held ones, so prior
+    # corpus coverage says nothing about what it should fetch.
+    del already_covered
     # No live search tool is handed to the agent: the deterministic round-trip below is the
     # *only* path that ever calls ``deps.search.search``. Handing the agent its own live
     # search tool as well would let it re-query out-of-band, double-billing a real provider
@@ -1598,8 +1668,21 @@ def _corpus_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
+    already_covered: frozenset[str] = frozenset(),
 ) -> None:
     """The corpus-only pass: read what is held, propose, ground, verify.
+
+    Documents in ``already_covered`` are SKIPPED. Without that, every pass re-read
+    the whole store: five passes over a corpus growing 8->40 papers is 120 document
+    reads to mine 40 papers, and the prompt for a given document is byte-identical
+    between passes (it carries no prior findings and no pass number), so the repeat
+    asks the same question and pays again for the same answer.
+
+    Cost is the smaller half. Because the corpus is presented in a deliberately
+    stable order and a pass stops when the token budget runs out, an unscoped pass
+    always re-read the same prefix and stopped -- so under a fixed budget, papers
+    acquired later were never reached at all, and the operator saw a completed pass
+    rather than an unread tail (F14).
 
     ONE MODEL CALL PER DOCUMENT, not one call holding the whole corpus. This is not a
     stylistic choice -- it was measured. Handing the model all 8 papers of the live
@@ -1618,6 +1701,22 @@ def _corpus_loop(
     re-read identical input at full cost.
     """
     corpus, skipped = _load_corpus(workspace_root)
+    if already_covered:
+        before = len(corpus)
+        corpus = [(a, e) for a, e in corpus if a.sha256 not in already_covered]
+        n_skipped = before - len(corpus)
+        if n_skipped:
+            state.warnings.append(
+                f"{n_skipped} document(s) already mined by an earlier pass were not re-read; "
+                f"{len(corpus)} new document(s) in this pass"
+            )
+            append_typed_event(
+                log_path,
+                event="literature.corpus_already_covered",
+                action_id=action_id,
+                run_id=run_id,
+                payload={"n_skipped": n_skipped, "n_new": len(corpus)},
+            )
     if skipped:
         state.warnings.append(
             f"{len(skipped)} held artifact(s) could not be read and were NOT covered by this pass: "
@@ -1632,7 +1731,13 @@ def _corpus_loop(
         )
     if not corpus:
         state.stop_reason = StopReason.NO_NEW_INFORMATION
-        state.warnings.append("the evidence store holds no readable artifacts, so there was nothing to read")
+        # Distinguish the two, because they call for opposite responses: acquire
+        # papers, versus stop paying for passes over a corpus already mined.
+        state.warnings.append(
+            "every held document has already been mined by an earlier pass; nothing new to read"
+            if already_covered
+            else "the evidence store holds no readable artifacts, so there was nothing to read"
+        )
         return
 
     agent = build_corpus_agent(model=deps.model, ledger=deps.ledger)
@@ -1642,6 +1747,9 @@ def _corpus_loop(
         # paper, so a digest naming any other is a mistake worth surfacing, even when
         # that other paper happens to be in the store.
         by_sha = {artifact.sha256: (artifact, extracted)}
+        # Recorded before the call, not after: a document the budget cut short was
+        # still paid for, and a later pass must not re-buy it.
+        state.covered.append(artifact.sha256)
         corpus_prompt = _corpus_prompt(campaign, artifact, extracted)
         result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
         proposal = CorpusProposal.model_validate(result.output)
@@ -1926,6 +2034,14 @@ def _run_pass(
             workspace_root, config=config, state=state, log_path=log_path, action_id=action.action_id, run_id=run_id
         )
 
+        # What earlier passes already mined. `reread_all` is the operator's escape
+        # hatch: coverage is recorded per document, so re-reading is otherwise never
+        # automatic, and a changed prompt or a newer model is a real reason to want it.
+        reread_all = bool(action.parameters.get("reread_all", False))
+        already_covered: frozenset[str] = frozenset()
+        if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
+            already_covered = frozenset(sha for record in previous.passes for sha in record.covered_sha256)
+
         slot_acquired = False
         try:
             session_budget().acquire_run_slot(config.budget.max_concurrent_runs)
@@ -1940,6 +2056,7 @@ def _run_pass(
                 log_path=log_path,
                 action_id=action.action_id,
                 run_id=run_id,
+                already_covered=already_covered,
             )
         except BudgetExceededError as exc:
             state.stop_reason = STOP_REASON_FOR_DIMENSION[exc.dimension]
@@ -1975,6 +2092,7 @@ def _run_pass(
                 stop_reason=state.stop_reason,
                 usage=deps.ledger.usage(),
                 warnings=state.warnings,
+                covered_sha256=list(state.covered),
             ),
             state=state,
             report_id=report_id,

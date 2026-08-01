@@ -78,7 +78,10 @@ from carmel.services.literature import (
 from carmel.services.plan_progress import publish_lock_info
 
 DOI = "10.1000/test.doi"
-SOURCE_URL = "https://example.com/papers/secret-paper-url"
+# An admissible host: production refuses to auto-admit documents from hosts
+# that are not recognised publishers/repositories/resolvers, so a fixture on
+# example.com would exercise the refusal rather than the path under test.
+SOURCE_URL = "https://arxiv.org/pdf/2401.00001v1"
 
 #: Title used for manual-acquisition drops; long enough that the identity check has
 #: real signal to match on rather than a couple of common words.
@@ -1449,7 +1452,7 @@ class TestWantedPaperOpenAccessResolution:
         assert not any(e["event"] == "literature.paper_requested" for e in events)
 
     def test_candidates_are_tried_in_order_until_one_succeeds(self, campaign: Campaign) -> None:
-        second = "https://repo.example/green.pdf"
+        second = "https://zenodo.org/records/1/files/green.pdf"
         resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
         fetch = _RoutedFetchTool(ok={second: (DOC.encode(), "text/plain")}, statuses={OA_PDF_URL: 404})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
@@ -1481,6 +1484,46 @@ class TestWantedPaperOpenAccessResolution:
         assert requested[0]["oa_attempts"] == [OA_PDF_URL]
         assert requested[0]["reason"] == "paywalled"
 
+    def test_an_oa_candidate_on_an_unrecognised_host_is_never_fetched(self, campaign: Campaign) -> None:
+        """F18. An OA index advertising a URL is not the same as vouching for it.
+
+        The identity gate confirms a document IS the cited work by finding the title
+        and DOI outside its reference list -- which a document that merely PRINTS
+        another paper's title and DOI also satisfies. Rather than tighten that gate on
+        a threshold calibrated against eight documents, keep documents of unknown
+        provenance out of the store.
+        """
+        hostile = "https://evil.example.net/looks-like-a-paper.pdf"
+        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(hostile,), note="1 candidate")})
+        deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
+        fetched: list[str] = []
+
+        class _RecordingFetch:
+            def fetch(self, url: str) -> tuple[object, bytes]:
+                fetched.append(url)
+                raise AssertionError(f"an inadmissible host was contacted: {url}")
+
+        deps.fetch = _RecordingFetch()  # type: ignore[assignment]
+
+        run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert fetched == [], "the host was contacted before being refused"
+        requests = load_manifest(campaign.workspace_root).requests
+        assert [r.reason for r in requests] == [AcquisitionReason.HOST_NOT_ADMISSIBLE]
+        # Queued, not dropped: the human-gated path runs its own identity check.
+        assert requests[0].status == AcquisitionStatus.REQUESTED
+
+    def test_an_operator_can_admit_an_extra_host(self, campaign: Campaign) -> None:
+        """The extension point an institutional proxy or lab mirror needs."""
+        from carmel.services.acquisition import host_is_admissible
+
+        url = "https://proxy.my-university.edu/paper.pdf"
+        assert not host_is_admissible(url)
+        assert host_is_admissible(url, ["proxy.my-university.edu"])
+        # Subdomains of an admitted host are admitted; lookalike suffixes are not.
+        assert host_is_admissible("https://a.b.proxy.my-university.edu/p.pdf", ["proxy.my-university.edu"])
+        assert not host_is_admissible("https://proxy.my-university.edu.evil.net/p.pdf", ["proxy.my-university.edu"])
+
     def test_a_404_on_the_oa_copy_is_queued_as_fetch_failed_not_paywalled(self, campaign: Campaign) -> None:
         resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
@@ -1495,7 +1538,7 @@ class TestWantedPaperOpenAccessResolution:
     def test_an_observed_paywall_wins_over_an_earlier_broken_link(self, campaign: Campaign) -> None:
         """403 is the reason the operator can act on (a subscription): if ANY candidate
         observed one, that is the request's reason, not whichever failure came first."""
-        second = "https://pubs.example/vor.pdf"
+        second = "https://arxiv.org/pdf/2401.00002v1"
         resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _RoutedFetchTool(ok={}, statuses={OA_PDF_URL: 404, second: 403})
@@ -1702,10 +1745,14 @@ class TestReportSchemaVersionGate:
     """
 
     def test_a_future_schema_version_is_refused(self) -> None:
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
         from carmel.services.literature import migrate_report_payload
 
-        with pytest.raises(ValueError, match="schema version 3"):
-            migrate_report_payload({"schema_version": 3, "report_id": "r1"})
+        # Relative to the current version, so a bump does not turn this into a test
+        # that the CURRENT version is refused.
+        future = CURRENT_REPORT_SCHEMA_VERSION + 1
+        with pytest.raises(ValueError, match=f"schema version {future}"):
+            migrate_report_payload({"schema_version": future, "report_id": "r1"})
 
     def test_the_current_version_passes_through_untouched(self) -> None:
         from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
@@ -1757,9 +1804,15 @@ class TestReportAccumulatesAcrossPasses:
 
         report = load_literature_report(campaign.workspace_root)
 
-        assert report.schema_version == 2
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+
+        assert report.schema_version == CURRENT_REPORT_SCHEMA_VERSION
         assert len(report.passes) == 1
         assert report.passes[0].mode == LiteraturePassMode.SEARCH
+        # v1 recorded no coverage, so the migration must not invent any -- an empty
+        # list reads as "not recorded" and makes the next corpus pass re-read once,
+        # which is the conservative direction.
+        assert report.passes[0].covered_sha256 == []
         assert report.run_id == "run-1"
         assert report.action_id == "act-1"
         assert report.stop_reason == StopReason.SELF_TERMINATED
@@ -2094,6 +2147,78 @@ class TestCorpusPass:
         assert report.findings == []
         assert deps.ledger.usage().model_calls == 0
         assert any("nothing to read" in w for w in report.latest.warnings)
+
+    def test_a_pass_records_every_document_it_read(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Coverage is per DOCUMENT, not per finding.
+
+        A document read and found barren produces nothing to attribute, and is
+        exactly the document a later pass must not pay to re-read -- so findings
+        cannot serve as the record of what was covered.
+        """
+        _patch_chem_success(monkeypatch)
+        first = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        second = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        # Both proposals empty: neither document yields a finding.
+        deps, _, config = _make_deps([_corpus_proposal([]), _corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert report.findings == []
+        assert sorted(report.latest.covered_sha256) == sorted([first, second])
+
+    def test_a_second_pass_does_not_re_read_what_the_first_already_mined(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """F14. The prompt for a document is byte-identical between passes, so a
+        re-read asks the same question and pays for the same answer twice."""
+        _patch_chem_success(monkeypatch)
+        _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        first_deps, _, first_config = _make_deps([_corpus_proposal([])])
+        first = run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
+        assert first_deps.ledger.usage().model_calls == 1
+        assert len(first.latest.covered_sha256) == 1
+
+        # A second pass with NO new documents must make no model call at all.
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        second = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 0, "the second pass re-read an already-mined document"
+        assert second.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+        assert any("already been mined" in w for w in second.latest.warnings)
+
+    def test_a_second_pass_reads_only_the_newly_acquired_document(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The starvation case: under a fixed budget an unscoped pass always re-read
+        the same stable-ordered prefix, so later papers were never reached."""
+        _patch_chem_success(monkeypatch)
+        old = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        first_deps, _, first_config = _make_deps([_corpus_proposal([])])
+        run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
+
+        new = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        second_action = _action().model_copy(update={"action_id": "lit-a2"})
+        report = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 1
+        assert report.latest.covered_sha256 == [new]
+        assert old not in report.latest.covered_sha256
+
+    def test_reread_all_overrides_the_scoping(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The operator's escape hatch: a changed model or prompt is a real reason."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        first_deps, _, first_config = _make_deps([_corpus_proposal([])])
+        run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
+
+        second_deps, _, second_config = _make_deps([_corpus_proposal([])])
+        forced = _action().model_copy(update={"action_id": "lit-a2", "parameters": {"reread_all": True}})
+        report = run_corpus_pass(campaign.workspace_root, campaign, forced, second_deps, config=second_config)
+
+        assert second_deps.ledger.usage().model_calls == 1
+        assert report.latest.covered_sha256 == [sha]
 
     def test_a_corpus_pass_appends_to_an_existing_search_report(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch

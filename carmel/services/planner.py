@@ -360,6 +360,7 @@ def append_corpus_pass_action(
     budget_tokens: int,
     model_name: str | None = None,
     rationale: str = "",
+    reread_all: bool = False,
 ) -> PlannedAction:
     """Append a corpus-pass action to the campaign's plan, on operator command.
 
@@ -410,11 +411,11 @@ def append_corpus_pass_action(
     # the whole sequence also closes the window in which progress had been written and
     # the plan had not.
     with workspace_lock(workspace_root):
-        return _append_corpus_pass_action_locked(workspace_root, budget_tokens, model_name, rationale)
+        return _append_corpus_pass_action_locked(workspace_root, budget_tokens, model_name, rationale, reread_all)
 
 
 def _append_corpus_pass_action_locked(
-    workspace_root: Path, budget_tokens: int, model_name: str | None, rationale: str
+    workspace_root: Path, budget_tokens: int, model_name: str | None, rationale: str, reread_all: bool = False
 ) -> PlannedAction:
     """Body of :func:`append_corpus_pass_action`, with the workspace lock held."""
     plan = load_plan(workspace_root)
@@ -460,7 +461,9 @@ def _append_corpus_pass_action_locked(
         # Provisional. Re-evaluated against the campaign's policy below -- a hardcoded
         # AUTO_APPROVED here is what let a corpus pass bypass the approval gate.
         approval_requirement=ApprovalRequirement.AUTO_APPROVED,
-        parameters={},
+        # Carried on the action, not passed at dispatch: the operator authorised THIS
+        # pass to re-read, and the action is the record of what they authorised.
+        parameters={"reread_all": True} if reread_all else {},
     )
     # Run the SAME policy gate the search action goes through. Without this,
     # `require_approval_for_literature: true` and `auto_approve_literature_under_usd`

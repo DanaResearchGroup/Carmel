@@ -34,9 +34,10 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -91,6 +92,108 @@ DOI_CORROBORATION_THRESHOLD = 0.4
 #: when the requested title itself contains the word (a paper genuinely titled "Comment
 #: on ..." is a legitimate request).
 #: Words too generic to distinguish one combustion paper from another.
+#: Hosts whose documents may enter the evidence store AUTOMATICALLY.
+#:
+#: The identity gate asks whether a document contains the cited title and DOI outside
+#: its reference list. A document that merely PRINTS another paper's title and DOI in
+#: its body satisfies that too, so its own prose can be recorded as grounded under the
+#: impersonated citation (provenance survives -- ``EvidenceRef`` and ``source_url``
+#: still name the true artifact -- but attribution does not).
+#:
+#: Measured on the 8-paper live corpus, this does not happen by accident: every DOI
+#: appearing outside a references section was the document's OWN front-matter DOI, and
+#: each testable citation was confirmed only by its own document. It needs a document
+#: that prints a foreign title and DOI in its body -- which an attacker-controlled page
+#: reached through a poisoned search result can do deliberately.
+#:
+#: Tightening the gate instead would mean a "front matter only" window, and the same
+#: corpus says a paper's own DOI sits 2.6k-5.1k characters in (5.8%-15.1%) and is
+#: labelled ``body``, never ``abstract``. A threshold with that little headroom,
+#: calibrated on eight documents, is the shape that produced the F1 identity bug. So
+#: the control lives here instead, where it costs nothing to be strict.
+#:
+#: Matching is on the registrable suffix: an entry matches the host itself and any
+#: subdomain of it. A non-matching host is not a failure -- the paper is queued for
+#: MANUAL acquisition, which runs its own identity check on admission.
+DEFAULT_ADMISSIBLE_HOSTS: frozenset[str] = frozenset(
+    {
+        # Resolvers and registries
+        "doi.org",
+        "crossref.org",
+        "openalex.org",
+        "unpaywall.org",
+        "semanticscholar.org",
+        "core.ac.uk",
+        # Publishers
+        "sciencedirect.com",
+        "elsevier.com",
+        "els-cdn.com",
+        "springer.com",
+        "springernature.com",
+        "wiley.com",
+        "tandfonline.com",
+        "acs.org",
+        "rsc.org",
+        "aip.org",
+        "iop.org",
+        "nature.com",
+        "science.org",
+        "pnas.org",
+        "cambridge.org",
+        "oup.com",
+        "sagepub.com",
+        "mdpi.com",
+        "frontiersin.org",
+        "plos.org",
+        "hindawi.com",
+        "degruyter.com",
+        "aiaa.org",
+        "asme.org",
+        # Preprints, repositories, government
+        "arxiv.org",
+        "chemrxiv.org",
+        "biorxiv.org",
+        "medrxiv.org",
+        "osf.io",
+        "zenodo.org",
+        "figshare.com",
+        "osti.gov",
+        "nih.gov",
+        "nasa.gov",
+    }
+)
+
+
+def host_is_admissible(url: str, additional_hosts: Iterable[str] = ()) -> bool:
+    """Whether a document from ``url`` may enter the evidence store automatically.
+
+    Fail-closed by construction: anything that does not parse, carries no host, or
+    does not match an allowed suffix is refused. ``additional_hosts`` is the operator's
+    extension point (an institutional proxy, a lab mirror) -- there is deliberately no
+    switch that disables the check, because "allow everything" is the configuration
+    this exists to prevent, and adding the one host you need is never harder.
+
+    Matching is on the registrable suffix, never a substring: ``sciencedirect.com``
+    admits ``www.sciencedirect.com`` but NOT ``sciencedirect.com.evil.net``, which a
+    substring test would wave through.
+
+    Args:
+        url: The candidate URL.
+        additional_hosts: Extra admissible hosts from configuration.
+
+    Returns:
+        True if the URL's host is, or is a subdomain of, an admissible host.
+    """
+    try:
+        host = (urlsplit(url).hostname or "").lower().strip(".")
+    except ValueError:
+        return False
+    if not host:
+        return False
+    allowed = {h.lower().strip(".") for h in (*DEFAULT_ADMISSIBLE_HOSTS, *additional_hosts) if h}
+    return any(host == entry or host.endswith("." + entry) for entry in allowed)
+
+
 _TITLE_STOPWORDS = frozenset(
     {
         "a", "an", "and", "at", "by", "for", "from", "in", "of", "on", "the", "to",
