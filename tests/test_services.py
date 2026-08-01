@@ -724,6 +724,10 @@ class TestStateMachine:
             (CampaignStateValue.RUNNING_LITERATURE, CampaignStateValue.FAILED),
             (CampaignStateValue.RUNNING_LITERATURE, CampaignStateValue.BLOCKED),
             (CampaignStateValue.LITERATURE_READY, CampaignStateValue.RUNNING_T3),
+            # A corpus pass re-enters the running state from LITERATURE_READY:
+            # that is the ONLY state a campaign holding papers is ever in, so
+            # without this edge `carmel corpus-pass` is inert and wedges the plan.
+            (CampaignStateValue.LITERATURE_READY, CampaignStateValue.RUNNING_LITERATURE),
             (CampaignStateValue.LITERATURE_READY, CampaignStateValue.COMPLETED_PHASE1),
             (CampaignStateValue.LITERATURE_READY, CampaignStateValue.BLOCKED),
             (CampaignStateValue.LITERATURE_READY, CampaignStateValue.FAILED),

@@ -1397,6 +1397,41 @@ class TestCorpusVersusSearchRouting:
         assert "names no positive budget" in (result.run_record.error_message or "")
         assert not (ws / LITERATURE_REPORT_NAME).exists()  # nothing ran
 
+    def test_a_corpus_pass_runs_on_a_campaign_that_already_holds_papers(self, tmp_path: Path) -> None:
+        """The state a corpus pass is FOR -- and the one nothing dispatched from.
+
+        Every other test here dispatches from APPROVED_FOR_EXECUTION, because the
+        corpus action is first in the plan. But a corpus pass is by definition a
+        second pass "over the papers this campaign already holds", and a campaign
+        that holds papers has finished its search, so it sits in LITERATURE_READY
+        and nothing else.
+
+        There was no ``LITERATURE_READY -> RUNNING_LITERATURE`` edge, so the real
+        use case raised ``InvalidTransitionError`` from both the CLI and the UI --
+        and appending a pass WEDGED the campaign, parking the cursor on an action
+        that could never run and stranding the T3 behind it. The suite missed it
+        because unit coverage of the corpus loop and the state table were each
+        self-consistent and never met. This is the test where they meet.
+        """
+        ws, campaign = _ready_campaign(tmp_path, [self._corpus_action(), _action("t3")])
+        _store_document(ws, text=_CORPUS_DOC, url="https://example.org/corpus.pdf")
+        # The campaign has finished literature: this is the ONLY difference from
+        # the passing test above, and it was the whole bug.
+        update_state(ws, CampaignStateValue.RUNNING_LITERATURE)
+        update_state(ws, CampaignStateValue.LITERATURE_READY)
+        deps = _corpus_deps([{"findings": [], "done": True}])
+
+        result = _dispatch(ws, campaign, handlers=default_handlers(literature_deps=deps))
+
+        assert result is not None, "the corpus pass never dispatched from LITERATURE_READY"
+        assert result.literature_report is not None
+        assert result.literature_report.latest.mode == LiteraturePassMode.CORPUS
+        # And the campaign returns to LITERATURE_READY, so the T3 behind it is
+        # reachable -- the wedge is gone, not merely relocated.
+        assert load_state(ws).state == CampaignStateValue.LITERATURE_READY
+        progress = load_progress(ws)
+        assert progress.actions[progress.cursor].kind == ActionKind.T3_RUN
+
 
 class TestAReportFromANewerCarmel:
     """``ReportSchemaTooNewError`` exists to be caught HERE, and nothing checked.
