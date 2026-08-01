@@ -380,6 +380,107 @@ class TestTheExtractedSidecarIsVerifiedToo:
         assert verify_artifact(tmp_path, stored.sha256) is True
 
 
+class TestDeepVerification:
+    """``verify_artifact(..., deep=True)``: a derivation-binding check.
+
+    Re-running the extractor is NOT guaranteed to reproduce byte-identical output
+    (``pypdf`` is an unpinned dependency, ``pypdf>=5.0``, and different installed
+    versions can extract different text from identical PDF bytes), so this cannot be
+    a true re-derivation proof. It instead binds the extractor identity, the raw
+    digest, and the sidecar digest into one value at store time, and the deep check
+    re-derives that binding from ``meta.json``'s OWN recorded fields and compares it
+    to the stored one. This is what catches a stale/swapped ``extracted.json`` whose
+    ``extracted_sha256`` was updated to match the new (wrong) sidecar bytes but whose
+    ``derivation_binding`` was left stale -- exactly the shape of a bad extraction
+    that would otherwise sail through the cheap digest-only check.
+    """
+
+    def test_deep_verification_passes_for_a_freshly_stored_artifact(self, tmp_path: Path) -> None:
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+
+        assert stored.derivation_binding is not None
+        assert stored.extractor_version is not None
+        assert verify_artifact(tmp_path, stored.sha256, deep=True) is True
+
+    def test_deep_verification_rejects_a_stale_extraction_the_cheap_check_would_miss(self, tmp_path: Path) -> None:
+        """The load-bearing case: a stale/swapped ``extracted.json`` whose
+        ``extracted_sha256`` was updated to match the new (wrong) bytes, so the cheap
+        digest-only check alone would still pass -- exactly what a bad or stale
+        extraction of a numeric dataset table would look like on disk."""
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted("original text"), max_bytes=MAX_BYTES
+        )
+        extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+
+        # Swap in a valid-but-wrong extraction (e.g. from stale bytes, or a different
+        # extractor run) and update ONLY `extracted_sha256` -- the field the cheap
+        # check reads -- to match it, exactly as a naive re-extraction script would
+        # that is unaware `derivation_binding` needs to be recomputed too.
+        wrong = ExtractedText(
+            text="a different, wrong extraction",
+            normalized="a different, wrong extraction",
+            sections=[],
+            extractor="pdf:pypdf",
+            lossy=False,
+        )
+        extracted_path.write_text(wrong.model_dump_json(indent=2), encoding="utf-8")
+        new_extracted_digest = hashlib.sha256(extracted_path.read_bytes()).hexdigest()
+
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        payload["extracted_sha256"] = new_extracted_digest
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        # The cheap check only compares the sidecar's digest to meta's recorded
+        # value, both of which now agree with each other -- so it is fooled.
+        assert verify_artifact(tmp_path, stored.sha256) is True
+        # The deep check re-derives the binding from meta's OWN extractor_version +
+        # sha256 + (now-updated) extracted_sha256 and finds it disagrees with the
+        # `derivation_binding` recorded at store time, which still describes the
+        # original extraction.
+        assert verify_artifact(tmp_path, stored.sha256, deep=True) is False
+
+    def test_deep_verification_fails_closed_when_binding_is_unreadable(self, tmp_path: Path) -> None:
+        """Same fail-closed pattern as an unreadable meta.json: "could not check" must
+        not read as "intact"."""
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        payload["derivation_binding"] = "0" * 64
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256, deep=True) is False
+
+    def test_legacy_artifact_without_a_derivation_binding_still_passes_the_cheap_check(self, tmp_path: Path) -> None:
+        """Backward compatibility, and the direction that matters: an artifact stored
+        before this field existed must not become unreadable under the DEFAULT
+        (cheap) check. Deep verification is opt-in and is a strictly stronger
+        standard old artifacts never had a chance to meet, so it is fine -- and
+        documented here -- for deep verification to refuse them; the cheap check
+        (the backward-compatible default) is what must keep working."""
+        data = b"paper bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        del payload["extractor_version"]
+        del payload["derivation_binding"]
+        meta_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+        assert verify_artifact(tmp_path, stored.sha256) is True
+        # Deep verification has no binding to check against: fail closed rather than
+        # silently declare a legacy artifact re-derivation-proof when it never was.
+        assert verify_artifact(tmp_path, stored.sha256, deep=True) is False
+
+
 class TestCorruptionDetectionAndRepair:
     """DEFECT 1 regression: the idempotent path must not trust a corrupted raw.bin forever."""
 

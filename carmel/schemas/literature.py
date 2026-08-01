@@ -395,6 +395,30 @@ class StoredArtifact(BaseModel):
     provenance: ArtifactProvenance = ArtifactProvenance.FETCHED
     """Defaults to ``FETCHED`` so artifacts stored before this field existed keep
     their (correct) meaning: at that time fetching was the only way in."""
+    #: Extractor identity+version string used to produce ``extracted.json``, e.g.
+    #: ``"pdf:pypdf==5.1.0"``, or ``None`` for artifacts stored before this field
+    #: existed. See :func:`carmel.services.evidence._extractor_identity`: ``pypdf``
+    #: is an unpinned dependency (``pypdf>=5.0``), and different installed versions
+    #: of the SAME library are not guaranteed to extract byte-identical text from
+    #: identical PDF bytes, so the exact version in play is worth recording.
+    extractor_version: str | None = None
+    #: sha256 of ``f"{extractor_version}|{sha256}|{extracted_sha256}"`` -- a binding
+    #: of the extractor identity, the raw bytes' digest, and the sidecar's digest
+    #: into one value. ``None`` for artifacts stored before this field existed.
+    #:
+    #: Read exactly what this proves, and no more. It is NOT proof that
+    #: ``extracted.json`` was actually re-derived from ``raw.bin``: re-running the
+    #: extractor is not guaranteed to reproduce byte-identical output (see the
+    #: determinism analysis in ``carmel.services.evidence``), so this digest is
+    #: never recomputed from a fresh extraction. All it proves is INTERNAL
+    #: CONSISTENCY of this ``meta.json`` record -- that ``extracted_sha256`` was not
+    #: changed independently of ``derivation_binding`` after the two were bound
+    #: together at store time. It closes exactly one gap: a stale or swapped
+    #: ``extracted.json`` whose ``extracted_sha256`` was updated to match the new
+    #: (wrong) sidecar, but whose ``derivation_binding`` was left stale because
+    #: nothing recomputed it. It is no defence against a forger who updates both
+    #: fields together.
+    derivation_binding: str | None = None
 
 
 class LiteraturePassMode(StrEnum):

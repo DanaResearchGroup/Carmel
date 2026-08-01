@@ -35,6 +35,37 @@ idempotent re-store, ``raw.bin``'s digest, ``meta.json``'s recorded sha256/byte-
 and the presence of ``text.txt``/``extracted.json`` are all verified against the
 directory name. Any mismatch is treated as on-disk corruption (bit rot, partial
 write, tampering) and repaired from the caller's bytes-in-hand rather than trusted.
+
+Neither of the checks above proves that ``extracted.json`` was actually DERIVED FROM
+``raw.bin`` -- only that each file, taken alone, matches its own recorded digest. A
+stale or swapped extraction (produced from different bytes, or by a different/older
+extractor) that also carries a self-consistent ``extracted_sha256`` would pass both
+checks. Whether re-running the extractor on ``raw.bin`` is even guaranteed to
+reproduce ``extracted.json`` byte-for-byte was investigated directly:
+
+- :mod:`carmel.agents.tools.extract` embeds no timestamps or UUIDs anywhere in
+  :class:`~carmel.agents.tools.extract.ExtractedText` (its fields are ``text``,
+  ``normalized``, ``sections``, ``page_count``, ``extractor``, ``lossy`` -- see that
+  module's docstring), and its extraction paths (PDF page loop, HTML tag stripping,
+  plain-text passthrough) run single-threaded with no parallelism, so nothing there
+  varies run to run for the SAME library versions.
+- But the PDF path (the common case) delegates the actual text extraction to the
+  third-party ``pypdf`` library (``import pypdf`` in
+  ``carmel/agents/tools/extract.py``, ``_extract_pdf``'s ``reader.pages[i]
+  .extract_text()``), and that dependency is unpinned in this project
+  (``pyproject.toml``: ``pypdf>=5.0``). Different installed versions of the SAME
+  library are not guaranteed to extract byte-identical text from identical PDF
+  bytes -- ``pypdf``'s extraction algorithm has changed release to release -- and
+  the persisted ``extractor`` string ("pdf:pypdf") does not even record which
+  version produced a given ``extracted.json``.
+- Conclusion: extraction is **not proven deterministic** across time/library
+  upgrades. Re-running the extractor and diffing the result would therefore be
+  unsound as a verification step -- a legitimate ``pypdf`` upgrade between store
+  time and verify time would make an untouched, perfectly good artifact fail a
+  byte-diff check. So :func:`verify_artifact`'s ``deep=True`` path does NOT
+  re-extract; instead it checks a *derivation binding* recorded at store time (see
+  :data:`StoredArtifact.derivation_binding` for exactly what that does and does not
+  prove).
 """
 
 from __future__ import annotations
@@ -293,6 +324,53 @@ def _extracted_sidecar_intact(extracted_path: Path, meta: StoredArtifact) -> boo
         return False
 
 
+def _extractor_identity(extractor: str) -> str:
+    """Best-effort extractor identity+version string for the derivation binding.
+
+    For the ``"pdf:pypdf"`` extractor this records the ACTUAL installed ``pypdf``
+    version (e.g. ``"pdf:pypdf==5.1.0"``), because that dependency is unpinned
+    (``pypdf>=5.0`` in ``pyproject.toml``) and different installed versions of the
+    same library are not guaranteed to extract byte-identical text from identical
+    PDF bytes -- see the module docstring's determinism analysis. For every other
+    extractor (``"html"``, ``"text"``, ``"pdf:unavailable"``, ``"unknown"``) there
+    is no third-party version to record -- those paths are stdlib-only -- so the
+    extractor string itself is the whole identity.
+
+    Args:
+        extracted.extractor: The extractor string recorded on the ``ExtractedText``.
+
+    Returns:
+        The identity+version string to fold into :func:`_derivation_binding`.
+    """
+    if extractor == "pdf:pypdf":
+        try:
+            import pypdf
+
+            return f"{extractor}=={pypdf.__version__}"
+        except Exception:  # noqa: BLE001 - version discovery is best-effort, never fatal
+            return extractor
+    return extractor
+
+
+def _derivation_binding(raw_sha256: str, extracted_sha256: str, extractor_identity: str) -> str:
+    """Bind extractor identity, raw digest, and sidecar digest into one digest.
+
+    Read exactly what the result proves -- documented in full on
+    :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding`, which this
+    function's docstring must not repeat and drift from. In short: internal
+    consistency of a single ``meta.json`` record, never literal re-derivation.
+
+    Args:
+        raw_sha256: Digest of the stored ``raw.bin`` bytes.
+        extracted_sha256: Digest of the stored ``extracted.json`` bytes.
+        extractor_identity: Result of :func:`_extractor_identity`.
+
+    Returns:
+        sha256 hex digest of the three inputs, joined by ``"|"``.
+    """
+    return hashlib.sha256(f"{extractor_identity}|{raw_sha256}|{extracted_sha256}".encode()).hexdigest()
+
+
 def _load_meta(meta_path: Path) -> StoredArtifact | None:
     """Best-effort load of an existing ``meta.json``; None if absent/unreadable."""
     try:
@@ -327,6 +405,7 @@ def _write_all(
     # to describe the bytes actually on disk, and re-deriving them here would silently
     # drift the moment `write_json`'s formatting changed.
     extracted_digest = hashlib.sha256(extracted_path.read_bytes()).hexdigest()
+    extractor_identity = _extractor_identity(extracted.extractor)
     stored = StoredArtifact(
         sha256=digest,
         source_url=artifact.url,
@@ -339,6 +418,8 @@ def _write_all(
         lossy=extracted.lossy,
         license_note=license_note,
         provenance=provenance,
+        extractor_version=extractor_identity,
+        derivation_binding=_derivation_binding(digest, extracted_digest, extractor_identity),
     )
     write_json(meta_path, stored)
     return stored
@@ -478,7 +559,7 @@ def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | Non
     )
 
 
-def verify_artifact(workspace_root: Path, sha256: str) -> bool:
+def verify_artifact(workspace_root: Path, sha256: str, *, deep: bool = False) -> bool:
     """Re-read the stored bytes and confirm they still match their recorded digests.
 
     This is what makes the stored provenance auditable rather than merely
@@ -492,15 +573,36 @@ def verify_artifact(workspace_root: Path, sha256: str) -> bool:
     ``extracted_sha256`` existed carry no sidecar digest and are judged on
     ``raw.bin`` alone, exactly as they were when written.
 
+    Neither check above proves ``extracted.json`` was actually DERIVED FROM
+    ``raw.bin`` -- only that each file, taken alone, matches its own recorded
+    digest. A stale or swapped extraction whose ``extracted_sha256`` was updated to
+    match its (wrong) new bytes would pass both checks. ``deep=True`` opts into an
+    additional derivation-binding check for that gap -- see
+    :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding` for
+    precisely what it does and does not prove (in short: internal consistency of
+    the stored metadata record, never literal re-derivation from ``raw.bin`` -- see
+    this module's docstring for why true re-derivation is unsound to check at all).
+    It defaults to False so the cheap, backward-compatible check remains the
+    default for existing callers.
+
     Args:
         workspace_root: Root of the campaign workspace.
         sha256: Hex digest identifying the artifact (and its directory name).
+        deep: When True, additionally require the derivation binding recorded in
+            ``meta.json`` to match one freshly recomputed from ``meta.json``'s own
+            ``extractor_version``, ``sha256``, and ``extracted_sha256`` fields.
+            Artifacts stored before this field existed (``derivation_binding is
+            None``) fail this check -- deep verification is a strictly stronger,
+            opt-in standard that legacy artifacts never had the chance to meet; the
+            default (non-deep) check above is unaffected and keeps working for them.
 
     Returns:
-        True if ``raw.bin`` exists, its sha256 matches ``sha256``, and the
-        ``extracted.json`` sidecar matches its recorded digest (when one exists);
-        False if the artifact is absent or any of those bytes have been
-        corrupted/tampered.
+        True if ``raw.bin`` exists, its sha256 matches ``sha256``, the
+        ``extracted.json`` sidecar matches its recorded digest (when one exists),
+        and -- when ``deep`` is True -- the recorded derivation binding is
+        internally consistent; False if the artifact is absent, any of those bytes
+        have been corrupted/tampered, or (``deep=True``) the binding is missing or
+        inconsistent.
 
     Raises:
         ValueError: If ``sha256`` is not a well-formed 64-character lowercase hex
@@ -529,4 +631,34 @@ def verify_artifact(workspace_root: Path, sha256: str) -> bool:
         # `extracted_sha256=None`, which _extracted_sidecar_intact still accepts.
         logger.warning("evidence store: %s has no readable meta.json; cannot verify", sha256)
         return False
-    return _extracted_sidecar_intact(dest_dir / _EXTRACTED_NAME, meta)
+    if not _extracted_sidecar_intact(dest_dir / _EXTRACTED_NAME, meta):
+        return False
+    if not deep:
+        return True
+    return _derivation_binding_intact(meta)
+
+
+def _derivation_binding_intact(meta: StoredArtifact) -> bool:
+    """Recompute the derivation binding from ``meta``'s own fields and compare.
+
+    Fail-closed, same pattern as the rest of this module: a legacy artifact with no
+    recorded ``derivation_binding``/``extractor_version`` (predates the field) or
+    with no recorded ``extracted_sha256`` (predates THAT field, so there is nothing
+    to bind) cannot satisfy a check it never had the data for, and is treated as
+    failing deep verification rather than as "can't tell so allow it". This is a
+    deliberate, documented exception to "fail closed by default" ONLY in the sense
+    that the DEFAULT (non-deep) check above is unaffected -- ``deep=True`` is opt-in,
+    and legacy artifacts keep passing the default check exactly as before.
+
+    Args:
+        meta: Metadata already loaded and known non-None.
+
+    Returns:
+        True iff ``meta.derivation_binding`` equals a fresh
+        :func:`_derivation_binding` of ``meta``'s own ``extractor_version``,
+        ``sha256``, and ``extracted_sha256``.
+    """
+    if meta.derivation_binding is None or meta.extractor_version is None or meta.extracted_sha256 is None:
+        return False
+    recomputed = _derivation_binding(meta.sha256, meta.extracted_sha256, meta.extractor_version)
+    return recomputed == meta.derivation_binding
