@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -30,7 +31,7 @@ from carmel.schemas.acquisition import (
     AcquisitionStatus,
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
-from carmel.services import acquisition
+from carmel.services import acquisition, acquisition_recipe
 from carmel.services.acquisition import (
     AlreadyAcquired,
     ManifestUnreadable,
@@ -1626,3 +1627,121 @@ class TestRecordRequestMerges:
             reason=AcquisitionReason.PAYWALLED,
         )
         assert merged.detail == "HTTP 403"
+
+
+class TestReadmeRecipeInstructions:
+    """The rendered README is the operator's ONLY instruction sheet for the manual
+    queue, so its download guidance must agree with what the ingestion layer actually
+    accepts -- most of all the supplementary filename convention, which is checked here
+    by driving a README-instructed filename through the real collector rather than by
+    comparing two hand-written constants."""
+
+    def _record(self, tmp_path: Path, *, doi: str | None = DOI, landing_url: str | None = None) -> AcquisitionRequest:
+        if landing_url is None:
+            landing_url = f"https://doi.org/{doi}" if doi else "https://example.org/conf/paper-7"
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=doi,
+            landing_url=landing_url,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def _readme(self, tmp_path: Path) -> str:
+        return (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+
+    def test_a_10_1016_request_renders_the_elsevier_label_and_pdf_instruction(self, tmp_path: Path) -> None:
+        """Rendered through ``_readme_text`` with a pinned ``today``: registry entries
+        expire by design, so asserting the label against the wall clock would make this
+        test fail the day the shipped entry goes stale."""
+        self._record(tmp_path)
+        manifest = load_manifest(tmp_path)
+        readme = acquisition._readme_text(manifest, today=date(2026, 8, 1))
+        assert "Elsevier" in readme
+        assert f"inbox/{slug_for(DOI, TITLE)}.pdf" in readme
+
+    def test_the_readme_explicitly_warns_against_save_page_as(self, tmp_path: Path) -> None:
+        """The point is that the warning IS present -- a landing page saved with
+        "Save Page As" carries the right title and DOI on the wrong document, and the
+        ingestion layer refuses both the HTML and the plain text it produces."""
+        self._record(tmp_path)
+        readme = self._readme(tmp_path)
+        assert 'Do NOT use the browser\'s "Save Page As"' in readme
+
+    def test_a_request_without_a_doi_still_gets_actionable_instructions(self, tmp_path: Path) -> None:
+        request = self._record(tmp_path, doi=None)
+        readme = self._readme(tmp_path)
+        assert "https://example.org/conf/paper-7" in readme
+        assert f"inbox/{request.slug}.pdf" in readme
+        assert f"{request.slug}.si." in readme
+
+    def test_the_readme_si_filename_is_the_one_the_collector_actually_binds(self, tmp_path: Path) -> None:
+        """The high-value agreement test: take the supplementary filename EXACTLY as
+        the README instructs it (not a constant re-derived here), drop a file under
+        that name, and require the real collector to bind it as SI to the right
+        request. A README that drifts from the collector's convention fails here."""
+        request = self._record(tmp_path)
+        readme = self._readme(tmp_path)
+
+        instructed = re.search(r"`inbox/([^`\s]+)\.<ext>`", readme)
+        assert instructed is not None, "the README no longer instructs an exact supplementary filename template"
+        name = f"{instructed.group(1)}.zip"
+        inbox_dir(tmp_path).mkdir(parents=True, exist_ok=True)
+        (inbox_dir(tmp_path) / name).write_bytes(ZIP_BYTES)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert changed, f"the collector did not bind the README-instructed supplementary filename {name!r}"
+        assert changed[0].slug == request.slug
+        assert [si.original_filename for si in changed[0].supplementary] == [name]
+
+    def test_a_stale_publisher_recipe_renders_generic_instructions_and_says_so(self, tmp_path: Path) -> None:
+        entry = acquisition_recipe.PUBLISHER_RECIPES["10.1016"]
+        self._record(tmp_path)
+        manifest = load_manifest(tmp_path)
+        stale_day = entry.verified_on + entry.stale_after + timedelta(days=1)
+        readme = acquisition._readme_text(manifest, today=stale_day)
+        assert "last verified" in readme
+        assert "generic" in readme
+
+    def test_the_si_naming_boilerplate_appears_once_for_a_multi_paper_queue(self, tmp_path: Path) -> None:
+        """At real queue sizes (~8 papers) the multi-sentence SI explanation must be
+        stated once in the shared header, not repeated verbatim per paper -- the thing
+        that actually differs per paper is only the concrete filename stem."""
+        self._record(tmp_path)
+        other_doi = "10.1002/kin.20603"
+        self._record(tmp_path, doi=other_doi)
+        readme = self._readme(tmp_path)
+        boilerplate_fragment = "if the article page lists Supplementary Material"
+        assert readme.count(boilerplate_fragment) == 1, (
+            f"expected the SI boilerplate paragraph exactly once (shared header), found "
+            f"{readme.count(boilerplate_fragment)} occurrences"
+        )
+
+    def test_no_raw_acquisition_reason_value_leaks_into_the_readme(self, tmp_path: Path) -> None:
+        """The 'Why manual' line must render a human phrase, never the raw enum value
+        (e.g. ``no_open_access_copy``, underscores intact). Iterates every member so a
+        reason added later is covered without hardcoding today's specific names."""
+        for index, reason in enumerate(AcquisitionReason):
+            record_request(
+                tmp_path,
+                title=f"Paper {index} needing manual acquisition",
+                doi=None,
+                landing_url=f"https://example.org/paper-{index}",
+                reason=reason,
+            )
+        readme = self._readme(tmp_path)
+        for reason in AcquisitionReason:
+            assert reason.value not in readme, f"raw enum value {reason.value!r} leaked into the README"
+            assert acquisition._reason_phrase(reason) in readme
+
+    def test_multiple_format_preferences_render_as_preferred_and_alternative_bullets(self, tmp_path: Path) -> None:
+        """The generic recipe offers PDF then conditional XML; both used to render as a
+        literal 'Format:' bullet, which reads like a duplicate-key bug rather than an
+        ordered list. Bullets must be distinctly labelled, generalising beyond exactly
+        two entries."""
+        self._record(tmp_path, doi="10.99999/made.up.2020.001")
+        readme = self._readme(tmp_path)
+        assert "- Preferred format: PDF --" in readme
+        assert "- Alternative format 1: Full-text XML --" in readme
+        assert "- Format: " not in readme

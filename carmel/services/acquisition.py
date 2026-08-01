@@ -35,7 +35,7 @@ import hashlib
 import re
 import shutil
 from collections.abc import Iterable, Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -53,6 +53,7 @@ from carmel.schemas.acquisition import (
     SupplementaryFile,
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
+from carmel.services.acquisition_recipe import SUPPLEMENTARY_CONVENTION, build_recipe
 from carmel.services.artifacts import read_json, write_bytes, write_json, write_text
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.grounding import (
@@ -60,6 +61,37 @@ from carmel.services.grounding import (
 )
 
 logger = get_logger("services.acquisition")
+
+#: Short, operator-facing phrasing for each :class:`AcquisitionReason`. Exists so the
+#: README's "Why manual" line never leaks a raw enum value (``no_open_access_copy``,
+#: underscores intact) into text a human is meant to read; the request's own
+#: ``detail`` (e.g. "HTTP 403") is appended separately and is unaffected by this
+#: mapping. Keyed on the enum member, not its ``.value``, so a future member that is
+#: added here without updating this dict fails loudly (``KeyError`` in
+#: :func:`_reason_phrase`) rather than silently falling back to the raw value it
+#: exists to hide.
+_REASON_PHRASES: dict[AcquisitionReason, str] = {
+    AcquisitionReason.PAYWALLED: "blocked by a publisher paywall",
+    AcquisitionReason.NO_OPEN_ACCESS_COPY: "no open-access copy was found",
+    AcquisitionReason.OA_LOOKUP_INCOMPLETE: "the open-access lookup did not finish",
+    AcquisitionReason.HOST_NOT_ADMISSIBLE: "the source is not on Carmel's auto-admit list",
+    AcquisitionReason.NOT_A_DOCUMENT: "the link did not serve an actual document",
+    AcquisitionReason.EMPTY_DOCUMENT: "the fetched file was empty",
+    AcquisitionReason.UNREADABLE: "the fetched file had no readable text",
+    AcquisitionReason.FETCH_FAILED: "the automated download failed",
+}
+
+
+def _reason_phrase(reason: AcquisitionReason) -> str:
+    """Human phrase for ``reason``, for the README's "Why manual" line.
+
+    Raises:
+        KeyError: ``reason`` has no entry in :data:`_REASON_PHRASES`. Deliberately
+            uncaught: a reason added to the enum without a phrase here must fail loudly
+            in tests, not silently render its raw ``.value`` in operator-facing text.
+    """
+    return _REASON_PHRASES[reason]
+
 
 REQUESTS_DIR = "literature_requests"
 INBOX_DIR = "inbox"
@@ -1350,8 +1382,17 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
     return request
 
 
-def _readme_text(manifest: AcquisitionManifest) -> str:
-    """Render operator instructions listing every outstanding request."""
+def _readme_text(manifest: AcquisitionManifest, *, today: date | None = None) -> str:
+    """Render operator instructions listing every outstanding request.
+
+    Args:
+        manifest: The acquisition queue to render.
+        today: The date publisher-recipe staleness is judged against; defaults to the
+            current UTC date. Exposed so tests can pin it -- the recipes EXPIRE by
+            design, and a test asserting publisher-specific text against the wall
+            clock would fail the day a shipped registry entry goes stale.
+    """
+    resolved_today = today if today is not None else datetime.now(UTC).date()
     pending = [r for r in manifest.requests if r.status == AcquisitionStatus.REQUESTED]
     rejected = [r for r in manifest.requests if r.status == AcquisitionStatus.REJECTED]
 
@@ -1367,20 +1408,60 @@ def _readme_text(manifest: AcquisitionManifest) -> str:
         "DOI or the title inside the document -- before it will use it as evidence. A file",
         "that does not match is reported back here rather than being used.",
         "",
+        "How to download, for every paper below:",
+        "",
+        '1. Open the paper\'s "Obtain from" link and sign in through your institution',
+        "   if the publisher asks.",
+        "2. Download the full article in the format listed for that paper, using the",
+        "   publisher's own download link/button.",
+        '3. Do NOT use the browser\'s "Save Page As" (in any format): that saves the',
+        "   landing page, which carries the right title and DOI but is the wrong",
+        "   document, and Carmel refuses both the HTML and the plain text it produces.",
+        "4. Save the file into `inbox/` under EXACTLY the name shown.",
+        f"5. {SUPPLEMENTARY_CONVENTION}",
+        "",
     ]
 
     if pending:
         lines.append(f"## Outstanding ({len(pending)})")
         lines.append("")
         for request in pending:
+            recipe = build_recipe(request, today=resolved_today)
             lines.append(f"### {request.title}")
             lines.append("")
-            lines.append(f"- Save as: `inbox/{request.slug}.pdf`")
+            if recipe.publisher is not None:
+                verification = (
+                    ""
+                    if recipe.verified
+                    else " -- exact click-path not yet verified, so follow the site's own download links"
+                )
+                lines.append(f"- Publisher: {recipe.publisher} (from DOI prefix){verification}")
+            else:
+                lines.append("- Publisher: unknown -- follow the site's own download links")
+            for index, preference in enumerate(recipe.formats):
+                # Distinct labels, not a repeated "Format:" for every entry: with more
+                # than one preference (e.g. the generic recipe's PDF-then-conditional-
+                # XML), a run of identically-labelled bullets reads like a duplicate-key
+                # bug rather than an ordered list. Generalises to any length: the first
+                # preference is always "Preferred", every one after it is numbered
+                # ("Alternative format 1", "Alternative format 2", ...) rather than
+                # hardcoding today's two-entry shape.
+                format_label = "Preferred format" if index == 0 else f"Alternative format {index}"
+                lines.append(f"- {format_label}: {preference.label} -- {preference.rationale}")
+            save_as = f"- Save as: `{recipe.save_as}`"
+            alternatives = [f for f in recipe.formats[1:] if f.extension != recipe.formats[0].extension]
+            if alternatives:
+                others = " or ".join(f"`inbox/{request.slug}.{f.extension}`" for f in alternatives)
+                save_as += f" (match the extension to what you downloaded: {others})"
+            lines.append(save_as)
+            lines.append(f"- {recipe.supplementary}")
             if request.doi:
                 lines.append(f"- DOI: `{request.doi}`")
-            lines.append(f"- Obtain from: {request.landing_url}")
+            lines.append(f"- Obtain from: {recipe.open_url}")
             detail = f" ({request.detail})" if request.detail else ""
-            lines.append(f"- Why manual: {request.reason.value}{detail}")
+            lines.append(f"- Why manual: {_reason_phrase(request.reason)}{detail}")
+            for note in recipe.notes:
+                lines.append(f"- Note: {note}")
             lines.append("")
     else:
         lines.append("## Outstanding (0)")
