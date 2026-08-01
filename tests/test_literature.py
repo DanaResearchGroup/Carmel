@@ -76,7 +76,7 @@ from carmel.services.literature import (
     run_record_for,
 )
 from carmel.services.plan_progress import publish_lock_info
-from tests.test_acquisition import _patch_text_sniff_to_pdf
+from tests.test_acquisition import _matching_body, _patch_text_sniff_to_pdf
 
 DOI = "10.1000/test.doi"
 # An admissible host: production refuses to auto-admit documents from hosts
@@ -1202,7 +1202,8 @@ class TestManualAcquisitionsAreCollectedByARun:
 
     def test_a_dropped_paper_is_admitted_at_the_start_of_the_next_run(self, campaign: Campaign) -> None:
         slug = self._queue_and_drop(
-            campaign.workspace_root, f"{TITLE_FOR_DROP}\nDOI: {DOI}\nAbstract: measurements follow."
+            campaign.workspace_root,
+            _matching_body("Abstract: measurements follow.\n", title=TITLE_FOR_DROP, doi=DOI),
         )
         deps, _, config = _make_deps([_proposal(done=True)])
 

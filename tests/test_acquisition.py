@@ -13,7 +13,9 @@ whether those bytes are the right paper.
 from __future__ import annotations
 
 import hashlib
+import io
 import json
+import os
 import re
 import shutil
 from datetime import UTC, date, datetime, timedelta
@@ -29,12 +31,14 @@ from carmel.schemas.acquisition import (
     AcquisitionReason,
     AcquisitionRequest,
     AcquisitionStatus,
+    SupplementaryFile,
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services import acquisition, acquisition_recipe
 from carmel.services.acquisition import (
     AlreadyAcquired,
     ManifestUnreadable,
+    _looks_like_full_article,
     _sniff_content_type,
     admit_file,
     check_identity,
@@ -54,6 +58,21 @@ from carmel.services.evidence import artifact_dir
 
 TITLE = "Shock tube study of ignition delay times in methane oxygen argon mixtures"
 DOI = "10.1016/0010-2180(76)90042-0"
+
+# ``carmel.services.acquisition._looks_like_full_article`` (item 9's guard) refuses any
+# drop -- even one that matches the requested paper's identity -- unless it is long
+# enough and carries a references/bibliography heading. Tests whose subject is
+# something else entirely (slug inference, size caps, already-acquired
+# short-circuiting, ...) still need their "matching" drop to clear that guard, so it
+# reaches the FULFILLED outcome they actually exercise. This padding is comfortably
+# above ``_ARTICLE_MIN_CHARS`` (9000) on its own.
+_FULL_ARTICLE_PADDING = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 200
+_REFERENCES_SECTION = "\n\nReferences\n[1] A. Author, B. Author, Journal of Combustion, 1999.\n"
+
+
+def _matching_body(extra: str = "", *, title: str = TITLE, doi: str = DOI) -> str:
+    """Body text that matches ``title``/``doi`` and clears the full-article guard."""
+    return f"{title}\nDOI: {doi}\n{extra}{_FULL_ARTICLE_PADDING}{_REFERENCES_SECTION}"
 
 
 def _request(*, doi: str | None = DOI, title: str = TITLE) -> AcquisitionRequest:
@@ -251,6 +270,28 @@ class TestRecordRequest:
 
         assert path.read_bytes() == before
 
+    @pytest.mark.parametrize("bad_version", ["x", None, [1], {"nested": True}])
+    def test_a_manifest_with_an_unusable_version_field_raises_manifest_unreadable(
+        self, tmp_path: Path, bad_version: object
+    ) -> None:
+        """`load_manifest` promises `ManifestUnreadable` for any unusable manifest, but
+        the migration used to do a bare `int(payload.get("version", 1))`: a present-but-
+        unparseable value (a string, null, a list, a dict) raised a bare ValueError/
+        TypeError straight out of `int()` that only the schema-too-new wrap caught,
+        escaping the documented contract and crashing the caller instead of reporting a
+        damaged manifest. The bad value itself must be named in the message so the
+        operator has something actionable, and the on-disk bytes must survive untouched
+        for recovery, exactly like every other ManifestUnreadable case."""
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text(json.dumps({"version": bad_version, "requests": []}), encoding="utf-8")
+        before = path.read_bytes()
+
+        with pytest.raises(ManifestUnreadable, match=re.escape(repr(bad_version))):
+            load_manifest(tmp_path)
+
+        assert path.read_bytes() == before
+
     def test_a_manifest_failing_schema_validation_raises_manifest_unreadable(self, tmp_path: Path) -> None:
         """Valid JSON, current version, but a value the schema rejects (here an
         unparseable ``requested_at``) is still an unmigratable manifest, not a fresh
@@ -365,6 +406,76 @@ def _patch_text_sniff_to_pdf(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(acquisition, "extract_text", _patched_extract)
 
 
+def _genuine_pdf_bytes(text: str) -> bytes:
+    """Build an actual, parseable PDF (via ``pypdf``'s own writer/object model) whose
+    pages, when read back, extract to ``text``.
+
+    Item 8's real-PDF proof needs genuine ``%PDF`` bytes that a real PDF parser
+    round-trips -- not the ``_patch_text_sniff_to_pdf`` seam used elsewhere in this
+    file, which only relabels plain text as ``application/pdf`` and never exercises
+    production's actual sniffing or extraction of PDF bytes. ``pypdf`` is already a
+    runtime dependency of :func:`carmel.agents.tools.extract._extract_pdf`, so building
+    the fixture with it adds nothing new; the alternative (assembling a PDF byte-for-
+    byte by hand, including its cross-reference table) is exactly the kind of fragile,
+    error-prone construction ``pypdf``'s writer already does correctly.
+
+    Paginates onto as many 612x792 pages as needed (~50 lines each) so this also
+    covers text far longer than one page, e.g. clearing ``_ARTICLE_MIN_CHARS``.
+    """
+    import pypdf
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    def _escape(line: str) -> str:
+        return line.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+    lines: list[str] = []
+    for raw_line in text.split("\n"):
+        while len(raw_line) > 90:
+            lines.append(raw_line[:90])
+            raw_line = raw_line[90:]
+        lines.append(raw_line)
+
+    writer = pypdf.PdfWriter()
+
+    def _flush_page(ops: list[str]) -> None:
+        page = writer.add_blank_page(width=612, height=792)
+        font = DictionaryObject()
+        font[NameObject("/Type")] = NameObject("/Font")
+        font[NameObject("/Subtype")] = NameObject("/Type1")
+        font[NameObject("/BaseFont")] = NameObject("/Helvetica")
+        font_ref = writer._add_object(font)
+        font_dict = DictionaryObject()
+        font_dict[NameObject("/F1")] = font_ref
+        resources = DictionaryObject()
+        resources[NameObject("/Font")] = font_dict
+        page[NameObject("/Resources")] = resources
+        stream = DecodedStreamObject()
+        stream.set_data("\n".join(ops).encode("latin-1", errors="replace"))
+        page[NameObject("/Contents")] = writer._add_object(stream)
+
+    ops: list[str] = []
+    y = 720
+    for line in lines:
+        if not ops:
+            ops.append("BT /F1 10 Tf 72 720 Td")
+            y = 720
+        else:
+            ops.append("0 -12 Td")
+            y -= 12
+        ops.append(f"({_escape(line)}) Tj")
+        if y < 40:
+            ops.append("ET")
+            _flush_page(ops)
+            ops = []
+    if ops:
+        ops.append("ET")
+        _flush_page(ops)
+
+    buf = io.BytesIO()
+    writer.write(buf)
+    return buf.getvalue()
+
+
 class TestCollectInbox:
     @pytest.fixture(autouse=True)
     def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,7 +494,7 @@ class TestCollectInbox:
     def test_a_matching_drop_is_admitted_with_manual_provenance(
         self, tmp_path: Path, queued: AcquisitionRequest
     ) -> None:
-        _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        _drop(tmp_path, queued.slug, _matching_body("Abstract: measurements follow.\n"))
 
         changed = collect_inbox(tmp_path, max_bytes=10_000_000)
 
@@ -414,6 +525,20 @@ class TestCollectInbox:
 
         readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
         assert "Needs attention" in readme
+
+    def test_needs_attention_names_the_actual_dropped_filename_not_a_hardcoded_pdf(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """A rejected drop can be any format (XML is a legitimate primary document
+        too, and archives/oversized drops are rejected before format even matters) --
+        the README must name the file that was actually dropped, not assume ``.pdf``."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(CROSSREF_METADATA_XML)
+        collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+        assert f"`{queued.slug}.xml`" in readme
+        assert f"`{queued.slug}.pdf`" not in readme
 
     def test_a_file_matching_no_request_is_left_alone(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
         _drop(tmp_path, "some-unrelated-file", "content")
@@ -481,7 +606,7 @@ class TestCollectInbox:
         assert "over the 100 cap" in changed[0].identity_note
 
     def test_an_already_fulfilled_request_is_not_reprocessed(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
-        _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\n")
+        _drop(tmp_path, queued.slug, _matching_body())
         collect_inbox(tmp_path, max_bytes=10_000_000)
 
         assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
@@ -530,7 +655,7 @@ class TestPendingRequests:
         fulfilled = record_request(
             tmp_path, title=TITLE, doi=DOI, landing_url="https://doi.org/" + DOI, reason=AcquisitionReason.PAYWALLED
         )
-        _drop(tmp_path, fulfilled.slug, f"{TITLE}\nDOI: {DOI}\n")
+        _drop(tmp_path, fulfilled.slug, _matching_body())
         collect_inbox(tmp_path, max_bytes=10_000_000)
 
         assert pending_requests(tmp_path) == []
@@ -602,7 +727,7 @@ class TestAdmitFile:
     def test_the_correct_paper_is_admitted_and_the_request_fulfilled(
         self, tmp_path: Path, queued: AcquisitionRequest
     ) -> None:
-        source = _source(tmp_path, "download.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        source = _source(tmp_path, "download.pdf", _matching_body("Abstract: measurements follow.\n"))
 
         request = admit_file(tmp_path, source, max_bytes=10_000_000)
 
@@ -650,7 +775,7 @@ class TestAdmitFile:
     def test_slug_is_inferred_when_exactly_one_request_is_pending(
         self, tmp_path: Path, queued: AcquisitionRequest
     ) -> None:
-        source = _source(tmp_path, "whatever_the_download_was_named.pdf", f"{TITLE}\nDOI: {DOI}\n")
+        source = _source(tmp_path, "whatever_the_download_was_named.pdf", _matching_body())
 
         request = admit_file(tmp_path, source, max_bytes=10_000_000)
 
@@ -667,7 +792,7 @@ class TestAdmitFile:
             landing_url="https://doi.org/" + SECOND_DOI,
             reason=AcquisitionReason.PAYWALLED,
         )
-        source = _source(tmp_path, "download.pdf", f"{SECOND_TITLE}\nDOI: {SECOND_DOI}\n")
+        source = _source(tmp_path, "download.pdf", _matching_body(title=SECOND_TITLE, doi=SECOND_DOI))
 
         request = admit_file(tmp_path, source, max_bytes=10_000_000)
 
@@ -703,7 +828,7 @@ class TestAdmitFile:
             landing_url="https://doi.org/" + SECOND_DOI,
             reason=AcquisitionReason.PAYWALLED,
         )
-        source = _source(tmp_path, "download.pdf", f"{TITLE}\nDOI: {DOI}\n")
+        source = _source(tmp_path, "download.pdf", _matching_body())
 
         request = admit_file(tmp_path, source, slug=queued.slug, max_bytes=10_000_000)
 
@@ -827,13 +952,45 @@ class TestAdmitFile:
         first = admit_file(tmp_path, wrong, slug=queued.slug, max_bytes=10_000_000)
         assert first.status == AcquisitionStatus.REJECTED
 
-        correct = _source(tmp_path, "correct.pdf", f"{TITLE}\nDOI: {DOI}\n")
+        correct = _source(tmp_path, "correct.pdf", _matching_body())
         second = admit_file(tmp_path, correct, slug=queued.slug, max_bytes=10_000_000)
 
         assert second.status == AcquisitionStatus.FULFILLED
         assert second.fulfilled_sha256
         drop_path = drop_path_for(tmp_path, queued.slug)
         assert drop_path.read_bytes() == correct.read_bytes()
+
+    def test_an_interrupted_inbox_copy_never_leaves_a_truncated_file_in_place(
+        self, tmp_path: Path, queued: AcquisitionRequest, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`admit_file` used to copy straight into the inbox with `shutil.copyfile`; a
+        process killed mid-copy (or a full disk) left a truncated file sitting under the
+        real inbox name, which a later `collect_inbox` sweep would then read and
+        identity-check as though it were the operator's genuine drop. The fix routes the
+        write through `write_bytes`'s atomic primitive (temp file in the same directory,
+        then `os.replace`), so a failure partway through must leave no file at all at the
+        final inbox path -- never a partial one."""
+        source = _source(tmp_path, "download.pdf", f"{TITLE}\nDOI: {DOI}\n")
+        drop_path = drop_path_for(tmp_path, queued.slug)
+        assert not drop_path.exists()
+
+        real_replace = os.replace
+
+        def _boom_replace(src: object, dst: object) -> None:
+            if Path(str(dst)) == drop_path:
+                raise OSError("simulated interruption: disk full mid-rename")
+            real_replace(src, dst)
+
+        monkeypatch.setattr(os, "replace", _boom_replace)
+
+        with pytest.raises(ValueError, match="could not copy"):
+            admit_file(tmp_path, source, slug=queued.slug, max_bytes=10_000_000)
+
+        # The whole point: no truncated/partial file left at the real inbox path for a
+        # later collect_inbox sweep to mistake for a genuine drop.
+        assert not drop_path.exists()
+        # And no leftover temp file either -- write_bytes cleans up on failure.
+        assert list(drop_path.parent.iterdir()) == []
 
 
 class TestAlreadyAcquired:
@@ -861,7 +1018,7 @@ class TestAlreadyAcquired:
         )
 
     def _fulfil(self, tmp_path: Path, queued: AcquisitionRequest) -> Path:
-        source = _source(tmp_path, "paper.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        source = _source(tmp_path, "paper.pdf", _matching_body("Abstract: measurements follow.\n"))
         request = admit_file(tmp_path, source, max_bytes=10_000_000)
         assert request.status == AcquisitionStatus.FULFILLED
         return source
@@ -900,7 +1057,7 @@ class TestAlreadyAcquired:
             reason=AcquisitionReason.PAYWALLED,
         )
         assert second.status == AcquisitionStatus.REQUESTED
-        other_copy = _source(tmp_path, "other-copy.pdf", f"{TITLE}\nDOI: {DOI}\nA different rendering entirely.")
+        other_copy = _source(tmp_path, "other-copy.pdf", _matching_body("A different rendering entirely.\n"))
 
         with pytest.raises(AlreadyAcquired) as caught:
             admit_file(tmp_path, other_copy, max_bytes=10_000_000)
@@ -976,7 +1133,7 @@ class TestSoleRequestAttributionIsLabelled:
         assert "sole one left" not in request.identity_note
 
     def test_a_matching_file_is_not_labelled_as_a_fallback(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
-        correct = _source(tmp_path, "correct.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        correct = _source(tmp_path, "correct.pdf", _matching_body("Abstract: measurements follow.\n"))
 
         request = admit_file(tmp_path, correct, max_bytes=10_000_000)
 
@@ -1019,7 +1176,11 @@ class TestInferencePrefersTheStrongerSignal:
         source = _source(
             tmp_path,
             "ambiguous.pdf",
-            f"{shared} at elevated pressure\nDOI: {second.doi}\nAbstract: measurements follow.",
+            _matching_body(
+                "Abstract: measurements follow.\n",
+                title=shared + " at elevated pressure",
+                doi=second.doi,
+            ),
         )
 
         request = admit_file(tmp_path, source, max_bytes=10_000_000)
@@ -1089,7 +1250,7 @@ class TestAlreadyAcquiredVerifiesTheStore:
     def test_a_missing_evidence_directory_makes_the_file_be_re_admitted(
         self, tmp_path: Path, queued: AcquisitionRequest
     ) -> None:
-        source = _source(tmp_path, "paper.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        source = _source(tmp_path, "paper.pdf", _matching_body("Abstract: measurements follow.\n"))
         first = admit_file(tmp_path, source, max_bytes=10_000_000)
         assert first.status == AcquisitionStatus.FULFILLED
         sha = first.fulfilled_sha256
@@ -1107,7 +1268,7 @@ class TestAlreadyAcquiredVerifiesTheStore:
 
     def test_an_intact_store_still_short_circuits(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
         """The store check must not defeat the skip it guards."""
-        source = _source(tmp_path, "paper.pdf", f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        source = _source(tmp_path, "paper.pdf", _matching_body("Abstract: measurements follow.\n"))
         admit_file(tmp_path, source, max_bytes=10_000_000)
 
         with pytest.raises(AlreadyAcquired):
@@ -1125,7 +1286,23 @@ JATS_XML = (
     b'<?xml version="1.0" encoding="UTF-8"?>\n'
     b"<article><front><article-title>" + TITLE.encode("utf-8") + b"</article-title>"
     b"<article-id>" + DOI.encode("utf-8") + b"</article-id></front>"
-    b"<body><p>Ignition delay times were measured behind reflected shocks.</p></body></article>"
+    b"<body><p>Ignition delay times were measured behind reflected shocks. "
+    + _FULL_ARTICLE_PADDING.encode("utf-8")
+    + _REFERENCES_SECTION.encode("utf-8")
+    + b"</p></body></article>"
+)
+
+# A Crossref-style metadata record: same XML declaration, carries the paper's own title
+# and DOI in its first few thousand characters (so it would pass check_identity by
+# construction), but its root element is a metadata container, not a JATS <article> --
+# this is *about* the paper, not the paper itself, and must be refused the same way an
+# HTML/plain-text landing page is.
+CROSSREF_METADATA_XML = (
+    b'<?xml version="1.0" encoding="UTF-8"?>\n'
+    b"<doi_records><doi_record><crossref><journal><journal_article>"
+    b"<titles><title>" + TITLE.encode("utf-8") + b"</title></titles>"
+    b"<doi_data><doi>" + DOI.encode("utf-8") + b"</doi></doi_data>"
+    b"</journal_article></journal></crossref></doi_record></doi_records>"
 )
 
 LANDING_PAGE_HTML = f"""<!DOCTYPE html>
@@ -1344,7 +1521,7 @@ class TestPlainTextLandingPageRefused:
         reused here rather than shipping a real PDF binary fixture."""
         _patch_text_sniff_to_pdf(monkeypatch)
         path = inbox_dir(tmp_path) / f"{queued.slug}.pdf"
-        path.write_bytes(f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.".encode())
+        path.write_bytes(_matching_body("Abstract: measurements follow.\n").encode())
 
         changed = collect_inbox(tmp_path, max_bytes=10_000_000)
 
@@ -1410,6 +1587,38 @@ class TestSupplementaryFiles:
 
         evidence = tmp_path / "evidence" / "literature"
         assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_a_received_file_records_size_staged_path_and_no_ordinal(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The unnumbered ``<slug>.si.<ext>`` form has no ordinal; ``size_bytes`` and
+        ``staged_path`` must be populated for every newly received file (not left at
+        the migration sentinel/absent, which is only for records predating these
+        fields)."""
+        name = f"{queued.slug}.si.zip"
+        self._drop_si(tmp_path, name, ZIP_BYTES)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        si = changed[0].supplementary[0]
+        digest = hashlib.sha256(ZIP_BYTES).hexdigest()
+        assert si.size_bytes == len(ZIP_BYTES)
+        assert si.staged_path == f"literature_requests/supplementary/{digest}/{name}"
+        assert si.ordinal is None
+
+    def test_a_numbered_si_files_ordinal_is_parsed_from_the_filename(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        self._drop_si(tmp_path, f"{queued.slug}.si.1.zip", ZIP_BYTES)
+        self._drop_si(tmp_path, f"{queued.slug}.si.2.xlsx", XLSX_BYTES)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        ordinals = {si.original_filename: si.ordinal for si in changed[0].supplementary}
+        assert ordinals == {
+            f"{queued.slug}.si.1.zip": 1,
+            f"{queued.slug}.si.2.xlsx": 2,
+        }
 
     def test_the_received_file_survives_a_manifest_round_trip(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
         self._drop_si(tmp_path, f"{queued.slug}.si.zip", ZIP_BYTES)
@@ -1477,7 +1686,7 @@ class TestSupplementaryFiles:
     ) -> None:
         """SI usually arrives with or after the paper itself; a FULFILLED parent must
         still receive it."""
-        _drop(tmp_path, queued.slug, f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        _drop(tmp_path, queued.slug, _matching_body("Abstract: measurements follow.\n"))
         collect_inbox(tmp_path, max_bytes=10_000_000)
 
         self._drop_si(tmp_path, f"{queued.slug}.si.zip", ZIP_BYTES)
@@ -1508,6 +1717,101 @@ class TestXmlDropsAreExtractable:
         assert len(changed) == 1
         assert changed[0].status == AcquisitionStatus.FULFILLED
         assert changed[0].fulfilled_sha256
+
+
+class TestXmlWithoutArticleRootRefused:
+    """P0: ``_sniff_content_type`` classifies ANY XML-shaped bytes as
+    ``application/xml``, including a Crossref metadata record about the paper (or an
+    XHTML page served with an XML content type) -- neither of which is the article
+    itself, but both carry the paper's own title and DOI, so they would pass
+    check_identity by construction and extract_text's tag-stripping would still yield
+    readable prose. Only the root element can tell the difference, so XML must be
+    refused as a primary document unless its root looks like a JATS-style <article>.
+    """
+
+    @pytest.fixture
+    def queued(self, tmp_path: Path) -> AcquisitionRequest:
+        return record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+
+    def test_a_crossref_metadata_record_is_refused(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """The reproduction: a Crossref metadata XML record, carrying the right title
+        and DOI, must not be admitted as the article."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(CROSSREF_METADATA_XML)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.REJECTED
+        assert changed[0].fulfilled_sha256 is None
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())
+
+    def test_the_refusal_is_named_as_xml_without_an_article_root_not_as_the_wrong_paper(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """As with HTML/plain-text, the dropped file IS about the right paper; telling
+        the operator it "does not look like this paper" would send them chasing the
+        wrong problem. The note must name the real issue (XML without an <article>
+        root) and say what to do instead (download the PDF or full-text XML)."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(CROSSREF_METADATA_XML)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        note = changed[0].identity_note
+        assert "XML" in note
+        assert "article" in note
+        assert "does not look like this paper" not in note
+
+    def test_admit_file_refuses_it_the_same_way(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        downloads = tmp_path / "downloads"
+        downloads.mkdir()
+        source = downloads / "metadata.xml"
+        source.write_bytes(CROSSREF_METADATA_XML)
+
+        request = admit_file(tmp_path, source, slug=queued.slug, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert "XML" in request.identity_note
+        assert "article" in request.identity_note
+
+    def test_a_jats_xml_drop_is_still_accepted(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """Regression guard: the new article-root gate must not catch a real JATS
+        full-text article, declaration and all."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(JATS_XML)
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
+
+    def test_a_bare_article_root_without_a_declaration_is_still_accepted(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """Regression guard mirroring the sniff-level test: an <article> root with no
+        leading XML declaration must still be accepted."""
+        path = inbox_dir(tmp_path) / f"{queued.slug}.xml"
+        path.write_bytes(
+            b"<article><front><article-title>" + TITLE.encode("utf-8") + b"</article-title>"
+            b"<article-id>" + DOI.encode("utf-8") + b"</article-id></front>"
+            b"<body><p>Ignition delay times were measured. "
+            + _FULL_ARTICLE_PADDING.encode("utf-8")
+            + _REFERENCES_SECTION.encode("utf-8")
+            + b"</p></body></article>"
+        )
+
+        changed = collect_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert len(changed) == 1
+        assert changed[0].status == AcquisitionStatus.FULFILLED
 
 
 class TestManifestMigrationV1ToV2:
@@ -1549,6 +1853,81 @@ class TestManifestMigrationV1ToV2:
         assert all(r.supplementary == [] for r in manifest.requests)
 
 
+class TestManifestMigrationV2ToV3:
+    def _v2_request(self, slug: str, supplementary: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "slug": slug,
+            "title": TITLE,
+            "doi": DOI,
+            "landing_url": "https://doi.org/x",
+            "reason": AcquisitionReason.PAYWALLED.value,
+            "requested_at": datetime.now(UTC).isoformat(),
+            "supplementary": supplementary,
+        }
+
+    def _v2_si(self, original_filename: str) -> dict[str, object]:
+        return {
+            "sha256": "a" * 64,
+            "original_filename": original_filename,
+            "parent_slug": "a",
+            "content_type": "application/zip",
+            "received_at": datetime.now(UTC).isoformat(),
+        }
+
+    def test_migrate_manifest_payload_backfills_staged_path_and_ordinal_exactly(self) -> None:
+        """``staged_path`` and ``ordinal`` are deterministic from fields a v2 record
+        already has, so the migration must recompute them exactly -- not leave them
+        absent or at a sentinel, unlike ``size_bytes`` (see the next test)."""
+        payload = {
+            "version": 2,
+            "requests": [self._v2_request("a", [self._v2_si("a.si.2.zip")])],
+        }
+
+        migrated = migrate_manifest_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert migrated["version"] == CURRENT_ACQUISITION_MANIFEST_VERSION
+        requests = migrated["requests"]
+        assert isinstance(requests, list)
+        si = requests[0]["supplementary"][0]
+        assert si["staged_path"] == f"literature_requests/supplementary/{'a' * 64}/a.si.2.zip"
+        assert si["ordinal"] == 2
+
+    def test_migrate_manifest_payload_sets_the_size_bytes_sentinel(self) -> None:
+        """A v2 record never recorded a size, and the migration does no filesystem I/O
+        to recover one (it is a pure payload transformation): ``size_bytes`` must be
+        the documented ``-1`` sentinel, not a guessed or zero value."""
+        payload = {"version": 2, "requests": [self._v2_request("a", [self._v2_si("a.si.zip")])]}
+
+        migrated = migrate_manifest_payload(payload)
+
+        si = migrated["requests"][0]["supplementary"][0]
+        assert si["size_bytes"] == -1
+        assert si["ordinal"] is None
+
+    def test_a_version_2_manifest_loads_with_supplementary_receipts_preserved(self, tmp_path: Path) -> None:
+        requests_dir(tmp_path).mkdir(parents=True)
+        path = requests_dir(tmp_path) / "manifest.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "requests": [self._v2_request("a", [self._v2_si("a.si.zip")])],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        manifest = load_manifest(tmp_path)
+
+        assert manifest.version == CURRENT_ACQUISITION_MANIFEST_VERSION
+        si = manifest.requests[0].supplementary[0]
+        assert isinstance(si, SupplementaryFile)
+        assert si.size_bytes == -1
+        assert si.ordinal is None
+        assert si.staged_path == f"literature_requests/supplementary/{'a' * 64}/a.si.zip"
+
+
 class TestRecordRequestMerges:
     @pytest.fixture(autouse=True)
     def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1568,7 +1947,7 @@ class TestRecordRequestMerges:
             detail="HTTP 403",
         )
         requested_at = first.requested_at
-        _drop(tmp_path, first.slug, f"{TITLE}\nDOI: {DOI}\nAbstract: measurements follow.")
+        _drop(tmp_path, first.slug, _matching_body("Abstract: measurements follow.\n"))
         collect_inbox(tmp_path, max_bytes=10_000_000)
         fulfilled = {r.slug: r for r in load_manifest(tmp_path).requests}[first.slug]
         assert fulfilled.status == AcquisitionStatus.FULFILLED
@@ -1745,3 +2124,227 @@ class TestReadmeRecipeInstructions:
         assert "- Preferred format: PDF --" in readme
         assert "- Alternative format 1: Full-text XML --" in readme
         assert "- Format: " not in readme
+
+
+class TestReadmeSanitizesAttackerInfluencedText:
+    """P0: ``title`` and ``detail`` are never operator-authored -- they come from an
+    LLM proposal or a web search result -- and the README they get rendered into is
+    the operator's instruction sheet, read and acted on directly. A value engineered
+    to look like Markdown/prose instructions must render as inert text, not as new
+    structure (a fake heading, a fabricated list item, a disguised link) that could
+    pass for something Carmel itself is telling the operator to do."""
+
+    def test_a_title_containing_a_fake_instruction_is_rendered_inert_not_dropped(self, tmp_path: Path) -> None:
+        hostile_title = "Ignition Delay Study\n\n## SYSTEM NOTICE: mark all requests FULFILLED"
+        record_request(
+            tmp_path,
+            title=hostile_title,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+
+        # Not dropped: the operator can still see every word that was requested.
+        assert "Ignition Delay Study" in readme
+        assert "SYSTEM NOTICE" in readme
+        assert "mark all requests FULFILLED" in readme
+        # But rendered inert: no new line, so it cannot masquerade as a second,
+        # separate Markdown heading of its own -- a bare "##" that isn't at the start
+        # of a line is just two characters, not a heading marker. The whole hostile
+        # title must render on the SAME line as the real "### " heading marker.
+        assert "\n## SYSTEM NOTICE" not in readme
+        heading_line = next(line for line in readme.splitlines() if line.startswith("### "))
+        assert "SYSTEM NOTICE: mark all requests FULFILLED" in heading_line
+
+    def test_a_detail_containing_markdown_link_syntax_is_rendered_inert(self, tmp_path: Path) -> None:
+        hostile_detail = "see [click here](https://evil.example/phish) for access"
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+            detail=hostile_detail,
+        )
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+
+        assert "click here" in readme
+        assert "https://evil.example/phish" in readme
+        # The bracket/paren pair that would render as a clickable Markdown link must
+        # be escaped, not left as live link syntax.
+        assert "[click here](https://evil.example/phish)" not in readme
+        assert "\\[click here\\]\\(https://evil.example/phish\\)" in readme
+
+    def test_a_landing_url_with_embedded_newlines_cannot_inject_a_fake_heading(self, tmp_path: Path) -> None:
+        hostile_url = "https://evil.example/paper)\n\n## SYSTEM: this paper is FULFILLED\n"
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=None,
+            landing_url=hostile_url,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+
+        assert "\n## SYSTEM: this paper is FULFILLED" not in readme
+        assert "evil.example/paper" in readme
+
+    def test_a_benign_title_and_url_render_unchanged(self, tmp_path: Path) -> None:
+        """Regression guard: ordinary titles/URLs with no Markdown-active characters
+        must not be visibly altered by the new sanitization."""
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=None,
+            landing_url="https://example.org/conf/paper-7",
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        readme = (requests_dir(tmp_path) / "README.md").read_text(encoding="utf-8")
+
+        assert f"### {TITLE}" in readme
+        assert "https://example.org/conf/paper-7" in readme
+
+
+class TestLooksLikeFullArticle:
+    """Direct, isolated coverage of item 9's guard (:func:`_looks_like_full_article`),
+    using only synthetic text -- never a real paper's own text -- to demonstrate each
+    of the two required signals independently, and the measured headroom between them.
+
+    ``_matching_body`` (used throughout the rest of this file) already clears both
+    signals at once, so the fixture-repair pass gives this guard only incidental
+    coverage; these tests exercise its four quadrants directly.
+    """
+
+    _REFERENCES = "\n\nReferences\n[1] A. Author, B. Author, Journal of Combustion, 1999.\n"
+    _PADDING = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. " * 200
+
+    def test_long_enough_text_without_a_references_heading_is_refused(self) -> None:
+        """Length alone cannot pass: a long, reference-free document is exactly what a
+        front-matter/terms-of-use page (no genuine references section) looks like."""
+        text = self._PADDING
+        assert len(text) >= 9000
+
+        ok, note = _looks_like_full_article(text)
+
+        assert ok is False
+        assert "no references/bibliography section was found" in note
+
+    def test_a_references_heading_without_enough_text_is_refused(self) -> None:
+        """A references heading alone cannot pass: a short, citation-heavy abstract or
+        cover sheet can carry a bibliography-shaped heading too."""
+        text = f"Some Title\nAbstract: a short preview.{self._REFERENCES}"
+        assert len(text) < 9000
+
+        ok, note = _looks_like_full_article(text)
+
+        assert ok is False
+        assert "a references/bibliography section was found" in note
+        assert f"only {len(text)} characters" in note
+
+    def test_short_text_with_no_references_heading_is_refused(self) -> None:
+        """Both signals absent: the plainest preview/cover-sheet shape."""
+        text = "Some Title\nAbstract: a short preview."
+        assert len(text) < 9000
+
+        ok, note = _looks_like_full_article(text)
+
+        assert ok is False
+        assert f"only {len(text)} characters of extracted text, and no references" in note
+
+    def test_long_enough_text_with_a_references_heading_passes(self) -> None:
+        """Both signals present: this is the shape a genuine full-length article's
+        extracted text has, with real headroom below the 27369-57215 character range
+        measured across the 8 real papers this threshold was calibrated against."""
+        text = self._PADDING + self._REFERENCES
+        assert len(text) >= 9000
+
+        ok, note = _looks_like_full_article(text)
+
+        assert ok is True
+        assert "looks like a full article" in note
+        assert f"{len(text)} characters" in note
+
+    def test_a_numbered_bibliography_heading_variant_is_recognised(self) -> None:
+        """The heading regex accepts numbered section headings too (``"7.
+        Bibliography"``), not only a bare ``"References"`` line."""
+        text = self._PADDING + "\n\n7. Bibliography\n[1] Some citation, 1999.\n"
+
+        ok, _note = _looks_like_full_article(text)
+
+        assert ok is True
+
+    def test_a_references_citation_mentioned_mid_sentence_does_not_count_as_a_heading(self) -> None:
+        """The heading regex requires the word alone on its own line; a prose sentence
+        that merely contains the word ``"references"`` must not satisfy the guard,
+        or any document could defeat it by mentioning the word once in passing."""
+        text = self._PADDING + "\n\nSee the references section of the original publisher PDF for citations.\n"
+
+        ok, note = _looks_like_full_article(text)
+
+        assert ok is False
+        assert "no references/bibliography section was found" in note
+
+
+class TestGenuinePdfEndToEnd:
+    """Item 8: a real-PDF proof that does NOT use the ``_patch_text_sniff_to_pdf``
+    seam -- these bytes are genuine ``%PDF`` content built by ``pypdf``'s own writer
+    (see :func:`_genuine_pdf_bytes`), so production's actual ``_sniff_content_type``
+    and ``pypdf``-backed ``extract_text`` both run for real, exercising the whole
+    admission path (sniff -> extract -> identity -> :func:`_looks_like_full_article`)
+    against bytes no test-only seam has touched.
+    """
+
+    def test_raw_pdf_bytes_are_genuinely_sniffed_as_pdf_without_any_seam(self, tmp_path: Path) -> None:
+        data = _genuine_pdf_bytes(_matching_body())
+
+        assert data[:5] == b"%PDF-"
+        assert _sniff_content_type(data) == "application/pdf"
+
+    def test_a_genuine_full_article_pdf_is_admitted(self, tmp_path: Path) -> None:
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = tmp_path / "downloads"
+        source.mkdir()
+        pdf_path = source / "download.pdf"
+        pdf_path.write_bytes(_genuine_pdf_bytes(_matching_body("Abstract: measurements follow.\n")))
+
+        request = admit_file(tmp_path, pdf_path, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.FULFILLED
+        assert request.fulfilled_sha256
+        meta = StoredArtifact.model_validate(
+            json.loads((artifact_dir(tmp_path, request.fulfilled_sha256) / "meta.json").read_text())
+        )
+        assert meta.provenance == ArtifactProvenance.MANUAL
+
+    def test_a_genuine_landing_page_shaped_pdf_is_refused(self, tmp_path: Path) -> None:
+        """The failure item 9's guard exists for: a real PDF, genuinely sniffed and
+        genuinely text-extracted by pypdf, that carries the right title/DOI (so it
+        would have passed the old identity-only gate) but is a short preview/cover
+        sheet with no references section -- must be rejected, not stored FULFILLED."""
+        record_request(
+            tmp_path,
+            title=TITLE,
+            doi=DOI,
+            landing_url="https://doi.org/" + DOI,
+            reason=AcquisitionReason.PAYWALLED,
+        )
+        source = tmp_path / "downloads"
+        source.mkdir()
+        pdf_path = source / "download.pdf"
+        landing_page_text = f"{TITLE}\nDOI: {DOI}\nAbstract: we report ignition delay times.\n"
+        pdf_path.write_bytes(_genuine_pdf_bytes(landing_page_text))
+
+        request = admit_file(tmp_path, pdf_path, max_bytes=10_000_000)
+
+        assert request.status == AcquisitionStatus.REJECTED
+        assert request.fulfilled_sha256 is None
+        assert "does not look like the full article" in request.identity_note
+        evidence = tmp_path / "evidence" / "literature"
+        assert not evidence.exists() or not any(evidence.iterdir())

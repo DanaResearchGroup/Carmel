@@ -10,7 +10,7 @@ import yaml
 from Carmel import main
 from carmel.paths import WORKSPACE_SUBDIRS
 from carmel.version import __version__
-from tests.test_acquisition import _patch_text_sniff_to_pdf
+from tests.test_acquisition import _matching_body, _patch_text_sniff_to_pdf
 
 
 class TestVersionCommand:
@@ -704,8 +704,11 @@ class TestRequestsCommand:
         cid, _ = self._campaign_with_request(tmp_path)
         right = tmp_path / "right.txt"
         right.write_text(
-            "Shock tube study of ammonia oxidation ignition delay times\n"
-            "DOI: 10.1016/j.test.2019.01.001\nAbstract: we report ignition delay times.\n",
+            _matching_body(
+                "Abstract: we report ignition delay times.\n",
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
             encoding="utf-8",
         )
 
@@ -723,7 +726,10 @@ class TestRequestsCommand:
         wrong.write_text("Something else entirely\n", encoding="utf-8")
         right = tmp_path / "right.txt"
         right.write_text(
-            "Shock tube study of ammonia oxidation ignition delay times\nDOI: 10.1016/j.test.2019.01.001\n",
+            _matching_body(
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
             encoding="utf-8",
         )
 
@@ -744,8 +750,11 @@ class TestRequestsCommand:
         drop = drop_path_for(ws, slug, suffix=".txt")
         drop.parent.mkdir(parents=True, exist_ok=True)
         drop.write_text(
-            "Shock tube study of ammonia oxidation ignition delay times\n"
-            "DOI: 10.1016/j.test.2019.01.001\nAbstract: we report ignition delay times.\n",
+            _matching_body(
+                "Abstract: we report ignition delay times.\n",
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
             encoding="utf-8",
         )
 
@@ -867,10 +876,13 @@ class TestRequestsCommandAddDirectory:
         # Real publisher filenames: spaces, parentheses, hyphens -- the whole point is
         # that these are irrelevant to matching, which happens on document content.
         (lit / "Experimental studies of the fundamental flame speeds of syngas (H2-CO)-air mixtures.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "Shock tube study (ammonia oxidation) - ignition delay times [2019].pdf").write_text(
-            f"{self._SECOND_TITLE}\nDOI: {self._SECOND_DOI}\nAbstract: we report ignition delay times.\n",
+            _matching_body(
+                "Abstract: we report ignition delay times.\n", title=self._SECOND_TITLE, doi=self._SECOND_DOI
+            ),
             encoding="utf-8",
         )
 
@@ -894,7 +906,8 @@ class TestRequestsCommandAddDirectory:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "good.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "bad.pdf").write_text("An entirely unrelated document about catalytic converters.\n", encoding="utf-8")
 
@@ -924,7 +937,8 @@ class TestRequestsCommandAddDirectory:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "good.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "bad.pdf").write_text("An entirely unrelated document about catalytic converters.\n", encoding="utf-8")
 
@@ -948,7 +962,8 @@ class TestRequestsCommandAddDirectory:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "good.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "subdir").mkdir()
         (lit / "subdir" / "nested.pdf").write_text("should never be seen\n", encoding="utf-8")
@@ -972,7 +987,7 @@ class TestRequestsCommandAddDirectory:
         cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
         lit = tmp_path / "lit"
         lit.mkdir()
-        (lit / "good.pdf").write_text(f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\n", encoding="utf-8")
+        (lit / "good.pdf").write_text(_matching_body(title=self._FIRST_TITLE, doi=self._FIRST_DOI), encoding="utf-8")
 
         from Carmel import main
 
@@ -992,7 +1007,8 @@ class TestRequestsCommandAddDirectory:
         cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
         right = tmp_path / "right.pdf"
         right.write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
 
         from Carmel import main
@@ -1058,7 +1074,7 @@ class TestRequestsCommandReIngest:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "publisher-named-download.txt").write_text(
-            f"{self._TITLE}\nDOI: {self._DOI}\nAbstract: ignition delay times.\n", encoding="utf-8"
+            _matching_body("Abstract: ignition delay times.\n", title=self._TITLE, doi=self._DOI), encoding="utf-8"
         )
         return lit
 

@@ -130,6 +130,24 @@ class SupplementaryFile(BaseModel):
     content_type: str
     """MIME type sniffed from the bytes (never from the filename)."""
     received_at: datetime
+    size_bytes: int = -1
+    """Size of the received bytes.
+
+    ``-1`` marks a record migrated forward from a manifest written before this field
+    existed (see ``_migrate_v2_to_v3``): that migration is a pure payload
+    transformation, mirroring :func:`carmel.services.literature.migrate_report_payload`,
+    and deliberately does no filesystem I/O to re-stat the staged file, so a genuine
+    size cannot be recovered for those older records without a separate maintenance
+    pass. Every file received from this version onward always gets a real size."""
+    staged_path: str
+    """Path of the staged file, relative to the workspace root (``literature_requests/
+    supplementary/<sha256>/<original_filename>``) -- deterministic from ``sha256`` and
+    ``original_filename``, so this is backfilled exactly (never a sentinel) for records
+    migrated forward from an older manifest."""
+    ordinal: int | None = None
+    """The ``<n>`` from a ``<slug>.si.<n>.<ext>`` drop (the nth of several SI files for
+    one paper); ``None`` for the unnumbered ``<slug>.si.<ext>`` form. Deterministic from
+    ``original_filename``, so this too is backfilled exactly for older records."""
 
 
 class AcquisitionRequest(BaseModel):
@@ -163,6 +181,12 @@ class AcquisitionRequest(BaseModel):
     identity_note: str = ""
     """Why the identity check passed or failed. Kept for rejected requests too, so a
     puzzled operator can see what the check was looking for."""
+    dropped_filename: str | None = None
+    """The actual filename of the last file dropped for this request, set whenever a
+    drop is admitted or rejected. The README's "Needs attention" section names this
+    file rather than assuming ``.pdf``: the format Carmel accepts is not limited to
+    PDF (JATS/full-text XML is also a primary document), and the rejected drop itself
+    can be any format at all (an archive, an oversized file, ...)."""
     supplementary: list[SupplementaryFile] = Field(default_factory=list)
     """Supplementary-information files received for this paper. Received-and-held
     only: see :class:`SupplementaryFile` -- nothing in this list is usable as
@@ -185,7 +209,7 @@ class AcquisitionRequest(BaseModel):
 #: be paired with a migration step in
 #: :func:`carmel.services.acquisition.migrate_manifest_payload`, mirroring
 #: :data:`carmel.schemas.literature.CURRENT_REPORT_SCHEMA_VERSION`.
-CURRENT_ACQUISITION_MANIFEST_VERSION = 2
+CURRENT_ACQUISITION_MANIFEST_VERSION = 3
 
 
 class AcquisitionManifest(BaseModel):

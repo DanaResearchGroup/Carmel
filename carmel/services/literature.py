@@ -1578,7 +1578,7 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     artifacts, skipped = list_artifacts_with_unreadable(workspace_root)
     for artifact in artifacts:
         try:
-            intact = verify_artifact(workspace_root, artifact.sha256)
+            intact = verify_artifact(workspace_root, artifact.sha256, deep=True)
         except ValueError:
             intact = False
         if not intact:

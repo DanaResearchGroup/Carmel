@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import hashlib
 import re
-import shutil
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -374,6 +373,18 @@ class _ManifestSchemaTooNew(ValueError):
     dict, never the path) does not have to fabricate one."""
 
 
+class _ManifestVersionUnusable(ValueError):
+    """Internal signal: ``migrate_manifest_payload`` saw a ``version`` field that is
+    present but is not a usable integer (``"x"``, ``null``, a list, ...). A missing
+    ``version`` is fine -- it defaults to 1, the pre-versioning shape -- but a present
+    and unparseable one must not raise a bare ``ValueError``/``TypeError`` straight out
+    of ``int(...)``: :func:`load_manifest` only ever catches the narrower OSError/JSON/
+    schema-validation failures around this call, so an uncaught ``int()`` failure would
+    escape the ``ManifestUnreadable`` contract entirely and crash the caller instead of
+    reporting a damaged manifest. Caught and rewrapped as :class:`ManifestUnreadable` by
+    :func:`load_manifest`, mirroring :class:`_ManifestSchemaTooNew` exactly."""
+
+
 def _migrate_v1_to_v2(payload: dict[str, object]) -> dict[str, object]:
     """v1 -> v2: every request gains a ``supplementary`` field (received SI files).
 
@@ -391,6 +402,61 @@ def _migrate_v1_to_v2(payload: dict[str, object]) -> dict[str, object]:
     return migrated
 
 
+def _migrate_v2_to_v3(payload: dict[str, object]) -> dict[str, object]:
+    """v2 -> v3: every supplementary receipt gains ``size_bytes``, ``staged_path``, and
+    ``ordinal``.
+
+    ``staged_path`` and ``ordinal`` are recomputed exactly (they are deterministic from
+    ``sha256``/``original_filename`` and from ``original_filename`` respectively, with
+    no filesystem I/O needed). ``size_bytes`` cannot be recovered this way -- it is the
+    one field this migration cannot backfill honestly, since a v2 record never recorded
+    it and re-deriving it would mean re-reading the staged file's bytes, which this
+    migration (a pure payload transformation, mirroring
+    :func:`carmel.services.literature.migrate_report_payload`) deliberately does not do
+    -- so it is set to the ``-1`` sentinel documented on
+    :attr:`carmel.schemas.acquisition.SupplementaryFile.size_bytes`.
+
+    Malformed entries (not dicts, or missing the fields this needs to recompute from)
+    are passed through untouched for the schema validator to reject with its own,
+    better message.
+    """
+    migrated = dict(payload)
+    requests = migrated.get("requests")
+    if not isinstance(requests, list):
+        return migrated
+    new_requests = []
+    for request in requests:
+        if not isinstance(request, dict):
+            new_requests.append(request)
+            continue
+        supplementary = request.get("supplementary")
+        if not isinstance(supplementary, list):
+            new_requests.append(request)
+            continue
+        new_supplementary = []
+        for si in supplementary:
+            if (
+                not isinstance(si, dict)
+                or not isinstance(si.get("sha256"), str)
+                or not isinstance(si.get("original_filename"), str)
+            ):
+                new_supplementary.append(si)
+                continue
+            sha256 = si["sha256"]
+            original_filename = si["original_filename"]
+            new_supplementary.append(
+                {
+                    "size_bytes": -1,
+                    "staged_path": _staged_supplementary_path(sha256, original_filename),
+                    "ordinal": _si_ordinal(Path(original_filename).stem.lower()),
+                    **si,
+                }
+            )
+        new_requests.append({**request, "supplementary": new_supplementary})
+    migrated["requests"] = new_requests
+    return migrated
+
+
 def migrate_manifest_payload(payload: object) -> object:
     """Bring a persisted manifest payload up to the current schema version.
 
@@ -402,10 +468,21 @@ def migrate_manifest_payload(payload: object) -> object:
         _ManifestSchemaTooNew: If ``payload``'s ``version`` is newer than
             :data:`~carmel.schemas.acquisition.CURRENT_ACQUISITION_MANIFEST_VERSION`.
             Rewrapped as :class:`ManifestUnreadable` by :func:`load_manifest`.
+        _ManifestVersionUnusable: If ``payload`` has a ``version`` field that is not a
+            usable integer. Rewrapped as :class:`ManifestUnreadable` by
+            :func:`load_manifest`, same as the too-new case above.
     """
     if not isinstance(payload, dict):
         return payload
-    version = int(payload.get("version", 1))
+    raw_version = payload.get("version", 1)
+    try:
+        version = int(raw_version)
+    except (ValueError, TypeError) as exc:
+        # e.g. {"version": "x"} or {"version": null} -- a damaged manifest, not a
+        # legitimately-versioned one. Named explicitly rather than left to propagate:
+        # this is exactly the kind of "manifest exists but is unusable" case
+        # ManifestUnreadable exists to report uniformly.
+        raise _ManifestVersionUnusable(f"manifest 'version' field is {raw_version!r}, not a usable integer") from exc
     if version > CURRENT_ACQUISITION_MANIFEST_VERSION:
         # Fail closed on a manifest from the FUTURE, exactly as
         # ``migrate_report_payload`` does: passing it through unmigrated hands it to a
@@ -425,6 +502,8 @@ def migrate_manifest_payload(payload: object) -> object:
     migrated = dict(payload)
     if version < 2:
         migrated = _migrate_v1_to_v2(migrated)
+    if version < 3:
+        migrated = _migrate_v2_to_v3(migrated)
     migrated["version"] = CURRENT_ACQUISITION_MANIFEST_VERSION
     return migrated
 
@@ -458,7 +537,7 @@ def load_manifest(workspace_root: Path) -> AcquisitionManifest:
         raise ManifestUnreadable(path, f"is not valid JSON ({exc})") from exc
     try:
         migrated = migrate_manifest_payload(payload)
-    except _ManifestSchemaTooNew as exc:
+    except (_ManifestSchemaTooNew, _ManifestVersionUnusable) as exc:
         raise ManifestUnreadable(path, str(exc)) from exc
     try:
         return AcquisitionManifest.model_validate(migrated)
@@ -783,7 +862,85 @@ def check_identity(extracted: ExtractedText, request: AcquisitionRequest) -> tup
     )
 
 
-_SI_STEM_RE = re.compile(r"^(?P<slug>.+?)\.si(?:\.\d+)?$")
+# Calibrated against 8 real full-length combustion-kinetics papers already extracted in
+# a live workspace (``~/runs/carmel/workspaces/live-syngas/evidence/literature/<sha256>/
+# text.txt``, read-only): extracted body text ranged 26913-56407 characters, and every
+# one of the 8 had at least one references/bibliography heading. A publisher preview,
+# cover sheet, or abstract-only PDF -- the failure mode this guard exists to catch --
+# carries title, authors, abstract and front matter, which runs at most a few thousand
+# characters, and has no reason to carry a references section at all.
+# ``_ARTICLE_MIN_CHARS`` is set to roughly a third of the real measured minimum (26913),
+# giving 2.99x headroom below every real paper measured while sitting comfortably above
+# what a cover page's front matter can plausibly reach.
+#
+# Those counts are CHARACTERS, matching what this guard compares. Measuring the same
+# files in bytes gives 27369-57215, because the papers carry non-ASCII glyphs (254 in
+# the smallest alone) that cost more than one byte each. The two units differ by under
+# 2% here and would not have changed the threshold -- but calibrating in the wrong one
+# is the same silent-unit mistake that makes an en-dash read as 1e9 downstream, so the
+# unit is stated rather than left to be inferred.
+#
+# KNOWN RESIDUAL, deliberately not over-engineered: the length axis alone cannot stop a
+# long preview page. No adversarial corpus of real landing/preview pages was measured to
+# bound their upper size, so the AND leans on the references heading to reject anything
+# verbose. A publisher preview that renders the full reference list would satisfy both
+# signals and be admitted. Tightening that means checking the heading is followed by
+# actual reference entries, which is worth doing only once a real sample exists to
+# calibrate against -- guessing a second threshold would repeat the mistake this comment
+# exists to record.
+#
+# Both signals are required (fail-closed AND, not OR): length alone
+# cannot distinguish a long, reference-free front-matter/terms-of-use page from a short
+# real paper, and a references heading alone cannot distinguish a short citation-heavy
+# abstract from a full article -- but no cover/preview page has both real headroom on
+# length AND a genuine references section, and every real paper measured has both.
+_ARTICLE_MIN_CHARS = 9000
+
+_REFERENCES_HEADING_RE = re.compile(
+    r"(?im)^\s*(?:[0-9]+[.\s]*)?(references|bibliography|works cited|literature cited)\s*$"
+)
+"""Matches a references/bibliography section heading on its own line, optionally
+numbered (``"7. References"``, ``"References"``, ``"Bibliography"``, ...)."""
+
+
+def _looks_like_full_article(text: str) -> tuple[bool, str]:
+    """Distinguish a full-length article from a preview/cover sheet/abstract page.
+
+    THE six-month failure this guards against: a valid PDF carrying the paper's own
+    title and DOI (so it passes format and identity checks) is actually a publisher
+    preview, cover sheet, or abstract-only page -- it gets stored FULFILLED, and later
+    grounds numeric claims against a document that was never the article. Neither the
+    format gate nor :func:`check_identity` can catch this: both are satisfied by
+    construction (a preview page IS about the right paper).
+
+    Returns:
+        ``(ok, note)``, same shape as :func:`check_identity`. ``note`` explains the
+        decision either way, so a false refusal (recoverable: the operator just checks
+        the file) is at least as legible as an acceptance.
+    """
+    n_chars = len(text)
+    has_references = bool(_REFERENCES_HEADING_RE.search(text))
+    if n_chars >= _ARTICLE_MIN_CHARS and has_references:
+        return True, (
+            f"looks like a full article: {n_chars} characters of extracted text and a "
+            f"references/bibliography section were both found"
+        )
+    if n_chars < _ARTICLE_MIN_CHARS and not has_references:
+        detail = f"only {n_chars} characters of extracted text, and no references/bibliography section"
+    elif n_chars < _ARTICLE_MIN_CHARS:
+        detail = f"only {n_chars} characters of extracted text (a references/bibliography section was found)"
+    else:
+        detail = f"{n_chars} characters of extracted text, but no references/bibliography section was found"
+    return False, (
+        f"the dropped file carries this paper's title and DOI, but does not look like the "
+        f"full article -- {detail}. This is what a publisher preview, cover sheet, or "
+        f"abstract-only PDF looks like: the right title and DOI on a document that is not "
+        f"the paper itself. Download the publisher's full-text PDF (or JATS/XML) of the "
+        f"article and drop that instead"
+    )
+
+
+_SI_STEM_RE = re.compile(r"^(?P<slug>.+?)\.si(?:\.(?P<ordinal>\d+))?$")
 """Filename-stem convention for supplementary information: ``<slug>.si.<ext>`` or
 ``<slug>.si.<n>.<ext>`` for the nth of several SI files. ``path.stem`` strips only the
 final extension, so the stems this sees are ``<slug>.si`` and ``<slug>.si.<n>``."""
@@ -798,6 +955,29 @@ def _si_parent_slug(stem: str) -> str | None:
     """
     match = _SI_STEM_RE.match(stem)
     return match.group("slug") if match else None
+
+
+def _si_ordinal(stem: str) -> int | None:
+    """Return the ``<n>`` from a ``<slug>.si.<n>`` stem, or ``None`` for ``<slug>.si``.
+
+    Returns ``None`` too when ``stem`` does not carry the ``.si`` marker at all --
+    callers only invoke this once :func:`_si_parent_slug` has already confirmed it does.
+    """
+    match = _SI_STEM_RE.match(stem)
+    if match is None or match.group("ordinal") is None:
+        return None
+    return int(match.group("ordinal"))
+
+
+def _staged_supplementary_path(sha256: str, original_filename: str) -> str:
+    """Path of a staged supplementary file, relative to the workspace root.
+
+    Deterministic from ``sha256`` and ``original_filename`` alone (matches
+    :func:`supplementary_dir`'s layout), so it can be recomputed with no filesystem I/O
+    -- both when a file is freshly received and when an older manifest is migrated
+    forward.
+    """
+    return f"{REQUESTS_DIR}/{SUPPLEMENTARY_DIR}/{sha256}/{original_filename}"
 
 
 def _receive_supplementary(workspace_root: Path, path: Path, parent: AcquisitionRequest, *, max_bytes: int) -> bool:
@@ -844,6 +1024,9 @@ def _receive_supplementary(workspace_root: Path, path: Path, parent: Acquisition
             parent_slug=parent.slug,
             content_type=_sniff_content_type(data),
             received_at=datetime.now(UTC),
+            size_bytes=len(data),
+            staged_path=_staged_supplementary_path(digest, path.name),
+            ordinal=_si_ordinal(path.stem.lower()),
         )
     )
     logger.info("received supplementary file %s for %s (held, not ingested)", path.name, parent.slug)
@@ -955,6 +1138,29 @@ def _sniff_content_type(data: bytes) -> str:
     return "text/plain"
 
 
+# Matches an XML document whose root element is (or looks like) a JATS-style
+# ``<article>`` -- optionally preceded by an XML declaration and/or a DOCTYPE. Used by
+# :func:`_admit_one` to distinguish a genuine full-text article from any other XML
+# shape (a Crossref metadata record, a bare XHTML fragment, ...) that
+# :func:`_sniff_content_type` classifies as ``application/xml`` too, since the sniff
+# above deliberately stays a broad "this is XML" classification -- the article-root
+# requirement is an identity-safety gate, not a type gate, and lives here so a future
+# non-article XML consumer of ``_sniff_content_type`` is not forced through it.
+_XML_ARTICLE_ROOT_RE = re.compile(rb"^\s*(<\?xml[^>]*\?>)?\s*(<!doctype[^>]*>)?\s*<article\b", re.IGNORECASE)
+
+
+def _xml_looks_like_article(data: bytes) -> bool:
+    """True when XML-sniffed bytes' root element is a JATS-style ``<article>``.
+
+    Any other XML shape -- a Crossref metadata record, a bare XHTML page saved with
+    an ``.xml`` extension -- carries the same title/DOI a real article does, so it
+    would pass :func:`check_identity` by construction, and :func:`extract_text`'s pure
+    tag-stripping would still yield readable prose from it. Neither check can tell
+    that the document itself is not the article; only the root element can.
+    """
+    return bool(_XML_ARTICLE_ROOT_RE.match(data[:4096]))
+
+
 def _admit_one(
     workspace_root: Path, path: Path, request: AcquisitionRequest, *, max_bytes: int
 ) -> StoredArtifact | None:
@@ -964,6 +1170,11 @@ def _admit_one(
         The stored artifact, or ``None`` when the file was rejected for any reason.
     """
     from carmel.agents.tools.fetch import FetchedArtifact
+
+    # Recorded unconditionally, before any rejection branch below, so the README's
+    # "Needs attention" section can name the file that was ACTUALLY dropped -- XML,
+    # an archive, an oversized file, anything -- rather than assuming it was a PDF.
+    request.dropped_filename = path.name
 
     # Check the size via stat BEFORE reading: a huge dropped file must be rejected
     # without ever being pulled fully into memory, or the cap below defeats its own
@@ -1037,6 +1248,29 @@ def _admit_one(
         logger.warning("rejected dropped file for %s: plain text is not accepted as a primary document", request.slug)
         return None
 
+    # XML is refused as a primary document unless it looks like a full-text article
+    # (a JATS-style <article> root), for the same reason HTML and plain text are: a
+    # Crossref metadata record, or an XHTML landing page served with an XML content
+    # type, carries the paper's own title and DOI in its first few thousand
+    # characters, so it passes :func:`check_identity` by construction, and
+    # :func:`extract_text`'s tag-stripping still yields readable prose from it -- it
+    # would be admitted as the article itself. Checked before identity, same as HTML
+    # and plain text above, because identity cannot catch this case either.
+    if content_type == "application/xml" and not _xml_looks_like_article(data):
+        request.status = AcquisitionStatus.REJECTED
+        request.identity_note = (
+            "the dropped file is XML but its root element is not an <article> -- "
+            "almost always publisher/Crossref metadata about the paper (or an XHTML "
+            "landing page), not the paper itself, and it carries the right title and "
+            "DOI on the wrong document. Download the publisher's PDF (or full-text "
+            "JATS/XML) of the article and drop that instead"
+        )
+        logger.warning(
+            "rejected dropped file for %s: XML without an <article> root is not accepted as a primary document",
+            request.slug,
+        )
+        return None
+
     # Archives are recognised (see :func:`_sniff_content_type`) but not processable:
     # naming that plainly beats the misleading "no extractable text (an image-only
     # scan?)" diagnosis an opaque-bytes classification used to produce for a zip.
@@ -1062,6 +1296,13 @@ def _admit_one(
     if not ok:
         request.status = AcquisitionStatus.REJECTED
         logger.warning("rejected dropped file for %s: %s", request.slug, note)
+        return None
+
+    article_ok, article_note = _looks_like_full_article(extracted.text)
+    request.identity_note = article_note
+    if not article_ok:
+        request.status = AcquisitionStatus.REJECTED
+        logger.warning("rejected dropped file for %s: %s", request.slug, article_note)
         return None
 
     digest = hashlib.sha256(data).hexdigest()
@@ -1356,11 +1597,22 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
     drop_path = drop_path_for(workspace_root, slug, suffix=source.suffix or ".pdf")
     inbox_dir(workspace_root).mkdir(parents=True, exist_ok=True)
     try:
+        source_data = source.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"could not read {source} to copy it into the inbox: {exc}") from exc
+    try:
         # Overwrite, deliberately, rather than refuse: the whole point of this function
         # is to shorten the retry loop after a wrong drop, and the file is re-verified
         # immediately below, so a stale inbox copy is never left standing as the thing
         # that determines the request's fate -- this call's ``source`` always is.
-        shutil.copyfile(source, drop_path)
+        #
+        # Written via :func:`~carmel.services.artifacts.write_bytes` rather than
+        # ``shutil.copyfile`` so the drop is atomic: that helper writes to a temp file
+        # in the same directory, fsyncs it, and ``os.replace``s it into place. A direct
+        # copy interrupted partway (killed process, full disk) leaves a truncated file
+        # sitting under the real inbox name, which a later ``collect_inbox`` sweep would
+        # then read and identity-check as if it were the operator's genuine drop.
+        write_bytes(drop_path, source_data)
     except OSError as exc:
         raise ValueError(f"could not copy {source} into the inbox: {exc}") from exc
 
@@ -1380,6 +1632,50 @@ def admit_file(workspace_root: Path, source: Path, *, slug: str | None = None, m
         )
     save_manifest(workspace_root, manifest)
     return request
+
+
+# Markdown-active characters that could turn attacker-influenced text (a request's
+# ``title``/``detail`` -- these originate from LLM proposals or web search, not from
+# the operator) into rendered Markdown structure -- emphasis, links, code spans, raw
+# HTML, table cells -- instead of inert text, when interpolated into the README.
+_MARKDOWN_ACTIVE_CHARS = "\\`*_[]()<>|"
+
+
+def _sanitize_markdown_text(text: str) -> str:
+    """Render attacker-influenced text as inert Markdown.
+
+    ``title`` and ``detail`` are never operator-authored -- they arrive from an LLM
+    proposal or a web search result -- so a value engineered to look like Markdown
+    instructions (a fake heading, a fabricated list item on its own line, a disguised
+    link) must not be able to inject new structure into the README the operator reads
+    and acts on. Nothing is dropped: every character the caller passed in is still
+    present in the output, either untouched or backslash-escaped, so the operator
+    still sees exactly what was requested -- only its ability to be interpreted as
+    Markdown control syntax is removed.
+    """
+    # Flatten control characters (newline, CR, tab, ...) to a single space first: a
+    # multi-line value is the actual injection vector (it can fake a new heading or
+    # list item on what looks like its own line); once it is one line, none of the
+    # remaining escaping needs to worry about line-start markers.
+    flattened = "".join(" " if ord(ch) < 0x20 else ch for ch in text)
+    flattened = " ".join(flattened.split())
+    return "".join(f"\\{ch}" if ch in _MARKDOWN_ACTIVE_CHARS else ch for ch in flattened)
+
+
+def _sanitize_markdown_url(url: str) -> str:
+    """Render an attacker-influenced URL (``landing_url``) as inert plain text.
+
+    Unlike :func:`_sanitize_markdown_text`, characters are dropped rather than
+    backslash-escaped: the whole point of this field is that the operator copies it
+    into a browser address bar, and a literal backslash is not a character a real URL
+    would ever legitimately need, so escaping it would corrupt what gets pasted. The
+    Markdown-active characters this strips (brackets, parens, backticks, pipes, angle
+    brackets) are exactly the ones that could turn the URL into a disguised link or
+    break out of its line; a well-formed URL does not need any of them.
+    """
+    flattened = "".join(" " if ord(ch) < 0x20 else ch for ch in url)
+    flattened = " ".join(flattened.split())
+    return "".join(ch for ch in flattened if ch not in _MARKDOWN_ACTIVE_CHARS)
 
 
 def _readme_text(manifest: AcquisitionManifest, *, today: date | None = None) -> str:
@@ -1427,7 +1723,7 @@ def _readme_text(manifest: AcquisitionManifest, *, today: date | None = None) ->
         lines.append("")
         for request in pending:
             recipe = build_recipe(request, today=resolved_today)
-            lines.append(f"### {request.title}")
+            lines.append(f"### {_sanitize_markdown_text(request.title)}")
             lines.append("")
             if recipe.publisher is not None:
                 verification = (
@@ -1457,8 +1753,8 @@ def _readme_text(manifest: AcquisitionManifest, *, today: date | None = None) ->
             lines.append(f"- {recipe.supplementary}")
             if request.doi:
                 lines.append(f"- DOI: `{request.doi}`")
-            lines.append(f"- Obtain from: {recipe.open_url}")
-            detail = f" ({request.detail})" if request.detail else ""
+            lines.append(f"- Obtain from: {_sanitize_markdown_url(recipe.open_url)}")
+            detail = f" ({_sanitize_markdown_text(request.detail)})" if request.detail else ""
             lines.append(f"- Why manual: {_reason_phrase(request.reason)}{detail}")
             for note in recipe.notes:
                 lines.append(f"- Note: {note}")
@@ -1475,7 +1771,12 @@ def _readme_text(manifest: AcquisitionManifest, *, today: date | None = None) ->
         lines.append("A file was dropped for these, but it did not pass the identity check:")
         lines.append("")
         for request in rejected:
-            lines.append(f"- `{request.slug}.pdf` -- {request.identity_note}")
+            # Name the file that was ACTUALLY dropped -- it need not be a PDF (XML is
+            # also accepted, and the rejected drop itself can be any format at all: an
+            # archive, an oversized file, ...) -- falling back to the slug alone only
+            # for a manifest written before this field existed.
+            dropped = request.dropped_filename or request.slug
+            lines.append(f"- `{dropped}` -- {request.identity_note}")
         lines.append("")
 
     received = [(request, si) for request in manifest.requests for si in request.supplementary]
