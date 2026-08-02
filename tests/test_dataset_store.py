@@ -11,12 +11,15 @@ import pytest
 
 from carmel.services.dataset_store import (
     _DECIMAL_REPR_VERSION_KEY,
+    _MAX_JSON_DEPTH,
     DATASET_STORE_DIR,
     CanonicalDecimalError,
     CanonicalJsonError,
+    _raw_bytes_nest_too_deeply,
     canonical_decimal,
     canonical_json_bytes,
     compute_dataset_sha,
+    dataset_decimal_repr_version,
     dataset_path,
     list_datasets,
     load_dataset,
@@ -556,3 +559,148 @@ class TestDecimalReprVersionIsRecordedInTheAddressedPayload:
 
         with pytest.raises(ValueError, match="reserved"):
             compute_dataset_sha(payload)
+
+
+class TestRawBytesNestingPrescan:
+    """Pins the prescan's OWN contract, directly.
+
+    The deep-nesting case in the class below passes even with this prescan
+    disabled entirely (measured by mutation): the broadened ``except`` catches
+    the resulting ``RecursionError`` and still returns ``False``. That is the
+    intended backstop, but it means the end-to-end test cannot tell whether the
+    prescan works -- it would go green on a prescan that never fired. The
+    prescan is the PRIMARY defence precisely because recovering from a
+    ``RecursionError`` is fragile, so its behaviour is pinned here on its own.
+    """
+
+    def test_rejects_genuinely_deep_nesting(self) -> None:
+        raw = b"[" * (_MAX_JSON_DEPTH + 1) + b"]" * (_MAX_JSON_DEPTH + 1)
+        assert _raw_bytes_nest_too_deeply(raw) is True
+
+    def test_accepts_nesting_at_the_limit(self) -> None:
+        raw = b"[" * _MAX_JSON_DEPTH + b"]" * _MAX_JSON_DEPTH
+        assert _raw_bytes_nest_too_deeply(raw) is False
+
+    def test_brackets_inside_a_string_are_not_structural(self) -> None:
+        # The whole reason this is a scanner and not a byte count: 50 000 '['
+        # characters inside a JSON string value nest nothing. A naive counter
+        # would reject this perfectly ordinary payload.
+        raw = b'{"s":"' + b"[" * 50_000 + b'"}'
+        assert _raw_bytes_nest_too_deeply(raw) is False
+
+    def test_escaped_quote_does_not_end_the_string(self) -> None:
+        # A backslash-escaped quote must not be read as closing the string --
+        # otherwise every bracket after it would be miscounted as structural.
+        raw = b'{"s":"a\\"' + b"[" * (_MAX_JSON_DEPTH + 1) + b'"}'
+        assert _raw_bytes_nest_too_deeply(raw) is False
+
+
+class TestVerifyDatasetFailsClosedOnHostileButHashCorrectBytes:
+    """A file's bytes can hash to their own filename and still be adversarial
+    on-disk content chosen to blow up whatever parses them next. Before this
+    fix, three such hash-correct payloads made ``verify_dataset`` *raise*
+    (``UnicodeEncodeError``, ``ValueError`` from CPython's int/str conversion
+    digit limit, or ``RecursionError``) instead of returning ``False`` --
+    turning a boolean health check into a crash any hostile file on disk could
+    trigger. ``verify_dataset``'s job is exactly to say "no" to bytes like
+    this, not to propagate whatever exception parsing them happens to throw."""
+
+    @staticmethod
+    def _write_raw(tmp_path: Path, raw_bytes: bytes) -> str:
+        sha = hashlib.sha256(raw_bytes).hexdigest()
+        path = dataset_path(tmp_path, sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw_bytes)
+        return sha
+
+    def test_lone_utf16_surrogate_in_a_string_value_returns_false(self, tmp_path: Path) -> None:
+        # A lone (unpaired) UTF-16 surrogate is representable in a Python str
+        # (json.loads happily decodes a `\ud800`-style escape into one) but
+        # cannot be re-encoded to UTF-8 -- `str.encode("utf-8")` raises
+        # `UnicodeEncodeError` on it. Hand-craft raw bytes containing the JSON
+        # *escape* for a lone surrogate so the bytes themselves stay valid
+        # UTF-8 all the way through `path.read_bytes()` and `json.loads`; the
+        # failure only surfaces when this store tries to re-canonicalize the
+        # parsed string back to bytes.
+        raw_bytes = b'{"a": "\\ud800"}\n'
+        sha = self._write_raw(tmp_path, raw_bytes)
+
+        assert verify_dataset(tmp_path, sha) is False
+
+    def test_five_thousand_digit_int_value_returns_false(self, tmp_path: Path) -> None:
+        # CPython bounds int<->str conversion by digit count (see
+        # `sys.set_int_max_str_digits`); parsing a 5000-digit integer literal
+        # out of JSON text trips that limit and raises `ValueError`, not
+        # anything specific to this module.
+        huge_digits = "9" * 5000
+        raw_bytes = f'{{"a": {huge_digits}}}\n'.encode()
+        sha = self._write_raw(tmp_path, raw_bytes)
+
+        assert verify_dataset(tmp_path, sha) is False
+
+    def test_hundred_thousand_deep_nested_array_returns_false(self, tmp_path: Path) -> None:
+        # Bracket-only nesting with no dict wrapper: `_raw_bytes_nest_too_deeply`
+        # must catch this via the raw-byte prescan run *before* `json.loads`,
+        # since letting `json.loads` itself hit the interpreter's recursion
+        # limit on 100 000 levels of `[` is exactly the crash this prescan
+        # exists to avoid.
+        depth = 100_000
+        raw_bytes = (b"[" * depth) + b"0" + (b"]" * depth) + b"\n"
+        sha = self._write_raw(tmp_path, raw_bytes)
+
+        assert verify_dataset(tmp_path, sha) is False
+
+
+class TestLoadDatasetRejectsNonDictPayloadAsValueError:
+    """``verify_dataset`` has always required the parsed payload to be a
+    ``dict``, but ``load_dataset`` lacked that guard: a canonical, hash-correct,
+    non-dict payload (e.g. a bare canonical string) sailed through the digest
+    and canonicality checks and only failed later, on ``.pop(...)``, with a
+    bare ``AttributeError`` -- not the ``ValueError`` this function documents
+    for every other rejection. Now both functions share one dict-checking
+    read path, so ``load_dataset`` fails the same documented way."""
+
+    def test_canonical_non_dict_payload_raises_value_error_not_attribute_error(self, tmp_path: Path) -> None:
+        raw_bytes = canonical_json_bytes("hello")
+        sha = hashlib.sha256(raw_bytes).hexdigest()
+        path = dataset_path(tmp_path, sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(raw_bytes)
+
+        with pytest.raises(ValueError, match="(?i)dict"):
+            load_dataset(tmp_path, sha)
+
+
+class TestCanonicalDecimalBoundsCoefficientLength:
+    """``_MAX_ADJUSTED_EXPONENT_MAGNITUDE`` bounds the *exponent* (order of
+    magnitude) of a decimal value, but nothing bounded the *coefficient*
+    (significant-digit count) -- an all-nines fractional tail like
+    ``"0." + "9" * 500000`` has an adjusted exponent of only -1, so it sails
+    straight past the exponent bound and was canonicalized into a
+    500 002-character string. (The similar-looking integer shape
+    ``"9" * 500000`` is already rejected -- but only incidentally, via the
+    *exponent* bound, since an all-nines integer's adjusted exponent equals its
+    digit count; that shape is not evidence a coefficient bound exists, which
+    is why the fractional-tail shape is the one that must be tested here.)"""
+
+    def test_long_fractional_tail_with_small_exponent_is_rejected(self) -> None:
+        text = "0." + "9" * 500_000
+
+        with pytest.raises(CanonicalDecimalError, match="(?i)coefficient|too long"):
+            canonical_decimal(text)
+
+
+class TestDatasetDecimalReprVersionAccessor:
+    """Finding #4: callers need to know which decimal-repr version a stored
+    dataset was written under without changing ``load_dataset``'s return type
+    (which must keep returning exactly the caller's own payload, version key
+    stripped). ``dataset_decimal_repr_version`` exposes that marker directly."""
+
+    def test_returns_the_version_recorded_at_store_time(self, tmp_path: Path) -> None:
+        stored = store_dataset(tmp_path, {"compound": "toluene", "k": "1.00"})
+
+        assert dataset_decimal_repr_version(tmp_path, stored.sha256) == 1
+
+    def test_raises_file_not_found_for_a_sha_that_does_not_exist(self, tmp_path: Path) -> None:
+        with pytest.raises(FileNotFoundError):
+            dataset_decimal_repr_version(tmp_path, "0" * 64)

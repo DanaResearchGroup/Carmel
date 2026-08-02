@@ -571,6 +571,37 @@ class TestMeasuredValue:
                 surprise="y",
             )  # type: ignore[call-arg]
 
+    def test_non_finite_canonical_value_rejected(self) -> None:
+        """The normalize/parse finiteness asymmetry in carmel.services.numeric
+        (normalize_numeric_span accepts "1E+400" as a well-formed decimal
+        while parse_numeric_span refuses it as non-finite) must not leak
+        through MeasuredValue: a stored measured quantity is never 1E+400, so
+        canonical_decimal_value must evaluate to a finite float even though
+        canonical_decimal() itself stays permissive (it also canonicalizes
+        bbox coordinates and conversion factors, which must not gain a
+        finiteness opinion -- see _require_finite_as_float's docstring)."""
+        with pytest.raises(ValidationError):
+            _measured_value(raw_text="1E+400", canonical_decimal_value="1E+400", repairs=())
+        # The corresponding positive case: a large-but-finite exponent must
+        # still work -- only the finiteness-as-float boundary is enforced,
+        # not an arbitrary tightening of magnitude.
+        mv = _measured_value(raw_text="1E+300", canonical_decimal_value="1E+300", repairs=())
+        assert mv.canonical_decimal_value == "1E+300"
+
+    def test_zero_or_negative_conversion_factor_rejected(self) -> None:
+        """A conversion factor of 0 annihilates the value it converts, and a
+        negative factor silently flips its sign -- exactly the corruption
+        class this corpus exhibits (a subsetted font deleted the minus glyph
+        from every value in one table) -- so conversion_factor must be
+        strictly positive."""
+        with pytest.raises(ValidationError):
+            _measured_value(conversion_factor="0")
+        with pytest.raises(ValidationError):
+            _measured_value(conversion_factor="-2")
+        # The corresponding positive case: a genuine positive factor still works.
+        mv = _measured_value(conversion_factor="2")
+        assert mv.conversion_factor == "2"
+
 
 def _uncertainty_measured_value(
     raw_text: str,
@@ -754,6 +785,57 @@ class TestUncertainty:
                 lower=_uncertainty_measured_value("0.05"),
                 surprise="y",
             )  # type: ignore[call-arg]
+
+    def test_negative_uncertainty_bound_rejected(self) -> None:
+        """An uncertainty bound is a magnitude (a distance), never negative
+        or zero -- asymmetric uncertainty is represented by upper/lower
+        differing in SIZE, never by one of them being negative."""
+        with pytest.raises(ValidationError):
+            Uncertainty(
+                kind=UncertaintyKind.STD_DEV,
+                basis=UncertaintyBasis.ABSOLUTE,
+                scale=UncertaintyScale.LINEAR,
+                upper=_uncertainty_measured_value("-5"),
+                lower=_uncertainty_measured_value("5"),
+            )
+        # The corresponding positive case: a genuine positive bound still works.
+        unc = Uncertainty(
+            kind=UncertaintyKind.STD_DEV,
+            basis=UncertaintyBasis.ABSOLUTE,
+            scale=UncertaintyScale.LINEAR,
+            upper=_uncertainty_measured_value("5"),
+            lower=_uncertainty_measured_value("5"),
+        )
+        assert isinstance(unc.upper, MeasuredValue)
+        assert unc.upper.canonical_decimal_value == "5"
+
+    def test_unspecified_percentage_blocks_even_when_fully_populated(self) -> None:
+        """UNSPECIFIED_PERCENTAGE's entire meaning is that the statistical
+        method was NOT stated -- measured over the 8 real corpus papers, an
+        explicit uncertainty KIND is stated in only 1 of 8, so this is the
+        common case, not an edge case. It must block statistical
+        interpretation exactly like UNKNOWN, even with basis, scale, and a
+        bound all present -- a consumer still cannot know whether "+-5%" is
+        a standard deviation, a 95% confidence interval, or an instrument
+        spec."""
+        unc = Uncertainty(
+            kind=UncertaintyKind.UNSPECIFIED_PERCENTAGE,
+            basis=UncertaintyBasis.ABSOLUTE,
+            scale=UncertaintyScale.LINEAR,
+            upper=_uncertainty_measured_value("5"),
+            lower=_uncertainty_measured_value("5"),
+        )
+        assert unc.blocks_statistical_interpretation is True
+        # The corresponding case that must still work: a stated kind (with the
+        # same basis/scale/bounds shape) does not block.
+        stated = Uncertainty(
+            kind=UncertaintyKind.STD_DEV,
+            basis=UncertaintyBasis.ABSOLUTE,
+            scale=UncertaintyScale.LINEAR,
+            upper=_uncertainty_measured_value("5"),
+            lower=_uncertainty_measured_value("5"),
+        )
+        assert stated.blocks_statistical_interpretation is False
 
 
 class TestComposition:

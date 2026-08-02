@@ -34,6 +34,7 @@ see that function's docstring for why floats are rejected outright.
 
 from __future__ import annotations
 
+import math
 import re
 from decimal import Decimal
 from enum import StrEnum
@@ -117,6 +118,40 @@ def _require_canonical_decimal(value: str, *, field_name: str) -> str:
             "store the output of canonical_decimal(), not a hand-formatted string"
         )
     return value
+
+
+def _require_finite_as_float(value: str, *, field_name: str) -> Decimal:
+    """Require ``value`` (already a canonical decimal string) to evaluate to a
+    finite ``float``, and return it as a :class:`Decimal`.
+
+    This closes a real leak across two deliberately different layers in
+    :mod:`carmel.services.numeric`: ``normalize_numeric_span`` accepts
+    ``"1E+400"`` as a well-formed, exactly-representable decimal numeral (its
+    docstring explains why -- textual FORM and float EVALUATION are different
+    concerns there), while ``parse_numeric_span`` refuses it because
+    ``float("1E+400")`` is ``inf``. ``canonical_decimal`` -- which every
+    canonical-decimal field here is built on -- inherits the permissive,
+    textual-only side of that split (deliberately: it also canonicalizes bbox
+    coordinates and conversion factors, none of which should ever gain a
+    finiteness opinion). Left unchecked, that permissiveness leaks straight
+    through into any field that stores the OUTCOME of a real-world
+    measurement: a ``MeasuredValue`` with ``canonical_decimal_value="1E+400"``
+    validates today, silently breaking every downstream consumer that
+    assumes "schema-valid implies convertible to a finite float".
+
+    Fix it HERE, at the model boundary that actually means "this is a
+    measured quantity" -- never in ``canonical_decimal`` itself, which must
+    stay permissive for its other, non-measurement callers. No measurement in
+    this domain is ``1E+400``.
+    """
+    decimal_value = Decimal(value)
+    if not math.isfinite(float(decimal_value)):
+        raise ValueError(
+            f"{field_name}={value!r} is a well-formed canonical decimal string but does not evaluate to "
+            "a finite float; no real measurement in this domain has that magnitude, and a consumer that "
+            "assumes 'schema-valid implies convertible to a finite float' would silently break on it"
+        )
+    return decimal_value
 
 
 class AbsenceReason(StrEnum):
@@ -479,6 +514,20 @@ class MeasuredValue(BaseModel):
     decided whether this span was allowed to become a ``MeasuredValue`` at
     all -- that decision must already have been made correctly upstream, at
     extraction time, and this schema is not a complete substitute for it.
+
+    To state that plainly rather than leave it implied: this validator
+    confirms CONTEXT-FREE DERIVABILITY only, and it is NOT an admission
+    check. The document-level dash-corruption quarantine is decided at
+    EXTRACTION time, against the source document; a stored ``MeasuredValue``
+    carries no document-health context at all, so a span the extractor
+    should have quarantined (e.g. ``"2e50"`` read out of a suspect flat-PDF
+    text layer whose minus/en-dash glyphs are known to be lost) is still
+    representable here -- this validator has no way to know the document was
+    ever suspect. Recording document glyph health belongs one level up, in
+    the storage envelope, and is deliberately NOT stamped onto every value:
+    a document-level fact repeated per point would let two values extracted
+    from the SAME document assert different glyph health with no way to
+    arbitrate between them.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -496,7 +545,15 @@ class MeasuredValue(BaseModel):
     Enforced below to be exactly ``canonical_decimal`` of ``raw_text`` as
     repaired by the claimed ``repairs`` chain -- never asserted
     independently, and never silently equal to ``canonical_decimal(raw_text)``
-    verbatim when a repair was actually needed."""
+    verbatim when a repair was actually needed.
+
+    Also enforced below (see :func:`_require_finite_as_float`) to evaluate to
+    a finite ``float``. ``canonical_decimal`` itself stays permissive and
+    accepts e.g. ``"1E+400"`` -- it also canonicalizes bbox coordinates and
+    conversion factors, which must never gain a finiteness opinion -- but a
+    ``MeasuredValue`` is a MEASURED QUANTITY, and no measurement in this
+    domain is ``1E+400``, so this field requires finiteness even though the
+    string it stores is otherwise a valid canonical decimal."""
     repairs: tuple[str, ...] = ()
     """Names of the glyph repairs (each a member of
     :data:`carmel.services.numeric.REPAIR_NAMES` -- never free text, enforced
@@ -514,7 +571,14 @@ class MeasuredValue(BaseModel):
     """Canonical decimal factor applied to convert ``unit_raw`` to
     ``unit_canonical``. ``"1"`` when no conversion was needed -- never
     omitted, so "no conversion happened" is always an explicit, auditable
-    fact rather than an assumption."""
+    fact rather than an assumption.
+
+    Required (enforced below) to be strictly positive and finite: a factor
+    of ``0`` annihilates the value it converts, and a negative factor
+    silently flips its sign -- and silent sign flips are a corruption class
+    this corpus actually exhibits (a subsetted font deleted the minus glyph
+    from every value in one table), so a zero or negative factor is rejected
+    rather than silently applied."""
     conversion_table_version: str = Field(min_length=1)
     """Identifies which version of the unit-conversion table produced
     ``conversion_factor``, so a later change to that table can never
@@ -528,7 +592,16 @@ class MeasuredValue(BaseModel):
     @field_validator("conversion_factor")
     @classmethod
     def _validate_conversion_factor(cls, value: str) -> str:
-        return _require_canonical_decimal(value, field_name="conversion_factor")
+        value = _require_canonical_decimal(value, field_name="conversion_factor")
+        decimal_value = _require_finite_as_float(value, field_name="conversion_factor")
+        if decimal_value <= 0:
+            raise ValueError(
+                f"conversion_factor={value!r} must be strictly positive: a factor of 0 annihilates the "
+                "value it converts, and a negative factor silently flips its sign -- exactly the "
+                "corruption class this corpus exhibits (a subsetted font deleted the minus glyph from "
+                "every value in one table) -- so it must be rejected rather than silently applied"
+            )
+        return value
 
     @field_validator("repairs")
     @classmethod
@@ -592,6 +665,10 @@ class MeasuredValue(BaseModel):
                 f"{expected!r}); a MeasuredValue's canonical form must be derived from its own "
                 "repaired raw_text, never asserted independently"
             )
+        # canonical_decimal() itself stays permissive (see _require_finite_as_float's
+        # docstring for why); a MeasuredValue is a MEASURED QUANTITY, so require its
+        # canonical value to evaluate to a finite float here instead.
+        _require_finite_as_float(self.canonical_decimal_value, field_name="canonical_decimal_value")
         return self
 
 
@@ -602,6 +679,16 @@ class UncertaintyKind(StrEnum):
     CI_95 = "ci_95"
     INSTRUMENT_ERROR = "instrument_error"
     UNSPECIFIED_PERCENTAGE = "unspecified_percentage"
+    """A bare percentage figure (e.g. "+-5%") whose statistical method was
+    NOT stated by the source. This kind's entire meaning is the absence of a
+    method, so it BLOCKS statistical interpretation (see
+    :attr:`Uncertainty.blocks_statistical_interpretation`) exactly like
+    :attr:`UNKNOWN`, even when ``basis``, ``scale``, and a bound are all
+    present -- a consumer still cannot know whether that "+-5%" is a standard
+    deviation, a 95% confidence interval, or an instrument spec. Measured
+    over the 8 real corpus papers: an explicit uncertainty KIND is stated in
+    only 1 of 8, so this (like ``UNKNOWN``) is the common case, not an edge
+    case."""
     UNKNOWN = "unknown"
     """First-class, NOT a lower-quality fallback: measured directly on this
     corpus, only 1 of 8 real papers states its uncertainty kind, making
@@ -663,26 +750,57 @@ class Uncertainty(BaseModel):
     """Lower bound magnitude, with its own unit and provenance. Absent if the
     source never states it."""
 
+    @model_validator(mode="after")
+    def _validate_bounds_are_positive_magnitudes(self) -> Uncertainty:
+        """Reject an ``upper``/``lower`` bound whose magnitude is zero or negative.
+
+        An uncertainty bound is a DISTANCE from the reported value, never a
+        signed quantity: an uncertainty of ``-5`` has no meaning (a bound
+        cannot be "5 less than the true value" -- that would just be a
+        different reported value). Asymmetric uncertainty is represented by
+        ``upper``/``lower`` differing in SIZE (e.g. upper=8, lower=3), never
+        by one of them being negative. ``MeasuredValue.canonical_decimal_value``
+        being finite (enforced there) is not enough on its own -- this
+        additionally rejects a bound that is finite but zero or negative.
+        """
+        for bound_name, bound in (("upper", self.upper), ("lower", self.lower)):
+            if isinstance(bound, MeasuredValue) and Decimal(bound.canonical_decimal_value) <= 0:
+                raise ValueError(
+                    f"{bound_name}.canonical_decimal_value={bound.canonical_decimal_value!r} must be "
+                    "strictly positive: an uncertainty bound is a magnitude (a distance), never "
+                    "negative or zero -- asymmetric uncertainty is represented by upper/lower "
+                    "differing in size, never by a negative bound"
+                )
+        return self
+
     @property
     def blocks_statistical_interpretation(self) -> bool:
         """False iff this uncertainty is FULLY quantified; True otherwise.
 
-        "Fully quantified" requires ALL FOUR of: ``kind`` is known (i.e. not
-        :attr:`UncertaintyKind.UNKNOWN` -- ``kind`` has no ``Absent`` state
-        of its own; ``UNKNOWN`` is its "not stated" sentinel), ``basis`` is
-        known (not :class:`Absent`), ``scale`` is known (not :class:`Absent`),
-        AND at least one of ``upper``/``lower`` is present (not
-        :class:`Absent`). A known ``kind`` alone is NOT sufficient: a known kind with basis,
-        scale, and both bounds all :class:`Absent` is "known kind, no usable
-        magnitude", which is just as statistically useless as an unknown
-        kind -- treating it as usable would let a paper's bare "+-5%, method
-        unstated" be silently read as a fully quantified standard deviation,
-        the exact failure this property exists to prevent. Deliberately NOT
-        a quality signal -- see :attr:`UncertaintyKind.UNKNOWN`'s docstring.
-        This flag tells a downstream consumer "do not compute a weighted
-        statistic from this bound", it does not say "this extraction is
-        worse than one with a stated kind"."""
-        if self.kind == UncertaintyKind.UNKNOWN:
+        "Fully quantified" requires ALL FOUR of: ``kind`` is known (i.e.
+        neither :attr:`UncertaintyKind.UNKNOWN` nor
+        :attr:`UncertaintyKind.UNSPECIFIED_PERCENTAGE` -- ``kind`` has no
+        ``Absent`` state of its own; those two members are its "not stated"
+        sentinels), ``basis`` is known (not :class:`Absent`), ``scale`` is
+        known (not :class:`Absent`), AND at least one of ``upper``/``lower``
+        is present (not :class:`Absent`). A known ``kind`` alone is NOT
+        sufficient: a known kind with basis, scale, and both bounds all
+        :class:`Absent` is "known kind, no usable magnitude", which is just
+        as statistically useless as an unknown kind -- treating it as usable
+        would let a paper's bare "+-5%, method unstated" be silently read as
+        a fully quantified standard deviation, the exact failure this
+        property exists to prevent. Nor is a fully-populated
+        ``UNSPECIFIED_PERCENTAGE`` sufficient on its own: that kind's entire
+        meaning is that the statistical method was NOT stated, so even with
+        ``basis``, ``scale``, and a bound all present, a consumer still
+        cannot know whether the figure is a standard deviation, a 95%
+        confidence interval, or an instrument spec -- it must block exactly
+        as ``UNKNOWN`` does. Deliberately NOT a quality signal -- see
+        :attr:`UncertaintyKind.UNKNOWN`'s docstring. This flag tells a
+        downstream consumer "do not compute a weighted statistic from this
+        bound", it does not say "this extraction is worse than one with a
+        stated kind"."""
+        if self.kind in (UncertaintyKind.UNKNOWN, UncertaintyKind.UNSPECIFIED_PERCENTAGE):
             return True
         if isinstance(self.basis, Absent) or isinstance(self.scale, Absent):
             return True
