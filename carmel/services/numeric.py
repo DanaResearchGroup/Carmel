@@ -47,13 +47,16 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 __all__ = [
+    "REPAIR_NAMES",
     "GlyphHealth",
+    "NormalizedNumeral",
     "NumericResult",
     "Range",
     "Scalar",
     "SourceContext",
     "Unresolvable",
     "assess_glyph_health",
+    "normalize_numeric_span",
     "parse_numeric_span",
 ]
 
@@ -130,6 +133,22 @@ _CORE_VALUE_RE = re.compile(
     r"(?P<lead_sign>/C0\s*|[-+−]|–)?"
     r"(?P<mantissa>\d+(?:\.\d+)?)"
     r"(?:(?P<emarker>[eE])(?P<exp_sign>þ\s*|[-+])?(?P<exponent>\d+(?:\.\d+)?))?"
+)
+
+#: The complete, closed set of repair names this module can ever emit (see the
+#: four ``repairs.append(...)`` call sites in :func:`_normalize_single_value`
+#: below). Exported so a downstream schema can validate a *recorded* repair
+#: list against this module's actual vocabulary instead of accepting free
+#: text -- a repair name that is not a member of this set could never have
+#: been produced by this module, so a schema can treat that as a hard error
+#: rather than trusting whatever string an upstream caller wrote down.
+REPAIR_NAMES: frozenset[str] = frozenset(
+    {
+        "slash_c0_to_minus",
+        "unicode_minus_to_ascii",
+        "leading_en_dash_to_minus",
+        "thorn_to_plus",
+    }
 )
 
 
@@ -231,6 +250,26 @@ class Unresolvable:
 NumericResult = Scalar | Range | Unresolvable
 
 
+@dataclass(frozen=True)
+class NormalizedNumeral:
+    """One span, textually validated and glyph-repaired, but NOT yet evaluated as a
+    float. See :func:`normalize_numeric_span`."""
+
+    raw: str
+    """The original input span, unmodified, exactly as given to
+    :func:`normalize_numeric_span`."""
+    text: str
+    """A strict ASCII numeral: optional leading ``-``, mantissa digits verbatim,
+    optional ``e+NN``/``e-NN`` exponent. Mantissa and exponent digits are preserved
+    VERBATIM from the input -- e.g. ``7.000Eþ17`` normalizes to ``"7.000e+17"``, never
+    collapsed to ``"7e+17"``, because trailing zeros encode measurement precision, a
+    fact a float can't carry and this type must not destroy."""
+    repairs: tuple[str, ...] = ()
+    """Explicit, enumerable names of every glyph repair applied to produce ``text``
+    (e.g. ``("slash_c0_to_minus",)``), empty when none were needed. Never free text;
+    every name is a member of :data:`REPAIR_NAMES`."""
+
+
 def _find_range_separator(text: str) -> int | None:
     """Return the index of the hyphen/en-dash that separates a range's two bounds, or
     None if ``text`` carries no such separator.
@@ -246,17 +285,44 @@ def _find_range_separator(text: str) -> int | None:
     return None
 
 
-def _parse_single_value(
+def _refuse_common(work: str) -> str | None:
+    """Apply the refusals that hold for the whole (already-stripped) span, before any
+    range-vs-scalar branching -- shared verbatim by :func:`normalize_numeric_span` and
+    :func:`parse_numeric_span` so the two can never drift apart on these checks.
+
+    Returns a human-readable refusal reason, or ``None`` if none of these apply.
+    """
+    if not work:
+        return "the span is empty; there is no numeral to reconstruct"
+
+    lowered = work.lower()
+    if lowered in _DISALLOWED_LITERALS:
+        return f"'{work}' is a disallowed non-finite literal, not a numeral"
+
+    if "_" in work:
+        return "digit separators ('_') are not accepted, even though Python's bare float() would allow them"
+
+    if _ASCII6_UNCERTAINTY_RE.fullmatch(work):
+        # Rule #8: never silently repaired -- an explicit refusal naming the possible
+        # ± interpretation, nothing stronger.
+        return "possible ± uncertainty pattern (ASCII '6' standing in for '±') is not decoded by this module"
+
+    return None
+
+
+def _normalize_single_value(
     text: str,
     *,
     source_context: SourceContext,
     glyph_health: GlyphHealth,
-) -> tuple[float, tuple[str, ...]] | str:
-    """Parse ``text`` (no range separator) as one signed numeric value.
+) -> tuple[str, tuple[str, ...]] | str:
+    """Validate ``text`` (no range separator) against the strict grammar and apply
+    glyph repairs, WITHOUT evaluating it as a float.
 
-    Returns ``(value, repairs)`` on success, or a failure reason string. Internal
-    helper only -- callers always go through :func:`parse_numeric_span`, which wraps
-    the outcome in the public result types with the ORIGINAL (unstripped) span.
+    Returns ``(cleaned_text, repairs)`` on success, or a failure reason string.
+    Internal helper only -- callers go through either :func:`normalize_numeric_span`
+    (textual form, no finiteness check) or :func:`_parse_single_value` (which adds the
+    float evaluation and finiteness check on top of this).
     """
     match = _CORE_VALUE_RE.fullmatch(text)
     if match is None:
@@ -325,17 +391,92 @@ def _parse_single_value(
             "scientific notation"
         )
 
+    # Mantissa and exponent digits are carried through VERBATIM -- never re-rendered
+    # via float() -- so trailing zeros (measurement precision) survive intact.
     cleaned = mantissa_str
     if emarker is not None:
         cleaned = f"{cleaned}e{'-' if exp_negative else '+'}{exponent_str}"
-    value = float(cleaned)  # safe: mantissa/exponent shapes are already validated above
     if lead_negative:
-        value = -value
+        cleaned = f"-{cleaned}"
 
+    return cleaned, tuple(repairs)
+
+
+def _parse_single_value(
+    text: str,
+    *,
+    source_context: SourceContext,
+    glyph_health: GlyphHealth,
+) -> tuple[float, tuple[str, ...]] | str:
+    """Parse ``text`` (no range separator) as one signed numeric value.
+
+    Returns ``(value, repairs)`` on success, or a failure reason string. Internal
+    helper only -- callers always go through :func:`parse_numeric_span`, which wraps
+    the outcome in the public result types with the ORIGINAL (unstripped) span.
+
+    Built on top of :func:`_normalize_single_value`: this layer adds exactly one
+    thing on top of the textual normalization, the float evaluation and its
+    finiteness check -- see :func:`normalize_numeric_span` for why that check does
+    NOT belong in the textual layer.
+    """
+    normalized = _normalize_single_value(text, source_context=source_context, glyph_health=glyph_health)
+    if isinstance(normalized, str):
+        return normalized
+    cleaned, repairs = normalized
+
+    value = float(cleaned)  # safe: mantissa/exponent shapes are already validated above
     if not math.isfinite(value):
         return f"'{text}' evaluates to a non-finite value (inf/-inf/nan), which is never a trustworthy value"
 
-    return value, tuple(repairs)
+    return value, repairs
+
+
+def normalize_numeric_span(
+    span: str,
+    *,
+    source_context: SourceContext,
+    glyph_health: GlyphHealth,
+) -> NormalizedNumeral | Unresolvable:
+    """Textually validate and glyph-repair an ALREADY-SCOPED ``span`` into a strict
+    ASCII numeral, or explicitly refuse -- WITHOUT evaluating it as a float.
+
+    Applies every refusal :func:`parse_numeric_span` applies at the whole-span level
+    (empty span, disallowed non-finite literals, digit separators, the ASCII-6
+    uncertainty shape) plus the strict per-value grammar (whole-span purity, Case A
+    illegal exponents, the FLAT_PDF_TEXT dash-corruption quarantine) applied by
+    :func:`_normalize_single_value`. It additionally refuses a range (a hyphen/en-dash
+    separator per :func:`_find_range_separator`) outright: a range is two numerals, not
+    one, and this function only ever produces a single :class:`NormalizedNumeral`.
+
+    Deliberately does NOT perform the float finiteness check that
+    :func:`parse_numeric_span` performs on top of this. ``1E+400`` is a perfectly
+    well-formed, exactly-representable decimal numeral -- it normalizes here -- but it
+    is not a finite ``float`` (``float("1e+400")`` is ``inf``), so
+    :func:`parse_numeric_span` still refuses it. Textual FORM and float EVALUATION are
+    different layers, and this module deliberately lets them diverge exactly there:
+    normalization is about whether the span reduces to a legitimate numeral written
+    down on the page; finiteness is a property of what that numeral evaluates to once
+    interpreted as an IEEE double. A caller that only needs the text (e.g. to store a
+    significance-preserving decimal string) should use this function directly rather
+    than going through the float-evaluating :func:`parse_numeric_span` and converting
+    the result back to text, which would silently destroy trailing zeros.
+    """
+    work = span.strip()
+    reason = _refuse_common(work)
+    if reason is not None:
+        return Unresolvable(raw=span, reason=reason)
+
+    if _find_range_separator(work) is not None:
+        return Unresolvable(
+            raw=span,
+            reason="the span is a range (contains a hyphen/en-dash bound separator), not a single numeral",
+        )
+
+    normalized = _normalize_single_value(work, source_context=source_context, glyph_health=glyph_health)
+    if isinstance(normalized, str):
+        return Unresolvable(raw=span, reason=normalized)
+    text, repairs = normalized
+    return NormalizedNumeral(raw=span, text=text, repairs=repairs)
 
 
 def parse_numeric_span(
@@ -355,26 +496,9 @@ def parse_numeric_span(
     specific position within this one span.
     """
     work = span.strip()
-    if not work:
-        return Unresolvable(raw=span, reason="the span is empty; there is no numeral to reconstruct")
-
-    lowered = work.lower()
-    if lowered in _DISALLOWED_LITERALS:
-        return Unresolvable(raw=span, reason=f"'{work}' is a disallowed non-finite literal, not a numeral")
-
-    if "_" in work:
-        return Unresolvable(
-            raw=span,
-            reason="digit separators ('_') are not accepted, even though Python's bare float() would allow them",
-        )
-
-    if _ASCII6_UNCERTAINTY_RE.fullmatch(work):
-        # Rule #8: never silently repaired -- an explicit refusal naming the possible
-        # ± interpretation, nothing stronger.
-        return Unresolvable(
-            raw=span,
-            reason="possible ± uncertainty pattern (ASCII '6' standing in for '±') is not decoded by this module",
-        )
+    reason = _refuse_common(work)
+    if reason is not None:
+        return Unresolvable(raw=span, reason=reason)
 
     range_separator = _find_range_separator(work)
     if range_separator is not None:

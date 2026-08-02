@@ -9,6 +9,7 @@ import pytest
 
 from carmel.services.dataset_store import (
     DATASET_STORE_DIR,
+    CanonicalDecimalError,
     canonical_decimal,
     canonical_json_bytes,
     compute_dataset_sha,
@@ -179,6 +180,44 @@ class TestCanonicalDecimal:
     def test_rejects_garbage_text(self) -> None:
         with pytest.raises(ValueError):
             canonical_decimal("not-a-number")
+
+    def test_rejects_digit_separator(self) -> None:
+        # Old loose Decimal("1_000") silently returned "1000" -- Python's Decimal (like
+        # float) accepts '_' digit separators. That let a value that could never
+        # survive paper extraction (the strict core refuses '_' outright) sneak into a
+        # canonical dataset via any caller that types a numeric string by hand.
+        with pytest.raises(CanonicalDecimalError):
+            canonical_decimal("1_000")
+
+    def test_rejects_leading_dot_form(self) -> None:
+        # Old loose Decimal(".5") silently returned "0.5". The strict core's mantissa
+        # grammar requires at least one digit before an optional decimal point, so a
+        # leading-dot numeral -- never produced by the paper-extraction path -- must
+        # not be accepted here either.
+        with pytest.raises(CanonicalDecimalError):
+            canonical_decimal(".5")
+
+    def test_rejects_trailing_dot_form(self) -> None:
+        # Old loose Decimal("1.") silently returned "1". The strict core's mantissa
+        # grammar requires at least one digit after a decimal point, so a
+        # trailing-dot numeral must not be accepted here either.
+        with pytest.raises(CanonicalDecimalError):
+            canonical_decimal("1.")
+
+    def test_rejects_unicode_minus_sign_because_it_requires_an_unrecorded_repair(self) -> None:
+        # The strict core CAN repair U+2212 MINUS SIGN to ASCII '-', but
+        # canonical_decimal must not accept a value that needed a repair: a canonical
+        # decimal string is the end of the pipeline, and any repair must already have
+        # happened upstream where it can be recorded alongside its provenance. Message
+        # must point at the repair path so a caller understands why this was rejected.
+        with pytest.raises(CanonicalDecimalError, match="repair"):
+            canonical_decimal("−1.5")
+
+    def test_surrounding_whitespace_is_still_accepted_not_a_divergence(self) -> None:
+        # Both the strict core (span.strip()) and bare Decimal() strip surrounding
+        # whitespace -- this is NOT one of the closed divergences. Pinned so nobody
+        # later "fixes" this as if it were a gap.
+        assert canonical_decimal(" 1.5 ") == canonical_decimal("1.5")
 
 
 class TestDatasetPath:

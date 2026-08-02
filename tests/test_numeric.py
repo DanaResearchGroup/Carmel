@@ -20,11 +20,14 @@ from __future__ import annotations
 import math
 
 from carmel.services.numeric import (
+    REPAIR_NAMES,
+    NormalizedNumeral,
     Range,
     Scalar,
     SourceContext,
     Unresolvable,
     assess_glyph_health,
+    normalize_numeric_span,
     parse_numeric_span,
 )
 
@@ -386,3 +389,74 @@ class TestEveryResultCarriesTheRawSpan:
         result = parse_numeric_span(" nan ", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
         assert isinstance(result, Unresolvable)
         assert result.raw == " nan "
+
+
+class TestRepairNames:
+    def test_repair_names_is_exactly_the_four_repairs_this_module_can_emit(self) -> None:
+        # Closed set: every name any repairs tuple can ever contain, no more, no less.
+        # A downstream schema validates recorded repairs against this instead of
+        # accepting free text.
+        assert (
+            frozenset(
+                {
+                    "slash_c0_to_minus",
+                    "unicode_minus_to_ascii",
+                    "leading_en_dash_to_minus",
+                    "thorn_to_plus",
+                }
+            )
+            == REPAIR_NAMES
+        )
+
+
+class TestNormalizeNumericSpan:
+    def test_significance_is_preserved_trailing_zeros_survive_unlike_the_float_path(self) -> None:
+        # This is the whole point of the split: parse_numeric_span would collapse
+        # "7.000Eþ17" to the float 7e17, silently destroying the 4-significant-figure
+        # precision the original text actually claims. normalize_numeric_span must not.
+        result = normalize_numeric_span("7.000Eþ17", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, NormalizedNumeral)
+        assert result.text == "7.000e+17"
+        assert result.repairs == ("thorn_to_plus",)
+        assert result.raw == "7.000Eþ17"
+
+    def test_slash_c0_repairs_to_ascii_minus_in_the_text(self) -> None:
+        result = normalize_numeric_span("/C0 1.0", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, NormalizedNumeral)
+        assert result.text == "-1.0"
+        assert result.repairs == ("slash_c0_to_minus",)
+
+    def test_unicode_minus_sign_repairs_to_ascii_minus_in_the_text(self) -> None:
+        result = normalize_numeric_span("−1.0", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, NormalizedNumeral)
+        assert result.text == "-1.0"
+        assert result.repairs == ("unicode_minus_to_ascii",)
+
+    def test_leading_en_dash_repairs_to_ascii_minus_in_the_text(self) -> None:
+        result = normalize_numeric_span("–1.0", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, NormalizedNumeral)
+        assert result.text == "-1.0"
+        assert result.repairs == ("leading_en_dash_to_minus",)
+
+    def test_a_range_is_refused_not_normalized_as_if_it_were_a_single_numeral(self) -> None:
+        result = normalize_numeric_span("1-2", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Unresolvable)
+        assert "range" in result.reason
+
+    def test_the_dash_corruption_quarantine_still_fires_through_the_textual_path(self) -> None:
+        result = normalize_numeric_span("1e2", source_context=SourceContext.FLAT_PDF_TEXT, glyph_health=SUSPECT)
+        assert isinstance(result, Unresolvable)
+        assert "quarantined" in result.reason
+
+    def test_1e_plus_400_normalizes_textually_even_though_it_is_not_a_finite_float(self) -> None:
+        # Pin BOTH sides of the deliberate divergence in one place: 1E+400 is a
+        # well-formed, exactly-representable decimal numeral -- normalize_numeric_span
+        # accepts it -- but float("1e+400") is inf, so parse_numeric_span still refuses
+        # it. Textual form and float evaluation are different layers on purpose.
+        normalized = normalize_numeric_span("1E+400", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(normalized, NormalizedNumeral)
+        assert normalized.text == "1e+400"
+
+        parsed = parse_numeric_span("1E+400", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(parsed, Unresolvable)
+        assert "non-finite" in parsed.reason

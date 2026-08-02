@@ -46,6 +46,7 @@ from typing import Any
 
 from carmel.paths import normalize_path
 from carmel.services.artifacts import _atomic_write_bytes  # noqa: PLC2701 - same-package reuse
+from carmel.services.numeric import GlyphHealth, SourceContext, Unresolvable, normalize_numeric_span
 
 __all__ = [
     "DATASET_STORE_DIR",
@@ -189,6 +190,25 @@ class CanonicalDecimalError(ValueError):
 # an enormous string.
 _MAX_ADJUSTED_EXPONENT_MAGNITUDE = 1000
 
+# canonical_decimal has no document to assess for glyph corruption -- it receives a
+# bare numeric string with no surrounding text -- so it cannot call
+# assess_glyph_health on a real document. Constructed directly from the dataclass
+# fields (all False/clean) rather than fabricating a document to feed through
+# assess_glyph_health: the quarantine rule guarded by suspects_dash_corruption is a
+# document-level EXTRACTION-time gate (is this PDF's text suspected of an en-dash ->
+# ASCII 'e' substitution?), not a property that a standalone canonical decimal string
+# could ever carry. SourceContext.OPERATOR_RAW is the matching choice on the other
+# side of the call: it is the one context that never inherits or implies a PDF
+# document's quarantine state (see SourceContext's docstring), which is exactly
+# correct here since there is no document at all.
+_HEALTHY_GLYPH_HEALTH = GlyphHealth(
+    suspects_dash_corruption=False,
+    has_thorn_plus_marker=False,
+    has_equals_ambiguity_marker=False,
+    has_slash_c0_minus_marker=False,
+    has_ascii6_uncertainty_marker=False,
+)
+
 
 def canonical_decimal(text: str) -> str:
     """Canonicalize a numeric string via :class:`decimal.Decimal`.
@@ -266,6 +286,36 @@ def canonical_decimal(text: str) -> str:
       round-trips through the ``Decimal`` constructor to the exact same
       ``(sign, digits, exponent)`` tuple, so re-canonicalizing it is a no-op.
 
+    - **Routed through the strict numeric core first.** Before ``text`` ever reaches
+      :class:`decimal.Decimal`, it is passed through
+      :func:`carmel.services.numeric.normalize_numeric_span`, the same strict textual
+      grammar the paper-extraction path uses. Bare ``Decimal(text)`` is, by design,
+      far looser than that grammar: it silently accepts digit-separator input like
+      ``"1_000"`` (-> ``1000``), a leading-dot form like ``".5"`` (-> ``0.5``), and a
+      trailing-dot form like ``"1."`` (-> ``1``) that the strict core refuses
+      outright. Routing through the core closes that gap so a value that would never
+      survive paper extraction cannot sneak into a canonical dataset via some other
+      caller that types a numeric string by hand.
+    - **A repaired input is refused, never silently repaired here.** If
+      ``normalize_numeric_span`` had to apply a glyph repair (e.g. U+2212 MINUS SIGN
+      -> ``"-"``) to make ``text`` parse, this function raises rather than accepting
+      the repaired form. A canonical decimal string is the END of the numeric
+      pipeline -- by the time a value reaches here, any repair it needed must already
+      have happened upstream, at extraction time, where it can be recorded alongside
+      its provenance. Silently repairing it again here would produce a canonical
+      value with no record of the repair that produced it.
+    - **``normalize_numeric_span`` is called with**
+      ``source_context=SourceContext.OPERATOR_RAW`` **and a healthy, hand-constructed**
+      ``GlyphHealth``. This function receives a bare numeric string with no
+      surrounding document, so it has nothing to run
+      :func:`~carmel.services.numeric.assess_glyph_health` on. The dash-corruption
+      quarantine that assessment feeds is a document-level, EXTRACTION-time gate (is
+      this PDF's flattened text suspected of an en-dash -> ASCII ``e`` substitution?)
+      -- not a property a standalone decimal string can carry -- and
+      ``OPERATOR_RAW`` is the one :class:`~carmel.services.numeric.SourceContext` that
+      never inherits or implies that quarantine state, which matches: there is no
+      document here at all.
+
     Args:
         text: The raw numeric string to canonicalize.
 
@@ -273,16 +323,30 @@ def canonical_decimal(text: str) -> str:
         The canonical decimal string, as rendered by ``str(Decimal(text))``.
 
     Raises:
-        CanonicalDecimalError: If ``text`` is empty, whitespace-only, one of the
-            non-finite spellings ``"nan"``, ``"inf"``, ``"-inf"`` (case-insensitive,
-            matching what :class:`decimal.Decimal` itself accepts), anything else
-            :class:`decimal.Decimal` cannot parse, or a value whose order of
-            magnitude exceeds ``_MAX_ADJUSTED_EXPONENT_MAGNITUDE``.
+        CanonicalDecimalError: If ``text`` fails the strict numeric core (empty,
+            whitespace-only, a disallowed non-finite literal, a digit separator, an
+            ASCII-6 uncertainty shape, a range, or any other shape
+            :func:`~carmel.services.numeric.normalize_numeric_span` refuses); if it
+            required a glyph repair to normalize; if the normalized text is one
+            :class:`decimal.Decimal` itself cannot parse or evaluates to a non-finite
+            decimal; or if its order of magnitude exceeds
+            ``_MAX_ADJUSTED_EXPONENT_MAGNITUDE``.
     """
-    if not text or not text.strip():
-        raise CanonicalDecimalError(f"cannot canonicalize empty/whitespace-only string: {text!r}")
+    normalized = normalize_numeric_span(
+        text,
+        source_context=SourceContext.OPERATOR_RAW,
+        glyph_health=_HEALTHY_GLYPH_HEALTH,
+    )
+    if isinstance(normalized, Unresolvable):
+        raise CanonicalDecimalError(f"cannot canonicalize {text!r}: {normalized.reason}")
+    if normalized.repairs:
+        raise CanonicalDecimalError(
+            f"cannot canonicalize {text!r}: it required glyph repair(s) {normalized.repairs} to parse; "
+            "a canonical decimal string is never produced by a silent repair -- the repair must happen "
+            "upstream, at extraction time, where it can be recorded alongside its provenance"
+        )
     try:
-        d = Decimal(text)
+        d = Decimal(normalized.text)
     except (InvalidOperation, DecimalException) as exc:
         raise CanonicalDecimalError(f"cannot parse {text!r} as a decimal: {exc}") from exc
     if not d.is_finite():
