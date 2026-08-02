@@ -647,6 +647,30 @@ class TestUncertainty:
         )
         assert unc.blocks_statistical_interpretation is True
 
+    def test_known_kind_with_no_usable_magnitude_blocks_statistical_interpretation(self) -> None:
+        """The real corpus case this fix prevents: a paper stating a bare
+        "+-5%, method unstated" -- a known kind but basis/scale/upper/lower
+        all Absent -- must NOT be readable as a fully quantified standard
+        deviation; a known kind alone is not sufficient usability."""
+        unc = Uncertainty(
+            kind=UncertaintyKind.UNSPECIFIED_PERCENTAGE,
+            basis=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+            scale=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+            upper=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+            lower=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        assert unc.blocks_statistical_interpretation is True
+
+    def test_fully_specified_uncertainty_does_not_block_statistical_interpretation(self) -> None:
+        unc = Uncertainty(
+            kind=UncertaintyKind.STD_DEV,
+            basis=UncertaintyBasis.ABSOLUTE,
+            scale=UncertaintyScale.LINEAR,
+            upper=_uncertainty_measured_value("0.05", unit_raw="m/s", unit_canonical="m/s"),
+            lower=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        assert unc.blocks_statistical_interpretation is False
+
     def test_stated_kind_does_not_block_statistical_interpretation(self) -> None:
         unc = Uncertainty(
             kind=UncertaintyKind.STD_DEV,
@@ -784,12 +808,38 @@ class TestComposition:
         assert len(mixture.components) == 2
         assert mixture.components[0].role == ComponentRole.FUEL
 
+    def test_component_with_concrete_role_still_constructs(self) -> None:
+        """Regression/sanity: a component whose role IS stated in the source
+        must still construct with a concrete ComponentRole, unchanged by
+        role becoming Maybe-typed."""
+        component = CompositionComponent(
+            species_raw_name="H2",
+            amount=_measured_value(),
+            role=ComponentRole.FUEL,
+        )
+        assert component.role == ComponentRole.FUEL
+
+    def test_component_with_unstated_role_constructs_without_fabrication(self) -> None:
+        """The real corpus case: a component is listed with no stated role
+        at all (e.g. a bare species list). This must be representable
+        without forcing the extractor to invent fuel/oxidizer/diluent/etc."""
+        component = CompositionComponent(
+            species_raw_name="Ar",
+            amount=_measured_value(),
+            role=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        assert isinstance(component.role, Absent)
+        assert component.role.reason == AbsenceReason.NOT_REPORTED_HERE
+
     def test_equivalence_ratio_absence_reason_distinguishable(self) -> None:
         mixture = Composition(
             raw_name="4% H2 in N2",
             resolution=CompositionResolution.RESOLVED_COMPONENTS,
             basis=CompositionBasis.MOLE_FRACTION,
             equivalence_ratio=Absent(reason=AbsenceReason.UNKNOWN),
+            components=[
+                CompositionComponent(species_raw_name="H2", amount=_measured_value(), role=ComponentRole.FUEL),
+            ],
         )
         assert isinstance(mixture.equivalence_ratio, Absent)
         assert mixture.equivalence_ratio.reason == AbsenceReason.UNKNOWN
@@ -807,6 +857,33 @@ class TestComposition:
             ),
         )
         assert isinstance(mixture.equivalence_ratio, MeasuredValue)
+
+    def test_resolved_components_cannot_be_empty(self) -> None:
+        """The mirror-image guard: a Composition claiming
+        resolution=RESOLVED_COMPONENTS with an empty components list would
+        let a downstream consumer read this as a resolved composition with
+        no actual composition data -- rejected, just like
+        UNRESOLVED_NAMED_MIXTURE is rejected for carrying components."""
+        with pytest.raises(ValidationError):
+            Composition(
+                raw_name="4% H2 in N2",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.MOLE_FRACTION,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[],
+            )
+
+    def test_resolved_components_with_at_least_one_component_still_valid(self) -> None:
+        mixture = Composition(
+            raw_name="4% H2 in N2",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.MOLE_FRACTION,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(species_raw_name="H2", amount=_measured_value(), role=ComponentRole.FUEL),
+            ],
+        )
+        assert len(mixture.components) == 1
 
     def test_basis_none_rejected(self) -> None:
         with pytest.raises(ValidationError):

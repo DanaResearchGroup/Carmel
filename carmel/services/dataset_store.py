@@ -38,14 +38,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
 from dataclasses import dataclass
 from decimal import Decimal, DecimalException, InvalidOperation
 from pathlib import Path
 from typing import Any
 
 from carmel.paths import normalize_path
-from carmel.services.artifacts import _atomic_write_bytes  # noqa: PLC2701 - same-package reuse
 from carmel.services.numeric import GlyphHealth, SourceContext, Unresolvable, normalize_numeric_span
 
 __all__ = [
@@ -79,7 +80,30 @@ class CanonicalJsonError(ValueError):
     """
 
 
-def _validate_json_value(value: Any, *, path: str) -> None:
+# Depth bound for _validate_json_value's recursion. Load-bearing for two distinct
+# reasons, both of which must hold at once:
+#
+# 1. This validator itself recurses once per nesting level, in pure Python, against
+#    the interpreter's own call-stack limit (default 1000). Left unbounded, a
+#    deeply-nested-but-otherwise-valid payload raises a bare ``RecursionError``
+#    instead of the ``CanonicalJsonError`` this module's contract promises for every
+#    other rejection -- and building that nesting is a cheap way to make ANY caller
+#    of this validator crash, not just fail cleanly.
+# 2. Even a payload that clears this validator still has to survive ``json.dumps``,
+#    which recurses too. 500 was chosen (and is verified by a test) to leave enough
+#    of the interpreter's 1000-frame budget free -- above whatever frames the
+#    validator's own call chain and the caller's existing stack have already used --
+#    that ``json.dumps`` cannot then blow the recursion limit on a payload that
+#    passed validation at this depth.
+_MAX_JSON_DEPTH = 500
+
+# Digit-count bound for int values. See the comment on `isinstance(value, int)`
+# below for why int gets a magnitude bound rather than the outright ban `float`
+# gets -- the failure modes are not the same and the fix is not the same.
+_MAX_INT_DIGITS = 1000
+
+
+def _validate_json_value(value: Any, *, path: str, depth: int = 0) -> None:
     """Recursively validate ``value`` is safe for canonical JSON serialization.
 
     Walks the structure BEFORE handing it to ``json.dumps`` so that violations
@@ -92,12 +116,23 @@ def _validate_json_value(value: Any, *, path: str) -> None:
         value: The (sub-)value being validated.
         path: A human-readable location string (e.g. ``"root['a'][0]"``) used in
             error messages so a violation deep in a large payload is easy to find.
+        depth: Current nesting depth, counted from the root (depth 0). Callers
+            outside this module never pass this; it is incremented on each
+            recursive call into a dict value or list item.
 
     Raises:
         CanonicalJsonError: If ``value`` (or anything nested in it) is a float,
-            a non-string dict key, or any type ``json.dumps`` cannot represent
-            losslessly without a ``default=`` fallback.
+            a non-string dict key, an int whose magnitude exceeds
+            ``_MAX_INT_DIGITS`` digits, any type ``json.dumps`` cannot represent
+            losslessly without a ``default=`` fallback, or if ``value`` nests
+            deeper than ``_MAX_JSON_DEPTH`` levels.
     """
+    if depth > _MAX_JSON_DEPTH:
+        raise CanonicalJsonError(
+            f"value nested too deeply at {path} (> {_MAX_JSON_DEPTH} levels); this is treated as "
+            "corrupted or adversarial input rather than a real dataset shape, and is rejected here "
+            "rather than being allowed to blow this validator's or json.dumps's recursion limit"
+        )
     # `float` is checked BEFORE the `(str, bool, int)` tuple even though `float` is
     # not a subclass of `int` in Python (unlike `bool`, which is), so this ordering
     # is not load-bearing for correctness -- it just keeps the float rejection as
@@ -107,17 +142,44 @@ def _validate_json_value(value: Any, *, path: str) -> None:
             f"float not allowed at {path}: {value!r} -- convert to a canonical decimal "
             "string via canonical_decimal() before serializing"
         )
-    if value is None or isinstance(value, (str, bool, int)):
+    if value is None or isinstance(value, str):
+        return
+    if isinstance(value, bool):
+        # Must be checked before `int` below: `bool` is a subclass of `int` in
+        # Python, but a bool has no "magnitude" in the sense the int digit-count
+        # bound below is guarding against, so it is exempt from that check.
+        return
+    if isinstance(value, int):
+        # Unlike `float`, `int` is bounded here, NOT banned -- these are different
+        # failure modes with different fixes. The float ban exists because float
+        # *repr* is unstable: the same value can print differently across
+        # platforms/interpreter versions, which would churn this store's content
+        # addresses. `int` has none of that problem -- Python's int-to-str
+        # conversion is exact and stable, so `1` always serializes as `"1"`,
+        # everywhere, forever; there is no repr instability to guard against, and
+        # banning int would also break real schema fields that legitimately
+        # serialize to int (e.g. page rotation, table cell row/col indices in
+        # carmel.schemas.datasets). What IS real for int, and IS worth guarding,
+        # is unbounded magnitude: Python ints are arbitrary-precision, so a
+        # payload can carry a million-digit integer -- the same memory-blowup
+        # class canonical_decimal's exponent-magnitude bound already guards
+        # against for decimals, just via a different mechanism (digit count
+        # instead of adjusted exponent, since int has no exponent).
+        if len(str(abs(value))) > _MAX_INT_DIGITS:
+            raise CanonicalJsonError(
+                f"int magnitude out of range (> {_MAX_INT_DIGITS} digits) at {path}: "
+                f"{value!r}; treated as corrupted/adversarial input rather than a real dataset value"
+            )
         return
     if isinstance(value, dict):
         for key, sub_value in value.items():
             if not isinstance(key, str):
                 raise CanonicalJsonError(f"non-string dict key not allowed at {path}: {key!r} ({type(key).__name__})")
-            _validate_json_value(sub_value, path=f"{path}[{key!r}]")
+            _validate_json_value(sub_value, path=f"{path}[{key!r}]", depth=depth + 1)
         return
     if isinstance(value, list):
         for index, item in enumerate(value):
-            _validate_json_value(item, path=f"{path}[{index}]")
+            _validate_json_value(item, path=f"{path}[{index}]", depth=depth + 1)
         return
     raise CanonicalJsonError(f"unsupported type at {path}: {type(value).__name__} ({value!r})")
 
@@ -144,6 +206,12 @@ def canonical_json_bytes(payload: Any) -> bytes:
     - Anything ``json`` cannot represent losslessly (arbitrary objects) is
       rejected -- this function never passes a ``default=`` fallback to
       ``json.dumps``.
+    - Ints are bounded (rejected past ``_MAX_INT_DIGITS`` digits) but not banned
+      like floats -- see the comment in :func:`_validate_json_value` for why the
+      two are not the same failure mode.
+    - Nesting is bounded (rejected past ``_MAX_JSON_DEPTH`` levels) so a
+      pathologically deep payload raises ``CanonicalJsonError`` instead of a bare
+      ``RecursionError``.
 
     Args:
         payload: The value to serialize. Typically a ``dict`` at the top level,
@@ -154,8 +222,8 @@ def canonical_json_bytes(payload: Any) -> bytes:
 
     Raises:
         CanonicalJsonError: If ``payload`` (or anything nested in it) contains a
-            float, a non-string dict key, or a type ``json`` cannot represent
-            losslessly.
+            float, a non-string dict key, an out-of-range int, a type ``json``
+            cannot represent losslessly, or nests deeper than ``_MAX_JSON_DEPTH``.
     """
     _validate_json_value(payload, path="root")
     text = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
@@ -411,6 +479,52 @@ def dataset_path(root: Path, dataset_sha: str) -> Path:
     return resolved
 
 
+# Reserved key namespace, owned exclusively by this store -- never by callers.
+#
+# `store_dataset`/`compute_dataset_sha` inject a marker recording which version
+# of `canonical_decimal`'s rendering rules produced a payload's canonical bytes,
+# under a key in this namespace, BEFORE canonicalizing -- so the injected form
+# is what actually gets hashed AND written, and "canonical form IS the on-disk
+# form" still holds exactly (see `_inject_decimal_repr_version`). This is what
+# turns the standing six-month-rot risk into a migration instead: if
+# `canonical_decimal`'s rendering ever changes, every already-stored dataset
+# keeps proof of which rules produced it, rather than silently re-addressing
+# with no way to tell old bytes from new.
+#
+# A payload that already contains any key in this namespace is rejected
+# outright -- a caller can neither forge nor accidentally omit the marker this
+# store alone is responsible for.
+_RESERVED_KEY_PREFIX = "_carmel_"
+_DECIMAL_REPR_VERSION_KEY = f"{_RESERVED_KEY_PREFIX}decimal_repr_version"
+_DECIMAL_REPR_VERSION = 1
+_RECOGNIZED_DECIMAL_REPR_VERSIONS = frozenset({_DECIMAL_REPR_VERSION})
+
+
+def _inject_decimal_repr_version(identity_payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy of ``identity_payload`` with the reserved version marker added.
+
+    Args:
+        identity_payload: The caller-supplied payload.
+
+    Returns:
+        A new dict equal to ``identity_payload`` plus
+        ``{_DECIMAL_REPR_VERSION_KEY: _DECIMAL_REPR_VERSION}``.
+
+    Raises:
+        ValueError: If ``identity_payload`` already contains a top-level key in
+            the ``_RESERVED_KEY_PREFIX`` namespace -- that namespace is owned by
+            this store, never by callers.
+    """
+    for key in identity_payload:
+        if isinstance(key, str) and key.startswith(_RESERVED_KEY_PREFIX):
+            raise ValueError(
+                f"payload key {key!r} is in the {_RESERVED_KEY_PREFIX!r} namespace reserved for "
+                "the dataset store itself (e.g. the decimal-representation version marker); "
+                "callers must not set it directly"
+            )
+    return {**identity_payload, _DECIMAL_REPR_VERSION_KEY: _DECIMAL_REPR_VERSION}
+
+
 def compute_dataset_sha(identity_payload: dict[str, Any]) -> str:
     """Compute the content address of ``identity_payload``.
 
@@ -423,37 +537,58 @@ def compute_dataset_sha(identity_payload: dict[str, Any]) -> str:
     asked for that. Callers own translating whatever schema they use into the
     plain dict that defines identity.
 
+    The reserved decimal-repr version marker is injected (see the
+    ``_RESERVED_KEY_PREFIX`` module comment) before the address is computed, so
+    the address itself is a function of both the payload AND the rendering
+    rules that produced it.
+
     Args:
         identity_payload: The plain dict whose canonical JSON form defines this
             dataset's content address.
 
     Returns:
-        The sha256 hex digest of ``identity_payload``'s canonical JSON bytes.
+        The sha256 hex digest of ``identity_payload``'s canonical JSON bytes
+        (with the version marker injected).
 
     Raises:
+        ValueError: If ``identity_payload`` already contains a reserved-namespace
+            key.
         CanonicalJsonError: If ``identity_payload`` is not representable as
             canonical JSON (see :func:`canonical_json_bytes`).
     """
-    return hashlib.sha256(canonical_json_bytes(identity_payload)).hexdigest()
+    return hashlib.sha256(canonical_json_bytes(_inject_decimal_repr_version(identity_payload))).hexdigest()
 
 
 def store_dataset(root: Path, identity_payload: dict[str, Any]) -> StoredDataset:
     """Content-address and durably persist ``identity_payload``.
 
-    Computes the sha256 of the canonical JSON bytes and writes them atomically
-    to ``<root>/evidence/datasets/<sha256>.json``.
+    Injects the reserved decimal-repr version marker (see the module-level
+    ``_RESERVED_KEY_PREFIX`` comment), computes the sha256 of the resulting
+    canonical JSON bytes, and durably publishes them to
+    ``<root>/evidence/datasets/<sha256>.json``.
 
-    Idempotent: if the target file already exists, its on-disk bytes are read
-    and compared for EXACT equality with the canonical bytes about to be
-    written.
+    Idempotent, and race-safe against a concurrent writer targeting the same
+    path: the canonical bytes are first written and fsynced to a private temp
+    file, then published via an exclusive hard link (``os.link``), which
+    atomically fails with ``FileExistsError`` if the target already exists
+    rather than silently replacing it. This is deliberately NOT
+    ``path.exists()`` followed by a write -- that check-then-act pair leaves a
+    window in which a different or corrupt file can appear at ``path`` between
+    the check and the write and be silently overwritten instead of raising as
+    promised. ``os.link`` closes that window because "does the target already
+    exist" and "create it" are a single atomic kernel operation. If the link
+    fails because the target already exists, the on-disk bytes are read and
+    compared for EXACT equality with the canonical bytes that were about to be
+    published:
 
     - Equal -> no rewrite; the existing record is returned unchanged (matches
       ``carmel.services.evidence.store_artifact``'s re-store behaviour).
     - Not equal -> raises. Two payloads that canonicalize to different bytes
       but hash to the same sha256 would be a genuine sha256 collision; more
       likely in practice, this indicates on-disk corruption (bit rot, a partial
-      write, tampering). Either way, silently overwriting would destroy the
-      auditability this store exists to provide, so this is always a hard
+      write, tampering), or a second writer's file landing at ``path`` between
+      this call's own checks. Either way, silently overwriting would destroy
+      the auditability this store exists to provide, so this is always a hard
       failure rather than a silent repair.
 
     Args:
@@ -466,70 +601,134 @@ def store_dataset(root: Path, identity_payload: dict[str, Any]) -> StoredDataset
         verified byte-identical).
 
     Raises:
+        ValueError: If ``identity_payload`` already contains a reserved-namespace
+            key, or if the on-disk bytes at the target path exist and differ
+            from the canonical bytes about to be written (hash collision,
+            on-disk corruption, or a lost race with a different writer).
         CanonicalJsonError: If ``identity_payload`` is not representable as
             canonical JSON.
-        ValueError: If the on-disk bytes at the target path exist and differ
-            from the canonical bytes about to be written (hash collision or
-            on-disk corruption).
     """
-    canonical_bytes = canonical_json_bytes(identity_payload)
+    canonical_bytes = canonical_json_bytes(_inject_decimal_repr_version(identity_payload))
     sha256 = hashlib.sha256(canonical_bytes).hexdigest()
     path = dataset_path(root, sha256)
 
-    if path.exists():
-        on_disk = path.read_bytes()
-        if on_disk == canonical_bytes:
-            return StoredDataset(sha256=sha256, path=path)
-        raise ValueError(
-            f"dataset store collision or corruption at {path}: on-disk bytes do not match "
-            f"the canonical bytes for sha256 {sha256!r}; refusing to overwrite"
-        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(canonical_bytes)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.link(tmp_path, path)
+        except FileExistsError:
+            on_disk = path.read_bytes()
+            if on_disk == canonical_bytes:
+                return StoredDataset(sha256=sha256, path=path)
+            raise ValueError(
+                f"dataset store collision or corruption at {path}: on-disk bytes do not match "
+                f"the canonical bytes for sha256 {sha256!r}; refusing to overwrite"
+            ) from None
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-    _atomic_write_bytes(path, canonical_bytes)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
     return StoredDataset(sha256=sha256, path=path)
 
 
 def load_dataset(root: Path, sha256: str) -> dict[str, Any]:
-    """Load and parse the dataset stored under ``sha256``.
+    """Load, verify, and parse the dataset stored under ``sha256``.
+
+    Recomputes the digest from the on-disk bytes and confirms they both hash to
+    ``sha256`` and are already in canonical form (the same two checks
+    :func:`verify_dataset` performs) before returning anything. A file that
+    merely happens to be valid, tampered-but-still-parseable JSON would
+    otherwise load "successfully" with content the filename never actually
+    vouches for -- exactly the failure this store exists to prevent, and a
+    caller should never have to remember to call :func:`verify_dataset` first
+    to be safe. There is deliberately no ``verify=False`` escape hatch: an
+    opt-out on a content-addressed load is a footgun, and a caller who
+    genuinely wants raw, unverified bytes can read the file directly instead
+    of going through this function.
+
+    The reserved decimal-repr version marker (see the module-level
+    ``_RESERVED_KEY_PREFIX`` comment) is stripped from the returned dict -- it
+    is this store's own bookkeeping, not part of the payload the caller handed
+    to :func:`store_dataset`.
 
     Args:
         root: Root of the campaign workspace.
         sha256: Hex digest identifying the dataset.
 
     Returns:
-        The parsed dataset payload.
+        The parsed dataset payload, with the reserved version marker removed.
 
     Raises:
         ValueError: If ``sha256`` is not a well-formed 64-character lowercase
-            hex digest, or if the resolved path would fall outside the resolved
-            workspace root.
+            hex digest, if the resolved path would fall outside the resolved
+            workspace root, if the on-disk bytes do not hash to ``sha256``, if
+            they are not already the canonical encoding of their own parsed
+            content, or if the decimal-repr version marker is missing or
+            unrecognized.
         FileNotFoundError: If no dataset is stored under ``sha256``.
     """
     path = dataset_path(root, sha256)
     if not path.exists():
         raise FileNotFoundError(f"dataset not found: {path}")
-    parsed: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    raw_bytes = path.read_bytes()
+    digest = hashlib.sha256(raw_bytes).hexdigest()
+    if digest != sha256:
+        raise ValueError(
+            f"dataset at {path} is corrupted or has been tampered with: on-disk bytes hash to "
+            f"{digest!r}, not the requested {sha256!r}; refusing to return unverified content"
+        )
+    parsed: dict[str, Any] = json.loads(raw_bytes.decode("utf-8"))
+    if canonical_json_bytes(parsed) != raw_bytes:
+        raise ValueError(
+            f"dataset at {path} hashes correctly but is not in canonical form: a hand-placed or "
+            "hand-edited file can satisfy the sha256 without being the exact encoding this store "
+            "guarantees -- refusing to return content that is merely self-consistent"
+        )
+    version = parsed.pop(_DECIMAL_REPR_VERSION_KEY, None)
+    if version not in _RECOGNIZED_DECIMAL_REPR_VERSIONS:
+        raise ValueError(
+            f"dataset at {path} has a missing or unrecognized decimal-repr version marker "
+            f"({version!r}); recognized versions are {sorted(_RECOGNIZED_DECIMAL_REPR_VERSIONS)!r}"
+        )
     return parsed
 
 
 def verify_dataset(root: Path, sha256: str) -> bool:
-    """Re-read the stored bytes and confirm they still hash to ``sha256``.
+    """Re-read the stored bytes and confirm they are a genuine, canonical dataset.
 
-    Because the canonical JSON form IS the on-disk form for this store (there
-    is no pydantic model or other layer in between), this recomputes the digest
-    straight from the on-disk bytes with NO re-serialization step -- there is no
-    round-trip through a model or re-canonicalization that could itself mask or
-    introduce drift. That is the whole point of keeping this store schema-free:
-    the bytes on disk are exactly what gets hashed, both at store time and at
-    verify time.
+    Verifies BOTH that the on-disk bytes hash to ``sha256`` AND that they are
+    already the canonical encoding of their own parsed content, i.e.
+    ``canonical_json_bytes(json.loads(raw_bytes)) == raw_bytes``, carrying a
+    recognized decimal-repr version marker. The hash check alone is not
+    enough: a hand-placed file named by the sha256 of some OTHER, non-canonical
+    JSON bytes (different key order, different whitespace, a stale or missing
+    version marker, ...) would satisfy a hash-only check while violating this
+    module's "canonical form IS the on-disk form" contract -- this store never
+    wrote that file, no matter how internally self-consistent it looks. Because
+    there is no pydantic model or other layer between the canonical bytes and
+    the file, this recomputes both the digest and the canonical re-encoding
+    straight from the on-disk bytes, with no round-trip that could itself mask
+    drift.
 
     Args:
         root: Root of the campaign workspace.
         sha256: Hex digest identifying the dataset (and its filename).
 
     Returns:
-        True if the file exists and its bytes hash to ``sha256``; False if the
-        file is absent or its bytes have been altered/corrupted.
+        True if the file exists, its bytes hash to ``sha256``, those bytes are
+        already in canonical form, and they carry a recognized decimal-repr
+        version marker. False otherwise -- including if the bytes are absent,
+        altered/corrupted, not valid UTF-8 JSON, or not a JSON object at all.
 
     Raises:
         ValueError: If ``sha256`` is not a well-formed 64-character lowercase
@@ -539,8 +738,21 @@ def verify_dataset(root: Path, sha256: str) -> bool:
     path = dataset_path(root, sha256)
     if not path.exists():
         return False
-    on_disk = path.read_bytes()
-    return hashlib.sha256(on_disk).hexdigest() == sha256
+    raw_bytes = path.read_bytes()
+    if hashlib.sha256(raw_bytes).hexdigest() != sha256:
+        return False
+    try:
+        parsed = json.loads(raw_bytes.decode("utf-8"))
+    except UnicodeDecodeError, json.JSONDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    try:
+        if canonical_json_bytes(parsed) != raw_bytes:
+            return False
+    except CanonicalJsonError:
+        return False
+    return parsed.get(_DECIMAL_REPR_VERSION_KEY) in _RECOGNIZED_DECIMAL_REPR_VERSIONS
 
 
 def list_datasets(root: Path) -> list[str]:

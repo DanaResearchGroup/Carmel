@@ -3,13 +3,17 @@ and content-addressed storage for literature dataset payloads."""
 
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from carmel.services.dataset_store import (
+    _DECIMAL_REPR_VERSION_KEY,
     DATASET_STORE_DIR,
     CanonicalDecimalError,
+    CanonicalJsonError,
     canonical_decimal,
     canonical_json_bytes,
     compute_dataset_sha,
@@ -353,3 +357,202 @@ class TestListDatasets:
 
         assert all(len(sha) == 64 for sha in result)
         assert "not-a-sha" not in result
+
+
+class TestLoadDatasetVerifiesContentAddress:
+    """Finding #1: ``load_dataset`` must recompute the digest of the bytes it is
+    about to return and refuse to return anything that does not hash to the
+    requested address -- otherwise a hand-placed or corrupted file that merely
+    *parses* as JSON is returned as if it were the genuine, address-verified
+    dataset."""
+
+    def test_raises_when_on_disk_bytes_do_not_hash_to_the_requested_sha256(self, tmp_path: Path) -> None:
+        stored = store_dataset(tmp_path, {"compound": "toluene", "k": "1.00"})
+
+        # Simulate a hand-placed (or corrupted-in-place) file: perfectly valid,
+        # perfectly parseable canonical bytes for SOME dataset, sitting under a
+        # filename (sha256) that they do not actually hash to.
+        wrong_sha = "0" * 64
+        wrong_path = dataset_path(tmp_path, wrong_sha)
+        wrong_path.write_bytes(stored.path.read_bytes())
+
+        with pytest.raises(ValueError, match="(?i)corrupt|tamper"):
+            load_dataset(tmp_path, wrong_sha)
+
+    def test_has_no_verify_false_escape_hatch(self, tmp_path: Path) -> None:
+        # A content-addressed load must never offer an opt-out of the address
+        # check -- that would just be a footgun with a different spelling. This
+        # asserts the parameter does not exist at all, so a load call can never
+        # accidentally silence the verification added for finding #1.
+        stored = store_dataset(tmp_path, {"a": "1"})
+        with pytest.raises(TypeError):
+            load_dataset(tmp_path, stored.sha256, verify=False)  # type: ignore[call-arg]
+
+
+class TestVerifyDatasetRequiresCanonicalForm:
+    """Finding #2: a file whose bytes hash to their own filename can still be
+    non-canonical (different key order, different whitespace, a stale/missing
+    version marker, ...). ``verify_dataset`` must reject that, not just check
+    the hash."""
+
+    def test_rejects_hash_matching_bytes_that_are_not_canonical_json(self, tmp_path: Path) -> None:
+        # Valid JSON, and its filename is genuinely the sha256 of these exact
+        # bytes -- but the bytes are not the canonical encoding this store
+        # guarantees (extra whitespace after the colon, no trailing newline).
+        non_canonical_bytes = b'{"a": "1"}'
+        sha = hashlib.sha256(non_canonical_bytes).hexdigest()
+        path = dataset_path(tmp_path, sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(non_canonical_bytes)
+
+        assert verify_dataset(tmp_path, sha) is False
+
+    def test_rejects_non_canonical_encoding_of_an_otherwise_complete_payload(self, tmp_path: Path) -> None:
+        # The test above passes for the WRONG REASON and cannot be relied on
+        # alone: its bytes also lack the decimal-representation version marker,
+        # so `verify_dataset` returns False via the version check even when the
+        # canonicality check is disabled entirely (measured by mutation).
+        #
+        # This fixture differs from a genuinely canonical file in ENCODING ONLY:
+        # same parsed content, version marker present, keys in a non-sorted
+        # order with JSON's default whitespace and no trailing newline. So the
+        # canonicality check is the only thing that can reject it, which is what
+        # makes this test load-bearing for finding #2.
+        payload = {"a": "1", _DECIMAL_REPR_VERSION_KEY: 1}
+        non_canonical_bytes = json.dumps(payload, sort_keys=False).encode("utf-8")
+        assert non_canonical_bytes != canonical_json_bytes(payload)
+        assert json.loads(non_canonical_bytes) == json.loads(canonical_json_bytes(payload))
+
+        sha = hashlib.sha256(non_canonical_bytes).hexdigest()
+        path = dataset_path(tmp_path, sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(non_canonical_bytes)
+
+        assert verify_dataset(tmp_path, sha) is False
+
+    def test_accepts_a_genuinely_canonical_stored_dataset(self, tmp_path: Path) -> None:
+        stored = store_dataset(tmp_path, {"a": "1"})
+        assert verify_dataset(tmp_path, stored.sha256) is True
+
+
+class TestIntIsBoundedNotBanned:
+    """Finding #3: unlike ``float`` (banned outright because its repr is
+    unstable across platforms/interpreter versions), ``int`` repr is exact and
+    stable, so it is not banned -- schema fields like ``rotation`` and
+    ``TableCellLocator.row``/``col`` legitimately serialize to int. What is real
+    is unbounded magnitude (arbitrary-precision Python ints), so int is bounded
+    by digit count instead."""
+
+    def test_ordinary_magnitude_int_is_allowed(self) -> None:
+        canonical_json_bytes({"rotation": 270, "row": 12})
+
+    def test_int_at_the_digit_bound_is_allowed(self) -> None:
+        value = 10**999  # exactly 1000 digits
+        canonical_json_bytes({"n": value})
+
+    def test_int_past_the_digit_bound_raises_canonical_json_error(self) -> None:
+        value = 10**1000  # 1001 digits
+        with pytest.raises(CanonicalJsonError, match="magnitude"):
+            canonical_json_bytes({"n": value})
+
+    def test_bool_remains_exempt_from_the_int_magnitude_bound(self) -> None:
+        # bool is an int subclass in Python; confirms the magnitude check does
+        # not misfire on it.
+        canonical_json_bytes({"flag": True})
+
+
+class TestStoreDatasetClosesTheCollisionCheckToWriteRace:
+    """Finding #4: the old ``path.exists()`` check followed by a separate write
+    left a TOCTOU window -- another writer (or a hand-placed file) landing
+    between the check and the write was silently overwritten. The fix publishes
+    via an atomic exclusive create (``os.link``) so a file that is already
+    there when the write is attempted is detected by the write itself, not by
+    an earlier, racy check."""
+
+    def test_raises_instead_of_overwriting_a_pre_existing_file_at_the_target_path(self, tmp_path: Path) -> None:
+        payload = {"compound": "toluene", "k": "1.00"}
+        sha = compute_dataset_sha(payload)
+        path = dataset_path(tmp_path, sha)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Simulate a concurrent writer (or corruption) landing at the target
+        # path before this call's own write is attempted.
+        other_bytes = b"not the canonical bytes for this payload"
+        path.write_bytes(other_bytes)
+
+        with pytest.raises(ValueError, match="(?i)collision|corrupt"):
+            store_dataset(tmp_path, payload)
+
+        # The pre-existing file must be left exactly as it was -- never
+        # silently overwritten by the losing side of the race.
+        assert path.read_bytes() == other_bytes
+
+
+class TestCanonicalJsonBytesBoundsRecursionDepth:
+    """Finding #5: both this module's own recursive validator and ``json.dumps``
+    itself recurse on nested structures with no bound, so a sufficiently deep
+    payload raised a bare ``RecursionError`` instead of the documented
+    ``CanonicalJsonError`` contract -- and was a cheap way to make any caller
+    crash. ``_MAX_JSON_DEPTH`` bounds the validator, chosen low enough that
+    ``json.dumps`` cannot then blow the interpreter's recursion limit on a
+    payload that passed validation (verified below, not just assumed)."""
+
+    @staticmethod
+    def _nested(depth: int) -> dict:
+        value: dict = {"v": 1}
+        for _ in range(depth):
+            value = {"n": value}
+        return value
+
+    def test_payload_nested_past_the_limit_raises_canonical_json_error(self) -> None:
+        with pytest.raises(CanonicalJsonError, match="500"):
+            canonical_json_bytes(self._nested(600))
+
+    def test_payload_at_the_accepted_depth_does_not_hit_the_recursion_limit(self) -> None:
+        payload = self._nested(499)
+
+        # canonical_json_bytes runs the validator AND calls json.dumps
+        # internally; both must survive without RecursionError at this depth.
+        result = canonical_json_bytes(payload)
+        assert isinstance(result, bytes)
+
+        # Also exercise json.dumps directly on the same structure, since the
+        # requirement being verified is specifically that json.dumps (not just
+        # our own validator) does not blow the interpreter's recursion limit on
+        # a payload that passed validation at the accepted depth.
+        assert isinstance(json.dumps(payload), str)
+
+
+class TestDecimalReprVersionIsRecordedInTheAddressedPayload:
+    """Finding #6: if ``canonical_decimal``'s rendering ever changes, every
+    already-stored dataset would silently re-address with no way to tell old
+    from new bytes apart. The store now injects a reserved, versioned marker
+    key into the payload before hashing/writing it, so the on-disk bytes always
+    say which decimal representation they were written under."""
+
+    def test_stored_payload_records_the_decimal_repr_version_key_on_disk(self, tmp_path: Path) -> None:
+        stored = store_dataset(tmp_path, {"compound": "toluene", "k": "1.00"})
+
+        on_disk = json.loads(stored.path.read_bytes())
+        assert on_disk["_carmel_decimal_repr_version"] == 1
+
+    def test_load_dataset_strips_the_version_key_so_callers_see_their_own_payload(self, tmp_path: Path) -> None:
+        payload = {"compound": "toluene", "k": "1.00"}
+        stored = store_dataset(tmp_path, payload)
+
+        loaded = load_dataset(tmp_path, stored.sha256)
+
+        assert loaded == payload
+        assert "_carmel_decimal_repr_version" not in loaded
+
+    def test_caller_supplied_reserved_namespace_key_is_rejected(self, tmp_path: Path) -> None:
+        # The `_carmel_` prefix is a namespace this store owns for its own
+        # bookkeeping -- a caller setting a key in it (even accidentally) must
+        # never be silently accepted or silently overwritten.
+        payload = {"a": "1", "_carmel_decimal_repr_version": 999}
+
+        with pytest.raises(ValueError, match="reserved"):
+            store_dataset(tmp_path, payload)
+
+        with pytest.raises(ValueError, match="reserved"):
+            compute_dataset_sha(payload)

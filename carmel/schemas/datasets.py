@@ -665,13 +665,28 @@ class Uncertainty(BaseModel):
 
     @property
     def blocks_statistical_interpretation(self) -> bool:
-        """True iff this uncertainty's kind is unknown.
+        """False iff this uncertainty is FULLY quantified; True otherwise.
 
-        Deliberately NOT a quality signal -- see :attr:`UncertaintyKind.UNKNOWN`'s
-        docstring. This flag tells a downstream consumer "do not compute a
-        weighted statistic from this bound", it does not say "this
-        extraction is worse than one with a stated kind"."""
-        return self.kind == UncertaintyKind.UNKNOWN
+        "Fully quantified" requires ALL FOUR of: ``kind`` is known (i.e. not
+        :attr:`UncertaintyKind.UNKNOWN` -- ``kind`` has no ``Absent`` state
+        of its own; ``UNKNOWN`` is its "not stated" sentinel), ``basis`` is
+        known (not :class:`Absent`), ``scale`` is known (not :class:`Absent`),
+        AND at least one of ``upper``/``lower`` is present (not
+        :class:`Absent`). A known ``kind`` alone is NOT sufficient: a known kind with basis,
+        scale, and both bounds all :class:`Absent` is "known kind, no usable
+        magnitude", which is just as statistically useless as an unknown
+        kind -- treating it as usable would let a paper's bare "+-5%, method
+        unstated" be silently read as a fully quantified standard deviation,
+        the exact failure this property exists to prevent. Deliberately NOT
+        a quality signal -- see :attr:`UncertaintyKind.UNKNOWN`'s docstring.
+        This flag tells a downstream consumer "do not compute a weighted
+        statistic from this bound", it does not say "this extraction is
+        worse than one with a stated kind"."""
+        if self.kind == UncertaintyKind.UNKNOWN:
+            return True
+        if isinstance(self.basis, Absent) or isinstance(self.scale, Absent):
+            return True
+        return isinstance(self.upper, Absent) and isinstance(self.lower, Absent)
 
 
 class CompositionResolution(StrEnum):
@@ -710,7 +725,19 @@ class CompositionComponent(BaseModel):
 
     species_raw_name: str = Field(min_length=1)
     amount: MeasuredValue
-    role: ComponentRole
+    role: Maybe[ComponentRole]
+    """The component's role in the mixture (fuel, oxidizer, diluent, ...).
+    ``Maybe``-typed, with no default, for the same reason documented on
+    :class:`Uncertainty`'s basis/scale fields: measured directly on this
+    corpus, ``"air"`` appears as an unresolved token in roughly 5 of 8 real
+    papers, no paper ever restates the O2:N2 ratio numerically, and
+    components routinely appear in the source with no stated role at all
+    (e.g. a bare species list). A mandatory concrete :class:`ComponentRole`
+    would force the extractor to invent ``fuel``/``diluent``/etc. for a
+    component whose role the paper never states -- exactly the fabrication
+    this schema exists to make structurally impossible -- so this field must
+    be able to say "not stated" via an explicit :class:`Absent` rather than
+    silently defaulting to a guess."""
 
 
 class Composition(BaseModel):
@@ -752,5 +779,16 @@ class Composition(BaseModel):
                 "a Composition with resolution=UNRESOLVED_NAMED_MIXTURE must not carry components -- "
                 "doing so would fabricate a numeric split (e.g. air -> 0.21/0.79) that the source "
                 "never stated; components may only be attached to a RESOLVED_COMPONENTS composition"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_resolved_has_components(self) -> Composition:
+        if self.resolution == CompositionResolution.RESOLVED_COMPONENTS and not self.components:
+            raise ValueError(
+                "a Composition with resolution=RESOLVED_COMPONENTS must carry at least one component -- "
+                "an empty components list would let a downstream consumer read this as a resolved "
+                "composition with no actual composition data; a composition with nothing resolved "
+                "must be represented as UNRESOLVED_NAMED_MIXTURE instead"
             )
         return self
