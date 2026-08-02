@@ -30,6 +30,22 @@ design here, each documented at the model that addresses it:
 Numeric facts here are canonical decimal STRINGS (via
 :func:`carmel.services.dataset_store.canonical_decimal`), never floats --
 see that function's docstring for why floats are rejected outright.
+
+Every model in this module is constructed with ``frozen=True``: a value that
+has passed validation must not be mutable afterward, because a content
+address (see :class:`MeasuredValue`'s ``conversion_table_sha256``, and the
+sha256 identity of :class:`~carmel.services.units.ConversionTable`) is a
+claim about a specific, already-validated payload -- an in-place attribute
+assignment after construction would let that payload silently drift out from
+under an address that was computed before the mutation, with nothing here to
+notice. Plain attribute assignment (``instance.field = ...``) now raises.
+This is NOT an absolute immutability guarantee: ``Model.model_construct()``
+bypasses validation entirely (including this check) by design, and
+``instance.model_copy(update={...})`` deliberately builds a new, independent
+instance rather than mutating the original -- neither is closed off by
+``frozen=True``, and both remain the correct escape hatches for code that
+genuinely needs to construct or derive a payload without going through
+``__init__`` validation.
 """
 
 from __future__ import annotations
@@ -206,7 +222,7 @@ class Absent(BaseModel):
     :class:`AbsenceReason` values applies.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     reason: AbsenceReason
     note: str | None = None
@@ -241,7 +257,7 @@ class CoordinateFrame(BaseModel):
     survives even when page numbering does not.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     render_fingerprint: str = Field(min_length=1)
     """Fingerprint of the rendered page (e.g. a hash of the rendered image or
@@ -314,7 +330,7 @@ class BBox(BaseModel):
     were measured against, so a bbox cannot be constructed at all without one.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     frame: CoordinateFrame
     x0: str
@@ -364,7 +380,7 @@ class SourceNode(BaseModel):
     paper; a figure crop's parent page/PDF).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     node_id: str = Field(min_length=1)
     kind: SourceNodeKind
@@ -391,7 +407,7 @@ class LocatorKind(StrEnum):
 class BBoxLocator(BaseModel):
     """Locates a reference at a bounding box on a rendered page."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal[LocatorKind.BBOX] = LocatorKind.BBOX
     bbox: BBox
@@ -400,7 +416,7 @@ class BBoxLocator(BaseModel):
 class TableCellLocator(BaseModel):
     """Locates a reference at a specific table cell."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal[LocatorKind.TABLE_CELL] = LocatorKind.TABLE_CELL
     row: int = Field(ge=0)
@@ -413,7 +429,7 @@ class TableCellLocator(BaseModel):
 class XPathLocator(BaseModel):
     """Locates a reference in JATS/XML via an XPath expression."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal[LocatorKind.XPATH] = LocatorKind.XPATH
     xpath: str = Field(min_length=1)
@@ -431,7 +447,7 @@ class ArchiveMemberLocator(BaseModel):
     the same reference, or vice versa.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal[LocatorKind.ARCHIVE_MEMBER] = LocatorKind.ARCHIVE_MEMBER
     member_sha256: str = Field(min_length=64, max_length=64)
@@ -456,7 +472,7 @@ SourceLocator = Annotated[
 class SourceRef(BaseModel):
     """A reference INTO a dataset's source graph: which node, and where in it."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     node_id: str = Field(min_length=1)
     locator: SourceLocator
@@ -548,7 +564,7 @@ class MeasuredValue(BaseModel):
     arbitrate between them.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     raw_text: str = Field(min_length=1)
     """The exact numeric span as it appears in the source, VERBATIM --
@@ -823,7 +839,7 @@ class Uncertainty(BaseModel):
     absent, not forced into ``ABSOLUTE``/``LINEAR`` as an invented default.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: UncertaintyKind
     basis: Maybe[UncertaintyBasis]
@@ -924,7 +940,7 @@ class ComponentRole(StrEnum):
 class CompositionComponent(BaseModel):
     """One resolved component of a :class:`Composition`."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     species_raw_name: str = Field(min_length=1)
     amount: MeasuredValue
@@ -965,7 +981,7 @@ class Composition(BaseModel):
     "stated as zero" or "inherits from the parent dataset".
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     raw_name: str = Field(min_length=1)
     """Verbatim mixture name/description as printed in the source (e.g.
@@ -994,4 +1010,94 @@ class Composition(BaseModel):
                 "composition with no actual composition data; a composition with nothing resolved "
                 "must be represented as UNRESOLVED_NAMED_MIXTURE instead"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_basis_matches_component_quantity_kind(self) -> Composition:
+        """Reject a ``basis`` that disagrees with what its components actually measure.
+
+        ``basis`` names the arithmetic space a resolved composition's
+        fractions live in (mole fraction, mass fraction, ...); each
+        component's ``amount.quantity_kind`` is the independently-validated
+        physical quantity that value was bound to at extraction time (see
+        :class:`MeasuredValue`). Without this check, ``basis`` is a free-text
+        label a downstream consumer must trust blind -- a component amount
+        that is actually a mass fraction could be labeled
+        ``basis=MOLE_FRACTION`` and nothing here would ever notice, silently
+        corrupting every arithmetic operation (e.g. summing a mixture to 1)
+        that trusts the label.
+
+        ``CompositionBasis.VOLUME_PERCENT`` is a judgment call, not a fact
+        this codebase measured: :class:`QuantityKind` has no dedicated
+        volume-fraction member, so this validator maps it onto
+        ``QuantityKind.MOLE_FRACTION``. That mapping is only exact for an
+        ideal gas (Amagat's law: volume fraction equals mole fraction for
+        ideal-gas mixtures at the same temperature and pressure), which is
+        the standard assumption combustion sources make when they report a
+        gas mixture by volume percent. It is NOT exact for a liquid mixture
+        or a real (non-ideal) gas; this schema has no way to distinguish
+        those cases from the ``basis`` value alone, so it accepts the
+        combustion-corpus-typical case rather than rejecting every
+        ``VOLUME_PERCENT`` composition outright.
+
+        ``CompositionBasis.PPM`` additionally requires
+        ``amount.unit_normalized == "ppm"`` specifically (not merely a
+        MOLE_FRACTION/MASS_FRACTION quantity_kind): both quantities also
+        accept unit ``"1"`` (a bare fraction), and a composition whose basis
+        is explicitly stated as parts-per-million must not silently accept a
+        component recorded as a bare fraction instead -- that would let a
+        components-summed-to-1 mixture and a components-summed-to-1e6
+        mixture both claim ``basis=PPM``.
+        """
+        if self.resolution != CompositionResolution.RESOLVED_COMPONENTS:
+            return self
+        if isinstance(self.basis, Absent):
+            return self
+        basis = self.basis
+        expected_quantity_kind = {
+            CompositionBasis.MOLE_FRACTION: QuantityKind.MOLE_FRACTION,
+            CompositionBasis.MASS_FRACTION: QuantityKind.MASS_FRACTION,
+            CompositionBasis.VOLUME_PERCENT: QuantityKind.MOLE_FRACTION,
+            CompositionBasis.PPM: None,
+        }[basis]
+        for component in self.components:
+            amount = component.amount
+            if basis == CompositionBasis.PPM:
+                if amount.quantity_kind not in (QuantityKind.MOLE_FRACTION, QuantityKind.MASS_FRACTION):
+                    raise ValueError(
+                        f"component {component.species_raw_name!r} has amount.quantity_kind="
+                        f"{amount.quantity_kind!r}, but basis=PPM requires a MOLE_FRACTION or "
+                        "MASS_FRACTION quantity_kind (ppm is representable under either)"
+                    )
+                if amount.unit_normalized != "ppm":
+                    raise ValueError(
+                        f"component {component.species_raw_name!r} has amount.unit_normalized="
+                        f"{amount.unit_normalized!r}, but basis=PPM requires unit_normalized == 'ppm' "
+                        "specifically -- a bare fraction (unit '1') under the same quantity_kind is a "
+                        "different fact and must not be labeled PPM"
+                    )
+            elif amount.quantity_kind is not expected_quantity_kind:
+                raise ValueError(
+                    f"component {component.species_raw_name!r} has amount.quantity_kind="
+                    f"{amount.quantity_kind!r}, but basis={basis!r} requires "
+                    f"quantity_kind={expected_quantity_kind!r}"
+                )
+            elif basis == CompositionBasis.VOLUME_PERCENT and amount.unit_normalized != "%":
+                # Same rule as PPM above, for the same reason, and it must not be
+                # weaker just because VOLUME_PERCENT shares MOLE_FRACTION's quantity
+                # kind: constraining the KIND alone still admits a bare fraction.
+                # A basis of VOLUME_PERCENT holding `0.21` reads as 0.21% to any
+                # consumer that trusts the basis, and as 21% to one that trusts the
+                # unit -- a silent factor of 100 in a composition, which is exactly
+                # the class of corruption this binding exists to prevent. Percent is
+                # a real unit in the table (it scales to the base by 0.01), so the
+                # honest representation of "21 vol%" is `21` with unit `%`, never
+                # `0.21` with unit `1` under a percent basis.
+                raise ValueError(
+                    f"component {component.species_raw_name!r} has amount.unit_normalized="
+                    f"{amount.unit_normalized!r}, but basis=VOLUME_PERCENT requires "
+                    "unit_normalized == '%' specifically -- a bare fraction (unit '1') "
+                    "under the same quantity_kind is the same number meaning something "
+                    "100x different, and must not be labeled a percent basis"
+                )
         return self

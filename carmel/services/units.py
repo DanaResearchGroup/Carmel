@@ -4,13 +4,19 @@
 """Unit normalization and conversion for literature-extracted kinetics datasets.
 
 Carmel's dataset schema (:mod:`carmel.schemas.datasets`) records a measured
-value's ``unit_raw`` (whatever spelling the source paper used) alongside a
-``unit_canonical``, ``conversion_factor``, and ``conversion_table_version`` --
-but, as of this module, no conversion table actually exists to populate those
-fields. This module builds that table: a small, closed-world, versioned set of
+value's ``unit_raw`` (whatever spelling the source paper used), its
+``unit_normalized`` spelling, and the ``conversion_table_sha256`` of the table
+``unit_normalized`` was normalized against -- but it never stores a converted
+value or a conversion factor as a schema field. This module builds the
+conversion table itself: a small, closed-world, versioned set of
 unit-conversion rules covering exactly the syngas/laminar-burning-velocity
 corpus this milestone targets, plus the machinery to look a rule up, apply it
-exactly, and round the result to a *documented*, defensible precision.
+exactly, and round the result to a *documented*, defensible precision. A
+converted value is always DERIVED on demand, never stored: call
+:meth:`~carmel.schemas.datasets.MeasuredValue.converted_to_base` on a
+``MeasuredValue`` to get its :class:`Converted` result, computed fresh each
+time from ``canonical_decimal_value``, ``unit_normalized``, and the recorded
+``conversion_table_sha256`` (looked up via :func:`table_for_sha`).
 
 Three design choices carry the same cardinal rule the rest of Carmel's dataset
 machinery serves -- every load-bearing number must be auditable, never
@@ -47,9 +53,47 @@ fabricated -- into this module specifically:
    preserves absolute precision) are rounded differently for that reason.
 
 Deliberately NOT built here: this module does not import from
-``carmel.schemas`` (schemas import services; the reverse would be circular),
-and it does not rewire the dataset schema's ``unit_raw``/``unit_canonical``
-fields to actually call this module -- that wiring is a later milestone.
+``carmel.schemas`` (schemas import services; the reverse would be circular).
+The schema-side wiring (``MeasuredValue`` calling ``normalize_unit``/
+``convert`` from its validators and ``converted_to_base()``) already exists in
+:mod:`carmel.schemas.datasets` as of this module -- it is not future work.
+
+NAMED TRAP for future extenders -- a unit whose conversion factor is not a
+finite decimal cannot be added as a :class:`ScaleRule` (or an
+:class:`AffineRule`'s ``scale``) without silently being false-exact. Torr is
+the concrete example: 1 Torr = 101325/760 Pa, and 101325/760 has no finite
+decimal expansion (760 = 2^3 * 5 * 19; the factor of 19 in the denominator
+never terminates in base 10). Writing any truncated decimal for it -- e.g.
+``"133.322"`` -- would silently discard precision at every single Torr
+conversion, forever, with no record that it happened, because a ``ScaleRule``
+carries a decimal *string*, not a rational number. Adding Torr support
+correctly requires a different rule shape (a rational scale, e.g. numerator/
+denominator ``Decimal``s multiplied and divided as separate exact steps) --
+not a decimal approximation squeezed into the existing ``ScaleRule``.
+
+SIGNIFICANCE STANCE -- this module does not second-guess a source's printed
+significant digits. ``canonical_decimal`` preserves the (sign, digits,
+exponent) triple exactly as the source wrote it: ``"1000"`` is four
+significant digits here, because a source meaning only one significant figure
+would have written ``"1E+3"`` instead; Carmel takes the printed form at face
+value rather than inferring intent from magnitude. ``"0"`` has one digit by
+the same rule, and converts without any special-casing: ``convert("0",
+quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")`` yields
+``exact="0"``, ``rounded="0"`` (verified in
+:mod:`tests.test_units`) -- zero is not an edge case this module treats
+differently from any other value.
+
+KNOWN LIMITATION -- ``QuantityKind.OTHER`` accepts any unit string and
+identity-converts it unconditionally (see :func:`normalize_unit` and
+:func:`convert`). This is deliberately the honest state for a genuinely
+unmodelled quantity this table has no opinion about -- but it also means an
+extractor bug could route a quantity this table DOES support (say, a pressure
+mislabeled ``OTHER``) through ``OTHER`` and bypass unit validation entirely,
+with no error raised anywhere in this module to catch it. This module is not
+the closer for that risk: the trust computation in M-D3 is, and it must not
+treat a dataset with a high proportion of ``OTHER``-quantity measurements as
+machine-verified in the same sense as one whose quantities were all validated
+against a real base unit.
 """
 
 from __future__ import annotations
@@ -304,6 +348,17 @@ class ConversionTable:
        ``raw != normalized`` (an alias that does nothing is not an alias).
     7. No rules and no aliases are registered for ``OTHER`` -- the whole
        point of ``OTHER`` is that this table has nothing to say about it.
+    8. An :class:`AffineRule`'s ``scale`` is exactly ``"1"``. ``convert()``'s
+       affine rounding branch rounds its result to the source value's decimal
+       exponent, which is only correct when the rule applies no multiplier; a
+       rule such as Fahrenheit->Kelvin with ``scale="5/9"`` would silently
+       mis-round under that policy. (Fahrenheit->Kelvin is also independently
+       inexpressible here regardless: 5/9 is not a finite decimal, so it
+       cannot be written as a canonical decimal ``scale`` string at all.)
+    9. Every :class:`QuantityKind` except ``OTHER`` has an :class:`IdentityRule`
+       for its own base unit. Without one, ``base_units`` makes the unit known
+       to :func:`normalize_unit` while :func:`convert` has no rule to find when
+       ``from_unit == to_unit`` -- a unit that is known but unusable.
     """
 
     table_id: str
@@ -382,6 +437,29 @@ class ConversionTable:
                     table_id=self.table_id,
                     version=self.version,
                 )
+                if rule.scale != "1":
+                    raise ConversionTableInvariantError(
+                        f"table {self.table_id!r} v{self.version}: affine rule "
+                        f"{rule.from_unit!r} -> {rule.to_unit!r} has scale {rule.scale!r}, but an "
+                        "AffineRule's scale must be exactly '1' -- convert()'s affine rounding branch "
+                        "rounds its result to the source value's decimal exponent, which is only "
+                        "correct when the rule applies no multiplier; a rule like Fahrenheit->Kelvin "
+                        "with scale=5/9 would silently mis-round under that policy. (Fahrenheit->Kelvin "
+                        "is also independently inexpressible as a ScaleRule/AffineRule in this table: "
+                        "5/9 is not a finite decimal, so it cannot be written as a canonical decimal "
+                        "scale string at all.)"
+                    )
+
+        identity_rule_quantities = {rule.quantity for rule in self.rules if isinstance(rule, IdentityRule)}
+        missing_identity_quantities = expected_quantities - identity_rule_quantities
+        if missing_identity_quantities:
+            raise ConversionTableInvariantError(
+                f"table {self.table_id!r} v{self.version}: quantities "
+                f"{sorted(q.value for q in missing_identity_quantities)!r} have no IdentityRule for "
+                "their own base unit -- without one, base_units makes the unit known to "
+                "normalize_unit(), but convert() has no rule to look up when from_unit == to_unit == "
+                "base unit, so the unit would be known but unusable"
+            )
 
         for alias in self.aliases:
             if alias.quantity is QuantityKind.OTHER:
@@ -557,6 +635,8 @@ def _scale_and_affine_rules_v1() -> tuple[ConversionRule, ...]:
         ScaleRule(kind="scale", quantity=QuantityKind.MOLE_FRACTION, from_unit="%", to_unit="1", scale="0.01"),
         ScaleRule(kind="scale", quantity=QuantityKind.MASS_FRACTION, from_unit="%", to_unit="1", scale="0.01"),
         ScaleRule(kind="scale", quantity=QuantityKind.RELATIVE_UNCERTAINTY, from_unit="%", to_unit="1", scale="0.01"),
+        ScaleRule(kind="scale", quantity=QuantityKind.MOLE_FRACTION, from_unit="ppm", to_unit="1", scale="0.000001"),
+        ScaleRule(kind="scale", quantity=QuantityKind.MASS_FRACTION, from_unit="ppm", to_unit="1", scale="0.000001"),
     )
 
 
@@ -583,6 +663,12 @@ def _aliases_v1() -> tuple[UnitAlias, ...]:
         UnitAlias(quantity=QuantityKind.MOLE_FRACTION, raw="percent", normalized="%"),
         UnitAlias(quantity=QuantityKind.MOLE_FRACTION, raw="-", normalized="1"),
         UnitAlias(quantity=QuantityKind.MOLE_FRACTION, raw="dimensionless", normalized="1"),
+        # "ppmv" is unambiguously volume/mole-basis parts-per-million; unlike
+        # bare "ppm" (which this table also treats as mole-fraction, since
+        # combustion literature overwhelmingly means mole fraction by it),
+        # "ppmv" is never aliased under MASS_FRACTION -- a source that writes
+        # the "v" is asserting a mole/volume basis, not leaving it ambiguous.
+        UnitAlias(quantity=QuantityKind.MOLE_FRACTION, raw="ppmv", normalized="ppm"),
         UnitAlias(quantity=QuantityKind.MASS_FRACTION, raw="percent", normalized="%"),
         UnitAlias(quantity=QuantityKind.MASS_FRACTION, raw="-", normalized="1"),
         UnitAlias(quantity=QuantityKind.MASS_FRACTION, raw="dimensionless", normalized="1"),
@@ -713,6 +799,23 @@ class Converted:
 
     rounding_policy: str
     """Which rounding branch ran: ``"identity"`` / ``"significant_digits"`` / ``"decimal_exponent"``."""
+
+    quantity: QuantityKind
+    """The :class:`QuantityKind` this conversion was performed for."""
+
+    from_unit: str
+    """The unit spelling converted from (the caller's ``from_unit`` argument, already normalized)."""
+
+    to_unit: str
+    """The unit spelling converted to (the caller's ``to_unit`` argument, already normalized)."""
+
+    conversion_table_sha256: str
+    """The :attr:`ConversionTable.sha256` of the table this conversion was performed against.
+
+    Lets a caller holding only a ``Converted`` result trace it back to the
+    exact rule set that produced it, without having to also thread the table
+    object itself around.
+    """
 
 
 # Decimal context precision used for both the exact-arithmetic step and the
@@ -872,7 +975,14 @@ def convert(
                 f"to_unit={to_unit!r}"
             )
         return Converted(
-            exact=canonical_value, rounded=canonical_value, rule_kind="identity", rounding_policy="identity"
+            exact=canonical_value,
+            rounded=canonical_value,
+            rule_kind="identity",
+            rounding_policy="identity",
+            quantity=quantity,
+            from_unit=from_unit,
+            to_unit=to_unit,
+            conversion_table_sha256=table.sha256,
         )
 
     rule: ConversionRule | None = None
@@ -893,7 +1003,14 @@ def convert(
                 f"requested to_unit={to_unit!r}"
             )
         return Converted(
-            exact=canonical_value, rounded=canonical_value, rule_kind="identity", rounding_policy="identity"
+            exact=canonical_value,
+            rounded=canonical_value,
+            rule_kind="identity",
+            rounding_policy="identity",
+            quantity=quantity,
+            from_unit=from_unit,
+            to_unit=to_unit,
+            conversion_table_sha256=table.sha256,
         )
 
     if to_unit != rule.to_unit:
@@ -936,4 +1053,8 @@ def convert(
         ),
         rule_kind=rule.kind,
         rounding_policy=rounding_policy,
+        quantity=quantity,
+        from_unit=from_unit,
+        to_unit=to_unit,
+        conversion_table_sha256=table.sha256,
     )

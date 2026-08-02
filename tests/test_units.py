@@ -5,7 +5,7 @@
 
 Pins three kinds of fact: (1) TABLE_V1's content address is a deterministic
 function of its own content, not of construction order or object identity;
-(2) each of ConversionTable's seven construction-time invariants actually
+(2) each of ConversionTable's nine construction-time invariants actually
 rejects a deliberately malformed table; (3) the rounding policy's two
 branches (significant-digits for scale rules, decimal-exponent for affine
 rules) produce the exact worked-example values the module's docstring
@@ -124,7 +124,7 @@ class TestIdentityPayload:
 
 
 class TestTableInvariants:
-    """Each of ConversionTable's seven construction-time invariants rejects a malformed table."""
+    """Each of ConversionTable's nine construction-time invariants rejects a malformed table."""
 
     def test_invariant_1_missing_quantity_in_base_units(self) -> None:
         base_units = tuple(
@@ -230,6 +230,20 @@ class TestTableInvariants:
         with pytest.raises(ConversionTableInvariantError, match="QuantityKind.OTHER"):
             _table_with(rules=_identity_only_rules(), aliases=(bad_alias,))
 
+    def test_invariant_8_affine_rule_scale_is_not_one(self) -> None:
+        bad_rule = AffineRule(
+            kind="affine", quantity=QuantityKind.TEMPERATURE, from_unit="F", to_unit="K", scale="5", offset="255.372"
+        )
+        with pytest.raises(ConversionTableInvariantError, match="AffineRule's scale must be exactly '1'"):
+            _table_with(rules=_identity_only_rules() + (bad_rule,))
+
+    def test_invariant_9_missing_identity_rule_for_base_unit(self) -> None:
+        # Omit LENGTH's identity rule entirely and add no replacement rule for
+        # it at all, so this trips only the "no IdentityRule for this
+        # quantity's base unit" invariant, not any of the per-rule checks.
+        with pytest.raises(ConversionTableInvariantError, match="no IdentityRule"):
+            _table_with(rules=_identity_only_rules(skip=QuantityKind.LENGTH))
+
 
 class TestNormalizeUnit:
     def test_micro_sign_spelling_of_microseconds(self) -> None:
@@ -272,6 +286,21 @@ class TestNormalizeUnit:
     def test_surrounding_whitespace_is_stripped(self) -> None:
         assert normalize_unit(QuantityKind.LENGTH, "  cm  ") == "cm"
 
+    def test_ppm_is_a_known_mole_fraction_unit(self) -> None:
+        assert normalize_unit(QuantityKind.MOLE_FRACTION, "ppm") == "ppm"
+
+    def test_ppm_is_a_known_mass_fraction_unit(self) -> None:
+        assert normalize_unit(QuantityKind.MASS_FRACTION, "ppm") == "ppm"
+
+    def test_ppmv_aliases_to_ppm_for_mole_fraction(self) -> None:
+        assert normalize_unit(QuantityKind.MOLE_FRACTION, "ppmv") == "ppm"
+
+    def test_ppmv_is_not_a_mass_fraction_alias(self) -> None:
+        # ppmv is explicitly volume/mole basis; it must not be usable as a
+        # mass-fraction spelling even though bare "ppm" is representable there.
+        with pytest.raises(UnknownUnitError):
+            normalize_unit(QuantityKind.MASS_FRACTION, "ppmv")
+
 
 class TestConvertTemperatureAffineRounding:
     """25 C -> K: affine rounding respects the source's ABSOLUTE precision (decimal exponent).
@@ -288,6 +317,10 @@ class TestConvertTemperatureAffineRounding:
         assert result.rounded == "298"
         assert result.rule_kind == "affine"
         assert result.rounding_policy == "decimal_exponent"
+        assert result.quantity is QuantityKind.TEMPERATURE
+        assert result.from_unit == "C"
+        assert result.to_unit == "K"
+        assert result.conversion_table_sha256 == TABLE_V1.sha256
 
     def test_25_point_0_degrees_rounds_to_tenths(self) -> None:
         result = convert("25.0", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K")
@@ -309,6 +342,32 @@ class TestConvertPressureScaleRounding:
         assert result.rounded == "1.25E+5"
         assert result.rule_kind == "scale"
         assert result.rounding_policy == "significant_digits"
+        assert result.quantity is QuantityKind.PRESSURE
+        assert result.from_unit == "atm"
+        assert result.to_unit == "Pa"
+        assert result.conversion_table_sha256 == TABLE_V1.sha256
+
+    def test_zero_atm_converts_to_zero_pa_without_special_casing(self) -> None:
+        # "0" has one significant digit by the same digit-preserving rule as
+        # any other canonical decimal; it is not an edge case this module
+        # treats differently. Pinned here because the module docstring cites
+        # this exact example as the significance-stance evidence.
+        result = convert("0", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+        assert result.exact == "0"
+        assert result.rounded == "0"
+
+
+class TestConvertMoleFractionPpmScaling:
+    """1 ppm -> mole fraction: pins Item 1's new ScaleRule at its documented scale."""
+
+    def test_one_ppm_is_one_millionth(self) -> None:
+        result = convert("1", quantity=QuantityKind.MOLE_FRACTION, from_unit="ppm", to_unit="1")
+        assert result.exact == "0.000001"
+        assert result.rule_kind == "scale"
+
+    def test_mass_fraction_ppm_is_also_representable(self) -> None:
+        result = convert("1", quantity=QuantityKind.MASS_FRACTION, from_unit="ppm", to_unit="1")
+        assert result.exact == "0.000001"
 
 
 class TestConvertVelocityScaleRounding:
@@ -319,6 +378,10 @@ class TestConvertVelocityScaleRounding:
         result = convert("1.23", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s")
         assert result.exact == "0.0123"
         assert result.rounded == "0.0123"
+        assert result.quantity is QuantityKind.VELOCITY
+        assert result.from_unit == "cm/s"
+        assert result.to_unit == "m/s"
+        assert result.conversion_table_sha256 == TABLE_V1.sha256
 
     def test_trailing_zero_significance_changes_rounded_result(self) -> None:
         # "1.230" carries 4 significant figures, "1.23" carries 3; both are
@@ -386,6 +449,10 @@ class TestConvertQuantityUnitPairErrors:
         assert result.rounded == "1.23"
         assert result.rule_kind == "identity"
         assert result.rounding_policy == "identity"
+        assert result.quantity is QuantityKind.OTHER
+        assert result.from_unit == "anything"
+        assert result.to_unit == "anything"
+        assert result.conversion_table_sha256 == TABLE_V1.sha256
 
 
 class TestTableForSha:

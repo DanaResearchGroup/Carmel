@@ -93,6 +93,20 @@ def _measured_value(
     )
 
 
+def _mole_fraction_measured_value(raw_text: str = "0.04", canonical_decimal_value: str | None = None) -> MeasuredValue:
+    """A physically-coherent MOLE_FRACTION amount, for Composition components
+    whose basis is CompositionBasis.MOLE_FRACTION -- Composition now
+    validates that a component's amount.quantity_kind matches its basis, so
+    the default VELOCITY/cm/s _measured_value() is no longer usable there."""
+    return _measured_value(
+        raw_text=raw_text,
+        canonical_decimal_value=canonical_decimal_value if canonical_decimal_value is not None else raw_text,
+        quantity_kind=QuantityKind.MOLE_FRACTION,
+        unit_raw="-",
+        unit_normalized="1",
+    )
+
+
 class TestBBoxCrossesStoreBoundary:
     """The load-bearing regression test for the confirmed defect: the store's
     ``canonical_json_bytes`` rejects a Python float ANYWHERE in a payload
@@ -1011,8 +1025,12 @@ class TestComposition:
             basis=CompositionBasis.MOLE_FRACTION,
             equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             components=[
-                CompositionComponent(species_raw_name="H2", amount=_measured_value(), role=ComponentRole.FUEL),
-                CompositionComponent(species_raw_name="N2", amount=_measured_value(), role=ComponentRole.BALANCE),
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
+                CompositionComponent(
+                    species_raw_name="N2", amount=_mole_fraction_measured_value(), role=ComponentRole.BALANCE
+                ),
             ],
         )
         assert len(mixture.components) == 2
@@ -1048,7 +1066,9 @@ class TestComposition:
             basis=CompositionBasis.MOLE_FRACTION,
             equivalence_ratio=Absent(reason=AbsenceReason.UNKNOWN),
             components=[
-                CompositionComponent(species_raw_name="H2", amount=_measured_value(), role=ComponentRole.FUEL),
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
             ],
         )
         assert isinstance(mixture.equivalence_ratio, Absent)
@@ -1091,7 +1111,9 @@ class TestComposition:
             basis=CompositionBasis.MOLE_FRACTION,
             equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             components=[
-                CompositionComponent(species_raw_name="H2", amount=_measured_value(), role=ComponentRole.FUEL),
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
             ],
         )
         assert len(mixture.components) == 1
@@ -1114,3 +1136,149 @@ class TestComposition:
                 equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
                 surprise="y",
             )  # type: ignore[call-arg]
+
+    def test_basis_mismatched_with_component_quantity_kind_is_rejected(self) -> None:
+        # basis says MOLE_FRACTION but the component's amount is a velocity --
+        # the mismatch must be caught here, not silently trusted.
+        with pytest.raises(ValidationError, match="quantity_kind"):
+            Composition(
+                raw_name="4% H2 in N2",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.MOLE_FRACTION,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[
+                    CompositionComponent(species_raw_name="H2", amount=_measured_value(), role=ComponentRole.FUEL),
+                ],
+            )
+
+    def test_basis_matching_mole_fraction_component_constructs(self) -> None:
+        mixture = Composition(
+            raw_name="4% H2 in N2",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.MOLE_FRACTION,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
+            ],
+        )
+        assert mixture.components[0].amount.quantity_kind == QuantityKind.MOLE_FRACTION
+
+    def test_ppm_basis_with_ppm_component_constructs(self) -> None:
+        mixture = Composition(
+            raw_name="4 ppm NO in N2",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.PPM,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="NO",
+                    amount=_measured_value(
+                        raw_text="4",
+                        canonical_decimal_value="4",
+                        quantity_kind=QuantityKind.MOLE_FRACTION,
+                        unit_raw="ppm",
+                        unit_normalized="ppm",
+                    ),
+                    role=ComponentRole.DILUENT,
+                ),
+            ],
+        )
+        assert mixture.components[0].amount.unit_normalized == "ppm"
+
+    def test_ppm_basis_rejects_bare_mole_fraction_component(self) -> None:
+        # basis=PPM requires unit_normalized == "ppm" specifically; a
+        # component recorded as a bare mole fraction ("1") is a different
+        # fact (parts-per-unit, not parts-per-million) and must not be
+        # silently accepted under a PPM-labeled basis.
+        with pytest.raises(ValidationError, match="PPM"):
+            Composition(
+                raw_name="4 ppm NO in N2",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.PPM,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[
+                    CompositionComponent(
+                        species_raw_name="NO", amount=_mole_fraction_measured_value(), role=ComponentRole.DILUENT
+                    ),
+                ],
+            )
+
+    def test_volume_percent_basis_rejects_a_bare_fraction_component(self) -> None:
+        """basis=VOLUME_PERCENT requires the unit '%', not merely the mole-fraction KIND.
+
+        VOLUME_PERCENT maps to QuantityKind.MOLE_FRACTION (volume fraction equals
+        mole fraction for an ideal gas), so constraining the kind alone leaves a
+        bare fraction admissible under a percent-labeled basis. `0.21` then reads
+        as 0.21% to a consumer that trusts the basis and as 21% to one that trusts
+        the unit -- a silent factor of 100 in a composition. This is the same rule
+        PPM already enforced, and it must not be weaker here just because the
+        quantity kind happens to be shared.
+        """
+        with pytest.raises(ValidationError, match="VOLUME_PERCENT"):
+            Composition(
+                raw_name="21 vol% O2 in N2",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.VOLUME_PERCENT,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[
+                    CompositionComponent(
+                        species_raw_name="O2", amount=_mole_fraction_measured_value(), role=ComponentRole.OXIDIZER
+                    ),
+                ],
+            )
+
+    def test_volume_percent_basis_with_a_percent_component_constructs(self) -> None:
+        """The honest representation of "21 vol%" is 21 with unit '%', and it is accepted."""
+        mixture = Composition(
+            raw_name="21 vol% O2 in N2",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.VOLUME_PERCENT,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="O2",
+                    amount=_measured_value(
+                        raw_text="21",
+                        canonical_decimal_value="21",
+                        quantity_kind=QuantityKind.MOLE_FRACTION,
+                        unit_raw="%",
+                        unit_normalized="%",
+                    ),
+                    role=ComponentRole.OXIDIZER,
+                ),
+            ],
+        )
+        assert mixture.components[0].amount.converted_to_base().exact == "0.21"
+
+
+class TestModelsAreFrozen:
+    """Every model in this module rejects post-validation attribute assignment.
+
+    A content address (e.g. MeasuredValue.conversion_table_sha256, or a
+    ConversionTable's own sha256) is a claim about a specific, already-
+    validated payload; an in-place mutation after construction would let that
+    payload silently drift out from under an address computed before the
+    mutation. frozen=True closes off plain attribute assignment -- it does
+    NOT close off model_construct() or model_copy(update=...), which remain
+    the deliberate escape hatches documented in this module's docstring.
+    """
+
+    def test_plain_attribute_assignment_is_rejected(self) -> None:
+        absent = Absent(reason=AbsenceReason.UNKNOWN)
+        with pytest.raises(ValidationError, match="frozen"):
+            absent.reason = AbsenceReason.NOT_APPLICABLE  # type: ignore[misc]
+
+    def test_measured_value_attribute_assignment_is_rejected(self) -> None:
+        value = _measured_value()
+        with pytest.raises(ValidationError, match="frozen"):
+            value.unit_raw = "m/s"  # type: ignore[misc]
+
+    def test_model_copy_update_remains_the_escape_hatch(self) -> None:
+        # frozen=True does not close off model_copy(update=...): it builds a
+        # new, independent instance rather than mutating the original.
+        absent = Absent(reason=AbsenceReason.UNKNOWN)
+        copied = absent.model_copy(update={"reason": AbsenceReason.NOT_APPLICABLE})
+        assert absent.reason == AbsenceReason.UNKNOWN
+        assert copied.reason == AbsenceReason.NOT_APPLICABLE
