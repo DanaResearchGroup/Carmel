@@ -31,6 +31,7 @@ from carmel.schemas.datasets import (
     UncertaintyScale,
     XPathLocator,
 )
+from carmel.services.dataset_store import canonical_json_bytes
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -39,17 +40,19 @@ SHA_B = "b" * 64
 def _frame(**kwargs: object) -> CoordinateFrame:
     defaults: dict[str, object] = {
         "render_fingerprint": "fp-1",
-        "cropbox": (0.0, 0.0, 612.0, 792.0),
-        "mediabox": (0.0, 0.0, 612.0, 792.0),
+        "cropbox": ("0", "0", "612", "792"),
+        "mediabox": ("0", "0", "612", "792"),
         "rotation": 0,
         "units": "pt",
+        "dpi": Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        "render_settings": Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
     }
     defaults.update(kwargs)
     return CoordinateFrame(**defaults)  # type: ignore[arg-type]
 
 
 def _bbox(**kwargs: object) -> BBox:
-    defaults: dict[str, object] = {"frame": _frame(), "x0": 10.0, "y0": 20.0, "x1": 30.0, "y1": 40.0}
+    defaults: dict[str, object] = {"frame": _frame(), "x0": "10", "y0": "20", "x1": "30", "y1": "40"}
     defaults.update(kwargs)
     return BBox(**defaults)  # type: ignore[arg-type]
 
@@ -73,6 +76,7 @@ def _measured_value(
     unit_canonical: str = "m/s",
     conversion_factor: str = "0.01",
     conversion_table_version: str = "v1",
+    repairs: tuple[str, ...] = (),
 ) -> MeasuredValue:
     return MeasuredValue(
         raw_text=raw_text,
@@ -81,9 +85,30 @@ def _measured_value(
         unit_canonical=unit_canonical,
         conversion_factor=conversion_factor,
         conversion_table_version=conversion_table_version,
+        repairs=repairs,
         value_ref=_bbox_ref(),
         unit_ref=_table_ref(),
     )
+
+
+class TestBBoxCrossesStoreBoundary:
+    """The load-bearing regression test for the confirmed defect: the store's
+    ``canonical_json_bytes`` rejects a Python float ANYWHERE in a payload
+    (floats churn content-address hashes across platforms/interpreters), but
+    this schema used to declare bbox/coordinate-frame fields as float --
+    meaning no payload containing a bbox could ever be stored. A test that
+    only constructs a BBox in isolation cannot catch that: it must actually
+    cross the seam into ``canonical_json_bytes``, built the way a real caller
+    would (``model_dump(mode="json")``), or it validates nothing about the
+    defect this module exists to fix."""
+
+    def test_bbox_bearing_payload_survives_canonical_json_bytes(self) -> None:
+        bbox = _bbox()
+        payload = {"bbox": bbox.model_dump(mode="json")}
+        encoded = canonical_json_bytes(payload)
+        assert isinstance(encoded, bytes)
+        assert b"10" in encoded
+        assert encoded.endswith(b"\n")
 
 
 class TestAbsenceStates:
@@ -156,7 +181,7 @@ class TestAbsenceStates:
 class TestCoordinateFrameAndBBox:
     def test_bbox_requires_frame(self) -> None:
         with pytest.raises(ValidationError):
-            BBox(x0=0.0, y0=0.0, x1=1.0, y1=1.0)  # type: ignore[call-arg]
+            BBox(x0="0", y0="0", x1="1", y1="1")  # type: ignore[call-arg]
 
     def test_bbox_with_frame_is_constructible(self) -> None:
         bbox = _bbox()
@@ -170,6 +195,18 @@ class TestCoordinateFrameAndBBox:
         frame = _frame(rotation=180)
         assert frame.rotation == 180
 
+    def test_frame_rejects_negative_rotation_even_though_multiple_of_90(self) -> None:
+        """-90 and 270 describe the same physical page but serialize to
+        different bytes, so admitting both would give one physical fact two
+        different content addresses. rotation is constrained to exactly
+        {0, 90, 180, 270}, not merely "a multiple of 90"."""
+        with pytest.raises(ValidationError):
+            _frame(rotation=-90)
+
+    def test_frame_accepts_270_rotation(self) -> None:
+        frame = _frame(rotation=270)
+        assert frame.rotation == 270
+
     def test_frame_rejects_extra_fields(self) -> None:
         with pytest.raises(ValidationError):
             _frame(surprise="y")
@@ -180,6 +217,66 @@ class TestCoordinateFrameAndBBox:
         CoordinateFrame must not expose one at all."""
         assert "page_number" not in CoordinateFrame.model_fields
         assert "page" not in CoordinateFrame.model_fields
+
+    def test_frame_rejects_degenerate_cropbox(self) -> None:
+        """A cropbox with x0 >= x1 describes no actual page area."""
+        with pytest.raises(ValidationError):
+            _frame(cropbox=("0", "0", "0", "792"))
+
+    def test_frame_rejects_inverted_mediabox(self) -> None:
+        with pytest.raises(ValidationError):
+            _frame(mediabox=("612", "0", "0", "792"))
+
+    def test_frame_dpi_can_be_present(self) -> None:
+        frame = _frame(dpi="300")
+        assert frame.dpi == "300"
+
+    def test_frame_dpi_can_be_explicitly_absent(self) -> None:
+        frame = _frame(dpi=Absent(reason=AbsenceReason.NOT_REPORTED_HERE))
+        assert isinstance(frame.dpi, Absent)
+
+    def test_frame_none_rejected_for_dpi(self) -> None:
+        """A bare None must never stand in for an explicit Absent -- see
+        module docstring on Maybe."""
+        with pytest.raises(ValidationError):
+            _frame(dpi=None)
+
+    def test_frame_rejects_zero_dpi(self) -> None:
+        with pytest.raises(ValidationError):
+            _frame(dpi="0")
+
+    def test_frame_rejects_negative_dpi(self) -> None:
+        with pytest.raises(ValidationError):
+            _frame(dpi="-300")
+
+    def test_frame_render_settings_can_be_present(self) -> None:
+        frame = _frame(render_settings="pdftoppm 24.08, 300dpi")
+        assert frame.render_settings == "pdftoppm 24.08, 300dpi"
+
+    def test_frame_render_settings_can_be_explicitly_absent(self) -> None:
+        frame = _frame(render_settings=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET))
+        assert isinstance(frame.render_settings, Absent)
+
+    def test_frame_none_rejected_for_render_settings(self) -> None:
+        with pytest.raises(ValidationError):
+            _frame(render_settings=None)
+
+    def test_bbox_rejects_degenerate_box(self) -> None:
+        """x0 == x1 locates no actual point/region."""
+        with pytest.raises(ValidationError):
+            _bbox(x0="10", x1="10")
+
+    def test_bbox_rejects_inverted_box(self) -> None:
+        with pytest.raises(ValidationError):
+            _bbox(y0="40", y1="20")
+
+    def test_bbox_rejects_non_canonical_coordinate(self) -> None:
+        """Coordinates go through the same canonical-decimal machinery as
+        every other numeric fact in this schema -- a hand-formatted string
+        that isn't already canonical (e.g. a spurious leading zero) must be
+        rejected, not silently accepted."""
+        with pytest.raises(ValidationError):
+            _bbox(x0="010")
 
 
 class TestSourceGraph:
@@ -206,6 +303,15 @@ class TestSourceGraph:
         assert isinstance(ref.locator, TableCellLocator)
         assert ref.locator.row == 2
         assert ref.locator.col == 3
+
+    def test_table_cell_locator_rejects_negative_row(self) -> None:
+        """A negative row locates no real table cell."""
+        with pytest.raises(ValidationError):
+            TableCellLocator(row=-1, col=0)
+
+    def test_table_cell_locator_rejects_negative_col(self) -> None:
+        with pytest.raises(ValidationError):
+            TableCellLocator(row=0, col=-1)
 
     def test_xpath_locator_ref_round_trips(self) -> None:
         ref = SourceRef(node_id="n1", locator=XPathLocator(xpath="//table/row[1]/cell[2]"))
@@ -374,6 +480,82 @@ class TestMeasuredValue:
     def test_no_conversion_still_requires_explicit_factor(self) -> None:
         mv = _measured_value(unit_raw="m/s", unit_canonical="m/s", conversion_factor="1")
         assert mv.conversion_factor == "1"
+
+    def test_slash_c0_repair_recovers_negative_value_with_evidence_preserved(self) -> None:
+        """The load-bearing case, drawn from real corpus data: ``/C0`` is the
+        minus sign in 7 of 8 real papers, so most real negative numbers in
+        this corpus can only be represented via a recorded repair -- and
+        raw_text must still read back exactly as printed, evidence intact."""
+        mv = _measured_value(
+            raw_text="/C0 1.0",
+            canonical_decimal_value="-1.0",
+            repairs=("slash_c0_to_minus",),
+        )
+        assert mv.raw_text == "/C0 1.0"
+        assert mv.canonical_decimal_value == "-1.0"
+
+    def test_thorn_repair_preserves_significant_figures(self) -> None:
+        """``þ`` (U+00FE) stands in for ``+`` in a corrupted exponent. A float
+        round-trip would collapse ``7.000E+17`` (4 significant figures) to
+        ``7E+17`` (1 significant figure) -- assert the coefficient survives
+        with all 4 digits, since canonical_decimal never re-renders via
+        float()."""
+        mv = _measured_value(
+            raw_text="7.000Eþ17",
+            canonical_decimal_value="7.000E+17",
+            repairs=("thorn_to_plus",),
+        )
+        assert mv.canonical_decimal_value == "7.000E+17"
+        mantissa = mv.canonical_decimal_value.split("E")[0]
+        assert len(mantissa.replace(".", "")) == 4
+
+    def test_unicode_minus_repair(self) -> None:
+        mv = _measured_value(
+            raw_text="−1.5",
+            canonical_decimal_value="-1.5",
+            repairs=("unicode_minus_to_ascii",),
+        )
+        assert mv.canonical_decimal_value == "-1.5"
+
+    def test_underclaimed_repair_rejected(self) -> None:
+        """A repair the text actually needs (``/C0`` -> minus) must be
+        recorded -- silently accepting it without a claimed repair would hide
+        the fact that raw_text was corrupted at all."""
+        with pytest.raises(ValidationError):
+            _measured_value(raw_text="/C0 1.0", canonical_decimal_value="-1.0", repairs=())
+
+    def test_fabricated_repair_rejected(self) -> None:
+        """A recorded repair the text never needed must be rejected -- the
+        repairs list is a claim about the evidence and must be exactly true,
+        not merely a superset of what happened."""
+        with pytest.raises(ValidationError):
+            _measured_value(raw_text="1.0", canonical_decimal_value="1.0", repairs=("slash_c0_to_minus",))
+
+    def test_unknown_repair_name_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _measured_value(raw_text="1.0", canonical_decimal_value="1.0", repairs=("made_up_repair",))
+
+    def test_silent_sign_loss_rejected(self) -> None:
+        """The exact corpus failure mode: a subsetted font deleting a minus
+        glyph produced a silent sign flip on every value in one real table.
+        Claiming the /C0 repair happened is not enough on its own --
+        canonical_decimal_value must actually reflect the repaired (negative)
+        value, not the unrepaired positive one."""
+        with pytest.raises(ValidationError):
+            _measured_value(
+                raw_text="/C0 1.0",
+                canonical_decimal_value="1.0",
+                repairs=("slash_c0_to_minus",),
+            )
+
+    def test_range_is_not_a_measured_value(self) -> None:
+        with pytest.raises(ValidationError):
+            _measured_value(raw_text="0.6–1.0", canonical_decimal_value="0.6")
+
+    def test_clean_no_repair_path_still_works(self) -> None:
+        mv = _measured_value(raw_text="1.23", canonical_decimal_value="1.23", repairs=())
+        assert mv.canonical_decimal_value == "1.23"
+        assert mv.repairs == ()
 
     def test_rejects_extra_fields(self) -> None:
         with pytest.raises(ValidationError):

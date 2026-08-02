@@ -35,12 +35,20 @@ see that function's docstring for why floats are rejected outright.
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal
+from carmel.services.numeric import (
+    REPAIR_NAMES,
+    GlyphHealth,
+    SourceContext,
+    Unresolvable,
+    normalize_numeric_span,
+)
 
 __all__ = [
     "AbsenceReason",
@@ -70,6 +78,22 @@ __all__ = [
 
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# carmel.services.dataset_store._HEALTHY_GLYPH_HEALTH is module-private (leading
+# underscore) -- reaching across a module boundary to import another module's private
+# name would tie this schema to dataset_store's internals, so this constant is
+# constructed here identically instead. Same rationale as there: a stored
+# MeasuredValue's raw_text carries no surrounding document, so there is nothing to run
+# assess_glyph_health() on, and SourceContext.OPERATOR_RAW (used below) is the one
+# SourceContext that never inherits or implies a document's dash-corruption quarantine
+# state -- exactly right here, since there is no document at all.
+_HEALTHY_GLYPH_HEALTH = GlyphHealth(
+    suspects_dash_corruption=False,
+    has_thorn_plus_marker=False,
+    has_equals_ambiguity_marker=False,
+    has_slash_c0_minus_marker=False,
+    has_ascii6_uncertainty_marker=False,
+)
 
 
 def _require_canonical_decimal(value: str, *, field_name: str) -> str:
@@ -184,22 +208,63 @@ class CoordinateFrame(BaseModel):
     render_fingerprint: str = Field(min_length=1)
     """Fingerprint of the rendered page (e.g. a hash of the rendered image or
     text layer). The actual provenance key -- see class docstring."""
-    cropbox: tuple[float, float, float, float]
-    mediabox: tuple[float, float, float, float]
+    cropbox: tuple[str, str, str, str]
+    """``(x0, y0, x1, y1)`` as canonical decimal strings, never floats -- see
+    module docstring. Must be non-degenerate under the same convention as
+    :class:`BBox` (enforced below): a cropbox with ``x0 >= x1`` or
+    ``y0 >= y1`` describes no actual page area."""
+    mediabox: tuple[str, str, str, str]
+    """Same convention and constraints as ``cropbox``."""
     rotation: int
-    """Page rotation in degrees; must be a multiple of 90."""
+    """Page rotation in degrees; constrained to exactly ``{0, 90, 180, 270}``
+    (not merely "a multiple of 90") -- see the validator below for why."""
     units: str = Field(min_length=1)
-    dpi: float | None = None
-    render_settings: str | None = None
+    dpi: Maybe[str]
+    """Canonical decimal string when present, strictly positive (enforced
+    below) -- a bare ``None`` would be exactly the un-reasoned absence this
+    module's ``Absent`` machinery exists to forbid (see module docstring), and
+    a dpi cannot legitimately measure zero or negative."""
+    render_settings: Maybe[str]
     """Free-text description of the renderer and its settings/version, for
     reproducing the exact render this frame's coordinates were measured
-    against."""
+    against. This is render PROVENANCE -- an asserted fact about how the page
+    was rendered, not decoration -- so a bare ``None`` must never stand in for
+    "the extractor didn't record this"; see :class:`Absent`."""
+
+    @field_validator("cropbox", "mediabox")
+    @classmethod
+    def _validate_box_coords(cls, value: tuple[str, str, str, str], info: ValidationInfo) -> tuple[str, str, str, str]:
+        field_name = info.field_name or "box"
+        x0, y0, x1, y1 = (_require_canonical_decimal(v, field_name=f"{field_name}[{i}]") for i, v in enumerate(value))
+        # Compare as Decimal, never as strings -- string comparison would call
+        # "10" less than "9". A degenerate or inverted box describes no actual
+        # page area.
+        if not (Decimal(x0) < Decimal(x1)):
+            raise ValueError(f"{field_name}: x0={x0!r} must be strictly less than x1={x1!r}")
+        if not (Decimal(y0) < Decimal(y1)):
+            raise ValueError(f"{field_name}: y0={y0!r} must be strictly less than y1={y1!r}")
+        return (x0, y0, x1, y1)
+
+    @field_validator("dpi")
+    @classmethod
+    def _validate_dpi(cls, value: str | Absent) -> str | Absent:
+        if isinstance(value, Absent):
+            return value
+        canonical = _require_canonical_decimal(value, field_name="dpi")
+        if not (Decimal(canonical) > 0):
+            raise ValueError(f"dpi={canonical!r} must be strictly positive -- a render cannot have zero/negative dpi")
+        return canonical
 
     @field_validator("rotation")
     @classmethod
     def _validate_rotation(cls, value: int) -> int:
-        if value % 90 != 0:
-            raise ValueError(f"rotation must be a multiple of 90 degrees, got {value}")
+        # Constrained to exactly {0, 90, 180, 270}, not merely "a multiple of
+        # 90": that would admit -90, which describes the same physical page
+        # as 270 but serializes to different bytes. Admitting both would give
+        # one physical fact two different content addresses -- an
+        # address-stability violation, not just a cosmetic one.
+        if value not in (0, 90, 180, 270):
+            raise ValueError(f"rotation must be one of 0, 90, 180, 270 degrees, got {value}")
         return value
 
 
@@ -214,10 +279,30 @@ class BBox(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     frame: CoordinateFrame
-    x0: float
-    y0: float
-    x1: float
-    y1: float
+    x0: str
+    """Canonical decimal string, never a float -- see module docstring."""
+    y0: str
+    x1: str
+    y1: str
+
+    @field_validator("x0", "y0", "x1", "y1")
+    @classmethod
+    def _validate_coord(cls, value: str, info: ValidationInfo) -> str:
+        field_name = info.field_name or "coordinate"
+        return _require_canonical_decimal(value, field_name=field_name)
+
+    @model_validator(mode="after")
+    def _validate_non_degenerate(self) -> BBox:
+        # Compare as Decimal, never as strings -- string comparison would
+        # call "10" less than "9". A degenerate or inverted box locates
+        # nothing, so impossible provenance must be rejected here rather than
+        # stored: bad provenance is worse than absent provenance, because it
+        # reads as verified.
+        if not (Decimal(self.x0) < Decimal(self.x1)):
+            raise ValueError(f"BBox requires x0 < x1, got x0={self.x0!r}, x1={self.x1!r}")
+        if not (Decimal(self.y0) < Decimal(self.y1)):
+            raise ValueError(f"BBox requires y0 < y1, got y0={self.y0!r}, y1={self.y1!r}")
+        return self
 
 
 class SourceNodeKind(StrEnum):
@@ -280,8 +365,10 @@ class TableCellLocator(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     kind: Literal[LocatorKind.TABLE_CELL] = LocatorKind.TABLE_CELL
-    row: int
-    col: int
+    row: int = Field(ge=0)
+    """0-indexed row; a negative row locates no real table cell."""
+    col: int = Field(ge=0)
+    """0-indexed column; a negative col locates no real table cell."""
     table_label: str | None = None
 
 
@@ -356,18 +443,69 @@ class MeasuredValue(BaseModel):
     together with ``conversion_table_version`` record exactly what was
     applied and against which version of the conversion table, so the
     conversion is always reversible and auditable.
+
+    ``raw_text`` and ``canonical_decimal_value`` are deliberately allowed to
+    DIFFER, via an explicit, auditable ``repairs`` chain -- this is not a gap,
+    it is the point. Measured directly on this corpus: real source text is
+    routinely glyph-corrupted in ways that hide a genuine numeric fact behind
+    a substituted character -- ``/C0`` standing in for a minus sign in 7 of 8
+    real papers, ``þ`` (U+00FE) standing in for a ``+`` in an exponent, U+2212
+    or a leading U+2013 also standing in for a minus. A schema that required
+    ``canonical_decimal_value == canonical_decimal(raw_text)`` verbatim could
+    never represent the (very common) case where the paper's own printed
+    minus sign survived only as a corrupted glyph -- it would force a choice
+    between rejecting most of the real corpus's negative numbers outright, or
+    writing the REPAIRED text into ``raw_text`` and destroying the evidence.
+    Neither is acceptable, so instead: ``raw_text`` keeps the corrupted
+    source span byte-for-byte (it IS the evidence), ``canonical_decimal_value``
+    holds the canonicalization of the REPAIRED text, and ``repairs`` is the
+    explicit, checked claim that bridges them -- validated below to be an
+    exact, ordered match against what :func:`~carmel.services.numeric.normalize_numeric_span`
+    itself reports needing, so neither under-claiming (a repair happened but
+    was not recorded) nor over-claiming (a recorded repair the text never
+    needed) can pass.
+
+    A real boundary this leaves open, stated plainly rather than papered
+    over: this schema's validator checks DERIVABILITY, a context-free
+    textual property of ``raw_text`` alone. The dash-corruption QUARANTINE
+    rule in :mod:`carmel.services.numeric` (a bare lowercase ``e`` exponent
+    token that might actually encode a corrupted en-dash range) is
+    document-level and extraction-time: it depends on whether the SOURCE
+    DOCUMENT is suspected of that corruption, a fact this schema calls with a
+    healthy, hand-constructed :class:`~carmel.services.numeric.GlyphHealth`
+    because a stored ``MeasuredValue`` carries no surrounding document to
+    assess. So this validator can confirm "this repair chain is internally
+    consistent" but it can never re-run the document-level quarantine that
+    decided whether this span was allowed to become a ``MeasuredValue`` at
+    all -- that decision must already have been made correctly upstream, at
+    extraction time, and this schema is not a complete substitute for it.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     raw_text: str = Field(min_length=1)
-    """The exact numeric span as it appears in the source (keeps printed
-    precision and any glyph corruption)."""
+    """The exact numeric span as it appears in the source, VERBATIM --
+    including any glyph corruption (e.g. ``"/C0 1.0"``, ``"7.000Eþ17"``). This
+    is the evidence; it is never rewritten to the repaired form, even when
+    ``repairs`` records exactly what repair would be needed to read it."""
     canonical_decimal_value: str = Field(min_length=1)
-    """``raw_text`` canonicalized via
-    :func:`carmel.services.dataset_store.canonical_decimal`. Never a float --
-    see that function's docstring for why. Must already be in canonical form
-    and must agree with ``raw_text``'s own canonicalization (enforced below)."""
+    """The canonicalization (via
+    :func:`carmel.services.dataset_store.canonical_decimal`) of ``raw_text``
+    AFTER applying the glyph repairs listed in ``repairs`` -- never a float,
+    see that function's docstring for why. Must already be in canonical form.
+    Enforced below to be exactly ``canonical_decimal`` of ``raw_text`` as
+    repaired by the claimed ``repairs`` chain -- never asserted
+    independently, and never silently equal to ``canonical_decimal(raw_text)``
+    verbatim when a repair was actually needed."""
+    repairs: tuple[str, ...] = ()
+    """Names of the glyph repairs (each a member of
+    :data:`carmel.services.numeric.REPAIR_NAMES` -- never free text, enforced
+    below) applied to ``raw_text`` to derive ``canonical_decimal_value``. The
+    empty tuple (the default) is the normal case: it means the source span
+    was already clean and needed no repair. When non-empty, this is a claim
+    about the evidence that must be EXACTLY true -- validated below against
+    what :func:`~carmel.services.numeric.normalize_numeric_span` itself
+    reports needing, in the same order."""
     unit_raw: str = Field(min_length=1)
     """The unit exactly as printed in the source."""
     unit_canonical: str = Field(min_length=1)
@@ -392,26 +530,67 @@ class MeasuredValue(BaseModel):
     def _validate_conversion_factor(cls, value: str) -> str:
         return _require_canonical_decimal(value, field_name="conversion_factor")
 
-    @model_validator(mode="after")
-    def _validate_canonical_agrees_with_raw_text(self) -> MeasuredValue:
-        """Reject a ``canonical_decimal_value`` that disagrees with ``raw_text``.
+    @field_validator("repairs")
+    @classmethod
+    def _validate_repair_names(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for name in value:
+            if name not in REPAIR_NAMES:
+                raise ValueError(
+                    f"repairs contains {name!r}, which is not a member of "
+                    f"carmel.services.numeric.REPAIR_NAMES ({sorted(REPAIR_NAMES)!r}); "
+                    "repairs must never contain free text -- only the core's own repair names"
+                )
+        return value
 
-        Both a hand-typed mismatch (e.g. a transcription slip) and a
-        non-canonical rendering (extra/missing precision vs. what
-        ``canonical_decimal`` would produce) are rejected: the only way this
-        field can validate is if it is EXACTLY
-        ``canonical_decimal(self.raw_text)``, which also guarantees the
-        round-trip property (``canonical_decimal`` is idempotent).
+    @model_validator(mode="after")
+    def _validate_repair_chain_agrees_with_raw_text(self) -> MeasuredValue:
+        """Reject a ``repairs``/``canonical_decimal_value`` pair that disagrees
+        with what ``raw_text`` itself actually needs.
+
+        Replaces a plain string-equality check (``canonical_decimal(raw_text)
+        == canonical_decimal_value``) that could never represent a repaired
+        value -- see the class docstring for why that was wrong for this
+        corpus. This validator checks the REPAIR CHAIN instead of string
+        equality:
+
+        1. ``raw_text`` must itself be derivable at all (rejects with the
+           core's own reason if not).
+        2. ``repairs`` must be an EXACT, ORDERED match for what
+           :func:`~carmel.services.numeric.normalize_numeric_span` reports
+           needing -- both under-claiming (a repair happened but was not
+           recorded) and over-claiming (a recorded repair the text never
+           needed) are rejected.
+        3. ``canonical_decimal_value`` must be exactly
+           ``canonical_decimal`` of the REPAIRED text -- never asserted
+           independently.
         """
+        normalized = normalize_numeric_span(
+            self.raw_text,
+            source_context=SourceContext.OPERATOR_RAW,
+            glyph_health=_HEALTHY_GLYPH_HEALTH,
+        )
+        if isinstance(normalized, Unresolvable):
+            raise ValueError(f"raw_text={self.raw_text!r} is not derivable into a numeral: {normalized.reason}")
+        if tuple(self.repairs) != normalized.repairs:
+            raise ValueError(
+                f"repairs={self.repairs!r} disagrees with the repair(s) raw_text={self.raw_text!r} "
+                f"actually needs ({normalized.repairs!r}); repairs is a claim about the evidence and "
+                "must be exactly true -- neither under-claimed (a repair happened but was not "
+                "recorded) nor over-claimed (a recorded repair the text never needed) is accepted"
+            )
         try:
-            expected = canonical_decimal(self.raw_text)
+            expected = canonical_decimal(normalized.text)
         except CanonicalDecimalError as exc:
-            raise ValueError(f"raw_text={self.raw_text!r} is not parseable as a numeric value: {exc}") from exc
+            raise ValueError(
+                f"raw_text={self.raw_text!r} repaired via {self.repairs!r} to {normalized.text!r}, "
+                f"which is not itself a valid canonical decimal string: {exc}"
+            ) from exc
         if expected != self.canonical_decimal_value:
             raise ValueError(
                 f"canonical_decimal_value={self.canonical_decimal_value!r} disagrees with raw_text="
-                f"{self.raw_text!r} (canonical_decimal(raw_text) == {expected!r}); a MeasuredValue's "
-                "canonical form must be derived from its own raw_text, never asserted independently"
+                f"{self.raw_text!r} as repaired via {self.repairs!r} (canonical_decimal(repaired) == "
+                f"{expected!r}); a MeasuredValue's canonical form must be derived from its own "
+                "repaired raw_text, never asserted independently"
             )
         return self
 
