@@ -21,6 +21,7 @@ from carmel.schemas.datasets import (
     CoordinateFrame,
     Maybe,
     MeasuredValue,
+    QuantityKind,
     SourceNode,
     SourceNodeKind,
     SourceRef,
@@ -32,6 +33,7 @@ from carmel.schemas.datasets import (
     XPathLocator,
 )
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.units import TABLE_V1
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -72,19 +74,19 @@ def _table_ref(node_id: str = "n1", row: int = 0, col: int = 1) -> SourceRef:
 def _measured_value(
     raw_text: str = "1.20",
     canonical_decimal_value: str = "1.20",
+    quantity_kind: QuantityKind = QuantityKind.VELOCITY,
     unit_raw: str = "cm/s",
-    unit_canonical: str = "m/s",
-    conversion_factor: str = "0.01",
-    conversion_table_version: str = "v1",
+    unit_normalized: str = "cm/s",
+    conversion_table_sha256: str = TABLE_V1.sha256,
     repairs: tuple[str, ...] = (),
 ) -> MeasuredValue:
     return MeasuredValue(
         raw_text=raw_text,
         canonical_decimal_value=canonical_decimal_value,
+        quantity_kind=quantity_kind,
         unit_raw=unit_raw,
-        unit_canonical=unit_canonical,
-        conversion_factor=conversion_factor,
-        conversion_table_version=conversion_table_version,
+        unit_normalized=unit_normalized,
+        conversion_table_sha256=conversion_table_sha256,
         repairs=repairs,
         value_ref=_bbox_ref(),
         unit_ref=_table_ref(),
@@ -348,17 +350,17 @@ class TestMeasuredValue:
         mv = _measured_value()
         assert mv.canonical_decimal_value == "1.20"
         assert mv.unit_raw == "cm/s"
-        assert mv.unit_canonical == "m/s"
+        assert mv.unit_normalized == "cm/s"
 
     def test_cannot_construct_without_value_ref(self) -> None:
         with pytest.raises(ValidationError):
             MeasuredValue(
                 raw_text="1.20",
                 canonical_decimal_value="1.20",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 unit_ref=_table_ref(),
             )  # type: ignore[call-arg]
 
@@ -367,10 +369,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text="1.20",
                 canonical_decimal_value="1.20",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
             )  # type: ignore[call-arg]
 
@@ -388,10 +390,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text="1.20",
                 canonical_decimal_value="1.30",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -405,10 +407,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text="1.20",
                 canonical_decimal_value="1.2",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -418,10 +420,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text=1.20,  # type: ignore[arg-type]
                 canonical_decimal_value="1.20",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -431,10 +433,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text="1.20",
                 canonical_decimal_value=1.20,  # type: ignore[arg-type]
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -444,10 +446,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text="not-a-number",
                 canonical_decimal_value="1.20",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -456,20 +458,20 @@ class TestMeasuredValue:
         a = MeasuredValue(
             raw_text="1E+3",
             canonical_decimal_value="1E+3",
+            quantity_kind=QuantityKind.VELOCITY,
             unit_raw="cm/s",
-            unit_canonical="m/s",
-            conversion_factor="1",
-            conversion_table_version="v1",
+            unit_normalized="cm/s",
+            conversion_table_sha256=TABLE_V1.sha256,
             value_ref=_bbox_ref(),
             unit_ref=_table_ref(),
         )
         b = MeasuredValue(
             raw_text="1000",
             canonical_decimal_value="1000",
+            quantity_kind=QuantityKind.VELOCITY,
             unit_raw="cm/s",
-            unit_canonical="m/s",
-            conversion_factor="1",
-            conversion_table_version="v1",
+            unit_normalized="cm/s",
+            conversion_table_sha256=TABLE_V1.sha256,
             value_ref=_bbox_ref(),
             unit_ref=_table_ref(),
         )
@@ -477,9 +479,129 @@ class TestMeasuredValue:
         assert a.canonical_decimal_value == "1E+3"
         assert b.canonical_decimal_value == "1000"
 
-    def test_no_conversion_still_requires_explicit_factor(self) -> None:
-        mv = _measured_value(unit_raw="m/s", unit_canonical="m/s", conversion_factor="1")
-        assert mv.conversion_factor == "1"
+    def test_no_conversion_needed_still_resolves_explicitly(self) -> None:
+        """Reinterpretation of the old ``conversion_factor``-era test (that
+        field is deleted -- see the migration report): a value whose
+        ``unit_raw`` already equals the quantity's base unit ("no conversion
+        needed") is still resolved EXPLICITLY via the table at call time, as
+        an ``identity`` rule -- never implicitly skipped."""
+        mv = _measured_value(unit_raw="m/s", unit_normalized="m/s")
+        converted = mv.converted_to_base()
+        assert converted.rule_kind == "identity"
+        assert converted.exact == mv.canonical_decimal_value
+
+    def test_alias_raw_unit_normalizes_to_recorded_spelling(self) -> None:
+        """A raw unit spelled with a degree glyph ("°C") still constructs
+        successfully when ``unit_normalized`` is the table's own spelling
+        normalization ("C", still Celsius, not a conversion to Kelvin)."""
+        mv = _measured_value(
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="°C",
+            unit_normalized="C",
+        )
+        assert mv.unit_raw == "°C"
+        assert mv.unit_normalized == "C"
+
+    def test_wrong_unit_normalized_rejected(self) -> None:
+        """The load-bearing case: ``unit_normalized`` must be the table's own
+        spelling normalization of ``unit_raw``, never a unit CONVERSION
+        smuggled in as if it were a normalization -- "°C" normalizes to "C"
+        (still Celsius), never to "K" (a different fact, Kelvin)."""
+        with pytest.raises(ValidationError):
+            _measured_value(
+                quantity_kind=QuantityKind.TEMPERATURE,
+                unit_raw="°C",
+                unit_normalized="K",
+            )
+
+    def test_unknown_conversion_table_sha_rejected(self) -> None:
+        """A well-formed but unrecognized sha256 is refused -- a MeasuredValue
+        is validated against the table it RECORDS, never silently
+        re-interpreted against whatever table happens to be live today."""
+        with pytest.raises(ValidationError, match="does not name any known conversion table"):
+            _measured_value(conversion_table_sha256="0" * 64)
+
+    def test_malformed_conversion_table_sha_rejected(self) -> None:
+        """A ``conversion_table_sha256`` that is not 64 lowercase hex
+        characters is rejected by the field validator before it ever reaches
+        the table-lookup validator."""
+        with pytest.raises(ValidationError):
+            _measured_value(conversion_table_sha256="not-a-sha")
+
+    def test_unit_not_known_for_declared_quantity_rejected(self) -> None:
+        """A unit that is real but not known for the DECLARED quantity kind
+        is rejected -- "atm" is a pressure unit, not a time unit."""
+        with pytest.raises(ValidationError):
+            _measured_value(
+                quantity_kind=QuantityKind.TIME,
+                unit_raw="atm",
+                unit_normalized="atm",
+            )
+
+    def test_same_unit_string_differs_in_validity_across_quantity_kinds(self) -> None:
+        """The same raw unit string can be valid under one quantity_kind and
+        invalid under another. The spec's own example (``"%"`` resolving to
+        different normalized spellings under MOLE_FRACTION vs
+        RELATIVE_UNCERTAINTY) does not actually hold against the real
+        carmel.services.units table -- both quantity kinds normalize and
+        convert ``"%"`` identically. This test pins a real, substitutable
+        distinction instead: ``"%"`` is a known unit for MOLE_FRACTION (and
+        RELATIVE_UNCERTAINTY) but is NOT a known unit for EQUIVALENCE_RATIO,
+        whose only known unit is ``"1"``."""
+        mv = _measured_value(
+            quantity_kind=QuantityKind.MOLE_FRACTION,
+            unit_raw="%",
+            unit_normalized="%",
+        )
+        assert mv.unit_normalized == "%"
+        with pytest.raises(ValidationError):
+            _measured_value(
+                quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+                unit_raw="%",
+                unit_normalized="%",
+            )
+
+    def test_converted_to_base_produces_expected_exact_and_rounded_values(self) -> None:
+        """``converted_to_base`` recomputes the conversion on demand from
+        recorded facts rather than trusting a stored value -- pin the actual
+        numbers for two real quantity kinds."""
+        velocity = _measured_value(
+            raw_text="1.23",
+            canonical_decimal_value="1.23",
+            quantity_kind=QuantityKind.VELOCITY,
+            unit_raw="cm/s",
+            unit_normalized="cm/s",
+        )
+        converted = velocity.converted_to_base()
+        assert converted.exact == "0.0123"
+        assert converted.rounded == "0.0123"
+
+        temperature = _measured_value(
+            raw_text="25",
+            canonical_decimal_value="25",
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="C",
+            unit_normalized="C",
+        )
+        converted = temperature.converted_to_base()
+        assert converted.exact == "298.15"
+        assert converted.rounded == "298"
+
+    def test_converted_to_base_under_other_quantity_kind_is_identity(self) -> None:
+        """``QuantityKind.OTHER`` has no base unit, so ``converted_to_base``
+        performs an identity conversion to ``unit_normalized`` itself rather
+        than raising or inventing a target unit."""
+        mv = _measured_value(
+            raw_text="42",
+            canonical_decimal_value="42",
+            quantity_kind=QuantityKind.OTHER,
+            unit_raw="widgets",
+            unit_normalized="widgets",
+        )
+        converted = mv.converted_to_base()
+        assert converted.rule_kind == "identity"
+        assert converted.exact == "42"
+        assert converted.rounded == "42"
 
     def test_slash_c0_repair_recovers_negative_value_with_evidence_preserved(self) -> None:
         """The load-bearing case, drawn from real corpus data: ``/C0`` is the
@@ -562,10 +684,10 @@ class TestMeasuredValue:
             MeasuredValue(
                 raw_text="1.20",
                 canonical_decimal_value="1.20",
+                quantity_kind=QuantityKind.VELOCITY,
                 unit_raw="cm/s",
-                unit_canonical="m/s",
-                conversion_factor="0.01",
-                conversion_table_version="v1",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
                 surprise="y",
@@ -588,35 +710,31 @@ class TestMeasuredValue:
         mv = _measured_value(raw_text="1E+300", canonical_decimal_value="1E+300", repairs=())
         assert mv.canonical_decimal_value == "1E+300"
 
-    def test_zero_or_negative_conversion_factor_rejected(self) -> None:
-        """A conversion factor of 0 annihilates the value it converts, and a
-        negative factor silently flips its sign -- exactly the corruption
-        class this corpus exhibits (a subsetted font deleted the minus glyph
-        from every value in one table) -- so conversion_factor must be
-        strictly positive."""
-        with pytest.raises(ValidationError):
-            _measured_value(conversion_factor="0")
-        with pytest.raises(ValidationError):
-            _measured_value(conversion_factor="-2")
-        # The corresponding positive case: a genuine positive factor still works.
-        mv = _measured_value(conversion_factor="2")
-        assert mv.conversion_factor == "2"
+    # test_zero_or_negative_conversion_factor_rejected: DELETED, not
+    # preservable. Its entire premise was a user-supplied `conversion_factor`
+    # field that could be zero/negative/corrupted; that field is gone by
+    # design (see MeasuredValue's docstring) -- conversion coefficients now
+    # live only inside the vetted, code-reviewed carmel.services.units
+    # ConversionTable, never as per-value untrusted input, so there is no
+    # analogous sign-corruption surface left in this schema to test. Flagged
+    # in the migration report rather than silently dropped.
 
 
 def _uncertainty_measured_value(
     raw_text: str,
+    quantity_kind: QuantityKind = QuantityKind.RELATIVE_UNCERTAINTY,
     unit_raw: str = "%",
-    unit_canonical: str = "%",
-    conversion_factor: str = "1",
+    unit_normalized: str = "%",
+    conversion_table_sha256: str = TABLE_V1.sha256,
     node_id: str = "n1",
 ) -> MeasuredValue:
     return MeasuredValue(
         raw_text=raw_text,
         canonical_decimal_value=raw_text,
+        quantity_kind=quantity_kind,
         unit_raw=unit_raw,
-        unit_canonical=unit_canonical,
-        conversion_factor=conversion_factor,
-        conversion_table_version="v1",
+        unit_normalized=unit_normalized,
+        conversion_table_sha256=conversion_table_sha256,
         value_ref=_bbox_ref(node_id=node_id),
         unit_ref=_table_ref(node_id=node_id),
     )
@@ -697,7 +815,9 @@ class TestUncertainty:
             kind=UncertaintyKind.STD_DEV,
             basis=UncertaintyBasis.ABSOLUTE,
             scale=UncertaintyScale.LINEAR,
-            upper=_uncertainty_measured_value("0.05", unit_raw="m/s", unit_canonical="m/s"),
+            upper=_uncertainty_measured_value(
+                "0.05", quantity_kind=QuantityKind.VELOCITY, unit_raw="m/s", unit_normalized="m/s"
+            ),
             lower=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
         )
         assert unc.blocks_statistical_interpretation is False
@@ -707,8 +827,12 @@ class TestUncertainty:
             kind=UncertaintyKind.STD_DEV,
             basis=UncertaintyBasis.ABSOLUTE,
             scale=UncertaintyScale.LINEAR,
-            upper=_uncertainty_measured_value("0.05", unit_raw="m/s", unit_canonical="m/s"),
-            lower=_uncertainty_measured_value("0.05", unit_raw="m/s", unit_canonical="m/s"),
+            upper=_uncertainty_measured_value(
+                "0.05", quantity_kind=QuantityKind.VELOCITY, unit_raw="m/s", unit_normalized="m/s"
+            ),
+            lower=_uncertainty_measured_value(
+                "0.05", quantity_kind=QuantityKind.VELOCITY, unit_raw="m/s", unit_normalized="m/s"
+            ),
         )
         assert unc.blocks_statistical_interpretation is False
 
@@ -726,11 +850,15 @@ class TestUncertainty:
             kind=UncertaintyKind.STD_DEV,
             basis=UncertaintyBasis.ABSOLUTE,
             scale=UncertaintyScale.LINEAR,
-            upper=_uncertainty_measured_value("0.05", unit_raw="m/s", unit_canonical="m/s"),
-            lower=_uncertainty_measured_value("0.05", unit_raw="m/s", unit_canonical="m/s"),
+            upper=_uncertainty_measured_value(
+                "0.05", quantity_kind=QuantityKind.VELOCITY, unit_raw="m/s", unit_normalized="m/s"
+            ),
+            lower=_uncertainty_measured_value(
+                "0.05", quantity_kind=QuantityKind.VELOCITY, unit_raw="m/s", unit_normalized="m/s"
+            ),
         )
         assert isinstance(unc.upper, MeasuredValue)
-        assert unc.upper.unit_canonical == "m/s"
+        assert unc.upper.unit_normalized == "m/s"
         assert unc.upper.value_ref is not None
 
     def test_bare_string_bound_rejected(self) -> None:
@@ -753,8 +881,8 @@ class TestUncertainty:
             kind=UncertaintyKind.CI_95,
             basis=UncertaintyBasis.RELATIVE,
             scale=UncertaintyScale.LOG,
-            upper=_uncertainty_measured_value("10", unit_raw="%", unit_canonical="%", node_id="n-upper"),
-            lower=_uncertainty_measured_value("4", unit_raw="%", unit_canonical="%", node_id="n-lower"),
+            upper=_uncertainty_measured_value("10", unit_raw="%", unit_normalized="%", node_id="n-upper"),
+            lower=_uncertainty_measured_value("4", unit_raw="%", unit_normalized="%", node_id="n-lower"),
         )
         restored = Uncertainty.model_validate(unc.model_dump(mode="json"))
         assert isinstance(restored.upper, MeasuredValue)
@@ -934,8 +1062,9 @@ class TestComposition:
             equivalence_ratio=_measured_value(
                 raw_text="1.0",
                 canonical_decimal_value="1.0",
+                quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
                 unit_raw="-",
-                unit_canonical="dimensionless",
+                unit_normalized="1",
             ),
         )
         assert isinstance(mixture.equivalence_ratio, MeasuredValue)

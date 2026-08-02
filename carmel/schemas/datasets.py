@@ -42,6 +42,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
+from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal
 from carmel.services.numeric import (
     REPAIR_NAMES,
@@ -50,6 +51,7 @@ from carmel.services.numeric import (
     Unresolvable,
     normalize_numeric_span,
 )
+from carmel.services.units import QuantityKind
 
 __all__ = [
     "AbsenceReason",
@@ -65,6 +67,7 @@ __all__ = [
     "CoordinateFrame",
     "Maybe",
     "MeasuredValue",
+    "QuantityKind",
     "SourceLocator",
     "SourceNode",
     "SourceNodeKind",
@@ -101,7 +104,7 @@ def _require_canonical_decimal(value: str, *, field_name: str) -> str:
     """Validate ``value`` is already in canonical decimal form.
 
     Shared by every model field that stores a canonical decimal string
-    (:class:`MeasuredValue`'s ``canonical_decimal``/``conversion_factor``,
+    (:class:`MeasuredValue`'s ``canonical_decimal_value``,
     :class:`Uncertainty`'s ``upper``/``lower``): re-canonicalizing must be a
     no-op (``canonical_decimal`` is idempotent by construction -- see its own
     docstring), so any mismatch means the caller handed this field a value
@@ -473,11 +476,26 @@ class MeasuredValue(BaseModel):
     :class:`SourceRef`, and both are required -- a value whose unit has no
     independent provenance cannot be constructed.
 
-    Unit conversion is never silent: ``unit_raw`` is preserved verbatim,
-    ``unit_canonical`` is the normalized form, and ``conversion_factor``
-    together with ``conversion_table_version`` record exactly what was
-    applied and against which version of the conversion table, so the
-    conversion is always reversible and auditable.
+    The addressed payload stores only what the SOURCE said; conversion is a
+    DERIVED, reproducible computation, never a stored claim. ``unit_raw`` is
+    preserved verbatim, and ``quantity_kind`` (together with the recorded
+    ``conversion_table_sha256``) is what makes a unit binding SOUND rather
+    than decorative -- a unit pair alone does not identify a conversion
+    (``"s"`` is time but ``"1/s"`` is a strain rate; ``"%"`` is a relative
+    uncertainty or a volume percent; ``"1"`` is an equivalence ratio or a
+    mole fraction). ``unit_normalized`` is the ONE table-derived claim that
+    still lives in the payload, because it is a real interpretation the
+    extractor made at extraction time (which spelling of ``unit_raw`` the
+    table recognizes) and must be pinned rather than silently re-derived
+    later if aliases change; it is emphatically not a converted value -- see
+    that field's own docstring. Everything past spelling -- the actual
+    numeric conversion to a quantity's base unit -- is recomputed on demand
+    by :meth:`converted_to_base`, never stored: storing a converted value
+    would manufacture precision into the content-addressed store (``1.23``
+    atm times ``101325`` is ``124629.75`` -- eight digits from a
+    three-significant-figure measurement), and a stored conversion that
+    later disagreed with the table would be exactly the silent
+    reinterpretation the table's sha256 exists to prevent.
 
     ``raw_text`` and ``canonical_decimal_value`` are deliberately allowed to
     DIFFER, via an explicit, auditable ``repairs`` chain -- this is not a gap,
@@ -563,44 +581,44 @@ class MeasuredValue(BaseModel):
     about the evidence that must be EXACTLY true -- validated below against
     what :func:`~carmel.services.numeric.normalize_numeric_span` itself
     reports needing, in the same order."""
+    quantity_kind: QuantityKind
+    """Which physical (or dimensionless-bookkeeping) quantity this value
+    measures. Required, no default: a unit pair alone does not identify a
+    conversion -- ``"s"`` is time but ``"1/s"`` is a strain rate, ``"%"`` is
+    a relative uncertainty or a volume percent, ``"1"`` is an equivalence
+    ratio or a mole fraction -- so the quantity kind is what makes the unit
+    binding SOUND rather than decorative. ``QuantityKind.OTHER`` is the
+    honest state for a quantity this table deliberately does not model; it
+    permits identity conversion only (see :mod:`carmel.services.units`)."""
     unit_raw: str = Field(min_length=1)
     """The unit exactly as printed in the source."""
-    unit_canonical: str = Field(min_length=1)
-    """The normalized unit."""
-    conversion_factor: str = Field(min_length=1)
-    """Canonical decimal factor applied to convert ``unit_raw`` to
-    ``unit_canonical``. ``"1"`` when no conversion was needed -- never
-    omitted, so "no conversion happened" is always an explicit, auditable
-    fact rather than an assumption.
-
-    Required (enforced below) to be strictly positive and finite: a factor
-    of ``0`` annihilates the value it converts, and a negative factor
-    silently flips its sign -- and silent sign flips are a corruption class
-    this corpus actually exhibits (a subsetted font deleted the minus glyph
-    from every value in one table), so a zero or negative factor is rejected
-    rather than silently applied."""
-    conversion_table_version: str = Field(min_length=1)
-    """Identifies which version of the unit-conversion table produced
-    ``conversion_factor``, so a later change to that table can never
-    silently reinterpret an already-stored value."""
+    unit_normalized: str = Field(min_length=1)
+    """The recorded table's canonical SPELLING of ``unit_raw`` -- the SAME
+    physical unit, never a converted target. ``"°C"`` normalizes to ``"C"``,
+    which is still Celsius; the comparable target unit ``"K"`` is a
+    different fact and is NOT stored here -- it is
+    ``table.base_unit(quantity_kind)``, derived on demand (see
+    :meth:`converted_to_base`). Conflating "the same unit, respelled" with
+    "the value converted to another unit" into a single field was the
+    defect this split replaced."""
+    conversion_table_sha256: str = Field(min_length=1)
+    """The content address (sha256) of the :class:`~carmel.services.units.ConversionTable`
+    that ``unit_normalized`` was validated against. A version STRING is not
+    identity: the constant behind a name like ``"v1"`` could be edited later
+    while every already-addressed payload still says ``"v1"``, silently
+    reinterpreting stored data. The sha256 makes that a migration (a new
+    table, a new sha) instead of a silent reinterpretation."""
     value_ref: SourceRef
     """Provenance for the NUMBER. Required -- see class docstring."""
     unit_ref: SourceRef
     """Provenance for the UNIT, independent of ``value_ref``. Required -- see
     class docstring."""
 
-    @field_validator("conversion_factor")
+    @field_validator("conversion_table_sha256")
     @classmethod
-    def _validate_conversion_factor(cls, value: str) -> str:
-        value = _require_canonical_decimal(value, field_name="conversion_factor")
-        decimal_value = _require_finite_as_float(value, field_name="conversion_factor")
-        if decimal_value <= 0:
-            raise ValueError(
-                f"conversion_factor={value!r} must be strictly positive: a factor of 0 annihilates the "
-                "value it converts, and a negative factor silently flips its sign -- exactly the "
-                "corruption class this corpus exhibits (a subsetted font deleted the minus glyph from "
-                "every value in one table) -- so it must be rejected rather than silently applied"
-            )
+    def _validate_conversion_table_sha256(cls, value: str) -> str:
+        if not _SHA256_RE.match(value):
+            raise ValueError(f"invalid conversion_table_sha256: {value!r} (expected 64 lowercase hex characters)")
         return value
 
     @field_validator("repairs")
@@ -670,6 +688,73 @@ class MeasuredValue(BaseModel):
         # canonical value to evaluate to a finite float here instead.
         _require_finite_as_float(self.canonical_decimal_value, field_name="canonical_decimal_value")
         return self
+
+    @model_validator(mode="after")
+    def _validate_unit_normalization_against_the_recorded_table(self) -> MeasuredValue:
+        """Reject a ``unit_normalized`` that is not the RECORDED table's own answer.
+
+        A ``MeasuredValue`` is validated against the table it RECORDS
+        (``conversion_table_sha256``), never against "the current table" --
+        an unresolvable sha is refused rather than silently re-interpreted
+        against whatever table happens to be live today. And within that
+        recorded table, ``unit_normalized`` must be exactly
+        :func:`~carmel.services.units.normalize_unit`'s own answer for
+        ``(quantity_kind, unit_raw)`` -- this is the check that keeps a
+        spelling normalization (``"°C"`` -> ``"C"``, still Celsius) from
+        silently becoming a unit CONVERSION (``"°C"`` -> ``"K"``, a
+        different fact) as an unverified claim in the payload.
+        """
+        try:
+            table = units.table_for_sha(self.conversion_table_sha256)
+        except units.UnknownConversionTableError as exc:
+            raise ValueError(
+                f"conversion_table_sha256={self.conversion_table_sha256!r} does not name any known "
+                "conversion table; a MeasuredValue is validated against the table it RECORDS, never "
+                f"against 'the current table', so an unresolvable sha is refused rather than silently "
+                f"re-interpreted: {exc}"
+            ) from exc
+        try:
+            expected = units.normalize_unit(self.quantity_kind, self.unit_raw, table=table)
+        except units.UnknownUnitError as exc:
+            raise ValueError(
+                f"unit_raw={self.unit_raw!r} is not a known unit or alias of quantity_kind="
+                f"{self.quantity_kind.value!r} in conversion table {self.conversion_table_sha256!r}: {exc}"
+            ) from exc
+        if expected != self.unit_normalized:
+            raise ValueError(
+                f"unit_normalized={self.unit_normalized!r} disagrees with the recorded table's own "
+                f"normalization of unit_raw={self.unit_raw!r} for quantity_kind="
+                f"{self.quantity_kind.value!r}, which is {expected!r}; unit_normalized must be exactly "
+                "the table's answer, never asserted independently"
+            )
+        return self
+
+    def converted_to_base(self) -> units.Converted:
+        """Convert ``canonical_decimal_value`` to this quantity's base unit.
+
+        This is what replaced the stored ``conversion_factor``/
+        ``unit_canonical``: the conversion is recomputed from recorded facts
+        (``conversion_table_sha256``, ``quantity_kind``, ``unit_normalized``)
+        on demand, so it can never drift out of step with the table, and the
+        manufactured-precision problem (see the class docstring) stays out
+        of the addressed store. For ``QuantityKind.OTHER``, which has no
+        base unit, this converts to ``unit_normalized`` itself -- i.e. an
+        identity conversion. See :func:`~carmel.services.units.convert` for
+        the pinned rounding policy; the returned :class:`~carmel.services.units.Converted`
+        carries both the ``exact`` and the ``rounded`` result.
+        """
+        table = units.table_for_sha(self.conversion_table_sha256)
+        if self.quantity_kind is QuantityKind.OTHER:
+            target_unit = self.unit_normalized
+        else:
+            target_unit = table.base_unit(self.quantity_kind)
+        return units.convert(
+            self.canonical_decimal_value,
+            quantity=self.quantity_kind,
+            from_unit=self.unit_normalized,
+            to_unit=target_unit,
+            table=table,
+        )
 
 
 class UncertaintyKind(StrEnum):
