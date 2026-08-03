@@ -53,6 +53,7 @@ __all__ = [
     "GlyphHealth",
     "NormalizedNumeral",
     "NumericResult",
+    "QuoteRole",
     "Range",
     "Scalar",
     "SourceContext",
@@ -61,8 +62,10 @@ __all__ = [
     "enclosing_numeric_construct",
     "find_numeral_extent",
     "has_clean_token_boundary",
+    "label_boundary_violation",
     "normalize_numeric_span",
     "parse_numeric_span",
+    "unit_boundary_violation",
 ]
 
 
@@ -86,6 +89,41 @@ class SourceContext(StrEnum):
 
     OPERATOR_RAW = "operator_raw"
     """Text an operator typed or pasted by hand."""
+
+
+class QuoteRole(StrEnum):
+    """What semantic job a quote passed to
+    :func:`carmel.services.dataset_producer.ground_quote` is playing in its
+    source sentence -- NOT a property of the quote's own characters, but of
+    what the caller is claiming it grounds. One boundary rule cannot serve
+    all three jobs at once: a unit glued directly after its value
+    (``"1023K"`` + quote ``"K"``) MUST stay groundable, while a species/label
+    token glued to a following digit (``"CO2"`` + quote ``"CO"``) MUST be
+    refused -- and those two quotes look identical (a bare letter run
+    immediately before a digit or vice versa) without knowing which job the
+    caller means. See :func:`unit_boundary_violation` and
+    :func:`label_boundary_violation` for the per-role adjacency rules; the
+    :attr:`VALUE` role keeps the pre-existing numeral-grammar path in
+    :func:`carmel.services.dataset_producer.ground_quote` unchanged.
+    """
+
+    VALUE = "value"
+    """A measured/reported numeral (or a multi-token numeric construct like a
+    range). Grounded via the numeral grammar (:data:`NUMERAL_CANDIDATE_RE`,
+    :func:`find_numeral_extent`, :func:`enclosing_numeric_construct`) when the
+    quote fullmatches a numeral candidate, else via the same generic
+    token-boundary fallback this role has always used."""
+
+    UNIT = "unit"
+    """A unit quote (``"K"``, ``"cm3/mol/s"``, ``"bar"``). Must not abut
+    another unit-token character on either edge, EXCEPT that its leading edge
+    may abut a preceding digit run if that digit run is itself a clean,
+    maximal numeral -- the value the unit is glued to."""
+
+    LABEL = "label"
+    """An axis/species/quantity label quote (``"pressure"``, ``"ignition
+    delay time"``). The strictest role: must not abut a letter or a digit on
+    either edge, with no exception."""
 
 
 #: Signal for :class:`GlyphHealth`: a bare lowercase ``e`` standing between two digit
@@ -345,6 +383,91 @@ def has_clean_token_boundary(text: str, start: int, end: int) -> bool:
     if trail.isalpha() and end < len(text) and text[end].isalpha():
         return False
     return not (trail.isdigit() and end < len(text) and (text[end].isdigit() or text[end] == ","))
+
+
+#: Characters that count as part of a unit token for :func:`unit_boundary_violation`
+#: -- letters, digits, and the symbols that appear WITHIN a compound unit
+#: (``cm3/mol/s``, ``m/s^2``, ``mol·s^-1``, ``50%``, ``µmol``). A unit quote
+#: abutting any of these on either edge is a fragment of a larger unit, not the
+#: whole thing, UNLESS the leading-edge exception in :func:`unit_boundary_violation`
+#: applies.
+_UNIT_TOKEN_SYMBOLS = frozenset("/°^*·%µμ")
+
+
+def _is_unit_token_char(ch: str) -> bool:
+    return ch.isalnum() or ch in _UNIT_TOKEN_SYMBOLS
+
+
+def unit_boundary_violation(text: str, start: int, end: int) -> str | None:
+    """Return a discriminant name for why ``text[start:end]`` is not a clean
+    UNIT-role quote, or ``None`` if it is clean.
+
+    Mirrors :func:`enclosing_numeric_construct`'s idiom of returning a name
+    string (or ``None``) for the caller to map to a message, rather than a
+    bare bool, so :func:`carmel.services.dataset_producer.ground_quote` can
+    give each refusal reason its own distinct message.
+
+    A unit quote (``"K"``, ``"cm3/mol/s"``, ``"bar"``) must not abut another
+    unit-token character (see :data:`_UNIT_TOKEN_SYMBOLS` / :func:`_is_unit_token_char`)
+    on EITHER edge -- that would mean the quote is a fragment of a larger unit
+    (``"cm3"`` inside ``"cm3/mol/s"``, or ``"C"`` inside ``"25°C"``).
+
+    ONE exception, leading edge only: the unit quote MAY abut a preceding
+    digit run if -- and only if -- that digit run is itself a clean, maximal
+    numeral ending exactly at ``start``. This is checked by REUSING
+    :func:`find_numeral_extent` (the same numeral grammar VALUE-role grounding
+    uses) rather than a bespoke digit-run scan, so "is this glued digit run a
+    real numeral" is answered identically everywhere in this module. That is
+    what lets ``"1023K"`` + quote ``"K"`` stay groundable (the numeral extent
+    of ``"1023"`` ends exactly at the ``"K"``) while ``"run3K"`` + quote ``"K"``
+    is refused: ``"3"`` is preceded by the letter ``"n"``, so it fails the
+    numeral grammar's own leading boundary and :func:`find_numeral_extent`
+    returns ``None`` for that position -- there is no numeral there to glue to.
+    """
+    if start >= end:
+        return None
+    if start > 0:
+        lead_prev = text[start - 1]
+        if _is_unit_token_char(lead_prev):
+            if lead_prev.isdigit():
+                extent = find_numeral_extent(text, start - 1)
+                if extent is None or extent[1] != start:
+                    return "unit_digit_glue"
+            else:
+                return "unit_char_adjacency"
+    if end < len(text) and _is_unit_token_char(text[end]):
+        return "unit_char_adjacency"
+    return None
+
+
+def label_boundary_violation(text: str, start: int, end: int) -> str | None:
+    """Return a discriminant name for why ``text[start:end]`` is not a clean
+    LABEL-role quote, or ``None`` if it is clean.
+
+    LABEL is the strictest role: a label/species/quantity-name quote
+    (``"pressure"``, ``"CO"``, ``"H"``) must not abut a letter OR a digit on
+    either edge, with NO exception -- unlike :func:`unit_boundary_violation`
+    there is no "glued value" shape a label is ever allowed to sit inside.
+    This is what refuses ``"CO"`` inside ``"CO2 mole fraction"`` (trailing
+    digit) and ``"NO"`` inside ``"the NO2 profile"`` alike.
+
+    Uses Python's own ``str.isdigit()`` per character rather than a narrower
+    ASCII-only digit test, so a subscript digit like ``'₂'`` (which
+    ``str.isdigit()`` reports ``True`` for) is also treated as digit adjacency
+    -- refusing ``"H"`` inside ``"H₂ mole fraction"`` the same way it refuses
+    ``"H"`` inside ``"H2O yield"``.
+    """
+    if start >= end:
+        return None
+    if start > 0:
+        prev = text[start - 1]
+        if prev.isalpha() or prev.isdigit():
+            return "label_adjacency"
+    if end < len(text):
+        nxt = text[end]
+        if nxt.isalpha() or nxt.isdigit():
+            return "label_adjacency"
+    return None
 
 
 #: ``NUM <ws> 6 <ws> NUM`` -- reused verbatim from :func:`assess_glyph_health`'s

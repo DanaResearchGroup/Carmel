@@ -97,13 +97,16 @@ from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_ar
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
     GlyphHealth,
+    QuoteRole,
     SourceContext,
     Unresolvable,
     assess_glyph_health,
     enclosing_numeric_construct,
     find_numeral_extent,
     has_clean_token_boundary,
+    label_boundary_violation,
     normalize_numeric_span,
+    unit_boundary_violation,
 )
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
@@ -204,9 +207,23 @@ class DatasetProducerError(ValueError):
     unverified bytes or an unverifiable claim."""
 
 
-def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> CharSpanLocator:
+def ground_quote(
+    text: str, quote: str, *, role: QuoteRole, occurrence: int | None = None
+) -> CharSpanLocator:
     """Locate ``quote`` in ``text`` by SEARCHING, returning a half-open
     :class:`CharSpanLocator` over ``TextSpace.EXTRACTED_TEXT``.
+
+    ``role`` is required and keyword-only, deliberately with NO default: one
+    boundary rule cannot serve every quote's job. A VALUE quote ("1023") and
+    a UNIT quote ("K") glued right after it in "1023K" need the numeral to
+    stay groundable and the unit to ALSO stay groundable -- but a LABEL quote
+    ("CO") glued to a trailing digit in "CO2" must be refused, because there
+    the digit is part of a DIFFERENT token (the species name "CO2"), not a
+    value the label is reporting. Collapsing all three into one boundary rule
+    either over-refuses the unit case or under-refuses the label case; there
+    is no default that is safe for every caller, so every call site must say
+    which job its quote is doing. See :class:`carmel.services.numeric.QuoteRole`
+    for the full role docstrings.
 
     ``occurrence`` is ``int | None`` with a default of ``None``, deliberately
     NOT ``int = 0``: with ``int = 0`` a caller who never thought about
@@ -229,6 +246,8 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
             the RAW string every ``CharSpanLocator`` offset indexes into --
             never ``.normalized``).
         quote: The exact source substring to locate, verbatim.
+        role: Which job this quote is doing (``VALUE`` / ``UNIT`` /
+            ``LABEL``) -- selects which boundary rule applies.
         occurrence: ``None`` to require uniqueness; a 0-based index to
             explicitly select among multiple matches.
 
@@ -236,8 +255,9 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
         A ``CharSpanLocator`` with ``text[start:end] == quote``.
 
     Raises:
-        QuoteGroundingError: Empty quote; quote not found; ambiguous quote
-            with ``occurrence=None``; or ``occurrence`` out of range.
+        QuoteGroundingError: Empty quote; whitespace-padded quote; quote not
+            found; ambiguous quote with ``occurrence=None``; ``occurrence``
+            out of range; or a role-specific boundary violation.
     """
     if not quote:
         # CharSpanLocator's own validator would eventually reject the
@@ -256,6 +276,17 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
         starts.append(found)
         found = text.find(quote, found + 1)
     display = quote if len(quote) <= 120 else quote[:117] + "..."
+    if quote != quote.strip():
+        # A quote padded with leading/trailing whitespace (e.g. " K" instead
+        # of "K") is not a token at all -- it is a slice that happens to
+        # include the separator next to the token. Refuse before the search
+        # even runs, for every role: no role's boundary rule is meant to
+        # accept a quote whose own edges are whitespace.
+        raise QuoteGroundingError(
+            f"ground_quote: quote {display!r} has leading or trailing whitespace -- a padded "
+            "quote is not a token; strip the whitespace and quote the exact token, or widen the "
+            "quote to include the adjacent text as its own token if that is what is meant"
+        )
     if not starts:
         raise QuoteGroundingError(f"ground_quote: quote {display!r} was not found in the supplied text")
     if occurrence is None:
@@ -274,7 +305,7 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
             )
         start = starts[occurrence]
     end = start + len(quote)
-    if NUMERAL_CANDIDATE_RE.fullmatch(quote):
+    if role is QuoteRole.VALUE and NUMERAL_CANDIDATE_RE.fullmatch(quote):
         # P1-A: a numeral quote must ground to a MAXIMAL numeral candidate, never
         # an interior slice of a strictly larger one, and it must sit at a genuine
         # numeral boundary at all -- e.g. quote "1023" must not silently accept the
@@ -339,17 +370,14 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
                 "base or only the exponent loses the value; quote the full triple "
                 "if that is what is meant"
             )
-    elif not has_clean_token_boundary(text, start, end):
-        # A non-numeric quote (a unit or a label) never fullmatches
-        # NUMERAL_CANDIDATE_RE, so it skipped every guard above entirely and
-        # grounded via plain, unguarded substring search -- e.g. quote "K"
-        # silently accepted the "K" inside "Kinetics" as if it were the unit
-        # Kelvin. See carmel.services.numeric.has_clean_token_boundary for the
+    elif role is QuoteRole.VALUE and not has_clean_token_boundary(text, start, end):
+        # A VALUE quote that is not itself a numeral candidate (rare, but
+        # possible if a caller passes a non-numeral VALUE quote) still needs
+        # SOME boundary guard rather than plain, unguarded substring search.
+        # See carmel.services.numeric.has_clean_token_boundary for the
         # per-edge letter/digit boundary rule (deliberately asymmetric: a
-        # digit immediately before a letter-initial quote is fine, so "K"
-        # stays groundable inside "1023K", mirroring NUMERAL_EXTENT_RE's own
-        # trailing-boundary asymmetry for the numeral "1023" in that same
-        # text).
+        # digit immediately before a letter-initial quote is fine, mirroring
+        # NUMERAL_EXTENT_RE's own trailing-boundary asymmetry).
         raise QuoteGroundingError(
             f"ground_quote: quote {display!r} does not sit at a clean word/token "
             "boundary in the supplied text -- it is directly adjacent to another "
@@ -358,6 +386,50 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
             "a larger token, not a standalone quote; quote the full token if "
             "that is what is meant"
         )
+    elif role is QuoteRole.UNIT:
+        # A unit quote (role UNIT) uses its own adjacency rule, not
+        # has_clean_token_boundary above: it must not abut another
+        # unit-token character on either edge, with one narrow leading-edge
+        # exception for a value the unit is genuinely glued to (see
+        # carmel.services.numeric.unit_boundary_violation for the full
+        # rule and how it reuses find_numeral_extent for that exception).
+        # Each distinguishable cause gets its own message, mirroring the
+        # enclosing_numeric_construct pattern above -- this project has
+        # hit masked, indistinguishable refusals of this shape before.
+        violation = unit_boundary_violation(text, start, end)
+        if violation == "unit_char_adjacency":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} does not sit at a clean unit "
+                "boundary in the supplied text -- it is directly adjacent to another "
+                "unit-token character (a letter, digit, or a symbol like '/', '°', "
+                "'^', '*', '·', '%', 'µ', or 'μ') that makes it look like a fragment "
+                "of a larger unit (e.g. 'cm3' inside 'cm3/mol/s', or 'C' inside "
+                "'25°C'); quote the full unit if that is what is meant"
+            )
+        if violation == "unit_digit_glue":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is glued to a preceding digit "
+                "run that is not itself a clean numeral -- a unit may only abut a "
+                "digit run on its leading edge when that digit run is the maximal "
+                "numeral value it is reporting (e.g. the '1023' in '1023K'); this "
+                "digit run does not qualify, so the quote looks like a fragment of "
+                "a larger token instead of a standalone unit"
+            )
+    elif role is QuoteRole.LABEL:
+        # A label quote (role LABEL) is the strictest role: it must not abut
+        # a letter or a digit on either edge, with no exception -- unlike
+        # UNIT there is no "glued value" shape a label is ever allowed to
+        # sit inside. See carmel.services.numeric.label_boundary_violation.
+        violation = label_boundary_violation(text, start, end)
+        if violation == "label_adjacency":
+            raise QuoteGroundingError(
+                f"ground_quote: label quote {display!r} does not sit at a clean "
+                "label boundary in the supplied text -- it is directly adjacent to "
+                "a letter or digit (e.g. 'CO' inside 'CO2 mole fraction', or 'NO' "
+                "inside 'the NO2 profile') that makes it look like a fragment of a "
+                "larger species/label token, not a standalone label; quote the full "
+                "label if that is what is meant"
+            )
     # Correctness self-check on this function's own arithmetic (an assert,
     # not a raise: user input was already validated above; this can only
     # fail if the search/slicing logic itself is wrong).
@@ -440,8 +512,12 @@ def _measured_value(
     stored, because ``MeasuredValue``'s own validator requires the
     context-free ``repairs`` exactly.
     """
-    value_locator = ground_quote(text, spec.value_quote, occurrence=spec.value_occurrence)
-    unit_locator = ground_quote(text, spec.unit_quote, occurrence=spec.unit_occurrence)
+    value_locator = ground_quote(
+        text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence
+    )
+    unit_locator = ground_quote(
+        text, spec.unit_quote, role=QuoteRole.UNIT, occurrence=spec.unit_occurrence
+    )
     canary = normalize_numeric_span(
         spec.value_quote,
         source_context=document_source_context,
@@ -797,7 +873,9 @@ def produce_envelope_from_artifact(
     coordinates: list[Coordinate] = []
     observations: list[Observation] = []
     for spec in sorted(measurements, key=lambda spec: spec.axis_id):
-        label_locator = ground_quote(text, spec.label_quote, occurrence=spec.label_occurrence)
+        label_locator = ground_quote(
+            text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
+        )
         axes.append(
             AxisDeclaration(
                 axis_id=spec.axis_id,
