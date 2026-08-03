@@ -489,12 +489,66 @@ class ExtractionBinding(BaseModel):
     """Digest of the stored ``extracted.json`` file's bytes -- the integrity anchor."""
     extracted_text_sha256: str = Field(min_length=64, max_length=64)
     """Digest of ``extracted.text.encode("utf-8")`` as recorded in that ``extracted.json``."""
+    derivation_binding: Maybe[str]
+    """Mirrors :attr:`carmel.schemas.literature.StoredArtifact.derivation_binding`:
+    ``sha256(f"{extractor_version}|{sha256}|{extracted_sha256}")`` as recorded in
+    the evidence store's ``meta.json``, or :class:`Absent` (reason ``UNKNOWN``)
+    for records stored before that field existed.
+
+    DELIBERATELY HAS NO DEFAULT, like every other ``Maybe[...]`` field in this
+    module. A default would silently convert "the producer forgot to carry the
+    binding across" into "this artifact genuinely never had one" -- and those
+    two must stay distinguishable, which is the entire reason :class:`Absent`
+    carries a reason instead of the field being ``| None``. Callers state the
+    absence explicitly or they do not build the binding.
+
+    The reason is ``UNKNOWN``, NOT ``NOT_EXTRACTED_YET``, and the distinction is
+    load-bearing rather than pedantic. ``NOT_EXTRACTED_YET`` names a remedy:
+    re-run extraction and the gap closes. That remedy provably does not exist
+    here. A legacy artifact's derivation binding cannot be recovered by
+    re-extracting, because re-running the extractor is not guaranteed to
+    reproduce byte-identical output -- which is precisely why the store never
+    recomputes this digest (see
+    :attr:`carmel.schemas.literature.StoredArtifact.derivation_binding`). The
+    extractor identity in play when those bytes were stored was never recorded
+    and is unrecoverable, so the fact is genuinely indeterminate: ``UNKNOWN``.
+    Using ``NOT_EXTRACTED_YET`` would promise a fix that no amount of
+    re-extraction can deliver.
+
+    Read exactly what this proves, and no more -- it is NOT proof that
+    ``extracted.json`` was actually re-derived from ``raw.bin``: re-running the
+    extractor is not guaranteed to reproduce byte-identical output, so this
+    digest is never recomputed from a fresh extraction. All it proves is
+    INTERNAL CONSISTENCY of the stored ``meta.json`` record -- that
+    ``extracted_sha256`` was not changed independently of
+    ``derivation_binding`` after the two were bound together at store time. It
+    is no defence against a forger who updates both fields together. Without
+    carrying it here, a replayer wanting to trust the raw-bytes-to-extracted
+    edge would have to trust the mutable, external ``meta.json`` file directly
+    -- outside this dataset's own content address -- for a fact this field lets
+    the dataset assert about itself.
+
+    Deliberately does NOT instead store ``extractor_version`` as a free-form
+    string: that is the anti-pattern :class:`SemanticDependencyUse` replaces
+    elsewhere in this module. ``derivation_binding`` is a single computed
+    digest that already folds extractor identity into itself, so there is no
+    separate free-text field to keep in sync or let drift.
+    """
 
     @field_validator("extracted_sha256", "extracted_text_sha256")
     @classmethod
     def _validate_sha256_shape(cls, value: str) -> str:
         if not _SHA256_RE.match(value):
             raise ValueError(f"invalid sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
+    @field_validator("derivation_binding")
+    @classmethod
+    def _validate_derivation_binding_shape(cls, value: Maybe[str]) -> Maybe[str]:
+        if isinstance(value, Absent):
+            return value
+        if not _SHA256_RE.match(value):
+            raise ValueError(f"invalid derivation_binding: {value!r} (expected 64 lowercase hex characters)")
         return value
 
 
@@ -962,6 +1016,43 @@ class SourceGraph(BaseModel):
         # this invariant does not treat that distinction as enough on its
         # own to admit both -- widening the triple to include origin is a
         # deliberate future change, not an oversight here.
+        # I5c: two nodes that share raw bytes (the same sha256) must agree on
+        # their whole ExtractionBinding, when both have one present. The
+        # evidence store lays out
+        # evidence/literature/<raw sha256>/{raw.bin,text.txt,extracted.json,meta.json}
+        # -- exactly ONE extracted.json per raw-bytes directory, so two
+        # disagreeing bindings can have at most one satisfied by a replayer;
+        # the other is guaranteed unresolvable. This compares the WHOLE
+        # ExtractionBinding via `==` (the model is frozen, so this is value
+        # equality over every field) rather than field-by-field, so that a
+        # future field added to ExtractionBinding is automatically covered
+        # here without needing to be remembered. An Absent extraction on
+        # either side is deliberately NOT a conflict -- only compare when
+        # BOTH nodes have a present binding; silence is not a contradiction,
+        # exactly as I5b (below) does not treat an Absent glyph_health as
+        # disagreeing with anything. This check is not gated on glyph_health
+        # in any way and must fire even when NEITHER node has any
+        # glyph_health at all -- that is the widest part of the hole it
+        # closes.
+        extraction_by_sha: dict[str, tuple[str, ExtractionBinding]] = {}
+        for node in self.nodes:
+            if isinstance(node.extraction, Absent):
+                continue
+            if node.sha256 in extraction_by_sha:
+                other_node_id, other_extraction = extraction_by_sha[node.sha256]
+                if other_extraction != node.extraction:
+                    raise ValueError(
+                        f"node {node.node_id!r} and node {other_node_id!r} share sha256={node.sha256!r} "
+                        "but their recorded ExtractionBinding values disagree; this is a CONFLICT, not "
+                        "a legal 'different role' duplicate: the evidence store lays out "
+                        "evidence/literature/<raw sha256>/{raw.bin,text.txt,extracted.json,meta.json} -- "
+                        "exactly one extracted.json per raw-bytes directory, so two disagreeing bindings "
+                        "can have at most one satisfied by a replayer; the other is guaranteed "
+                        "unresolvable and must be reconciled before this graph can validate"
+                    )
+                continue
+            extraction_by_sha[node.sha256] = (node.node_id, node.extraction)
+
         # I5b: two nodes that share raw bytes (the same sha256) must agree
         # on glyph health, if both have any recorded. The same bytes can
         # only actually have one glyph-health story, so a disagreement here
@@ -970,7 +1061,7 @@ class SourceGraph(BaseModel):
         # bytes) -- it is a CONFLICT between two assessments of the same
         # text, and must be rejected as such rather than silently admitted.
         #
-        # THE ORDER OF THESE TWO CHECKS IS LOAD-BEARING, not stylistic.
+        # THE ORDER OF THESE CHECKS IS LOAD-BEARING, not stylistic.
         # Nodes sharing a (kind, sha256, parent_node_id) triple AND disagreeing
         # on glyph health satisfy both checks at once. Running the duplicate
         # check first therefore reports them as "an exact repeat" that "adds
@@ -980,6 +1071,17 @@ class SourceGraph(BaseModel):
         # actionable diagnosis, so it must be raised first. A regression test
         # covers same-triple-disagreeing-health for exactly this reason; if it
         # starts reporting a duplicate, these blocks have been reordered.
+        #
+        # I5c (above) must run before I5b, for the same reason one level up:
+        # when two same-sha256 nodes disagree on BOTH extraction and glyph
+        # health, the extraction disagreement is the ROOT CAUSE (different
+        # extracted text naturally produces different health) and the health
+        # disagreement is only a downstream SYMPTOM of it -- reporting the
+        # symptom first misdirects the reader away from the actual conflict.
+        # This exact class of bug already bit this file once: the I5b branch
+        # was written correctly but placed after the duplicate check, so for
+        # the case that mattered it was unreachable. Do not recreate that
+        # mistake by placing I5c after I5b.
         health_by_sha: dict[str, tuple[str, GlyphHealth]] = {}
         for node in self.nodes:
             if isinstance(node.glyph_health, Absent):
@@ -2765,6 +2867,7 @@ def _extraction_binding_identity_payload(binding: ExtractionBinding) -> dict[str
     return {
         "extracted_sha256": binding.extracted_sha256,
         "extracted_text_sha256": binding.extracted_text_sha256,
+        "derivation_binding": _project_maybe(binding.derivation_binding),
     }
 
 

@@ -69,6 +69,13 @@ _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 """Module-level singleton default for SourceNode.glyph_health, matching
 _NO_ORIGIN's reasoning."""
 
+_NO_DERIVATION_BINDING = Absent(reason=AbsenceReason.UNKNOWN)
+"""Module-level singleton default for ExtractionBinding.derivation_binding,
+matching _NO_ORIGIN's reasoning. Reason is UNKNOWN, not NOT_EXTRACTED_YET:
+see ExtractionBinding.derivation_binding's docstring in carmel/schemas/datasets.py --
+NOT_EXTRACTED_YET promises a remedy (re-run extraction) that provably cannot
+recover this field, since re-extraction is not byte-reproducible."""
+
 _HEALTHY_GLYPH_HEALTH = GlyphHealth(
     suspects_dash_corruption=False,
     has_thorn_plus_marker=False,
@@ -79,10 +86,14 @@ _HEALTHY_GLYPH_HEALTH = GlyphHealth(
 
 
 def _extraction_binding(
-    extracted_sha256: str = SHA_A, extracted_text_sha256: str = SHA_B
+    extracted_sha256: str = SHA_A,
+    extracted_text_sha256: str = SHA_B,
+    derivation_binding: Maybe[str] = _NO_DERIVATION_BINDING,
 ) -> ExtractionBinding:
     return ExtractionBinding(
-        extracted_sha256=extracted_sha256, extracted_text_sha256=extracted_text_sha256
+        extracted_sha256=extracted_sha256,
+        extracted_text_sha256=extracted_text_sha256,
+        derivation_binding=derivation_binding,
     )
 
 
@@ -490,17 +501,33 @@ class TestSourceGraph:
 
     def test_extraction_binding_rejects_bad_hex(self) -> None:
         with pytest.raises(ValidationError):
-            ExtractionBinding(extracted_sha256="not-a-sha", extracted_text_sha256=SHA_B)
+            ExtractionBinding(
+                extracted_sha256="not-a-sha",
+                extracted_text_sha256=SHA_B,
+                derivation_binding=_NO_DERIVATION_BINDING,
+            )
         with pytest.raises(ValidationError):
-            ExtractionBinding(extracted_sha256=SHA_A, extracted_text_sha256="not-a-sha")
+            ExtractionBinding(
+                extracted_sha256=SHA_A,
+                extracted_text_sha256="not-a-sha",
+                derivation_binding=_NO_DERIVATION_BINDING,
+            )
 
     def test_extraction_binding_rejects_uppercase_hex(self) -> None:
         with pytest.raises(ValidationError):
-            ExtractionBinding(extracted_sha256="A" * 64, extracted_text_sha256=SHA_B)
+            ExtractionBinding(
+                extracted_sha256="A" * 64,
+                extracted_text_sha256=SHA_B,
+                derivation_binding=_NO_DERIVATION_BINDING,
+            )
 
     def test_extraction_binding_rejects_wrong_length_hex(self) -> None:
         with pytest.raises(ValidationError):
-            ExtractionBinding(extracted_sha256="a" * 63, extracted_text_sha256=SHA_B)
+            ExtractionBinding(
+                extracted_sha256="a" * 63,
+                extracted_text_sha256=SHA_B,
+                derivation_binding=_NO_DERIVATION_BINDING,
+            )
 
     def test_extraction_binding_round_trips(self) -> None:
         binding = _extraction_binding()

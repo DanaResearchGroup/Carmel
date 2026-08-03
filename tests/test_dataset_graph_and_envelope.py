@@ -110,6 +110,13 @@ _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 """Module-level singleton default for SourceNode.glyph_health, matching
 _NO_ORIGIN's reasoning."""
 
+_NO_DERIVATION_BINDING = Absent(reason=AbsenceReason.UNKNOWN)
+"""Module-level singleton default for ExtractionBinding.derivation_binding,
+matching _NO_ORIGIN's reasoning. Reason is UNKNOWN, not NOT_EXTRACTED_YET:
+see ExtractionBinding.derivation_binding's docstring in carmel/schemas/datasets.py --
+NOT_EXTRACTED_YET promises a remedy (re-run extraction) that provably cannot
+recover this field, since re-extraction is not byte-reproducible."""
+
 _HEALTHY_GLYPH_HEALTH = GlyphHealth(
     suspects_dash_corruption=False,
     has_thorn_plus_marker=False,
@@ -128,10 +135,14 @@ _UNHEALTHY_GLYPH_HEALTH = GlyphHealth(
 
 
 def _extraction_binding(
-    extracted_sha256: str = SHA_A, extracted_text_sha256: str = SHA_B
+    extracted_sha256: str = SHA_A,
+    extracted_text_sha256: str = SHA_B,
+    derivation_binding: Maybe[str] = _NO_DERIVATION_BINDING,
 ) -> ExtractionBinding:
     return ExtractionBinding(
-        extracted_sha256=extracted_sha256, extracted_text_sha256=extracted_text_sha256
+        extracted_sha256=extracted_sha256,
+        extracted_text_sha256=extracted_text_sha256,
+        derivation_binding=derivation_binding,
     )
 
 
@@ -1000,6 +1011,17 @@ class TestSourceGraphConflictingGlyphHealth:
             SourceGraph(nodes=(paper, crop))
 
     def test_same_bytes_agreeing_on_glyph_health_is_allowed(self) -> None:
+        """Two nodes sharing raw bytes are allowed ONLY when they agree on
+        both invariants: the whole ExtractionBinding (I5c) and glyph health
+        (I5b). This fixture used to give `paper` and `crop` DIFFERENT
+        ExtractionBinding values (extracted_text_sha256=SHA_B vs SHA_C) while
+        still asserting acceptance -- that was the exact permissive gap I5c
+        closes (two nodes sharing one raw-bytes directory, and therefore one
+        `extracted.json`, silently allowed to disagree about what that
+        extraction produced). Both nodes now share the identical
+        ExtractionBinding, so this test exercises the true "fully agreeing"
+        case instead of accidentally pinning the bug.
+        """
         paper = _node(
             "paper",
             SourceNodeKind.PAPER_PDF,
@@ -1013,8 +1035,8 @@ class TestSourceGraphConflictingGlyphHealth:
             SourceNodeKind.FIGURE_CROP,
             SHA_A,
             parent_node_id="paper",
-            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
-            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_HEALTHY_GLYPH_HEALTH),
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
         )
         graph = SourceGraph(nodes=(paper, crop))
         assert graph.node("crop").sha256 == graph.node("paper").sha256
@@ -1065,6 +1087,93 @@ class TestSourceGraphConflictingGlyphHealth:
         with pytest.raises(ValidationError, match="CONFLICT") as excinfo:
             SourceGraph(nodes=(a, b))
         assert "duplicates an earlier node" not in str(excinfo.value)
+
+
+class TestSourceGraphConflictingExtractionBinding:
+    """I5c: two nodes that share raw bytes (the same sha256) must agree on
+    their whole ExtractionBinding, when both have one present. This fires
+    independently of glyph_health -- the evidence store lays out exactly one
+    extracted.json per raw-bytes directory, so two disagreeing bindings can
+    have at most one satisfied by a replayer."""
+
+    def test_same_bytes_disagreeing_on_extraction_neither_has_health_is_rejected(self) -> None:
+        """I5c must fire even when NEITHER node carries any glyph_health at
+        all -- it is not gated on glyph_health presence in any way."""
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
+        )
+        with pytest.raises(ValidationError, match="ExtractionBinding values disagree") as excinfo:
+            SourceGraph(nodes=(paper, crop))
+        assert "CONFLICT" in str(excinfo.value)
+
+    def test_same_bytes_one_extraction_absent_is_allowed(self) -> None:
+        """An Absent extraction on either side is deliberately NOT a
+        conflict: silence is not a contradiction, exactly as I5b does not
+        treat an Absent glyph_health as disagreeing with anything. Only
+        compare when BOTH nodes have a present binding."""
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            # extraction left as the default _NO_EXTRACTION (Absent).
+        )
+        graph = SourceGraph(nodes=(paper, crop))
+        assert graph.node("crop").sha256 == graph.node("paper").sha256
+
+    def test_disagreeing_on_both_extraction_and_health_reports_extraction_conflict(self) -> None:
+        """ORDER is the whole point of this test, mirroring
+        test_same_triple_disagreeing_on_health_reports_conflict_not_duplicate
+        one level up. These two nodes disagree on BOTH their
+        ExtractionBinding AND their glyph_health. Extraction disagreement is
+        the ROOT CAUSE (different extracted text naturally produces
+        different health); health disagreement is only a downstream
+        SYMPTOM. I5c must therefore run BEFORE I5b and report the
+        extraction conflict specifically -- not the glyph-health conflict,
+        and not the unrelated exact-duplicate message. If I5c and I5b are
+        ever reordered, this test starts reporting the health conflict
+        instead and must fail.
+        """
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH),
+        )
+        with pytest.raises(ValidationError, match="ExtractionBinding values disagree") as excinfo:
+            SourceGraph(nodes=(paper, crop))
+        message = str(excinfo.value)
+        assert "CONFLICT" in message
+        assert "glyph_health assessments disagree" not in message
+        assert "duplicates an earlier node" not in message
 
 
 class TestSourceGraphLookupAPI:
