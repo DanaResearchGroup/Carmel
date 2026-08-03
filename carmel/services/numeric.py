@@ -58,6 +58,7 @@ __all__ = [
     "SourceContext",
     "Unresolvable",
     "assess_glyph_health",
+    "enclosing_numeric_construct",
     "find_numeral_extent",
     "normalize_numeric_span",
     "parse_numeric_span",
@@ -216,10 +217,17 @@ REPAIR_NAMES: frozenset[str] = frozenset(
 #: and easy to get wrong the next time it is edited. Writing every class out
 #: explicitly keeps the case-sensitivity of each piece an intentional, visible choice.
 _NUMERAL_LEADING_BOUNDARY = r"(?<![0-9a-zA-Z.,])"
-_NUMERAL_BODY = (
-    r"(?:/[cC]0\s*|[-+−]|–(?=\d))?\d+(?:\.\d+)?(?:[eE][-+]?\d+(?:\.\d+)?)?"
-    r"(?:[-–]\d+(?:\.\d+)?(?:[eE][-+]?\d+(?:\.\d+)?)?)?"
-)
+#: One signed value: optional leading sign (ASCII/Unicode minus, leading en dash,
+#: ``/c0``/``/C0`` repair token) followed by a mantissa and an optional bare
+#: ``[eE]``-marked exponent. This is the piece :data:`_NUMERAL_BODY` repeats (once
+#: signed, once unsigned) to build the hyphenated-range alternative below, and it is
+#: also the shared "NUM" building block :func:`enclosing_numeric_construct` reuses so a
+#: fourth, independently-drifting numeral grammar never appears in this module.
+_NUMERAL_SINGLE_VALUE = r"(?:/[cC]0\s*|[-+−]|–(?=\d))?\d+(?:\.\d+)?(?:[eE][-+]?\d+(?:\.\d+)?)?"
+#: The UNSIGNED tail used for a range's high bound (no lead-sign alternatives: the
+#: dash immediately before it already IS the range separator).
+_NUMERAL_TAIL_VALUE = r"\d+(?:\.\d+)?(?:[eE][-+]?\d+(?:\.\d+)?)?"
+_NUMERAL_BODY = _NUMERAL_SINGLE_VALUE + r"(?:[-–]" + _NUMERAL_TAIL_VALUE + r")?"
 
 #: TRAILING boundary is intentionally NOT shared -- the two callers ask different
 #: questions of it, and collapsing them back into one regex is exactly the mistake
@@ -271,6 +279,85 @@ def find_numeral_extent(text: str, index: int) -> tuple[int, int] | None:
             return match.span()
         if match.start() > index:
             break
+    return None
+
+
+#: ``NUM <ws> 6 <ws> NUM`` -- reused verbatim from :func:`assess_glyph_health`'s
+#: document-wide fingerprint (:data:`_ASCII6_UNCERTAINTY_RE`) rather than re-encoding
+#: the same shape a second time.
+_SPACED_RANGE_RE = re.compile(_NUMERAL_SINGLE_VALUE + r"(?:\s+[-–]\s*|[-–]\s+)" + _NUMERAL_TAIL_VALUE)
+#: ``NUM <ws>* [x×*] <ws>* 10 <ws>+ NUM`` -- a superscript exponent that PDF text
+#: extraction flattened into its own separate token, e.g. ``"3.94 x 10 03"`` for
+#: ``3.94 × 10^03``.
+_FLATTENED_SCIENTIFIC_RE = re.compile(_NUMERAL_SINGLE_VALUE + r"\s*[x×*]\s*10\s+" + _NUMERAL_TAIL_VALUE)
+
+#: Ordered ``(construct_name, pattern)`` pairs consulted by
+#: :func:`enclosing_numeric_construct`. Order only matters in the (currently
+#: unobserved) case where more than one pattern's match strictly contains the same
+#: span; the first match found wins.
+_ENCLOSING_CONSTRUCT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("ascii6_uncertainty", _ASCII6_UNCERTAINTY_RE),
+    ("spaced_range", _SPACED_RANGE_RE),
+    ("flattened_scientific", _FLATTENED_SCIENTIFIC_RE),
+)
+
+
+def enclosing_numeric_construct(text: str, start: int, end: int) -> str | None:
+    """Return the NAME of a multi-token numeric construct in ``text`` that STRICTLY
+    CONTAINS the span ``text[start:end]`` -- i.e. the span is only a PART of a larger
+    construct, never the whole of it -- or ``None`` when the span stands alone.
+
+    This answers a narrower question than either of this module's other two span
+    questions, and sits strictly between them in strength:
+
+    - :func:`find_numeral_extent` asks "is this span a WHOLE NUMERAL" -- a
+      character-level question about where one numeral's own extent starts and ends.
+    - :func:`enclosing_numeric_construct` (this function) asks "is this whole numeral
+      only ONE PIECE of a larger multi-token numeric VALUE" -- a token-level question
+      that only makes sense to ask once the character-level question above has already
+      been answered "yes". A span that is not even a whole numeral is not this
+      function's concern.
+    - :func:`parse_numeric_span` asks "does this span, taken alone and in isolation,
+      PARSE" -- it never looks at the surrounding text at all, so it cannot see a
+      multi-token construct this function exists to catch.
+
+    Recognises at least:
+
+    - ``"ascii6_uncertainty"``: ``NUM <ws> 6 <ws> NUM`` -- an ASCII ``6`` standing in
+      for a mangled ``±`` (e.g. ``"307 6 10"`` for ``"307 ± 10"``). Shares
+      :data:`_ASCII6_UNCERTAINTY_RE` verbatim with :func:`assess_glyph_health`'s
+      document-wide fingerprint rather than re-encoding the same shape.
+    - ``"spaced_range"``: ``NUM <ws>* [-–] <ws>* NUM`` with whitespace on AT LEAST ONE
+      side of the dash (e.g. ``"1000 - 1200"``, ``"1000 – 1200"``). The TIGHT,
+      no-whitespace form (``"1000-1200"``) is deliberately NOT reported here -- it is
+      already recognised as ONE candidate by :data:`NUMERAL_EXTENT_RE` /
+      :data:`NUMERAL_CANDIDATE_RE`, and reporting it here too would double-handle it
+      and change existing, already-correct behaviour.
+    - ``"flattened_scientific"``: ``NUM <ws>* [x×*] <ws>* 10 <ws>+ NUM`` -- a
+      superscript exponent flattened into its own token by PDF text extraction (e.g.
+      ``"3.94 x 10 03"`` for ``3.94 × 10^03``).
+
+    The "NUM" piece in every pattern above is built from :data:`_NUMERAL_SINGLE_VALUE`
+    / :data:`_NUMERAL_TAIL_VALUE`, the same shared grammar body :data:`_NUMERAL_BODY`
+    is built from -- so this function does not introduce a fourth, independently
+    drifting numeral grammar into this module.
+
+    Only known caller today: :func:`carmel.services.dataset_producer.ground_quote`,
+    which calls this AFTER its own :func:`find_numeral_extent` maximality check
+    already passed, to refuse grounding a quote that is a whole numeral in isolation
+    but only a fragment of a larger numeric construct in context.
+
+    KNOWN GAP, recorded deliberately rather than forgotten: :mod:`carmel.services.grounding`'s
+    evidence-window scanner is a second caller that plausibly needs this same guard --
+    it does NOT yet call this function. That gap is an intentional scope boundary of
+    the change that introduced this function, not an oversight: the window scanner is
+    the load-bearing S1 corroboration gate, and tightening it deserves its own,
+    separately reviewed commit rather than riding in on this one.
+    """
+    for name, pattern in _ENCLOSING_CONSTRUCT_PATTERNS:
+        for match in pattern.finditer(text):
+            if match.start() <= start and end <= match.end() and (match.start(), match.end()) != (start, end):
+                return name
     return None
 
 

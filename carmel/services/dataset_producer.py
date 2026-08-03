@@ -100,6 +100,7 @@ from carmel.services.numeric import (
     SourceContext,
     Unresolvable,
     assess_glyph_health,
+    enclosing_numeric_construct,
     find_numeral_extent,
     normalize_numeric_span,
 )
@@ -302,6 +303,40 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
                 f"[{extent[0]}:{extent[1]}]) in the supplied text -- a grounded "
                 "numeral span must be the MAXIMAL numeral candidate, never a slice of a "
                 "bigger one; quote the full numeral if that is what is meant"
+            )
+        # `extent == (start, end)` only proves the quote is a whole numeral ON
+        # ITS OWN -- it does not prove the numeral is not itself just one piece
+        # of a larger multi-token construct (a mangled ASCII-6 uncertainty
+        # marker, a spaced range, or a flattened scientific-notation triple).
+        # `enclosing_numeric_construct` answers exactly that strictly-weaker
+        # question. Each construct gets its own message (not just a distinct
+        # exception type) so operators -- and tests -- can tell the refusals
+        # apart from message content alone; this project has hit masked,
+        # indistinguishable refusals of this shape before.
+        construct = enclosing_numeric_construct(text, start, end)
+        if construct == "ascii6_uncertainty":
+            raise QuoteGroundingError(
+                f"ground_quote: quote {display!r} is one piece of a mangled "
+                "ascii6_uncertainty marker (e.g. '307 6 10' where '±' was OCR'd as "
+                "a bare '6' between a value and its uncertainty) -- quoting only "
+                "the value, the digit '6', or the uncertainty in isolation loses "
+                "the marker's meaning; refuse rather than ground a fragment of it"
+            )
+        if construct == "spaced_range":
+            raise QuoteGroundingError(
+                f"ground_quote: quote {display!r} is one endpoint of a "
+                "spaced_range whose dash has whitespace on at least one side "
+                "(e.g. '1000 - 1200' or '1000 – 1200') -- quoting only one "
+                "endpoint silently drops the other bound; quote the full range "
+                "if that is what is meant"
+            )
+        if construct == "flattened_scientific":
+            raise QuoteGroundingError(
+                f"ground_quote: quote {display!r} is one piece of a "
+                "flattened_scientific notation triple (e.g. '3.94 x 10 03' where "
+                "the exponent was split from its base by OCR) -- quoting only the "
+                "base or only the exponent loses the value; quote the full triple "
+                "if that is what is meant"
             )
     # Correctness self-check on this function's own arithmetic (an assert,
     # not a raise: user input was already validated above; this can only

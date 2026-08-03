@@ -393,6 +393,97 @@ class TestGroundQuoteNumeralGrammarUnification:
             ground_quote(text, "-3")
 
 
+class TestGroundQuoteEnclosingConstructGuard:
+    """A numeral that is a whole numeral on its own can still be only one PIECE
+    of a larger multi-token numeric construct that `find_numeral_extent`'s
+    character-level check cannot see (it only asks "is THIS candidate whole",
+    never "is a larger sibling construct wrapped around it"). These are real
+    accepted-but-wrong grounding bugs this guard closes; each construct must
+    refuse with a message an operator can tell apart from the others, not
+    merely a distinct exception type."""
+
+    def test_rejects_the_mangled_ascii6_uncertainty_marker_itself(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="ascii6_uncertainty"):
+            ground_quote("The temperature was 307 6 10 K.", "6")
+
+    def test_rejects_the_uncertainty_value_not_the_measurement(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="ascii6_uncertainty"):
+            ground_quote("The temperature was 307 6 10 K.", "10")
+
+    def test_rejects_spaced_range_endpoint_ascii_hyphen(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="spaced_range"):
+            ground_quote("The range was 1000 - 1200 K.", "1200")
+
+    def test_rejects_spaced_range_endpoint_en_dash(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="spaced_range"):
+            ground_quote("The range was 1000 – 1200 K.", "1200")
+
+    def test_rejects_flattened_scientific_notation_exponent(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="flattened_scientific"):
+            ground_quote("k = 3.94 x 10 03 s-1.", "03")
+
+    def test_rejects_flattened_scientific_notation_base(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="flattened_scientific"):
+            ground_quote("k = 3.94 x 10 03 s-1.", "10")
+
+    def test_ascii6_uncertainty_and_spaced_range_messages_are_distinct(self) -> None:
+        # Anti-masking-bug regression: the two refusals must be tellable apart
+        # by MESSAGE CONTENT, not merely by both being QuoteGroundingError.
+        try:
+            ground_quote("The temperature was 307 6 10 K.", "6")
+        except QuoteGroundingError as exc:
+            ascii6_message = str(exc)
+        try:
+            ground_quote("The range was 1000 - 1200 K.", "1200")
+        except QuoteGroundingError as exc:
+            spaced_range_message = str(exc)
+        assert ascii6_message != spaced_range_message
+        assert "ascii6_uncertainty" in ascii6_message
+        assert "spaced_range" in spaced_range_message
+
+    def test_tight_range_endpoint_is_still_rejected_as_a_maximality_fragment(self) -> None:
+        # Pre-existing behavior, unaffected by this guard: the tight (no
+        # surrounding whitespace) range endpoint is refused earlier, by the
+        # find_numeral_extent maximality check.
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("over 1000-1200 K", "1200")
+
+    def test_whole_tight_range_still_grounds(self) -> None:
+        locator = ground_quote("over 1000-1200 K", "1000-1200")
+        assert (locator.start, locator.end) == (5, 14)
+
+    def test_plain_integer_unaffected_by_the_new_guard(self) -> None:
+        locator = ground_quote("T = 1023 K", "1023")
+        assert (locator.start, locator.end) == (4, 8)
+
+    def test_negative_value_unaffected_by_the_new_guard(self) -> None:
+        locator = ground_quote("T = -1.5 K was used", "-1.5")
+        assert (locator.start, locator.end) == (4, 8)
+
+    def test_temperature_glued_to_unit_unaffected_by_the_new_guard(self) -> None:
+        locator = ground_quote("at 1023K nominal", "1023")
+        assert (locator.start, locator.end) == (3, 7)
+
+    def test_unit_letter_quote_unaffected_by_the_new_guard(self) -> None:
+        locator = ground_quote("T = 1023 K", "K")
+        assert (locator.start, locator.end) == (9, 10)
+
+    def test_label_quote_unaffected_by_the_new_guard(self) -> None:
+        locator = ground_quote("the mole fraction of CO", "mole fraction")
+        assert (locator.start, locator.end) == (4, 17)
+
+    def test_whole_quote_spaced_range_still_grounds_via_plain_substring_search(self) -> None:
+        # The whole-quote spaced range contains internal whitespace, so it
+        # never fullmatches NUMERAL_CANDIDATE_RE and the entire numeral-guard
+        # block (including this new check) is skipped: it grounds via plain
+        # substring search, exactly as before this guard existed. This test
+        # pins that capability is NOT lost by the new guard.
+        text = "The range was 1000 - 1200 K."
+        quote = "1000 - 1200"
+        locator = ground_quote(text, quote)
+        assert text[locator.start : locator.end] == quote
+
+
 class TestProducerEndToEnd:
     def test_produce_store_load_replay(self, tmp_path: Path) -> None:
         """The whole vertical slice: real store_artifact -> producer ->

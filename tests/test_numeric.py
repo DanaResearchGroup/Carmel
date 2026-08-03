@@ -29,6 +29,7 @@ from carmel.services.numeric import (
     SourceContext,
     Unresolvable,
     assess_glyph_health,
+    enclosing_numeric_construct,
     find_numeral_extent,
     normalize_numeric_span,
     parse_numeric_span,
@@ -528,3 +529,71 @@ class TestCandidateVsExtentTrailingBoundaryDivergence:
         span = find_numeral_extent(text, index)
         assert span == (index, index + 4)
         assert text[span[0] : span[1]] == "1023"
+
+
+class TestEnclosingNumericConstruct:
+    """`enclosing_numeric_construct` answers a token-level question one layer above
+    `find_numeral_extent`'s character-level "is this the WHOLE numeral" question: is
+    this whole numeral only a PIECE of a larger multi-token numeric construct (a
+    mangled ASCII-6 uncertainty marker, a spaced range, or a flattened scientific
+    notation triple)? Real corruption found by running the actual `ground_quote`
+    against real documents motivates every case below."""
+
+    def test_a_standalone_numeral_returns_none(self) -> None:
+        text = "T = 1023 K"
+        index = text.index("1023")
+        assert enclosing_numeric_construct(text, index, index + 4) is None
+
+    def test_span_equal_to_the_whole_construct_is_not_strictly_contained_and_returns_none(self) -> None:
+        text = "The range was 1000 - 1200 K."
+        start = text.index("1000")
+        end = start + len("1000 - 1200")
+        assert text[start:end] == "1000 - 1200"
+        assert enclosing_numeric_construct(text, start, end) is None
+
+    def test_tight_no_whitespace_range_is_not_reported_as_a_spaced_range(self) -> None:
+        text = "over 1000-1200 K"
+        start = text.index("1200")
+        assert enclosing_numeric_construct(text, start, start + 4) is None
+
+    def test_empty_text_returns_none(self) -> None:
+        assert enclosing_numeric_construct("", 0, 0) is None
+
+    def test_boundary_at_the_very_start_of_text(self) -> None:
+        text = "307 6 10 K was measured."
+        assert enclosing_numeric_construct(text, 0, 3) == "ascii6_uncertainty"
+
+    def test_boundary_at_the_very_end_of_text(self) -> None:
+        text = "measured at 307 6 10"
+        start = text.rindex("10")
+        assert enclosing_numeric_construct(text, start, len(text)) == "ascii6_uncertainty"
+
+    def test_ascii6_uncertainty_value_piece_is_caught(self) -> None:
+        text = "The temperature was 307 6 10 K."
+        start = text.index(" 6 ") + 1
+        assert enclosing_numeric_construct(text, start, start + 1) == "ascii6_uncertainty"
+
+    def test_ascii6_uncertainty_trailing_piece_is_caught(self) -> None:
+        text = "The temperature was 307 6 10 K."
+        start = text.rindex("10")
+        assert enclosing_numeric_construct(text, start, start + 2) == "ascii6_uncertainty"
+
+    def test_spaced_range_ascii_hyphen_endpoint_is_caught(self) -> None:
+        text = "The range was 1000 - 1200 K."
+        start = text.rindex("1200")
+        assert enclosing_numeric_construct(text, start, start + 4) == "spaced_range"
+
+    def test_spaced_range_en_dash_endpoint_is_caught(self) -> None:
+        text = "The range was 1000 – 1200 K."
+        start = text.rindex("1200")
+        assert enclosing_numeric_construct(text, start, start + 4) == "spaced_range"
+
+    def test_flattened_scientific_exponent_piece_is_caught(self) -> None:
+        text = "k = 3.94 x 10 03 s-1."
+        start = text.rindex("03")
+        assert enclosing_numeric_construct(text, start, start + 2) == "flattened_scientific"
+
+    def test_flattened_scientific_base_piece_is_caught(self) -> None:
+        text = "k = 3.94 x 10 03 s-1."
+        start = text.index(" 10 ") + 1
+        assert enclosing_numeric_construct(text, start, start + 2) == "flattened_scientific"
