@@ -70,10 +70,10 @@ from __future__ import annotations
 
 import math
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
@@ -1352,6 +1352,43 @@ class Composition(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _enforce_no_duplicate_component_species(self) -> Composition:
+        """Reject a repeated ``species_raw_name`` among ``components``.
+
+        A duplicate species name would make "which component's amount is
+        THE amount for this species" ambiguous for any downstream consumer
+        that indexes components by species -- the same failure mode S1/S6
+        close one level down, for axes and points within a :class:`Series`.
+        """
+        seen: set[str] = set()
+        for component in self.components:
+            if component.species_raw_name in seen:
+                raise ValueError(
+                    f"Composition(raw_name={self.raw_name!r}): duplicate species_raw_name "
+                    f"{component.species_raw_name!r} in components"
+                )
+            seen.add(component.species_raw_name)
+        return self
+
+    @model_validator(mode="after")
+    def _enforce_components_sorted_by_species(self) -> Composition:
+        """``components`` must be sorted ascending by ``species_raw_name``.
+
+        Pinning one canonical ordering here (rather than leaving component
+        order to whatever sequence an extractor happened to emit) is what
+        makes ``identity_payload()`` produce the same content address for
+        logically-identical mixtures regardless of input order -- the same
+        rationale as S2/S7/E1b for ``axes``/``points``/``series``.
+        """
+        expected = tuple(sorted(self.components, key=lambda component: component.species_raw_name))
+        if self.components != expected:
+            raise ValueError(
+                f"Composition(raw_name={self.raw_name!r}): components must be sorted ascending by "
+                "species_raw_name"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _enforce_basis_matches_component_quantity_kind(self) -> Composition:
         """Reject a ``basis`` that disagrees with what its components actually measure.
 
@@ -2061,6 +2098,208 @@ assert set(_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS) == set(TableKeyKind), (
 )
 
 
+def _absent_identity_payload(value: Absent) -> dict[str, Any]:
+    """Project an :class:`Absent` marker to a shape no present value can produce.
+
+    ``{"__absent__": True, "reason": ..., "note": ...}``: no other projector
+    in this module ever emits a ``"__absent__"`` key, so this dict can never
+    collide with the projection of a present value of any ``Maybe[T]`` --
+    not a present ``str`` (projects as a bare string), not a present model
+    (projects as a dict keyed on that model's own field names, never
+    ``"__absent__"``). ``reason`` is unwrapped to its ``.value`` like every
+    other enum in this projection; ``note`` is carried through as-is (it is
+    already ``str | None``).
+    """
+    return {"__absent__": True, "reason": value.reason.value, "note": value.note}
+
+
+def _project_maybe(value: Any, project: Callable[[Any], Any] = lambda value: value) -> Any:
+    """Project a ``Maybe[T]`` field: ``Absent`` becomes an uncollidable marker,
+    a present value is handed to ``project`` (identity by default, for the
+    ``Maybe[str]``/``Maybe[<StrEnum>]`` fields whose present projection is
+    already a bare JSON-able scalar).
+    """
+    if isinstance(value, Absent):
+        return _absent_identity_payload(value)
+    return project(value)
+
+
+def _coordinate_frame_identity_payload(frame: CoordinateFrame) -> dict[str, Any]:
+    return {
+        "render_fingerprint": frame.render_fingerprint,
+        "cropbox": list(frame.cropbox),
+        "mediabox": list(frame.mediabox),
+        "rotation": frame.rotation,
+        "units": frame.units,
+        "dpi": _project_maybe(frame.dpi),
+        "render_settings": _project_maybe(frame.render_settings),
+    }
+
+
+def _bbox_identity_payload(bbox: BBox) -> dict[str, Any]:
+    return {
+        "frame": _coordinate_frame_identity_payload(bbox.frame),
+        "x0": bbox.x0,
+        "y0": bbox.y0,
+        "x1": bbox.x1,
+        "y1": bbox.y1,
+    }
+
+
+def _table_key_identity_payload(table_key: CaptionLabelKey | MemberSheetKey) -> dict[str, Any]:
+    if isinstance(table_key, CaptionLabelKey):
+        return {"kind": table_key.kind.value, "label": table_key.label}
+    if isinstance(table_key, MemberSheetKey):
+        return {"kind": table_key.kind.value, "sheet_name": table_key.sheet_name}
+    raise TypeError(f"_table_key_identity_payload: unhandled TableKey variant {table_key!r}")
+
+
+def _source_locator_identity_payload(
+    locator: BBoxLocator | TableCellLocator | XPathLocator,
+) -> dict[str, Any]:
+    if isinstance(locator, BBoxLocator):
+        return {"kind": locator.kind.value, "bbox": _bbox_identity_payload(locator.bbox)}
+    if isinstance(locator, TableCellLocator):
+        return {
+            "kind": locator.kind.value,
+            "table_key": _table_key_identity_payload(locator.table_key),
+            "row": locator.row,
+            "col": locator.col,
+        }
+    if isinstance(locator, XPathLocator):
+        return {"kind": locator.kind.value, "xpath": locator.xpath}
+    raise TypeError(f"_source_locator_identity_payload: unhandled SourceLocator variant {locator!r}")
+
+
+def _source_ref_identity_payload(ref: SourceRef) -> dict[str, Any]:
+    return {"node_id": ref.node_id, "locator": _source_locator_identity_payload(ref.locator)}
+
+
+def _archive_origin_identity_payload(origin: ArchiveOrigin) -> dict[str, Any]:
+    return {"archive_sha256": origin.archive_sha256, "member_display_path": origin.member_display_path}
+
+
+def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
+    return {
+        "node_id": node.node_id,
+        "kind": node.kind.value,
+        "sha256": node.sha256,
+        "parent_node_id": node.parent_node_id,
+        "origin": _project_maybe(node.origin, _archive_origin_identity_payload),
+    }
+
+
+def _source_graph_identity_payload(graph: SourceGraph) -> dict[str, Any]:
+    return {"nodes": [_source_node_identity_payload(node) for node in graph.nodes]}
+
+
+def _measured_value_identity_payload(value: MeasuredValue) -> dict[str, Any]:
+    return {
+        "raw_text": value.raw_text,
+        "canonical_decimal_value": value.canonical_decimal_value,
+        "repairs": list(value.repairs),
+        "quantity_kind": value.quantity_kind.value,
+        "unit_raw": value.unit_raw,
+        "unit_normalized": value.unit_normalized,
+        "conversion_table_sha256": value.conversion_table_sha256,
+        "value_ref": _source_ref_identity_payload(value.value_ref),
+        "unit_ref": _source_ref_identity_payload(value.unit_ref),
+    }
+
+
+def _uncertainty_identity_payload(uncertainty: Uncertainty) -> dict[str, Any]:
+    return {
+        "kind": uncertainty.kind.value,
+        "basis": _project_maybe(uncertainty.basis, lambda basis: basis.value),
+        "scale": _project_maybe(uncertainty.scale, lambda scale: scale.value),
+        "upper": _project_maybe(uncertainty.upper, _measured_value_identity_payload),
+        "lower": _project_maybe(uncertainty.lower, _measured_value_identity_payload),
+    }
+
+
+def _composition_component_identity_payload(component: CompositionComponent) -> dict[str, Any]:
+    return {
+        "species_raw_name": component.species_raw_name,
+        "amount": _measured_value_identity_payload(component.amount),
+        "role": _project_maybe(component.role, lambda role: role.value),
+    }
+
+
+def _composition_identity_payload(composition: Composition) -> dict[str, Any]:
+    return {
+        "raw_name": composition.raw_name,
+        "resolution": composition.resolution.value,
+        "basis": _project_maybe(composition.basis, lambda basis: basis.value),
+        "equivalence_ratio": _project_maybe(composition.equivalence_ratio, _measured_value_identity_payload),
+        "components": [_composition_component_identity_payload(c) for c in composition.components],
+    }
+
+
+def _axis_declaration_identity_payload(axis: AxisDeclaration) -> dict[str, Any]:
+    return {
+        "axis_id": axis.axis_id,
+        "role": axis.role.value,
+        "quantity_kind": axis.quantity_kind.value,
+        "label_raw": axis.label_raw,
+        "label_ref": _source_ref_identity_payload(axis.label_ref),
+    }
+
+
+def _coordinate_identity_payload(coordinate: Coordinate) -> dict[str, Any]:
+    return {
+        "axis_id": coordinate.axis_id,
+        "value": _measured_value_identity_payload(coordinate.value),
+        "uncertainty": _project_maybe(coordinate.uncertainty, _uncertainty_identity_payload),
+    }
+
+
+def _observation_identity_payload(observation: Observation) -> dict[str, Any]:
+    return {
+        "axis_id": observation.axis_id,
+        "value": _project_maybe(observation.value, _measured_value_identity_payload),
+        "uncertainty": _project_maybe(observation.uncertainty, _uncertainty_identity_payload),
+    }
+
+
+def _data_point_identity_payload(point: DataPoint) -> dict[str, Any]:
+    return {
+        "point_id": point.point_id,
+        "coordinates": [_coordinate_identity_payload(c) for c in point.coordinates],
+        "observations": [_observation_identity_payload(o) for o in point.observations],
+        "composition": _project_maybe(point.composition, _composition_identity_payload),
+    }
+
+
+def _series_identity_payload(series: Series) -> dict[str, Any]:
+    return {
+        "series_id": series.series_id,
+        "source_form": series.source_form.value,
+        "value_origin": series.value_origin.value,
+        "axes": [_axis_declaration_identity_payload(a) for a in series.axes],
+        "constants": [_coordinate_identity_payload(c) for c in series.constants],
+        "points": [_data_point_identity_payload(p) for p in series.points],
+    }
+
+
+_UNADDRESSED_FIELDS: Mapping[tuple[str, str], str] = {}
+"""``(model_name, field_name) -> reason`` registry of fields NOT covered by
+:meth:`DatasetEnvelope.identity_payload`'s hand-written projection.
+
+Deliberately EMPTY: every field of every pydantic model reachable from
+:class:`DatasetEnvelope` (``SourceGraph``, ``SourceNode``, ``ArchiveOrigin``,
+``SourceRef`` and its locator/table-key discriminated-union arms, ``BBox``,
+``CoordinateFrame``, ``MeasuredValue``, ``Uncertainty``, ``Composition``,
+``CompositionComponent``, ``Series``, ``AxisDeclaration``, ``Coordinate``,
+``Observation``, ``DataPoint``, and ``Absent`` itself) is projected by one of
+the ``_*_identity_payload`` helpers above. This registry exists so that a
+FUTURE field added to any of those models and left unprojected is caught by
+the completeness meta-test as a loud failure -- entering it here is the
+escape hatch for a field that is genuinely not addressable (e.g. a derived
+``@property``), not a shortcut for "forgot to project it". Do not add an
+entry to make the meta-test pass; add the projection instead.
+"""
+
+
 class DatasetEnvelope(BaseModel):
     """The top-level payload for one literature-extracted dataset: a source
     graph plus the extracted content that cites it.
@@ -2335,3 +2574,50 @@ class DatasetEnvelope(BaseModel):
                         ),
                     )
         return self
+
+    def identity_payload(self) -> dict[str, Any]:
+        """Project this envelope to its canonical-JSON identity payload.
+
+        Feeds :func:`carmel.services.dataset_store.canonical_json_bytes` and
+        :func:`carmel.services.dataset_store.compute_dataset_sha` -- mirrors
+        :meth:`carmel.services.units.ConversionTable.identity_payload`, the
+        in-repo precedent for exactly this shape (a hand-written projection
+        sitting next to the model it inverts).
+
+        Deliberately NOT ``self.model_dump()`` / ``self.model_dump_json()`` /
+        ``dict(self)``. ``compute_dataset_sha``'s own docstring refuses to
+        accept or unwrap a pydantic model for one reason: an unrelated change
+        to this schema's field shape, order, or defaults must never be able
+        to silently re-address (rename the content-addressed identity of)
+        every dataset already in the store. Routing this method through
+        ``model_dump`` would reintroduce exactly that hazard one layer up --
+        pydantic's default dump shape is an implementation detail of the
+        model, not a stable on-the-wire contract, and it would change out
+        from under callers the instant a field is renamed, reordered, or
+        given a new default. Every nested model is instead projected by an
+        explicit, hand-written ``_*_identity_payload`` helper (see the
+        module-level helpers directly above this class) that names every
+        field it emits, so a future field is either projected here on
+        purpose or is a loud test failure via ``_UNADDRESSED_FIELDS`` --
+        never a silent, unreviewed change to every stored dataset's address.
+
+        Output is plain JSON-able data only: ``dict``/``list``/``str``/
+        ``int``/``bool``/``None``, enums unwrapped to ``.value``, tuples
+        projected as lists, and never a ``float`` at any depth (every
+        numeric fact in this schema is already a canonical decimal
+        ``str`` -- see the module docstring). A ``Maybe[T]`` field holding
+        ``Absent`` projects via ``_absent_identity_payload`` to a
+        ``{"__absent__": True, "reason": ..., "note": ...}`` dict that no
+        present value's projection can ever collide with, so an envelope
+        with ``composition=Absent(...)`` addresses differently from one
+        with a real ``Composition``.
+
+        Returns a freshly built dict on every call: nothing here is shared
+        with ``self`` or with a previous call's return value, so mutating
+        the result affects neither this envelope nor a subsequent call.
+        """
+        return {
+            "source_graph": _source_graph_identity_payload(self.source_graph),
+            "composition": _project_maybe(self.composition, _composition_identity_payload),
+            "series": [_series_identity_payload(series) for series in self.series],
+        }

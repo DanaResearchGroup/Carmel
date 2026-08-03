@@ -1085,6 +1085,61 @@ class TestComposition:
         assert len(mixture.components) == 2
         assert mixture.components[0].role == ComponentRole.FUEL
 
+    def test_unsorted_components_rejected(self) -> None:
+        """Components must be sorted ascending by species_raw_name, same
+        rationale as S2/S7/E1b for axes/points/series: it pins one
+        canonical ordering so identity_payload() addresses a logically-
+        identical mixture identically regardless of extraction order."""
+        with pytest.raises(ValidationError, match="components must be sorted ascending by"):
+            Composition(
+                raw_name="CH4/O2 mixture",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.MOLE_FRACTION,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[
+                    CompositionComponent(
+                        species_raw_name="O2", amount=_mole_fraction_measured_value(), role=ComponentRole.OXIDIZER
+                    ),
+                    CompositionComponent(
+                        species_raw_name="CH4", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                    ),
+                ],
+            )
+
+    def test_duplicate_component_species_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="duplicate species_raw_name"):
+            Composition(
+                raw_name="CH4/CH4 mixture",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.MOLE_FRACTION,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[
+                    CompositionComponent(
+                        species_raw_name="CH4", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                    ),
+                    CompositionComponent(
+                        species_raw_name="CH4", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                    ),
+                ],
+            )
+
+    def test_sorted_components_accepted(self) -> None:
+        mixture = Composition(
+            raw_name="CH4/O2 mixture",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.MOLE_FRACTION,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="CH4", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
+                CompositionComponent(
+                    species_raw_name="O2", amount=_mole_fraction_measured_value(), role=ComponentRole.OXIDIZER
+                ),
+            ],
+        )
+        assert [c.species_raw_name for c in mixture.components] == ["CH4", "O2"]
+
     def test_component_with_concrete_role_still_constructs(self) -> None:
         """Regression/sanity: a component whose role IS stated in the source
         must still construct with a concrete ComponentRole, unchanged by
