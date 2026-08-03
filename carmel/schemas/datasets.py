@@ -3,11 +3,14 @@
 
 """Schema primitives for literature-extracted experimental kinetics datasets.
 
-This module builds ONLY the primitives listed for milestone M-D2a: explicit
-absence states, coordinate frames/bboxes, the source graph, measured values
-with per-field unit binding, uncertainty, and composition. It deliberately
-does NOT build a dataset "series", the dataset envelope, or a registry --
-those are M-D2b.
+This module builds the primitives listed for milestone M-D2a (explicit
+absence states, coordinate frames/bboxes, measured values with per-field
+unit binding, uncertainty, and composition) plus M-D2b part c: the source
+graph (:class:`SourceGraph`) and the dataset envelope
+(:class:`DatasetEnvelope`) that ties every embedded :class:`SourceRef` back
+to a node the graph actually contains. It deliberately does NOT yet build a
+dataset "series" aggregate or a registry -- those remain M-D2b part a and
+part b respectively.
 
 Cardinal rule this module exists to serve: every load-bearing number in a
 Carmel dataset must be grounded against stored bytes and auditable, and the
@@ -52,6 +55,7 @@ from __future__ import annotations
 
 import math
 import re
+from collections.abc import Iterator
 from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -81,9 +85,11 @@ __all__ = [
     "CompositionComponent",
     "CompositionResolution",
     "CoordinateFrame",
+    "DatasetEnvelope",
     "Maybe",
     "MeasuredValue",
     "QuantityKind",
+    "SourceGraph",
     "SourceLocator",
     "SourceNode",
     "SourceNodeKind",
@@ -94,6 +100,7 @@ __all__ = [
     "UncertaintyKind",
     "UncertaintyScale",
     "XPathLocator",
+    "iter_source_refs",
 ]
 
 
@@ -476,6 +483,217 @@ class SourceRef(BaseModel):
 
     node_id: str = Field(min_length=1)
     locator: SourceLocator
+
+
+def iter_source_refs(obj: object, _path: str = "") -> Iterator[tuple[str, SourceRef]]:
+    """Recursively walk ``obj``, yielding ``(dotted_path, ref)`` for every
+    :class:`SourceRef` reachable from it.
+
+    This is the single choke point every "does this payload cite something
+    real" check (:class:`DatasetEnvelope`'s V1/V2 validators, and any future
+    consumer) runs through, and it is deliberately GENERIC over the payload
+    shape rather than hand-listing "the composition's equivalence_ratio, the
+    composition's components' amounts, ..." field by field: a hand-written
+    list silently goes stale the moment a new SourceRef-bearing field is
+    added anywhere in the tree (the series aggregate, M-D2b part a, is the
+    concrete next case), which would let a dangling or decorative ref hide
+    from validation with nothing here to notice. Walking pydantic
+    ``BaseModel`` fields, ``list``/``tuple`` elements, and ``dict`` values
+    covers every shape this schema currently uses to nest a payload, so
+    adding a field of any of those container shapes is automatically
+    covered with zero changes here -- see
+    ``TestRefWalkCannotBeOutgrown`` in the test suite, which pins exactly
+    this property.
+
+    Deliberately does NOT recurse into a :class:`SourceRef`'s own fields
+    (``node_id``, ``locator``): a ``SourceRef`` is a leaf of this walk, not a
+    container to look inside of -- its ``locator`` may itself be a
+    ``BaseModel`` (e.g. :class:`BBoxLocator` wrapping a :class:`BBox`), but
+    that nested structure is the locator's OWN geometry, not another
+    reference to chase.
+
+    ``_path`` is an internal accumulator (leading underscore, not part of the
+    public two-argument contract) used for the recursive descent; callers
+    always invoke this with a single argument. Path segments join field
+    names with ``.`` and index list/tuple elements or dict keys with
+    ``[...]`` (e.g. ``"composition.components[0].amount.value_ref"``),
+    matching the format asserted throughout the test suite.
+    """
+    if isinstance(obj, SourceRef):
+        yield _path, obj
+        return
+    if isinstance(obj, BaseModel):
+        for name in type(obj).model_fields:
+            value = getattr(obj, name)
+            child_path = f"{_path}.{name}" if _path else name
+            yield from iter_source_refs(value, child_path)
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from iter_source_refs(value, f"{_path}[{key}]")
+        return
+    if isinstance(obj, (list, tuple)):
+        for index, value in enumerate(obj):
+            yield from iter_source_refs(value, f"{_path}[{index}]")
+        return
+    return
+
+
+class SourceGraph(BaseModel):
+    """A validated DAG of :class:`SourceNode`\\ s: a dataset's whole provenance graph.
+
+    A single node cannot express "the main PDF, plus an SI spreadsheet
+    member, plus a figure crop taken from one of the PDF's pages, all
+    provenance for the SAME dataset" -- so the graph, not the individual
+    node, is the top-level provenance primitive an envelope holds. Every
+    invariant below runs in a FIXED order via a single ``model_validator``,
+    each with a distinctive, greppable error message, so a test can pin any
+    one of them independently of the others.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    nodes: tuple[SourceNode, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _validate_invariants(self) -> SourceGraph:
+        nodes_by_id: dict[str, SourceNode] = {}
+        # I1: every node_id must be unique -- a duplicate id would make
+        # `graph.node(id)` and every SourceRef targeting it ambiguous about
+        # which node's provenance is actually meant.
+        for node in self.nodes:
+            if node.node_id in nodes_by_id:
+                raise ValueError(f"SourceGraph contains a duplicate node_id: {node.node_id!r} appears more than once")
+            nodes_by_id[node.node_id] = node
+
+        # I2: a stated parent_node_id must resolve to a node actually present
+        # in this graph -- an unresolvable parent is a dangling provenance
+        # claim, no different in kind from a SourceRef naming a node that
+        # doesn't exist.
+        for node in self.nodes:
+            if node.parent_node_id is not None and node.parent_node_id not in nodes_by_id:
+                raise ValueError(
+                    f"node {node.node_id!r} names parent_node_id={node.parent_node_id!r}, which is not "
+                    "the id of any node present in this SourceGraph"
+                )
+
+        # I3: the parent_node_id chain must be acyclic. This MUST run before
+        # I4 (kind/parent rules), and deliberately raises a distinct
+        # "cycle"-bearing message: I4 happens to forbid every cycle the
+        # current SourceNodeKind hierarchy can express (no kind lists itself,
+        # or any kind reachable from itself, among its own valid parent
+        # kinds), so if I4 ran first it would always win the race and I3
+        # would never be reachable -- its own test would then pass only by
+        # accident, via the neighbouring guard, leaving I3 itself
+        # unpinned. Running I3 first, with its own message, is what makes it
+        # independently testable.
+        resolved: set[str] = set()
+        for start_id in nodes_by_id:
+            if start_id in resolved:
+                continue
+            path: list[str] = []
+            position: dict[str, int] = {}
+            current_id: str | None = start_id
+            while current_id is not None and current_id not in resolved:
+                if current_id in position:
+                    cycle_ids = path[position[current_id] :]
+                    raise ValueError(
+                        f"SourceGraph contains a cycle among node ids {cycle_ids!r}: following "
+                        "parent_node_id from each of these nodes loops back on itself instead of "
+                        "terminating at a parentless root"
+                    )
+                position[current_id] = len(path)
+                path.append(current_id)
+                current_id = nodes_by_id[current_id].parent_node_id
+            resolved.update(path)
+
+        # I4: which SourceNodeKinds may/must have a parent, and of what kind.
+        # PAPER_PDF/JATS_XML are the only artifacts that can stand on their
+        # own (a top-level document); SI_MEMBER and FIGURE_CROP are always
+        # DERIVED from something else, so an orphan of either kind, or one
+        # whose parent is the wrong kind, describes a provenance relationship
+        # that cannot actually exist.
+        for node in self.nodes:
+            if node.kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML):
+                if node.parent_node_id is not None:
+                    parent_kind = nodes_by_id[node.parent_node_id].kind
+                    raise ValueError(
+                        f"node {node.node_id!r} has kind={node.kind.value!r}, which must be a parentless "
+                        f"root, but names parent_node_id={node.parent_node_id!r} (kind={parent_kind.value!r})"
+                    )
+            elif node.kind == SourceNodeKind.SI_MEMBER:
+                if node.parent_node_id is None:
+                    raise ValueError(
+                        f"node {node.node_id!r} has kind={node.kind.value!r}, which requires a parent of "
+                        "kind PAPER_PDF or JATS_XML, but has no parent"
+                    )
+                parent_kind = nodes_by_id[node.parent_node_id].kind
+                if parent_kind not in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML):
+                    raise ValueError(
+                        f"node {node.node_id!r} has kind={node.kind.value!r}, which requires a parent of "
+                        f"kind PAPER_PDF or JATS_XML, but its parent {node.parent_node_id!r} has "
+                        f"kind={parent_kind.value!r}"
+                    )
+            elif node.kind == SourceNodeKind.FIGURE_CROP:
+                if node.parent_node_id is None:
+                    raise ValueError(
+                        f"node {node.node_id!r} has kind={node.kind.value!r}, which requires a parent of "
+                        "kind PAPER_PDF, JATS_XML or SI_MEMBER, but has no parent"
+                    )
+                parent_kind = nodes_by_id[node.parent_node_id].kind
+                if parent_kind not in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
+                    raise ValueError(
+                        f"node {node.node_id!r} has kind={node.kind.value!r}, which requires a parent of "
+                        f"kind PAPER_PDF, JATS_XML or SI_MEMBER, but its parent {node.parent_node_id!r} has "
+                        f"kind={parent_kind.value!r}"
+                    )
+
+        # I5: no two nodes may be exact duplicates of each other -- same
+        # kind, same bytes, same parent. The same bytes appearing under a
+        # genuinely different role (a different kind, or a different parent)
+        # stays legal: e.g. a PAPER_PDF root and a FIGURE_CROP taken from
+        # that same PDF share a sha256 but are not duplicates of each other.
+        seen_triples: set[tuple[SourceNodeKind, str, str | None]] = set()
+        for node in self.nodes:
+            triple = (node.kind, node.sha256, node.parent_node_id)
+            if triple in seen_triples:
+                raise ValueError(
+                    f"node {node.node_id!r} duplicates an earlier node exactly: another node already "
+                    f"has kind={node.kind.value!r}, sha256={node.sha256!r}, "
+                    f"parent_node_id={node.parent_node_id!r}; the same bytes in a genuinely different "
+                    "role (a different kind or a different parent) remains legal, but an exact repeat "
+                    "adds nothing"
+                )
+            seen_triples.add(triple)
+
+        return self
+
+    @property
+    def node_ids(self) -> frozenset[str]:
+        """Every node id present in this graph."""
+        return frozenset(node.node_id for node in self.nodes)
+
+    def node(self, node_id: str) -> SourceNode:
+        """Return the node with id ``node_id``, or raise ``KeyError(node_id)``."""
+        for node in self.nodes:
+            if node.node_id == node_id:
+                return node
+        raise KeyError(node_id)
+
+    def ancestors(self, node_id: str) -> tuple[SourceNode, ...]:
+        """Return ``node_id``'s parent chain, from immediate parent to root.
+
+        Empty for a root node (``parent_node_id is None``). Safe against the
+        cycles I3 already forbids at construction time -- this never has to
+        defend against an infinite chain itself.
+        """
+        nodes_by_id = {node.node_id: node for node in self.nodes}
+        chain: list[SourceNode] = []
+        current = nodes_by_id[node_id]
+        while current.parent_node_id is not None:
+            current = nodes_by_id[current.parent_node_id]
+            chain.append(current)
+        return tuple(chain)
 
 
 class MeasuredValue(BaseModel):
@@ -1099,5 +1317,207 @@ class Composition(BaseModel):
                     "unit_normalized == '%' specifically -- a bare fraction (unit '1') "
                     "under the same quantity_kind is the same number meaning something "
                     "100x different, and must not be labeled a percent basis"
+                )
+        return self
+
+
+_LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]] = {
+    LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
+    LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
+    LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML}),
+    LocatorKind.ARCHIVE_MEMBER: frozenset({SourceNodeKind.SI_MEMBER}),
+}
+"""Which :class:`SourceNodeKind`\\ s a given :class:`LocatorKind` may target.
+
+A SINGLE explicit table, keyed by every ``LocatorKind`` member, rather than a
+chain of per-kind ``if`` branches: a dict lookup on a key that is missing
+raises ``KeyError`` immediately (see the assertion right below, which pins
+that the table stays exhaustive), so a newly added ``LocatorKind`` with no
+entry here is a loud crash the next time :class:`DatasetEnvelope` validates
+anything, not a locator/kind pair that silently sails through unchecked --
+which is exactly what an ``if``/``elif`` chain with no matching branch (and
+no final ``else: raise``) would do instead.
+
+The compatibility itself reflects what each locator actually addresses:
+``XPathLocator`` only makes sense against a JATS/XML document; a bounding
+box only makes sense against something that was actually RENDERED to a page
+(a PDF, an SI member that is itself a rendered document, or a figure crop);
+an archive member locator only makes sense against an SI archive member
+itself; a table cell locator makes sense against anything that can carry a
+table (a PDF, JATS/XML, or an SI spreadsheet member) but not a figure crop,
+which has no tabular structure of its own.
+"""
+
+assert set(_LOCATOR_KIND_COMPATIBLE_NODE_KINDS) == set(LocatorKind), (
+    "_LOCATOR_KIND_COMPATIBLE_NODE_KINDS must have an entry for every LocatorKind member -- see its "
+    "docstring for why an omission must be a loud failure rather than a silent pass"
+)
+
+
+class DatasetEnvelope(BaseModel):
+    """The top-level payload for one literature-extracted dataset: a source
+    graph plus the extracted content that cites it.
+
+    This is the model that makes fabrication structurally impossible at the
+    WHOLE-PAYLOAD level, not just within a single :class:`MeasuredValue`:
+    every :class:`SourceRef` embedded anywhere in this envelope (found via
+    :func:`iter_source_refs`, which is shape-agnostic -- see its docstring)
+    is checked against ``source_graph``, and the graph itself is checked for
+    having nothing extra hanging off it. The five validators below run in a
+    fixed order (V0 through V4), each addressing a distinct, independently
+    measured failure mode; see each validator's own docstring for the
+    concrete failure it closes.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_graph: SourceGraph
+    composition: Maybe[Composition]
+
+    @model_validator(mode="after")
+    def _validate_grounded(self) -> DatasetEnvelope:
+        """V0: the envelope must contain at least one :class:`SourceRef`.
+
+        An envelope that cites nothing is, by definition, ungrounded -- and
+        making that impossible to construct is precisely why this project's
+        schema layer exists at all (see the module docstring's "cardinal
+        rule"). This currently makes ``composition=Absent(...)``
+        unconstructible: today ``composition`` is the ONLY field that can
+        carry a ``SourceRef``, so an envelope with no composition carries
+        none anywhere, and this validator refuses it. That is a real,
+        temporary limitation of this milestone (M-D2b part c), not a design
+        claim that ``composition`` must always be present: once the series
+        aggregate (M-D2b part a) adds its own ref-bearing payload alongside
+        ``composition``, an envelope with ``composition=Absent(...)`` but a
+        populated series becomes constructible again -- the ``Absent``
+        branch is a real future state this validator will naturally admit
+        once there is another field to ground the envelope through, not a
+        dead branch kept around for cosmetic completeness.
+        """
+        if next(iter_source_refs(self), None) is None:
+            raise ValueError(
+                "DatasetEnvelope contains no SourceRef anywhere in its payload; an envelope that cites "
+                "no evidence is ungrounded by definition and cannot be constructed -- see this "
+                "validator's docstring for the composition=Absent(...) case specifically"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_refs_resolve(self) -> DatasetEnvelope:
+        """V1: every embedded :class:`SourceRef` must name a node this
+        envelope's ``source_graph`` actually contains.
+
+        Without this, a ``SourceRef`` is just a free-floating claim -- it
+        looks like provenance (it has a ``node_id`` and a locator) but there
+        is no guarantee the node it names was ever validated, or even
+        exists. This is the check that makes a ``SourceRef`` actually mean
+        something.
+        """
+        node_ids = self.source_graph.node_ids
+        for path, ref in iter_source_refs(self):
+            if ref.node_id not in node_ids:
+                raise ValueError(
+                    f"SourceRef at {path!r} names node_id={ref.node_id!r}, which is not present in "
+                    f"source_graph (known node ids: {sorted(node_ids)!r})"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_no_decorative_nodes(self) -> DatasetEnvelope:
+        """V2: every node in ``source_graph`` must be targeted by some
+        ``SourceRef``, or be an ancestor of a node that is.
+
+        An unreferenced node pads the graph with authoritative-looking
+        provenance that nothing in the payload actually relies on -- an
+        "audit-shaped" artifact rather than a real one: it LOOKS like the
+        dataset is grounded against that artifact, but no extracted fact
+        actually cites it. That is precisely the failure class this
+        milestone exists to close, so a node that nothing (directly or via
+        an ancestor of something) targets is rejected, not merely unused.
+        Ancestors of a targeted node stay legal: an SI member's PAPER_PDF
+        parent is real provenance context for that member even if nothing
+        cites the parent directly.
+        """
+        referenced_ids = {ref.node_id for _, ref in iter_source_refs(self)}
+        covered_ids: set[str] = set()
+        for node_id in referenced_ids:
+            covered_ids.add(node_id)
+            covered_ids.update(ancestor.node_id for ancestor in self.source_graph.ancestors(node_id))
+        for node in self.source_graph.nodes:
+            if node.node_id not in covered_ids:
+                raise ValueError(
+                    f"node {node.node_id!r} is not targeted by any SourceRef, nor is it an ancestor of a "
+                    "targeted node -- an unreferenced node is decorative provenance that nothing in this "
+                    "envelope actually relies on"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_locator_kind_compatibility(self) -> DatasetEnvelope:
+        """V3: a :class:`SourceRef`'s locator kind must be compatible with
+        the kind of node it targets.
+
+        See :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` for the compatibility
+        table and why it exists. Without this check, e.g. an
+        ``XPathLocator`` could target a ``PAPER_PDF`` node -- an XPath into a
+        PDF is not a real locator, it is a claim about a document that was
+        never parsed as XML at all.
+        """
+        for path, ref in iter_source_refs(self):
+            node = self.source_graph.node(ref.node_id)
+            locator_kind = ref.locator.kind
+            compatible_kinds = _LOCATOR_KIND_COMPATIBLE_NODE_KINDS[locator_kind]
+            if node.kind not in compatible_kinds:
+                raise ValueError(
+                    f"SourceRef at {path!r} uses locator kind={locator_kind.value!r} against node "
+                    f"{node.node_id!r} of kind={node.kind.value!r}, but {locator_kind.value!r} may only "
+                    f"target nodes of kind {sorted(kind.value for kind in compatible_kinds)!r}"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_archive_member_sha_matches_node(self) -> DatasetEnvelope:
+        """V4: an :class:`ArchiveMemberLocator`'s ``member_sha256`` must
+        equal the ``sha256`` of the ``SI_MEMBER`` node its ``SourceRef``
+        targets.
+
+        This is fail-closed rather than a nicety. ``SourceGraph``'s I4
+        forbids an ``SI_MEMBER`` node from parenting another ``SI_MEMBER``
+        node (see that invariant's docstring), which means "an archive node
+        containing addressable member nodes" is structurally unrepresentable
+        today: an ``SI_MEMBER`` node IS the supplementary file itself, and
+        its ``sha256`` IS that file's actual bytes-hash. So an
+        ``ArchiveMemberLocator`` claiming a different ``member_sha256`` for
+        that same node is not describing some other, unaddressed artifact
+        inside an archive -- there is no such node to describe -- it is an
+        unverifiable, unaddressable provenance claim about the very node the
+        ref names, and without this check it validated successfully. If a
+        later milestone (M-E, SI retrieval) needs to genuinely model an
+        archive containing separately-addressed members, it must add a new
+        node kind for that and deliberately relax this check -- not leave
+        the claim unchecked in the meantime.
+
+        Design note for future review, NOT to be acted on now: with this
+        check in place, ``member_sha256`` on ``ArchiveMemberLocator``
+        becomes purely a cross-check against data already recoverable from
+        ``source_graph`` (the node's own ``sha256``) -- it carries no new
+        information. That hints ``ArchiveMemberLocator`` may really be
+        describing an artifact's ORIGIN (which member of a zip archive it
+        was extracted from) rather than a LOCATION WITHIN a currently
+        referenced artifact, i.e. it may conceptually belong on
+        :class:`SourceNode` rather than in the ``SourceLocator`` union. This
+        tension is recorded here for a future design review, not resolved
+        by this validator.
+        """
+        for path, ref in iter_source_refs(self):
+            if not isinstance(ref.locator, ArchiveMemberLocator):
+                continue
+            node = self.source_graph.node(ref.node_id)
+            if ref.locator.member_sha256 != node.sha256:
+                raise ValueError(
+                    f"SourceRef at {path!r} uses ArchiveMemberLocator with member_sha256="
+                    f"{ref.locator.member_sha256!r}, but the targeted node {node.node_id!r} has "
+                    f"sha256={node.sha256!r} -- these must match, since an SI_MEMBER node's sha256 IS "
+                    "the member's actual bytes"
                 )
         return self
