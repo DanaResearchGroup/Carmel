@@ -305,6 +305,94 @@ class TestGroundQuoteNumericTokenMaximality:
             ground_quote("k = 1023e5 1/s", "1023")
 
 
+class TestGroundQuoteNumeralGrammarUnification:
+    """P1: `ground_quote`'s numeral-boundary guard is unified onto the shared
+    `carmel.services.numeric.NUMERAL_CANDIDATE_RE` / `find_numeral_extent`
+    primitive (the same grammar `carmel.services.grounding` uses), closing
+    real accepted-but-wrong grounding bugs the old, weaker
+    `_NUMERIC_TOKEN_RE` / `_quote_looks_numeric` pair let through."""
+
+    def test_rejects_sign_flip_negative_grounded_as_positive(self) -> None:
+        # Old bug: "1.5" alone would ground inside "-1.5", silently dropping
+        # the sign and recording +1.5 for a document stating -1.5.
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("T = -1.5 K was used", "1.5")
+
+    def test_accepts_signed_value_as_the_maximal_candidate(self) -> None:
+        locator = ground_quote("T = -1.5 K was used", "-1.5")
+        assert (locator.start, locator.end) == (4, 8)
+
+    def test_rejects_exponent_fragment_lacking_sign_in_old_regex(self) -> None:
+        # Old bug: `_quote_looks_numeric("-3")` was False (no sign in the old
+        # grammar), so the maximality check was skipped entirely and an
+        # exponent fragment grounded as if it were a standalone value.
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("k = 1.0e-3 cm3/mol/s", "-3")
+
+    def test_rejects_species_subscript_as_sits_inside_identifier(self) -> None:
+        # Old bug: a bare digit subscript of a species name ("H2") grounded
+        # as if it were a measured value.
+        with pytest.raises(QuoteGroundingError, match="does not sit at a clean numeral boundary"):
+            ground_quote("Fuel H2 was used", "2")
+
+    def test_rejects_unit_digit_as_sits_inside_identifier(self) -> None:
+        # "cm3" -- the "3" is a unit power, not a numeral in its own right.
+        with pytest.raises(QuoteGroundingError, match="does not sit at a clean numeral boundary"):
+            ground_quote("k = 1.0e-5 cm3/mol/s", "3")
+
+    def test_rejects_thousands_fragment(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="does not sit at a clean numeral boundary"):
+            ground_quote("T = 1,023 K", "023")
+
+    def test_rejects_thousands_leading_digit_fragment(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="does not sit at a clean numeral boundary"):
+            ground_quote("T = 1,023 K", "1")
+
+    def test_rejects_cas_number_fragment(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("ethanol 64-17-5 was used", "17")
+
+    def test_rejects_range_endpoint_fragment(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("over 1000-1200 K", "1200")
+
+    def test_accepts_whole_range_as_one_candidate(self) -> None:
+        locator = ground_quote("over 1000-1200 K", "1000-1200")
+        assert (locator.start, locator.end) == (5, 14)
+
+    def test_accepts_plain_integer_unaffected(self) -> None:
+        locator = ground_quote("T = 1023 K", "1023")
+        assert (locator.start, locator.end) == (4, 8)
+
+    def test_accepts_negative_value_full_precision(self) -> None:
+        text = "T = -1.5 K was used"
+        locator = ground_quote(text, "-1.5")
+        assert text[locator.start : locator.end] == "-1.5"
+
+    def test_accepts_number_glued_to_unit_letter(self) -> None:
+        # A glued unit must stay groundable: letters are not part of a
+        # numeral, so they never extend or block a candidate on their own.
+        locator = ground_quote("at 1023K nominal", "1023")
+        assert (locator.start, locator.end) == (3, 7)
+
+    def test_non_numeral_unit_quote_unaffected(self) -> None:
+        locator = ground_quote("T = 1023 K", "K")
+        assert (locator.start, locator.end) == (9, 10)
+
+    def test_non_numeral_label_quote_unaffected(self) -> None:
+        locator = ground_quote("the mole fraction of CO", "mole fraction")
+        assert (locator.start, locator.end) == (4, 17)
+
+    def test_ambiguity_is_checked_before_the_numeral_check_and_still_refuses(self) -> None:
+        # The new numeral check must never silently resolve an ambiguous
+        # quote: ambiguity is still detected and raised BEFORE the numeral
+        # check ever runs, even though "-3" now fullmatches the numeral
+        # candidate grammar (unlike under the old, sign-less grammar).
+        text = "k1 = 1.0e-3 cm3/mol/s, k2 = 2.0e-3 cm3/mol/s"
+        with pytest.raises(QuoteGroundingError, match=r"appears 2 times"):
+            ground_quote(text, "-3")
+
+
 class TestProducerEndToEnd:
     def test_produce_store_load_replay(self, tmp_path: Path) -> None:
         """The whole vertical slice: real store_artifact -> producer ->

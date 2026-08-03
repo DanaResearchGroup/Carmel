@@ -748,6 +748,24 @@ def test_check_evidence_spans_corrupt_exponent_token_in_window_does_not_corrobor
     assert "6.0" in missing[0]
 
 
+def test_check_evidence_spans_letter_glued_numeral_does_not_corroborate_a_clean_value_anchor() -> None:
+    """A numeral glued to trailing letters (a run label like '3a'/'4b', or a value
+    smashed into its own unit like '720k') must NOT count as a clean corroborating
+    VALUE for a required numeric anchor -- only :func:`find_numeral_extent`'s wider
+    trailing boundary (used for grounded-quote MAXIMALITY, not for window
+    corroboration) is allowed to look past a trailing letter. This window contains no
+    clean, standalone '720' anywhere -- only '720k' -- so the anchor must be reported
+    missing, not silently corroborated by the glued digits."""
+    text = "In run 3a and run 4b the reactor gave 720k for the final reading.\n"
+    extracted = _extracted(text)
+    match = find_quote(extracted, "In run 3a and run 4b the reactor gave 720k for the final reading")
+    assert match is not None
+
+    missing = check_evidence_spans(extracted, match, ["720"])
+
+    assert missing == ["720"]
+
+
 def test_check_evidence_spans_numeric_anchor_that_float_rejects_never_falls_through_to_substring_matching() -> None:
     """A required anchor that is numeric in intent but not strictly resolvable used to
     fall through to a plain substring search when bare float() raised on it -- so a

@@ -85,6 +85,7 @@ from carmel.schemas.literature import (
     QMProperty,
 )
 from carmel.services.numeric import (
+    NUMERAL_CANDIDATE_RE,
     GlyphHealth,
     Range,
     Scalar,
@@ -151,13 +152,15 @@ def _is_percent_adjacent_exponent(window_norm: str, match: re.Match[str]) -> boo
     return before == "%" or after == "%"
 
 
-_WINDOW_NUMBER_CANDIDATE_RE = re.compile(
-    r"(?<![0-9a-z.,])"
-    r"(?:/c0\s*|[-+−]|–(?=\d))?\d+(?:\.\d+)?(?:e[-+]?\d+(?:\.\d+)?)?"
-    r"(?:[-–]\d+(?:\.\d+)?(?:e[-+]?\d+(?:\.\d+)?)?)?"
-    r"(?![0-9a-z,])"
-)
-
+#: This scanner uses the shared :data:`carmel.services.numeric.NUMERAL_CANDIDATE_RE`
+#: primitive (see that module for the full boundary rationale) rather than its own
+#: copy. Using it here is a provable no-op versus the module's former private regex:
+#: the window text handed to it (``window_norm`` below) is already casefolded by
+#: ``normalize_for_match``, so the shared pattern's added uppercase
+#: (``A-Z``/``E``/``/C0``) branches can never match anything in it -- only the
+#: lowercase branches, which are byte-for-byte what this module's own pattern used
+#: to contain, are ever reachable here.
+#:
 #: Shapes that mark a required anchor as numeric IN INTENT even when bare ``float()``
 #: rejects it (e.g. the corrupt ``0.6e1.0``): an optional sign followed by a digit and
 #: then only number-ish characters. Together with :func:`_is_numeric_literal` (which
@@ -1215,7 +1218,8 @@ def _source_context_for(extracted: ExtractedText) -> SourceContext:
 def _window_numeric_values(raw_window: str, *, glyph_health: GlyphHealth, source_context: SourceContext) -> list[float]:
     """Every strictly-validated numeric value present in the window text.
 
-    Candidate BOUNDARIES are located by running :data:`_WINDOW_NUMBER_CANDIDATE_RE`
+    Candidate BOUNDARIES are located by running
+    :data:`carmel.services.numeric.NUMERAL_CANDIDATE_RE`
     against the CASEFOLDED window text (which owns the boundary rules for scanning
     running prose -- the strict core never widens its own window), but each matched
     span is then mapped back to the window's ORIGINAL-CASE text (via
@@ -1250,7 +1254,7 @@ def _window_numeric_values(raw_window: str, *, glyph_health: GlyphHealth, source
     """
     window_norm, index_map = normalize_with_map(raw_window)
     values: list[float] = []
-    for m in _WINDOW_NUMBER_CANDIDATE_RE.finditer(window_norm):
+    for m in NUMERAL_CANDIDATE_RE.finditer(window_norm):
         raw_start, raw_end = raw_span(index_map, m.start(), m.end(), len(raw_window))
         candidate = raw_window[raw_start:raw_end]
         if _is_percent_adjacent_exponent(window_norm, m):

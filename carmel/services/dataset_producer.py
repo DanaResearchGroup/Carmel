@@ -60,7 +60,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -96,10 +95,12 @@ from carmel.services.dataset_store import (
 )
 from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_artifact
 from carmel.services.numeric import (
+    NUMERAL_CANDIDATE_RE,
     GlyphHealth,
     SourceContext,
     Unresolvable,
     assess_glyph_health,
+    find_numeral_extent,
     normalize_numeric_span,
 )
 from carmel.services.semantic_deps import (
@@ -131,32 +132,6 @@ from the artifact's own ``content_type``, never hardcoded -- see
 ``_CONTENT_TYPE_TO_NODE_KIND``."""
 
 _POINT_ID = "p1"
-
-_NUMERIC_TOKEN_RE = re.compile(r"[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?")
-"""Character class defining one "numeric token" for :func:`ground_quote`'s
-maximal-extent check: an optional integer part, an optional decimal point, a
-mandatory digit run, and an optional exponent suffix (``e``/``E`` with an
-optional sign). This governs ONLY where a numeric token STOPS -- a run of
-``[0-9]``, at most one ``.``, and at most one ``[eE][+-]?[0-9]+`` suffix all
-count as one token; anything else (a letter that isn't part of an exponent
-marker, whitespace, punctuation) ends it. Deliberate consequence: ``"1023"``
-grounded against ``"1023K"`` is accepted (``K`` is not numeric continuation,
-so ``"1023"`` IS the maximal token there) but ``"1023"`` grounded against
-``"11023"`` or ``"1023.5"`` or ``"0.51023"`` is rejected (in each case the
-match is an interior slice of a strictly larger numeric token). A quote that
-does not itself look like a numeric token (e.g. a unit or label quote such as
-``"mole fraction"``) is exempt from this check entirely -- it exists only to
-stop a numeral from silently grounding to a fragment of a bigger numeral."""
-
-
-def _quote_looks_numeric(quote: str) -> bool:
-    """True if ``quote`` itself matches :data:`_NUMERIC_TOKEN_RE` in full --
-    i.e. the caller is claiming a numeral, so the maximal-token check below
-    applies. A unit/label quote (``"K"``, ``"mole fraction"``) never matches
-    this and is left alone: the check exists to stop a numeral fragmenting a
-    larger numeral, not to constrain non-numeric quotes."""
-    match = _NUMERIC_TOKEN_RE.fullmatch(quote)
-    return match is not None
 
 # Mirrors carmel.schemas.datasets._HEALTHY_GLYPH_HEALTH (module-private there,
 # so restated rather than imported): MeasuredValue's own repair-chain
@@ -297,26 +272,37 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
             )
         start = starts[occurrence]
     end = start + len(quote)
-    if _quote_looks_numeric(quote):
-        # P1-A: a numeral quote must ground to a MAXIMAL numeric token, never
-        # an interior slice of a strictly larger one -- e.g. quote "1023"
-        # must not silently accept the middle of "11023", "1023.5", or
-        # "0.51023". ``_NUMERIC_TOKEN_RE.finditer`` walks the text producing
-        # non-overlapping, greedily-maximal numeric tokens, so the token that
-        # contains our chosen ``start`` is, by construction, the largest
-        # numeral touching that position; if its span differs from
-        # ``(start, end)`` the quote is a fragment, not the whole numeral.
-        for match in _NUMERIC_TOKEN_RE.finditer(text):
-            if match.start() <= start < match.end():
-                if match.span() != (start, end):
-                    raise QuoteGroundingError(
-                        f"ground_quote: quote {display!r} is an interior fragment of the larger "
-                        f"numeral {text[match.start():match.end()]!r} (span "
-                        f"[{match.start()}:{match.end()}]) in the supplied text -- a grounded "
-                        "numeral span must be the MAXIMAL numeric token, never a slice of a "
-                        "bigger one; quote the full numeral if that is what is meant"
-                    )
-                break
+    if NUMERAL_CANDIDATE_RE.fullmatch(quote):
+        # P1-A: a numeral quote must ground to a MAXIMAL numeral candidate, never
+        # an interior slice of a strictly larger one, and it must sit at a genuine
+        # numeral boundary at all -- e.g. quote "1023" must not silently accept the
+        # middle of "11023", "1023.5", "1,023", or "0.51023", and quote "2" must not
+        # silently accept the subscript digit inside the identifier "H2". This uses
+        # the SAME shared primitive (:data:`carmel.services.numeric.NUMERAL_CANDIDATE_RE`
+        # / :func:`carmel.services.numeric.find_numeral_extent`) that
+        # :mod:`carmel.services.grounding` uses to scan an evidence window for
+        # numeric corroboration -- unifying two independently-grown, and
+        # independently-wrong, boundary heuristics onto one grammar. Note the
+        # trigger is `fullmatch` against this CORRECTED (signed) grammar, not the
+        # old, sign-less one -- so a quote like "-3" now actually reaches this
+        # check, where under the old grammar it silently skipped it entirely.
+        extent = find_numeral_extent(text, start)
+        if extent is None:
+            raise QuoteGroundingError(
+                f"ground_quote: quote {display!r} looks like a numeral but does not sit at a "
+                "clean numeral boundary in the supplied text -- it is directly adjacent to a "
+                "letter, digit, dot, or comma that disqualifies it from ever being a standalone "
+                "numeral candidate (e.g. a species subscript like 'H2', a unit power like 'cm3', "
+                "or a comma-grouped thousands digit like the '023' in '1,023')"
+            )
+        if extent != (start, end):
+            raise QuoteGroundingError(
+                f"ground_quote: quote {display!r} is an interior fragment of the larger "
+                f"numeral {text[extent[0]:extent[1]]!r} (span "
+                f"[{extent[0]}:{extent[1]}]) in the supplied text -- a grounded "
+                "numeral span must be the MAXIMAL numeral candidate, never a slice of a "
+                "bigger one; quote the full numeral if that is what is meant"
+            )
     # Correctness self-check on this function's own arithmetic (an assert,
     # not a raise: user input was already validated above; this can only
     # fail if the search/slicing logic itself is wrong).

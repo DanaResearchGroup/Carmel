@@ -20,6 +20,8 @@ from __future__ import annotations
 import math
 
 from carmel.services.numeric import (
+    NUMERAL_CANDIDATE_RE,
+    NUMERAL_EXTENT_RE,
     REPAIR_NAMES,
     NormalizedNumeral,
     Range,
@@ -27,6 +29,7 @@ from carmel.services.numeric import (
     SourceContext,
     Unresolvable,
     assess_glyph_health,
+    find_numeral_extent,
     normalize_numeric_span,
     parse_numeric_span,
 )
@@ -460,3 +463,68 @@ class TestNormalizeNumericSpan:
         parsed = parse_numeric_span("1E+400", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
         assert isinstance(parsed, Unresolvable)
         assert "non-finite" in parsed.reason
+
+
+class TestCandidateVsExtentTrailingBoundaryDivergence:
+    """`NUMERAL_CANDIDATE_RE` (strict: no trailing letter) and `NUMERAL_EXTENT_RE`
+    (permissive: trailing letter allowed) share the identical leading boundary and
+    body, and diverge ONLY on whether a numeral immediately followed by a letter is
+    seen as a candidate at all. This pins the divergence with a concrete table so a
+    future edit that re-collapses the two trailing boundaries back into one breaks a
+    test, not just a comment."""
+
+    def test_720k_is_a_candidate_only_for_extent_not_for_the_strict_value_scanner(self) -> None:
+        text = "720k"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == []
+        assert NUMERAL_EXTENT_RE.findall(text) == ["720"]
+
+    def test_1023k_is_a_candidate_only_for_extent_not_for_the_strict_value_scanner(self) -> None:
+        text = "1023K"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == []
+        assert NUMERAL_EXTENT_RE.findall(text) == ["1023"]
+
+    def test_h2_is_refused_by_both_via_the_shared_leading_boundary(self) -> None:
+        text = "H2"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == []
+        assert NUMERAL_EXTENT_RE.findall(text) == []
+
+    def test_comma_grouped_thousands_is_refused_by_both(self) -> None:
+        text = "1,023"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == []
+        assert NUMERAL_EXTENT_RE.findall(text) == []
+
+    def test_hyphenated_range_is_one_candidate_for_both(self) -> None:
+        text = "1000-1200"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == ["1000-1200"]
+        assert NUMERAL_EXTENT_RE.findall(text) == ["1000-1200"]
+
+    def test_signed_value_is_one_candidate_for_both(self) -> None:
+        text = "-1.5"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == ["-1.5"]
+        assert NUMERAL_EXTENT_RE.findall(text) == ["-1.5"]
+
+    def test_exponent_form_is_one_candidate_for_both(self) -> None:
+        text = "1.0e-3"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == ["1.0e-3"]
+        assert NUMERAL_EXTENT_RE.findall(text) == ["1.0e-3"]
+
+    def test_percent_suffix_is_not_part_of_the_candidate_for_either(self) -> None:
+        # '%' is neither a digit/comma (EXTENT's trailing exclusion) nor a letter
+        # (CANDIDATE's additional trailing exclusion), so both regexes stop the
+        # numeral at "50" and agree here -- included to make that agreement
+        # explicit rather than assumed.
+        text = "50%"
+        assert NUMERAL_CANDIDATE_RE.findall(text) == ["50"]
+        assert NUMERAL_EXTENT_RE.findall(text) == ["50"]
+
+    def test_trailing_sentence_period_is_not_part_of_the_candidate_for_either(self) -> None:
+        text = "850."
+        assert NUMERAL_CANDIDATE_RE.findall(text) == ["850"]
+        assert NUMERAL_EXTENT_RE.findall(text) == ["850"]
+
+    def test_find_numeral_extent_uses_the_permissive_extent_regex(self) -> None:
+        text = "the temperature was 1023K in the reactor"
+        index = text.index("1023")
+        span = find_numeral_extent(text, index)
+        assert span == (index, index + 4)
+        assert text[span[0] : span[1]] == "1023"

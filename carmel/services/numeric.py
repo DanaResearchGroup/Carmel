@@ -47,6 +47,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 __all__ = [
+    "NUMERAL_CANDIDATE_RE",
+    "NUMERAL_EXTENT_RE",
     "REPAIR_NAMES",
     "GlyphHealth",
     "NormalizedNumeral",
@@ -56,6 +58,7 @@ __all__ = [
     "SourceContext",
     "Unresolvable",
     "assess_glyph_health",
+    "find_numeral_extent",
     "normalize_numeric_span",
     "parse_numeric_span",
 ]
@@ -150,6 +153,125 @@ REPAIR_NAMES: frozenset[str] = frozenset(
         "thorn_to_plus",
     }
 )
+
+
+#: THE single shared GRAMMAR BODY, codebase-wide, for where a numeral "candidate"
+#: begins in free-running text -- factored out so two independent trailing-boundary
+#: choices (see :data:`NUMERAL_CANDIDATE_RE` and :data:`NUMERAL_EXTENT_RE` below)
+#: cannot drift apart on the parts that must stay identical: the leading boundary
+#: and the numeral body itself (sign, mantissa, exponent, hyphenated-range
+#: alternative). This exists because two modules -- :mod:`carmel.services.grounding`
+#: (scanning an evidence window for numbers that corroborate a claim) and
+#: :mod:`carmel.services.dataset_producer` (checking that a quoted numeral is the
+#: MAXIMAL numeral at its position, not a fragment of a bigger one) -- independently
+#: grew their own, weaker, boundary regexes to answer two DIFFERENT questions, and
+#: both were demonstrably wrong in different ways (the producer's version, for
+#: instance, had no sign alternative at all, so a quote like ``"-3"`` skipped its own
+#: maximality check entirely).
+#:
+#: This body is deliberately WIDER than this module's own strict core
+#: (:data:`_CORE_VALUE_RE` / :func:`parse_numeric_span`): the candidate grammar's job
+#: is to decide EXTENT -- where a numeral-shaped run of characters starts and stops in
+#: surrounding text, so that a fragment of it can never be mistaken for the whole
+#: thing -- while the strict core's job is to decide VALUE -- whether that text, once
+#: isolated, reconstructs to one trustworthy float (or explicitly refuses to). A span
+#: either candidate regex matches is not automatically a valid :class:`Scalar` or
+#: :class:`Range`; it still has to survive :func:`parse_numeric_span`. Conversely, a
+#: span :func:`parse_numeric_span` accepts is always contained in (or equal to) the
+#: candidate span covering its position, by construction: the candidate grammar is a
+#: strict superset (it additionally tolerates, e.g., comma-grouped thousands and the
+#: ``/c0``/``/C0`` sign repair token, both of which the strict core validates and
+#: refuses on its own terms once isolated).
+#:
+#: Leading boundary (SHARED, identical in both regexes below): a candidate must not
+#: be directly PRECEDED by a letter, digit, or dot -- that is what stops a match from
+#: starting mid-identifier (``h2o``'s ``2``) or mid-numeral. This is shared because an
+#: identifier prefix invalidates a numeral for BOTH questions this module answers --
+#: "is this a clean corroborating VALUE" and "where does this numeral's extent END" --
+#: alike: ``"2"`` inside ``"H2"`` must stay refused no matter which trailing question
+#: is being asked.
+#:
+#: An optional leading sign (ASCII ``-``/``+``, Unicode minus, a leading en dash
+#: before a digit, or the ``/c0``/``/C0`` repair token) is part of the candidate; an
+#: optional single ``-``/en-dash-separated second value makes a hyphenated range ONE
+#: candidate, never two, so a range's individual endpoint (e.g. ``"1200"`` inside
+#: ``"1000-1200"``) is correctly seen as a fragment of the range, not a standalone
+#: value; an optional exponent suffix (``e``/``E`` then optional sign then digits)
+#: extends the candidate so ``"1023"`` inside ``"1023e5"`` is a fragment of the
+#: exponent form, not the whole numeral.
+#:
+#: Case sensitivity: this body is written with EXPLICIT ``[0-9a-zA-Z...]`` character
+#: classes and an explicit ``[eE]``/``/[cC]0`` alternative, NOT ``re.IGNORECASE``, and
+#: that is a deliberate choice, not an oversight. :mod:`carmel.services.grounding`
+#: runs its regex against text it has ALREADY casefolded (so only the lowercase
+#: branches of these classes can ever match there -- adding the uppercase branches is
+#: a provable no-op for that caller). But :mod:`carmel.services.dataset_producer` runs
+#: its regex against RAW, un-casefolded ``ExtractedText.text``, where an uppercase
+#: ``E1023`` exponent marker or a real ``/C0`` sign-repair token must be recognized as
+#: part of the numeral. A blanket ``re.IGNORECASE`` flag would also silently case-fold
+#: every OTHER character class in this pattern -- in particular it would make the
+#: boundary lookaround classes match uppercase letters too, which they already do via
+#: the explicit ``A-Z`` here, so that part is harmless -- but relying on the flag
+#: instead of writing the classes out would make the pattern's case behavior implicit
+#: and easy to get wrong the next time it is edited. Writing every class out
+#: explicitly keeps the case-sensitivity of each piece an intentional, visible choice.
+_NUMERAL_LEADING_BOUNDARY = r"(?<![0-9a-zA-Z.,])"
+_NUMERAL_BODY = (
+    r"(?:/[cC]0\s*|[-+−]|–(?=\d))?\d+(?:\.\d+)?(?:[eE][-+]?\d+(?:\.\d+)?)?"
+    r"(?:[-–]\d+(?:\.\d+)?(?:[eE][-+]?\d+(?:\.\d+)?)?)?"
+)
+
+#: TRAILING boundary is intentionally NOT shared -- the two callers ask different
+#: questions of it, and collapsing them back into one regex is exactly the mistake
+#: this split undoes (see commit history: an earlier unification narrowed the
+#: trailing boundary to ``(?![0-9,])`` everywhere so that ``"1023"`` would ground
+#: inside ``"1023K"``, but that also let :mod:`carmel.services.grounding`'s window
+#: scanner start emitting spurious candidates for run/table labels glued to digits,
+#: e.g. over ``"run 3a and 4b gave 720k"`` it would find ``['3', '4', '720']`` where
+#: the strict boundary correctly finds nothing, and over ``"the temperature was
+#: 1023k"`` it would find ``['1023']`` where the strict boundary correctly finds
+#: nothing -- a numeric anchor could then look "corroborated" by digits that are
+#: really part of a run label or a glued token). DO NOT re-collapse these into one
+#: regex.
+#:
+#: - :data:`NUMERAL_CANDIDATE_RE` (used by :mod:`carmel.services.grounding`'s
+#:   window/value scan, :func:`_window_numeric_values`): forbids a following digit,
+#:   comma, OR letter. This is the strict "is there a clean corroborating VALUE
+#:   here" question -- ``"720k"`` is not a clean value, so this must refuse to see a
+#:   candidate there at all.
+#: - :data:`NUMERAL_EXTENT_RE` (used by :func:`find_numeral_extent`, which backs
+#:   :mod:`carmel.services.dataset_producer`'s ``ground_quote``): forbids only a
+#:   following digit or comma, tolerating a following letter. This is the "where does
+#:   this numeral END" extent question -- a numeral is routinely glued to a trailing
+#:   unit letter in real text (``"1023K"``, ``"5s"``), and a trailing ``K`` is not
+#:   part of the numeral's own extent, so ``"1023"`` must still be seen as the FULL
+#:   numeral at that position (not a fragment) when a caller is checking maximality.
+NUMERAL_CANDIDATE_RE = re.compile(_NUMERAL_LEADING_BOUNDARY + _NUMERAL_BODY + r"(?![0-9a-zA-Z,])")
+
+NUMERAL_EXTENT_RE = re.compile(_NUMERAL_LEADING_BOUNDARY + _NUMERAL_BODY + r"(?![0-9,])")
+
+
+def find_numeral_extent(text: str, index: int) -> tuple[int, int] | None:
+    """Return the ``(start, end)`` span of the numeral candidate covering character
+    ``index`` in ``text``, or ``None`` if no candidate covers that position.
+
+    "Covering" means ``start <= index < end``: the character at ``index`` sits
+    somewhere inside the matched span, not merely adjacent to it. A caller holding a
+    known substring position (e.g. a quote's search-found offset) uses this to answer
+    "what is the FULL numeral touching this position?" -- if the returned span is wider
+    than the caller's own substring, the caller's substring is a fragment, not the
+    whole numeral.
+
+    Implemented by scanning :data:`NUMERAL_EXTENT_RE` left to right via
+    ``finditer`` and returning the first (and by construction, since candidates never
+    overlap, only) match whose span contains ``index``.
+    """
+    for match in NUMERAL_EXTENT_RE.finditer(text):
+        if match.start() <= index < match.end():
+            return match.span()
+        if match.start() > index:
+            break
+    return None
 
 
 @dataclass(frozen=True)
