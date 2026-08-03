@@ -492,7 +492,7 @@ _CONTENT_TYPE_TO_NODE_KIND: dict[str, SourceNodeKind] = {
 
 def _load_verified_extracted_text(
     workspace_root: Path, sha256: str
-) -> tuple[ExtractedText, str, str | None, str]:
+) -> tuple[ExtractedText, str, str, str]:
     """Resolve, verify, and parse the stored extraction for ``sha256``.
 
     Returns ``(extracted, extracted_sha256, derivation_binding, content_type)``.
@@ -523,15 +523,29 @@ def _load_verified_extracted_text(
        ``meta.json`` -- so a ``meta.json`` whose ``sha256`` field disagrees
        with the directory it lives in (e.g. hand-edited or copied from
        elsewhere) would otherwise go undetected.
-    2. Two legacy carve-outs, each refused with its own named cause rather
-       than falling through to :func:`~carmel.services.evidence.verify_artifact`
-       (which would otherwise report the same generic failure for both, and
-       for every other kind of corruption besides): an artifact that predates
+    2. round-36: :func:`~carmel.services.evidence.verify_artifact` with
+       ``deep=False`` -- runs BEFORE the legacy carve-outs in step 3, on
+       purpose. An artifact that is both legacy (predates
+       ``extracted_sha256``/``derivation_binding``) AND corrupt (``raw.bin``
+       no longer hashes to ``sha256``, or its sidecar no longer matches its
+       recorded digest) must be refused as CORRUPT, not waved through to a
+       legacy carve-out whose message reads as routine and names the wrong
+       problem. Checking shallow integrity first, before either carve-out
+       runs, is what makes that ordering guarantee hold.
+    3. Two legacy carve-outs, each refused with its own named cause rather
+       than falling through to the generic ``verify_artifact`` failure above
+       (which would otherwise report the same message for both, and for
+       every other kind of corruption besides): an artifact that predates
        ``extracted_sha256`` (its sidecar can never be verified at all), and
        one that predates ``derivation_binding`` but does carry
-       ``extracted_sha256`` (handled below via ``AbsenceReason.UNKNOWN`` in
-       :func:`produce_envelope_from_artifact`).
-    3. :func:`carmel.services.evidence.verify_artifact` with ``deep=True``:
+       ``extracted_sha256``. round-36: this carve-out's raise means
+       :func:`produce_envelope_from_artifact` is never even reached for such
+       an artifact -- an earlier version of this docstring described that
+       function as handling this case "below via ``AbsenceReason.UNKNOWN``",
+       which was never true: the ``None`` this function's own return type
+       still admits for ``derivation_binding`` is unreachable in practice,
+       because every path that would produce it raises first, right here.
+    4. :func:`carmel.services.evidence.verify_artifact` with ``deep=True``:
        confirms ``raw.bin`` exists and hashes to ``sha256`` (the parameter),
        that ``extracted.json`` matches its recorded digest (the same check
        performed by hand below, but this call also covers ``raw.bin``, which
@@ -572,6 +586,22 @@ def _load_verified_extracted_text(
         raise DatasetProducerError(
             f"artifact meta.json at sha256 {sha256!r} records sha256={meta.sha256!r} internally -- "
             "the two disagree, so this evidence directory is not trustworthy; refusing to use it"
+        )
+    if not verify_artifact(workspace_root, sha256, deep=False):
+        # round-36: this shallow integrity check MUST run before the legacy
+        # carve-outs below. An artifact that is BOTH legacy (predates
+        # extracted_sha256/derivation_binding) AND corrupt (raw.bin no longer
+        # hashes to sha256, or its sidecar no longer matches its recorded
+        # digest) used to reach a legacy carve-out first and be refused with a
+        # "predates ..." message that named the wrong problem -- masking a
+        # real integrity failure behind a message that reads as routine
+        # legacy handling. Checking integrity first ensures corruption is
+        # always named as corruption, on legacy artifacts included.
+        raise DatasetProducerError(
+            f"artifact {sha256!r} failed integrity verification (raw.bin missing, its bytes not "
+            "hashing to sha256, meta.json unreadable, or extracted.json not matching its recorded "
+            "digest -- verify_artifact reports only a plain bool, not which check failed); refusing "
+            "to use unverified bytes"
         )
     if meta.extracted_sha256 is None:
         # A legacy artifact stored before extracted_sha256 existed carries no
@@ -693,7 +723,7 @@ def produce_envelope_from_artifact(
                 "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
             )
 
-    extracted, extracted_sha256, derivation_binding_raw, content_type = _load_verified_extracted_text(
+    extracted, extracted_sha256, derivation_binding, content_type = _load_verified_extracted_text(
         workspace_root, sha256
     )
     node_kind = _CONTENT_TYPE_TO_NODE_KIND.get(content_type)
@@ -721,14 +751,12 @@ def produce_envelope_from_artifact(
     # docstring), so a digest of it would be anchored to the one unverified
     # file in the store.
     extracted_text_sha256 = hashlib.sha256(extracted.text.encode("utf-8")).hexdigest()
-    derivation_binding: str | Absent
-    if derivation_binding_raw is None:
-        # UNKNOWN is the ONLY reason ExtractionBinding permits here (enforced
-        # by its own validator): the digest predates the field and no other
-        # AbsenceReason promises a remedy that exists.
-        derivation_binding = Absent(reason=AbsenceReason.UNKNOWN)
-    else:
-        derivation_binding = derivation_binding_raw
+    # round-36: no Absent(reason=AbsenceReason.UNKNOWN) branch belongs here.
+    # _load_verified_extracted_text already raises DatasetProducerError for
+    # any artifact whose meta.derivation_binding is None (the legacy
+    # carve-out at its own "predates derivation_binding" check) -- this
+    # function is never reached for such an artifact at all, so
+    # derivation_binding here is always the verified str the type says it is.
     binding = ExtractionBinding(
         extracted_sha256=extracted_sha256,
         extracted_text_sha256=extracted_text_sha256,

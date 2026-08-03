@@ -560,7 +560,11 @@ class TestProducerFailClosed:
         check below it (with the older "refusing to parse unverified bytes"
         message) is reached only if verify_artifact's own check is somehow
         bypassed, e.g. by a future refactor -- both are exercised by other
-        tests in ``TestProducerFailClosed``."""
+        tests in ``TestProducerFailClosed``. round-36: the shallow
+        ``verify_artifact(deep=False)`` integrity check now runs before
+        BOTH the legacy carve-outs and the deep=True call, so this is the
+        gate that actually fires now -- its "failed integrity verification"
+        message, not the deep-check's "failed verify_artifact" message."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
         corrupt = ExtractedText(
@@ -568,7 +572,7 @@ class TestProducerFailClosed:
         )
         extracted_path.write_bytes(corrupt.model_dump_json().encode("utf-8"))
 
-        with pytest.raises(DatasetProducerError, match="failed verify_artifact"):
+        with pytest.raises(DatasetProducerError, match="failed integrity verification"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
@@ -630,12 +634,16 @@ class TestProducerFailClosed:
     def test_refuses_corrupted_raw_bin(self, tmp_path: Path) -> None:
         """P1-B: raw.bin was never verified before this fix -- only
         extracted.json was. Corrupt raw.bin (leave extracted.json/meta.json
-        untouched) and confirm production now refuses."""
+        untouched) and confirm production now refuses. round-36: the
+        shallow ``verify_artifact(deep=False)`` integrity check now runs
+        before the deep=True call, so it is the one that catches raw.bin
+        corruption and its "failed integrity verification" message is what
+        fires, not the deep-check's "failed verify_artifact" message."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         raw_path = artifact_dir(tmp_path, stored.sha256) / "raw.bin"
         raw_path.write_bytes(b"not the original bytes at all")
 
-        with pytest.raises(DatasetProducerError, match="failed verify_artifact"):
+        with pytest.raises(DatasetProducerError, match="failed integrity verification"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
@@ -706,6 +714,35 @@ class TestProducerFailClosed:
         meta_path.write_text(tampered.model_dump_json())
 
         with pytest.raises(DatasetProducerError, match="predates derivation_binding"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+    def test_refuses_a_legacy_artifact_that_is_also_corrupt_by_naming_the_integrity_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """round-36: an artifact that is BOTH legacy (predates extracted_sha256,
+        so it would also hit the legacy carve-out) AND corrupt (raw.bin no
+        longer hashes to sha256) must be refused as CORRUPT -- the shallow
+        verify_artifact(deep=False) integrity check now runs BEFORE the
+        legacy carve-outs, precisely so this case is never misreported as
+        routine legacy handling. Before this fix, the legacy carve-out ran
+        first and this same scenario raised "predates extracted_sha256"
+        instead, hiding the real integrity failure."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        assert meta.extracted_sha256 is not None
+        legacy = meta.model_copy(update={"extracted_sha256": None, "derivation_binding": None})
+        meta_path.write_text(legacy.model_dump_json())
+        raw_path = artifact_dir(tmp_path, stored.sha256) / "raw.bin"
+        raw_path.write_bytes(b"not the original bytes at all")
+
+        with pytest.raises(DatasetProducerError, match="failed integrity verification"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
