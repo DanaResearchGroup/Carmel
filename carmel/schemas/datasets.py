@@ -76,7 +76,7 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
@@ -115,6 +115,7 @@ __all__ = [
     "CoordinateFrame",
     "DataPoint",
     "DatasetEnvelope",
+    "DatasetEnvelopeParseError",
     "EmbeddedConversionTable",
     "ExtractionBinding",
     "GlyphHealthAssessment",
@@ -302,6 +303,28 @@ runtime and under static type checking; pydantic's "smart" union mode picks
 the right member on validation, and passing ``None`` for a ``Maybe[T]``
 field matches neither member and is rejected.
 """
+
+
+class DatasetEnvelopeParseError(ValueError):
+    """Raised by :meth:`DatasetEnvelope.from_identity_payload` when a payload
+    cannot be reconstructed into a :class:`DatasetEnvelope` that reproduces
+    it exactly.
+
+    Covers three distinct failure modes, all reported through this one type
+    so callers can catch it and distinguish it from an unrelated
+    ``ValueError``:
+
+    * a malformed ``__absent__`` marker (wrong shape, ``__absent__`` not
+      ``True``, unknown ``reason``, non-``str``/``None`` ``note``) found
+      while rehydrating the payload, before validation is even attempted;
+    * an ordinary pydantic ``ValidationError`` raised by
+      ``DatasetEnvelope.model_validate`` on the rehydrated payload (e.g. a
+      cross-field invariant such as sorted-``series`` is violated);
+    * the parsed envelope validates, but re-projecting it via
+      :meth:`DatasetEnvelope.identity_payload` does not reproduce the input
+      payload byte-for-byte -- a parser/projector disagreement, not a claim
+      that the input itself is corrupt.
+    """
 
 
 class CoordinateFrame(BaseModel):
@@ -2902,6 +2925,84 @@ def _project_maybe(value: Any, project: Callable[[Any], Any] = lambda value: val
     return project(value)
 
 
+_ABSENCE_MARKER_KEYS = frozenset({"__absent__", "reason", "note"})
+
+
+def _is_absence_marker(value: Any) -> bool:
+    """Detect a dict that is *shaped like* an absence marker, i.e. carries the
+    ``"__absent__"`` key at all.
+
+    This is deliberately a cheap, permissive test (key presence only, not full
+    shape validation) -- :func:`_rehydrate_absence_marker` does the strict
+    validation and is the one that raises. Using the mere presence of the key
+    to decide "this dict must be a marker" is exactly what makes a malformed
+    marker (bad ``__absent__`` value, extra key, unknown ``reason``) a hard
+    rejection here rather than something that falls through and gets handed
+    to pydantic as if it were ordinary present-value data.
+    """
+    return isinstance(value, dict) and "__absent__" in value
+
+
+def _rehydrate_absence_marker(marker: dict[str, Any]) -> Absent:
+    """Reconstruct the :class:`Absent` instance that
+    :func:`_absent_identity_payload` would have projected from ``marker``.
+
+    Every check here is load-bearing: ``Absent`` itself is
+    ``extra="forbid"``, so it cannot be constructed directly from the
+    marker's own dict (which carries the extra ``"__absent__"`` key) --
+    this function is what strips that key back out, but only after proving
+    the marker is exactly what a real projection would have produced.
+    """
+    if marker.get("__absent__") is not True:
+        raise DatasetEnvelopeParseError(
+            f"absence marker has __absent__={marker.get('__absent__')!r}, not True -- "
+            "a real Absent projection always sets __absent__ to the literal True"
+        )
+    actual_keys = set(marker)
+    if actual_keys != _ABSENCE_MARKER_KEYS:
+        raise DatasetEnvelopeParseError(
+            f"absence marker has keys {sorted(actual_keys)!r}, expected exactly "
+            f"{sorted(_ABSENCE_MARKER_KEYS)!r} -- a real Absent projection never has more or fewer"
+        )
+    reason_raw = marker["reason"]
+    if not isinstance(reason_raw, str):
+        raise DatasetEnvelopeParseError(
+            f"absence marker's reason is {reason_raw!r} ({type(reason_raw).__name__}), expected a str "
+            "-- AbsenceReason always projects to its .value, a plain string"
+        )
+    try:
+        reason = AbsenceReason(reason_raw)
+    except ValueError as exc:
+        raise DatasetEnvelopeParseError(
+            f"absence marker's reason {reason_raw!r} is not a known AbsenceReason value"
+        ) from exc
+    note = marker["note"]
+    if note is not None and not isinstance(note, str):
+        raise DatasetEnvelopeParseError(
+            f"absence marker's note is {note!r} ({type(note).__name__}), expected str or None"
+        )
+    return Absent(reason=reason, note=note)
+
+
+def _rehydrate_identity_payload(value: Any) -> Any:
+    """Recursively walk an ``identity_payload()``-shaped structure, replacing
+    every absence marker with the real :class:`Absent` instance it
+    represents so the result can be handed to ``DatasetEnvelope.model_validate``.
+
+    Everything that is not an absence marker -- dicts, lists, scalars -- is
+    left structurally alone; pydantic does the rest of the reconstruction
+    (enums from their ``.value`` strings, tuples from lists, nested models
+    from nested dicts) during ``model_validate`` itself.
+    """
+    if isinstance(value, dict):
+        if _is_absence_marker(value):
+            return _rehydrate_absence_marker(value)
+        return {key: _rehydrate_identity_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_rehydrate_identity_payload(item) for item in value]
+    return value
+
+
 def _coordinate_frame_identity_payload(frame: CoordinateFrame) -> dict[str, Any]:
     return {
         "render_fingerprint": frame.render_fingerprint,
@@ -3592,3 +3693,108 @@ class DatasetEnvelope(BaseModel):
                 _embedded_conversion_table_identity_payload(table) for table in self.conversion_tables
             ],
         }
+
+    @classmethod
+    def from_identity_payload(cls, payload: dict[str, Any]) -> DatasetEnvelope:
+        """Reconstruct a :class:`DatasetEnvelope` from its own
+        :meth:`identity_payload` projection -- the exact inverse of that
+        method.
+
+        This is a two-stage parse, and both stages are load-bearing:
+
+        1. **Rehydrate.** ``identity_payload()`` is not pydantic's dump
+           shape: an ``Absent`` marker projects to a plain
+           ``{"__absent__": True, "reason": ..., "note": ...}`` dict, and
+           ``Absent`` is ``extra="forbid"`` so that dict cannot be handed
+           to ``model_validate`` as-is. This stage walks the payload and
+           replaces every such marker with a real ``Absent`` instance
+           (see :func:`_rehydrate_identity_payload`); everything else --
+           other dicts, lists, scalars -- is left structurally alone,
+           because pydantic itself already knows how to turn an enum's
+           ``.value`` string back into the enum and a list back into a
+           tuple.
+        2. **Validate, then prove the parse.** The rehydrated structure is
+           handed to ``cls.model_validate``, and the *resulting* envelope
+           is immediately re-projected via its own ``identity_payload()``
+           and compared, byte-for-byte (via
+           :func:`carmel.services.dataset_store.canonical_json_bytes`),
+           against the original input ``payload``.
+
+           This second half of stage 2 is not a redundant belt-and-braces
+           check on top of ``model_validate`` -- it is the only thing that
+           actually proves this method is the inverse of
+           ``identity_payload()``, because ``identity_payload()`` *is* the
+           definition of this envelope's identity (it is exactly what
+           ``compute_dataset_sha`` hashes). ``model_validate`` succeeding
+           only proves the rehydrated structure satisfies this schema's
+           field types and cross-field invariants; it does not prove
+           nothing was lost or silently reinterpreted along the way. The
+           clearest case is a dict that looks like a present value but
+           happens to also validate as ``Absent`` under pydantic's "smart"
+           union mode (e.g. a mangled ``ArchiveOrigin`` payload missing its
+           required field, which is a legal ``Absent`` shape once
+           ``__absent__`` is disregarded) -- ``model_validate`` would
+           accept it silently, changing what dataset this payload
+           addresses, and only the round-trip byte comparison below
+           catches that.
+
+           If the byte comparison fails, the raised error says the payload
+           did not survive a round trip and names it as a disagreement
+           between this parser and ``identity_payload()`` -- never as a
+           claim that the input ``payload`` itself is corrupt, because
+           nothing here has evidence of that; all that is known is that
+           the parser and the projector disagree about what the payload
+           means.
+
+        **This inverse is exact on IDENTITY, and lossy on everything
+        else.** ``result == original_envelope`` is NOT guaranteed, and in
+        general is false: any field registered in
+        :data:`_UNADDRESSED_FIELDS` is deliberately never projected, so it
+        cannot possibly come back. Today that is exactly one field --
+        :attr:`ArchiveOrigin.member_display_path` -- so an envelope stored
+        carrying ``member_display_path="si/data.csv"`` parses back with
+        that field as ``None``, silently.
+
+        Silently, and correctly, because the guarantee this method offers
+        is the one a content-addressed store actually needs: the returned
+        envelope ADDRESSES THE SAME DATASET as the one that was stored, and
+        stage 2 proves exactly that, byte for byte. It does not offer
+        object equality, and callers must not test for it. A caller that
+        needs a display path -- or any other unaddressed, display-only
+        datum -- has to carry it alongside the dataset rather than expect
+        to recover it from the store: it was never in the stored bytes to
+        recover. ``test_round_trip_drops_unaddressed_display_only_fields``
+        in ``tests/test_dataset_bridge.py`` pins this, so that projecting a
+        currently-unaddressed field later has to be a deliberate, visible
+        decision instead of a silent change of what a stored sha means.
+
+        Args:
+            payload: A ``dict`` produced by (or shaped exactly like one
+                produced by) some ``DatasetEnvelope.identity_payload()``
+                call.
+
+        Returns:
+            The reconstructed ``DatasetEnvelope``.
+
+        Raises:
+            DatasetEnvelopeParseError: the payload contains a malformed
+                absence marker, fails pydantic validation, or -- after
+                validating -- does not reproduce byte-for-byte under
+                re-projection.
+        """
+        rehydrated = _rehydrate_identity_payload(payload)
+        try:
+            parsed = cls.model_validate(rehydrated)
+        except ValidationError as exc:
+            raise DatasetEnvelopeParseError(
+                f"DatasetEnvelope payload failed validation after rehydration: {exc}"
+            ) from exc
+        reprojected = parsed.identity_payload()
+        if canonical_json_bytes(reprojected) != canonical_json_bytes(payload):
+            raise DatasetEnvelopeParseError(
+                "DatasetEnvelope.from_identity_payload: the parsed envelope's re-projected "
+                "identity_payload() does not byte-match the input payload -- this is a "
+                "parser/projector disagreement (the parse silently changed what dataset this "
+                "payload addresses), not a claim that the input payload itself is corrupt"
+            )
+        return parsed
