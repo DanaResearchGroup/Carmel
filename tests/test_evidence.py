@@ -16,6 +16,7 @@ from carmel.schemas.campaign import ReactorType
 from carmel.schemas.literature import Citation, ExperimentalBenchmarkPayload, GroundingStatus, ObservableKind, Quantity
 from carmel.services.evidence import (
     artifact_dir,
+    load_artifact_meta,
     load_artifact_text,
     store_artifact,
     verify_artifact,
@@ -720,3 +721,26 @@ class TestSha256Validation:
         short_digest = "0" * 63
         with pytest.raises(ValueError, match="invalid sha256"):
             verify_artifact(tmp_path, short_digest)
+
+
+class TestLoadArtifactMeta:
+    """`load_artifact_meta`: direct by-sha metadata lookup (added for the
+    dataset producer, which must resolve ONE artifact rather than scan the
+    whole store via `list_artifacts`)."""
+
+    def test_returns_stored_metadata_for_known_sha(self, tmp_path: Path) -> None:
+        data = b"meta lookup bytes"
+        stored = store_artifact(
+            tmp_path, data=data, artifact=_artifact(data), extracted=_extracted(), max_bytes=MAX_BYTES
+        )
+
+        loaded = load_artifact_meta(tmp_path, stored.sha256)
+
+        assert loaded == stored
+
+    def test_returns_none_for_absent_sha(self, tmp_path: Path) -> None:
+        assert load_artifact_meta(tmp_path, "0" * 64) is None
+
+    def test_rejects_malformed_sha(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError, match="invalid sha256"):
+            load_artifact_meta(tmp_path, "../../etc/passwd")

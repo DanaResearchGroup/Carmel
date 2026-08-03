@@ -1,0 +1,351 @@
+"""Tests for ``carmel.services.dataset_producer`` -- the M-D2d vertical slice.
+
+One REAL stored evidence artifact (stored through the real
+``evidence.store_artifact`` API, never a hand-built directory) is turned into
+a validated ``DatasetEnvelope`` whose every ``CharSpanLocator`` was produced
+by ``ground_quote`` SEARCHING the artifact's verified extracted text, then
+round-tripped through the real content-addressed dataset store, and finally
+proven correct by an independent replayer-style check that re-reads and
+re-verifies ``extracted.json`` from disk and re-slices every span.
+
+All text here is SYNTHETIC -- invented sentences and numbers, never real
+paper text (the project's corpus is closed-access, non-redistributable).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from carmel.agents.tools.extract import ExtractedText
+from carmel.agents.tools.fetch import FetchedArtifact
+from carmel.schemas.datasets import (
+    AxisRole,
+    CharSpanLocator,
+    DatasetEnvelope,
+    ExtractionBinding,
+    ValueOrigin,
+    iter_measured_values,
+    iter_source_refs,
+)
+from carmel.schemas.literature import StoredArtifact
+from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
+from carmel.services.dataset_producer import (
+    DatasetProducerError,
+    MeasurementSpec,
+    QuoteGroundingError,
+    ground_quote,
+    produce_envelope_from_artifact,
+)
+from carmel.services.dataset_store import compute_dataset_sha
+from carmel.services.evidence import artifact_dir, load_artifact_meta, store_artifact
+from carmel.services.units import QuantityKind
+
+MAX_BYTES = 10_000_000
+
+_TEXT = (
+    "The reactor was held at a temperature of 1023 K while the measured "
+    "mole fraction (-) of the fuel species was 0.0123 at steady state."
+)
+"""Synthetic source sentence. Every grounded quote below ("temperature",
+"1023", "K", "mole fraction", "-", "0.0123") appears exactly once in it, so
+`ground_quote`'s uniqueness default applies throughout."""
+
+_MUTATED_TEXT = _TEXT.replace("1023 K", "1024 K")
+"""Differs from `_TEXT` by exactly ONE character ('3' -> '4'), at the same
+position, INSIDE the grounded value quote "1023"."""
+
+_SPECS = (
+    MeasurementSpec(
+        axis_id="temperature",
+        role=AxisRole.COORDINATE,
+        quantity_kind=QuantityKind.TEMPERATURE,
+        label_quote="temperature",
+        value_quote="1023",
+        unit_quote="K",
+    ),
+    MeasurementSpec(
+        axis_id="mole_fraction",
+        role=AxisRole.OBSERVATION,
+        quantity_kind=QuantityKind.MOLE_FRACTION,
+        label_quote="mole fraction",
+        value_quote="0.0123",
+        unit_quote="-",
+    ),
+)
+
+
+def _store_synthetic_artifact(workspace_root: Path, text: str) -> StoredArtifact:
+    """Store a synthetic artifact through the REAL evidence.store_artifact API."""
+    data = text.encode("utf-8")
+    artifact = FetchedArtifact(
+        url="https://example.org/synthetic.pdf",
+        final_url="https://example.org/synthetic.pdf",
+        sha256=hashlib.sha256(data).hexdigest(),
+        content_type="application/pdf",
+        n_bytes=len(data),
+        fetched_at=datetime.now(UTC),
+    )
+    extracted = ExtractedText(
+        text=text, normalized=text.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
+    )
+    return store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+
+
+def _independently_verified_text(workspace_root: Path, raw_sha256: str) -> str:
+    """Replayer-side read: re-read extracted.json's BYTES from disk, re-verify
+    their digest against StoredArtifact.extracted_sha256, and only then parse.
+
+    Deliberately independent of the producer's own loading code: it re-reads
+    the file and recomputes the digest here, so a producer bug cannot vouch
+    for itself.
+    """
+    meta = load_artifact_meta(workspace_root, raw_sha256)
+    assert meta is not None, f"no stored artifact under {raw_sha256!r}"
+    assert meta.extracted_sha256 is not None
+    raw_bytes = (artifact_dir(workspace_root, raw_sha256) / "extracted.json").read_bytes()
+    assert hashlib.sha256(raw_bytes).hexdigest() == meta.extracted_sha256, (
+        "extracted.json bytes on disk do not match the digest recorded at store time"
+    )
+    extracted = ExtractedText.model_validate(json.loads(raw_bytes))
+    return extracted.text
+
+
+def _assert_every_char_span_grounds(envelope: DatasetEnvelope, text: str) -> int:
+    """The replayer-style check: walk the ENTIRE envelope generically and
+    assert every reachable ``CharSpanLocator`` slices ``text`` to exactly the
+    verbatim string the envelope claims for it.
+
+    Three claim kinds exist in this schema, each walked generically (never
+    "the one span the test knows about"):
+
+    - every ``MeasuredValue``'s ``value_ref`` span must slice to its
+      ``raw_text`` (found via ``iter_measured_values``, the schema's own
+      shape-agnostic walker);
+    - every ``MeasuredValue``'s ``unit_ref`` span must slice to its
+      ``unit_raw``;
+    - every ``AxisDeclaration``'s ``label_ref`` span must slice to its
+      ``label_raw``.
+
+    Coverage is then proven, not assumed: the number of spans checked above
+    must equal the TOTAL number of ``CharSpanLocator``-bearing ``SourceRef``s
+    reachable via ``iter_source_refs`` -- so a char-span ref hanging anywhere
+    this pairing does not know about fails the test loudly instead of
+    escaping it.
+
+    Returns the number of spans checked (callers assert it is non-zero).
+    """
+    checked = 0
+    for path, value in iter_measured_values(envelope):
+        for which, ref, expected in (
+            ("value_ref", value.value_ref, value.raw_text),
+            ("unit_ref", value.unit_ref, value.unit_raw),
+        ):
+            locator = ref.locator
+            if isinstance(locator, CharSpanLocator):
+                actual = text[locator.start : locator.end]
+                assert actual == expected, (
+                    f"replay mismatch at {path}.{which}: text[{locator.start}:{locator.end}] == "
+                    f"{actual!r}, but the envelope claims {expected!r}"
+                )
+                checked += 1
+    for series in envelope.series:
+        for axis in series.axes:
+            locator = axis.label_ref.locator
+            if isinstance(locator, CharSpanLocator):
+                actual = text[locator.start : locator.end]
+                assert actual == axis.label_raw, (
+                    f"replay mismatch at series {series.series_id!r} axis {axis.axis_id!r} label_ref: "
+                    f"text[{locator.start}:{locator.end}] == {actual!r}, but the envelope claims "
+                    f"{axis.label_raw!r}"
+                )
+                checked += 1
+    total_char_span_refs = sum(
+        1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
+    )
+    assert checked == total_char_span_refs, (
+        f"replayer checked {checked} char-span ref(s) but iter_source_refs finds "
+        f"{total_char_span_refs}; some CharSpanLocator is reachable that this pairing never verified"
+    )
+    return checked
+
+
+class TestGroundQuote:
+    def test_grounds_unique_quote_by_search(self) -> None:
+        locator = ground_quote(_TEXT, "1023")
+        assert _TEXT[locator.start : locator.end] == "1023"
+        # Derived by SEARCH, not asserted: the span really is where "1023"
+        # sits in this sentence.
+        assert locator.start == _TEXT.index("1023")
+
+    def test_quote_absent_from_text_raises(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="not found"):
+            ground_quote(_TEXT, "774 K")
+
+    def test_ambiguous_quote_raises_and_states_match_count(self) -> None:
+        text = "measured at 1023 K, then again at 1023 K"
+        with pytest.raises(QuoteGroundingError, match=r"appears 2 times"):
+            ground_quote(text, "1023")
+
+    def test_empty_quote_raises_with_specific_message(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="quote is empty"):
+            ground_quote(_TEXT, "")
+
+    def test_occurrence_out_of_range_raises_and_states_match_count(self) -> None:
+        text = "measured at 1023 K, then again at 1023 K"
+        with pytest.raises(QuoteGroundingError, match=r"2 match\(es\) found"):
+            ground_quote(text, "1023", occurrence=2)
+
+    def test_explicit_occurrence_selects_that_match(self) -> None:
+        text = "measured at 1023 K, then again at 1023 K"
+        first = ground_quote(text, "1023", occurrence=0)
+        second = ground_quote(text, "1023", occurrence=1)
+        assert first.start == text.index("1023")
+        assert second.start == text.index("1023", first.start + 1)
+        assert text[second.start : second.end] == "1023"
+
+    def test_overlapping_matches_count_as_ambiguous(self) -> None:
+        with pytest.raises(QuoteGroundingError, match=r"appears 2 times"):
+            ground_quote("aaa", "aa")
+
+
+class TestProducerEndToEnd:
+    def test_produce_store_load_replay(self, tmp_path: Path) -> None:
+        """The whole vertical slice: real store_artifact -> producer ->
+        DatasetEnvelope -> store_dataset_envelope -> load_dataset_envelope ->
+        independent replayer-style verification of every grounded span."""
+        stored_artifact = _store_synthetic_artifact(tmp_path, _TEXT)
+        datasets_root = tmp_path / "datasets"
+
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored_artifact.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        stored_dataset = store_dataset_envelope(datasets_root, envelope)
+        loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
+
+        assert compute_dataset_sha(loaded.identity_payload()) == stored_dataset.sha256
+
+        # Replayer-style check: independently re-read + re-verify + re-parse
+        # the stored extraction, then generically verify every span in the
+        # LOADED envelope against it.
+        replayed_text = _independently_verified_text(tmp_path, stored_artifact.sha256)
+        checked = _assert_every_char_span_grounds(loaded, replayed_text)
+        # 2 axes x (value_ref + unit_ref + label_ref) = 6 char-span refs.
+        assert checked == 6
+
+        # The loaded binding's extracted_text_sha256 must equal a digest
+        # recomputed here from the independently re-read, re-verified text.
+        node = loaded.source_graph.node("paper")
+        binding = node.extraction
+        assert isinstance(binding, ExtractionBinding), "extraction must be present, not Absent"
+        assert binding.extracted_text_sha256 == hashlib.sha256(replayed_text.encode("utf-8")).hexdigest()
+        assert binding.extracted_sha256 == stored_artifact.extracted_sha256
+
+    def test_replay_fails_against_single_character_mutation(self, tmp_path: Path) -> None:
+        """THE non-vacuousness proof for the replayer check: an envelope
+        grounded against the ORIGINAL text must FAIL the replay when checked
+        against a second stored artifact whose text differs by exactly one
+        character inside a grounded span ("1023 K" -> "1024 K")."""
+        original = _store_synthetic_artifact(tmp_path, _TEXT)
+        mutated = _store_synthetic_artifact(tmp_path, _MUTATED_TEXT)
+        assert original.sha256 != mutated.sha256
+        assert len(_TEXT) == len(_MUTATED_TEXT)
+
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=original.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+
+        # Sanity: the SAME check passes against the original artifact's text...
+        original_text = _independently_verified_text(tmp_path, original.sha256)
+        assert _assert_every_char_span_grounds(envelope, original_text) == 6
+
+        # ...and fails against the mutated artifact's (independently
+        # verified) text, on the exact claimed-vs-actual slice disagreement.
+        mutated_text = _independently_verified_text(tmp_path, mutated.sha256)
+        with pytest.raises(AssertionError, match="replay mismatch"):
+            _assert_every_char_span_grounds(envelope, mutated_text)
+
+
+class TestProducerFailClosed:
+    def test_refuses_corrupted_extracted_json(self, tmp_path: Path) -> None:
+        """Bytes on disk that no longer match StoredArtifact.extracted_sha256
+        are refused BEFORE parsing -- the corrupt replacement here is valid
+        JSON and would parse fine, so only the digest check can be what
+        refuses it."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
+        corrupt = ExtractedText(
+            text="tampered", normalized="tampered", sections=[], extractor="pdf:pypdf", lossy=False
+        )
+        extracted_path.write_bytes(corrupt.model_dump_json().encode("utf-8"))
+
+        with pytest.raises(DatasetProducerError, match="refusing to parse unverified bytes"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+    def test_refuses_unknown_sha256(self, tmp_path: Path) -> None:
+        with pytest.raises(DatasetProducerError, match="no stored artifact"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256="0" * 64,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+    def test_refuses_constant_role_spec(self, tmp_path: Path) -> None:
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        constant_spec = MeasurementSpec(
+            axis_id="temperature",
+            role=AxisRole.CONSTANT,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_quote="temperature",
+            value_quote="1023",
+            unit_quote="K",
+        )
+        with pytest.raises(DatasetProducerError, match="role=CONSTANT"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=(constant_spec,),
+            )
+
+    def test_ungroundable_quote_propagates(self, tmp_path: Path) -> None:
+        """A spec whose quote is not in the text fails the whole production --
+        the producer never falls back to a hand-supplied or guessed offset."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        bad_spec = MeasurementSpec(
+            axis_id="pressure",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.PRESSURE,
+            label_quote="pressure",
+            value_quote="101325",
+            unit_quote="Pa",
+        )
+        with pytest.raises(QuoteGroundingError, match="not found"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=(bad_spec, *_SPECS),
+            )

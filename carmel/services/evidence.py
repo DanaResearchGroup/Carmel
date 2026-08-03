@@ -87,6 +87,7 @@ __all__ = [
     "artifact_dir",
     "list_artifacts",
     "list_artifacts_with_unreadable",
+    "load_artifact_meta",
     "load_artifact_text",
     "store_artifact",
     "verify_artifact",
@@ -503,6 +504,32 @@ def list_artifacts(workspace_root: Path) -> list[StoredArtifact]:
     use that function instead and account for what it could not read.
     """
     return list_artifacts_with_unreadable(workspace_root)[0]
+
+
+def load_artifact_meta(workspace_root: Path, sha256: str) -> StoredArtifact | None:
+    """Load the :class:`StoredArtifact` metadata for one artifact, by sha256.
+
+    Direct single-artifact lookup, as opposed to :func:`list_artifacts` (which
+    scans and parses every ``meta.json`` in the store and silently drops
+    unreadable ones -- fine for corpus enumeration, wrong for "resolve THIS
+    artifact"). Goes through the same sha-shape and containment validation as
+    every other read path in this module.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        sha256: Hex digest identifying the artifact.
+
+    Returns:
+        The persisted metadata, or None when no artifact is stored under
+        ``sha256`` or its ``meta.json`` is missing/unreadable/invalid.
+
+    Raises:
+        ValueError: If ``sha256`` is not a well-formed 64-character lowercase
+            hex digest, or if the resolved artifact directory would fall
+            outside the resolved workspace root.
+    """
+    dest_dir = _validate_sha256(workspace_root, sha256)
+    return _load_meta(dest_dir / _META_NAME)
 
 
 def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | None:
