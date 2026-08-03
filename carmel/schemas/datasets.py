@@ -5,12 +5,12 @@
 
 This module builds the primitives listed for milestone M-D2a (explicit
 absence states, coordinate frames/bboxes, measured values with per-field
-unit binding, uncertainty, and composition) plus M-D2b part c: the source
-graph (:class:`SourceGraph`) and the dataset envelope
-(:class:`DatasetEnvelope`) that ties every embedded :class:`SourceRef` back
-to a node the graph actually contains. It deliberately does NOT yet build a
-dataset "series" aggregate or a registry -- those remain M-D2b part a and
-part b respectively.
+unit binding, uncertainty, and composition), M-D2b part c (the source graph,
+:class:`SourceGraph`, and the dataset envelope, :class:`DatasetEnvelope`,
+that ties every embedded :class:`SourceRef` back to a node the graph
+actually contains), and M-D2b part a (the dataset "series" aggregate,
+:class:`Series`, built from axes/constants/points -- see its own docstring).
+A registry across envelopes (M-D2b part b) remains out of scope here.
 
 Cardinal rule this module exists to serve: every load-bearing number in a
 Carmel dataset must be grounded against stored bytes and auditable, and the
@@ -1901,6 +1901,24 @@ class Series(BaseModel):
         :class:`Composition`'s basis check exists to prevent one layer up.
         Runs AFTER S8/S9 (declaration order), so every ``axis_id`` looked
         up here is already known to name a real axis.
+
+        This check does NOT validate the printed HEADER text against the
+        axis's ``quantity_kind`` -- ``AxisDeclaration.label_raw`` is verbatim
+        source text and is never inspected here at all; what this compares
+        is two already-structured fields (the axis's own ``quantity_kind``
+        and the value's ``MeasuredValue.quantity_kind``), and
+        ``MeasuredValue`` itself RE-DERIVES its ``unit_normalized`` from the
+        recorded conversion table rather than trusting a printed unit
+        string, so this guard inherits that same distance from the source
+        text. Two live escape hatches remain even with this check in place:
+        (1) ``QuantityKind.OTHER`` is a legitimate value on both the axis and
+        the ``MeasuredValue``, so a genuinely mismatched physical quantity
+        can still agree at ``OTHER`` on both sides with no unit binding to
+        catch it either, and (2) nothing here re-derives or re-checks the
+        header text itself against either quantity_kind. Closing that
+        remaining gap between printed header text and a trusted
+        quantity_kind is M-D3's job (trust computation over the extracted
+        payload), not this validator's.
         """
         axis_by_id = {axis.axis_id: axis for axis in self.axes}
 
@@ -2000,6 +2018,48 @@ assert set(_LOCATOR_KIND_COMPATIBLE_NODE_KINDS) == set(LocatorKind), (
     "docstring for why an omission must be a loud failure rather than a silent pass"
 )
 
+_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS: dict[TableKeyKind, frozenset[SourceNodeKind]] = {
+    TableKeyKind.CAPTION_LABEL: frozenset(
+        {SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}
+    ),
+    TableKeyKind.MEMBER_SHEET: frozenset({SourceNodeKind.SI_MEMBER}),
+}
+"""Which :class:`SourceNodeKind`\\ s a given :class:`TableKeyKind` may target.
+
+Same idiom as :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` right above, and for
+the same reason: a single explicit table keyed by every ``TableKeyKind``
+member, checked exhaustive by the assertion below, so a newly added
+``TableKeyKind`` with no entry here is a loud ``KeyError`` the next time
+:class:`DatasetEnvelope` validates anything, not a table-key/node-kind pair
+that silently sails through unchecked.
+
+A ``MEMBER_SHEET`` key names a workbook SHEET NAME -- that concept only
+exists for a spreadsheet SI member, so it may only target ``SI_MEMBER``. A
+``CAPTION_LABEL`` key names a caption string printed in a rendered document
+-- a PDF page, a JATS/XML document, or an SI member that is itself such a
+document -- so it may target any of those three, but a ``TableCellLocator``
+against those node kinds is already required by
+:data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` to exclude ``FIGURE_CROP``, so
+that exclusion is not repeated here.
+
+``SI_MEMBER`` compatible with BOTH key kinds is a known remaining gap, not an
+oversight: today ``SI_MEMBER`` is a single ``SourceNodeKind`` covering a csv,
+an xlsx, a PDF, and a zip member all alike, so this table cannot yet tell
+"this SI member is a spreadsheet, so only MEMBER_SHEET makes sense against
+it" from "this SI member is a rendered document, so only CAPTION_LABEL makes
+sense against it" -- both keys are accepted against SI_MEMBER because the
+node kind itself does not yet distinguish those cases. M-E (SI retrieval) is
+the closer for this gap -- that is the milestone where an SI member's media
+type first becomes known at all: once an SI member's actual media type is
+represented, this table can narrow to reject a ``MEMBER_SHEET`` key against
+an SI member that is not actually a spreadsheet.
+"""
+
+assert set(_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS) == set(TableKeyKind), (
+    "_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS must have an entry for every TableKeyKind member -- see its "
+    "docstring for why an omission must be a loud failure rather than a silent pass"
+)
+
 
 class DatasetEnvelope(BaseModel):
     """The top-level payload for one literature-extracted dataset: a source
@@ -2010,10 +2070,24 @@ class DatasetEnvelope(BaseModel):
     every :class:`SourceRef` embedded anywhere in this envelope (found via
     :func:`iter_source_refs`, which is shape-agnostic -- see its docstring)
     is checked against ``source_graph``, and the graph itself is checked for
-    having nothing extra hanging off it. The four validators below run in a
-    fixed order (V0 through V3), each addressing a distinct, independently
-    measured failure mode; see each validator's own docstring for the
-    concrete failure it closes.
+    having nothing extra hanging off it. The validators below run in a fixed
+    order (V1 through V5), each addressing a distinct, independently measured
+    failure mode; see each validator's own docstring for the concrete failure
+    it closes.
+
+    A former V0 (`"the envelope must cite at least one SourceRef"`) has been
+    DELETED, not merely renumbered: it was unreachable and untestable. Once
+    ``series`` became a required (``min_length=1``) field whose ``axes`` are
+    themselves non-empty (S2) and whose ``AxisDeclaration.label_ref`` is a
+    required ``SourceRef`` (not ``Maybe``), no ``DatasetEnvelope`` can be
+    constructed at all without at least one ``SourceRef`` reachable via
+    :func:`iter_source_refs` -- grounding is now enforced STRUCTURALLY by
+    that chain of required fields, so V0's own runtime check could never
+    actually fire, and a negative test for it could only ever be rejected by
+    one of these earlier structural requirements instead. Keeping a guard
+    that can never independently fail is worse than deleting it: it invites
+    the false confidence of a "passing" test that in fact pins some other
+    validator's message.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -2043,30 +2117,6 @@ class DatasetEnvelope(BaseModel):
     """
 
     @model_validator(mode="after")
-    def _validate_grounded(self) -> DatasetEnvelope:
-        """V0: the envelope must contain at least one :class:`SourceRef`.
-
-        An envelope that cites nothing is, by definition, ungrounded -- and
-        making that impossible to construct is precisely why this project's
-        schema layer exists at all (see the module docstring's "cardinal
-        rule"). Today, both ``composition`` and ``series`` can carry a
-        ``SourceRef``, so ``composition=Absent(...)`` IS constructible as
-        long as ``series`` is populated (a series' axis labels and
-        point/constant values each ground the envelope on their own) --
-        this validator's logic did not change to admit that case, since
-        :func:`iter_source_refs` already walks ``series`` generically (see
-        its own docstring); only this note needed updating once ``series``
-        existed to ground an envelope through.
-        """
-        if next(iter_source_refs(self), None) is None:
-            raise ValueError(
-                "DatasetEnvelope contains no SourceRef anywhere in its payload; an envelope that cites "
-                "no evidence is ungrounded by definition and cannot be constructed -- see this "
-                "validator's docstring for the composition=Absent(...) case specifically"
-            )
-        return self
-
-    @model_validator(mode="after")
     def _validate_refs_resolve(self) -> DatasetEnvelope:
         """V1: every embedded :class:`SourceRef` must name a node this
         envelope's ``source_graph`` actually contains.
@@ -2083,6 +2133,51 @@ class DatasetEnvelope(BaseModel):
                 raise ValueError(
                     f"SourceRef at {path!r} names node_id={ref.node_id!r}, which is not present in "
                     f"source_graph (known node ids: {sorted(node_ids)!r})"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_series_single_root_artifact(self) -> DatasetEnvelope:
+        """V5: every :class:`SourceRef` within a single :class:`Series` must
+        resolve to a node under the SAME parentless root artifact.
+
+        Runs AFTER V1 (``_validate_refs_resolve``), so every ``ref.node_id``
+        below is already known to resolve against ``self.source_graph`` --
+        this validator only has to reason about which root each resolved
+        node sits under, not whether it resolves at all.
+
+        A series is meant to be one coherent measured quantity extracted
+        from one place in the literature; a series whose refs span two
+        different root artifacts (e.g. half its points grounded in the main
+        PDF, the other half in an entirely different paper's PDF pulled into
+        the same source graph) is not one dataset series, it is two series
+        silently stitched into one -- exactly the kind of fabrication this
+        module exists to make structurally impossible. This is checked at
+        the ROOT level, not the node level: different nodes under the SAME
+        root (e.g. a table cell in the main PDF and a caption label in an SI
+        member of that same paper) are legitimate -- unit inconsistency
+        WITHIN one paper is a real, expected shape (see the module
+        docstring's second empirically-measured failure mode), not a
+        fabrication signal, so refs to different nodes sharing one root must
+        stay accepted.
+
+        A node's root is itself (empty ``ancestors()``) if it is parentless,
+        otherwise ``ancestors(node_id)[-1]`` -- ``ancestors()`` returns the
+        chain from immediate parent up to root, so the ROOT is the LAST
+        entry, not the first.
+        """
+        for series in self.series:
+            roots: dict[str, str] = {}
+            for _, ref in iter_source_refs(series):
+                node_id = ref.node_id
+                ancestor_chain = self.source_graph.ancestors(node_id)
+                root_id = ancestor_chain[-1].node_id if ancestor_chain else node_id
+                roots[root_id] = node_id
+            if len(roots) > 1:
+                raise ValueError(
+                    f"Series(series_id={series.series_id!r}) spans multiple root artifacts: refs resolve "
+                    f"to nodes under root artifacts {sorted(roots)!r} -- a series must be grounded under "
+                    "a single root artifact"
                 )
         return self
 
@@ -2119,13 +2214,23 @@ class DatasetEnvelope(BaseModel):
     @model_validator(mode="after")
     def _validate_locator_kind_compatibility(self) -> DatasetEnvelope:
         """V3: a :class:`SourceRef`'s locator kind must be compatible with
-        the kind of node it targets.
+        the kind of node it targets, and (for a ``TableCellLocator``) its
+        ``table_key`` kind must ALSO be compatible with that node kind.
 
-        See :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` for the compatibility
-        table and why it exists. Without this check, e.g. an
-        ``XPathLocator`` could target a ``PAPER_PDF`` node -- an XPath into a
-        PDF is not a real locator, it is a claim about a document that was
-        never parsed as XML at all.
+        See :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` for the
+        locator/node-kind compatibility table and why it exists. Without
+        this check, e.g. an ``XPathLocator`` could target a ``PAPER_PDF``
+        node -- an XPath into a PDF is not a real locator, it is a claim
+        about a document that was never parsed as XML at all.
+
+        The ``table_key`` check is a second, narrower compatibility axis
+        layered on top: ``LocatorKind.TABLE_CELL`` alone says the target can
+        carry SOME table, but a ``MemberSheetKey`` names a workbook SHEET --
+        a concept meaningless against anything but an ``SI_MEMBER`` -- while
+        a ``CaptionLabelKey`` names a printed caption, meaningless against a
+        node that carries no rendered caption at all. See
+        :data:`_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS` for the compatibility
+        table and its documented remaining gap (``SI_MEMBER`` too broad).
         """
         for path, ref in iter_source_refs(self):
             node = self.source_graph.node(ref.node_id)
@@ -2137,6 +2242,16 @@ class DatasetEnvelope(BaseModel):
                     f"{node.node_id!r} of kind={node.kind.value!r}, but {locator_kind.value!r} may only "
                     f"target nodes of kind {sorted(kind.value for kind in compatible_kinds)!r}"
                 )
+            if isinstance(ref.locator, TableCellLocator):
+                table_key_kind = ref.locator.table_key.kind
+                compatible_table_key_kinds = _TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS[table_key_kind]
+                if node.kind not in compatible_table_key_kinds:
+                    raise ValueError(
+                        f"SourceRef at {path!r} uses table_key kind={table_key_kind.value!r} against node "
+                        f"{node.node_id!r} of kind={node.kind.value!r}, but table_key kind="
+                        f"{table_key_kind.value!r} may only target nodes of kind "
+                        f"{sorted(kind.value for kind in compatible_table_key_kinds)!r}"
+                    )
         return self
 
     @model_validator(mode="after")
@@ -2160,13 +2275,13 @@ class DatasetEnvelope(BaseModel):
         """E1b: ``series`` must be sorted ascending by ``series_id``.
 
         Deliberately does NOT also assert non-emptiness the way S2/S7 do on
-        :class:`Series` (``axes``/``points``): unlike those fields, an empty
-        ``series`` tuple on :class:`DatasetEnvelope` is a legitimate,
-        backward-compatible state (envelopes predating M-D2b(a) have none),
-        and ``sorted(()) == ()`` trivially passes this check for that case
-        with no special-casing needed -- see :attr:`series`'s own docstring
-        for why non-emptiness cannot be enforced as a ``Field`` constraint
-        here without breaking a JSON round trip of such an envelope.
+        :class:`Series` (``axes``/``points``): here that non-emptiness is
+        already enforced structurally by ``Field(min_length=1)`` on
+        :attr:`series` itself (see that field's own docstring for why an
+        empty ``series`` tuple was made unconstructible), so this validator
+        has exactly one job -- pin ascending ``series_id`` order -- and does
+        not need to duplicate a check pydantic already runs before this
+        validator ever executes.
         """
         expected = tuple(sorted(self.series, key=lambda series: series.series_id))
         if self.series != expected:

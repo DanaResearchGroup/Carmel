@@ -46,6 +46,7 @@ from carmel.schemas.datasets import (
     UncertaintyScale,
     ValueOrigin,
     XPathLocator,
+    _check_source_form_for_ref,
 )
 from carmel.services.units import TABLE_V1
 
@@ -893,6 +894,24 @@ class TestSourceFormConstrainsValueRef:
         envelope = _envelope_with_series((series,), graph=graph)
         assert isinstance(envelope, DatasetEnvelope)
 
+    def test_check_source_form_for_ref_has_no_silent_escape_branch(self) -> None:
+        """``_check_source_form_for_ref``'s if/elif/elif chain is deliberately
+        NOT closed by an unconstrained ``else`` -- a ``source_form`` this
+        function doesn't recognize must crash loudly (an ``AssertionError``
+        naming the unhandled value), not fall through unchecked. Calling the
+        module-level helper directly with a bogus ``source_form`` is the only
+        way to exercise this branch: every real ``Series.source_form`` is
+        itself a validated ``SourceForm`` member, so this path is otherwise
+        unreachable through the public model.
+        """
+        with pytest.raises(AssertionError, match="unhandled source_form"):
+            _check_source_form_for_ref(
+                source_form="not-a-real-source-form",  # type: ignore[arg-type]
+                ref=_bbox_ref("paper"),
+                node_kind=SourceNodeKind.PAPER_PDF,
+                where="test",
+            )
+
 
 # ===========================================================================
 # TableCellLocator.table_key -- new required discriminated-union field
@@ -1005,25 +1024,27 @@ class TestCompositionAbsentGroundedThroughSeries:
             DatasetEnvelope(source_graph=graph, composition=_NO_COMPOSITION, series=())
 
     def test_the_structural_chain_that_makes_v0_unreachable_is_intact(self) -> None:
-        """V0 ("envelope must contain >=1 SourceRef") is now UNREACHABLE, and
-        this test guards the three links that make it so.
+        """V0 ("envelope must contain >=1 SourceRef") has been DELETED, and
+        this test guards the three structural links that made it unreachable
+        -- and that now enforce grounding in its place.
 
         Measured, not reasoned: ``series`` is required with ``min_length=1``;
         ``Series.axes`` is non-empty (enforced by S2, since ``axes`` carries
         no ``MinLen`` metadata of its own); and ``AxisDeclaration.label_ref``
         is a bare required ``SourceRef``, never a ``Maybe``. Together those
         mean every constructible envelope carries at least one SourceRef, so
-        V0's raise can never fire.
+        grounding is now enforced STRUCTURALLY, with no runtime check ever
+        needing to walk the payload looking for one.
 
-        V0 is nonetheless KEPT, on the same reasoning that kept I3 (acyclic):
-        a guard whose absence only becomes harmful once the schema widens is
-        worth retaining. But an unreachable validator whose test can no
-        longer construct its case would leave an INERT test behind -- one
-        that passes whether or not the guard exists, which is exactly the
-        failure mutation testing exposed twice last milestone. So instead of
-        asserting V0 fires (impossible) this asserts WHY it cannot, and fails
-        loudly if any link is weakened -- at which point V0 becomes reachable
-        again and needs a real test of its own.
+        V0 itself was removed rather than kept: unlike I3 (acyclic), which
+        stays meaningful even after the schema widens, V0's raise could never
+        independently fire once these three links were in place, so a
+        "passing" negative test for it could only ever be pinning one of
+        THESE links' messages instead -- exactly the inert-test failure
+        mutation testing exposed twice last milestone. This test replaces
+        that inert one: it asserts WHY grounding cannot be violated, and
+        fails loudly if any link is weakened -- at which point a fresh
+        runtime guard (not a resurrected V0) would be needed again.
         """
         series_field = DatasetEnvelope.model_fields["series"]
         assert series_field.is_required()

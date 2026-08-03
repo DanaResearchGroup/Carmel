@@ -38,6 +38,7 @@ from carmel.schemas.datasets import (
     DatasetEnvelope,
     Maybe,
     MeasuredValue,
+    MemberSheetKey,
     Observation,
     QuantityKind,
     Series,
@@ -47,6 +48,7 @@ from carmel.schemas.datasets import (
     SourceNodeKind,
     SourceRef,
     TableCellLocator,
+    TableKeyKind,
     Uncertainty,
     UncertaintyBasis,
     UncertaintyKind,
@@ -139,6 +141,20 @@ def _equivalence_ratio_amount(value_ref: SourceRef, unit_ref: SourceRef, raw_tex
         quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
         unit_raw="-",
         unit_normalized="1",
+        conversion_table_sha256=TABLE_V1.sha256,
+        repairs=(),
+        value_ref=value_ref,
+        unit_ref=unit_ref,
+    )
+
+
+def _velocity_amount(value_ref: SourceRef, unit_ref: SourceRef, raw_text: str = "35.0") -> MeasuredValue:
+    return MeasuredValue(
+        raw_text=raw_text,
+        canonical_decimal_value=raw_text,
+        quantity_kind=QuantityKind.VELOCITY,
+        unit_raw="cm/s",
+        unit_normalized="cm/s",
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
         value_ref=value_ref,
@@ -881,12 +897,141 @@ class TestDatasetEnvelopeNoDecorativeNodes:
         (tests/test_dataset_series.py) guards the three links that keep V0
         unreachable, so weakening any of them fails loudly.
 
-        V0 itself is retained on the I3 precedent: a guard kept because a
-        future widening of the schema makes its absence harmful.
+        V0 itself has been DELETED, not retained: a guard that can never
+        independently fire is worse than no guard at all, since a "passing"
+        negative test for it would only ever be pinning one of these three
+        earlier structural requirements instead. Grounding is now enforced
+        STRUCTURALLY by the series/axes/label_ref chain above, and this test
+        exists to pin exactly that -- not to exercise V0, which no longer
+        exists.
         """
         graph = _minimal_graph("paper")
         with pytest.raises(ValidationError, match="at least 1 item"):
             DatasetEnvelope(source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=())
+
+
+class TestDatasetEnvelopeSeriesSingleRootArtifact:
+    """V5: every SourceRef within a single Series must resolve to a node
+    under the same parentless root artifact."""
+
+    def test_series_spanning_two_root_papers_rejected(self) -> None:
+        """Two separate PAPER_PDF nodes are each their own root (empty
+        ancestors()). Grounding one axis's label_ref under "paper-a" and the
+        other axis's label_ref under "paper-b" -- while every OTHER ref in
+        the series stays on "paper-a" -- means only V5 can reject this: V1
+        (both node_ids resolve), V2 (both nodes are directly targeted, so
+        neither is decorative), V3 (a CaptionLabelKey TableCellLocator is
+        compatible with PAPER_PDF for both locator kind and table_key kind),
+        and V4 (source_form=TABULAR with TABLE_CELL value_refs) all pass.
+        """
+        paper_a = _node("paper-a", SourceNodeKind.PAPER_PDF, SHA_A)
+        paper_b = _node("paper-b", SourceNodeKind.PAPER_PDF, SHA_B)
+        graph = SourceGraph(nodes=(paper_a, paper_b))
+
+        phi_axis = AxisDeclaration(
+            axis_id="phi",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+            label_raw="phi",
+            label_ref=_table_ref("paper-a", row=0, col=0),
+        )
+        sl_axis = AxisDeclaration(
+            axis_id="sl",
+            role=AxisRole.OBSERVATION,
+            quantity_kind=QuantityKind.VELOCITY,
+            label_raw="S_L (cm/s)",
+            label_ref=_table_ref("paper-b", row=0, col=1),
+        )
+        coordinate = Coordinate(
+            axis_id="phi",
+            value=_equivalence_ratio_amount(
+                value_ref=_table_ref("paper-a", row=1, col=0), unit_ref=_table_ref("paper-a", row=1, col=1)
+            ),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        observation = Observation(
+            axis_id="sl",
+            value=_velocity_amount(value_ref=coordinate.value.value_ref, unit_ref=coordinate.value.unit_ref),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        point = DataPoint(
+            point_id="p1",
+            coordinates=(coordinate,),
+            observations=(observation,),
+            composition=Absent(reason=AbsenceReason.SAME_AS_DATASET),
+        )
+        series = Series(
+            series_id="s1",
+            source_form=SourceForm.TABULAR,
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            axes=(phi_axis, sl_axis),
+            constants=(),
+            points=(point,),
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            DatasetEnvelope(
+                source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=(series,)
+            )
+        msg = str(excinfo.value)
+        assert "spans multiple root artifacts" in msg
+        assert "s1" in msg
+        assert "paper-a" in msg
+        assert "paper-b" in msg
+
+    def test_series_referencing_different_nodes_under_same_root_accepted(self) -> None:
+        """Unit inconsistency within one paper is legitimate: one axis's
+        label_ref is grounded via a BBoxLocator on a FIGURE_CROP child
+        ("crop"), while everything else stays on the PAPER_PDF parent
+        ("paper") -- two different nodes, but a single root ("paper"),
+        since ancestors("crop") == (paper,)."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
+        crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_B, parent_node_id="paper")
+        graph = SourceGraph(nodes=(paper, crop))
+
+        phi_axis = AxisDeclaration(
+            axis_id="phi",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+            label_raw="phi",
+            label_ref=_bbox_ref("crop"),
+        )
+        sl_axis = AxisDeclaration(
+            axis_id="sl",
+            role=AxisRole.OBSERVATION,
+            quantity_kind=QuantityKind.VELOCITY,
+            label_raw="S_L (cm/s)",
+            label_ref=_table_ref("paper", row=0, col=1),
+        )
+        coordinate = Coordinate(
+            axis_id="phi",
+            value=_equivalence_ratio_amount(
+                value_ref=_table_ref("paper", row=1, col=0), unit_ref=_table_ref("paper", row=1, col=1)
+            ),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        observation = Observation(
+            axis_id="sl",
+            value=_velocity_amount(value_ref=coordinate.value.value_ref, unit_ref=coordinate.value.unit_ref),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        point = DataPoint(
+            point_id="p1",
+            coordinates=(coordinate,),
+            observations=(observation,),
+            composition=Absent(reason=AbsenceReason.SAME_AS_DATASET),
+        )
+        series = Series(
+            series_id="s1",
+            source_form=SourceForm.TABULAR,
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            axes=(phi_axis, sl_axis),
+            constants=(),
+            points=(point,),
+        )
+        envelope = DatasetEnvelope(
+            source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=(series,)
+        )
+        assert len(envelope.series) == 1
 
 
 class TestDatasetEnvelopeLocatorKindCompatibility:
@@ -928,6 +1073,37 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
     def test_bbox_locator_accepted_against_paper_pdf_si_member_and_figure_crop(self) -> None:
         for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP):
             _envelope_with_value_ref_locator(BBoxLocator(bbox=_bbox()), kind)
+
+
+class TestDatasetEnvelopeTableKeyKindCompatibility:
+    """V3 (extended): a TableCellLocator's table_key kind must ALSO be
+    compatible with the kind of node it targets -- a check distinct from,
+    and layered on top of, the plain locator-kind check above."""
+
+    def test_member_sheet_key_rejected_against_paper_pdf_node(self) -> None:
+        """TABLE_CELL is itself compatible with PAPER_PDF (see
+        test_table_cell_locator_accepted_against_paper_pdf_jats_xml_and_si_member
+        above), so the old LocatorKind-level check alone would accept this --
+        only the newer table_key-kind check can reject a MemberSheetKey
+        against a PAPER_PDF node."""
+
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_value_ref_locator(
+                TableCellLocator(table_key=MemberSheetKey(sheet_name="Sheet1"), row=0, col=0), SourceNodeKind.PAPER_PDF
+            )
+        msg = str(excinfo.value)
+        assert "table_key kind" in msg
+        assert TableKeyKind.MEMBER_SHEET.value in msg
+        assert SourceNodeKind.PAPER_PDF.value in msg
+
+    def test_caption_label_key_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
+        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
+            locator = TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=0)
+            _envelope_with_value_ref_locator(locator, kind)
+
+    def test_member_sheet_key_accepted_against_si_member_node(self) -> None:
+        locator = TableCellLocator(table_key=MemberSheetKey(sheet_name="Sheet1"), row=0, col=0)
+        _envelope_with_value_ref_locator(locator, SourceNodeKind.SI_MEMBER)
 
 
 # --------------------------------------------------------------------------
