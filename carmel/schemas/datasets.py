@@ -92,28 +92,40 @@ __all__ = [
     "AbsenceReason",
     "Absent",
     "ArchiveOrigin",
+    "AxisDeclaration",
+    "AxisRole",
     "BBox",
     "BBoxLocator",
+    "CaptionLabelKey",
     "ComponentRole",
     "Composition",
     "CompositionBasis",
     "CompositionComponent",
     "CompositionResolution",
+    "Coordinate",
     "CoordinateFrame",
+    "DataPoint",
     "DatasetEnvelope",
     "Maybe",
     "MeasuredValue",
+    "MemberSheetKey",
+    "Observation",
     "QuantityKind",
+    "Series",
+    "SourceForm",
     "SourceGraph",
     "SourceLocator",
     "SourceNode",
     "SourceNodeKind",
     "SourceRef",
     "TableCellLocator",
+    "TableKey",
+    "TableKeyKind",
     "Uncertainty",
     "UncertaintyBasis",
     "UncertaintyKind",
     "UncertaintyScale",
+    "ValueOrigin",
     "XPathLocator",
     "iter_source_refs",
 ]
@@ -495,17 +507,62 @@ class BBoxLocator(BaseModel):
     bbox: BBox
 
 
+class TableKeyKind(StrEnum):
+    """Discriminator for :data:`TableKey`."""
+
+    CAPTION_LABEL = "caption_label"
+    MEMBER_SHEET = "member_sheet"
+
+
+class CaptionLabelKey(BaseModel):
+    """Identifies a table by the label printed on its caption (e.g. ``"Table 2"``)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[TableKeyKind.CAPTION_LABEL] = TableKeyKind.CAPTION_LABEL
+    label: str = Field(min_length=1)
+    """The caption label verbatim, e.g. ``"Table 2"`` or ``"Table S1"``."""
+
+
+class MemberSheetKey(BaseModel):
+    """Identifies a table by the sheet name of an ``SI_MEMBER`` spreadsheet."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[TableKeyKind.MEMBER_SHEET] = TableKeyKind.MEMBER_SHEET
+    sheet_name: str = Field(min_length=1)
+    """The workbook sheet name verbatim."""
+
+
+TableKey = Annotated[CaptionLabelKey | MemberSheetKey, Field(discriminator="kind")]
+"""Which table, within the targeted node, a :class:`TableCellLocator` addresses.
+
+Required rather than optional: a node (e.g. a multi-table SI member or a PDF
+page rendering several tables) can hold more than one table, and ``row``/
+``col`` alone are meaningless without saying which table they index into.
+"""
+
+
 class TableCellLocator(BaseModel):
-    """Locates a reference at a specific table cell."""
+    """Locates a reference at a specific table cell.
+
+    ``table_key`` disambiguates WITHIN THE TARGETED NODE only -- it makes no
+    global-uniqueness claim across the dataset's whole source graph, and it
+    is not itself an independent locator: two different nodes may each
+    legitimately hold a "Table 2". A content-addressed digest of the actual
+    table REGION (as opposed to this caption/sheet-name key) is deliberately
+    deferred to M-C/M1: it is circular to require now, before any extractor
+    exists that defines what bytes constitute "the region" to hash.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     kind: Literal[LocatorKind.TABLE_CELL] = LocatorKind.TABLE_CELL
+    table_key: TableKey
     row: int = Field(ge=0)
     """0-indexed row; a negative row locates no real table cell."""
     col: int = Field(ge=0)
     """0-indexed column; a negative col locates no real table cell."""
-    table_label: str | None = None
 
 
 class XPathLocator(BaseModel):
@@ -1385,6 +1442,532 @@ class Composition(BaseModel):
         return self
 
 
+class AxisRole(StrEnum):
+    """What role an axis plays within a :class:`Series`."""
+
+    COORDINATE = "coordinate"
+    """Varies point to point; together with the series' other COORDINATE
+    axes, it locates the point among its siblings (e.g. equivalence ratio in
+    a burning-velocity-vs-phi series)."""
+
+    OBSERVATION = "observation"
+    """What was measured or computed at that located point (e.g. burning
+    velocity itself)."""
+
+    CONSTANT = "constant"
+    """Fixed for the whole series and cited once via :attr:`Series.constants`,
+    never repeated per point (e.g. the pressure a whole burning-velocity
+    sweep was run at)."""
+
+
+class SourceForm(StrEnum):
+    """WHERE, physically, a series' numbers were read from in the source.
+
+    Orthogonal to :class:`ValueOrigin` (which is about HOW the numbers were
+    produced): a simulation's results can still be read off a table
+    (TABULAR) or off a plotted figure (DIGITIZED) -- the two axes vary
+    independently. See :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS`-adjacent
+    :class:`DatasetEnvelope` validator V4 for what each member constrains.
+    """
+
+    TABULAR = "tabular"
+    DIGITIZED = "digitized"
+    TEXTUAL = "textual"
+
+
+class ValueOrigin(StrEnum):
+    """HOW a series' numbers were produced, as ASSERTED by the extractor.
+
+    This is an extractor ASSERTION, not a grounded claim the way a
+    :class:`SourceRef` is: nothing in this schema layer verifies that a
+    series claiming ``EXPERIMENTAL`` truly reports a measurement rather than
+    a simulation the source itself mislabels, or that a ``DERIVED``
+    quantity's derivation was performed correctly -- there is no
+    machine-checkable ground truth for "how was this number produced" the
+    way there is for "does this SourceRef resolve". Turning this assertion,
+    combined with everything else known about the source, into an actual
+    TRUST score is M-D3's job, not this schema's; this field only records
+    what the extractor claims.
+    """
+
+    EXPERIMENTAL = "experimental"
+    SIMULATION = "simulation"
+    DERIVED = "derived"
+
+
+_IDENTIFIER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _require_identifier(value: str, *, field_name: str) -> str:
+    """Reject an id that is not a plain lowercase ASCII identifier.
+
+    ``axis_id``/``series_id``/``point_id`` values appear inside dotted
+    diagnostic paths (see :func:`iter_source_refs`) and inside the
+    content-addressed payload itself: an id containing ``.``, ``[``, ``]``,
+    a quote character, or a Unicode confusable would be indistinguishable
+    from path-parsing syntax (a ``.`` inside an id looks exactly like a
+    field-name separator) or could collide/fail-to-collide unpredictably
+    under normalization. Restricting every such id to
+    ``^[a-z][a-z0-9_]*$`` removes the entire class at construction time
+    rather than leaving it to whatever code later parses a diagnostic path.
+    """
+    if not _IDENTIFIER_PATTERN.match(value):
+        raise ValueError(
+            f"{field_name}={value!r} must match {_IDENTIFIER_PATTERN.pattern!r} -- ids appear inside "
+            "dotted diagnostic paths and the content-addressed payload, where a character other than "
+            "[a-z0-9_] (or a Unicode confusable) would poison path parsing or collide unpredictably"
+        )
+    return value
+
+
+def _validate_uncertainty_bound_quantity_kind(
+    *, uncertainty: Maybe[Uncertainty], value: Maybe[MeasuredValue], where: str
+) -> None:
+    """S13: an :class:`Uncertainty` bound's ``quantity_kind`` must agree with
+    its ``basis``, on BOTH :class:`Coordinate` and :class:`Observation`.
+
+    Factored into one module-level helper (rather than duplicated on both
+    models) so there is a SINGLE implementation of this rule: an
+    ``ABSOLUTE`` bound is a magnitude in the same physical quantity as the
+    value itself (e.g. an absolute burning-velocity uncertainty is itself a
+    velocity), so its ``quantity_kind`` must equal ``value.quantity_kind``;
+    a ``RELATIVE`` bound is a fraction/percentage OF the value, so its
+    ``quantity_kind`` must be ``QuantityKind.RELATIVE_UNCERTAINTY``
+    specifically, never the value's own quantity_kind. Skipped entirely when
+    ``uncertainty``, ``uncertainty.basis``, or ``value`` is ``Absent``:
+    there is nothing to cross-check a bound's quantity against when either
+    side of the comparison was never stated.
+    """
+    if isinstance(uncertainty, Absent) or isinstance(value, Absent):
+        return
+    basis = uncertainty.basis
+    if isinstance(basis, Absent):
+        return
+    expected = value.quantity_kind if basis == UncertaintyBasis.ABSOLUTE else QuantityKind.RELATIVE_UNCERTAINTY
+    for bound_name, bound in (("upper", uncertainty.upper), ("lower", uncertainty.lower)):
+        if isinstance(bound, Absent):
+            continue
+        if bound.quantity_kind is not expected:
+            raise ValueError(
+                f"{where}: uncertainty bound quantity -- {bound_name}.quantity_kind="
+                f"{bound.quantity_kind!r} does not match the required {expected!r} for basis={basis!r}"
+            )
+
+
+class AxisDeclaration(BaseModel):
+    """One axis of a :class:`Series`: its role, physical quantity, and where
+    its printed label was read from.
+
+    ``label_ref`` grounds the axis HEADER itself (e.g. the table column
+    header or figure axis label): the header is a claim about what the
+    column/axis means just as much as any individual value is a claim about
+    a number, and this project's cardinal rule (see the module docstring)
+    applies to it identically -- a fabricated or unverifiable axis label
+    would silently mislabel every value recorded under it.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    axis_id: str
+    role: AxisRole
+    quantity_kind: QuantityKind
+    label_raw: str = Field(min_length=1)
+    """Verbatim header/axis text as printed in the source (e.g. ``"phi"``,
+    ``"S_L (cm/s)"``)."""
+    label_ref: SourceRef
+
+    @field_validator("axis_id")
+    @classmethod
+    def _validate_axis_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="axis_id")
+
+
+class Coordinate(BaseModel):
+    """A value that is always present: either a per-point locating
+    coordinate, or one of a :class:`Series`' whole-series constants.
+
+    Unlike :class:`Observation`, ``value`` here is a plain
+    :class:`MeasuredValue` with no ``Absent`` option: a coordinate that
+    could be absent would not locate the point it is attached to, and a
+    constant that could be absent is not actually constant for the series --
+    either case belongs to :class:`Observation` instead.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    axis_id: str
+    value: MeasuredValue
+    uncertainty: Maybe[Uncertainty]
+
+    @field_validator("axis_id")
+    @classmethod
+    def _validate_axis_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="axis_id")
+
+    @model_validator(mode="after")
+    def _validate_uncertainty_bound_quantity(self) -> Coordinate:
+        _validate_uncertainty_bound_quantity_kind(
+            uncertainty=self.uncertainty, value=self.value, where=f"Coordinate(axis_id={self.axis_id!r})"
+        )
+        return self
+
+
+class Observation(BaseModel):
+    """A value that may be explicitly absent: what was measured/computed at
+    a point along one ``OBSERVATION`` axis.
+
+    ``value`` is ``Maybe[MeasuredValue]`` (unlike :class:`Coordinate`,
+    which is never absent) because a point can genuinely lack an observed
+    value the source never reported for it (e.g. one row of a table left a
+    column blank) -- see :class:`Absent` for why that must be an explicit,
+    reasoned state rather than a bare ``None`` or an omitted slot (also see
+    S9 on :class:`Series`, which requires the slot to exist regardless).
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    axis_id: str
+    value: Maybe[MeasuredValue]
+    uncertainty: Maybe[Uncertainty]
+
+    @field_validator("axis_id")
+    @classmethod
+    def _validate_axis_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="axis_id")
+
+    @model_validator(mode="after")
+    def _validate_uncertainty_without_value(self) -> Observation:
+        """S12: an absent ``value`` implies an absent ``uncertainty``.
+
+        An uncertainty bound is meaningless without the value it bounds --
+        "the error bar on a number that was never reported" is not a fact
+        this schema can represent, so a populated ``uncertainty`` alongside
+        ``value=Absent(...)`` is rejected outright rather than silently
+        accepted as orphaned metadata.
+        """
+        if isinstance(self.value, Absent) and not isinstance(self.uncertainty, Absent):
+            raise ValueError(
+                f"Observation(axis_id={self.axis_id!r}): uncertainty without a value -- an uncertainty "
+                "bound on a value that was never reported is not a representable fact; uncertainty "
+                "must be Absent whenever value is Absent"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_uncertainty_bound_quantity(self) -> Observation:
+        _validate_uncertainty_bound_quantity_kind(
+            uncertainty=self.uncertainty, value=self.value, where=f"Observation(axis_id={self.axis_id!r})"
+        )
+        return self
+
+
+class DataPoint(BaseModel):
+    """One located point of a :class:`Series`: its coordinates, its
+    observations, and an optional per-point composition override."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    point_id: str
+    coordinates: tuple[Coordinate, ...]
+    observations: tuple[Observation, ...]
+    composition: Maybe[Composition]
+    """A per-point composition override. ``Maybe``-typed with no default:
+    most points inherit the dataset's single :class:`DatasetEnvelope`
+    composition unchanged, but a series that sweeps composition itself
+    (rather than sweeping equivalence ratio at one fixed composition) needs
+    a way to say so per point, and an unstated per-point composition must
+    stay distinguishable from an explicit ``SAME_AS_DATASET`` claim -- see
+    :class:`AbsenceReason`."""
+
+    @field_validator("point_id")
+    @classmethod
+    def _validate_point_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="point_id")
+
+
+class Series(BaseModel):
+    """One aggregate series of data points extracted from a source: a set
+    of declared axes, whole-series constants, and the points themselves.
+
+    This is the M-D2b(a) aggregate: the structural container that lets a
+    multi-point table or digitized plot be recorded as ONE grounded object
+    (one ``source_form``, one ``value_origin``, one fixed axis schema)
+    rather than as N independent, uncorrelated :class:`MeasuredValue`
+    fragments with no shared structure tying them together as one dataset.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    series_id: str
+    source_form: SourceForm
+    value_origin: ValueOrigin
+    axes: tuple[AxisDeclaration, ...]
+    constants: tuple[Coordinate, ...]
+    points: tuple[DataPoint, ...]
+
+    @field_validator("series_id")
+    @classmethod
+    def _validate_series_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="series_id")
+
+    @model_validator(mode="after")
+    def _validate_no_duplicate_axis_id(self) -> Series:
+        """S1: reject a repeated ``axis_id`` among ``axes``.
+
+        Every downstream lookup (S3-S5, S8, S9, S11, and V4) indexes axes BY
+        ``axis_id``; a duplicate id would make "which axis declaration does
+        this coordinate/observation's axis_id refer to" ill-defined.
+        """
+        seen: set[str] = set()
+        for axis in self.axes:
+            if axis.axis_id in seen:
+                raise ValueError(
+                    f"Series(series_id={self.series_id!r}): duplicate axis_id {axis.axis_id!r} in axes"
+                )
+            seen.add(axis.axis_id)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_axes_sorted_and_nonempty(self) -> Series:
+        """S2: ``axes`` must be sorted ascending by ``axis_id`` and
+        non-empty.
+
+        Deliberately checked here rather than via ``Field(min_length=1)``,
+        so that BOTH the sortedness failure and the non-emptiness failure
+        raise through the same marker-bearing message: a bare
+        ``Field(min_length=1)`` failure carries pydantic's own generic
+        "too_short" text, which a mutation test could satisfy whether or
+        not this validator's actual sortedness check exists at all (the
+        exact mutation-testing failure mode this spec calls out).
+        """
+        expected = tuple(sorted(self.axes, key=lambda axis: axis.axis_id))
+        if not self.axes or self.axes != expected:
+            raise ValueError(
+                f"Series(series_id={self.series_id!r}): axes must be sorted ascending by axis_id and "
+                "must contain at least one axis"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_has_coordinate_axis(self) -> Series:
+        """S3: a series must declare at least one ``COORDINATE`` axis.
+
+        A series with zero locating axes cannot place a point among its
+        siblings at all -- locating a point is the entire purpose a
+        ``COORDINATE`` axis serves.
+        """
+        if not any(axis.role == AxisRole.COORDINATE for axis in self.axes):
+            raise ValueError(
+                f"Series(series_id={self.series_id!r}) must declare at least one coordinate axis"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_has_observation_axis(self) -> Series:
+        """S4: a series must declare at least one ``OBSERVATION`` axis.
+
+        A series with no observation axis records locations but nothing
+        measured at them -- it would be a table of coordinates with no
+        data, not a dataset.
+        """
+        if not any(axis.role == AxisRole.OBSERVATION for axis in self.axes):
+            raise ValueError(
+                f"Series(series_id={self.series_id!r}) must declare at least one observation axis"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_constants_cover_constant_axes(self) -> Series:
+        """S5: ``constants`` must cover EXACTLY the series' ``CONSTANT``
+        axes, sorted by ``axis_id``, with no duplicates.
+
+        Reuses the idiom from
+        :meth:`Composition._enforce_basis_matches_component_quantity_kind`:
+        a single list-equality check against a canonically sorted expected
+        id list simultaneously enforces set-coverage (every CONSTANT axis
+        has a value and nothing extra is present), sortedness, AND
+        uniqueness in one comparison.
+        """
+        constant_axis_ids = sorted(axis.axis_id for axis in self.axes if axis.role == AxisRole.CONSTANT)
+        actual = [constant.axis_id for constant in self.constants]
+        if actual != constant_axis_ids:
+            raise ValueError(
+                f"Series(series_id={self.series_id!r}): constants must cover exactly the series' "
+                f"CONSTANT axes, sorted by axis_id with no duplicates (expected {constant_axis_ids!r}, "
+                f"got {actual!r})"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_no_duplicate_point_id(self) -> Series:
+        """S6: reject a repeated ``point_id`` among ``points``."""
+        seen: set[str] = set()
+        for point in self.points:
+            if point.point_id in seen:
+                raise ValueError(
+                    f"Series(series_id={self.series_id!r}): duplicate point_id {point.point_id!r} in "
+                    "points"
+                )
+            seen.add(point.point_id)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_points_sorted_and_nonempty(self) -> Series:
+        """S7: ``points`` must be sorted ascending by ``point_id`` and
+        non-empty -- same rationale as S2 for bundling both checks under
+        one custom message rather than relying on ``Field(min_length=1)``.
+        """
+        expected = tuple(sorted(self.points, key=lambda point: point.point_id))
+        if not self.points or self.points != expected:
+            raise ValueError(
+                f"Series(series_id={self.series_id!r}): points must be sorted ascending by point_id "
+                "and must contain at least one point"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_coordinates_cover_coordinate_axes(self) -> Series:
+        """S8: each point's ``coordinates`` must cover EXACTLY the series'
+        ``COORDINATE`` axes, sorted by ``axis_id``, with no duplicates.
+
+        A point missing a coordinate is unlocated -- it cannot be placed
+        among its siblings -- so this is checked per point, not merely
+        summed across the series.
+        """
+        coordinate_axis_ids = sorted(axis.axis_id for axis in self.axes if axis.role == AxisRole.COORDINATE)
+        for point in self.points:
+            actual = [coord.axis_id for coord in point.coordinates]
+            if actual != coordinate_axis_ids:
+                raise ValueError(
+                    f"Series(series_id={self.series_id!r}) point {point.point_id!r}: coordinates must "
+                    f"cover exactly the series' COORDINATE axes, sorted by axis_id with no duplicates "
+                    f"(expected {coordinate_axis_ids!r}, got {actual!r}) -- a point missing a "
+                    "coordinate is unlocated"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_observations_cover_observation_axes(self) -> Series:
+        """S9: each point's ``observations`` must cover EXACTLY the series'
+        ``OBSERVATION`` axes, sorted by ``axis_id``, with no duplicates.
+
+        The slot must exist for every ``OBSERVATION`` axis regardless of
+        whether the source actually reported a value there -- absence is
+        expressed by ``value=Absent(...)``, never by omitting the slot
+        itself (the round of review that settled on "distinct states,
+        never a missing field" for exactly this reason).
+        """
+        observation_axis_ids = sorted(axis.axis_id for axis in self.axes if axis.role == AxisRole.OBSERVATION)
+        for point in self.points:
+            actual = [obs.axis_id for obs in point.observations]
+            if actual != observation_axis_ids:
+                raise ValueError(
+                    f"Series(series_id={self.series_id!r}) point {point.point_id!r}: observations must "
+                    f"cover exactly the series' OBSERVATION axes, sorted by axis_id with no duplicates "
+                    f"(expected {observation_axis_ids!r}, got {actual!r}) -- absence is expressed by "
+                    "value=Absent(...), never by omitting the slot"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_points_record_observed_value(self) -> Series:
+        """S10: every point must carry at least one observation whose
+        ``value`` is a present :class:`MeasuredValue`.
+
+        A point where every single observation is ``Absent`` records a
+        location and nothing else -- it contributes no actual data to the
+        series, which is indistinguishable from the point not existing at
+        all except that it silently pads the point count.
+        """
+        for point in self.points:
+            if not any(isinstance(obs.value, MeasuredValue) for obs in point.observations):
+                raise ValueError(
+                    f"Series(series_id={self.series_id!r}) point {point.point_id!r} records no "
+                    "observed value -- at least one observation must carry a present MeasuredValue"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_quantity_kind_matches_axis(self) -> Series:
+        """S11: every present coordinate/observation/constant value's
+        ``quantity_kind`` must equal the ``quantity_kind`` its declared
+        axis carries.
+
+        Without this, ``axis_id`` is just a free-text label a downstream
+        consumer must trust blind -- a value physically bound (see
+        :class:`MeasuredValue`) to ``QuantityKind.TEMPERATURE`` could sit
+        under an axis declared ``QuantityKind.PRESSURE`` and nothing would
+        ever notice, exactly the label/physical-quantity mismatch
+        :class:`Composition`'s basis check exists to prevent one layer up.
+        Runs AFTER S8/S9 (declaration order), so every ``axis_id`` looked
+        up here is already known to name a real axis.
+        """
+        axis_by_id = {axis.axis_id: axis for axis in self.axes}
+
+        def _check(axis_id: str, value: Maybe[MeasuredValue], where: str) -> None:
+            if isinstance(value, Absent):
+                return
+            expected = axis_by_id[axis_id].quantity_kind
+            if value.quantity_kind is not expected:
+                raise ValueError(
+                    f"{where}: quantity_kind disagrees with its axis -- value.quantity_kind="
+                    f"{value.quantity_kind!r} but axis {axis_id!r} declares quantity_kind={expected!r}"
+                )
+
+        for constant in self.constants:
+            _check(constant.axis_id, constant.value, f"Series(series_id={self.series_id!r}) constant")
+        for point in self.points:
+            for coord in point.coordinates:
+                _check(
+                    coord.axis_id,
+                    coord.value,
+                    f"Series(series_id={self.series_id!r}) point {point.point_id!r} coordinate",
+                )
+            for obs in point.observations:
+                _check(
+                    obs.axis_id,
+                    obs.value,
+                    f"Series(series_id={self.series_id!r}) point {point.point_id!r} observation",
+                )
+        return self
+
+
+def _check_source_form_for_ref(
+    *, source_form: SourceForm, ref: SourceRef, node_kind: SourceNodeKind, where: str
+) -> None:
+    """V4: constrain a ``value_ref`` to match the ``source_form`` claimed
+    for the :class:`Series` it belongs to.
+
+    Every branch below is constrained -- there is deliberately no
+    unconstrained escape branch, so a ``source_form`` this table has no
+    entry for would be a loud crash (a missing dict-style ``elif``/``else``
+    match) rather than a silently unchecked case; see
+    :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` for the same design
+    philosophy applied to locator/node compatibility.
+    """
+    if source_form == SourceForm.TABULAR:
+        if ref.locator.kind is not LocatorKind.TABLE_CELL:
+            raise ValueError(
+                f"{where}: source_form=TABULAR requires value_ref.locator.kind=TABLE_CELL, got "
+                f"{ref.locator.kind!r}"
+            )
+    elif source_form == SourceForm.DIGITIZED:
+        if node_kind is not SourceNodeKind.FIGURE_CROP:
+            raise ValueError(
+                f"{where}: source_form=DIGITIZED requires value_ref to target a FIGURE_CROP node, got "
+                f"node kind={node_kind!r}"
+            )
+    elif source_form == SourceForm.TEXTUAL:
+        if ref.locator.kind is LocatorKind.TABLE_CELL or node_kind is SourceNodeKind.FIGURE_CROP:
+            raise ValueError(
+                f"{where}: source_form=TEXTUAL requires value_ref to be neither a TABLE_CELL locator "
+                f"nor a reference to a FIGURE_CROP node, got locator kind={ref.locator.kind!r} node "
+                f"kind={node_kind!r}"
+            )
+    else:  # pragma: no cover - exhaustiveness guard, see docstring
+        raise AssertionError(f"unhandled source_form={source_form!r}; every SourceForm member must be handled above")
+
+
 _LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]] = {
     LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
     LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
@@ -1437,6 +2020,27 @@ class DatasetEnvelope(BaseModel):
 
     source_graph: SourceGraph
     composition: Maybe[Composition]
+    series: tuple[Series, ...] = Field(min_length=1)
+    """Series aggregates (M-D2b part a) extracted from this source, each a
+    self-contained set of axes/constants/points -- see :class:`Series`.
+
+    REQUIRED, with no default and at least one entry: a dataset envelope that
+    carries no series carries no dataset. Such an envelope would be the
+    "audit-shaped artifact" this whole milestone exists to eliminate -- it
+    has a validated source graph and possibly a composition, so it LOOKS like
+    grounded extracted data, while containing nothing a model could ever be
+    compared against.
+
+    An earlier revision gave this field a ``()`` default, justified as
+    backward compatibility and as avoiding a JSON round-trip failure in
+    ``TestFunctionalRealisticEnvelope``. Both reasons were wrong. Nothing has
+    ever been stored under this schema (the branch is unreleased), so there
+    is no compatibility to preserve; and the round-trip failure was a signal
+    that the FIXTURE was modelling an envelope that should not exist, not a
+    reason to weaken the field. Reshaping the schema so an existing test
+    keeps passing is precisely the "build to pass the check" antipattern --
+    the fixture was fixed instead.
+    """
 
     @model_validator(mode="after")
     def _validate_grounded(self) -> DatasetEnvelope:
@@ -1445,18 +2049,14 @@ class DatasetEnvelope(BaseModel):
         An envelope that cites nothing is, by definition, ungrounded -- and
         making that impossible to construct is precisely why this project's
         schema layer exists at all (see the module docstring's "cardinal
-        rule"). This currently makes ``composition=Absent(...)``
-        unconstructible: today ``composition`` is the ONLY field that can
-        carry a ``SourceRef``, so an envelope with no composition carries
-        none anywhere, and this validator refuses it. That is a real,
-        temporary limitation of this milestone (M-D2b part c), not a design
-        claim that ``composition`` must always be present: once the series
-        aggregate (M-D2b part a) adds its own ref-bearing payload alongside
-        ``composition``, an envelope with ``composition=Absent(...)`` but a
-        populated series becomes constructible again -- the ``Absent``
-        branch is a real future state this validator will naturally admit
-        once there is another field to ground the envelope through, not a
-        dead branch kept around for cosmetic completeness.
+        rule"). Today, both ``composition`` and ``series`` can carry a
+        ``SourceRef``, so ``composition=Absent(...)`` IS constructible as
+        long as ``series`` is populated (a series' axis labels and
+        point/constant values each ground the envelope on their own) --
+        this validator's logic did not change to admit that case, since
+        :func:`iter_source_refs` already walks ``series`` generically (see
+        its own docstring); only this note needed updating once ``series``
+        existed to ground an envelope through.
         """
         if next(iter_source_refs(self), None) is None:
             raise ValueError(
@@ -1537,4 +2137,86 @@ class DatasetEnvelope(BaseModel):
                     f"{node.node_id!r} of kind={node.kind.value!r}, but {locator_kind.value!r} may only "
                     f"target nodes of kind {sorted(kind.value for kind in compatible_kinds)!r}"
                 )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_no_duplicate_series_id(self) -> DatasetEnvelope:
+        """E1a: reject a repeated ``series_id`` among ``series``.
+
+        A duplicate ``series_id`` would make "which series does this id
+        refer to" ambiguous for any downstream consumer that indexes series
+        by id -- the same failure mode S1/S6 close one level down, for axes
+        and points within a single series.
+        """
+        seen: set[str] = set()
+        for series in self.series:
+            if series.series_id in seen:
+                raise ValueError(f"DatasetEnvelope: duplicate series_id {series.series_id!r} in series")
+            seen.add(series.series_id)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_series_sorted(self) -> DatasetEnvelope:
+        """E1b: ``series`` must be sorted ascending by ``series_id``.
+
+        Deliberately does NOT also assert non-emptiness the way S2/S7 do on
+        :class:`Series` (``axes``/``points``): unlike those fields, an empty
+        ``series`` tuple on :class:`DatasetEnvelope` is a legitimate,
+        backward-compatible state (envelopes predating M-D2b(a) have none),
+        and ``sorted(()) == ()`` trivially passes this check for that case
+        with no special-casing needed -- see :attr:`series`'s own docstring
+        for why non-emptiness cannot be enforced as a ``Field`` constraint
+        here without breaking a JSON round trip of such an envelope.
+        """
+        expected = tuple(sorted(self.series, key=lambda series: series.series_id))
+        if self.series != expected:
+            raise ValueError("DatasetEnvelope: series must be sorted ascending by series_id")
+        return self
+
+    @model_validator(mode="after")
+    def _validate_source_form_constrains_value_refs(self) -> DatasetEnvelope:
+        """V4: a series' ``source_form`` constrains where its points' values
+        may be grounded -- see :func:`_check_source_form_for_ref` for the
+        per-branch rule and why every branch is constrained with no escape
+        hatch.
+
+        Only ``Coordinate.value.value_ref`` and a present
+        ``Observation.value.value_ref`` are constrained -- NOT
+        ``unit_ref``, ``label_ref``, or any composition ref: this validator
+        is about where the NUMBER itself was read from, not about where its
+        unit or axis label came from (a TABULAR series can still cite its
+        unit spelling from running prose, for instance).
+
+        Runs AFTER V1 (``_validate_refs_resolve``, declaration order), so
+        every ``ref.node_id`` looked up here via ``self.source_graph.node``
+        is already known to resolve.
+        """
+        for series in self.series:
+            for point in series.points:
+                for coord in point.coordinates:
+                    ref = coord.value.value_ref
+                    node = self.source_graph.node(ref.node_id)
+                    _check_source_form_for_ref(
+                        source_form=series.source_form,
+                        ref=ref,
+                        node_kind=node.kind,
+                        where=(
+                            f"Series(series_id={series.series_id!r}) point {point.point_id!r} "
+                            f"coordinate axis_id={coord.axis_id!r}"
+                        ),
+                    )
+                for obs in point.observations:
+                    if isinstance(obs.value, Absent):
+                        continue
+                    ref = obs.value.value_ref
+                    node = self.source_graph.node(ref.node_id)
+                    _check_source_form_for_ref(
+                        source_form=series.source_form,
+                        ref=ref,
+                        node_kind=node.kind,
+                        where=(
+                            f"Series(series_id={series.series_id!r}) point {point.point_id!r} "
+                            f"observation axis_id={obs.axis_id!r}"
+                        ),
+                    )
         return self

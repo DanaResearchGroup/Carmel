@@ -22,23 +22,36 @@ from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
     ArchiveOrigin,
+    AxisDeclaration,
+    AxisRole,
     BBox,
     BBoxLocator,
+    CaptionLabelKey,
     ComponentRole,
     Composition,
     CompositionBasis,
     CompositionComponent,
     CompositionResolution,
+    Coordinate,
     CoordinateFrame,
+    DataPoint,
     DatasetEnvelope,
     Maybe,
     MeasuredValue,
+    Observation,
     QuantityKind,
+    Series,
+    SourceForm,
     SourceGraph,
     SourceNode,
     SourceNodeKind,
     SourceRef,
     TableCellLocator,
+    Uncertainty,
+    UncertaintyBasis,
+    UncertaintyKind,
+    UncertaintyScale,
+    ValueOrigin,
     XPathLocator,
     iter_source_refs,
 )
@@ -93,7 +106,9 @@ def _bbox_ref(node_id: str) -> SourceRef:
 
 
 def _table_ref(node_id: str, row: int = 0, col: int = 1) -> SourceRef:
-    return SourceRef(node_id=node_id, locator=TableCellLocator(row=row, col=col))
+    return SourceRef(
+        node_id=node_id, locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=row, col=col)
+    )
 
 
 def _xpath_ref(node_id: str, xpath: str = "//table/row[1]/cell[1]") -> SourceRef:
@@ -186,13 +201,169 @@ def _envelope_with_value_ref_locator(locator: object, node_kind: SourceNodeKind)
         equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         components=[CompositionComponent(species_raw_name="H2", amount=amount, role=ComponentRole.FUEL)],
     )
-    return DatasetEnvelope(source_graph=graph, composition=composition)
+    return DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("unit-root"),))
+
+
+_UNIT_FOR_QUANTITY_KIND: dict[QuantityKind, tuple[str, str]] = {
+    QuantityKind.TEMPERATURE: ("K", "K"),
+    QuantityKind.EQUIVALENCE_RATIO: ("-", "1"),
+    QuantityKind.VELOCITY: ("cm/s", "cm/s"),
+}
+"""(unit_raw, unit_normalized) each fixture-used QuantityKind actually
+accepts in TABLE_V1 -- an uncertainty bound is itself a MeasuredValue, so
+it must pass the same unit/quantity_kind conversion-table check (including
+the table's own normalized spelling) as any other value."""
+
+
+def _uncertainty(value_ref: SourceRef, unit_ref: SourceRef, quantity_kind: QuantityKind) -> Uncertainty:
+    """A fully-populated Uncertainty (kind/basis/scale/upper/lower all
+    present, both bounds referenced) -- used by the ref-walk drift meta-test
+    so every series.*.uncertainty.{upper,lower}.{value_ref,unit_ref} location
+    is actually reachable."""
+    unit_raw, unit_normalized = _UNIT_FOR_QUANTITY_KIND[quantity_kind]
+
+    def _bound(raw_text: str, row: int) -> MeasuredValue:
+        return MeasuredValue(
+            raw_text=raw_text,
+            canonical_decimal_value=raw_text,
+            quantity_kind=quantity_kind,
+            unit_raw=unit_raw,
+            unit_normalized=unit_normalized,
+            conversion_table_sha256=TABLE_V1.sha256,
+            repairs=(),
+            value_ref=_table_ref(value_ref.node_id, row=row, col=0),
+            unit_ref=_table_ref(unit_ref.node_id, row=row, col=1),
+        )
+
+    return Uncertainty(
+        kind=UncertaintyKind.STD_DEV,
+        basis=UncertaintyBasis.ABSOLUTE,
+        scale=UncertaintyScale.LINEAR,
+        upper=_bound("0.1", row=90),
+        lower=_bound("0.1", row=91),
+    )
+
+
+def _fully_populated_series(node_id: str = "paper") -> Series:
+    """A Series with every SourceRef-bearing field actually populated:
+    one coordinate axis, one observation axis, one constant axis, a
+    constant covering that axis (with a fully-populated uncertainty), and
+    one point whose coordinates/observations/composition are all likewise
+    fully populated -- used by the ref-walk drift meta-test to make sure
+    every series.* SourceRef location is actually reachable, not just
+    statically declared."""
+    phi_axis = AxisDeclaration(
+        axis_id="phi",
+        role=AxisRole.COORDINATE,
+        quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+        label_raw="phi",
+        label_ref=_table_ref(node_id, row=10, col=0),
+    )
+    sl_axis = AxisDeclaration(
+        axis_id="sl",
+        role=AxisRole.OBSERVATION,
+        quantity_kind=QuantityKind.VELOCITY,
+        label_raw="S_L (cm/s)",
+        label_ref=_table_ref(node_id, row=10, col=1),
+    )
+    const_axis = AxisDeclaration(
+        axis_id="temperature",
+        role=AxisRole.CONSTANT,
+        quantity_kind=QuantityKind.TEMPERATURE,
+        label_raw="T (K)",
+        label_ref=_table_ref(node_id, row=10, col=2),
+    )
+
+    const_value = MeasuredValue(
+        raw_text="298",
+        canonical_decimal_value="298",
+        quantity_kind=QuantityKind.TEMPERATURE,
+        unit_raw="K",
+        unit_normalized="K",
+        conversion_table_sha256=TABLE_V1.sha256,
+        repairs=(),
+        value_ref=_table_ref(node_id, row=11, col=0),
+        unit_ref=_table_ref(node_id, row=11, col=1),
+    )
+    constant = Coordinate(
+        axis_id="temperature",
+        value=const_value,
+        uncertainty=_uncertainty(
+            value_ref=_table_ref(node_id), unit_ref=_table_ref(node_id), quantity_kind=QuantityKind.TEMPERATURE
+        ),
+    )
+
+    phi_value = _equivalence_ratio_amount(
+        value_ref=_table_ref(node_id, row=20, col=0),
+        unit_ref=_table_ref(node_id, row=20, col=1),
+    )
+    coordinate = Coordinate(
+        axis_id="phi",
+        value=phi_value,
+        uncertainty=_uncertainty(
+            value_ref=_table_ref(node_id), unit_ref=_table_ref(node_id), quantity_kind=QuantityKind.EQUIVALENCE_RATIO
+        ),
+    )
+
+    sl_value = MeasuredValue(
+        raw_text="35.0",
+        canonical_decimal_value="35.0",
+        quantity_kind=QuantityKind.VELOCITY,
+        unit_raw="cm/s",
+        unit_normalized="cm/s",
+        conversion_table_sha256=TABLE_V1.sha256,
+        repairs=(),
+        value_ref=_table_ref(node_id, row=21, col=0),
+        unit_ref=_table_ref(node_id, row=21, col=1),
+    )
+    observation = Observation(
+        axis_id="sl",
+        value=sl_value,
+        uncertainty=_uncertainty(
+            value_ref=_table_ref(node_id), unit_ref=_table_ref(node_id), quantity_kind=QuantityKind.VELOCITY
+        ),
+    )
+
+    point_eq_ratio = _equivalence_ratio_amount(
+        value_ref=_table_ref(node_id, row=30, col=0),
+        unit_ref=_table_ref(node_id, row=30, col=1),
+    )
+    point_component_amount = _mole_fraction_amount(
+        value_ref=_table_ref(node_id, row=31, col=0),
+        unit_ref=_table_ref(node_id, row=31, col=1),
+    )
+    point_composition = Composition(
+        raw_name="4% H2 in N2",
+        resolution=CompositionResolution.RESOLVED_COMPONENTS,
+        basis=CompositionBasis.MOLE_FRACTION,
+        equivalence_ratio=point_eq_ratio,
+        components=[
+            CompositionComponent(species_raw_name="H2", amount=point_component_amount, role=ComponentRole.FUEL)
+        ],
+    )
+
+    point = DataPoint(
+        point_id="p1",
+        coordinates=(coordinate,),
+        observations=(observation,),
+        composition=point_composition,
+    )
+
+    return Series(
+        series_id="s1",
+        source_form=SourceForm.TABULAR,
+        value_origin=ValueOrigin.EXPERIMENTAL,
+        axes=(phi_axis, sl_axis, const_axis),
+        constants=(constant,),
+        points=(point,),
+    )
 
 
 def _fully_populated_envelope() -> DatasetEnvelope:
     """A DatasetEnvelope with every SourceRef-bearing field actually
     populated (including equivalence_ratio, which is Absent in most other
-    fixtures here) -- used by the ref-walk drift meta-test."""
+    fixtures here, and the series aggregate added by M-D2b part a) --
+    used by the ref-walk drift meta-test."""
     paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
     graph = SourceGraph(nodes=(paper,))
     eq_ratio = _equivalence_ratio_amount(
@@ -210,7 +381,7 @@ def _fully_populated_envelope() -> DatasetEnvelope:
         equivalence_ratio=eq_ratio,
         components=[CompositionComponent(species_raw_name="H2", amount=component_amount, role=ComponentRole.FUEL)],
     )
-    return DatasetEnvelope(source_graph=graph, composition=composition)
+    return DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
 
 
 def _strip_list_indices(path: str) -> str:
@@ -554,7 +725,7 @@ class TestDatasetEnvelopeRefsResolve:
             equivalence_ratio=eq_ratio,
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition)
+            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
         assert "equivalence_ratio" in msg
@@ -573,7 +744,7 @@ class TestDatasetEnvelopeRefsResolve:
             equivalence_ratio=eq_ratio,
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition)
+            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
         assert "equivalence_ratio" in msg
@@ -586,7 +757,7 @@ class TestDatasetEnvelopeRefsResolve:
             unit_ref=_table_ref("paper"),
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition)
+            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
         msg = str(excinfo.value)
         assert "ghost" in msg
         assert "components" in msg
@@ -600,7 +771,7 @@ class TestDatasetEnvelopeRefsResolve:
             unit_ref=_bbox_ref("ghost"),
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition)
+            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
         msg = str(excinfo.value)
         assert "ghost" in msg
         assert "components" in msg
@@ -621,12 +792,21 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             unit_ref=_table_ref("paper"),
         )
         with pytest.raises(ValidationError, match="decorative"):
-            DatasetEnvelope(source_graph=graph, composition=composition)
+            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
 
     def test_unreferenced_ancestor_of_a_referenced_node_is_allowed(self) -> None:
         """The PAPER_PDF root is never targeted directly, but its
         FIGURE_CROP child is -- an ancestor of a targeted node is not
-        decorative."""
+        decorative.
+
+        The series added here (required since DatasetEnvelope.series gained
+        Field(min_length=1)) is deliberately built to reference ONLY "crop",
+        never "paper" -- reusing the shared _fully_populated_series("paper")
+        fixture would make "paper" directly referenced too, which would
+        make this test pass without ever exercising the ancestor-is-allowed
+        path it is named for. A DIGITIZED series (rather than TABULAR) is
+        used because its value_refs must target a FIGURE_CROP node (V4),
+        matching "crop"'s own kind."""
         paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
         crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_B, parent_node_id="paper")
         graph = SourceGraph(nodes=(paper, crop))
@@ -634,33 +814,79 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             value_ref=_bbox_ref("crop"),
             unit_ref=SourceRef(node_id="crop", locator=BBoxLocator(bbox=_bbox(x0="1", y0="1", x1="2", y1="2"))),
         )
-        envelope = DatasetEnvelope(source_graph=graph, composition=composition)
+        phi_axis = AxisDeclaration(
+            axis_id="phi",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+            label_raw="phi",
+            label_ref=_bbox_ref("crop"),
+        )
+        sl_axis = AxisDeclaration(
+            axis_id="sl",
+            role=AxisRole.OBSERVATION,
+            quantity_kind=QuantityKind.VELOCITY,
+            label_raw="S_L (cm/s)",
+            label_ref=_bbox_ref("crop"),
+        )
+        coordinate = Coordinate(
+            axis_id="phi",
+            value=_equivalence_ratio_amount(value_ref=_bbox_ref("crop"), unit_ref=_bbox_ref("crop")),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        observation = Observation(
+            axis_id="sl",
+            value=MeasuredValue(
+                raw_text="35.0",
+                canonical_decimal_value="35.0",
+                quantity_kind=QuantityKind.VELOCITY,
+                unit_raw="cm/s",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
+                repairs=(),
+                value_ref=_bbox_ref("crop"),
+                unit_ref=_bbox_ref("crop"),
+            ),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        point = DataPoint(
+            point_id="p1",
+            coordinates=(coordinate,),
+            observations=(observation,),
+            composition=Absent(reason=AbsenceReason.SAME_AS_DATASET),
+        )
+        series_referencing_crop_only = Series(
+            series_id="s1",
+            source_form=SourceForm.DIGITIZED,
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            axes=(phi_axis, sl_axis),
+            constants=(),
+            points=(point,),
+        )
+        envelope = DatasetEnvelope(source_graph=graph, composition=composition, series=(series_referencing_crop_only,))
         assert envelope.source_graph.node("paper").parent_node_id is None
 
-    def test_an_envelope_citing_nothing_is_rejected_as_ungrounded(self) -> None:
-        """V0, and it MUST match on "ungrounded" rather than on a bare
-        ValidationError.
+    def test_an_envelope_citing_nothing_can_no_longer_be_constructed_at_all(self) -> None:
+        """This test's predecessor asserted V0 fires with match="ungrounded".
+        Its own docstring flagged the expiry, and M-D2b part (a) triggered it.
 
-        V0 is subsumed by V2 as a rejection: SourceGraph requires at least one
-        node, so an envelope with zero SourceRefs always leaves some node
-        unreferenced, and V2 would reject it anyway. Mutation testing proved
-        the consequence -- with V0's raise neutralised, all 48 tests still
-        passed, because this test was being satisfied by V2 next door.
+        `series` is now required with min_length=1, every Series needs at
+        least one AxisDeclaration, and every AxisDeclaration carries a bare
+        required `label_ref: SourceRef`. So a ref-free envelope is no longer
+        constructible and V0's raise is UNREACHABLE. Rather than keep an
+        assertion that can never run the code it names -- an inert test, the
+        exact failure mutation testing exposed twice in the previous
+        milestone -- this pins what NOW rejects the case, and
+        `TestCompositionAbsentGroundedThroughSeries::
+        test_the_structural_chain_that_makes_v0_unreachable_is_intact`
+        (tests/test_dataset_series.py) guards the three links that keep V0
+        unreachable, so weakening any of them fails loudly.
 
-        V0 is kept, and pinned this way, because it is not redundant as a
-        DIAGNOSIS. "this envelope cites nothing at all" and "node 'paper' is
-        decorative" describe very different mistakes to whoever has to fix the
-        extractor, and V0 runs first precisely so the clearer one wins. Matching
-        its distinctive word is what keeps that promise honest.
-
-        Note the expiry: composition=Absent is unconstructible only while
-        composition is the sole ref-bearing field. When the series aggregate
-        (M-D2b part a) lands, an Absent composition alongside ref-bearing
-        series becomes a legitimate, constructible state and this test's
-        premise changes."""
+        V0 itself is retained on the I3 precedent: a guard kept because a
+        future widening of the schema makes its absence harmful.
+        """
         graph = _minimal_graph("paper")
-        with pytest.raises(ValidationError, match="ungrounded"):
-            DatasetEnvelope(source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE))
+        with pytest.raises(ValidationError, match="at least 1 item"):
+            DatasetEnvelope(source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=())
 
 
 class TestDatasetEnvelopeLocatorKindCompatibility:
@@ -680,14 +906,17 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
 
     def test_table_cell_locator_rejected_against_figure_crop_node(self) -> None:
         with pytest.raises(ValidationError) as excinfo:
-            _envelope_with_value_ref_locator(TableCellLocator(row=0, col=0), SourceNodeKind.FIGURE_CROP)
+            _envelope_with_value_ref_locator(
+                TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=0), SourceNodeKind.FIGURE_CROP
+            )
         msg = str(excinfo.value).lower()
         assert "table_cell" in msg
         assert SourceNodeKind.FIGURE_CROP.value in msg
 
     def test_table_cell_locator_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
         for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
-            _envelope_with_value_ref_locator(TableCellLocator(row=0, col=0), kind)
+            locator = TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=0)
+            _envelope_with_value_ref_locator(locator, kind)
 
     def test_bbox_locator_rejected_against_jats_xml_node(self) -> None:
         with pytest.raises(ValidationError) as excinfo:
@@ -746,7 +975,7 @@ class TestFunctionalRealisticEnvelope:
             equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             components=[h2, n2, o2],
         )
-        return DatasetEnvelope(source_graph=graph, composition=composition)
+        return DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
 
     def test_constructs(self) -> None:
         envelope = self._build()

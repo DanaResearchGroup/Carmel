@@ -13,6 +13,7 @@ from carmel.schemas.datasets import (
     ArchiveOrigin,
     BBox,
     BBoxLocator,
+    CaptionLabelKey,
     ComponentRole,
     Composition,
     CompositionBasis,
@@ -79,7 +80,9 @@ def _bbox_ref(node_id: str = "n1") -> SourceRef:
 
 
 def _table_ref(node_id: str = "n1", row: int = 0, col: int = 1) -> SourceRef:
-    return SourceRef(node_id=node_id, locator=TableCellLocator(row=row, col=col))
+    return SourceRef(
+        node_id=node_id, locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=row, col=col)
+    )
 
 
 def _measured_value(
@@ -373,11 +376,11 @@ class TestSourceGraph:
     def test_table_cell_locator_rejects_negative_row(self) -> None:
         """A negative row locates no real table cell."""
         with pytest.raises(ValidationError):
-            TableCellLocator(row=-1, col=0)
+            TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=-1, col=0)
 
     def test_table_cell_locator_rejects_negative_col(self) -> None:
         with pytest.raises(ValidationError):
-            TableCellLocator(row=0, col=-1)
+            TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=-1)
 
     def test_xpath_locator_ref_round_trips(self) -> None:
         ref = SourceRef(node_id="n1", locator=XPathLocator(xpath="//table/row[1]/cell[2]"))
