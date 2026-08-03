@@ -84,6 +84,8 @@ def _embedded_table_v1() -> EmbeddedConversionTable:
         canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
     )
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+_NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+_NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 
 
 # ---------------------------------------------------------------------------
@@ -97,7 +99,15 @@ def _node(
     sha256: str = SHA_A,
     parent_node_id: str | None = None,
 ) -> SourceNode:
-    return SourceNode(node_id=node_id, kind=kind, sha256=sha256, parent_node_id=parent_node_id, origin=_NO_ORIGIN)
+    return SourceNode(
+        node_id=node_id,
+        kind=kind,
+        sha256=sha256,
+        parent_node_id=parent_node_id,
+        origin=_NO_ORIGIN,
+        extraction=_NO_EXTRACTION,
+        glyph_health=_NO_GLYPH_HEALTH,
+    )
 
 
 def _single_paper_graph(node_id: str = "paper", sha256: str = SHA_A) -> SourceGraph:

@@ -42,6 +42,8 @@ from carmel.schemas.datasets import (
     DataPoint,
     DatasetEnvelope,
     EmbeddedConversionTable,
+    ExtractionBinding,
+    GlyphHealthAssessment,
     Maybe,
     MeasuredValue,
     MemberSheetKey,
@@ -67,7 +69,12 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import units
 from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
+from carmel.services.numeric import GlyphHealth
+from carmel.services.semantic_deps import (
+    CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    GLYPH_HEALTH_DEPENDENCY_ID,
+    current_sha_for,
+)
 from carmel.services.units import TABLE_V1, ConversionTable, IdentityRule
 
 SHA_A = "a" * 64
@@ -94,6 +101,52 @@ _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 so sharing one instance across every _node() call that doesn't need a
 concrete ArchiveOrigin is safe, and avoids a function-call-in-argument-default
 (ruff B008)."""
+
+_NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+"""Module-level singleton default for SourceNode.extraction, matching
+_NO_ORIGIN's reasoning."""
+
+_NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+"""Module-level singleton default for SourceNode.glyph_health, matching
+_NO_ORIGIN's reasoning."""
+
+_HEALTHY_GLYPH_HEALTH = GlyphHealth(
+    suspects_dash_corruption=False,
+    has_thorn_plus_marker=False,
+    has_equals_ambiguity_marker=False,
+    has_slash_c0_minus_marker=False,
+    has_ascii6_uncertainty_marker=False,
+)
+
+_UNHEALTHY_GLYPH_HEALTH = GlyphHealth(
+    suspects_dash_corruption=True,
+    has_thorn_plus_marker=False,
+    has_equals_ambiguity_marker=False,
+    has_slash_c0_minus_marker=False,
+    has_ascii6_uncertainty_marker=False,
+)
+
+
+def _extraction_binding(
+    extracted_sha256: str = SHA_A, extracted_text_sha256: str = SHA_B
+) -> ExtractionBinding:
+    return ExtractionBinding(
+        extracted_sha256=extracted_sha256, extracted_text_sha256=extracted_text_sha256
+    )
+
+
+def _glyph_health_assessment(
+    input_sha256: str = SHA_B, health: GlyphHealth = _HEALTHY_GLYPH_HEALTH
+) -> GlyphHealthAssessment:
+    return GlyphHealthAssessment(
+        health=health,
+        assessor=SemanticDependencyUse(
+            dependency_id=GLYPH_HEALTH_DEPENDENCY_ID,
+            content_sha256=current_sha_for(GLYPH_HEALTH_DEPENDENCY_ID),
+            input_sha256=input_sha256,
+        ),
+    )
+
 
 _CURRENT_REPAIR_DEPENDENCY = SemanticDependencyUse(
     dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
@@ -131,8 +184,18 @@ def _node(
     sha256: str = SHA_A,
     parent_node_id: str | None = None,
     origin: ArchiveOrigin | Absent = _NO_ORIGIN,
+    extraction: ExtractionBinding | Absent = _NO_EXTRACTION,
+    glyph_health: GlyphHealthAssessment | Absent = _NO_GLYPH_HEALTH,
 ) -> SourceNode:
-    return SourceNode(node_id=node_id, kind=kind, sha256=sha256, parent_node_id=parent_node_id, origin=origin)
+    return SourceNode(
+        node_id=node_id,
+        kind=kind,
+        sha256=sha256,
+        parent_node_id=parent_node_id,
+        origin=origin,
+        extraction=extraction,
+        glyph_health=glyph_health,
+    )
 
 
 def _bbox_ref(node_id: str) -> SourceRef:
@@ -673,7 +736,13 @@ def _unwalkable_annotations(
 
 
 def _inspect_annotation_walkability(annotation: object, path: str, seen: frozenset[type]) -> dict[str, object]:
-    if annotation is SourceRef or annotation in _ALLOWED_PRIMITIVE_ANNOTATIONS:
+    # GlyphHealth is allowlisted by name, not by shape: it's a stdlib frozen
+    # dataclass (deliberately not a pydantic BaseModel -- see its own
+    # docstring), so it falls outside this walker's BaseModel-recursion
+    # branch below. It is safe to allowlist because every one of its fields
+    # is a bare bool -- there is no annotation shape inside it that could
+    # possibly carry a SourceRef, so it cannot hide one from either walker.
+    if annotation is SourceRef or annotation is GlyphHealth or annotation in _ALLOWED_PRIMITIVE_ANNOTATIONS:
         return {}
 
     if isinstance(annotation, type):
@@ -902,6 +971,100 @@ class TestSourceGraphDuplicateNodes:
         si_under_jats1 = _node("si-j1", SourceNodeKind.SI_MEMBER, SHA_C, parent_node_id="jats1")
         graph = SourceGraph(nodes=(paper1, jats1, si_under_paper1, si_under_jats1))
         assert graph.node("si-p1").sha256 == graph.node("si-j1").sha256
+
+
+class TestSourceGraphConflictingGlyphHealth:
+    """I5b: two nodes that share raw bytes (the same sha256) but disagree on
+    glyph health are rejected as CONFLICTING -- distinct from I5's "exact
+    duplicate" rejection above, and must not fire for any of that class's
+    fixtures (which never carry a concrete glyph_health at all)."""
+
+    def test_same_bytes_disagreeing_on_glyph_health_is_rejected(self) -> None:
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH),
+        )
+        with pytest.raises(ValidationError, match="CONFLICT"):
+            SourceGraph(nodes=(paper, crop))
+
+    def test_same_bytes_agreeing_on_glyph_health_is_allowed(self) -> None:
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_HEALTHY_GLYPH_HEALTH),
+        )
+        graph = SourceGraph(nodes=(paper, crop))
+        assert graph.node("crop").sha256 == graph.node("paper").sha256
+
+    def test_exact_duplicate_still_reports_duplicate_wording_not_conflict(self) -> None:
+        """A true (kind, sha256, parent_node_id) duplicate must still raise
+        the original 'duplicates an earlier node' message, even when neither
+        node carries glyph_health -- the two rejection paths must stay
+        distinguishable by wording."""
+        a = _node("a", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        b = _node("b", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        with pytest.raises(ValidationError, match="duplicates an earlier node"):
+            SourceGraph(nodes=(a, b))
+
+    def test_same_triple_disagreeing_on_health_reports_conflict_not_duplicate(self) -> None:
+        """The check ORDER is the whole point of this test.
+
+        These two nodes satisfy BOTH invariants at once: they share a
+        (kind, sha256, parent_node_id) triple AND they disagree on glyph
+        health. If the duplicate check runs first they are reported as "an
+        exact repeat" that "adds nothing" -- which is flatly false, since
+        they differ on health, and it points the reader at a redundant node
+        instead of at an irreconcilable pair of assessments.
+
+        The sibling tests above only ever use DIFFERENT roles (PAPER_PDF vs
+        FIGURE_CROP), where the triples differ and the duplicate check never
+        competes -- so they pass either way and cannot catch a reordering.
+        This one can.
+        """
+        a = _node(
+            "a",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
+        )
+        b = _node(
+            "b",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(
+                input_sha256=SHA_B, health=_UNHEALTHY_GLYPH_HEALTH
+            ),
+        )
+        with pytest.raises(ValidationError, match="CONFLICT") as excinfo:
+            SourceGraph(nodes=(a, b))
+        assert "duplicates an earlier node" not in str(excinfo.value)
 
 
 class TestSourceGraphLookupAPI:

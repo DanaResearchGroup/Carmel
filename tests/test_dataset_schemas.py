@@ -24,6 +24,8 @@ from carmel.schemas.datasets import (
     CompositionComponent,
     CompositionResolution,
     CoordinateFrame,
+    ExtractionBinding,
+    GlyphHealthAssessment,
     Maybe,
     MeasuredValue,
     QuantityKind,
@@ -40,8 +42,10 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import semantic_deps
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.numeric import GlyphHealth
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    GLYPH_HEALTH_DEPENDENCY_ID,
     InputPolicy,
     SemanticDependencyDefinition,
     current_sha_for,
@@ -56,6 +60,45 @@ _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 so sharing one instance across every _node() call that doesn't need a
 concrete ArchiveOrigin is safe, and avoids a function-call-in-argument-default
 (ruff B008)."""
+
+_NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+"""Module-level singleton default for SourceNode.extraction, matching
+_NO_ORIGIN's reasoning."""
+
+_NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+"""Module-level singleton default for SourceNode.glyph_health, matching
+_NO_ORIGIN's reasoning."""
+
+_HEALTHY_GLYPH_HEALTH = GlyphHealth(
+    suspects_dash_corruption=False,
+    has_thorn_plus_marker=False,
+    has_equals_ambiguity_marker=False,
+    has_slash_c0_minus_marker=False,
+    has_ascii6_uncertainty_marker=False,
+)
+
+
+def _extraction_binding(
+    extracted_sha256: str = SHA_A, extracted_text_sha256: str = SHA_B
+) -> ExtractionBinding:
+    return ExtractionBinding(
+        extracted_sha256=extracted_sha256, extracted_text_sha256=extracted_text_sha256
+    )
+
+
+def _glyph_health_assessment(
+    input_sha256: str = SHA_B,
+    health: GlyphHealth = _HEALTHY_GLYPH_HEALTH,
+    dependency_id: str = GLYPH_HEALTH_DEPENDENCY_ID,
+) -> GlyphHealthAssessment:
+    return GlyphHealthAssessment(
+        health=health,
+        assessor=SemanticDependencyUse(
+            dependency_id=dependency_id,
+            content_sha256=current_sha_for(GLYPH_HEALTH_DEPENDENCY_ID),
+            input_sha256=input_sha256,
+        ),
+    )
 
 
 def _frame(**kwargs: object) -> CoordinateFrame:
@@ -83,8 +126,17 @@ def _node(
     kind: SourceNodeKind = SourceNodeKind.PAPER_PDF,
     sha256: str = SHA_A,
     origin: ArchiveOrigin | Absent = _NO_ORIGIN,
+    extraction: ExtractionBinding | Absent = _NO_EXTRACTION,
+    glyph_health: GlyphHealthAssessment | Absent = _NO_GLYPH_HEALTH,
 ) -> SourceNode:
-    return SourceNode(node_id=node_id, kind=kind, sha256=sha256, origin=origin)
+    return SourceNode(
+        node_id=node_id,
+        kind=kind,
+        sha256=sha256,
+        origin=origin,
+        extraction=extraction,
+        glyph_health=glyph_health,
+    )
 
 
 def _bbox_ref(node_id: str = "n1") -> SourceRef:
@@ -387,6 +439,8 @@ class TestSourceGraph:
                 kind=SourceNodeKind.PAPER_PDF,
                 sha256="not-a-sha",
                 origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                extraction=_NO_EXTRACTION,
+                glyph_health=_NO_GLYPH_HEALTH,
             )
 
     def test_si_member_can_link_to_parent_paper(self) -> None:
@@ -397,6 +451,8 @@ class TestSourceGraph:
             sha256=SHA_B,
             parent_node_id=parent.node_id,
             origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            extraction=_NO_EXTRACTION,
+            glyph_health=_NO_GLYPH_HEALTH,
         )
         assert member.parent_node_id == "paper"
 
@@ -411,6 +467,8 @@ class TestSourceGraph:
             sha256=SHA_B,
             parent_node_id=parent.node_id,
             origin=ArchiveOrigin(archive_sha256=SHA_A, member_display_path="data/table1.csv"),
+            extraction=_NO_EXTRACTION,
+            glyph_health=_NO_GLYPH_HEALTH,
         )
         assert isinstance(member.origin, ArchiveOrigin)
         assert member.origin.archive_sha256 == SHA_A
@@ -426,7 +484,81 @@ class TestSourceGraph:
                 kind=SourceNodeKind.PAPER_PDF,
                 sha256=SHA_A,
                 origin=ArchiveOrigin(archive_sha256=SHA_B),
+                extraction=_NO_EXTRACTION,
+                glyph_health=_NO_GLYPH_HEALTH,
             )
+
+    def test_extraction_binding_rejects_bad_hex(self) -> None:
+        with pytest.raises(ValidationError):
+            ExtractionBinding(extracted_sha256="not-a-sha", extracted_text_sha256=SHA_B)
+        with pytest.raises(ValidationError):
+            ExtractionBinding(extracted_sha256=SHA_A, extracted_text_sha256="not-a-sha")
+
+    def test_extraction_binding_rejects_uppercase_hex(self) -> None:
+        with pytest.raises(ValidationError):
+            ExtractionBinding(extracted_sha256="A" * 64, extracted_text_sha256=SHA_B)
+
+    def test_extraction_binding_rejects_wrong_length_hex(self) -> None:
+        with pytest.raises(ValidationError):
+            ExtractionBinding(extracted_sha256="a" * 63, extracted_text_sha256=SHA_B)
+
+    def test_extraction_binding_round_trips(self) -> None:
+        binding = _extraction_binding()
+        assert binding.extracted_sha256 == SHA_A
+        assert binding.extracted_text_sha256 == SHA_B
+
+    def test_glyph_health_assessment_rejects_wrong_dependency_id(self) -> None:
+        with pytest.raises(ValidationError):
+            _glyph_health_assessment(dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID)
+
+    def test_glyph_health_assessment_rejects_unknown_content_sha256(self) -> None:
+        with pytest.raises(ValidationError):
+            GlyphHealthAssessment(
+                health=_HEALTHY_GLYPH_HEALTH,
+                assessor=SemanticDependencyUse(
+                    dependency_id=GLYPH_HEALTH_DEPENDENCY_ID,
+                    content_sha256="f" * 64,
+                    input_sha256=SHA_B,
+                ),
+            )
+
+    def test_glyph_health_is_genuinely_immutable(self) -> None:
+        assessment = _glyph_health_assessment()
+        with pytest.raises(Exception):  # noqa: B017 -- dataclasses.FrozenInstanceError
+            assessment.health.suspects_dash_corruption = True
+
+    def test_source_node_rejects_glyph_health_without_extraction(self) -> None:
+        with pytest.raises(ValidationError):
+            _node(extraction=_NO_EXTRACTION, glyph_health=_glyph_health_assessment())
+
+    def test_source_node_rejects_glyph_health_input_sha_mismatch(self) -> None:
+        with pytest.raises(ValidationError):
+            _node(
+                extraction=_extraction_binding(extracted_text_sha256=SHA_A),
+                glyph_health=_glyph_health_assessment(input_sha256=SHA_B),
+            )
+
+    def test_source_node_accepts_both_extraction_fields_absent(self) -> None:
+        node = _node(extraction=_NO_EXTRACTION, glyph_health=_NO_GLYPH_HEALTH)
+        assert isinstance(node.extraction, Absent)
+        assert isinstance(node.glyph_health, Absent)
+
+    def test_source_node_accepts_a_correctly_bound_pair(self) -> None:
+        binding = _extraction_binding(extracted_text_sha256=SHA_B)
+        assessment = _glyph_health_assessment(input_sha256=SHA_B)
+        node = _node(extraction=binding, glyph_health=assessment)
+        assert node.extraction is binding
+        assert node.glyph_health is assessment
+
+    def test_source_node_extraction_absent_round_trips_not_extracted_yet(self) -> None:
+        node = _node(extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET))
+        assert isinstance(node.extraction, Absent)
+        assert node.extraction.reason == AbsenceReason.NOT_EXTRACTED_YET
+
+    def test_source_node_extraction_absent_round_trips_not_applicable(self) -> None:
+        node = _node(extraction=Absent(reason=AbsenceReason.NOT_APPLICABLE))
+        assert isinstance(node.extraction, Absent)
+        assert node.extraction.reason == AbsenceReason.NOT_APPLICABLE
 
     def test_bbox_locator_ref_round_trips(self) -> None:
         ref = _bbox_ref()

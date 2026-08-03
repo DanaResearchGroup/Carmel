@@ -89,6 +89,7 @@ from carmel.services.numeric import (
 )
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    GLYPH_HEALTH_DEPENDENCY_ID,
     InputPolicy,
     UnknownSemanticDependencyError,
     current_sha_for,
@@ -115,6 +116,8 @@ __all__ = [
     "DataPoint",
     "DatasetEnvelope",
     "EmbeddedConversionTable",
+    "ExtractionBinding",
+    "GlyphHealthAssessment",
     "Maybe",
     "MeasuredValue",
     "MemberSheetKey",
@@ -459,6 +462,83 @@ class ArchiveOrigin(BaseModel):
         return value
 
 
+class ExtractionBinding(BaseModel):
+    """Binds a :class:`SourceNode`'s raw bytes to the extracted text derived
+    from them, closing a gap where the two were connected only by
+    convention.
+
+    ``extracted_sha256`` is the integrity anchor: the digest of the stored
+    ``extracted.json`` FILE BYTES, computed by
+    :func:`carmel.services.evidence` AFTER writing that file to disk (never
+    re-serialized from the in-memory model), so it describes exactly the
+    bytes a replayer would read back. ``extracted_text_sha256`` is the
+    digest of ``extracted.text`` (UTF-8 encoded) as recorded in that same
+    verified ``extracted.json`` -- deliberately NOT a digest of the
+    evidence store's ``text.txt``, because ``text.txt`` is only ever
+    presence-checked on disk (``text_path.exists()`` in
+    ``evidence._artifact_intact``), never digest-checked, so it cannot serve
+    as an integrity anchor. A replayer wanting to confirm
+    ``extracted_text_sha256`` must recompute it from a VERIFIED
+    ``extracted.json`` (one whose bytes hash to ``extracted_sha256``), not
+    from ``text.txt``.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    extracted_sha256: str = Field(min_length=64, max_length=64)
+    """Digest of the stored ``extracted.json`` file's bytes -- the integrity anchor."""
+    extracted_text_sha256: str = Field(min_length=64, max_length=64)
+    """Digest of ``extracted.text.encode("utf-8")`` as recorded in that ``extracted.json``."""
+
+    @field_validator("extracted_sha256", "extracted_text_sha256")
+    @classmethod
+    def _validate_sha256_shape(cls, value: str) -> str:
+        if not _SHA256_RE.match(value):
+            raise ValueError(f"invalid sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
+
+class GlyphHealthAssessment(BaseModel):
+    """A stored record of a document's glyph-health assessment (see
+    :class:`~carmel.services.numeric.GlyphHealth`), attributed to the
+    dependency version that produced it.
+
+    HONEST SCOPE: validating a stored ``GlyphHealthAssessment`` can check
+    registry identity (``assessor.dependency_id`` genuinely names the glyph
+    -health dependency), digest shape, and -- once embedded in a
+    :class:`SourceNode` -- the node's extraction binding. It CANNOT re-run
+    :func:`~carmel.services.numeric.assess_glyph_health`, because its input
+    (the whole extracted document text) is out-of-payload here. A stored
+    assessment is therefore UNVERIFIED-BY-CONSTRUCTION until the replayer
+    milestone lands; never describe one as "verified" anywhere.
+
+    All five booleans on ``health`` are recorded even though only
+    ``suspects_dash_corruption`` is consumed by parsing logic today
+    (:mod:`carmel.services.numeric`). That is acceptable ONLY because
+    ``assessor`` identity travels with them: if a later heuristic version
+    disagrees with an earlier one about, say, ``has_thorn_plus_marker``, the
+    disagreement reads as "a different heuristic version produced this," not
+    as an unexplained bug.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    health: GlyphHealth
+    assessor: SemanticDependencyUse
+
+    @model_validator(mode="after")
+    def _validate_assessor_names_the_glyph_health_dependency(self) -> GlyphHealthAssessment:
+        if self.assessor.dependency_id != GLYPH_HEALTH_DEPENDENCY_ID:
+            raise ValueError(
+                f"assessor.dependency_id={self.assessor.dependency_id!r} is not the glyph-health "
+                f"dependency this assessment claims to record ({GLYPH_HEALTH_DEPENDENCY_ID!r}); a "
+                "GlyphHealthAssessment whose assessor does not name that dependency is a forgery "
+                "attempt (mis-stamping a health record with the wrong heuristic's identity), not a "
+                "harmless inconsistency, and is rejected as such"
+            )
+        return self
+
+
 class SourceNode(BaseModel):
     """One artifact in a dataset's source graph.
 
@@ -486,6 +566,21 @@ class SourceNode(BaseModel):
     the honest, structural answer is "the concept does not apply here" (see
     the validator below, which requires exactly that for every non
     ``SI_MEMBER`` node) rather than an unreasoned absence."""
+    extraction: Maybe[ExtractionBinding]
+    """Binds this node's raw bytes to the extracted text derived from them,
+    if any has been recorded. ``Maybe``-typed, with no default, for the same
+    "no unreasoned absence" reasoning as ``origin`` above. Deliberately NOT
+    inferred from ``kind``: a ``SI_MEMBER`` is a mixed bucket (some members
+    are spreadsheets with no flat text layer at all; others are text-bearing
+    documents), and even ``PAPER_PDF`` does not itself assert that a flat
+    text layer has been extracted -- so ``kind`` alone cannot distinguish
+    "extraction does not apply to this node" (``NOT_APPLICABLE``) from
+    "extraction has not happened yet" (``NOT_EXTRACTED_YET``); only an
+    explicit ``Absent(reason=...)`` can say which."""
+    glyph_health: Maybe[GlyphHealthAssessment]
+    """This node's stored glyph-health assessment, if any has been recorded.
+    ``Maybe``-typed, with no default, for the same reason as ``extraction``
+    above -- and for the same reason, NOT inferred from ``kind`` either."""
 
     @model_validator(mode="after")
     def _validate_origin_only_for_si_member(self) -> SourceNode:
@@ -502,6 +597,39 @@ class SourceNode(BaseModel):
                 f"node {self.node_id!r} has kind={self.kind.value!r}, which cannot carry a concrete "
                 "ArchiveOrigin -- only an SI_MEMBER node can, since only an SI_MEMBER node was ever "
                 "extracted from an archive; origin must be Absent(...) here"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_glyph_health_binds_to_this_nodes_extraction(self) -> SourceNode:
+        """A ``glyph_health`` assessment must be attributable to THIS node's
+        extracted text, not merely present alongside it.
+
+        Requires ``extraction`` to be present whenever ``glyph_health`` is
+        (an assessment of "the extracted text" with no recorded extraction
+        to point at is meaningless), and requires
+        ``glyph_health.assessor.input_sha256`` to both be present and equal
+        ``extraction.extracted_text_sha256`` -- an assessment whose input
+        digest does not match this node's extracted text cannot be
+        attributed to this node, whatever else it might be valid evidence
+        of.
+        """
+        if isinstance(self.glyph_health, Absent):
+            return self
+        if isinstance(self.extraction, Absent):
+            raise ValueError(
+                f"node {self.node_id!r} carries a glyph_health assessment but no extraction "
+                "binding; an assessment of 'the extracted text' cannot be attributed to this node "
+                "without a recorded extraction to point at -- extraction must be present whenever "
+                "glyph_health is"
+            )
+        input_sha256 = self.glyph_health.assessor.input_sha256
+        if isinstance(input_sha256, Absent) or input_sha256 != self.extraction.extracted_text_sha256:
+            raise ValueError(
+                f"node {self.node_id!r} carries a glyph_health assessment whose assessor.input_sha256="
+                f"{input_sha256!r} does not equal this node's extraction.extracted_text_sha256="
+                f"{self.extraction.extracted_text_sha256!r}; an assessment whose input digest doesn't "
+                "match the node's extracted text cannot be attributed to that node"
             )
         return self
 
@@ -834,6 +962,42 @@ class SourceGraph(BaseModel):
         # this invariant does not treat that distinction as enough on its
         # own to admit both -- widening the triple to include origin is a
         # deliberate future change, not an oversight here.
+        # I5b: two nodes that share raw bytes (the same sha256) must agree
+        # on glyph health, if both have any recorded. The same bytes can
+        # only actually have one glyph-health story, so a disagreement here
+        # is not a legal "different role" case like the duplicate check
+        # below (which is about kind/parent, not about the underlying
+        # bytes) -- it is a CONFLICT between two assessments of the same
+        # text, and must be rejected as such rather than silently admitted.
+        #
+        # THE ORDER OF THESE TWO CHECKS IS LOAD-BEARING, not stylistic.
+        # Nodes sharing a (kind, sha256, parent_node_id) triple AND disagreeing
+        # on glyph health satisfy both checks at once. Running the duplicate
+        # check first therefore reports them as "an exact repeat" that "adds
+        # nothing" -- which is precisely false, because they differ on health,
+        # and it sends the reader looking for a redundant node instead of an
+        # irreconcilable assessment. The conflict is the more specific and more
+        # actionable diagnosis, so it must be raised first. A regression test
+        # covers same-triple-disagreeing-health for exactly this reason; if it
+        # starts reporting a duplicate, these blocks have been reordered.
+        health_by_sha: dict[str, tuple[str, GlyphHealth]] = {}
+        for node in self.nodes:
+            if isinstance(node.glyph_health, Absent):
+                continue
+            health = node.glyph_health.health
+            if node.sha256 in health_by_sha:
+                other_node_id, other_health = health_by_sha[node.sha256]
+                if other_health != health:
+                    raise ValueError(
+                        f"node {node.node_id!r} and node {other_node_id!r} share sha256={node.sha256!r} "
+                        "but their recorded glyph_health assessments disagree; the same bytes can only "
+                        "have one true glyph-health story, so this is a CONFLICT between two "
+                        "assessments of the same text -- not a legal 'different role' duplicate -- and "
+                        "must be reconciled before this graph can validate"
+                    )
+                continue
+            health_by_sha[node.sha256] = (node.node_id, health)
+
         seen_triples: set[tuple[SourceNodeKind, str, str | None]] = set()
         for node in self.nodes:
             triple = (node.kind, node.sha256, node.parent_node_id)
@@ -1072,11 +1236,16 @@ class MeasuredValue(BaseModel):
     should have quarantined (e.g. ``"2e50"`` read out of a suspect flat-PDF
     text layer whose minus/en-dash glyphs are known to be lost) is still
     representable here -- this validator has no way to know the document was
-    ever suspect. Recording document glyph health belongs one level up, in
-    the storage envelope, and is deliberately NOT stamped onto every value:
-    a document-level fact repeated per point would let two values extracted
-    from the SAME document assert different glyph health with no way to
-    arbitrate between them.
+    ever suspect. Recording document glyph health belongs one level down, on
+    the per-document :class:`SourceNode` (see its ``glyph_health`` field),
+    NOT on the multi-document ``DatasetEnvelope``: an envelope holds a whole
+    :class:`SourceGraph` of documents, so stamping the fact at envelope level
+    would reintroduce the exact arbitration failure it must avoid -- two
+    nodes in the SAME envelope could then disagree on glyph health with no
+    way to say which document a given assessment actually describes. It is
+    still deliberately NOT stamped onto every value: a document-level fact
+    repeated per point would let two values extracted from the SAME document
+    assert different glyph health with no way to arbitrate between them.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -2592,6 +2761,30 @@ def _archive_origin_identity_payload(origin: ArchiveOrigin) -> dict[str, Any]:
     return {"archive_sha256": origin.archive_sha256}
 
 
+def _extraction_binding_identity_payload(binding: ExtractionBinding) -> dict[str, Any]:
+    return {
+        "extracted_sha256": binding.extracted_sha256,
+        "extracted_text_sha256": binding.extracted_text_sha256,
+    }
+
+
+def _glyph_health_identity_payload(health: GlyphHealth) -> dict[str, Any]:
+    return {
+        "suspects_dash_corruption": health.suspects_dash_corruption,
+        "has_thorn_plus_marker": health.has_thorn_plus_marker,
+        "has_equals_ambiguity_marker": health.has_equals_ambiguity_marker,
+        "has_slash_c0_minus_marker": health.has_slash_c0_minus_marker,
+        "has_ascii6_uncertainty_marker": health.has_ascii6_uncertainty_marker,
+    }
+
+
+def _glyph_health_assessment_identity_payload(assessment: GlyphHealthAssessment) -> dict[str, Any]:
+    return {
+        "health": _glyph_health_identity_payload(assessment.health),
+        "assessor": _semantic_dependency_use_identity_payload(assessment.assessor),
+    }
+
+
 def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
     return {
         "node_id": node.node_id,
@@ -2599,6 +2792,8 @@ def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
         "sha256": node.sha256,
         "parent_node_id": node.parent_node_id,
         "origin": _project_maybe(node.origin, _archive_origin_identity_payload),
+        "extraction": _project_maybe(node.extraction, _extraction_binding_identity_payload),
+        "glyph_health": _project_maybe(node.glyph_health, _glyph_health_assessment_identity_payload),
     }
 
 
