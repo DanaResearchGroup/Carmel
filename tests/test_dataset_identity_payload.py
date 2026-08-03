@@ -17,6 +17,7 @@ contract of one method -- rather than the schema's construction invariants.
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from enum import Enum
 
@@ -395,6 +396,29 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
         assert isinstance(
             projected, dict
         ), f"{path}: an Absent value must project to a dict shape, got {type(projected)!r}"
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        # Same rule as for BaseModel above, applied to a stdlib dataclass field --
+        # otherwise a dataclass-valued field could silently drop its own sub-fields
+        # from identity_payload() while this "completeness" meta-test stayed green.
+        from carmel.schemas.datasets import _UNADDRESSED_FIELDS  # type: ignore[attr-defined]
+
+        dataclass_name = type(value).__name__
+        assert isinstance(
+            projected, dict
+        ), f"{path}: expected a dict projection of {dataclass_name}, got {type(projected)!r}"
+        for field in dataclasses.fields(type(value)):
+            name = field.name
+            key = (dataclass_name, name)
+            if key in _UNADDRESSED_FIELDS:
+                assert _UNADDRESSED_FIELDS[
+                    key
+                ], f"{path}.{name}: registered in _UNADDRESSED_FIELDS with an empty reason"
+                continue
+            assert name in projected, (
+                f"{path}.{name}: field {name!r} of {dataclass_name} is missing from identity_payload()'s output "
+                f"-- it is neither projected nor registered in _UNADDRESSED_FIELDS"
+            )
+            _walk_completeness(getattr(value, name), projected[name], f"{path}.{name}")
     elif isinstance(value, (tuple, list)):
         assert isinstance(projected, list), f"{path}: a tuple/list must project to a list, got {type(projected)!r}"
         assert len(projected) == len(value), (
@@ -470,6 +494,88 @@ class TestCompletenessWalkerIsNotVacuous:
             datasets_module._UNADDRESSED_FIELDS = {  # type: ignore[attr-defined]
                 **original,
                 ("_ScratchLeafEmptyReason", "forgotten"): "",
+            }
+            with pytest.raises(AssertionError, match="empty reason"):
+                _walk_completeness(instance, projected, "root")
+        finally:
+            datasets_module._UNADDRESSED_FIELDS = original  # type: ignore[attr-defined]
+
+    def test_walker_fails_when_a_dataclass_fields_field_is_absent_from_the_projection_and_unregistered(
+        self,
+    ) -> None:
+        @dataclasses.dataclass(frozen=True)
+        class _ProbeDataclassForWalkerTest:
+            field_a: str
+            field_b: str
+
+        class _ScratchModelWithDataclassField(BaseModel):
+            model_config = {"arbitrary_types_allowed": True}
+
+            payload: _ProbeDataclassForWalkerTest
+
+        instance = _ScratchModelWithDataclassField(
+            payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b")
+        )
+        # deliberately omit "field_b" from the dataclass's sub-projection, and no
+        # registry entry covers it
+        projected = {"payload": {"field_a": "a"}}
+
+        with pytest.raises(AssertionError, match="field_b"):
+            _walk_completeness(instance, projected, "root")
+
+    def test_walker_passes_when_the_missing_dataclass_field_is_registered_with_a_reason(self) -> None:
+        import carmel.schemas.datasets as datasets_module
+
+        @dataclasses.dataclass(frozen=True)
+        class _ProbeDataclassForWalkerTest:
+            field_a: str
+            field_b: str
+
+        class _ScratchModelWithDataclassField(BaseModel):
+            model_config = {"arbitrary_types_allowed": True}
+
+            payload: _ProbeDataclassForWalkerTest
+
+        instance = _ScratchModelWithDataclassField(
+            payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b")
+        )
+        projected = {"payload": {"field_a": "a"}}
+
+        original = dict(datasets_module._UNADDRESSED_FIELDS)  # type: ignore[attr-defined]
+        try:
+            datasets_module._UNADDRESSED_FIELDS = {  # type: ignore[attr-defined]
+                **original,
+                ("_ProbeDataclassForWalkerTest", "field_b"): (
+                    "test-only: deliberately omitted for walker not-vacuous proof"
+                ),
+            }
+            _walk_completeness(instance, projected, "root")  # must not raise
+        finally:
+            datasets_module._UNADDRESSED_FIELDS = original  # type: ignore[attr-defined]
+
+    def test_walker_fails_when_dataclass_field_registered_with_an_empty_reason(self) -> None:
+        import carmel.schemas.datasets as datasets_module
+
+        @dataclasses.dataclass(frozen=True)
+        class _ProbeDataclassForWalkerTest:
+            field_a: str
+            field_b: str
+
+        class _ScratchModelWithDataclassField(BaseModel):
+            model_config = {"arbitrary_types_allowed": True}
+
+            payload: _ProbeDataclassForWalkerTest
+
+        instance = _ScratchModelWithDataclassField(
+            payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b")
+        )
+        projected = {"payload": {"field_a": "a"}}
+
+        original = dict(datasets_module._UNADDRESSED_FIELDS)  # type: ignore[attr-defined]
+        try:
+            datasets_module._UNADDRESSED_FIELDS = {  # type: ignore[attr-defined]
+                **original,
+                ("_ProbeDataclassForWalkerTest", "field_b"): "",
             }
             with pytest.raises(AssertionError, match="empty reason"):
                 _walk_completeness(instance, projected, "root")
