@@ -385,20 +385,29 @@ def has_clean_token_boundary(text: str, start: int, end: int) -> bool:
     return not (trail.isdigit() and end < len(text) and (text[end].isdigit() or text[end] == ","))
 
 
-#: Characters that count as part of a unit token for :func:`unit_boundary_violation`
-#: -- letters, digits, and the symbols that appear WITHIN a compound unit
-#: (``cm3/mol/s``, ``m/s^2``, ``mol·s^-1``, ``50%``, ``µmol``). A unit quote
-#: abutting any of these on either edge is a fragment of a larger unit, not the
-#: whole thing, UNLESS the leading-edge exception in :func:`unit_boundary_violation`
-#: applies.
-_UNIT_TOKEN_SYMBOLS = frozenset("/°^*·%µμ")
+#: Characters permitted immediately BEFORE a UNIT-role quote (its leading edge),
+#: besides whitespace and start-of-string. Deliberately an ALLOWLIST of permitted
+#: separators, not a denylist of forbidden unit-token characters -- a denylist
+#: rots (round 40 found the old ``_UNIT_TOKEN_SYMBOLS`` denylist already missing
+#: U+2212 MINUS SIGN, U+2013 EN DASH, and superscript minus/one, none of which
+#: were "unit-token characters" under the old alnum+symbol test, yet all glue a
+#: unit quote to something that is not a clean boundary; it also silently
+#: accepted ``"bar"`` inside ``"bar(a)"``). ``(`` is leading-only -- a unit that
+#: opens a parenthetical, e.g. the ``K`` in ``"T (K) 1023"``, must accept ``(``
+#: immediately before it -- deliberately asymmetric with the trailing allowlist
+#: below, which does not include ``(``.
+_UNIT_LEADING_ALLOWLIST = frozenset("(=:,")
+
+#: Characters permitted immediately AFTER a UNIT-role quote (its trailing edge),
+#: besides whitespace and end-of-string. ``)`` closes a parenthetical the unit
+#: sat inside (the same ``"T (K) 1023"`` shape above) and is trailing-only,
+#: mirroring ``(`` being leading-only above.
+_UNIT_TRAILING_ALLOWLIST = frozenset(",;.)")
 
 
-def _is_unit_token_char(ch: str) -> bool:
-    return ch.isalnum() or ch in _UNIT_TOKEN_SYMBOLS
-
-
-def unit_boundary_violation(text: str, start: int, end: int) -> str | None:
+def unit_boundary_violation(
+    text: str, start: int, end: int, *, value_span: tuple[int, int] | None = None
+) -> str | None:
     """Return a discriminant name for why ``text[start:end]`` is not a clean
     UNIT-role quote, or ``None`` if it is clean.
 
@@ -407,37 +416,60 @@ def unit_boundary_violation(text: str, start: int, end: int) -> str | None:
     bare bool, so :func:`carmel.services.dataset_producer.ground_quote` can
     give each refusal reason its own distinct message.
 
-    A unit quote (``"K"``, ``"cm3/mol/s"``, ``"bar"``) must not abut another
-    unit-token character (see :data:`_UNIT_TOKEN_SYMBOLS` / :func:`_is_unit_token_char`)
-    on EITHER edge -- that would mean the quote is a fragment of a larger unit
-    (``"cm3"`` inside ``"cm3/mol/s"``, or ``"C"`` inside ``"25°C"``).
+    Fail-closed ALLOWLIST, not a denylist: a unit quote (``"K"``,
+    ``"cm3/mol/s"``, ``"bar"``) is refused on an edge unless the character
+    immediately outside that edge is on the permitted-neighbour allowlist for
+    that edge (:data:`_UNIT_LEADING_ALLOWLIST` / :data:`_UNIT_TRAILING_ALLOWLIST`)
+    or whitespace/start-of-string/end-of-string. Anything else -- a letter, a
+    digit, or a symbol not on the allowlist -- means the quote is a fragment of
+    a larger unit (``"cm3"`` inside ``"cm3/mol/s"``, or ``"C"`` inside
+    ``"25°C"``).
 
-    ONE exception, leading edge only: the unit quote MAY abut a preceding
-    digit run if -- and only if -- that digit run is itself a clean, maximal
-    numeral ending exactly at ``start``. This is checked by REUSING
-    :func:`find_numeral_extent` (the same numeral grammar VALUE-role grounding
-    uses) rather than a bespoke digit-run scan, so "is this glued digit run a
-    real numeral" is answered identically everywhere in this module. That is
-    what lets ``"1023K"`` + quote ``"K"`` stay groundable (the numeral extent
-    of ``"1023"`` ends exactly at the ``"K"``) while ``"run3K"`` + quote ``"K"``
-    is refused: ``"3"`` is preceded by the letter ``"n"``, so it fails the
-    numeral grammar's own leading boundary and :func:`find_numeral_extent`
-    returns ``None`` for that position -- there is no numeral there to glue to.
+    ONE exception, leading edge only, gated by ``value_span``: the unit quote
+    MAY abut a preceding digit run if -- and only if -- ``value_span`` is
+    supplied AND its end is exactly ``start``, i.e. the caller has already
+    independently grounded a VALUE quote and is asserting that THIS digit run
+    IS that value, not merely some clean numeral. This is deliberately
+    stricter than "is there a clean numeral here": round 40 found that
+    checking cleanliness alone (via :func:`find_numeral_extent`) proves "SOME
+    clean numeral ends here", not "THIS measurement's value ends here" --
+    value and unit are grounded independently, so e.g. the run id ``"1"`` in
+    ``"case 1K was the run id. Temperature was 1023 K"`` is itself a clean,
+    maximal numeral and would wrongly satisfy a cleanliness-only check. Without
+    a ``value_span`` (the default), the exception never fires -- fail closed,
+    not fail open -- which is why ``"1023K"`` + quote ``"K"`` with no
+    ``value_span`` now refuses exactly like ``"run3K"`` + quote ``"K"`` does;
+    only a caller that supplies the matching value span (as
+    :func:`carmel.services.dataset_producer._measured_value` does, from the
+    VALUE locator it already grounded) gets the glue exception.
     """
     if start >= end:
         return None
     if start > 0:
         lead_prev = text[start - 1]
-        if _is_unit_token_char(lead_prev):
-            if lead_prev.isdigit():
-                extent = find_numeral_extent(text, start - 1)
-                if extent is None or extent[1] != start:
-                    return "unit_digit_glue"
-            else:
-                return "unit_char_adjacency"
-    if end < len(text) and _is_unit_token_char(text[end]):
-        return "unit_char_adjacency"
+        if lead_prev.isdigit():
+            if value_span is None or value_span[1] != start:
+                return "unit_digit_glue"
+        elif not (lead_prev.isspace() or lead_prev in _UNIT_LEADING_ALLOWLIST):
+            return "unit_leading_adjacency"
+    if end < len(text):
+        nxt = text[end]
+        if not (nxt.isspace() or nxt in _UNIT_TRAILING_ALLOWLIST):
+            return "unit_trailing_adjacency"
     return None
+
+
+#: Characters permitted immediately before/after a LABEL-role quote, besides
+#: whitespace and start/end-of-string. Deliberately an ALLOWLIST, mirroring the
+#: UNIT allowlists above -- round 40 found the previous letter/digit-only
+#: denylist under-refused punctuation-delimited fragments (``"T"`` inside
+#: ``"1/T"``, ``"CO"`` inside ``"X_CO"``, ``"H2"`` inside ``"H2/CO"``, ``"S"``
+#: inside ``"S_L"``), because ``/`` and ``_`` are neither letters nor digits.
+#: Symmetric (unlike the UNIT allowlists): a label never opens or closes a
+#: parenthetical the way a unit does, so both edges share one allowlist.
+#: ``_`` and ``/`` are deliberately NOT here -- a label glued to either is a
+#: fragment of a larger token, never a standalone label on its own.
+_LABEL_ALLOWLIST = frozenset("()=:,;.")
 
 
 def label_boundary_violation(text: str, start: int, end: int) -> str | None:
@@ -445,28 +477,31 @@ def label_boundary_violation(text: str, start: int, end: int) -> str | None:
     LABEL-role quote, or ``None`` if it is clean.
 
     LABEL is the strictest role: a label/species/quantity-name quote
-    (``"pressure"``, ``"CO"``, ``"H"``) must not abut a letter OR a digit on
-    either edge, with NO exception -- unlike :func:`unit_boundary_violation`
-    there is no "glued value" shape a label is ever allowed to sit inside.
-    This is what refuses ``"CO"`` inside ``"CO2 mole fraction"`` (trailing
-    digit) and ``"NO"`` inside ``"the NO2 profile"`` alike.
+    (``"pressure"``, ``"CO"``, ``"H"``) must not abut anything except
+    whitespace, start/end-of-string, or a character on :data:`_LABEL_ALLOWLIST`
+    on either edge, with NO exception -- unlike :func:`unit_boundary_violation`
+    there is no "glued value" shape a label is ever allowed to sit inside. This
+    refuses ``"CO"`` inside ``"CO2 mole fraction"`` (trailing digit) and
+    ``"NO"`` inside ``"the NO2 profile"`` alike, exactly as the previous
+    letter/digit denylist did, but -- being an allowlist -- it ALSO refuses
+    ``"T"`` inside ``"1/T"`` and ``"CO"`` inside ``"X_CO"``, which the old
+    denylist missed because ``/`` and ``_`` are neither letters nor digits.
 
-    Uses Python's own ``str.isdigit()`` per character rather than a narrower
-    ASCII-only digit test, so a subscript digit like ``'₂'`` (which
-    ``str.isdigit()`` reports ``True`` for) is also treated as digit adjacency
-    -- refusing ``"H"`` inside ``"H₂ mole fraction"`` the same way it refuses
-    ``"H"`` inside ``"H2O yield"``.
+    Any character (including a subscript digit like ``'₂'``, or any other
+    symbol) that is not whitespace and not on the allowlist triggers a
+    refusal -- there is no per-character-class test here at all, unlike the
+    old ``isalpha()``/``isdigit()`` denylist.
     """
     if start >= end:
         return None
     if start > 0:
         prev = text[start - 1]
-        if prev.isalpha() or prev.isdigit():
-            return "label_adjacency"
+        if not (prev.isspace() or prev in _LABEL_ALLOWLIST):
+            return "label_leading_adjacency"
     if end < len(text):
         nxt = text[end]
-        if nxt.isalpha() or nxt.isdigit():
-            return "label_adjacency"
+        if not (nxt.isspace() or nxt in _LABEL_ALLOWLIST):
+            return "label_trailing_adjacency"
     return None
 
 

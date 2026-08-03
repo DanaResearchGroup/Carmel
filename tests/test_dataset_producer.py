@@ -485,6 +485,40 @@ class TestGroundQuoteEnclosingConstructGuard:
         assert text[locator.start : locator.end] == quote
 
 
+class TestGroundQuoteRoleDispatchIsExhaustive:
+    """Round 40, defect 1: `ground_quote`'s role dispatch was an
+    if/elif/elif chain with NO final `else` -- a `role` that is not a
+    genuine `QuoteRole` member (a plain string, `None`, or any other object)
+    matched no branch and fell through to the unconditional assert/return at
+    the bottom of the function, grounding via raw, unguarded substring
+    search -- a total regression of every boundary guard below. These pin
+    the fail-closed guard that now refuses any non-`QuoteRole` role outright,
+    before the search for `quote` is even interpreted against a boundary
+    rule. The scenario text is the same one `TestGroundQuoteNonNumericTokenBoundary
+    .test_rejects_letter_quote_glued_to_a_larger_word` uses for the genuine
+    `QuoteRole.UNIT` refusal, to make the contrast explicit: a bad `role`
+    must refuse the SAME "K" grounds inside "Kinetics" shape, not silently
+    accept it."""
+
+    def test_rejects_a_plain_string_role_that_equals_a_member_value(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ):
+            ground_quote("Kinetics pressure 1023", "K", role="value")  # type: ignore[arg-type]
+
+    def test_rejects_a_none_role(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ):
+            ground_quote("Kinetics pressure 1023", "K", role=None)  # type: ignore[arg-type]
+
+    def test_rejects_an_arbitrary_object_role(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ):
+            ground_quote("Kinetics pressure 1023", "K", role=object())  # type: ignore[arg-type]
+
+
 class TestGroundQuoteNonNumericTokenBoundary:
     """A non-numeric quote (a unit or a label) never fullmatches
     `NUMERAL_CANDIDATE_RE`, so it skipped every boundary guard above entirely
@@ -493,69 +527,147 @@ class TestGroundQuoteNonNumericTokenBoundary:
     silently accepted the "K" inside "Kinetics" as if it were the unit
     Kelvin. This class pins the ROLE-AWARE boundary guards that close that
     gap: `QuoteRole.UNIT` and `QuoteRole.LABEL` each apply their own
-    per-edge adjacency rule (`carmel.services.numeric.unit_boundary_violation`
-    / `label_boundary_violation`), distinct from the generic
+    per-edge ALLOWLIST of permitted neighbouring characters
+    (`carmel.services.numeric.unit_boundary_violation` /
+    `label_boundary_violation`), distinct from the generic
     `has_clean_token_boundary` fallback that `QuoteRole.VALUE` still uses for
     a non-numeral quote. Every refusal branch below asserts a message
-    substring specific to ITS branch, never the shared "token boundary"
-    substring alone -- this project has hit masked, indistinguishable
-    refusals of this shape five times before."""
+    substring specific to ITS branch and ITS edge (LEADING vs TRAILING),
+    never a substring shared across branches -- this project has hit masked,
+    indistinguishable refusals of this shape five times before."""
 
-    # -- QuoteRole.UNIT: unit-token-character adjacency -------------------
+    # -- QuoteRole.UNIT: allowlist adjacency, trailing edge ----------------
 
     def test_rejects_letter_quote_glued_to_a_larger_word(self) -> None:
         # The original bug report: "K" grounds inside "Kinetics", not as the
-        # unit Kelvin.
-        with pytest.raises(QuoteGroundingError, match="unit-token character"):
+        # unit Kelvin. "K" is the first letter of "Kinetics", so this is a
+        # TRAILING-edge violation (the "i" right after it).
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("Kinetics pressure 1023", "K", role=QuoteRole.UNIT)
 
     def test_rejects_quote_that_is_a_prefix_of_a_larger_word(self) -> None:
-        with pytest.raises(QuoteGroundingError, match="unit-token character"):
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("5 atm", "at", role=QuoteRole.UNIT)
 
     def test_rejects_unit_fragment_of_a_compound_unit(self) -> None:
         # "cm3" is a real unit-shaped token on its own, but here it is only
         # the leading piece of the compound unit "cm3/mol/s" -- the trailing
-        # "/" is a unit-token character, so this is a fragment, not the whole
-        # unit.
-        with pytest.raises(QuoteGroundingError, match="unit-token character"):
+        # "/" is not on the trailing allowlist, so this is a fragment, not
+        # the whole unit.
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("k = 1.0 cm3/mol/s", "cm3", role=QuoteRole.UNIT)
 
     def test_rejects_unit_fragment_truncating_an_exponent(self) -> None:
         # "m/s" is a real unit on its own, but here it is truncating "m/s2"
-        # -- the trailing "2" is a unit-token character (a digit), so quoting
-        # only "m/s" silently drops the exponent.
-        with pytest.raises(QuoteGroundingError, match="unit-token character"):
+        # -- the trailing "2" is a digit, not on the trailing allowlist, so
+        # quoting only "m/s" silently drops the exponent.
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("a = 9.8 m/s2", "m/s", role=QuoteRole.UNIT)
 
+    def test_rejects_unit_quote_followed_by_an_open_paren(self) -> None:
+        # "(" is LEADING-only on the unit allowlist -- a unit may OPEN a
+        # parenthetical ("T (K) 1023") but must never sit INSIDE one on its
+        # trailing edge, so "bar" inside "bar(a)" is refused, not silently
+        # accepted as plain "bar" (round 40, defect 2, confirmed-bad case).
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote("the pressure was 1 bar(a)", "bar", role=QuoteRole.UNIT)
+
+    def test_rejects_unit_quote_followed_by_a_unicode_minus_sign(self) -> None:
+        # U+2212 MINUS SIGN -- not the ASCII hyphen, not on the trailing
+        # allowlist, and not whitespace. The old denylist
+        # (`_UNIT_TOKEN_SYMBOLS`) missed this character entirely (round 40,
+        # defect 2, confirmed-bad case).
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote("k = 3 s−1", "s", role=QuoteRole.UNIT)
+
+    def test_rejects_unit_quote_followed_by_an_en_dash(self) -> None:
+        # U+2013 EN DASH -- same story as the minus sign above (round 40,
+        # defect 2, confirmed-bad case).
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote("k = 3 s–1", "s", role=QuoteRole.UNIT)
+
+    def test_rejects_unit_quote_followed_by_a_superscript_minus(self) -> None:
+        # U+207B SUPERSCRIPT MINUS -- same story again (round 40, defect 2,
+        # confirmed-bad case).
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote("k = 3 s⁻¹", "s", role=QuoteRole.UNIT)
+
+    # -- QuoteRole.UNIT: allowlist adjacency, leading edge ------------------
+
     def test_rejects_unit_quote_with_the_degree_mark_stripped(self) -> None:
-        # "C" alone is glued to the preceding degree mark "°" -- a
-        # unit-token symbol -- so quoting bare "C" silently strips the
-        # degree mark from "25°C".
-        with pytest.raises(QuoteGroundingError, match="unit-token character"):
+        # "C" alone is glued to the preceding degree mark "°" -- not
+        # whitespace and not on the leading allowlist -- so quoting bare "C"
+        # silently strips the degree mark from "25°C".
+        with pytest.raises(QuoteGroundingError, match="LEADING edge"):
             ground_quote("T = 25°C", "C", role=QuoteRole.UNIT)
+
+    def test_rejects_unit_quote_immediately_preceded_by_a_letter(self) -> None:
+        # Isolates the LEADING-edge, non-digit branch in isolation from the
+        # digit-glue exception: "K" in "mK sensor" is preceded by the letter
+        # "m", not a digit, so this exercises the plain leading-allowlist
+        # check, not `unit_digit_glue` -- round 40 review noted no test
+        # isolated this shape.
+        with pytest.raises(QuoteGroundingError, match="LEADING edge"):
+            ground_quote("mK sensor", "K", role=QuoteRole.UNIT)
 
     # -- QuoteRole.UNIT: digit-glue exception, and its refusal -------------
 
     def test_rejects_unit_glued_to_a_non_numeral_digit_run(self) -> None:
         # "K" is immediately preceded by a digit ("3"), which is the leading-
         # edge glue exception's shape -- but that "3" is the tail of the word
-        # "run3", not a clean numeral (it fails NUMERAL_EXTENT_RE's own
-        # leading boundary, since it is itself preceded by the letter "n").
+        # "run3", not a clean numeral, and no value_span is supplied either.
         # The exception must NOT fire here.
         with pytest.raises(QuoteGroundingError, match="not itself a clean numeral"):
             ground_quote("run3K reactor", "K", role=QuoteRole.UNIT)
+
+    def test_rejects_letter_quote_preceded_by_a_digit_without_a_value_span(self) -> None:
+        # Round 40, defect 3: fail-closed by default. "1023" is a clean,
+        # maximal numeral ending exactly at "K" -- the OLD (buggy) rule
+        # accepted this on cleanliness alone. The new rule requires the
+        # caller to additionally supply value_span proving THIS digit run is
+        # the measurement's own value; omitting it means the exception never
+        # fires, even though the digit run is clean.
+        with pytest.raises(
+            QuoteGroundingError, match="not confirmed as this measurement's own value"
+        ):
+            ground_quote("1023K", "K", role=QuoteRole.UNIT)
+
+    def test_rejects_letter_quote_preceded_by_a_digit_with_a_mismatched_value_span(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not confirmed as this measurement's own value"
+        ):
+            ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(10, 12))
 
     def test_accepts_letter_quote_immediately_preceded_by_a_digit(self) -> None:
         # Deliberate asymmetry, load-bearing: NUMERAL_EXTENT_RE's trailing
         # boundary permits a letter right after a numeral (so "1023" stays
         # groundable inside "1023K"). The symmetric consequence is that the
         # unit "K" glued to that same numeral must ALSO stay groundable --
-        # this is the ONE exception `unit_boundary_violation` allows, gated
-        # by reusing `find_numeral_extent` to confirm "1023" really is a
-        # clean, maximal numeral ending exactly where "K" starts.
-        locator = ground_quote("1023K", "K", role=QuoteRole.UNIT)
+        # this is the ONE exception `unit_boundary_violation` allows, now
+        # gated by an explicit value_span proving "1023" really is THIS
+        # measurement's own value, ending exactly where "K" starts (round 40,
+        # defect 3).
+        locator = ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(0, 4))
         assert (locator.start, locator.end) == (4, 5)
+
+    def test_value_span_prevents_grounding_a_run_id_digit_as_the_value(self) -> None:
+        # Round 40, defect 3's confirmed bug: value and unit are grounded
+        # independently, so proving "some clean numeral ends here" is not the
+        # same claim as "THIS measurement's value ends here". Occurrence 0 of
+        # "K" is glued to the run id "1" in "1K" -- itself a clean, maximal
+        # numeral -- but it is NOT this measurement's value ("1023"), so it
+        # must be refused even though it looks exactly like the accepted
+        # shape above. Occurrence 1 is the real unit glued to the real value
+        # and must still be accepted.
+        text = "case 1K was the run id. Temperature was 1023 K"
+        value_locator = ground_quote(text, "1023", role=QuoteRole.VALUE)
+        value_span = (value_locator.start, value_locator.end)
+        with pytest.raises(
+            QuoteGroundingError, match="not confirmed as this measurement's own value"
+        ):
+            ground_quote(text, "K", role=QuoteRole.UNIT, occurrence=0, value_span=value_span)
+        locator = ground_quote(text, "K", role=QuoteRole.UNIT, occurrence=1, value_span=value_span)
+        assert text[locator.start : locator.end] == "K"
 
     def test_accepts_letter_quote_in_parentheses(self) -> None:
         locator = ground_quote("T (K) 1023", "K", role=QuoteRole.UNIT)
@@ -578,7 +690,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
     # -- QuoteRole.LABEL: strict letter/digit adjacency, no exception ------
 
     def test_rejects_quote_immediately_followed_by_a_letter(self) -> None:
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("the temperature rose", "temp", role=QuoteRole.LABEL)
 
     def test_rejects_quote_immediately_preceded_by_a_letter(self) -> None:
@@ -586,7 +698,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # the tail of "Kinetics" (preceded by the letter "t"), but its own
         # trailing edge sits cleanly at a space before "pressure" -- so this
         # can only be caught by the leading check, not the trailing one.
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="LEADING edge"):
             ground_quote("Kinetics pressure", "ics", role=QuoteRole.LABEL)
 
     def test_rejects_label_glued_to_a_trailing_digit(self) -> None:
@@ -594,15 +706,15 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # leading piece of "CO2" -- LABEL allows no glue exception, unlike
         # UNIT, so this must refuse even though "CO2" looks like a
         # value-glued-to-a-label shape.
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("CO2 mole fraction = 0.1", "CO", role=QuoteRole.LABEL)
 
     def test_rejects_label_glued_to_a_trailing_digit_mid_sentence(self) -> None:
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("the NO2 profile", "NO", role=QuoteRole.LABEL)
 
     def test_rejects_single_letter_label_glued_to_a_trailing_digit(self) -> None:
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("H2O yield", "H", role=QuoteRole.LABEL)
 
     def test_rejects_label_glued_to_a_trailing_subscript_digit(self) -> None:
@@ -612,7 +724,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # so a subscript-digit species marker is refused exactly like an
         # ordinary digit would be.
         assert "₂".isdigit()
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
             ground_quote("H₂ mole fraction", "H", role=QuoteRole.LABEL)
 
     def test_rejects_label_quote_immediately_preceded_by_a_digit(self) -> None:
@@ -620,8 +732,47 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # "H2O yield" sits cleanly at a space before "yield" on its trailing
         # edge, but is immediately preceded by the digit "2" -- so this can
         # only be caught by the leading check, not the trailing one.
-        with pytest.raises(QuoteGroundingError, match="clean label boundary"):
+        with pytest.raises(QuoteGroundingError, match="LEADING edge"):
             ground_quote("H2O yield", "O", role=QuoteRole.LABEL)
+
+    # -- QuoteRole.LABEL: round 40, defect 4 -- punctuation delimiters -----
+    # "_" and "/" are deliberately NOT on the label allowlist: a label
+    # fragment separated from a larger identifier only by an underscore or a
+    # slash must refuse just as it would if separated by a bare letter or
+    # digit, since species/ratio identifiers like "X_CO" or "H2/CO" are
+    # exactly the shape a label-fragment bug would silently mis-ground.
+
+    def test_rejects_label_quote_preceded_by_a_slash(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="LEADING edge"):
+            ground_quote("1/T plot", "T", role=QuoteRole.LABEL)
+
+    def test_rejects_label_quote_preceded_by_an_underscore(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="LEADING edge"):
+            ground_quote("X_CO was reported", "CO", role=QuoteRole.LABEL)
+
+    def test_rejects_label_quote_followed_by_a_slash(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote("H2/CO ratio = 1", "H2", role=QuoteRole.LABEL)
+
+    def test_rejects_label_quote_followed_by_an_underscore(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote("S_L measured", "S", role=QuoteRole.LABEL)
+
+    def test_accepts_label_quote_with_an_underscore_quoted_whole(self) -> None:
+        locator = ground_quote("X_CO was reported", "X_CO", role=QuoteRole.LABEL)
+        assert (locator.start, locator.end) == (0, 4)
+
+    def test_accepts_label_quote_with_a_slash_quoted_whole(self) -> None:
+        locator = ground_quote("1/T plot", "1/T", role=QuoteRole.LABEL)
+        assert (locator.start, locator.end) == (0, 3)
+
+    def test_accepts_multi_species_label_quote_with_a_slash_quoted_whole(self) -> None:
+        locator = ground_quote("H2/CO ratio = 1", "H2/CO", role=QuoteRole.LABEL)
+        assert (locator.start, locator.end) == (0, 5)
+
+    def test_accepts_label_quote_with_an_underscore_subscript_quoted_whole(self) -> None:
+        locator = ground_quote("S_L measured", "S_L", role=QuoteRole.LABEL)
+        assert (locator.start, locator.end) == (0, 3)
 
     def test_accepts_label_quote_bounded_by_whitespace(self) -> None:
         locator = ground_quote("Kinetics pressure 1023", "pressure", role=QuoteRole.LABEL)

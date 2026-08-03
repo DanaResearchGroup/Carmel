@@ -208,7 +208,12 @@ class DatasetProducerError(ValueError):
 
 
 def ground_quote(
-    text: str, quote: str, *, role: QuoteRole, occurrence: int | None = None
+    text: str,
+    quote: str,
+    *,
+    role: QuoteRole,
+    occurrence: int | None = None,
+    value_span: tuple[int, int] | None = None,
 ) -> CharSpanLocator:
     """Locate ``quote`` in ``text`` by SEARCHING, returning a half-open
     :class:`CharSpanLocator` over ``TextSpace.EXTRACTED_TEXT``.
@@ -250,6 +255,15 @@ def ground_quote(
             ``LABEL``) -- selects which boundary rule applies.
         occurrence: ``None`` to require uniqueness; a 0-based index to
             explicitly select among multiple matches.
+        value_span: Only meaningful for ``role=QuoteRole.UNIT``. The
+            ``(start, end)`` span of this measurement's own already-grounded
+            VALUE quote, used solely to gate UNIT's leading-edge digit-glue
+            exception: a unit may abut a preceding digit run only when
+            ``value_span`` is supplied and ends exactly where the unit quote
+            starts, i.e. the caller is asserting that digit run IS the value
+            being reported, not merely some other clean numeral (e.g. a run
+            id). Omitted (``None``, the default) means the exception never
+            fires -- fail closed.
 
     Returns:
         A ``CharSpanLocator`` with ``text[start:end] == quote``.
@@ -305,131 +319,202 @@ def ground_quote(
             )
         start = starts[occurrence]
     end = start + len(quote)
-    if role is QuoteRole.VALUE and NUMERAL_CANDIDATE_RE.fullmatch(quote):
-        # P1-A: a numeral quote must ground to a MAXIMAL numeral candidate, never
-        # an interior slice of a strictly larger one, and it must sit at a genuine
-        # numeral boundary at all -- e.g. quote "1023" must not silently accept the
-        # middle of "11023", "1023.5", "1,023", or "0.51023", and quote "2" must not
-        # silently accept the subscript digit inside the identifier "H2". This uses
-        # the SAME shared primitive (:data:`carmel.services.numeric.NUMERAL_CANDIDATE_RE`
-        # / :func:`carmel.services.numeric.find_numeral_extent`) that
-        # :mod:`carmel.services.grounding` uses to scan an evidence window for
-        # numeric corroboration -- unifying two independently-grown, and
-        # independently-wrong, boundary heuristics onto one grammar. Note the
-        # trigger is `fullmatch` against this CORRECTED (signed) grammar, not the
-        # old, sign-less one -- so a quote like "-3" now actually reaches this
-        # check, where under the old grammar it silently skipped it entirely.
-        extent = find_numeral_extent(text, start)
-        if extent is None:
-            raise QuoteGroundingError(
-                f"ground_quote: quote {display!r} looks like a numeral but does not sit at a "
-                "clean numeral boundary in the supplied text -- it is directly adjacent to a "
-                "letter, digit, dot, or comma that disqualifies it from ever being a standalone "
-                "numeral candidate (e.g. a species subscript like 'H2', a unit power like 'cm3', "
-                "or a comma-grouped thousands digit like the '023' in '1,023')"
-            )
-        if extent != (start, end):
-            raise QuoteGroundingError(
-                f"ground_quote: quote {display!r} is an interior fragment of the larger "
-                f"numeral {text[extent[0]:extent[1]]!r} (span "
-                f"[{extent[0]}:{extent[1]}]) in the supplied text -- a grounded "
-                "numeral span must be the MAXIMAL numeral candidate, never a slice of a "
-                "bigger one; quote the full numeral if that is what is meant"
-            )
-        # `extent == (start, end)` only proves the quote is a whole numeral ON
-        # ITS OWN -- it does not prove the numeral is not itself just one piece
-        # of a larger multi-token construct (a mangled ASCII-6 uncertainty
-        # marker, a spaced range, or a flattened scientific-notation triple).
-        # `enclosing_numeric_construct` answers exactly that strictly-weaker
-        # question. Each construct gets its own message (not just a distinct
-        # exception type) so operators -- and tests -- can tell the refusals
-        # apart from message content alone; this project has hit masked,
-        # indistinguishable refusals of this shape before.
-        construct = enclosing_numeric_construct(text, start, end)
-        if construct == "ascii6_uncertainty":
-            raise QuoteGroundingError(
-                f"ground_quote: quote {display!r} is one piece of a mangled "
-                "ascii6_uncertainty marker (e.g. '307 6 10' where '±' was OCR'd as "
-                "a bare '6' between a value and its uncertainty) -- quoting only "
-                "the value, the digit '6', or the uncertainty in isolation loses "
-                "the marker's meaning; refuse rather than ground a fragment of it"
-            )
-        if construct == "spaced_range":
-            raise QuoteGroundingError(
-                f"ground_quote: quote {display!r} is one endpoint of a "
-                "spaced_range whose dash has whitespace on at least one side "
-                "(e.g. '1000 - 1200' or '1000 – 1200') -- quoting only one "
-                "endpoint silently drops the other bound; quote the full range "
-                "if that is what is meant"
-            )
-        if construct == "flattened_scientific":
-            raise QuoteGroundingError(
-                f"ground_quote: quote {display!r} is one piece of a "
-                "flattened_scientific notation triple (e.g. '3.94 x 10 03' where "
-                "the exponent was split from its base by OCR) -- quoting only the "
-                "base or only the exponent loses the value; quote the full triple "
-                "if that is what is meant"
-            )
-    elif role is QuoteRole.VALUE and not has_clean_token_boundary(text, start, end):
-        # A VALUE quote that is not itself a numeral candidate (rare, but
-        # possible if a caller passes a non-numeral VALUE quote) still needs
-        # SOME boundary guard rather than plain, unguarded substring search.
-        # See carmel.services.numeric.has_clean_token_boundary for the
-        # per-edge letter/digit boundary rule (deliberately asymmetric: a
-        # digit immediately before a letter-initial quote is fine, mirroring
-        # NUMERAL_EXTENT_RE's own trailing-boundary asymmetry).
+    if not isinstance(role, QuoteRole):
+        # Exhaustive, fail-closed dispatch: EVERY call must resolve to one of
+        # the three role-specific boundary rules below, never fall through to
+        # the unconditional assert/return at the bottom of this function via
+        # unguarded substring search. A role that is not a genuine QuoteRole
+        # member -- a plain string that happens to equal a member's value
+        # (e.g. "value"), None, or any other object -- has no boundary rule
+        # that is safe to apply, so it is refused here, up front, rather than
+        # silently skipping every check below (the round-40 regression this
+        # guard exists to close for good).
         raise QuoteGroundingError(
-            f"ground_quote: quote {display!r} does not sit at a clean word/token "
-            "boundary in the supplied text -- it is directly adjacent to another "
-            "character of the same class (a letter next to a letter, or a digit "
-            "next to a digit, '.', or ',') that makes it look like a fragment of "
-            "a larger token, not a standalone quote; quote the full token if "
-            "that is what is meant"
+            f"ground_quote: role={role!r} is not a carmel.services.numeric.QuoteRole "
+            "member -- grounding has no default boundary rule that is safe for every "
+            "quote's job, so a role that is not a genuine QuoteRole member (a plain "
+            "string, None, or any other object) is refused outright rather than "
+            "silently skipping every boundary check"
         )
+    if role is QuoteRole.VALUE:
+        # Both VALUE branches below are conditional on a property of `quote`
+        # itself (is it numeral-shaped, does it already sit at a clean
+        # boundary) rather than on `role`, unlike UNIT/LABEL below -- so this
+        # wraps both in a single `if role is QuoteRole.VALUE:` and lets
+        # neither inner branch raising mean "accept": a VALUE quote that is
+        # non-numeral AND already at a clean token boundary falls through
+        # both inner checks with nothing to raise, which is the intended
+        # accept path, not a missing-branch bug (round 40, defect 1's fix
+        # must not turn a legitimate "no violation found" into a spurious
+        # refusal).
+        if NUMERAL_CANDIDATE_RE.fullmatch(quote):
+            # P1-A: a numeral quote must ground to a MAXIMAL numeral candidate, never
+            # an interior slice of a strictly larger one, and it must sit at a genuine
+            # numeral boundary at all -- e.g. quote "1023" must not silently accept the
+            # middle of "11023", "1023.5", "1,023", or "0.51023", and quote "2" must not
+            # silently accept the subscript digit inside the identifier "H2". This uses
+            # the SAME shared primitive (:data:`carmel.services.numeric.NUMERAL_CANDIDATE_RE`
+            # / :func:`carmel.services.numeric.find_numeral_extent`) that
+            # :mod:`carmel.services.grounding` uses to scan an evidence window for
+            # numeric corroboration -- unifying two independently-grown, and
+            # independently-wrong, boundary heuristics onto one grammar. Note the
+            # trigger is `fullmatch` against this CORRECTED (signed) grammar, not the
+            # old, sign-less one -- so a quote like "-3" now actually reaches this
+            # check, where under the old grammar it silently skipped it entirely.
+            extent = find_numeral_extent(text, start)
+            if extent is None:
+                raise QuoteGroundingError(
+                    f"ground_quote: quote {display!r} looks like a numeral but does not sit at a "
+                    "clean numeral boundary in the supplied text -- it is directly adjacent to a "
+                    "letter, digit, dot, or comma that disqualifies it from ever being a standalone "
+                    "numeral candidate (e.g. a species subscript like 'H2', a unit power like 'cm3', "
+                    "or a comma-grouped thousands digit like the '023' in '1,023')"
+                )
+            if extent != (start, end):
+                raise QuoteGroundingError(
+                    f"ground_quote: quote {display!r} is an interior fragment of the larger "
+                    f"numeral {text[extent[0]:extent[1]]!r} (span "
+                    f"[{extent[0]}:{extent[1]}]) in the supplied text -- a grounded "
+                    "numeral span must be the MAXIMAL numeral candidate, never a slice of a "
+                    "bigger one; quote the full numeral if that is what is meant"
+                )
+            # `extent == (start, end)` only proves the quote is a whole numeral ON
+            # ITS OWN -- it does not prove the numeral is not itself just one piece
+            # of a larger multi-token construct (a mangled ASCII-6 uncertainty
+            # marker, a spaced range, or a flattened scientific-notation triple).
+            # `enclosing_numeric_construct` answers exactly that strictly-weaker
+            # question. Each construct gets its own message (not just a distinct
+            # exception type) so operators -- and tests -- can tell the refusals
+            # apart from message content alone; this project has hit masked,
+            # indistinguishable refusals of this shape before.
+            construct = enclosing_numeric_construct(text, start, end)
+            if construct == "ascii6_uncertainty":
+                raise QuoteGroundingError(
+                    f"ground_quote: quote {display!r} is one piece of a mangled "
+                    "ascii6_uncertainty marker (e.g. '307 6 10' where '±' was OCR'd as "
+                    "a bare '6' between a value and its uncertainty) -- quoting only "
+                    "the value, the digit '6', or the uncertainty in isolation loses "
+                    "the marker's meaning; refuse rather than ground a fragment of it"
+                )
+            if construct == "spaced_range":
+                raise QuoteGroundingError(
+                    f"ground_quote: quote {display!r} is one endpoint of a "
+                    "spaced_range whose dash has whitespace on at least one side "
+                    "(e.g. '1000 - 1200' or '1000 – 1200') -- quoting only one "
+                    "endpoint silently drops the other bound; quote the full range "
+                    "if that is what is meant"
+                )
+            if construct == "flattened_scientific":
+                raise QuoteGroundingError(
+                    f"ground_quote: quote {display!r} is one piece of a "
+                    "flattened_scientific notation triple (e.g. '3.94 x 10 03' where "
+                    "the exponent was split from its base by OCR) -- quoting only the "
+                    "base or only the exponent loses the value; quote the full triple "
+                    "if that is what is meant"
+                )
+        elif not has_clean_token_boundary(text, start, end):
+            # A VALUE quote that is not itself a numeral candidate (rare, but
+            # possible if a caller passes a non-numeral VALUE quote) still needs
+            # SOME boundary guard rather than plain, unguarded substring search.
+            # See carmel.services.numeric.has_clean_token_boundary for the
+            # per-edge letter/digit boundary rule (deliberately asymmetric: a
+            # digit immediately before a letter-initial quote is fine, mirroring
+            # NUMERAL_EXTENT_RE's own trailing-boundary asymmetry).
+            raise QuoteGroundingError(
+                f"ground_quote: quote {display!r} does not sit at a clean word/token "
+                "boundary in the supplied text -- it is directly adjacent to another "
+                "character of the same class (a letter next to a letter, or a digit "
+                "next to a digit, '.', or ',') that makes it look like a fragment of "
+                "a larger token, not a standalone quote; quote the full token if "
+                "that is what is meant"
+            )
+        # else: quote is a clean, non-numeral VALUE token already at a clean
+        # boundary -- nothing to raise, fall through to the self-check below.
     elif role is QuoteRole.UNIT:
-        # A unit quote (role UNIT) uses its own adjacency rule, not
-        # has_clean_token_boundary above: it must not abut another
-        # unit-token character on either edge, with one narrow leading-edge
-        # exception for a value the unit is genuinely glued to (see
-        # carmel.services.numeric.unit_boundary_violation for the full
-        # rule and how it reuses find_numeral_extent for that exception).
+        # A unit quote (role UNIT) uses its own ALLOWLIST-based adjacency
+        # rule, not has_clean_token_boundary above: each edge is refused
+        # unless the neighbouring character is whitespace, start/end of
+        # text, or on that edge's specific permitted-separator allowlist,
+        # with one narrow leading-edge exception for a value the unit is
+        # genuinely glued to (see carmel.services.numeric.unit_boundary_violation
+        # for the full rule -- the exception now requires the caller to pass
+        # value_span, matching exactly, not merely "some clean numeral").
         # Each distinguishable cause gets its own message, mirroring the
         # enclosing_numeric_construct pattern above -- this project has
         # hit masked, indistinguishable refusals of this shape before.
-        violation = unit_boundary_violation(text, start, end)
-        if violation == "unit_char_adjacency":
+        violation = unit_boundary_violation(text, start, end, value_span=value_span)
+        if violation == "unit_leading_adjacency":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} does not sit at a clean unit "
-                "boundary in the supplied text -- it is directly adjacent to another "
-                "unit-token character (a letter, digit, or a symbol like '/', '°', "
-                "'^', '*', '·', '%', 'µ', or 'μ') that makes it look like a fragment "
-                "of a larger unit (e.g. 'cm3' inside 'cm3/mol/s', or 'C' inside "
-                "'25°C'); quote the full unit if that is what is meant"
+                "boundary in the supplied text -- its LEADING edge is directly "
+                "adjacent to a character that is not whitespace, start-of-text, or "
+                "one of the permitted leading separators ('(', '=', ':', ',') -- that "
+                "makes it look like a fragment of a larger unit or token (e.g. 'C' "
+                "inside '25°C'); quote the full unit if that is what is meant"
+            )
+        if violation == "unit_trailing_adjacency":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} does not sit at a clean unit "
+                "boundary in the supplied text -- its TRAILING edge is directly "
+                "adjacent to a character that is not whitespace, end-of-text, or one "
+                "of the permitted trailing separators (',', ';', '.', ')') -- that "
+                "makes it look like a fragment of a larger unit (e.g. 'cm3' inside "
+                "'cm3/mol/s', or 'm/s' inside 'm/s2'); quote the full unit if that is "
+                "what is meant"
             )
         if violation == "unit_digit_glue":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} is glued to a preceding digit "
-                "run that is not itself a clean numeral -- a unit may only abut a "
-                "digit run on its leading edge when that digit run is the maximal "
-                "numeral value it is reporting (e.g. the '1023' in '1023K'); this "
-                "digit run does not qualify, so the quote looks like a fragment of "
-                "a larger token instead of a standalone unit"
+                "run that is not confirmed as this measurement's own value -- either "
+                "no value_span was supplied, or the preceding digit run does not end "
+                "exactly at this quote (i.e. it is not itself a clean numeral matching "
+                "the value already grounded for this measurement); a unit may only "
+                "abut a digit run on its leading edge when that digit run IS the "
+                "value it is reporting (e.g. the '1023' in '1023K'), never merely "
+                "some other clean numeral (e.g. a run id like the '1' in '1K')"
             )
     elif role is QuoteRole.LABEL:
-        # A label quote (role LABEL) is the strictest role: it must not abut
-        # a letter or a digit on either edge, with no exception -- unlike
-        # UNIT there is no "glued value" shape a label is ever allowed to
-        # sit inside. See carmel.services.numeric.label_boundary_violation.
+        # A label quote (role LABEL) is the strictest role: each edge is
+        # refused unless the neighbouring character is whitespace,
+        # start/end of text, or on the shared LABEL separator allowlist --
+        # unlike UNIT there is no "glued value" shape a label is ever
+        # allowed to sit inside, and unlike the old letter/digit-only
+        # denylist this also refuses punctuation-glued fragments like the
+        # 'T' inside '1/T' or the 'CO' inside 'X_CO'. See
+        # carmel.services.numeric.label_boundary_violation.
         violation = label_boundary_violation(text, start, end)
-        if violation == "label_adjacency":
+        if violation == "label_leading_adjacency":
             raise QuoteGroundingError(
                 f"ground_quote: label quote {display!r} does not sit at a clean "
-                "label boundary in the supplied text -- it is directly adjacent to "
-                "a letter or digit (e.g. 'CO' inside 'CO2 mole fraction', or 'NO' "
-                "inside 'the NO2 profile') that makes it look like a fragment of a "
-                "larger species/label token, not a standalone label; quote the full "
-                "label if that is what is meant"
+                "label boundary in the supplied text -- its LEADING edge is directly "
+                "adjacent to a character that is not whitespace, start-of-text, or a "
+                "permitted separator (e.g. 'CO' inside 'X_CO', or 'T' inside '1/T') "
+                "that makes it look like a fragment of a larger species/label token, "
+                "not a standalone label; quote the full label if that is what is meant"
             )
+        if violation == "label_trailing_adjacency":
+            raise QuoteGroundingError(
+                f"ground_quote: label quote {display!r} does not sit at a clean "
+                "label boundary in the supplied text -- its TRAILING edge is directly "
+                "adjacent to a character that is not whitespace, end-of-text, or a "
+                "permitted separator (e.g. 'CO' inside 'CO2 mole fraction', or 'H2' "
+                "inside 'H2/CO') that makes it look like a fragment of a larger "
+                "species/label token, not a standalone label; quote the full label if "
+                "that is what is meant"
+            )
+    else:
+        # Unreachable given the isinstance(role, QuoteRole) guard above --
+        # QuoteRole has exactly three members (VALUE / UNIT / LABEL), all
+        # handled above. Kept as an explicit, fail-closed backstop so a
+        # FUTURE QuoteRole member added without a corresponding branch here
+        # raises loudly instead of silently falling through to the
+        # unconditional assert/return below -- exactly the round-40 defect
+        # this function exists to never repeat.
+        raise QuoteGroundingError(
+            f"ground_quote: role={role!r} is a QuoteRole member with no boundary rule "
+            "implemented in this function -- add one before using this role, never "
+            "fall through to unguarded substring search"
+        )
     # Correctness self-check on this function's own arithmetic (an assert,
     # not a raise: user input was already validated above; this can only
     # fail if the search/slicing logic itself is wrong).
@@ -515,8 +600,17 @@ def _measured_value(
     value_locator = ground_quote(
         text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence
     )
+    # P1: pass the VALUE locator's own span so UNIT's leading-edge digit-glue
+    # exception (see carmel.services.numeric.unit_boundary_violation) can
+    # require the glued digit run to be THIS measurement's own value, not
+    # merely some other clean numeral (e.g. a run id) that happens to sit
+    # before the unit quote.
     unit_locator = ground_quote(
-        text, spec.unit_quote, role=QuoteRole.UNIT, occurrence=spec.unit_occurrence
+        text,
+        spec.unit_quote,
+        role=QuoteRole.UNIT,
+        occurrence=spec.unit_occurrence,
+        value_span=(value_locator.start, value_locator.end),
     )
     canary = normalize_numeric_span(
         spec.value_quote,
