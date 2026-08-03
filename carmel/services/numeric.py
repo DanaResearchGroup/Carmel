@@ -60,6 +60,7 @@ __all__ = [
     "assess_glyph_health",
     "enclosing_numeric_construct",
     "find_numeral_extent",
+    "has_clean_token_boundary",
     "normalize_numeric_span",
     "parse_numeric_span",
 ]
@@ -280,6 +281,70 @@ def find_numeral_extent(text: str, index: int) -> tuple[int, int] | None:
         if match.start() > index:
             break
     return None
+
+
+def has_clean_token_boundary(text: str, start: int, end: int) -> bool:
+    """Return whether ``text[start:end]`` sits at a clean word/token boundary in
+    ``text`` -- i.e. it is not an interior fragment of a larger alphanumeric token.
+
+    This is the NON-numeric counterpart to :func:`find_numeral_extent` /
+    :data:`NUMERAL_EXTENT_RE`: those exist to stop a numeral quote from grounding
+    to a fragment of a bigger numeral, but a non-numeric quote (a unit like
+    ``"K"`` or a label like ``"pressure"``) never matches that grammar at all, so
+    it needs its own boundary rule. Only known caller today:
+    :func:`carmel.services.dataset_producer.ground_quote`, applied to a quote
+    that does NOT fullmatch :data:`NUMERAL_CANDIDATE_RE`.
+
+    The check is PER-EDGE and classified by the character AT that edge of
+    ``text[start:end]`` -- deliberately NOT a single uniform "alphanumeric"
+    rule, because the two edge classes need different answers:
+
+    - Leading edge (``text[start]``):
+      - LETTER: the character immediately before ``start`` (if any) must not
+        also be a letter -- otherwise the quote starts mid-word (``"K"`` inside
+        ``"Kinetics"``).
+      - DIGIT: the character immediately before ``start`` must not be a digit,
+        ``.``, or ``,`` -- otherwise the quote starts mid-numeral or mid-thousands
+        group.
+      - Anything else (punctuation, whitespace, symbol): no constraint at this
+        edge.
+    - Trailing edge (``text[end - 1]``), symmetric:
+      - LETTER: the character immediately after ``end`` (if any) must not also
+        be a letter.
+      - DIGIT: the character immediately after ``end`` must not be a digit or
+        ``,``.
+      - Anything else: no constraint at this edge.
+
+    The letter/digit asymmetry is deliberate and load-bearing -- do NOT
+    "simplify" it to one uniform alphanumeric rule. It mirrors
+    :data:`NUMERAL_EXTENT_RE`'s own asymmetric trailing boundary
+    (``(?![0-9,])``, which permits a letter right after a numeral so that
+    ``"1023"`` stays groundable inside ``"1023K"``): the symmetric consequence
+    is that the unit ``"K"`` glued to that same numeral must ALSO stay
+    groundable, so a DIGIT immediately before a LETTER-initial quote must NOT
+    trigger a refusal here, even though a LETTER immediately before a
+    LETTER-initial quote (or a DIGIT/``.``/``,`` immediately before a
+    DIGIT-initial quote) does.
+
+    Note this function does not, by itself, resolve which of several matches
+    of a quote in ``text`` to check -- a caller with multiple matches must
+    decide (or refuse) ambiguity BEFORE calling this, exactly as
+    :func:`carmel.services.dataset_producer.ground_quote` already does for its
+    numeral-boundary guard: this function only ever answers the question for
+    ONE already-chosen ``(start, end)`` span, never reduces a multi-match set
+    to one on its own.
+    """
+    if start >= end:
+        return True
+    lead = text[start]
+    if lead.isalpha() and start > 0 and text[start - 1].isalpha():
+        return False
+    if lead.isdigit() and start > 0 and (text[start - 1].isdigit() or text[start - 1] in ".,"):
+        return False
+    trail = text[end - 1]
+    if trail.isalpha() and end < len(text) and text[end].isalpha():
+        return False
+    return not (trail.isdigit() and end < len(text) and (text[end].isdigit() or text[end] == ","))
 
 
 #: ``NUM <ws> 6 <ws> NUM`` -- reused verbatim from :func:`assess_glyph_health`'s

@@ -102,6 +102,7 @@ from carmel.services.numeric import (
     assess_glyph_health,
     enclosing_numeric_construct,
     find_numeral_extent,
+    has_clean_token_boundary,
     normalize_numeric_span,
 )
 from carmel.services.semantic_deps import (
@@ -338,6 +339,25 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
                 "base or only the exponent loses the value; quote the full triple "
                 "if that is what is meant"
             )
+    elif not has_clean_token_boundary(text, start, end):
+        # A non-numeric quote (a unit or a label) never fullmatches
+        # NUMERAL_CANDIDATE_RE, so it skipped every guard above entirely and
+        # grounded via plain, unguarded substring search -- e.g. quote "K"
+        # silently accepted the "K" inside "Kinetics" as if it were the unit
+        # Kelvin. See carmel.services.numeric.has_clean_token_boundary for the
+        # per-edge letter/digit boundary rule (deliberately asymmetric: a
+        # digit immediately before a letter-initial quote is fine, so "K"
+        # stays groundable inside "1023K", mirroring NUMERAL_EXTENT_RE's own
+        # trailing-boundary asymmetry for the numeral "1023" in that same
+        # text).
+        raise QuoteGroundingError(
+            f"ground_quote: quote {display!r} does not sit at a clean word/token "
+            "boundary in the supplied text -- it is directly adjacent to another "
+            "character of the same class (a letter next to a letter, or a digit "
+            "next to a digit, '.', or ',') that makes it look like a fragment of "
+            "a larger token, not a standalone quote; quote the full token if "
+            "that is what is meant"
+        )
     # Correctness self-check on this function's own arithmetic (an assert,
     # not a raise: user input was already validated above; this can only
     # fail if the search/slicing logic itself is wrong).

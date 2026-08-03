@@ -484,6 +484,98 @@ class TestGroundQuoteEnclosingConstructGuard:
         assert text[locator.start : locator.end] == quote
 
 
+class TestGroundQuoteNonNumericTokenBoundary:
+    """A non-numeric quote (a unit or a label) never fullmatches
+    `NUMERAL_CANDIDATE_RE`, so it skipped every boundary guard above entirely
+    and grounded via plain, unguarded substring search -- e.g.
+    `ground_quote("Kinetics pressure 1023", "K")` silently accepted the "K"
+    inside "Kinetics" as if it were the unit Kelvin. This class pins the new
+    per-edge word/token-boundary guard that closes that gap: refuse a
+    non-numeric quote that is an interior fragment of a larger alphanumeric
+    token, using the same LETTER/DIGIT edge classification documented on
+    `carmel.services.numeric.has_clean_token_boundary`."""
+
+    def test_rejects_letter_quote_glued_to_a_larger_word(self) -> None:
+        # The original bug report: "K" grounds inside "Kinetics", not as the
+        # unit Kelvin.
+        with pytest.raises(QuoteGroundingError, match="token boundary"):
+            ground_quote("Kinetics pressure 1023", "K")
+
+    def test_rejects_quote_immediately_preceded_by_a_digit(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="token boundary"):
+            ground_quote("310 ms elapsed", "10 ms")
+
+    def test_rejects_quote_immediately_followed_by_a_letter(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="token boundary"):
+            ground_quote("the temperature rose", "temp")
+
+    def test_rejects_quote_that_is_a_prefix_of_a_larger_word(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="token boundary"):
+            ground_quote("5 atm", "at")
+
+    def test_rejects_quote_immediately_preceded_by_a_letter(self) -> None:
+        # Isolates the LEADING-edge, letter-precedes-letter branch: "ics" is
+        # the tail of "Kinetics" (preceded by the letter "t"), but its own
+        # trailing edge sits cleanly at a space before "pressure" -- so this
+        # can only be caught by the leading check, not the trailing one.
+        with pytest.raises(QuoteGroundingError, match="token boundary"):
+            ground_quote("Kinetics pressure", "ics")
+
+    def test_rejects_quote_immediately_followed_by_a_digit(self) -> None:
+        # Isolates the TRAILING-edge, digit-followed-by-digit branch: "was 10"
+        # starts cleanly after a space, but its trailing "0" is immediately
+        # followed by another digit ("2" of "102") -- so this can only be
+        # caught by the trailing check, not the leading one.
+        with pytest.raises(QuoteGroundingError, match="token boundary"):
+            ground_quote("value was 102 units", "was 10")
+
+    def test_accepts_letter_quote_immediately_preceded_by_a_digit(self) -> None:
+        # Deliberate asymmetry, load-bearing: NUMERAL_EXTENT_RE's trailing
+        # boundary permits a letter right after a numeral (so "1023" stays
+        # groundable inside "1023K"). The symmetric consequence is that the
+        # unit "K" glued to that same numeral must ALSO stay groundable, so a
+        # digit immediately before a LETTER-initial quote must NOT trigger
+        # this guard -- only a letter before a letter, or a digit/dot/comma
+        # before a digit, does.
+        locator = ground_quote("1023K", "K")
+        assert (locator.start, locator.end) == (4, 5)
+
+    def test_accepts_letter_quote_in_parentheses(self) -> None:
+        locator = ground_quote("T (K) 1023", "K")
+        assert (locator.start, locator.end) == (3, 4)
+
+    def test_accepts_label_quote_bounded_by_whitespace(self) -> None:
+        locator = ground_quote("Kinetics pressure 1023", "pressure")
+        assert (locator.start, locator.end) == (9, 17)
+
+    def test_accepts_unit_quote_bounded_by_whitespace(self) -> None:
+        locator = ground_quote("the pressure was 1 bar", "bar")
+        assert (locator.start, locator.end) == (19, 22)
+
+    def test_accepts_unit_quote_containing_a_slash(self) -> None:
+        locator = ground_quote("flame speed in cm/s", "cm/s")
+        assert (locator.start, locator.end) == (15, 19)
+
+    def test_accepts_multi_word_label_quote(self) -> None:
+        locator = ground_quote("ignition delay time", "ignition delay")
+        assert (locator.start, locator.end) == (0, 14)
+
+    def test_ambiguity_is_checked_before_the_token_boundary_check_and_still_refuses(self) -> None:
+        # Same ordering as `TestGroundQuoteNumeralGrammarUnification
+        # .test_ambiguity_is_checked_before_the_numeral_check_and_still_refuses`
+        # for the numeral path: `ground_quote` counts every match BEFORE it
+        # ever looks at the boundary of the single, already-resolved
+        # occurrence. A boundary filter that instead ran first and silently
+        # dropped the bad match would turn a genuinely ambiguous quote into a
+        # falsely "unique" one -- exactly the ambiguity this function exists
+        # to refuse, never resolve. Here "K" appears twice: once glued inside
+        # "Kelvin" (which the new guard would refuse on its own) and once as
+        # a clean, isolated unit -- ambiguity must still win.
+        text = "Kelvin unit and 1023 K measured"
+        with pytest.raises(QuoteGroundingError, match=r"appears 2 times"):
+            ground_quote(text, "K")
+
+
 class TestProducerEndToEnd:
     def test_produce_store_load_replay(self, tmp_path: Path) -> None:
         """The whole vertical slice: real store_artifact -> producer ->
