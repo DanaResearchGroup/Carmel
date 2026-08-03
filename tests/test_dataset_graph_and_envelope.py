@@ -12,7 +12,8 @@ isolation, not the graph-level model introduced here).
 from __future__ import annotations
 
 import re
-from typing import get_args, get_origin
+from enum import Enum
+from typing import Union, get_args, get_origin
 
 import pytest
 from pydantic import BaseModel, ValidationError
@@ -20,7 +21,7 @@ from pydantic import BaseModel, ValidationError
 from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
-    ArchiveMemberLocator,
+    ArchiveOrigin,
     BBox,
     BBoxLocator,
     ComponentRole,
@@ -30,6 +31,7 @@ from carmel.schemas.datasets import (
     CompositionResolution,
     CoordinateFrame,
     DatasetEnvelope,
+    Maybe,
     MeasuredValue,
     QuantityKind,
     SourceGraph,
@@ -48,6 +50,12 @@ SHA_C = "c" * 64
 SHA_D = "d" * 64
 SHA_E = "e" * 64
 SHA_F = "f" * 64
+
+_NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""Module-level singleton default for SourceNode.origin -- Absent is frozen,
+so sharing one instance across every _node() call that doesn't need a
+concrete ArchiveOrigin is safe, and avoids a function-call-in-argument-default
+(ruff B008)."""
 
 
 def _frame(**kwargs: object) -> CoordinateFrame:
@@ -75,8 +83,9 @@ def _node(
     kind: SourceNodeKind = SourceNodeKind.PAPER_PDF,
     sha256: str = SHA_A,
     parent_node_id: str | None = None,
+    origin: ArchiveOrigin | Absent = _NO_ORIGIN,
 ) -> SourceNode:
-    return SourceNode(node_id=node_id, kind=kind, sha256=sha256, parent_node_id=parent_node_id)
+    return SourceNode(node_id=node_id, kind=kind, sha256=sha256, parent_node_id=parent_node_id, origin=origin)
 
 
 def _bbox_ref(node_id: str) -> SourceRef:
@@ -89,10 +98,6 @@ def _table_ref(node_id: str, row: int = 0, col: int = 1) -> SourceRef:
 
 def _xpath_ref(node_id: str, xpath: str = "//table/row[1]/cell[1]") -> SourceRef:
     return SourceRef(node_id=node_id, locator=XPathLocator(xpath=xpath))
-
-
-def _archive_ref(node_id: str, member_sha256: str = SHA_B) -> SourceRef:
-    return SourceRef(node_id=node_id, locator=ArchiveMemberLocator(member_sha256=member_sha256))
 
 
 def _mole_fraction_amount(value_ref: SourceRef, unit_ref: SourceRef, raw_text: str = "0.04") -> MeasuredValue:
@@ -244,6 +249,85 @@ def _inspect_annotation(annotation: object, path: str, seen: frozenset[type]) ->
     return set()
 
 
+_ALLOWED_PRIMITIVE_ANNOTATIONS = (str, int, float, bool, bytes, type(None))
+_DATASETS_MODULE = "carmel.schemas.datasets"
+
+
+def _unwalkable_annotations(
+    model_cls: type[BaseModel], prefix: str = "", seen: frozenset[type] | None = None
+) -> dict[str, object]:
+    """Recursively walk `model_cls`'s field annotations and return a
+    path -> annotation mapping for every annotation that is NOT built
+    entirely out of shapes both _collect_field_paths_carrying_source_ref
+    (above) and the runtime walker (iter_source_refs) know how to
+    traverse.
+
+    _inspect_annotation above answers "does this annotation carry a
+    SourceRef, given what I know how to walk?" -- which is silently blind
+    to a shape it doesn't know how to walk at all: `typing.Any`, a bare
+    `object`, an un-parameterized container, or a container neither walker
+    descends into (e.g. `set`/`frozenset` -- iter_source_refs only
+    descends into BaseModel/list/tuple/dict). A field given one of those
+    annotations could hide a SourceRef from BOTH the annotation-side check
+    and the runtime walker at once, which is exactly the failure
+    TestRefWalkCannotBeOutgrown above cannot catch by itself. This walk
+    reports every such shape explicitly instead.
+
+    Expressed as an explicit ALLOWLIST (BaseModel subclasses defined in
+    this module, tuple/list/dict, primitives, Maybe/Optional/Union,
+    Enum subclasses, SourceRef itself) rather than a per-disallowed-type
+    special case, so a brand-new unwalkable shape fails closed by default
+    instead of silently passing because nobody thought to blocklist it.
+    """
+    seen = seen or frozenset()
+    if model_cls in seen:
+        return {}
+    seen = seen | {model_cls}
+    unwalkable: dict[str, object] = {}
+    for name, field in model_cls.model_fields.items():
+        unwalkable.update(_inspect_annotation_walkability(field.annotation, f"{prefix}{name}", seen))
+    return unwalkable
+
+
+def _inspect_annotation_walkability(annotation: object, path: str, seen: frozenset[type]) -> dict[str, object]:
+    if annotation is SourceRef or annotation in _ALLOWED_PRIMITIVE_ANNOTATIONS:
+        return {}
+
+    if isinstance(annotation, type):
+        if issubclass(annotation, Enum):
+            return {}
+        if issubclass(annotation, BaseModel):
+            if annotation.__module__ != _DATASETS_MODULE or annotation in seen:
+                return {}
+            return _unwalkable_annotations(annotation, prefix=f"{path}.", seen=seen)
+        # A bare type that is neither an Enum nor a BaseModel we can descend
+        # into -- covers `object`, and any other non-allowlisted concrete
+        # type used as a bare annotation.
+        return {path: annotation}
+
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+
+    if origin is Maybe:
+        result: dict[str, object] = {}
+        for arg in args:
+            result.update(_inspect_annotation_walkability(arg, path, seen))
+        return result
+
+    if origin in (tuple, list, dict, Union):
+        result = {}
+        for arg in args:
+            if arg is Ellipsis:
+                continue
+            result.update(_inspect_annotation_walkability(arg, path, seen))
+        return result
+
+    # Everything else -- typing.Any (origin/args both empty), `set`/
+    # `frozenset` (a container the runtime walker never descends into),
+    # Callable, or any other origin not on the allowlist -- is unwalkable.
+    return {path: annotation}
+
+
 # --------------------------------------------------------------------------
 # SourceGraph invariants
 # --------------------------------------------------------------------------
@@ -277,9 +361,9 @@ class TestSourceGraphIdentityAndAcyclicity:
     # green. Matching the distinctive word is what makes I3 independently pinned,
     # because I4's message never contains it. I3 is kept rather than deleted
     # because it stops being unreachable the moment the kind rules admit a
-    # same-kind parent (an archive containing members is the live candidate --
-    # see the ArchiveMemberLocator question), and a cycle then costs a hang, not
-    # a rejection: the walk's only exit is this raise.
+    # same-kind parent (an archive containing members is the live candidate),
+    # and a cycle then costs a hang, not a rejection: the walk's only exit is
+    # this raise.
 
     def test_self_parent_rejected(self) -> None:
         looped = _node("self-loop", SourceNodeKind.SI_MEMBER, SHA_A, parent_node_id="self-loop")
@@ -435,6 +519,18 @@ class TestSourceGraphLookupAPI:
         graph = SourceGraph(nodes=(paper,))
         assert list(graph.ancestors("paper")) == []
 
+    def test_ancestors_raises_instead_of_hanging_on_a_cycle_from_model_construct(self) -> None:
+        """Normal validated construction rejects cycles (I3), but
+        ``SourceGraph.model_construct()`` is a documented escape hatch that
+        bypasses validation entirely and can produce one. ``ancestors()``
+        walks ``parent_node_id`` with no visited-set of its own, so a cyclic
+        graph built this way must not hang forever -- it must raise."""
+        a = _node("a", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id="b")
+        b = _node("b", SourceNodeKind.PAPER_PDF, SHA_B, parent_node_id="a")
+        graph = SourceGraph.model_construct(nodes=(a, b))
+        with pytest.raises(ValueError, match="cycle"):
+            graph.ancestors("a")
+
 
 # --------------------------------------------------------------------------
 # DatasetEnvelope invariants
@@ -582,19 +678,6 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
         envelope = _envelope_with_value_ref_locator(XPathLocator(xpath="//a"), SourceNodeKind.JATS_XML)
         assert envelope.composition == envelope.composition  # constructs without raising
 
-    def test_archive_member_locator_rejected_against_non_si_member_nodes(self) -> None:
-        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.FIGURE_CROP):
-            with pytest.raises(ValidationError) as excinfo:
-                _envelope_with_value_ref_locator(ArchiveMemberLocator(member_sha256=SHA_E), kind)
-            msg = str(excinfo.value).lower()
-            assert "archive_member" in msg or "archivemember" in msg
-            assert kind.value in msg
-
-    def test_archive_member_locator_accepted_against_si_member_node(self) -> None:
-        # member_sha256 must equal the target node's own sha256 (V4) --
-        # _graph_and_node_of_kind's default target sha256 is SHA_A.
-        _envelope_with_value_ref_locator(ArchiveMemberLocator(member_sha256=SHA_A), SourceNodeKind.SI_MEMBER)
-
     def test_table_cell_locator_rejected_against_figure_crop_node(self) -> None:
         with pytest.raises(ValidationError) as excinfo:
             _envelope_with_value_ref_locator(TableCellLocator(row=0, col=0), SourceNodeKind.FIGURE_CROP)
@@ -618,51 +701,6 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
             _envelope_with_value_ref_locator(BBoxLocator(bbox=_bbox()), kind)
 
 
-class TestDatasetEnvelopeArchiveMemberShaMatchesNode:
-    """V4: an ArchiveMemberLocator's member_sha256 must match the sha256 of
-    the SI_MEMBER node it targets."""
-
-    def test_member_sha256_mismatching_target_node_sha256_rejected(self) -> None:
-        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
-        si = _node("si", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
-        graph = SourceGraph(nodes=(paper, si))
-        amount = _mole_fraction_amount(
-            value_ref=_archive_ref("si", member_sha256=SHA_E),
-            unit_ref=_table_ref("paper"),
-        )
-        composition = Composition(
-            raw_name="mix",
-            resolution=CompositionResolution.RESOLVED_COMPONENTS,
-            basis=CompositionBasis.MOLE_FRACTION,
-            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
-            components=[CompositionComponent(species_raw_name="H2", amount=amount, role=ComponentRole.FUEL)],
-        )
-        with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition)
-        msg = str(excinfo.value)
-        assert "composition.components[0].amount.value_ref" in msg
-        assert SHA_E in msg
-        assert SHA_B in msg
-
-    def test_member_sha256_matching_target_node_sha256_accepted(self) -> None:
-        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
-        si = _node("si", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
-        graph = SourceGraph(nodes=(paper, si))
-        amount = _mole_fraction_amount(
-            value_ref=_archive_ref("si", member_sha256=SHA_B),
-            unit_ref=_table_ref("paper"),
-        )
-        composition = Composition(
-            raw_name="mix",
-            resolution=CompositionResolution.RESOLVED_COMPONENTS,
-            basis=CompositionBasis.MOLE_FRACTION,
-            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
-            components=[CompositionComponent(species_raw_name="H2", amount=amount, role=ComponentRole.FUEL)],
-        )
-        envelope = DatasetEnvelope(source_graph=graph, composition=composition)
-        assert envelope.composition == composition
-
-
 # --------------------------------------------------------------------------
 # Functional / meta / frozen-ness
 # --------------------------------------------------------------------------
@@ -676,13 +714,19 @@ class TestFunctionalRealisticEnvelope:
 
     def _build(self) -> DatasetEnvelope:
         paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
-        si = _node("si", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
+        si = _node(
+            "si",
+            SourceNodeKind.SI_MEMBER,
+            SHA_B,
+            parent_node_id="paper",
+            origin=ArchiveOrigin(archive_sha256=SHA_A, member_display_path="SI/data.xlsx"),
+        )
         crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_C, parent_node_id="paper")
         graph = SourceGraph(nodes=(paper, si, crop))
 
         h2 = _component(
             "H2",
-            value_ref=_archive_ref("si", member_sha256=SHA_B),
+            value_ref=_table_ref("si", row=0, col=0),
             unit_ref=_table_ref("paper", row=0, col=0),
         )
         n2 = _component(
@@ -742,6 +786,31 @@ class TestRefWalkCannotBeOutgrown:
             "A future SourceRef-bearing field must not be able to silently evade the V1/V2 "
             "integrity check -- if this fails, either the walker's field-location list or "
             "iter_source_refs' traversal has fallen out of sync with the schema."
+        )
+
+    def test_no_field_reachable_from_dataset_envelope_has_an_unwalkable_annotation(self) -> None:
+        """The test above can be defeated by a single vague annotation: a
+        field typed `typing.Any`, bare `object`, or a `set`/`frozenset` is
+        invisible to BOTH _collect_field_paths_carrying_source_ref (the
+        annotation-side check above) AND iter_source_refs (the runtime
+        walker) at once -- so a SourceRef tucked inside such a field would
+        never show up as "expected" and never show up as "missing" either;
+        the test above would stay green while a ref silently evaded V1/V2.
+
+        This test closes that hole directly: it walks every field
+        annotation reachable from DatasetEnvelope against an explicit
+        allowlist of shapes both walkers actually know how to traverse,
+        and fails loudly, naming the offending path and annotation, the
+        moment anything falls outside that allowlist."""
+        unwalkable = _unwalkable_annotations(DatasetEnvelope)
+        assert not unwalkable, (
+            "found field(s) reachable from DatasetEnvelope whose annotation shape is not on the "
+            f"walkable allowlist: {sorted(unwalkable.items(), key=lambda item: item[0])!r}. "
+            "An annotation shape like typing.Any, a bare `object`, or an unwalkable container "
+            "(e.g. set/frozenset) could hide a SourceRef from both the annotation-side check "
+            "(TestRefWalkCannotBeOutgrown above) and the runtime walker (iter_source_refs) at "
+            "the same time -- widen the allowlist in _inspect_annotation_walkability only after "
+            "confirming iter_source_refs itself can actually traverse the new shape."
         )
 
 

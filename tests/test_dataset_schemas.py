@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
-    ArchiveMemberLocator,
+    ArchiveOrigin,
     BBox,
     BBoxLocator,
     ComponentRole,
@@ -38,6 +38,12 @@ from carmel.services.units import TABLE_V1
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 
+_NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""Module-level singleton default for SourceNode.origin -- Absent is frozen,
+so sharing one instance across every _node() call that doesn't need a
+concrete ArchiveOrigin is safe, and avoids a function-call-in-argument-default
+(ruff B008)."""
+
 
 def _frame(**kwargs: object) -> CoordinateFrame:
     defaults: dict[str, object] = {
@@ -59,8 +65,13 @@ def _bbox(**kwargs: object) -> BBox:
     return BBox(**defaults)  # type: ignore[arg-type]
 
 
-def _node(node_id: str = "n1", kind: SourceNodeKind = SourceNodeKind.PAPER_PDF, sha256: str = SHA_A) -> SourceNode:
-    return SourceNode(node_id=node_id, kind=kind, sha256=sha256)
+def _node(
+    node_id: str = "n1",
+    kind: SourceNodeKind = SourceNodeKind.PAPER_PDF,
+    sha256: str = SHA_A,
+    origin: ArchiveOrigin | Absent = _NO_ORIGIN,
+) -> SourceNode:
+    return SourceNode(node_id=node_id, kind=kind, sha256=sha256, origin=origin)
 
 
 def _bbox_ref(node_id: str = "n1") -> SourceRef:
@@ -303,12 +314,51 @@ class TestSourceGraph:
 
     def test_source_node_rejects_bad_sha(self) -> None:
         with pytest.raises(ValidationError):
-            SourceNode(node_id="n1", kind=SourceNodeKind.PAPER_PDF, sha256="not-a-sha")
+            SourceNode(
+                node_id="n1",
+                kind=SourceNodeKind.PAPER_PDF,
+                sha256="not-a-sha",
+                origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
 
     def test_si_member_can_link_to_parent_paper(self) -> None:
         parent = _node(node_id="paper", kind=SourceNodeKind.PAPER_PDF, sha256=SHA_A)
-        member = SourceNode(node_id="si-1", kind=SourceNodeKind.SI_MEMBER, sha256=SHA_B, parent_node_id=parent.node_id)
+        member = SourceNode(
+            node_id="si-1",
+            kind=SourceNodeKind.SI_MEMBER,
+            sha256=SHA_B,
+            parent_node_id=parent.node_id,
+            origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
         assert member.parent_node_id == "paper"
+
+    def test_si_member_can_carry_a_concrete_archive_origin(self) -> None:
+        """An SI_MEMBER node -- and only an SI_MEMBER node -- is legitimately
+        the output of extracting one member from an archive, so it is the
+        one kind allowed to carry a concrete (non-Absent) ArchiveOrigin."""
+        parent = _node(node_id="paper", kind=SourceNodeKind.PAPER_PDF, sha256=SHA_A)
+        member = SourceNode(
+            node_id="si-1",
+            kind=SourceNodeKind.SI_MEMBER,
+            sha256=SHA_B,
+            parent_node_id=parent.node_id,
+            origin=ArchiveOrigin(archive_sha256=SHA_A, member_display_path="data/table1.csv"),
+        )
+        assert isinstance(member.origin, ArchiveOrigin)
+        assert member.origin.archive_sha256 == SHA_A
+
+    def test_non_si_member_node_cannot_carry_a_concrete_archive_origin(self) -> None:
+        """A paper PDF didn't come out of a zip -- only an SI_MEMBER node
+        was ever extracted from an archive, so a concrete ArchiveOrigin on
+        any other kind describes a provenance relationship that cannot
+        actually exist and must be rejected."""
+        with pytest.raises(ValidationError):
+            SourceNode(
+                node_id="n1",
+                kind=SourceNodeKind.PAPER_PDF,
+                sha256=SHA_A,
+                origin=ArchiveOrigin(archive_sha256=SHA_B),
+            )
 
     def test_bbox_locator_ref_round_trips(self) -> None:
         ref = _bbox_ref()
@@ -333,26 +383,22 @@ class TestSourceGraph:
         ref = SourceRef(node_id="n1", locator=XPathLocator(xpath="//table/row[1]/cell[2]"))
         assert isinstance(ref.locator, XPathLocator)
 
-    def test_archive_member_locator_uses_sha_as_identity(self) -> None:
-        ref = SourceRef(node_id="n1", locator=ArchiveMemberLocator(member_sha256=SHA_B, display_path="./SI/data.xlsx"))
-        assert isinstance(ref.locator, ArchiveMemberLocator)
-        assert ref.locator.member_sha256 == SHA_B
-
-    def test_archive_member_locator_rejects_bad_sha(self) -> None:
+    def test_archive_origin_rejects_bad_sha(self) -> None:
         with pytest.raises(ValidationError):
-            ArchiveMemberLocator(member_sha256="not-a-sha")
+            ArchiveOrigin(archive_sha256="not-a-sha")
 
-    def test_archive_member_locator_display_path_is_optional(self) -> None:
-        ref = ArchiveMemberLocator(member_sha256=SHA_B)
-        assert ref.display_path is None
+    def test_archive_origin_member_display_path_is_optional(self) -> None:
+        origin = ArchiveOrigin(archive_sha256=SHA_B)
+        assert origin.member_display_path is None
 
-    def test_two_different_display_paths_can_share_identity(self) -> None:
-        """Member SHA is identity; the path is display-only, so two locators
-        with the same sha but differently-normalized paths are the same
-        reference in every way that matters (sha256 identity)."""
-        a = ArchiveMemberLocator(member_sha256=SHA_B, display_path="./a/b.csv")
-        b = ArchiveMemberLocator(member_sha256=SHA_B, display_path="a/b.csv")
-        assert a.member_sha256 == b.member_sha256
+    def test_archive_origin_member_display_path_is_not_identity(self) -> None:
+        """archive_sha256 is identity; member_display_path is display-only,
+        so two origins with the same archive sha but differently-normalized
+        display paths are the same reference in every way that matters
+        (archive_sha256 identity)."""
+        a = ArchiveOrigin(archive_sha256=SHA_B, member_display_path="./a/b.csv")
+        b = ArchiveOrigin(archive_sha256=SHA_B, member_display_path="a/b.csv")
+        assert a.archive_sha256 == b.archive_sha256
 
     def test_source_ref_rejects_unknown_locator_kind(self) -> None:
         with pytest.raises(ValidationError):
@@ -988,7 +1034,7 @@ class TestComposition:
             basis=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             equivalence_ratio=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
         )
-        assert air.components == []
+        assert air.components == ()
 
     def test_air_round_trips_without_gaining_components(self) -> None:
         air = Composition(
@@ -999,7 +1045,7 @@ class TestComposition:
         )
         dumped = air.model_dump(mode="json")
         restored = Composition.model_validate(dumped)
-        assert restored.components == []
+        assert restored.components == ()
         assert restored.raw_name == "air"
 
     def test_unresolved_mixture_cannot_be_given_components(self) -> None:
@@ -1282,3 +1328,44 @@ class TestModelsAreFrozen:
         copied = absent.model_copy(update={"reason": AbsenceReason.NOT_APPLICABLE})
         assert absent.reason == AbsenceReason.UNKNOWN
         assert copied.reason == AbsenceReason.NOT_APPLICABLE
+
+    def test_composition_components_is_immutable_to_in_place_mutation(self) -> None:
+        """frozen=True only blocks attribute REASSIGNMENT; a components field
+        still typed list[...] would remain mutable in place (.append/.clear),
+        silently defeating the RESOLVED_COMPONENTS/UNRESOLVED_NAMED_MIXTURE
+        invariants enforced at construction time. components is tuple[...],
+        so it must expose no mutating list methods at all."""
+        mixture = Composition(
+            raw_name="4% H2 in N2",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.MOLE_FRACTION,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
+            ],
+        )
+        assert isinstance(mixture.components, tuple)
+        with pytest.raises(AttributeError):
+            mixture.components.append(mixture.components[0])  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            mixture.components.clear()  # type: ignore[attr-defined]
+
+    def test_composition_components_accepts_list_input_and_coerces_to_tuple(self) -> None:
+        """A caller passing a plain list (the natural shape when building one
+        up in a loop) must still work -- pydantic coerces it to the declared
+        tuple[...] type rather than rejecting it."""
+        mixture = Composition(
+            raw_name="4% H2 in N2",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.MOLE_FRACTION,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
+            ],
+        )
+        assert isinstance(mixture.components, tuple)
+        assert len(mixture.components) == 1

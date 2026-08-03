@@ -49,6 +49,21 @@ instance rather than mutating the original -- neither is closed off by
 ``frozen=True``, and both remain the correct escape hatches for code that
 genuinely needs to construct or derive a payload without going through
 ``__init__`` validation.
+
+``frozen=True`` only blocks attribute REASSIGNMENT (``instance.field = ...``);
+it does nothing to stop IN-PLACE mutation of a mutable container an instance
+happens to hold (``instance.field.append(...)``, ``.clear()``, ``[...] =
+...``). A field typed ``list[...]``/``dict[...]``/``set[...]`` would reopen
+exactly the hole this paragraph describes -- an already-validated payload
+(e.g. ``Composition.components``, which every RESOLVED_COMPONENTS/
+UNRESOLVED_NAMED_MIXTURE invariant is checked against at construction time)
+could be mutated after the fact with no validator ever re-running. Every
+container-typed field in this module is therefore declared with an immutable
+element type -- ``tuple[..., ...]`` in place of ``list[...]`` (see
+``MeasuredValue.repairs`` and ``Composition.components``) -- and this is
+exhaustive only because every field is checked this way; a future field that
+introduces a bare ``list``/``dict``/``set`` would silently reopen the hole
+frozen=True was meant to close.
 """
 
 from __future__ import annotations
@@ -76,7 +91,7 @@ from carmel.services.units import QuantityKind
 __all__ = [
     "AbsenceReason",
     "Absent",
-    "ArchiveMemberLocator",
+    "ArchiveOrigin",
     "BBox",
     "BBoxLocator",
     "ComponentRole",
@@ -375,6 +390,40 @@ class SourceNodeKind(StrEnum):
     FIGURE_CROP = "figure_crop"
 
 
+class ArchiveOrigin(BaseModel):
+    """Which archive (e.g. an SI zip) a :class:`SourceNode` was extracted
+    from, and where within it -- an artifact's ORIGIN, not a location within
+    currently-referenced content (that's what :class:`SourceLocator` is for;
+    see :class:`SourceNode`'s ``origin`` field for the boundary between the
+    two).
+
+    ``archive_sha256`` is identity; ``member_display_path`` is display-only.
+    This split is deliberate: archive paths collide under normalization
+    (e.g. ``"./a/b"`` and ``"a/b"`` name the same path; a path may use ``/``
+    or ``\\`` as its separator) in ways that carry no information about the
+    member's actual bytes, and a path string can be adversarially crafted
+    (path traversal sequences, homoglyphs) to *look* like it identifies one
+    member while actually addressing another. Treating a display path as
+    identity would let two such adversarial paths collide silently;
+    ``archive_sha256`` is the only identity-bearing field here for exactly
+    that reason, and ``member_display_path`` exists purely so a human
+    reviewing provenance has something readable to look at.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    archive_sha256: str = Field(min_length=64, max_length=64)
+    member_display_path: str | None = None
+    """Human-readable ONLY -- never identity. See class docstring."""
+
+    @field_validator("archive_sha256")
+    @classmethod
+    def _validate_archive_sha256(cls, value: str) -> str:
+        if not _SHA256_RE.match(value):
+            raise ValueError(f"invalid archive_sha256: expected 64 lowercase hex chars, got {value!r}")
+        return value
+
+
 class SourceNode(BaseModel):
     """One artifact in a dataset's source graph.
 
@@ -393,6 +442,33 @@ class SourceNode(BaseModel):
     kind: SourceNodeKind
     sha256: str = Field(min_length=64, max_length=64)
     parent_node_id: str | None = None
+    origin: Maybe[ArchiveOrigin]
+    """Which archive this node was extracted from, if any. ``Maybe``-typed,
+    with no default, for the same reason documented on
+    :class:`CompositionComponent`'s ``role`` field: a mandatory default
+    would force every node -- including a ``PAPER_PDF`` that plainly didn't
+    come out of a zip -- to state one way or the other, when for most nodes
+    the honest, structural answer is "the concept does not apply here" (see
+    the validator below, which requires exactly that for every non
+    ``SI_MEMBER`` node) rather than an unreasoned absence."""
+
+    @model_validator(mode="after")
+    def _validate_origin_only_for_si_member(self) -> SourceNode:
+        """Only an ``SI_MEMBER`` node may carry a concrete (non-``Absent``)
+        :class:`ArchiveOrigin`.
+
+        A paper PDF didn't come out of a zip -- nor did a JATS/XML document,
+        nor a figure crop (both derived some other way) -- so any other
+        kind claiming a concrete origin is describing a provenance
+        relationship that cannot actually exist.
+        """
+        if self.kind != SourceNodeKind.SI_MEMBER and not isinstance(self.origin, Absent):
+            raise ValueError(
+                f"node {self.node_id!r} has kind={self.kind.value!r}, which cannot carry a concrete "
+                "ArchiveOrigin -- only an SI_MEMBER node can, since only an SI_MEMBER node was ever "
+                "extracted from an archive; origin must be Absent(...) here"
+            )
+        return self
 
     @field_validator("sha256")
     @classmethod
@@ -408,7 +484,6 @@ class LocatorKind(StrEnum):
     BBOX = "bbox"
     TABLE_CELL = "table_cell"
     XPATH = "xpath"
-    ARCHIVE_MEMBER = "archive_member"
 
 
 class BBoxLocator(BaseModel):
@@ -442,36 +517,8 @@ class XPathLocator(BaseModel):
     xpath: str = Field(min_length=1)
 
 
-class ArchiveMemberLocator(BaseModel):
-    """Locates a reference at a member of an archive (e.g. an SI zip).
-
-    ``member_sha256`` is identity; ``display_path`` is display-only. This
-    split is deliberate: member paths collide after normalization (e.g.
-    ``"./a/b"`` vs ``"a/b"`` vs a path using backslashes) and, for archives
-    extracted from untrusted PDFs' supplementary information, can be
-    adversarially crafted (path traversal, homoglyphs). A locator that used
-    the path as identity would let two different bytes silently look like
-    the same reference, or vice versa.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    kind: Literal[LocatorKind.ARCHIVE_MEMBER] = LocatorKind.ARCHIVE_MEMBER
-    member_sha256: str = Field(min_length=64, max_length=64)
-    display_path: str | None = None
-    """Human-readable path for display ONLY -- never used for identity or
-    equality. See class docstring."""
-
-    @field_validator("member_sha256")
-    @classmethod
-    def _validate_member_sha256(cls, value: str) -> str:
-        if not _SHA256_RE.match(value):
-            raise ValueError(f"invalid member_sha256: {value!r} (expected 64 lowercase hex characters)")
-        return value
-
-
 SourceLocator = Annotated[
-    BBoxLocator | TableCellLocator | XPathLocator | ArchiveMemberLocator,
+    BBoxLocator | TableCellLocator | XPathLocator,
     Field(discriminator="kind"),
 ]
 
@@ -653,6 +700,13 @@ class SourceGraph(BaseModel):
         # genuinely different role (a different kind, or a different parent)
         # stays legal: e.g. a PAPER_PDF root and a FIGURE_CROP taken from
         # that same PDF share a sha256 but are not duplicates of each other.
+        # This triple deliberately does NOT include `origin`: two
+        # byte-identical SI_MEMBER files belonging to the same paper are now
+        # DISTINGUISHABLE from each other via `origin` (different archives,
+        # or different member_display_paths within the same archive), but
+        # this invariant does not treat that distinction as enough on its
+        # own to admit both -- widening the triple to include origin is a
+        # deliberate future change, not an oversight here.
         seen_triples: set[tuple[SourceNodeKind, str, str | None]] = set()
         for node in self.nodes:
             triple = (node.kind, node.sha256, node.parent_node_id)
@@ -683,14 +737,24 @@ class SourceGraph(BaseModel):
     def ancestors(self, node_id: str) -> tuple[SourceNode, ...]:
         """Return ``node_id``'s parent chain, from immediate parent to root.
 
-        Empty for a root node (``parent_node_id is None``). Safe against the
-        cycles I3 already forbids at construction time -- this never has to
-        defend against an infinite chain itself.
+        Empty for a root node (``parent_node_id is None``). I3 forbids cycles
+        at construction time for a graph built through normal validation, but
+        ``SourceGraph.model_construct()`` is a documented escape hatch that
+        bypasses validation (including I3) and can produce one -- so this
+        walk keeps its own visited-set and raises ``ValueError`` naming the
+        cycle rather than looping forever if it ever revisits a node_id.
         """
         nodes_by_id = {node.node_id: node for node in self.nodes}
         chain: list[SourceNode] = []
+        visited: set[str] = {node_id}
         current = nodes_by_id[node_id]
         while current.parent_node_id is not None:
+            if current.parent_node_id in visited:
+                raise ValueError(
+                    f"cycle detected in source graph while walking ancestors of {node_id!r}: "
+                    f"node_id {current.parent_node_id!r} was already visited"
+                )
+            visited.add(current.parent_node_id)
             current = nodes_by_id[current.parent_node_id]
             chain.append(current)
         return tuple(chain)
@@ -1207,7 +1271,7 @@ class Composition(BaseModel):
     resolution: CompositionResolution
     basis: Maybe[CompositionBasis]
     equivalence_ratio: Maybe[MeasuredValue]
-    components: list[CompositionComponent] = Field(default_factory=list)
+    components: tuple[CompositionComponent, ...] = ()
 
     @model_validator(mode="after")
     def _enforce_unresolved_has_no_components(self) -> Composition:
@@ -1325,7 +1389,6 @@ _LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]
     LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
     LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
     LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML}),
-    LocatorKind.ARCHIVE_MEMBER: frozenset({SourceNodeKind.SI_MEMBER}),
 }
 """Which :class:`SourceNodeKind`\\ s a given :class:`LocatorKind` may target.
 
@@ -1342,10 +1405,11 @@ The compatibility itself reflects what each locator actually addresses:
 ``XPathLocator`` only makes sense against a JATS/XML document; a bounding
 box only makes sense against something that was actually RENDERED to a page
 (a PDF, an SI member that is itself a rendered document, or a figure crop);
-an archive member locator only makes sense against an SI archive member
-itself; a table cell locator makes sense against anything that can carry a
-table (a PDF, JATS/XML, or an SI spreadsheet member) but not a figure crop,
-which has no tabular structure of its own.
+a table cell locator makes sense against anything that can carry a table (a
+PDF, JATS/XML, or an SI spreadsheet member) but not a figure crop, which has
+no tabular structure of its own. Which ARCHIVE a node was extracted from is
+not a locator concern at all -- see :class:`ArchiveOrigin` on
+:class:`SourceNode` -- so no ``LocatorKind`` addresses that here.
 """
 
 assert set(_LOCATOR_KIND_COMPATIBLE_NODE_KINDS) == set(LocatorKind), (
@@ -1363,8 +1427,8 @@ class DatasetEnvelope(BaseModel):
     every :class:`SourceRef` embedded anywhere in this envelope (found via
     :func:`iter_source_refs`, which is shape-agnostic -- see its docstring)
     is checked against ``source_graph``, and the graph itself is checked for
-    having nothing extra hanging off it. The five validators below run in a
-    fixed order (V0 through V4), each addressing a distinct, independently
+    having nothing extra hanging off it. The four validators below run in a
+    fixed order (V0 through V3), each addressing a distinct, independently
     measured failure mode; see each validator's own docstring for the
     concrete failure it closes.
     """
@@ -1472,52 +1536,5 @@ class DatasetEnvelope(BaseModel):
                     f"SourceRef at {path!r} uses locator kind={locator_kind.value!r} against node "
                     f"{node.node_id!r} of kind={node.kind.value!r}, but {locator_kind.value!r} may only "
                     f"target nodes of kind {sorted(kind.value for kind in compatible_kinds)!r}"
-                )
-        return self
-
-    @model_validator(mode="after")
-    def _validate_archive_member_sha_matches_node(self) -> DatasetEnvelope:
-        """V4: an :class:`ArchiveMemberLocator`'s ``member_sha256`` must
-        equal the ``sha256`` of the ``SI_MEMBER`` node its ``SourceRef``
-        targets.
-
-        This is fail-closed rather than a nicety. ``SourceGraph``'s I4
-        forbids an ``SI_MEMBER`` node from parenting another ``SI_MEMBER``
-        node (see that invariant's docstring), which means "an archive node
-        containing addressable member nodes" is structurally unrepresentable
-        today: an ``SI_MEMBER`` node IS the supplementary file itself, and
-        its ``sha256`` IS that file's actual bytes-hash. So an
-        ``ArchiveMemberLocator`` claiming a different ``member_sha256`` for
-        that same node is not describing some other, unaddressed artifact
-        inside an archive -- there is no such node to describe -- it is an
-        unverifiable, unaddressable provenance claim about the very node the
-        ref names, and without this check it validated successfully. If a
-        later milestone (M-E, SI retrieval) needs to genuinely model an
-        archive containing separately-addressed members, it must add a new
-        node kind for that and deliberately relax this check -- not leave
-        the claim unchecked in the meantime.
-
-        Design note for future review, NOT to be acted on now: with this
-        check in place, ``member_sha256`` on ``ArchiveMemberLocator``
-        becomes purely a cross-check against data already recoverable from
-        ``source_graph`` (the node's own ``sha256``) -- it carries no new
-        information. That hints ``ArchiveMemberLocator`` may really be
-        describing an artifact's ORIGIN (which member of a zip archive it
-        was extracted from) rather than a LOCATION WITHIN a currently
-        referenced artifact, i.e. it may conceptually belong on
-        :class:`SourceNode` rather than in the ``SourceLocator`` union. This
-        tension is recorded here for a future design review, not resolved
-        by this validator.
-        """
-        for path, ref in iter_source_refs(self):
-            if not isinstance(ref.locator, ArchiveMemberLocator):
-                continue
-            node = self.source_graph.node(ref.node_id)
-            if ref.locator.member_sha256 != node.sha256:
-                raise ValueError(
-                    f"SourceRef at {path!r} uses ArchiveMemberLocator with member_sha256="
-                    f"{ref.locator.member_sha256!r}, but the targeted node {node.node_id!r} has "
-                    f"sha256={node.sha256!r} -- these must match, since an SI_MEMBER node's sha256 IS "
-                    "the member's actual bytes"
                 )
         return self
