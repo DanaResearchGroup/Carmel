@@ -575,6 +575,54 @@ class TestProducerFailClosed:
                 measurements=_SPECS,
             )
 
+    def test_refuses_stale_derivation_binding(self, tmp_path: Path) -> None:
+        """Hand-edit ``derivation_binding`` so it no longer recomputes from
+        meta.json's own extractor_version/sha256/extracted_sha256, leaving
+        extracted_sha256 (and everything on disk) untouched -- raw.bin and
+        extracted.json both still verify fine, so only the deep
+        derivation_binding re-check (``verify_artifact(deep=True)``) can
+        catch this. This is the entire point of the deep=True flip: this
+        test MUST fail if that flip is reverted to deep=False."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        assert meta.derivation_binding is not None
+        tampered = meta.model_copy(update={"derivation_binding": "0" * 64})
+        assert tampered.derivation_binding != meta.derivation_binding
+        meta_path.write_text(tampered.model_dump_json())
+
+        with pytest.raises(DatasetProducerError, match="failed verify_artifact"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+    def test_refuses_legacy_artifact_missing_derivation_binding(self, tmp_path: Path) -> None:
+        """A legacy artifact stored after extracted_sha256 existed but before
+        derivation_binding did has extracted_sha256 set and
+        derivation_binding=None -- refused with a message naming that
+        specific legacy cause, distinguishable both from the
+        extracted_sha256-is-None legacy message and from a stale-binding
+        refusal."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        assert meta.extracted_sha256 is not None
+        tampered = meta.model_copy(update={"derivation_binding": None, "extractor_version": None})
+        meta_path.write_text(tampered.model_dump_json())
+
+        with pytest.raises(DatasetProducerError, match="predates derivation_binding"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
 
 class TestProducerNodeKind:
     """P1-C: the root SourceNode's ``kind`` must be derived honestly from the

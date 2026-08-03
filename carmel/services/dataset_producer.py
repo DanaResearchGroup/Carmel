@@ -478,8 +478,8 @@ def _load_verified_extracted_text(
 
     P1-B: before this function existed, the producer verified ONLY
     ``extracted.json`` (below) -- ``raw.bin`` and ``meta.json`` were never
-    checked at all. Two checks close that gap, both refusing with a message
-    naming exactly which one failed:
+    checked at all. Several checks close that gap, each refusing with a
+    message naming exactly which one failed:
 
     1. ``meta.sha256 == sha256``: ``load_artifact_meta`` resolves the store
        directory purely from the ``sha256`` PARAMETER (via its own
@@ -488,22 +488,45 @@ def _load_verified_extracted_text(
        ``meta.json`` -- so a ``meta.json`` whose ``sha256`` field disagrees
        with the directory it lives in (e.g. hand-edited or copied from
        elsewhere) would otherwise go undetected.
-    2. :func:`carmel.services.evidence.verify_artifact` with ``deep=False``:
+    2. Two legacy carve-outs, each refused with its own named cause rather
+       than falling through to :func:`~carmel.services.evidence.verify_artifact`
+       (which would otherwise report the same generic failure for both, and
+       for every other kind of corruption besides): an artifact that predates
+       ``extracted_sha256`` (its sidecar can never be verified at all), and
+       one that predates ``derivation_binding`` but does carry
+       ``extracted_sha256`` (handled below via ``AbsenceReason.UNKNOWN`` in
+       :func:`produce_envelope_from_artifact`).
+    3. :func:`carmel.services.evidence.verify_artifact` with ``deep=True``:
        confirms ``raw.bin`` exists and hashes to ``sha256`` (the parameter),
-       and that ``extracted.json`` matches its recorded digest (the same
-       check performed by hand below, but this call also covers ``raw.bin``,
-       which nothing here otherwise touches). ``deep=False`` deliberately:
-       ``deep=True`` additionally re-checks ``derivation_binding``, but it
-       FAILS CLOSED for any artifact missing ``derivation_binding`` /
-       ``extractor_version`` / ``extracted_sha256`` -- i.e. every legacy
-       artifact -- which would silently regress this producer's existing,
-       deliberate support for legacy artifacts (handled below via
-       ``AbsenceReason.UNKNOWN``). Consequence, flagged rather than
-       silently accepted: ``derivation_binding``'s own internal-consistency
-       guarantee (see ``StoredArtifact.derivation_binding``'s docstring) is
-       NOT independently re-verified by this producer for artifacts that do
-       carry it; only ``meta.json``'s presence, structure, and the
-       ``extracted.json``/``raw.bin`` digests it records are.
+       that ``extracted.json`` matches its recorded digest (the same check
+       performed by hand below, but this call also covers ``raw.bin``, which
+       nothing here otherwise touches), and -- because every artifact reaching
+       this call already carries a non-``None`` ``extracted_sha256`` and
+       ``derivation_binding`` (checks 2 above ran first) -- that the recorded
+       ``derivation_binding`` is internally consistent: recomputed from
+       ``meta.json``'s own ``extractor_version``/``sha256``/``extracted_sha256``
+       fields, it still matches the recorded value. That closes the gap this
+       function used to leave open: ``derivation_binding`` is carried verbatim
+       into the produced envelope (see ``produce_envelope_from_artifact``
+       below), so it is worth re-checking rather than trusted blind.
+
+       Read exactly what this buys, and no more -- quoting
+       :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding`'s
+       own caveat: it proves only INTERNAL CONSISTENCY of the ``meta.json``
+       record -- that ``extracted_sha256`` was not changed independently of
+       ``derivation_binding`` after the two were bound together at store
+       time. It is NOT proof that ``extracted.json`` was actually re-derived
+       from ``raw.bin``, and it is no defence against a forger who swaps the
+       sidecar AND updates ``extracted_sha256`` AND recomputes
+       ``derivation_binding`` to match, all together, consistently -- that
+       forgery passes every check here undetected.
+
+       Because :func:`verify_artifact` returns a plain ``bool`` with no record
+       of which of its internal checks failed, a ``False`` here cannot be
+       narrated as one specific cause: it might be ``raw.bin`` missing or not
+       hashing to ``sha256``, ``extracted.json`` not matching its recorded
+       digest, or a stale/inconsistent ``derivation_binding`` -- the refusal
+       message below says so honestly rather than guessing.
     """
     meta = load_artifact_meta(workspace_root, sha256)
     if meta is None:
@@ -515,18 +538,31 @@ def _load_verified_extracted_text(
             f"artifact meta.json at sha256 {sha256!r} records sha256={meta.sha256!r} internally -- "
             "the two disagree, so this evidence directory is not trustworthy; refusing to use it"
         )
-    if not verify_artifact(workspace_root, sha256, deep=False):
-        raise DatasetProducerError(
-            f"artifact {sha256!r} failed verify_artifact (raw.bin missing/corrupt, or extracted.json "
-            "does not match its recorded extracted_sha256); refusing to use unverified bytes"
-        )
     if meta.extracted_sha256 is None:
         # A legacy artifact stored before extracted_sha256 existed carries no
         # digest for its sidecar, so its extracted.json cannot be verified at
-        # all -- and this producer never parses unverified bytes.
+        # all -- and this producer never parses unverified bytes. Checked
+        # before verify_artifact(deep=True) below: that call fails closed for
+        # this same artifact too, but with no way to say why.
         raise DatasetProducerError(
             f"artifact {sha256!r} predates extracted_sha256 and its extracted.json cannot be "
             "verified; refusing to parse unverified bytes"
+        )
+    if meta.derivation_binding is None:
+        # A legacy artifact stored before derivation_binding existed (but
+        # after extracted_sha256 did) has a verifiable sidecar yet nothing to
+        # deep-verify -- also checked before verify_artifact(deep=True),
+        # which would otherwise fail this artifact for the same underlying
+        # reason as a genuinely stale binding, indistinguishably.
+        raise DatasetProducerError(
+            f"artifact {sha256!r} predates derivation_binding and its extractor identity cannot be "
+            "bound to its extracted bytes; refusing to carry an unverifiable binding forward"
+        )
+    if not verify_artifact(workspace_root, sha256, deep=True):
+        raise DatasetProducerError(
+            f"artifact {sha256!r} failed verify_artifact (raw.bin digest, meta.json, extracted.json "
+            "digest, or derivation_binding consistency -- verify_artifact reports only a plain bool, "
+            "not which check failed); refusing to use unverified bytes"
         )
     extracted_path = artifact_dir(workspace_root, sha256) / _EXTRACTED_NAME
     try:
