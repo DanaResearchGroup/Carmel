@@ -68,6 +68,7 @@ frozen=True was meant to close.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections.abc import Callable, Iterator, Mapping
@@ -78,7 +79,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator, model_validator
 
 from carmel.services import units
-from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal
+from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
 from carmel.services.numeric import (
     REPAIR_NAMES,
     GlyphHealth,
@@ -106,6 +107,7 @@ __all__ = [
     "CoordinateFrame",
     "DataPoint",
     "DatasetEnvelope",
+    "EmbeddedConversionTable",
     "Maybe",
     "MeasuredValue",
     "MemberSheetKey",
@@ -127,6 +129,7 @@ __all__ = [
     "UncertaintyScale",
     "ValueOrigin",
     "XPathLocator",
+    "iter_measured_values",
     "iter_source_refs",
 ]
 
@@ -639,6 +642,53 @@ def iter_source_refs(obj: object, _path: str = "") -> Iterator[tuple[str, Source
     if isinstance(obj, (list, tuple)):
         for index, value in enumerate(obj):
             yield from iter_source_refs(value, f"{_path}[{index}]")
+        return
+    return
+
+
+def iter_measured_values(obj: object, _path: str = "") -> Iterator[tuple[str, MeasuredValue]]:
+    """Recursively walk ``obj``, yielding ``(dotted_path, value)`` for every
+    :class:`MeasuredValue` reachable from it.
+
+    Mirrors :func:`iter_source_refs` exactly in style and for the same
+    reason: it is the choke point :class:`DatasetEnvelope`'s T2 validator
+    (``conversion_tables`` must cover exactly the set of tables actually
+    cited) runs through, and it is deliberately GENERIC over payload shape
+    rather than a hand-written list of "the composition's components'
+    amounts, a point's coordinates' values, an observation's uncertainty
+    bounds, ..." -- a hand-written list would silently go stale the moment a
+    new ``MeasuredValue``-bearing field is added anywhere in the tree,
+    letting a cited-but-unembedded table hide from T2 with nothing here to
+    notice. Walking pydantic ``BaseModel`` fields, ``list``/``tuple``
+    elements, and ``dict`` values covers every shape this schema currently
+    uses to nest a payload, so a future field of any of those container
+    shapes is automatically covered with zero changes here.
+
+    Deliberately does NOT recurse into a :class:`MeasuredValue`'s own fields:
+    a ``MeasuredValue`` is a leaf of this walk, not a container to look
+    inside of -- its ``value_ref``/``unit_ref`` are followed by
+    :func:`iter_source_refs`, a separate walk for a separate purpose.
+
+    ``_path`` is an internal accumulator, exactly as in
+    :func:`iter_source_refs`; callers always invoke this with a single
+    argument.
+    """
+    if isinstance(obj, MeasuredValue):
+        yield _path, obj
+        return
+    if isinstance(obj, BaseModel):
+        for name in type(obj).model_fields:
+            value = getattr(obj, name)
+            child_path = f"{_path}.{name}" if _path else name
+            yield from iter_measured_values(value, child_path)
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from iter_measured_values(value, f"{_path}[{key}]")
+        return
+    if isinstance(obj, (list, tuple)):
+        for index, value in enumerate(obj):
+            yield from iter_measured_values(value, f"{_path}[{index}]")
         return
     return
 
@@ -1987,6 +2037,95 @@ class Series(BaseModel):
         return self
 
 
+class EmbeddedConversionTable(BaseModel):
+    """A :class:`~carmel.services.units.ConversionTable`'s own canonical
+    identity-payload JSON, embedded VERBATIM in a :class:`DatasetEnvelope` so
+    that a non-Carmel consumer holding only this envelope's bytes can learn
+    what a cited ``conversion_table_sha256`` means (e.g. that ``atm -> Pa``
+    is ``101325``) without needing :mod:`carmel.services.units` at all.
+
+    ``canonical_json`` is a ``str``, deliberately never a ``dict``:
+    ``frozen=True`` (see ``model_config`` below) is a claim about attribute
+    REASSIGNMENT, not about the mutability of an object a validated,
+    frozen model happens to hold -- a ``dict`` field here could be mutated
+    in place after validation with nothing here to notice, which has
+    already shipped as a defect twice in this project. A ``str`` is
+    immutable, closing that hole structurally rather than by convention.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- must equal the sha256 of the table
+    that ``canonical_json`` decodes to; see
+    :meth:`_validate_canonical_json_reconstructs_to_sha256` (T1)."""
+
+    canonical_json: str = Field(min_length=1)
+    """The table's canonical identity-payload JSON, verbatim, as a str --
+    see the class docstring for why this is never a ``dict``."""
+
+    @field_validator("sha256")
+    @classmethod
+    def _validate_sha256_shape(cls, value: str) -> str:
+        if not _SHA256_RE.match(value):
+            raise ValueError(
+                f"EmbeddedConversionTable.sha256 {value!r} is not 64 lowercase hex characters"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_canonical_json_reconstructs_to_sha256(self) -> EmbeddedConversionTable:
+        """T1: ``canonical_json`` must be the CANONICAL rendering of a
+        conversion table whose sha256 is exactly ``self.sha256`` -- verified
+        by full RECONSTRUCTION, not merely by re-hashing the stored bytes (a
+        byte-hash check alone proves only self-addressing: arbitrary garbage
+        can be honestly hashed against itself).
+
+        Four steps, each with its own marker phrase so a test can tell
+        exactly which one fired:
+
+        1. parse ``canonical_json`` as JSON at all;
+        2. reconstruct via ``ConversionTable.from_identity_payload`` -- this
+           re-runs every ``__post_init__`` invariant on the reconstructed
+           table, including the scale/offset checks an opaque string
+           bypasses;
+        3. the reconstructed table's own ``.sha256`` must equal the
+           declared ``self.sha256``;
+        4. re-projecting the reconstructed table's ``identity_payload()``
+           through ``canonical_json_bytes`` must reproduce
+           ``canonical_json`` byte-for-byte -- this is what pins that the
+           embedded bytes are the CANONICAL rendering, not merely some JSON
+           that happens to parse to an equivalent object.
+        """
+        try:
+            parsed = json.loads(self.canonical_json)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json does not parse as JSON: "
+                f"{exc}"
+            ) from exc
+        try:
+            reconstructed = units.ConversionTable.from_identity_payload(parsed)
+        except units.ConversionTableInvariantError as exc:
+            raise ValueError(
+                f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json does not decode to a "
+                f"structurally valid ConversionTable: {exc}"
+            ) from exc
+        if reconstructed.sha256 != self.sha256:
+            raise ValueError(
+                f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json decodes to a table whose "
+                f"own sha256 is {reconstructed.sha256!r}, not the declared sha256"
+            )
+        recanonicalized = canonical_json_bytes(reconstructed.identity_payload())
+        if recanonicalized != self.canonical_json.encode("utf-8"):
+            raise ValueError(
+                f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json is not the canonical "
+                "rendering of the table it decodes to -- re-serializing the reconstructed table's own "
+                "identity_payload() through canonical_json_bytes produced different bytes"
+            )
+        return self
+
+
 def _check_source_form_for_ref(
     *, source_form: SourceForm, ref: SourceRef, node_kind: SourceNodeKind, where: str
 ) -> None:
@@ -2281,6 +2420,10 @@ def _series_identity_payload(series: Series) -> dict[str, Any]:
     }
 
 
+def _embedded_conversion_table_identity_payload(table: EmbeddedConversionTable) -> dict[str, Any]:
+    return {"sha256": table.sha256, "canonical_json": table.canonical_json}
+
+
 _UNADDRESSED_FIELDS: Mapping[tuple[str, str], str] = {}
 """``(model_name, field_name) -> reason`` registry of fields NOT covered by
 :meth:`DatasetEnvelope.identity_payload`'s hand-written projection.
@@ -2290,9 +2433,11 @@ Deliberately EMPTY: every field of every pydantic model reachable from
 ``SourceRef`` and its locator/table-key discriminated-union arms, ``BBox``,
 ``CoordinateFrame``, ``MeasuredValue``, ``Uncertainty``, ``Composition``,
 ``CompositionComponent``, ``Series``, ``AxisDeclaration``, ``Coordinate``,
-``Observation``, ``DataPoint``, and ``Absent`` itself) is projected by one of
-the ``_*_identity_payload`` helpers above. This registry exists so that a
-FUTURE field added to any of those models and left unprojected is caught by
+``Observation``, ``DataPoint``, ``EmbeddedConversionTable``, and ``Absent``
+itself) is projected by one of the ``_*_identity_payload`` helpers above.
+This registry exists so that a
+FUTURE field added to any of those models and left unprojected is caught
+by
 the completeness meta-test as a loud failure -- entering it here is the
 escape hatch for a field that is genuinely not addressable (e.g. a derived
 ``@property``), not a shortcut for "forgot to project it". Do not add an
@@ -2354,6 +2499,68 @@ class DatasetEnvelope(BaseModel):
     keeps passing is precisely the "build to pass the check" antipattern --
     the fixture was fixed instead.
     """
+    conversion_tables: tuple[EmbeddedConversionTable, ...]
+    """Every :class:`~carmel.services.units.ConversionTable` cited (by
+    ``conversion_table_sha256``) by any :class:`MeasuredValue` reachable in
+    this envelope, embedded verbatim via its own canonical JSON -- see
+    :class:`EmbeddedConversionTable`. Required so a stored dataset's bytes
+    are self-contained: a non-Carmel consumer never needs
+    :mod:`carmel.services.units` to learn what e.g. ``atm -> Pa`` means.
+
+    Deliberately NOT constrained to "exactly one table" or "one table per
+    series": a series citing both ``TABLE_V1`` and a future ``TABLE_V2`` is
+    a PROVENANCE SMELL worth surfacing, not corruption -- forbidding it
+    would block a legitimate re-extraction that spans a table revision.
+    Detecting and scoring mixed-table use within one envelope/series is
+    deliberately NOT enforced here; it is deferred to M-D3's trust
+    computation. This field only enforces that the embedded set is EXACTLY
+    the set actually cited (T2, below) and that it has one canonical order
+    (T3, below).
+    """
+
+    @model_validator(mode="after")
+    def _validate_conversion_tables_cover_cited_tables(self) -> DatasetEnvelope:
+        """T2: ``conversion_tables`` must cover EXACTLY the set of
+        ``conversion_table_sha256`` values cited by every :class:`MeasuredValue`
+        reachable in this envelope (via :func:`iter_measured_values`) -- no
+        fewer, no more.
+
+        A table cited but not embedded (missing) would leave a
+        ``MeasuredValue`` whose conversion a non-Carmel consumer cannot
+        interpret at all -- exactly the payload this field exists to
+        prevent. A table embedded but never cited by anything (decorative)
+        is unearned provenance, the same failure class V2 closes for source
+        graph nodes. These are two distinct, independently measured failure
+        modes, so they get two distinct error messages -- a test must be
+        able to tell which one fired, not merely that "something" was
+        wrong.
+        """
+        cited = {value.conversion_table_sha256 for _, value in iter_measured_values(self)}
+        embedded = {table.sha256 for table in self.conversion_tables}
+        missing = cited - embedded
+        if missing:
+            raise ValueError(
+                f"DatasetEnvelope.conversion_tables is missing table(s) {sorted(missing)!r} cited by a "
+                "MeasuredValue -- every cited conversion table must be embedded"
+            )
+        decorative = embedded - cited
+        if decorative:
+            raise ValueError(
+                f"DatasetEnvelope.conversion_tables embeds decorative table(s) {sorted(decorative)!r} that "
+                "no MeasuredValue actually cites -- an embedded table nothing needs is unearned provenance"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_conversion_tables_sorted(self) -> DatasetEnvelope:
+        """T3: ``conversion_tables`` must be sorted ascending by ``sha256``,
+        so exactly one legal ordering exists -- matching the S2/S7/E1b idiom
+        already in this module (a canonical order pins one, and only one,
+        addressable representation)."""
+        expected = tuple(sorted(self.conversion_tables, key=lambda table: table.sha256))
+        if self.conversion_tables != expected:
+            raise ValueError("DatasetEnvelope.conversion_tables must be sorted ascending by sha256")
+        return self
 
     @model_validator(mode="after")
     def _validate_refs_resolve(self) -> DatasetEnvelope:
@@ -2620,4 +2827,7 @@ class DatasetEnvelope(BaseModel):
             "source_graph": _source_graph_identity_payload(self.source_graph),
             "composition": _project_maybe(self.composition, _composition_identity_payload),
             "series": [_series_identity_payload(series) for series in self.series],
+            "conversion_tables": [
+                _embedded_conversion_table_identity_payload(table) for table in self.conversion_tables
+            ],
         }

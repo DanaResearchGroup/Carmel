@@ -123,6 +123,114 @@ class TestIdentityPayload:
             assert "scale" in rule
 
 
+class TestFromIdentityPayload:
+    """ConversionTable.from_identity_payload inverts identity_payload(), strictly.
+
+    Round-trip must hold exactly (same fields, same sha256). Every rejection
+    must fail closed with a marker phrase specific enough to tell which check
+    fired -- untrusted JSON must never construct a table whose scale is
+    ``None`` or whose ``from_unit`` is a list, because dataclasses do not
+    enforce field types themselves.
+    """
+
+    def test_round_trips_table_v1_to_an_equal_table_with_the_same_sha256(self) -> None:
+        payload = TABLE_V1.identity_payload()
+        reconstructed = ConversionTable.from_identity_payload(payload)
+        assert reconstructed == TABLE_V1
+        assert reconstructed.sha256 == TABLE_V1.sha256
+
+    def test_round_trips_a_smaller_hand_built_table(self) -> None:
+        table = _table_with(rules=_identity_only_rules())
+        reconstructed = ConversionTable.from_identity_payload(table.identity_payload())
+        assert reconstructed == table
+        assert reconstructed.sha256 == table.sha256
+
+    def test_payload_that_is_not_a_json_object_is_rejected(self) -> None:
+        with pytest.raises(ConversionTableInvariantError, match="JSON object"):
+            ConversionTable.from_identity_payload(["not", "an", "object"])
+
+    def test_missing_top_level_key_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        del payload["aliases"]
+        with pytest.raises(ConversionTableInvariantError, match="keys must be exactly"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_unexpected_top_level_key_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        payload["checksum"] = "deadbeef"
+        with pytest.raises(ConversionTableInvariantError, match="keys must be exactly"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_non_str_table_id_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        payload["table_id"] = 123
+        with pytest.raises(ConversionTableInvariantError, match="'table_id' must be a str"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_non_int_version_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        payload["version"] = "1"
+        with pytest.raises(ConversionTableInvariantError, match="'version' must be an int"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_base_units_that_is_not_a_list_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        payload["base_units"] = {"length": "m"}
+        with pytest.raises(ConversionTableInvariantError, match="'base_units' must be a JSON array"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_bogus_quantity_string_in_base_units_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        base_units = [list(entry) for entry in payload["base_units"]]
+        base_units[0][0] = "not-a-real-quantity"
+        payload["base_units"] = base_units
+        with pytest.raises(ConversionTableInvariantError, match="is not a known QuantityKind"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_bogus_rule_kind_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        rules = [dict(rule) for rule in payload["rules"]]
+        rules[0]["kind"] = "logarithmic"
+        payload["rules"] = rules
+        with pytest.raises(ConversionTableInvariantError, match="'identity'/'scale'/'affine'"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_scale_of_null_on_a_scale_rule_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        rules = [dict(rule) for rule in payload["rules"]]
+        scale_rule_index = next(index for index, rule in enumerate(rules) if rule["kind"] == "scale")
+        rules[scale_rule_index]["scale"] = None
+        payload["rules"] = rules
+        with pytest.raises(ConversionTableInvariantError, match=r"'scale' must be a str, got NoneType"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_from_unit_as_a_list_on_a_scale_rule_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        rules = [dict(rule) for rule in payload["rules"]]
+        scale_rule_index = next(index for index, rule in enumerate(rules) if rule["kind"] == "scale")
+        rules[scale_rule_index]["from_unit"] = ["cm/s"]
+        payload["rules"] = rules
+        with pytest.raises(ConversionTableInvariantError, match=r"'from_unit' must be a str, got list"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_bool_version_is_rejected_even_though_bool_is_an_int_subclass(self) -> None:
+        # isinstance(True, int) is True in Python; a bool must still be refused
+        # as a version number, or "version": true would silently become 1.
+        payload = dict(TABLE_V1.identity_payload())
+        payload["version"] = True
+        with pytest.raises(ConversionTableInvariantError, match="'version' must be an int"):
+            ConversionTable.from_identity_payload(payload)
+
+    def test_rule_missing_a_required_key_is_rejected(self) -> None:
+        payload = dict(TABLE_V1.identity_payload())
+        rules = [dict(rule) for rule in payload["rules"]]
+        scale_rule_index = next(index for index, rule in enumerate(rules) if rule["kind"] == "scale")
+        del rules[scale_rule_index]["scale"]
+        payload["rules"] = rules
+        with pytest.raises(ConversionTableInvariantError, match="keys must be exactly"):
+            ConversionTable.from_identity_payload(payload)
+
+
 class TestTableInvariants:
     """Each of ConversionTable's nine construction-time invariants rejects a malformed table."""
 
@@ -504,3 +612,42 @@ class TestConversionResultsStayRepresentable:
         value = "1." + "3" * 999
         with pytest.raises(UnitError, match="exact result"):
             convert(value, quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+
+
+class TestShippedTablesAreNeverRemoved:
+    """Section 6's append-only tripwire.
+
+    The module docstring's doctrine is that a shipped ConversionTable is
+    never mutated -- corrections ship as a new version alongside, never as
+    a replacement. Nothing before this test enforced the other half of
+    that doctrine: that a shipped table's sha256 is never REMOVED from
+    TABLES_BY_SHA either. If one ever silently disappeared, every embedded
+    dataset that cites it would become unvalidatable (table_for_sha would
+    raise UnknownConversionTableError for a sha256 real stored data still
+    names), with no fallback to "the current table" by design -- see
+    table_for_sha's own docstring.
+
+    This pins an explicit, frozen set of every sha256 TABLES_BY_SHA is
+    historically known to have shipped (seeded with TABLE_V1's, read at
+    runtime rather than hand-copied, so this test cannot itself go stale
+    relative to today's TABLE_V1) as a SUBSET check against the live
+    registry: adding a new table alongside is fine (the registry only
+    grows), but removing one -- or replacing TABLE_V1 in place so its
+    sha256 changes -- fails this test.
+
+    When a future commit legitimately adds a new shipped table version,
+    add its sha256 to _HISTORICALLY_SHIPPED_SHA256S below (append, do not
+    replace) in the same change.
+    """
+
+    _HISTORICALLY_SHIPPED_SHA256S = frozenset({TABLE_V1.sha256})
+
+    def test_every_historically_shipped_sha256_is_still_in_the_registry(self) -> None:
+        missing = self._HISTORICALLY_SHIPPED_SHA256S - set(TABLES_BY_SHA)
+        assert not missing, (
+            f"shipped conversion table(s) {sorted(missing)!r} are no longer in TABLES_BY_SHA -- "
+            "removing a shipped table orphans every stored dataset that embeds/cites it "
+            "(table_for_sha has no fallback to 'the current table'); a shipped table must never "
+            "be removed or replaced in place -- add a replacement table ALONGSIDE it instead, and "
+            "keep the old sha256 in TABLES_BY_SHA (and in this test's historically-shipped set)"
+        )

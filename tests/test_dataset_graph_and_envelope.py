@@ -11,8 +11,12 @@ isolation, not the graph-level model introduced here).
 
 from __future__ import annotations
 
+import contextlib
+import json
 import re
+from collections.abc import Iterator
 from enum import Enum
+from types import MappingProxyType
 from typing import Union, get_args, get_origin
 
 import pytest
@@ -36,6 +40,7 @@ from carmel.schemas.datasets import (
     CoordinateFrame,
     DataPoint,
     DatasetEnvelope,
+    EmbeddedConversionTable,
     Maybe,
     MeasuredValue,
     MemberSheetKey,
@@ -55,9 +60,12 @@ from carmel.schemas.datasets import (
     UncertaintyScale,
     ValueOrigin,
     XPathLocator,
+    iter_measured_values,
     iter_source_refs,
 )
-from carmel.services.units import TABLE_V1
+from carmel.services import units
+from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.units import TABLE_V1, ConversionTable, IdentityRule
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -65,6 +73,18 @@ SHA_C = "c" * 64
 SHA_D = "d" * 64
 SHA_E = "e" * 64
 SHA_F = "f" * 64
+
+
+def _embedded_table_v1() -> EmbeddedConversionTable:
+    """The one conversion table every ``MeasuredValue`` fixture in this file
+    cites (via ``conversion_table_sha256=TABLE_V1.sha256``) -- embedded
+    verbatim so ``DatasetEnvelope.conversion_tables``'s T2 cover-exactly
+    check is satisfied by every envelope built here."""
+    return EmbeddedConversionTable(
+        sha256=TABLE_V1.sha256,
+        canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
+    )
+
 
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """Module-level singleton default for SourceNode.origin -- Absent is frozen,
@@ -217,7 +237,12 @@ def _envelope_with_value_ref_locator(locator: object, node_kind: SourceNodeKind)
         equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         components=[CompositionComponent(species_raw_name="H2", amount=amount, role=ComponentRole.FUEL)],
     )
-    return DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("unit-root"),))
+    return DatasetEnvelope(
+        source_graph=graph,
+        composition=composition,
+        series=(_fully_populated_series("unit-root"),),
+        conversion_tables=(_embedded_table_v1(),),
+    )
 
 
 _UNIT_FOR_QUANTITY_KIND: dict[QuantityKind, tuple[str, str]] = {
@@ -375,11 +400,23 @@ def _fully_populated_series(node_id: str = "paper") -> Series:
     )
 
 
-def _fully_populated_envelope() -> DatasetEnvelope:
+def _fully_populated_envelope(
+    conversion_tables: tuple[EmbeddedConversionTable, ...] | None = None,
+) -> DatasetEnvelope:
     """A DatasetEnvelope with every SourceRef-bearing field actually
     populated (including equivalence_ratio, which is Absent in most other
     fixtures here, and the series aggregate added by M-D2b part a) --
-    used by the ref-walk drift meta-test."""
+    used by the ref-walk drift meta-test.
+
+    ``conversion_tables`` defaults to the usual single-table
+    ``(_embedded_table_v1(),)`` (every MeasuredValue built by this fixture
+    cites only TABLE_V1), but can be overridden so the T2 (cover-exactly)
+    tests can vary ONLY the embedded set while reusing this fixture's
+    otherwise-valid shape. A full constructor call is used here (not
+    ``model_copy(update=...)``) deliberately: ``model_copy`` does not
+    re-run pydantic v2's ``model_validator(mode="after")`` validators, so
+    it cannot be used to exercise T2/T3 -- it would silently bypass the
+    very checks these tests exist to exercise."""
     paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
     graph = SourceGraph(nodes=(paper,))
     eq_ratio = _equivalence_ratio_amount(
@@ -397,7 +434,147 @@ def _fully_populated_envelope() -> DatasetEnvelope:
         equivalence_ratio=eq_ratio,
         components=[CompositionComponent(species_raw_name="H2", amount=component_amount, role=ComponentRole.FUEL)],
     )
-    return DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+    return DatasetEnvelope(
+        source_graph=graph,
+        composition=composition,
+        series=(_fully_populated_series("paper"),),
+        conversion_tables=conversion_tables if conversion_tables is not None else (_embedded_table_v1(),),
+    )
+
+
+def _second_conversion_table() -> ConversionTable:
+    """A second, distinct, validly-constructed ConversionTable: the same 11
+    base units as TABLE_V1, one IdentityRule per base unit (the minimum
+    ConversionTable.__post_init__ requires -- see its invariant 9), but a
+    different table_id, so it hashes to a DIFFERENT sha256 than TABLE_V1.
+
+    Built independently here from scratch, rather than by importing
+    units.py's private ``_base_units_v1``/``_identity_rules_v1`` helpers,
+    so this fixture does not couple to that module's internal (``_``
+    -prefixed) helper functions remaining named or shaped the way they are
+    today."""
+    base_units: tuple[tuple[QuantityKind, str], ...] = (
+        (QuantityKind.LENGTH, "m"),
+        (QuantityKind.VELOCITY, "m/s"),
+        (QuantityKind.TEMPERATURE, "K"),
+        (QuantityKind.PRESSURE, "Pa"),
+        (QuantityKind.TIME, "s"),
+        (QuantityKind.VOLUME, "m3"),
+        (QuantityKind.STRAIN_RATE, "1/s"),
+        (QuantityKind.MOLE_FRACTION, "1"),
+        (QuantityKind.MASS_FRACTION, "1"),
+        (QuantityKind.EQUIVALENCE_RATIO, "1"),
+        (QuantityKind.RELATIVE_UNCERTAINTY, "1"),
+    )
+    rules = tuple(IdentityRule(kind="identity", quantity=quantity, unit=unit) for quantity, unit in base_units)
+    return ConversionTable(
+        table_id="carmel-unit-conversions-test-fixture-2",
+        version=1,
+        base_units=base_units,
+        aliases=(),
+        rules=rules,
+    )
+
+
+def _embedded_second_table() -> EmbeddedConversionTable:
+    table = _second_conversion_table()
+    return EmbeddedConversionTable(
+        sha256=table.sha256,
+        canonical_json=canonical_json_bytes(table.identity_payload()).decode("utf-8"),
+    )
+
+
+@contextlib.contextmanager
+def _registered_second_table() -> Iterator[ConversionTable]:
+    """Temporarily registers _second_conversion_table() into
+    units.TABLES_BY_SHA for the duration of the `with` block, then restores
+    the original mapping unconditionally (even if the block raises).
+
+    Why this is needed rather than just constructing a MeasuredValue that
+    cites a second table directly: MeasuredValue.conversion_table_sha256 is
+    validated (via units.table_for_sha, see its docstring) against "every
+    table this module ships" -- there is deliberately no way to construct a
+    MeasuredValue citing a sha256 the shipped registry does not recognize.
+    Today that registry (units.TABLES_BY_SHA) holds exactly one table,
+    TABLE_V1. Exercising DatasetEnvelope's T2/T3 checks, though, requires a
+    SECOND genuinely-cited table (one MeasuredValue citing table A, another
+    citing table B) -- otherwise T2's cover-exactly check can never be
+    isolated from T3's sort-order check, since with only one ever-citable
+    table there is nothing to sort.
+
+    ``units.table_for_sha`` resolves ``TABLES_BY_SHA`` as a plain module
+    global at call time, so reassigning the attribute on the imported
+    ``units`` module object here is visible to it for the lifetime of this
+    context manager -- this mutates test-process state only, never
+    carmel/'s source, and is restored before the block exits."""
+    table = _second_conversion_table()
+    original = units.TABLES_BY_SHA
+    units.TABLES_BY_SHA = MappingProxyType({**original, table.sha256: table})
+    try:
+        yield table
+    finally:
+        units.TABLES_BY_SHA = original
+
+
+def _mole_fraction_amount_citing(
+    conversion_table_sha256: str, value_ref: SourceRef, unit_ref: SourceRef, raw_text: str = "0.04"
+) -> MeasuredValue:
+    """Like _mole_fraction_amount, but citing an arbitrary conversion table
+    sha256 -- used to build a composition component that cites a SECOND
+    conversion table (distinct from TABLE_V1), for the T2/T3
+    conversion_tables tests below.
+
+    Uses unit_raw="1" (the base unit itself) rather than TABLE_V1's "-"
+    alias: _second_conversion_table() below is built with no aliases at
+    all (only the one IdentityRule invariant 9 requires), so "-" is not a
+    known unit/alias of MOLE_FRACTION in that table."""
+    return MeasuredValue(
+        raw_text=raw_text,
+        canonical_decimal_value=raw_text,
+        quantity_kind=QuantityKind.MOLE_FRACTION,
+        unit_raw="1",
+        unit_normalized="1",
+        conversion_table_sha256=conversion_table_sha256,
+        repairs=(),
+        value_ref=value_ref,
+        unit_ref=unit_ref,
+    )
+
+
+def _envelope_citing_two_tables(conversion_tables: tuple[EmbeddedConversionTable, ...]) -> DatasetEnvelope:
+    """A DatasetEnvelope whose composition cites BOTH TABLE_V1 (via its H2
+    component) and _second_conversion_table() (via its N2 component) --
+    used by the T3 sort-order tests so a conversion_tables ordering failure
+    can be exercised in isolation from T2's cover-exactly check (which
+    would otherwise also fire if only one table were actually cited, since
+    then the *other* embedded table would look decorative)."""
+    paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A)
+    graph = SourceGraph(nodes=(paper,))
+    h2_amount = _mole_fraction_amount(
+        value_ref=_table_ref("paper", row=0, col=0),
+        unit_ref=_table_ref("paper", row=0, col=1),
+    )
+    n2_amount = _mole_fraction_amount_citing(
+        _second_conversion_table().sha256,
+        value_ref=_table_ref("paper", row=1, col=0),
+        unit_ref=_table_ref("paper", row=1, col=1),
+    )
+    composition = Composition(
+        raw_name="4% H2 in N2",
+        resolution=CompositionResolution.RESOLVED_COMPONENTS,
+        basis=CompositionBasis.MOLE_FRACTION,
+        equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        components=[
+            CompositionComponent(species_raw_name="H2", amount=h2_amount, role=ComponentRole.FUEL),
+            CompositionComponent(species_raw_name="N2", amount=n2_amount, role=ComponentRole.DILUENT),
+        ],
+    )
+    return DatasetEnvelope(
+        source_graph=graph,
+        composition=composition,
+        series=(_fully_populated_series("paper"),),
+        conversion_tables=conversion_tables,
+    )
 
 
 def _strip_list_indices(path: str) -> str:
@@ -513,6 +690,43 @@ def _inspect_annotation_walkability(annotation: object, path: str, seen: frozens
     # `frozenset` (a container the runtime walker never descends into),
     # Callable, or any other origin not on the allowlist -- is unwalkable.
     return {path: annotation}
+
+
+def _collect_field_paths_carrying_measured_value(
+    model_cls: type[BaseModel], prefix: str = "", seen: frozenset[type] | None = None
+) -> set[str]:
+    """Mirrors _collect_field_paths_carrying_source_ref above, but targets
+    MeasuredValue instead of SourceRef -- used by iter_measured_values'
+    drift meta-test below. The "unwalkable annotation" half of that drift
+    check is target-agnostic (an annotation shape neither walker can
+    traverse hides ANY target type, SourceRef or MeasuredValue, equally)
+    and is already covered by
+    test_no_field_reachable_from_dataset_envelope_has_an_unwalkable_annotation
+    above; only this annotation-vs-runtime direct-coverage half needs a
+    MeasuredValue-targeted twin."""
+    seen = seen or frozenset()
+    if model_cls in seen:
+        return set()
+    seen = seen | {model_cls}
+    paths: set[str] = set()
+    for name, field in model_cls.model_fields.items():
+        paths |= _inspect_annotation_for_measured_value(field.annotation, f"{prefix}{name}", seen)
+    return paths
+
+
+def _inspect_annotation_for_measured_value(annotation: object, path: str, seen: frozenset[type]) -> set[str]:
+    if annotation is MeasuredValue:
+        return {path}
+    origin = get_origin(annotation)
+    args = get_args(annotation)
+    if origin is not None:
+        paths: set[str] = set()
+        for arg in args:
+            paths |= _inspect_annotation_for_measured_value(arg, path, seen)
+        return paths
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return _collect_field_paths_carrying_measured_value(annotation, prefix=f"{path}.", seen=seen)
+    return set()
 
 
 # --------------------------------------------------------------------------
@@ -741,7 +955,12 @@ class TestDatasetEnvelopeRefsResolve:
             equivalence_ratio=eq_ratio,
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+            DatasetEnvelope(
+                source_graph=graph,
+                composition=composition,
+                series=(_fully_populated_series("paper"),),
+                conversion_tables=(_embedded_table_v1(),),
+            )
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
         assert "equivalence_ratio" in msg
@@ -760,7 +979,12 @@ class TestDatasetEnvelopeRefsResolve:
             equivalence_ratio=eq_ratio,
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+            DatasetEnvelope(
+                source_graph=graph,
+                composition=composition,
+                series=(_fully_populated_series("paper"),),
+                conversion_tables=(_embedded_table_v1(),),
+            )
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
         assert "equivalence_ratio" in msg
@@ -773,7 +997,12 @@ class TestDatasetEnvelopeRefsResolve:
             unit_ref=_table_ref("paper"),
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+            DatasetEnvelope(
+                source_graph=graph,
+                composition=composition,
+                series=(_fully_populated_series("paper"),),
+                conversion_tables=(_embedded_table_v1(),),
+            )
         msg = str(excinfo.value)
         assert "ghost" in msg
         assert "components" in msg
@@ -787,7 +1016,12 @@ class TestDatasetEnvelopeRefsResolve:
             unit_ref=_bbox_ref("ghost"),
         )
         with pytest.raises(ValidationError) as excinfo:
-            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+            DatasetEnvelope(
+                source_graph=graph,
+                composition=composition,
+                series=(_fully_populated_series("paper"),),
+                conversion_tables=(_embedded_table_v1(),),
+            )
         msg = str(excinfo.value)
         assert "ghost" in msg
         assert "components" in msg
@@ -808,7 +1042,12 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             unit_ref=_table_ref("paper"),
         )
         with pytest.raises(ValidationError, match="decorative"):
-            DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+            DatasetEnvelope(
+                source_graph=graph,
+                composition=composition,
+                series=(_fully_populated_series("paper"),),
+                conversion_tables=(_embedded_table_v1(),),
+            )
 
     def test_unreferenced_ancestor_of_a_referenced_node_is_allowed(self) -> None:
         """The PAPER_PDF root is never targeted directly, but its
@@ -878,7 +1117,12 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             constants=(),
             points=(point,),
         )
-        envelope = DatasetEnvelope(source_graph=graph, composition=composition, series=(series_referencing_crop_only,))
+        envelope = DatasetEnvelope(
+            source_graph=graph,
+            composition=composition,
+            series=(series_referencing_crop_only,),
+            conversion_tables=(_embedded_table_v1(),),
+        )
         assert envelope.source_graph.node("paper").parent_node_id is None
 
     def test_an_envelope_citing_nothing_can_no_longer_be_constructed_at_all(self) -> None:
@@ -907,7 +1151,12 @@ class TestDatasetEnvelopeNoDecorativeNodes:
         """
         graph = _minimal_graph("paper")
         with pytest.raises(ValidationError, match="at least 1 item"):
-            DatasetEnvelope(source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=())
+            DatasetEnvelope(
+                source_graph=graph,
+                composition=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                series=(),
+                conversion_tables=(),
+            )
 
 
 class TestDatasetEnvelopeSeriesSingleRootArtifact:
@@ -970,7 +1219,10 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
         )
         with pytest.raises(ValidationError) as excinfo:
             DatasetEnvelope(
-                source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=(series,)
+                source_graph=graph,
+                composition=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                series=(series,),
+                conversion_tables=(_embedded_table_v1(),),
             )
         msg = str(excinfo.value)
         assert "spans multiple root artifacts" in msg
@@ -1029,7 +1281,10 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
             points=(point,),
         )
         envelope = DatasetEnvelope(
-            source_graph=graph, composition=Absent(reason=AbsenceReason.NOT_APPLICABLE), series=(series,)
+            source_graph=graph,
+            composition=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            series=(series,),
+            conversion_tables=(_embedded_table_v1(),),
         )
         assert len(envelope.series) == 1
 
@@ -1151,7 +1406,12 @@ class TestFunctionalRealisticEnvelope:
             equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             components=[h2, n2, o2],
         )
-        return DatasetEnvelope(source_graph=graph, composition=composition, series=(_fully_populated_series("paper"),))
+        return DatasetEnvelope(
+        source_graph=graph,
+        composition=composition,
+        series=(_fully_populated_series("paper"),),
+        conversion_tables=(_embedded_table_v1(),),
+    )
 
     def test_constructs(self) -> None:
         envelope = self._build()
@@ -1217,6 +1477,159 @@ class TestRefWalkCannotBeOutgrown:
             "the same time -- widen the allowlist in _inspect_annotation_walkability only after "
             "confirming iter_source_refs itself can actually traverse the new shape."
         )
+
+
+class TestMeasuredValueWalkCannotBeOutgrown:
+    """Mirrors TestRefWalkCannotBeOutgrown above, but for iter_measured_values
+    (the choke point DatasetEnvelope's T2 conversion_tables cover-exactly
+    check runs through) instead of iter_source_refs.
+
+    Only the direct annotation-vs-runtime coverage test needs a
+    MeasuredValue-targeted twin here: the "unwalkable annotation" half
+    (test_no_field_reachable_from_dataset_envelope_has_an_unwalkable_annotation
+    above) is target-agnostic -- an annotation shape neither walker can
+    traverse (typing.Any, bare object, set/frozenset) hides ANY target type
+    equally, regardless of whether the walker is looking for a SourceRef or
+    a MeasuredValue -- so it already covers iter_measured_values too and is
+    not repeated here."""
+
+    def test_iter_measured_values_reports_a_value_from_every_field_location_that_can_carry_one(self) -> None:
+        expected_paths = _collect_field_paths_carrying_measured_value(DatasetEnvelope)
+        assert expected_paths, (
+            "the type walk itself found no MeasuredValue-carrying field on DatasetEnvelope -- "
+            "the walker is broken, not the schema"
+        )
+        envelope = _fully_populated_envelope()
+        produced_paths = {_strip_list_indices(path) for path, _ in iter_measured_values(envelope)}
+        missing = expected_paths - produced_paths
+        assert not missing, (
+            "iter_measured_values did not report a value from every field location that "
+            f"DatasetEnvelope's own type annotations say can carry a MeasuredValue: {sorted(missing)!r}. "
+            "A future MeasuredValue-bearing field must not be able to silently evade the T2 "
+            "conversion_tables cover-exactly check -- if this fails, either the walker's "
+            "field-location list or iter_measured_values' traversal has fallen out of sync "
+            "with the schema."
+        )
+
+    def test_finds_values_nested_inside_series_points_coordinates_and_observations(self) -> None:
+        """Positive coverage of the nesting iter_source_refs never has to
+        traverse: Series -> DataPoint -> Coordinate/Observation, several
+        BaseModel layers below DatasetEnvelope.series itself."""
+        envelope = _fully_populated_envelope()
+        found = {_strip_list_indices(path) for path, _ in iter_measured_values(envelope)}
+        assert "series.constants.value" in found
+        assert "series.points.coordinates.value" in found
+        assert "series.points.observations.value" in found
+
+    def test_finds_values_nested_inside_composition_components(self) -> None:
+        """Positive coverage of both places a Composition (and therefore its
+        components' amounts) can appear: the envelope's own top-level
+        composition, and a DataPoint's own per-point composition override."""
+        envelope = _fully_populated_envelope()
+        found = {_strip_list_indices(path) for path, _ in iter_measured_values(envelope)}
+        assert "composition.components.amount" in found
+        assert "series.points.composition.components.amount" in found
+
+
+class TestEmbeddedConversionTableT1:
+    """T1: an EmbeddedConversionTable must reconstruct, byte-for-byte, back
+    to the exact ConversionTable its declared sha256 names -- each of the
+    four independent checks that invariant depends on is exercised in
+    isolation here, plus the sha256 field's own shape validator."""
+
+    def test_canonical_json_that_does_not_parse_as_json_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="does not parse as JSON"):
+            EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json="{not json")
+
+    def test_canonical_json_that_is_structurally_invalid_rejected(self) -> None:
+        """Valid JSON, but not a shape from_identity_payload accepts (e.g. a
+        JSON object missing the required table_id/version/base_units/
+        aliases/rules keys)."""
+        with pytest.raises(ValidationError, match="does not decode to a structurally valid ConversionTable"):
+            EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json="{}")
+
+    def test_canonical_json_whose_reconstructed_table_hashes_to_a_different_sha256_rejected(self) -> None:
+        """A structurally valid table, but the *declared* sha256 field names
+        some OTHER table -- i.e. the payload was swapped or corrupted after
+        the sha256 was computed."""
+        other_table = _second_conversion_table()
+        with pytest.raises(ValidationError, match="not the declared sha256"):
+            EmbeddedConversionTable(
+                sha256=TABLE_V1.sha256,
+                canonical_json=canonical_json_bytes(other_table.identity_payload()).decode("utf-8"),
+            )
+
+    def test_canonical_json_that_is_valid_but_not_canonically_rendered_rejected(self) -> None:
+        """A JSON string that (a) parses to the identity_payload of a real,
+        valid table, (b) reconstructs to the SAME sha256 as declared, but
+        (c) is not byte-for-byte what canonical_json_bytes would have
+        produced for that payload (extra whitespace/indentation here,
+        instead of canonical_json_bytes' compact separators) -- this is the
+        one T1 check the other three cannot exercise, since it requires a
+        payload that is otherwise entirely valid and self-consistent."""
+        payload = TABLE_V1.identity_payload()
+        non_canonical = json.dumps(payload, sort_keys=True, indent=2) + "\n"
+        canonical = canonical_json_bytes(payload).decode("utf-8")
+        assert non_canonical != canonical, "test setup bug: the two renderings must actually differ byte-for-byte"
+        assert json.loads(non_canonical) == json.loads(canonical), (
+            "test setup bug: the two renderings must parse to the same payload"
+        )
+        with pytest.raises(ValidationError, match="is not the canonical rendering of the table it decodes to"):
+            EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json=non_canonical)
+
+    def test_sha256_that_is_not_64_lowercase_hex_characters_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="is not 64 lowercase hex characters"):
+            EmbeddedConversionTable(
+                sha256="not-a-hash",
+                canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
+            )
+
+    def test_a_genuinely_valid_embedding_is_accepted(self) -> None:
+        embedded = _embedded_table_v1()
+        assert embedded.sha256 == TABLE_V1.sha256
+
+
+class TestDatasetEnvelopeConversionTablesCoverExactly:
+    """T2: DatasetEnvelope.conversion_tables must embed exactly the tables
+    actually cited by some MeasuredValue.conversion_table_sha256 reachable
+    from the envelope -- no fewer (a cited table left un-embedded), and no
+    more (a decorative table nobody cites)."""
+
+    def test_missing_a_cited_table_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="is missing table\\(s\\)"):
+            _fully_populated_envelope(conversion_tables=())
+
+    def test_embedding_an_uncited_table_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="embeds decorative table\\(s\\)"):
+            _fully_populated_envelope(conversion_tables=(_embedded_table_v1(), _embedded_second_table()))
+
+    def test_embedding_exactly_the_cited_tables_accepted(self) -> None:
+        envelope = _fully_populated_envelope(conversion_tables=(_embedded_table_v1(),))
+        assert envelope.conversion_tables == (_embedded_table_v1(),)
+
+
+class TestDatasetEnvelopeConversionTablesSorted:
+    """T3: DatasetEnvelope.conversion_tables must be sorted ascending by
+    sha256 -- exercised with two genuinely-distinct, both-cited tables so a
+    sort-order failure can be triggered without also tripping T2."""
+
+    def test_conversion_tables_out_of_sha256_order_rejected(self) -> None:
+        with _registered_second_table():
+            first = _embedded_table_v1()
+            second = _embedded_second_table()
+            ascending = sorted((first, second), key=lambda table: table.sha256)
+            descending = tuple(reversed(ascending))
+            assert descending != tuple(ascending), "test setup bug: the two tables must actually sort differently"
+            with pytest.raises(ValidationError, match="must be sorted ascending by sha256"):
+                _envelope_citing_two_tables(descending)
+
+    def test_conversion_tables_in_sha256_order_accepted(self) -> None:
+        with _registered_second_table():
+            first = _embedded_table_v1()
+            second = _embedded_second_table()
+            ascending = tuple(sorted((first, second), key=lambda table: table.sha256))
+            envelope = _envelope_citing_two_tables(ascending)
+            assert envelope.conversion_tables == ascending
 
 
 class TestModelsAreFrozen:

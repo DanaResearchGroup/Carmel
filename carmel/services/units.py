@@ -318,6 +318,165 @@ def _rule_identity_payload(rule: ConversionRule) -> dict[str, Any]:
     }
 
 
+def _quantity_kind_from_identity_payload(value: Any, *, where: str) -> QuantityKind:
+    """Parse ``value`` as a :class:`QuantityKind` value string, for
+    :meth:`ConversionTable.from_identity_payload`.
+
+    Fails closed: ``value`` is untrusted JSON, and a bare ``QuantityKind(value)``
+    call would raise an unlabelled ``ValueError`` if it is not even a string
+    (``TypeError``, in fact, for a non-``str``/``int``) -- every failure here
+    is instead wrapped with ``where`` so a caller can tell exactly which part
+    of the payload misbehaved.
+    """
+    if not isinstance(value, str):
+        raise ConversionTableInvariantError(
+            f"conversion table payload: {where} 'quantity' must be a str, got {type(value).__name__}"
+        )
+    try:
+        return QuantityKind(value)
+    except ValueError as exc:
+        raise ConversionTableInvariantError(
+            f"conversion table payload: {where} 'quantity' {value!r} is not a known QuantityKind: {exc}"
+        ) from exc
+
+
+def _base_units_from_identity_payload(payload: Any) -> tuple[tuple[QuantityKind, str], ...]:
+    """Parse a conversion table payload's ``base_units`` list, strictly."""
+    if not isinstance(payload, list):
+        raise ConversionTableInvariantError(
+            f"conversion table payload: 'base_units' must be a JSON array, got {type(payload).__name__}"
+        )
+    result: list[tuple[QuantityKind, str]] = []
+    for index, entry in enumerate(payload):
+        where = f"base_units[{index}]"
+        if not isinstance(entry, list) or len(entry) != 2:
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} must be a 2-element JSON array of [quantity, unit], "
+                f"got {entry!r}"
+            )
+        quantity_value, unit = entry
+        quantity = _quantity_kind_from_identity_payload(quantity_value, where=where)
+        if not isinstance(unit, str):
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} unit must be a str, got {type(unit).__name__}"
+            )
+        result.append((quantity, unit))
+    return tuple(result)
+
+
+def _aliases_from_identity_payload(payload: Any) -> tuple[UnitAlias, ...]:
+    """Parse a conversion table payload's ``aliases`` list, strictly."""
+    if not isinstance(payload, list):
+        raise ConversionTableInvariantError(
+            f"conversion table payload: 'aliases' must be a JSON array, got {type(payload).__name__}"
+        )
+    result: list[UnitAlias] = []
+    expected_keys = {"quantity", "raw", "normalized"}
+    for index, entry in enumerate(payload):
+        where = f"aliases[{index}]"
+        if not isinstance(entry, Mapping):
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} must be a JSON object, got {type(entry).__name__}"
+            )
+        actual_keys = set(entry)
+        if actual_keys != expected_keys:
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} keys must be exactly {sorted(expected_keys)!r}, got "
+                f"{sorted(actual_keys)!r}"
+            )
+        quantity = _quantity_kind_from_identity_payload(entry["quantity"], where=where)
+        raw, normalized = entry["raw"], entry["normalized"]
+        for field_name, field_value in (("raw", raw), ("normalized", normalized)):
+            if not isinstance(field_value, str):
+                raise ConversionTableInvariantError(
+                    f"conversion table payload: {where} {field_name!r} must be a str, got "
+                    f"{type(field_value).__name__}"
+                )
+        result.append(UnitAlias(quantity=quantity, raw=raw, normalized=normalized))
+    return tuple(result)
+
+
+def _rule_from_identity_payload(payload: Any, *, index: int) -> ConversionRule:
+    """Parse one entry of a conversion table payload's ``rules`` list, strictly.
+
+    Rejects anything that is not a JSON object with EXACTLY the keys its
+    ``kind`` discriminator implies, of exactly the right primitive types,
+    before ever reaching :class:`IdentityRule`/:class:`ScaleRule`/
+    :class:`AffineRule` construction -- those dataclasses do not enforce
+    field types themselves.
+    """
+    where = f"rules[{index}]"
+    if not isinstance(payload, Mapping):
+        raise ConversionTableInvariantError(
+            f"conversion table payload: {where} must be a JSON object, got {type(payload).__name__}"
+        )
+    kind = payload.get("kind")
+    if kind == "identity":
+        expected_keys = {"kind", "quantity", "unit"}
+        actual_keys = set(payload)
+        if actual_keys != expected_keys:
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} (kind='identity') keys must be exactly "
+                f"{sorted(expected_keys)!r}, got {sorted(actual_keys)!r}"
+            )
+        quantity = _quantity_kind_from_identity_payload(payload["quantity"], where=where)
+        unit = payload["unit"]
+        if not isinstance(unit, str):
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} 'unit' must be a str, got {type(unit).__name__}"
+            )
+        return IdentityRule(kind="identity", quantity=quantity, unit=unit)
+    if kind == "scale":
+        expected_keys = {"kind", "quantity", "from_unit", "to_unit", "scale"}
+        actual_keys = set(payload)
+        if actual_keys != expected_keys:
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} (kind='scale') keys must be exactly "
+                f"{sorted(expected_keys)!r}, got {sorted(actual_keys)!r}"
+            )
+        quantity = _quantity_kind_from_identity_payload(payload["quantity"], where=where)
+        from_unit, to_unit, scale = payload["from_unit"], payload["to_unit"], payload["scale"]
+        for field_name, field_value in (("from_unit", from_unit), ("to_unit", to_unit), ("scale", scale)):
+            if not isinstance(field_value, str):
+                raise ConversionTableInvariantError(
+                    f"conversion table payload: {where} {field_name!r} must be a str, got "
+                    f"{type(field_value).__name__}"
+                )
+        return ScaleRule(kind="scale", quantity=quantity, from_unit=from_unit, to_unit=to_unit, scale=scale)
+    if kind == "affine":
+        expected_keys = {"kind", "quantity", "from_unit", "to_unit", "scale", "offset"}
+        actual_keys = set(payload)
+        if actual_keys != expected_keys:
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} (kind='affine') keys must be exactly "
+                f"{sorted(expected_keys)!r}, got {sorted(actual_keys)!r}"
+            )
+        quantity = _quantity_kind_from_identity_payload(payload["quantity"], where=where)
+        from_unit, to_unit, scale, offset = (
+            payload["from_unit"],
+            payload["to_unit"],
+            payload["scale"],
+            payload["offset"],
+        )
+        for field_name, field_value in (
+            ("from_unit", from_unit),
+            ("to_unit", to_unit),
+            ("scale", scale),
+            ("offset", offset),
+        ):
+            if not isinstance(field_value, str):
+                raise ConversionTableInvariantError(
+                    f"conversion table payload: {where} {field_name!r} must be a str, got "
+                    f"{type(field_value).__name__}"
+                )
+        return AffineRule(
+            kind="affine", quantity=quantity, from_unit=from_unit, to_unit=to_unit, scale=scale, offset=offset
+        )
+    raise ConversionTableInvariantError(
+        f"conversion table payload: {where} 'kind' must be one of 'identity'/'scale'/'affine', got {kind!r}"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ConversionTable:
     """A closed, versioned, content-addressed set of unit-conversion rules.
@@ -514,6 +673,67 @@ class ConversionTable:
             ],
             "rules": [_rule_identity_payload(rule) for rule in self.rules],
         }
+
+    @classmethod
+    def from_identity_payload(cls, payload: Mapping[str, Any]) -> ConversionTable:
+        """Reconstruct a :class:`ConversionTable` from its own
+        :meth:`identity_payload` projection -- the exact inverse of that
+        method.
+
+        STRICT parsing is the whole point: a dataclass does not enforce its
+        own field types at construction, so a naive ``cls(**payload)``-style
+        splat would let an untrusted JSON payload smuggle e.g. a ``scale``
+        of ``None`` or a list-valued ``from_unit`` straight into a live
+        ``ConversionTable``. Every key, its presence, and its primitive type
+        are checked explicitly here, BEFORE any dataclass is constructed;
+        only once every piece already looks like the right shape does
+        construction run -- and construction itself still re-runs every
+        ``__post_init__`` invariant (see that method's docstring), so a
+        payload that is shaped correctly but semantically incoherent (e.g. a
+        duplicate rule key) is caught there, not skipped here.
+
+        Round-trips exactly against :meth:`identity_payload`:
+        ``ConversionTable.from_identity_payload(t.identity_payload())``
+        reconstructs a table equal to ``t``, with the same ``.sha256``.
+
+        Raises:
+            ConversionTableInvariantError: ``payload`` is not shaped like a
+                conversion table's identity payload (wrong top-level keys, a
+                wrong primitive type anywhere, an unrecognized
+                ``QuantityKind``, or an unrecognized rule ``kind``), or
+                constructing the parsed fields violates one of
+                ``__post_init__``'s invariants.
+        """
+        if not isinstance(payload, Mapping):
+            raise ConversionTableInvariantError(
+                f"conversion table payload must be a JSON object, got {type(payload).__name__}"
+            )
+        expected_keys = {"table_id", "version", "base_units", "aliases", "rules"}
+        actual_keys = set(payload)
+        if actual_keys != expected_keys:
+            raise ConversionTableInvariantError(
+                f"conversion table payload keys must be exactly {sorted(expected_keys)!r}, got "
+                f"{sorted(actual_keys)!r}"
+            )
+        table_id = payload["table_id"]
+        if not isinstance(table_id, str):
+            raise ConversionTableInvariantError(
+                f"conversion table payload 'table_id' must be a str, got {type(table_id).__name__}"
+            )
+        version = payload["version"]
+        if not isinstance(version, int) or isinstance(version, bool):
+            raise ConversionTableInvariantError(
+                f"conversion table payload 'version' must be an int, got {type(version).__name__}"
+            )
+        base_units = _base_units_from_identity_payload(payload["base_units"])
+        aliases = _aliases_from_identity_payload(payload["aliases"])
+        rules_payload = payload["rules"]
+        if not isinstance(rules_payload, list):
+            raise ConversionTableInvariantError(
+                f"conversion table payload 'rules' must be a JSON array, got {type(rules_payload).__name__}"
+            )
+        rules = tuple(_rule_from_identity_payload(entry, index=i) for i, entry in enumerate(rules_payload))
+        return cls(table_id=table_id, version=version, base_units=base_units, aliases=aliases, rules=rules)
 
     @property
     def sha256(self) -> str:

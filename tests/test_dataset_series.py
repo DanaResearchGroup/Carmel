@@ -27,6 +27,7 @@ from carmel.schemas.datasets import (
     CoordinateFrame,
     DataPoint,
     DatasetEnvelope,
+    EmbeddedConversionTable,
     Maybe,
     MeasuredValue,
     MemberSheetKey,
@@ -48,6 +49,7 @@ from carmel.schemas.datasets import (
     XPathLocator,
     _check_source_form_for_ref,
 )
+from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.units import TABLE_V1
 
 SHA_A = "a" * 64
@@ -59,6 +61,17 @@ _NOT_REPORTED = Absent(reason=AbsenceReason.NOT_REPORTED_HERE)
 every builder call that doesn't need a distinct reason is safe."""
 
 _NO_COMPOSITION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+
+
+def _embedded_table_v1() -> EmbeddedConversionTable:
+    """The one conversion table every ``MeasuredValue`` fixture in this file
+    cites (via ``conversion_table_sha256=TABLE_V1.sha256``) -- embedded
+    verbatim so ``DatasetEnvelope.conversion_tables``'s T2 cover-exactly
+    check is satisfied by every envelope built here."""
+    return EmbeddedConversionTable(
+        sha256=TABLE_V1.sha256,
+        canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
+    )
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 
 
@@ -313,6 +326,7 @@ def _envelope_with_series(
         source_graph=graph if graph is not None else _single_paper_graph(),
         composition=composition,
         series=series,
+        conversion_tables=(_embedded_table_v1(),),
     )
 
 
@@ -1021,7 +1035,7 @@ class TestCompositionAbsentGroundedThroughSeries:
         """
         graph = _single_paper_graph()
         with pytest.raises(ValidationError, match="at least 1 item"):
-            DatasetEnvelope(source_graph=graph, composition=_NO_COMPOSITION, series=())
+            DatasetEnvelope(source_graph=graph, composition=_NO_COMPOSITION, series=(), conversion_tables=())
 
     def test_the_structural_chain_that_makes_v0_unreachable_is_intact(self) -> None:
         """V0 ("envelope must contain >=1 SourceRef") has been DELETED, and
@@ -1130,7 +1144,12 @@ class TestFunctionalRealisticSeries:
             constants=constants,
             points=points,
         )
-        return DatasetEnvelope(source_graph=graph, composition=_NO_COMPOSITION, series=(series,))
+        return DatasetEnvelope(
+            source_graph=graph,
+            composition=_NO_COMPOSITION,
+            series=(series,),
+            conversion_tables=(_embedded_table_v1(),),
+        )
 
     def test_constructs(self) -> None:
         envelope = self._build()
