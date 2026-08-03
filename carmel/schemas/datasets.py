@@ -546,6 +546,21 @@ class ExtractionBinding(BaseModel):
     @classmethod
     def _validate_derivation_binding_shape(cls, value: Maybe[str]) -> Maybe[str]:
         if isinstance(value, Absent):
+            # The docstring above argues at length that UNKNOWN is the only
+            # honest reason here and that NOT_EXTRACTED_YET actively lies (it
+            # names the remedy "re-run extraction", which cannot recover this
+            # digest). An argument nothing enforces is a comment, not a rule --
+            # so enforce it. Round-31 review caught that the prose and the code
+            # disagreed, and the prose was the load-bearing-looking half.
+            if value.reason is not AbsenceReason.UNKNOWN:
+                raise ValueError(
+                    f"derivation_binding may only be Absent for reason {AbsenceReason.UNKNOWN.value!r}, "
+                    f"not {value.reason.value!r}: a stored artifact either recorded this digest or "
+                    "predates the field entirely, and in the latter case the extractor identity in "
+                    "play at store time is unrecoverable -- re-extraction is not byte-reproducible, "
+                    "which is exactly why the evidence store never recomputes it. Any other reason "
+                    "claims a remedy that does not exist"
+                )
             return value
         if not _SHA256_RE.match(value):
             raise ValueError(f"invalid derivation_binding: {value!r} (expected 64 lowercase hex characters)")

@@ -1883,3 +1883,38 @@ class TestModelsAreFrozen:
         )
         assert isinstance(mixture.components, tuple)
         assert len(mixture.components) == 1
+
+
+class TestDerivationBindingAbsenceReasonIsConstrained:
+    """The only honest absence reason for ``derivation_binding`` is UNKNOWN.
+
+    ``NOT_EXTRACTED_YET`` is the tempting wrong answer and is rejected on
+    purpose: it names the remedy "re-run extraction and the gap closes", and
+    that remedy provably cannot work for this field. Re-running the extractor
+    is not guaranteed to reproduce byte-identical output, which is precisely
+    why the evidence store never recomputes the digest -- so a legacy
+    artifact's binding is unrecoverable, not merely un-extracted-yet.
+
+    Round-31 review found the docstring asserting this while the validator
+    accepted any reason at all.
+    """
+
+    def test_absent_for_unknown_is_accepted(self) -> None:
+        binding = ExtractionBinding(
+            extracted_sha256=SHA_A,
+            extracted_text_sha256=SHA_B,
+            derivation_binding=Absent(reason=AbsenceReason.UNKNOWN),
+        )
+        assert isinstance(binding.derivation_binding, Absent)
+
+    @pytest.mark.parametrize(
+        "reason",
+        [r for r in AbsenceReason if r is not AbsenceReason.UNKNOWN],
+    )
+    def test_every_other_absence_reason_is_rejected(self, reason: AbsenceReason) -> None:
+        with pytest.raises(ValidationError, match="may only be Absent for reason"):
+            ExtractionBinding(
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                derivation_binding=Absent(reason=reason),
+            )

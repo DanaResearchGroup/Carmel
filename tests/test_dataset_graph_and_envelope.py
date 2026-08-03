@@ -1004,11 +1004,22 @@ class TestSourceGraphConflictingGlyphHealth:
             SourceNodeKind.FIGURE_CROP,
             SHA_A,
             parent_node_id="paper",
-            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
-            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH),
+            # DELIBERATELY the SAME extraction binding as `paper`, not a different
+            # one. Both nodes must agree here or I5c fires first and this test
+            # silently stops testing I5b at all -- which is exactly what happened
+            # when I5c was introduced: the two nodes carried different bindings,
+            # I5c rejected the graph before I5b was ever consulted, and the test
+            # stayed green because BOTH messages contain the word "CONFLICT".
+            # Round-31 review caught it. Hence also the wording assertion below.
+            extraction=_extraction_binding(extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_UNHEALTHY_GLYPH_HEALTH),
         )
-        with pytest.raises(ValidationError, match="CONFLICT"):
+        with pytest.raises(ValidationError, match="CONFLICT") as excinfo:
             SourceGraph(nodes=(paper, crop))
+        # Pin WHICH conflict: matching "CONFLICT" alone cannot distinguish I5b from
+        # I5c, so it would not notice this test being captured by I5c a second time.
+        assert "glyph-health story" in str(excinfo.value)
+        assert "ExtractionBinding values disagree" not in str(excinfo.value)
 
     def test_same_bytes_agreeing_on_glyph_health_is_allowed(self) -> None:
         """Two nodes sharing raw bytes are allowed ONLY when they agree on
