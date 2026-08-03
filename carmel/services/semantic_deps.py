@@ -64,10 +64,11 @@ Three limitations are load-bearing and must not be relaxed silently:
    scope of what a ``content_sha256`` computed by this module can attest to;
    this is a named, accepted limitation, not a bug to fix here.
 
-This module also does not model FULL numeric parsing or glyph-health
-admission -- see :data:`DEPENDENCIES_BY_SHA`'s seeded entry and its
-docstring for exactly what the one seeded dependency does and does not
-cover.
+This module also does not model FULL numeric parsing -- see
+:data:`DEPENDENCIES_BY_SHA`'s seeded entries and their docstrings for exactly
+what each seeded dependency does and does not cover. Glyph-health ASSESSMENT is
+a separate registered dependency (:data:`GLYPH_HEALTH_DEPENDENCY_ID`); the
+repair entry still does not cover it, and the two are deliberately not merged.
 """
 
 from __future__ import annotations
@@ -84,6 +85,7 @@ from carmel.services.dataset_store import canonical_json_bytes
 
 __all__ = [
     "CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID",
+    "GLYPH_HEALTH_DEPENDENCY_ID",
     "DEPENDENCIES_BY_SHA",
     "CURRENT_SHA_BY_DEPENDENCY_ID",
     "InputPolicy",
@@ -95,8 +97,27 @@ __all__ = [
     "dependency_for_sha",
 ]
 
+GLYPH_HEALTH_DEPENDENCY_ID = "carmel.numeric.glyph_health"
+"""The stable ``dependency_id`` for the glyph-health ASSESSMENT dependency.
+
+Deliberately a SEPARATE identity from
+:data:`CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID`, never an extension of it. The
+two heuristics have genuinely different closures -- editing
+``assess_glyph_health`` must not re-address stored repair claims, and editing
+the repair chain must not re-address stored glyph assessments. That split is
+empirically real, not aspirational: the two entry-point sets share only
+``GlyphHealth`` and ``_ASCII6_UNCERTAINTY_RE``, and each computes a different
+content sha.
+
+Unlike the repair dependency, this one's input is NOT a sibling field of the
+record that cites it -- it is a whole extracted document text living in the
+evidence store -- so it carries
+:attr:`InputPolicy.EXTERNAL_DIGEST_REQUIRED` and is the first real user of
+that branch.
+"""
+
 CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID = "carmel.numeric.context_free_span_repair"
-"""The stable ``dependency_id`` for the one seeded dependency in this registry.
+"""The stable ``dependency_id`` for the span-repair dependency in this registry.
 
 Exported so callers outside this module (schema-layer validators, in
 particular) that need to pin ``MeasuredValue.repair_dependency`` to exactly
@@ -575,6 +596,25 @@ def _assert_no_carmel_imports(module_source: str) -> None:
 # registry row that uses it.
 _CONTEXT_FREE_SPAN_REPAIR_SHA256 = "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
 
+# HARDCODED for exactly the same reasons as the literal above; the whole comment
+# there applies here verbatim. Independently verified once via:
+#   compute_dependency_sha(
+#       inspect.getsource(carmel.services.numeric), ["assess_glyph_health"]
+#   )
+# Adding "GlyphHealth" as a second entry point does NOT change this value -- the
+# class is already pulled into the closure transitively by assess_glyph_health's
+# return statement -- so the single entry point is not an under-specification.
+#
+# NOTE this sha and _CONTEXT_FREE_SPAN_REPAIR_SHA256 are NOT independently
+# versioned: compute_dependency_sha folds the WHOLE module's import list into
+# every payload, so any import edit in numeric.py moves BOTH shas at once, even
+# one touching neither closure. That over-firing is deliberate and must not be
+# "fixed" by scoping imports to the closure: over-firing costs a spurious
+# re-address (loud, cheap), while under-hashing costs a behaviour change with no
+# identity change (silent corruption -- the exact failure this module exists to
+# prevent).
+_GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a"
+
 
 def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
     """Return the append-only registry's initial contents.
@@ -590,12 +630,32 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
     normalize_numeric_span that only trigger for a real document's assessed
     GlyphHealth, and never anything about full numeric parsing beyond this one
     heuristic. Do not rename or redocument this entry to imply broader coverage.
+
+    The glyph-health entry is the ASSESSMENT half that the repair entry above
+    explicitly excludes. Its input is a whole extracted document text held in the
+    evidence store rather than a sibling field of the citing record, hence
+    EXTERNAL_DIGEST_REQUIRED: without a recorded digest of the exact text that
+    was assessed, a disagreement between a stored assessment and a fresh one is
+    uninterpretable (same input under a changed heuristic, or a different input
+    entirely?). Recording the digest is what makes that distinguishable later.
+
+    HONEST SCOPE: validation of a stored assessment can check registry identity,
+    digest shape and the node's extraction binding. It CANNOT re-run
+    assess_glyph_health, because the input is out-of-payload. A stored
+    assessment is therefore UNVERIFIED-BY-CONSTRUCTION until the replayer
+    milestone lands. Do not describe it as verified anywhere.
     """
     return (
         SemanticDependencyDefinition(
             dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
             content_sha256=_CONTEXT_FREE_SPAN_REPAIR_SHA256,
             input_policy=InputPolicy.SIBLING_FIELD,
+            is_current=True,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=GLYPH_HEALTH_DEPENDENCY_ID,
+            content_sha256=_GLYPH_HEALTH_SHA256,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=True,
         ),
     )

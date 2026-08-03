@@ -58,10 +58,19 @@ _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256 = (
     "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
 )
 
+# Pinned for carmel.numeric.glyph_health on exactly the same terms as the literal
+# above: hardcoded, never recomputed from the live module, never edited in place.
+# Entry point: assess_glyph_health.
+_PINNED_GLYPH_HEALTH_SHA256 = (
+    "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a"
+)
+
 # The set of sha256 digests this registry has ever shipped, as of this test's writing.
 # Used only to assert DEPENDENCIES_BY_SHA never drops a previously-shipped entry (see
 # test_registry_is_append_only_and_never_drops_a_previously_shipped_sha below).
-_HISTORICALLY_SHIPPED_SHAS = frozenset({_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256})
+_HISTORICALLY_SHIPPED_SHAS = frozenset(
+    {_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256, _PINNED_GLYPH_HEALTH_SHA256}
+)
 
 
 def _real_numeric_source() -> str:
@@ -145,6 +154,105 @@ def test_calibration_closure_is_exactly_the_expected_twelve_names() -> None:
         "normalize_numeric_span",
     }
     assert closure == expected
+
+
+def test_glyph_health_sha_matches_a_hardcoded_pin() -> None:
+    computed = compute_dependency_sha(_real_numeric_source(), ["assess_glyph_health"])
+    assert computed == _PINNED_GLYPH_HEALTH_SHA256, (
+        "carmel/services/numeric.py's glyph-health assessment (or this toolchain's "
+        "ast.dump rendering) has changed since carmel.numeric.glyph_health was pinned. "
+        "Fix: ADD A NEW entry to DEPENDENCIES_BY_SHA in "
+        "carmel/services/semantic_deps.py for the new sha -- do not edit or replace "
+        "the existing pinned entry or this test's hardcoded literal."
+    )
+
+
+def test_glyph_health_registry_seed_agrees_with_the_pin() -> None:
+    assert _PINNED_GLYPH_HEALTH_SHA256 in DEPENDENCIES_BY_SHA
+    entry = DEPENDENCIES_BY_SHA[_PINNED_GLYPH_HEALTH_SHA256]
+    assert entry.dependency_id == "carmel.numeric.glyph_health"
+    assert entry.input_policy is InputPolicy.EXTERNAL_DIGEST_REQUIRED
+
+
+def test_glyph_health_and_repair_chain_have_different_shas() -> None:
+    """The two dependencies must never collapse into one identity.
+
+    If these ever coincide, a change to one heuristic would silently re-address
+    records produced by the other.
+    """
+    assert _PINNED_GLYPH_HEALTH_SHA256 != _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256
+
+
+def test_declaring_glyph_health_as_a_second_entry_point_does_not_change_the_sha() -> None:
+    """GlyphHealth is already pulled into the closure transitively by
+    assess_glyph_health, so naming it explicitly must be a no-op.
+
+    This is what justifies seeding the dependency with a SINGLE entry point: it
+    proves the single entry point is not an under-specification.
+    """
+    source = _real_numeric_source()
+    one = compute_dependency_sha(source, ["assess_glyph_health"])
+    two = compute_dependency_sha(source, ["assess_glyph_health", "GlyphHealth"])
+    assert one == two == _PINNED_GLYPH_HEALTH_SHA256
+
+
+def test_editing_glyph_health_does_not_re_address_the_repair_chain() -> None:
+    """The two closures are genuinely scoped, in the direction that matters.
+
+    Mutating a marker that lives ONLY in assess_glyph_health must move the
+    glyph-health sha and leave the repair-chain sha untouched. Without this,
+    'separate dependency ids' would be a naming convention rather than a
+    property of the code.
+    """
+    source = _real_numeric_source()
+    mutated = source.replace('has_thorn_plus_marker="þ" in', 'has_thorn_plus_marker="Þ" in')
+    assert mutated != source, "the mutation target vanished; update this test"
+
+    assert compute_dependency_sha(mutated, ["assess_glyph_health"]) != _PINNED_GLYPH_HEALTH_SHA256
+    assert (
+        compute_dependency_sha(mutated, ["normalize_numeric_span", "REPAIR_NAMES"])
+        == _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256
+    )
+
+
+def test_glyph_health_closure_is_exactly_the_expected_four_names() -> None:
+    """Pinned separately from the sha so a closure-membership regression and an
+    unparse/dump-format regression can be told apart by which test fails.
+
+    The overlap with the repair closure is exactly {GlyphHealth,
+    _ASCII6_UNCERTAINTY_RE} -- both are genuine shared references, not an
+    over-broad walk.
+    """
+    source = _real_numeric_source()
+    tree = ast.parse(source)
+    definitions: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    definitions[target.id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            definitions[node.target.id] = node
+
+    closure: set[str] = set()
+    frontier = ["assess_glyph_health"]
+    while frontier:
+        name = frontier.pop()
+        if name in closure or name not in definitions:
+            continue
+        closure.add(name)
+        for child in ast.walk(definitions[name]):
+            if isinstance(child, ast.Name) and child.id in definitions and child.id not in closure:
+                frontier.append(child.id)
+
+    assert closure == {
+        "GlyphHealth",
+        "_ASCII6_UNCERTAINTY_RE",
+        "_BARE_DASH_CORRUPTION_RE",
+        "assess_glyph_health",
+    }
 
 
 def test_determinism_same_input_same_sha() -> None:
