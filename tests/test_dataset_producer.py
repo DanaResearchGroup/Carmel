@@ -28,6 +28,7 @@ from carmel.schemas.datasets import (
     CharSpanLocator,
     DatasetEnvelope,
     ExtractionBinding,
+    SourceNodeKind,
     ValueOrigin,
     iter_measured_values,
     iter_source_refs,
@@ -79,19 +80,25 @@ _SPECS = (
 )
 
 
-def _store_synthetic_artifact(workspace_root: Path, text: str) -> StoredArtifact:
+def _store_synthetic_artifact(
+    workspace_root: Path,
+    text: str,
+    *,
+    content_type: str = "application/pdf",
+    extractor: str = "pdf:pypdf",
+) -> StoredArtifact:
     """Store a synthetic artifact through the REAL evidence.store_artifact API."""
     data = text.encode("utf-8")
     artifact = FetchedArtifact(
         url="https://example.org/synthetic.pdf",
         final_url="https://example.org/synthetic.pdf",
         sha256=hashlib.sha256(data).hexdigest(),
-        content_type="application/pdf",
+        content_type=content_type,
         n_bytes=len(data),
         fetched_at=datetime.now(UTC),
     )
     extracted = ExtractedText(
-        text=text, normalized=text.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
+        text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=False
     )
     return store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
 
@@ -174,6 +181,52 @@ def _assert_every_char_span_grounds(envelope: DatasetEnvelope, text: str) -> int
     return checked
 
 
+class TestMeasurementSpecOccurrence:
+    """P2-E: ``bool`` is a subclass of ``int`` in Python, so an unvalidated
+    ``occurrence: int | None`` field would silently accept ``True``/``False``
+    as occurrence 1/0 -- a near-certain caller typo, never a real disambiguation
+    intent. ``MeasurementSpec`` must reject bool explicitly, not merely
+    ``isinstance(x, int)`` (which bool satisfies)."""
+
+    @pytest.mark.parametrize("field", ["label_occurrence", "value_occurrence", "unit_occurrence"])
+    @pytest.mark.parametrize("bad_value", [True, False])
+    def test_bool_occurrence_rejected(self, field: str, bad_value: bool) -> None:
+        kwargs = {
+            "axis_id": "temperature",
+            "role": AxisRole.COORDINATE,
+            "quantity_kind": QuantityKind.TEMPERATURE,
+            "label_quote": "temperature",
+            "value_quote": "1023",
+            "unit_quote": "K",
+            field: bad_value,
+        }
+        with pytest.raises(DatasetProducerError, match=f"{field}={bad_value!r}"):
+            MeasurementSpec(**kwargs)
+
+    def test_int_occurrence_still_accepted(self) -> None:
+        spec = MeasurementSpec(
+            axis_id="temperature",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_quote="temperature",
+            value_quote="1023",
+            unit_quote="K",
+            value_occurrence=0,
+        )
+        assert spec.value_occurrence == 0
+
+    def test_none_occurrence_still_accepted(self) -> None:
+        spec = MeasurementSpec(
+            axis_id="temperature",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_quote="temperature",
+            value_quote="1023",
+            unit_quote="K",
+        )
+        assert spec.value_occurrence is None
+
+
 class TestGroundQuote:
     def test_grounds_unique_quote_by_search(self) -> None:
         locator = ground_quote(_TEXT, "1023")
@@ -211,6 +264,45 @@ class TestGroundQuote:
     def test_overlapping_matches_count_as_ambiguous(self) -> None:
         with pytest.raises(QuoteGroundingError, match=r"appears 2 times"):
             ground_quote("aaa", "aa")
+
+
+class TestGroundQuoteNumericTokenMaximality:
+    """P1-A: a numeral quote must ground to the MAXIMAL numeric token, never
+    an interior fragment of a strictly larger one."""
+
+    def test_rejects_fragment_inside_larger_integer(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("T = 11023 K", "1023")
+
+    def test_rejects_fragment_before_decimal_point(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("T = 1023.5 K", "1023")
+
+    def test_rejects_fragment_after_decimal_point(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("phi 0.51023 was used", "1023")
+
+    def test_accepts_whole_number_bounded_by_whitespace(self) -> None:
+        locator = ground_quote("T = 1023 K", "1023")
+        assert (locator.start, locator.end) == (4, 8)
+
+    def test_accepts_number_immediately_followed_by_unit_letter(self) -> None:
+        # Deliberate policy: a trailing letter that isn't part of an
+        # exponent marker (e/E) does not continue a numeric token, so
+        # "1023" IS the maximal numeral in "1023K" -- unlike a trailing
+        # digit or decimal point, "K" cannot extend a numeral.
+        locator = ground_quote("1023K", "1023")
+        assert (locator.start, locator.end) == (0, 4)
+
+    def test_non_numeric_quote_is_unaffected_by_maximality_check(self) -> None:
+        # "mole fraction" never matches the numeric-token pattern at all, so
+        # the maximality check must not even engage for it.
+        locator = ground_quote("the mole fraction was measured", "mole fraction")
+        assert (locator.start, locator.end) == (4, 17)
+
+    def test_rejects_fragment_of_exponent_form(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="interior fragment"):
+            ground_quote("k = 1023e5 1/s", "1023")
 
 
 class TestProducerEndToEnd:
@@ -283,7 +375,13 @@ class TestProducerFailClosed:
         """Bytes on disk that no longer match StoredArtifact.extracted_sha256
         are refused BEFORE parsing -- the corrupt replacement here is valid
         JSON and would parse fine, so only the digest check can be what
-        refuses it."""
+        refuses it. P1-B added ``verify_artifact`` as an earlier gate that
+        also checks this same extracted.json digest (among other things), so
+        it is now the one that fires first; the still-later, by-hand digest
+        check below it (with the older "refusing to parse unverified bytes"
+        message) is reached only if verify_artifact's own check is somehow
+        bypassed, e.g. by a future refactor -- both are exercised by other
+        tests in ``TestProducerFailClosed``."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
         corrupt = ExtractedText(
@@ -291,7 +389,7 @@ class TestProducerFailClosed:
         )
         extracted_path.write_bytes(corrupt.model_dump_json().encode("utf-8"))
 
-        with pytest.raises(DatasetProducerError, match="refusing to parse unverified bytes"):
+        with pytest.raises(DatasetProducerError, match="failed verify_artifact"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
@@ -349,3 +447,184 @@ class TestProducerFailClosed:
                 value_origin=ValueOrigin.EXPERIMENTAL,
                 measurements=(bad_spec, *_SPECS),
             )
+
+    def test_refuses_corrupted_raw_bin(self, tmp_path: Path) -> None:
+        """P1-B: raw.bin was never verified before this fix -- only
+        extracted.json was. Corrupt raw.bin (leave extracted.json/meta.json
+        untouched) and confirm production now refuses."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        raw_path = artifact_dir(tmp_path, stored.sha256) / "raw.bin"
+        raw_path.write_bytes(b"not the original bytes at all")
+
+        with pytest.raises(DatasetProducerError, match="failed verify_artifact"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+    def test_refuses_meta_sha256_field_disagreeing_with_directory(self, tmp_path: Path) -> None:
+        """P1-B: ``load_artifact_meta`` resolves the directory purely from the
+        ``sha256`` PARAMETER and never cross-checks it against the ``sha256``
+        FIELD recorded inside meta.json. Hand-edit that field to some other
+        (still well-formed) digest, leaving raw.bin/extracted.json under the
+        TRUE sha256 directory untouched -- both would otherwise verify fine,
+        so only an explicit field-vs-parameter check can catch this."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        tampered = meta.model_copy(update={"sha256": "1" * 64})
+        meta_path.write_text(tampered.model_dump_json())
+
+        with pytest.raises(DatasetProducerError, match="disagree"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+
+class TestProducerNodeKind:
+    """P1-C: the root SourceNode's ``kind`` must be derived honestly from the
+    artifact's own ``content_type``, never hardcoded, and refused when the
+    content_type establishes nothing."""
+
+    def test_pdf_artifact_yields_paper_pdf_node(self, tmp_path: Path) -> None:
+        stored = _store_synthetic_artifact(tmp_path, _TEXT, content_type="application/pdf")
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        assert envelope.source_graph.nodes[0].kind == SourceNodeKind.PAPER_PDF
+
+    def test_xml_artifact_yields_jats_xml_node(self, tmp_path: Path) -> None:
+        stored = _store_synthetic_artifact(
+            tmp_path, _TEXT, content_type="application/xml", extractor="xml"
+        )
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        assert envelope.source_graph.nodes[0].kind == SourceNodeKind.JATS_XML
+
+    def test_unrecognised_content_type_is_refused(self, tmp_path: Path) -> None:
+        stored = _store_synthetic_artifact(
+            tmp_path, _TEXT, content_type="text/html", extractor="html"
+        )
+        with pytest.raises(DatasetProducerError, match="does not map to any SourceNodeKind"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+
+class TestProducerGlyphHealthQuarantine:
+    """P1-D: normalization must not bypass the document-level dash/ligature
+    corruption quarantine by hardcoding a healthy glyph-health/OPERATOR_RAW
+    context. A document that (a) came from the PDF extractor (so
+    SourceContext.FLAT_PDF_TEXT applies) and (b) has no en-dash but does have
+    a bare lowercase-``e`` exponent shape (``assess_glyph_health``'s
+    ``suspects_dash_corruption`` signal) must have that bare-exponent value
+    quote REFUSED -- where, before this fix, the producer's hardcoded
+    OPERATOR_RAW/healthy computation would have let it sail through."""
+
+    _SUSPECT_TEXT = (
+        "The reactor was held at a temperature of 300 K. The rate constant k "
+        "was found to be 1023e5 1/s in the flattened region of the reactor."
+    )
+    """No en-dash anywhere, and "1023e5" is exactly the bare lowercase-e
+    exponent shape `_BARE_DASH_CORRUPTION_RE` (`\\d+e\\d+`) matches -- so
+    `assess_glyph_health` flags `suspects_dash_corruption=True` for this
+    document. `extractor="pdf:pypdf"` (via `_store_synthetic_artifact`'s
+    default) makes `_source_context_for`'s equivalent derive FLAT_PDF_TEXT.
+    The temperature sentence exists only to give the envelope a COORDINATE
+    axis (schema requires at least one of each); it is unrelated to the
+    suspect rate-constant value under test."""
+
+    def test_bare_exponent_value_refused_in_suspect_pdf_document(self, tmp_path: Path) -> None:
+        stored = _store_synthetic_artifact(tmp_path, self._SUSPECT_TEXT)
+        coordinate_spec = MeasurementSpec(
+            axis_id="temperature",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_quote="temperature",
+            value_quote="300",
+            unit_quote="K",
+        )
+        spec = MeasurementSpec(
+            axis_id="rate_constant",
+            role=AxisRole.OBSERVATION,
+            quantity_kind=QuantityKind.STRAIN_RATE,
+            label_quote="rate constant",
+            value_quote="1023e5",
+            unit_quote="1/s",
+        )
+        with pytest.raises(DatasetProducerError, match="1023e5"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=(coordinate_spec, spec),
+            )
+
+
+class TestGroundingIsIndependentPerQuote:
+    """P1-F (documented, deliberately NOT fixed by this change): value, unit,
+    and label quotes for one axis are each grounded INDEPENDENTLY anywhere in
+    the document -- nothing checks they were stated together. This is a
+    pinning test of that CURRENT, UNSOUND behaviour: it must FAIL the day a
+    bounded measurement-context check closes the gap, forcing this test (and
+    the docstring paragraph in ``produce_envelope_from_artifact`` describing
+    the same gap) to be updated or removed."""
+
+    def test_value_and_unit_from_unrelated_parts_of_document_both_ground(
+        self, tmp_path: Path
+    ) -> None:
+        text = (
+            "The reactor was held at a temperature of 1023 K during the run. "
+            "In an unrelated paragraph about SI units, Pa was mentioned as the "
+            "SI unit of static gauge reading."
+        )
+        stored = _store_synthetic_artifact(tmp_path, text)
+        # "1023" comes from the temperature sentence; "Pa" comes from the
+        # unrelated SI-units sentence. Nothing binds them to the same
+        # physical statement -- yet this spec grounds and validates cleanly.
+        coordinate_spec = MeasurementSpec(
+            axis_id="temperature",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_quote="temperature",
+            value_quote="1023",
+            unit_quote="K",
+        )
+        spec = MeasurementSpec(
+            axis_id="pressure",
+            role=AxisRole.OBSERVATION,
+            quantity_kind=QuantityKind.PRESSURE,
+            label_quote="static gauge reading",
+            value_quote="1023",
+            unit_quote="Pa",
+        )
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=(coordinate_spec, spec),
+        )
+        # Reachable and schema-valid today: this IS the gap P1-F describes.
+        assert envelope.series[0].points[0].observations[0].axis_id == "pressure"

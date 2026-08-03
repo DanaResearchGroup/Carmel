@@ -38,12 +38,29 @@ producer enforces that rule MECHANICALLY, not by convention:
 Everything here is fail-closed: a quote that cannot be found, is ambiguous,
 or is out of range raises; a missing/legacy/corrupt artifact raises; nothing
 ever silently guesses.
+
+WHAT GROUNDING DOES AND DOES NOT PROVE (read this before trusting an
+envelope this module produces): every span this module records verifiably
+slices the extracted text to exactly the string the envelope claims -- that
+is what :func:`ground_quote` mechanically enforces, and (for a numeric value
+quote) that the span is a maximal numeric token rather than an interior
+fragment of a larger one. NOTHING here yet checks that the value, unit, and
+label spans it grounds independently belong to the SAME measurement: a
+caller can pass a ``value_quote`` from one sentence and a ``unit_quote``
+from an unrelated one elsewhere in the document, and this module will
+happily ground both and assemble a valid envelope out of them. Each
+:class:`MeasurementSpec` is grounded quote-by-quote, with no adjacency,
+table/row, or sentence-scoping check tying the three quotes of one spec
+together. Closing that gap needs a bounded measurement context (e.g.
+adjacency or table/row structure) and is its own future milestone, not
+something this vertical slice attempts.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -77,11 +94,12 @@ from carmel.services.dataset_store import (
     canonical_decimal,
     canonical_json_bytes,
 )
-from carmel.services.evidence import artifact_dir, load_artifact_meta
+from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_artifact
 from carmel.services.numeric import (
     GlyphHealth,
     SourceContext,
     Unresolvable,
+    assess_glyph_health,
     normalize_numeric_span,
 )
 from carmel.services.semantic_deps import (
@@ -107,10 +125,38 @@ here."""
 
 _ROOT_NODE_ID = "paper"
 """The single :class:`SourceNode`'s id in every produced graph. One artifact
-in, one root ``PAPER_PDF`` node out -- this vertical slice models exactly
-that shape and nothing more."""
+in, one root node out -- this vertical slice models exactly that shape and
+nothing more. The node's ``kind`` (``PAPER_PDF`` or ``JATS_XML``) is derived
+from the artifact's own ``content_type``, never hardcoded -- see
+``_CONTENT_TYPE_TO_NODE_KIND``."""
 
 _POINT_ID = "p1"
+
+_NUMERIC_TOKEN_RE = re.compile(r"[0-9]*\.?[0-9]+(?:[eE][+-]?[0-9]+)?")
+"""Character class defining one "numeric token" for :func:`ground_quote`'s
+maximal-extent check: an optional integer part, an optional decimal point, a
+mandatory digit run, and an optional exponent suffix (``e``/``E`` with an
+optional sign). This governs ONLY where a numeric token STOPS -- a run of
+``[0-9]``, at most one ``.``, and at most one ``[eE][+-]?[0-9]+`` suffix all
+count as one token; anything else (a letter that isn't part of an exponent
+marker, whitespace, punctuation) ends it. Deliberate consequence: ``"1023"``
+grounded against ``"1023K"`` is accepted (``K`` is not numeric continuation,
+so ``"1023"`` IS the maximal token there) but ``"1023"`` grounded against
+``"11023"`` or ``"1023.5"`` or ``"0.51023"`` is rejected (in each case the
+match is an interior slice of a strictly larger numeric token). A quote that
+does not itself look like a numeric token (e.g. a unit or label quote such as
+``"mole fraction"``) is exempt from this check entirely -- it exists only to
+stop a numeral from silently grounding to a fragment of a bigger numeral."""
+
+
+def _quote_looks_numeric(quote: str) -> bool:
+    """True if ``quote`` itself matches :data:`_NUMERIC_TOKEN_RE` in full --
+    i.e. the caller is claiming a numeral, so the maximal-token check below
+    applies. A unit/label quote (``"K"``, ``"mole fraction"``) never matches
+    this and is left alone: the check exists to stop a numeral fragmenting a
+    larger numeral, not to constrain non-numeric quotes."""
+    match = _NUMERIC_TOKEN_RE.fullmatch(quote)
+    return match is not None
 
 # Mirrors carmel.schemas.datasets._HEALTHY_GLYPH_HEALTH (module-private there,
 # so restated rather than imported): MeasuredValue's own repair-chain
@@ -128,6 +174,43 @@ _CONTEXT_FREE_GLYPH_HEALTH = GlyphHealth(
     has_slash_c0_minus_marker=False,
     has_ascii6_uncertainty_marker=False,
 )
+
+
+#: Restated from :mod:`carmel.services.grounding`'s ``_PDF_EXTRACTOR_PREFIX``
+#: (module-private, so per this codebase's convention it is restated here
+#: rather than imported): the ``ExtractedText.extractor`` value recorded for
+#: text flattened out of a PDF's text layer, and therefore the one extractor
+#: family known to be subject to the dash-corruption quarantine rule.
+_PDF_EXTRACTOR_PREFIX = "pdf:pypdf"
+
+
+def _source_context_for(extracted: ExtractedText) -> SourceContext:
+    """The strict core's :class:`SourceContext` for text extracted into
+    ``extracted``. Mirrors :func:`carmel.services.grounding._source_context_for`
+    exactly: derived from ``extracted.extractor`` rather than hardcoded, so
+    only artifacts that actually came from a flattened PDF text layer are
+    ever subject to the dash-corruption quarantine rule.
+
+    P1-D: this producer's own :func:`_measured_value` used to normalize every
+    value quote under a HARDCODED ``SourceContext.OPERATOR_RAW`` plus a
+    hand-constructed always-healthy ``_CONTEXT_FREE_GLYPH_HEALTH`` --
+    regardless of what the artifact actually was or whether its text showed
+    any sign of corruption. That bypassed the exact quarantine
+    :mod:`carmel.services.grounding` enforces for suspect PDF text, so a
+    dash-corrupted bare-exponent value (e.g. ``"1023e5"`` where the source
+    PDF actually had an en-dash-separated range) could sail straight through
+    this producer while :func:`carmel.services.grounding` would have refused
+    it. This function and :func:`_document_glyph_health` below restore that
+    quarantine as an ADDITIONAL refusal-only canary check in
+    :func:`_measured_value` -- the value actually stored on
+    :class:`MeasuredValue` still comes from the OPERATOR_RAW/context-free
+    computation, because ``MeasuredValue``'s own pydantic validator
+    recomputes and requires exactly that computation's ``repairs``; this
+    canary can only ever ADD a refusal, never change what gets stored.
+    """
+    if extracted.extractor == _PDF_EXTRACTOR_PREFIX:
+        return SourceContext.FLAT_PDF_TEXT
+    return SourceContext.OPERATOR_RAW
 
 
 class QuoteGroundingError(ValueError):
@@ -214,6 +297,26 @@ def ground_quote(text: str, quote: str, *, occurrence: int | None = None) -> Cha
             )
         start = starts[occurrence]
     end = start + len(quote)
+    if _quote_looks_numeric(quote):
+        # P1-A: a numeral quote must ground to a MAXIMAL numeric token, never
+        # an interior slice of a strictly larger one -- e.g. quote "1023"
+        # must not silently accept the middle of "11023", "1023.5", or
+        # "0.51023". ``_NUMERIC_TOKEN_RE.finditer`` walks the text producing
+        # non-overlapping, greedily-maximal numeric tokens, so the token that
+        # contains our chosen ``start`` is, by construction, the largest
+        # numeral touching that position; if its span differs from
+        # ``(start, end)`` the quote is a fragment, not the whole numeral.
+        for match in _NUMERIC_TOKEN_RE.finditer(text):
+            if match.start() <= start < match.end():
+                if match.span() != (start, end):
+                    raise QuoteGroundingError(
+                        f"ground_quote: quote {display!r} is an interior fragment of the larger "
+                        f"numeral {text[match.start():match.end()]!r} (span "
+                        f"[{match.start()}:{match.end()}]) in the supplied text -- a grounded "
+                        "numeral span must be the MAXIMAL numeric token, never a slice of a "
+                        "bigger one; quote the full numeral if that is what is meant"
+                    )
+                break
     # Correctness self-check on this function's own arithmetic (an assert,
     # not a raise: user input was already validated above; this can only
     # fail if the search/slicing logic itself is wrong).
@@ -244,6 +347,22 @@ class MeasurementSpec:
     value_occurrence: int | None = None
     unit_occurrence: int | None = None
 
+    def __post_init__(self) -> None:
+        # A plain dataclass has no field validation of its own, and this one is
+        # slotted/frozen so nothing downstream re-checks its fields either. ``bool``
+        # is a subclass of ``int`` in Python, so a bare ``isinstance(x, int)`` check
+        # would silently accept ``True``/``False`` here as occurrence 1/0 -- almost
+        # certainly a caller typo (e.g. a stray boolean flag), never a real
+        # disambiguation intent -- so ``bool`` must be excluded explicitly.
+        for name in ("label_occurrence", "value_occurrence", "unit_occurrence"):
+            value = getattr(self, name)
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                raise DatasetProducerError(
+                    f"MeasurementSpec.{name}={value!r} must be an int or None, not "
+                    f"{type(value).__name__} -- bool is a subclass of int in Python and would "
+                    "silently mean occurrence 0/1"
+                )
+
 
 def _current_repair_dependency() -> SemanticDependencyUse:
     """The repair-dependency record for a value repaired by the CURRENT
@@ -256,16 +375,45 @@ def _current_repair_dependency() -> SemanticDependencyUse:
     )
 
 
-def _measured_value(text: str, spec: MeasurementSpec) -> MeasuredValue:
+def _measured_value(
+    text: str,
+    spec: MeasurementSpec,
+    *,
+    document_source_context: SourceContext,
+    document_glyph_health: GlyphHealth,
+) -> MeasuredValue:
     """Build one grounded :class:`MeasuredValue` from ``spec`` against ``text``.
 
     Every offset comes from :func:`ground_quote`; ``repairs`` and
     ``canonical_decimal_value`` are DERIVED from the value quote through the
     same ``normalize_numeric_span`` call the schema's own validator re-runs
     (see ``_CONTEXT_FREE_GLYPH_HEALTH``), never asserted independently.
+
+    P1-D: ``document_source_context``/``document_glyph_health`` (the artifact's
+    REAL context and glyph health, from :func:`_source_context_for` and
+    :func:`carmel.services.numeric.assess_glyph_health` against the actual
+    stored text -- see :func:`_source_context_for`'s docstring for why) are
+    used ONLY as an additional refusal-only canary call below, run BEFORE the
+    stored value is computed. It can only ever REFUSE a value the
+    context-free computation would have accepted; it never changes what gets
+    stored, because ``MeasuredValue``'s own validator requires the
+    context-free ``repairs`` exactly.
     """
     value_locator = ground_quote(text, spec.value_quote, occurrence=spec.value_occurrence)
     unit_locator = ground_quote(text, spec.unit_quote, occurrence=spec.unit_occurrence)
+    canary = normalize_numeric_span(
+        spec.value_quote,
+        source_context=document_source_context,
+        glyph_health=document_glyph_health,
+    )
+    if isinstance(canary, Unresolvable):
+        raise DatasetProducerError(
+            f"value quote {spec.value_quote!r} for axis {spec.axis_id!r} is refused under the "
+            f"document's REAL source context ({document_source_context!r}) and glyph health "
+            f"({document_glyph_health!r}): {canary.reason} -- this is the P1-D quarantine canary; "
+            "the value may be genuinely corrupt in this document even though it would parse fine "
+            "in isolation"
+        )
     normalized = normalize_numeric_span(
         spec.value_quote,
         source_context=SourceContext.OPERATOR_RAW,
@@ -304,11 +452,30 @@ def _measured_value(text: str, spec: MeasurementSpec) -> MeasuredValue:
     )
 
 
-def _load_verified_extracted_text(workspace_root: Path, sha256: str) -> tuple[ExtractedText, str, str | None]:
+#: Maps ``StoredArtifact.content_type`` to the :class:`SourceNodeKind` this
+#: producer's single root node may honestly claim to be. Only the two content
+#: types :func:`carmel.services.acquisition._sniff_content_type` actually
+#: emits for a primary document are recognised: ``"application/pdf"`` and
+#: ``"application/xml"`` (the latter used for JATS-style full-text XML;
+#: ``"text/xml"`` is included too since it is the same media type family and
+#: some sources serve it under that label). Anything else -- an HTML page, a
+#: plain-text scrape, an unrecognised type -- has no ``SourceNodeKind`` this
+#: producer may truthfully assert, so it is not in this table and must be
+#: refused rather than guessed.
+_CONTENT_TYPE_TO_NODE_KIND: dict[str, SourceNodeKind] = {
+    "application/pdf": SourceNodeKind.PAPER_PDF,
+    "application/xml": SourceNodeKind.JATS_XML,
+    "text/xml": SourceNodeKind.JATS_XML,
+}
+
+
+def _load_verified_extracted_text(
+    workspace_root: Path, sha256: str
+) -> tuple[ExtractedText, str, str | None, str]:
     """Resolve, verify, and parse the stored extraction for ``sha256``.
 
-    Returns ``(extracted, extracted_sha256, derivation_binding)``. The bytes
-    of ``extracted.json`` are read directly from disk and their digest is
+    Returns ``(extracted, extracted_sha256, derivation_binding, content_type)``.
+    The bytes of ``extracted.json`` are read directly from disk and their digest is
     compared against ``StoredArtifact.extracted_sha256`` BEFORE any parsing
     -- unverified bytes are never parsed. (``extracted_sha256`` really is the
     digest of those file bytes: ``evidence._write_all`` computes it as
@@ -322,11 +489,50 @@ def _load_verified_extracted_text(workspace_root: Path, sha256: str) -> tuple[Ex
     skips artifacts whose ``meta.json`` is unreadable (so "absent" and
     "present but corrupt" become indistinguishable), and validates nothing
     about the caller-supplied sha string.
+
+    P1-B: before this function existed, the producer verified ONLY
+    ``extracted.json`` (below) -- ``raw.bin`` and ``meta.json`` were never
+    checked at all. Two checks close that gap, both refusing with a message
+    naming exactly which one failed:
+
+    1. ``meta.sha256 == sha256``: ``load_artifact_meta`` resolves the store
+       directory purely from the ``sha256`` PARAMETER (via its own
+       sha-shape/containment validation) and does NOT cross-check that
+       parameter against the ``sha256`` FIELD recorded inside the loaded
+       ``meta.json`` -- so a ``meta.json`` whose ``sha256`` field disagrees
+       with the directory it lives in (e.g. hand-edited or copied from
+       elsewhere) would otherwise go undetected.
+    2. :func:`carmel.services.evidence.verify_artifact` with ``deep=False``:
+       confirms ``raw.bin`` exists and hashes to ``sha256`` (the parameter),
+       and that ``extracted.json`` matches its recorded digest (the same
+       check performed by hand below, but this call also covers ``raw.bin``,
+       which nothing here otherwise touches). ``deep=False`` deliberately:
+       ``deep=True`` additionally re-checks ``derivation_binding``, but it
+       FAILS CLOSED for any artifact missing ``derivation_binding`` /
+       ``extractor_version`` / ``extracted_sha256`` -- i.e. every legacy
+       artifact -- which would silently regress this producer's existing,
+       deliberate support for legacy artifacts (handled below via
+       ``AbsenceReason.UNKNOWN``). Consequence, flagged rather than
+       silently accepted: ``derivation_binding``'s own internal-consistency
+       guarantee (see ``StoredArtifact.derivation_binding``'s docstring) is
+       NOT independently re-verified by this producer for artifacts that do
+       carry it; only ``meta.json``'s presence, structure, and the
+       ``extracted.json``/``raw.bin`` digests it records are.
     """
     meta = load_artifact_meta(workspace_root, sha256)
     if meta is None:
         raise DatasetProducerError(
             f"no stored artifact found under sha256 {sha256!r} in this workspace's evidence store"
+        )
+    if meta.sha256 != sha256:
+        raise DatasetProducerError(
+            f"artifact meta.json at sha256 {sha256!r} records sha256={meta.sha256!r} internally -- "
+            "the two disagree, so this evidence directory is not trustworthy; refusing to use it"
+        )
+    if not verify_artifact(workspace_root, sha256, deep=False):
+        raise DatasetProducerError(
+            f"artifact {sha256!r} failed verify_artifact (raw.bin missing/corrupt, or extracted.json "
+            "does not match its recorded extracted_sha256); refusing to use unverified bytes"
         )
     if meta.extracted_sha256 is None:
         # A legacy artifact stored before extracted_sha256 existed carries no
@@ -355,7 +561,7 @@ def _load_verified_extracted_text(workspace_root: Path, sha256: str) -> tuple[Ex
         raise DatasetProducerError(
             f"artifact {sha256!r}: verified {_EXTRACTED_NAME} bytes do not parse as an ExtractedText: {exc}"
         ) from exc
-    return extracted, meta.extracted_sha256, meta.derivation_binding
+    return extracted, meta.extracted_sha256, meta.derivation_binding, meta.content_type
 
 
 def produce_envelope_from_artifact(
@@ -369,18 +575,38 @@ def produce_envelope_from_artifact(
     """Build a fully validated :class:`DatasetEnvelope` from ONE stored artifact.
 
     The vertical slice, end to end: resolve the artifact's metadata by its
-    raw-bytes sha256, re-read and digest-verify ``extracted.json``, parse it,
-    ground every caller-stated quote in the extracted text via
-    :func:`ground_quote`, and assemble one root ``PAPER_PDF`` node, one
-    ``TEXTUAL`` series, and one data point into an envelope that passes every
-    schema validator (construction runs pydantic's full validation -- nothing
-    here uses ``model_construct``).
+    raw-bytes sha256, verify ``raw.bin``/``meta.json``/``extracted.json``
+    (see :func:`_load_verified_extracted_text`), parse the verified
+    extraction, ground every caller-stated quote in the extracted text via
+    :func:`ground_quote`, and assemble one root node -- ``PAPER_PDF`` or
+    ``JATS_XML``, derived honestly from the artifact's own ``content_type``
+    (never hardcoded; an unrecognised ``content_type`` is refused, not
+    guessed) -- one ``TEXTUAL`` series, and one data point into an envelope
+    that passes every schema validator (construction runs pydantic's full
+    validation -- nothing here uses ``model_construct``).
 
     ``source_form`` is fixed at ``TEXTUAL``: a :class:`CharSpanLocator` into
     extracted running text is the only locator kind this runtime can actually
     produce (the round-33 ruling that added it), and it is what every span
     here is. ``value_origin`` is the caller's assertion, passed through --
     see :class:`ValueOrigin` for why the schema records it unverified.
+
+    WHAT GROUNDING DOES AND DOES NOT PROVE (P1-F, restated at the call site
+    that matters most): every ``value_ref``/``unit_ref``/``label_ref`` this
+    function emits is independently verified to be an exact, located
+    substring of the one verified document -- that is the entire guarantee.
+    It is NOT verified that the value, unit, and label for a given axis were
+    stated TOGETHER, in the same sentence, table row, or even the same
+    paragraph. A caller can supply ``value_quote="1023"`` from one part of
+    the paper and ``unit_quote="K"`` from an unrelated part, and this
+    function will happily ground both and produce a fully schema-valid
+    envelope asserting they belong together. Closing that gap needs a bounded
+    measurement-context notion (e.g. requiring value/unit/label quotes to
+    fall within one caller-supplied span) that does not exist yet -- it is
+    intentionally out of scope for this vertical slice and is its own future
+    milestone. See ``TestGroundingIsIndependentPerQuote`` in the test suite
+    for a pinning test of this exact gap: if it starts failing, this
+    paragraph is stale and must be updated (or removed) alongside the fix.
 
     Args:
         workspace_root: Root of the campaign workspace holding the evidence
@@ -410,8 +636,28 @@ def produce_envelope_from_artifact(
                 "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
             )
 
-    extracted, extracted_sha256, derivation_binding_raw = _load_verified_extracted_text(workspace_root, sha256)
+    extracted, extracted_sha256, derivation_binding_raw, content_type = _load_verified_extracted_text(
+        workspace_root, sha256
+    )
+    node_kind = _CONTENT_TYPE_TO_NODE_KIND.get(content_type)
+    if node_kind is None:
+        # P1-C: fail closed rather than guess. This producer's single root
+        # node must honestly claim what kind of document it is; a
+        # content_type this table does not recognise establishes nothing,
+        # so no SourceNodeKind may be asserted for it.
+        raise DatasetProducerError(
+            f"artifact {sha256!r} has content_type={content_type!r}, which does not map to any "
+            f"SourceNodeKind this producer may honestly assert (recognised: "
+            f"{sorted(_CONTENT_TYPE_TO_NODE_KIND)}); refusing to guess the document kind"
+        )
     text = extracted.text
+    # P1-D: the artifact's REAL source context and glyph health, derived the
+    # same way carmel.services.grounding derives them for the strict core --
+    # never hardcoded -- used below as an additional refusal-only canary in
+    # _measured_value. See _source_context_for's docstring for the full gap
+    # this closes.
+    document_source_context = _source_context_for(extracted)
+    document_glyph_health = assess_glyph_health(text)
     # CRITICAL: hash extracted.text (the field inside the verified, parsed
     # ExtractedText), NEVER text.txt on disk -- text.txt is presence-checked
     # only, never digest-checked (see ExtractionBinding.extracted_text_sha256's
@@ -433,7 +679,7 @@ def produce_envelope_from_artifact(
     )
     root_node = SourceNode(
         node_id=_ROOT_NODE_ID,
-        kind=SourceNodeKind.PAPER_PDF,
+        kind=node_kind,
         sha256=sha256,
         parent_node_id=None,
         origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
@@ -456,7 +702,12 @@ def produce_envelope_from_artifact(
                 label_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=label_locator),
             )
         )
-        value = _measured_value(text, spec)
+        value = _measured_value(
+            text,
+            spec,
+            document_source_context=document_source_context,
+            document_glyph_health=document_glyph_health,
+        )
         if spec.role is AxisRole.COORDINATE:
             coordinates.append(
                 Coordinate(
