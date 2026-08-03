@@ -33,6 +33,7 @@ from carmel.schemas.datasets import (
     MemberSheetKey,
     Observation,
     QuantityKind,
+    SemanticDependencyUse,
     Series,
     SourceForm,
     SourceGraph,
@@ -50,6 +51,7 @@ from carmel.schemas.datasets import (
     _check_source_form_for_ref,
 )
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1
 
 SHA_A = "a" * 64
@@ -61,6 +63,15 @@ _NOT_REPORTED = Absent(reason=AbsenceReason.NOT_REPORTED_HERE)
 every builder call that doesn't need a distinct reason is safe."""
 
 _NO_COMPOSITION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+
+_CURRENT_REPAIR_DEPENDENCY = SemanticDependencyUse(
+    dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+)
+"""Module-level singleton for MeasuredValue.repair_dependency -- frozen, so
+sharing one instance across every fixture that doesn't need a
+deliberately-wrong or superseded dependency record is safe."""
 
 
 def _embedded_table_v1() -> EmbeddedConversionTable:
@@ -170,6 +181,7 @@ def _amount(
         unit_normalized=unit_normalized,
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=value_ref if value_ref is not None else _table_ref(node_id, row=0, col=1),
         unit_ref=unit_ref if unit_ref is not None else _table_ref(node_id, row=0, col=2),
     )

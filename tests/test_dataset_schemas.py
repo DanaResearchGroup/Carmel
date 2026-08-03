@@ -4,6 +4,10 @@ and composition) for literature-extracted experimental kinetics datasets."""
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
+from types import MappingProxyType
+
 import pytest
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -23,6 +27,7 @@ from carmel.schemas.datasets import (
     Maybe,
     MeasuredValue,
     QuantityKind,
+    SemanticDependencyUse,
     SourceNode,
     SourceNodeKind,
     SourceRef,
@@ -33,7 +38,14 @@ from carmel.schemas.datasets import (
     UncertaintyScale,
     XPathLocator,
 )
+from carmel.services import semantic_deps
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.semantic_deps import (
+    CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    InputPolicy,
+    SemanticDependencyDefinition,
+    current_sha_for,
+)
 from carmel.services.units import TABLE_V1
 
 SHA_A = "a" * 64
@@ -85,6 +97,17 @@ def _table_ref(node_id: str = "n1", row: int = 0, col: int = 1) -> SourceRef:
     )
 
 
+_CURRENT_REPAIR_DEPENDENCY = SemanticDependencyUse(
+    dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+)
+"""Module-level singleton: the CURRENT ``carmel.numeric.context_free_span_repair``
+version, for every ``MeasuredValue`` fixture in this file that doesn't itself
+exercise ``repair_dependency`` -- SemanticDependencyUse is frozen, so sharing
+one instance is safe, mirroring the existing ``_NO_ORIGIN`` pattern above."""
+
+
 def _measured_value(
     raw_text: str = "1.20",
     canonical_decimal_value: str = "1.20",
@@ -93,6 +116,7 @@ def _measured_value(
     unit_normalized: str = "cm/s",
     conversion_table_sha256: str = TABLE_V1.sha256,
     repairs: tuple[str, ...] = (),
+    repair_dependency: SemanticDependencyUse = _CURRENT_REPAIR_DEPENDENCY,
 ) -> MeasuredValue:
     return MeasuredValue(
         raw_text=raw_text,
@@ -102,6 +126,7 @@ def _measured_value(
         unit_normalized=unit_normalized,
         conversion_table_sha256=conversion_table_sha256,
         repairs=repairs,
+        repair_dependency=repair_dependency,
         value_ref=_bbox_ref(),
         unit_ref=_table_ref(),
     )
@@ -119,6 +144,46 @@ def _mole_fraction_measured_value(raw_text: str = "0.04", canonical_decimal_valu
         unit_raw="-",
         unit_normalized="1",
     )
+
+
+@contextlib.contextmanager
+def _registered_extra_dependency(
+    definition: SemanticDependencyDefinition, *, make_current: bool = False
+) -> Iterator[SemanticDependencyDefinition]:
+    """Temporarily registers ``definition`` into
+    semantic_deps.DEPENDENCIES_BY_SHA (and, if ``make_current``, also into
+    semantic_deps.CURRENT_SHA_BY_DEPENDENCY_ID for its dependency_id) for the
+    duration of the `with` block, then restores both original mappings
+    unconditionally -- mirrors _registered_second_table() in
+    test_dataset_graph_and_envelope.py exactly, for the same reason: a
+    SemanticDependencyUse is validated (via semantic_deps.dependency_for_sha)
+    against "every dependency this module knows about", so there is
+    deliberately no way to construct one citing a content_sha256 the shipped
+    registry does not recognize. Exercising the superseded-registry branch of
+    MeasuredValue._validate_repair_chain_agrees_with_raw_text, or the
+    dependency_id-mismatch branch of its own field_validator, requires a
+    SECOND genuinely-registered dependency entry that this test process would
+    otherwise have no way to produce.
+
+    ``dependency_for_sha``/``current_sha_for`` resolve their registries as
+    plain module globals at call time, so reassigning the attributes on the
+    imported ``semantic_deps`` module object here is visible to them for the
+    lifetime of this context manager -- this mutates test-process state only,
+    never carmel/'s source, and is restored before the block exits."""
+    original_by_sha = semantic_deps.DEPENDENCIES_BY_SHA
+    original_current = semantic_deps.CURRENT_SHA_BY_DEPENDENCY_ID
+    semantic_deps.DEPENDENCIES_BY_SHA = MappingProxyType(
+        {**original_by_sha, definition.content_sha256: definition}
+    )
+    if make_current:
+        semantic_deps.CURRENT_SHA_BY_DEPENDENCY_ID = MappingProxyType(
+            {**original_current, definition.dependency_id: definition.content_sha256}
+        )
+    try:
+        yield definition
+    finally:
+        semantic_deps.DEPENDENCIES_BY_SHA = original_by_sha
+        semantic_deps.CURRENT_SHA_BY_DEPENDENCY_ID = original_current
 
 
 class TestBBoxCrossesStoreBoundary:
@@ -424,6 +489,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 unit_ref=_table_ref(),
             )  # type: ignore[call-arg]
 
@@ -436,6 +502,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
             )  # type: ignore[call-arg]
 
@@ -457,6 +524,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -474,6 +542,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -487,6 +556,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -500,6 +570,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -513,6 +584,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
             )
@@ -525,6 +597,7 @@ class TestMeasuredValue:
             unit_raw="cm/s",
             unit_normalized="cm/s",
             conversion_table_sha256=TABLE_V1.sha256,
+            repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
             value_ref=_bbox_ref(),
             unit_ref=_table_ref(),
         )
@@ -535,6 +608,7 @@ class TestMeasuredValue:
             unit_raw="cm/s",
             unit_normalized="cm/s",
             conversion_table_sha256=TABLE_V1.sha256,
+            repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
             value_ref=_bbox_ref(),
             unit_ref=_table_ref(),
         )
@@ -751,6 +825,7 @@ class TestMeasuredValue:
                 unit_raw="cm/s",
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref(),
                 unit_ref=_table_ref(),
                 surprise="y",
@@ -783,6 +858,169 @@ class TestMeasuredValue:
     # in the migration report rather than silently dropped.
 
 
+class TestSemanticDependencyUse:
+    """SemanticDependencyUse is what closes the defect this commit exists
+    for: a MeasuredValue.repairs claim now cites WHICH version of the repair
+    heuristic produced it, rather than being re-validated against "whatever
+    normalize_numeric_span does today" with no version identity at all. Each
+    of its three validators gets a positive and a negative case here."""
+
+    def test_construction_with_the_current_dependency_succeeds(self) -> None:
+        use = SemanticDependencyUse(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+            input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+        assert use.dependency_id == CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID
+
+    def test_unknown_content_sha256_is_rejected(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            SemanticDependencyUse(
+                dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                content_sha256="f" * 64,
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+        message = str(excinfo.value)
+        assert "does not name any known semantic dependency" in message
+        assert "never against 'the current dependency'" in message
+
+    def test_dependency_id_disagreeing_with_the_resolved_sha_is_rejected(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            SemanticDependencyUse(
+                dependency_id="carmel.numeric.some_other_heuristic",
+                content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+        message = str(excinfo.value)
+        assert "disagrees with the dependency that" in message
+        assert "is a forgery attempt, not a typo, and is rejected as such" in message
+
+    def test_input_sha256_present_when_policy_requires_absent_is_rejected(self) -> None:
+        """The one seeded dependency's input_policy is SIBLING_FIELD, which
+        requires input_sha256 to be Absent -- a present value must be
+        rejected."""
+        with pytest.raises(ValidationError) as excinfo:
+            SemanticDependencyUse(
+                dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                input_sha256="e" * 64,
+            )
+        message = str(excinfo.value)
+        assert "input_policy is 'sibling_field'" in message
+        assert "input_sha256 must be" in message
+
+    def test_input_sha256_absent_when_policy_requires_present_is_rejected(self) -> None:
+        extra = SemanticDependencyDefinition(
+            dependency_id="carmel.numeric.an_external_digest_heuristic",
+            content_sha256="a" * 64,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        )
+        with _registered_extra_dependency(extra), pytest.raises(ValidationError) as excinfo:
+            SemanticDependencyUse(
+                dependency_id=extra.dependency_id,
+                content_sha256=extra.content_sha256,
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+        message = str(excinfo.value)
+        assert "input_policy is EXTERNAL_DIGEST_REQUIRED, so input_sha256 must be present" in message
+
+    def test_input_sha256_present_when_policy_requires_present_succeeds(self) -> None:
+        extra = SemanticDependencyDefinition(
+            dependency_id="carmel.numeric.an_external_digest_heuristic",
+            content_sha256="a" * 64,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        )
+        with _registered_extra_dependency(extra):
+            use = SemanticDependencyUse(
+                dependency_id=extra.dependency_id,
+                content_sha256=extra.content_sha256,
+                input_sha256="e" * 64,
+            )
+        assert use.input_sha256 == "e" * 64
+
+    def test_rejects_extra_fields(self) -> None:
+        with pytest.raises(ValidationError):
+            SemanticDependencyUse(
+                dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                surprise="y",
+            )  # type: ignore[call-arg]
+
+
+class TestMeasuredValueRepairDependency:
+    """MeasuredValue.repair_dependency is the required field that closes the
+    defect: repairs is now validated against the SPECIFIC dependency version
+    it names, never silently re-validated against "whatever the current code
+    does" nor silently accepted without re-running when it does agree."""
+
+    def test_omitted_repair_dependency_is_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            MeasuredValue(
+                raw_text="1.20",
+                canonical_decimal_value="1.20",
+                quantity_kind=QuantityKind.VELOCITY,
+                unit_raw="cm/s",
+                unit_normalized="cm/s",
+                conversion_table_sha256=TABLE_V1.sha256,
+                value_ref=_bbox_ref(),
+                unit_ref=_table_ref(),
+            )  # type: ignore[call-arg]
+
+    def test_repair_dependency_naming_a_different_dependency_id_is_rejected(self) -> None:
+        extra = SemanticDependencyDefinition(
+            dependency_id="carmel.numeric.some_other_heuristic",
+            content_sha256="b" * 64,
+            input_policy=InputPolicy.SIBLING_FIELD,
+            is_current=True,
+        )
+        with _registered_extra_dependency(extra, make_current=True):
+            other_use = SemanticDependencyUse(
+                dependency_id=extra.dependency_id,
+                content_sha256=extra.content_sha256,
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+            with pytest.raises(ValidationError) as excinfo:
+                _measured_value(repair_dependency=other_use)
+        message = str(excinfo.value)
+        assert "is not the repair heuristic this validator chain re-runs" in message
+        assert "must name exactly the one dependency its own repair-chain validator knows how to re-run" in message
+
+    def test_registered_but_superseded_repair_dependency_is_rejected_outright(self) -> None:
+        """A repair_dependency whose content_sha256 resolves (registry-wise)
+        but is no longer CURRENT must be rejected outright -- there is no
+        "re-run the current heuristic anyway" fallback and no "accept
+        without re-running" path."""
+        superseded = SemanticDependencyDefinition(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256="c" * 64,
+            input_policy=InputPolicy.SIBLING_FIELD,
+            is_current=False,
+        )
+        with _registered_extra_dependency(superseded, make_current=False):
+            superseded_use = SemanticDependencyUse(
+                dependency_id=superseded.dependency_id,
+                content_sha256=superseded.content_sha256,
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+            with pytest.raises(ValidationError) as excinfo:
+                _measured_value(repair_dependency=superseded_use)
+        message = str(excinfo.value)
+        assert "registered but SUPERSEDED version of" in message
+        assert "no 'accept without re-running' path" in message
+
+    def test_current_repair_dependency_with_wrong_repairs_is_still_rejected(self) -> None:
+        """The unchanged/current-sha branch must still run the full
+        repair-chain check -- citing the current dependency is not itself
+        sufficient to bypass the repairs-agrees-with-raw_text validation."""
+        with pytest.raises(ValidationError) as excinfo:
+            _measured_value(raw_text="/C0 1.0", canonical_decimal_value="-1.0", repairs=())
+        message = str(excinfo.value)
+        assert "disagrees with the repair(s)" in message
+
+
 def _uncertainty_measured_value(
     raw_text: str,
     quantity_kind: QuantityKind = QuantityKind.RELATIVE_UNCERTAINTY,
@@ -798,6 +1036,7 @@ def _uncertainty_measured_value(
         unit_raw=unit_raw,
         unit_normalized=unit_normalized,
         conversion_table_sha256=conversion_table_sha256,
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=_bbox_ref(node_id=node_id),
         unit_ref=_table_ref(node_id=node_id),
     )

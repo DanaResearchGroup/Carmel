@@ -87,6 +87,13 @@ from carmel.services.numeric import (
     Unresolvable,
     normalize_numeric_span,
 )
+from carmel.services.semantic_deps import (
+    CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    InputPolicy,
+    UnknownSemanticDependencyError,
+    current_sha_for,
+    dependency_for_sha,
+)
 from carmel.services.units import QuantityKind
 
 __all__ = [
@@ -113,6 +120,7 @@ __all__ = [
     "MemberSheetKey",
     "Observation",
     "QuantityKind",
+    "SemanticDependencyUse",
     "Series",
     "SourceForm",
     "SourceGraph",
@@ -879,6 +887,112 @@ class SourceGraph(BaseModel):
         return tuple(chain)
 
 
+class SemanticDependencyUse(BaseModel):
+    """A RECORD that a specific :class:`~carmel.services.semantic_deps.SemanticDependencyDefinition`
+    was applied to produce some other field on the record that embeds this one.
+
+    This is deliberately NOT the same thing as
+    :class:`~carmel.services.semantic_deps.SemanticDependencyDefinition` itself.
+    That class (in the services layer, a frozen stdlib dataclass) names WHAT a
+    versioned heuristic IS -- one entry per historical code version, living in
+    an append-only registry. This class instead records THIS APPLICATION of
+    that heuristic to a specific input -- e.g. "this particular
+    ``MeasuredValue.repairs`` was produced by running
+    ``carmel.numeric.context_free_span_repair`` at content address
+    ``content_sha256``." Conflating the two would make it impossible to tell
+    "the logic exists" from "the logic was actually run to produce this
+    field," which is exactly the gap this model closes.
+
+    ``content_sha256`` is validated against
+    :func:`~carmel.services.semantic_deps.dependency_for_sha`'s registry --
+    never against "the current version of the dependency" -- mirroring
+    :meth:`MeasuredValue._validate_unit_normalization_against_the_recorded_table`'s
+    own framing: a ``SemanticDependencyUse`` is validated against the
+    dependency version it RECORDS, and an unresolvable ``content_sha256`` is
+    refused rather than silently re-interpreted against whatever dependency
+    happens to be current today.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    dependency_id: str = Field(min_length=1)
+    """The stable slug naming WHAT dependency this is (see
+    :attr:`~carmel.services.semantic_deps.SemanticDependencyDefinition.dependency_id`).
+    Enforced below to equal the RESOLVED definition's own ``dependency_id`` --
+    an attacker (or a typo) supplying a ``content_sha256`` that resolves to
+    one dependency while claiming a different ``dependency_id`` is a forgery
+    attempt, not a harmless inconsistency, and is rejected as such."""
+    content_sha256: str = Field(min_length=1)
+    """The content address of the EXACT dependency version that was applied.
+    Must resolve via :func:`~carmel.services.semantic_deps.dependency_for_sha`;
+    an unresolvable value is refused rather than silently accepted, exactly
+    like :attr:`MeasuredValue.conversion_table_sha256`."""
+    input_sha256: Maybe[str]
+    """The digest of the external input the dependency was applied to, when
+    the resolved dependency's ``input_policy`` is
+    :attr:`~carmel.services.semantic_deps.InputPolicy.EXTERNAL_DIGEST_REQUIRED`.
+    Enforced below to be present if and only if the resolved dependency's
+    ``input_policy`` demands it -- never a free-floating optional field whose
+    presence is left to the caller's discretion."""
+
+    @field_validator("input_sha256")
+    @classmethod
+    def _validate_input_sha256_shape(cls, value: Maybe[str]) -> Maybe[str]:
+        if isinstance(value, Absent):
+            return value
+        if not _SHA256_RE.match(value):
+            raise ValueError(f"invalid input_sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_against_the_resolved_dependency(self) -> SemanticDependencyUse:
+        """Resolve ``content_sha256`` once and check every cross-field invariant against it.
+
+        Three distinct checks share a single ``dependency_for_sha`` lookup
+        (rather than three separate model validators each re-resolving it)
+        because the registry lookup is monkeypatched in tests -- three
+        independent lookups could observe three different registry states if
+        anything ever mutated the registry mid-validation, so resolving once
+        and reusing the result is the only way to guarantee all three checks
+        agree on what ``content_sha256`` actually names.
+        """
+        try:
+            definition = dependency_for_sha(self.content_sha256)
+        except UnknownSemanticDependencyError as exc:
+            raise ValueError(
+                f"content_sha256={self.content_sha256!r} does not name any known semantic "
+                "dependency; a SemanticDependencyUse is validated against the dependency "
+                "version it RECORDS, never against 'the current dependency', so an "
+                f"unresolvable sha is refused rather than silently re-interpreted: {exc}"
+            ) from exc
+
+        if self.dependency_id != definition.dependency_id:
+            raise ValueError(
+                f"dependency_id={self.dependency_id!r} disagrees with the dependency that "
+                f"content_sha256={self.content_sha256!r} actually resolves to "
+                f"(dependency_id={definition.dependency_id!r}); a SemanticDependencyUse whose "
+                "dependency_id does not match its own content_sha256 is a forgery attempt, "
+                "not a typo, and is rejected as such"
+            )
+
+        is_present = not isinstance(self.input_sha256, Absent)
+        if definition.input_policy is InputPolicy.EXTERNAL_DIGEST_REQUIRED:
+            if not is_present:
+                raise ValueError(
+                    f"content_sha256={self.content_sha256!r} resolves to a dependency whose "
+                    "input_policy is EXTERNAL_DIGEST_REQUIRED, so input_sha256 must be present; "
+                    "got Absent"
+                )
+        else:
+            if is_present:
+                raise ValueError(
+                    f"content_sha256={self.content_sha256!r} resolves to a dependency whose "
+                    f"input_policy is {definition.input_policy.value!r}, so input_sha256 must be "
+                    f"Absent; got a present value {self.input_sha256!r}"
+                )
+        return self
+
+
 class MeasuredValue(BaseModel):
     """A single numeric fact, bound to its unit with independently-verifiable provenance.
 
@@ -998,6 +1112,18 @@ class MeasuredValue(BaseModel):
     about the evidence that must be EXACTLY true -- validated below against
     what :func:`~carmel.services.numeric.normalize_numeric_span` itself
     reports needing, in the same order."""
+    repair_dependency: SemanticDependencyUse
+    """WHICH version of the repair heuristic produced ``repairs``. Required,
+    no default: this closes the defect where a stored ``MeasuredValue``
+    recorded no version identity for the heuristic that produced its
+    ``repairs``, so a future change to :mod:`carmel.services.numeric`'s
+    regex/logic would make old, correctly-recorded data fail validation
+    indistinguishably from forged data. Enforced below to name exactly
+    :data:`~carmel.services.semantic_deps.CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID`
+    -- the only repair heuristic this validator chain re-runs -- and its
+    ``content_sha256`` is what the repair-chain validator below compares
+    against the CURRENT sha to decide whether it may re-run the heuristic at
+    all."""
     quantity_kind: QuantityKind
     """Which physical (or dimensionless-bookkeeping) quantity this value
     measures. Required, no default: a unit pair alone does not identify a
@@ -1050,6 +1176,20 @@ class MeasuredValue(BaseModel):
                 )
         return value
 
+    @field_validator("repair_dependency")
+    @classmethod
+    def _validate_repair_dependency_names_the_context_free_span_repair(
+        cls, value: SemanticDependencyUse
+    ) -> SemanticDependencyUse:
+        if value.dependency_id != CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID:
+            raise ValueError(
+                f"repair_dependency.dependency_id={value.dependency_id!r} is not the repair "
+                f"heuristic this validator chain re-runs ({CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID!r}); "
+                "a MeasuredValue's repair_dependency must name exactly the one dependency its own "
+                "repair-chain validator knows how to re-run"
+            )
+        return value
+
     @model_validator(mode="after")
     def _validate_repair_chain_agrees_with_raw_text(self) -> MeasuredValue:
         """Reject a ``repairs``/``canonical_decimal_value`` pair that disagrees
@@ -1059,10 +1199,22 @@ class MeasuredValue(BaseModel):
         == canonical_decimal_value``) that could never represent a repaired
         value -- see the class docstring for why that was wrong for this
         corpus. This validator checks the REPAIR CHAIN instead of string
-        equality:
+        equality, but ONLY when ``repair_dependency`` names the CURRENT
+        version of the heuristic:
 
-        1. ``raw_text`` must itself be derivable at all (rejects with the
-           core's own reason if not).
+        0. If ``repair_dependency.content_sha256`` is not the CURRENT sha for
+           :data:`~carmel.services.semantic_deps.CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID`,
+           this record names a REGISTERED-BUT-SUPERSEDED version of the
+           heuristic. There is no runnable validator for a superseded
+           version, so this validator refuses to re-run the CURRENT
+           heuristic against a record that does not claim to have used it --
+           doing so would silently re-interpret old data against logic it was
+           never produced by, exactly the failure mode
+           :mod:`carmel.services.semantic_deps` exists to prevent. There is
+           NO "accept without re-running" middle path: a superseded record is
+           rejected outright, never silently passed through.
+        1. Otherwise (current version), ``raw_text`` must itself be
+           derivable at all (rejects with the core's own reason if not).
         2. ``repairs`` must be an EXACT, ORDERED match for what
            :func:`~carmel.services.numeric.normalize_numeric_span` reports
            needing -- both under-claiming (a repair happened but was not
@@ -1071,7 +1223,23 @@ class MeasuredValue(BaseModel):
         3. ``canonical_decimal_value`` must be exactly
            ``canonical_decimal`` of the REPAIRED text -- never asserted
            independently.
+
+        (An unresolvable ``repair_dependency.content_sha256`` never reaches
+        this validator at all: it is rejected by ``SemanticDependencyUse``'s
+        own validator during construction of the nested model, which
+        completes -- including any raising -- before this outer model's own
+        ``model_validator``s run.)
         """
+        current_sha = current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID)
+        if self.repair_dependency.content_sha256 != current_sha:
+            raise ValueError(
+                f"repair_dependency.content_sha256={self.repair_dependency.content_sha256!r} names a "
+                f"registered but SUPERSEDED version of {CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID!r} "
+                f"(current content_sha256 is {current_sha!r}); no runnable validator is registered for "
+                "a superseded version, so this record cannot be re-validated by re-running the CURRENT "
+                "heuristic against it -- there is no 'accept without re-running' path, so it is rejected "
+                "outright rather than silently passed through"
+            )
         normalized = normalize_numeric_span(
             self.raw_text,
             source_context=SourceContext.OPERATOR_RAW,
@@ -2438,11 +2606,20 @@ def _source_graph_identity_payload(graph: SourceGraph) -> dict[str, Any]:
     return {"nodes": [_source_node_identity_payload(node) for node in graph.nodes]}
 
 
+def _semantic_dependency_use_identity_payload(use: SemanticDependencyUse) -> dict[str, Any]:
+    return {
+        "dependency_id": use.dependency_id,
+        "content_sha256": use.content_sha256,
+        "input_sha256": _project_maybe(use.input_sha256),
+    }
+
+
 def _measured_value_identity_payload(value: MeasuredValue) -> dict[str, Any]:
     return {
         "raw_text": value.raw_text,
         "canonical_decimal_value": value.canonical_decimal_value,
         "repairs": list(value.repairs),
+        "repair_dependency": _semantic_dependency_use_identity_payload(value.repair_dependency),
         "quantity_kind": value.quantity_kind.value,
         "unit_raw": value.unit_raw,
         "unit_normalized": value.unit_normalized,
@@ -2550,10 +2727,11 @@ _UNADDRESSED_FIELDS: Mapping[tuple[str, str], str] = {
 Every OTHER field of every pydantic model reachable from
 :class:`DatasetEnvelope` (``SourceGraph``, ``SourceNode``, ``ArchiveOrigin``,
 ``SourceRef`` and its locator/table-key discriminated-union arms, ``BBox``,
-``CoordinateFrame``, ``MeasuredValue``, ``Uncertainty``, ``Composition``,
-``CompositionComponent``, ``Series``, ``AxisDeclaration``, ``Coordinate``,
-``Observation``, ``DataPoint``, ``EmbeddedConversionTable``, and ``Absent``
-itself) is projected by one of the ``_*_identity_payload`` helpers above.
+``CoordinateFrame``, ``MeasuredValue``, ``SemanticDependencyUse``,
+``Uncertainty``, ``Composition``, ``CompositionComponent``, ``Series``,
+``AxisDeclaration``, ``Coordinate``, ``Observation``, ``DataPoint``,
+``EmbeddedConversionTable``, and ``Absent`` itself) is projected by one of
+the ``_*_identity_payload`` helpers above.
 This registry exists so that a
 FUTURE field added to any of those models and left unprojected is caught
 by

@@ -47,6 +47,7 @@ from carmel.schemas.datasets import (
     MemberSheetKey,
     Observation,
     QuantityKind,
+    SemanticDependencyUse,
     Series,
     SourceForm,
     SourceGraph,
@@ -66,6 +67,7 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import units
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1, ConversionTable, IdentityRule
 
 SHA_A = "a" * 64
@@ -92,6 +94,15 @@ _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 so sharing one instance across every _node() call that doesn't need a
 concrete ArchiveOrigin is safe, and avoids a function-call-in-argument-default
 (ruff B008)."""
+
+_CURRENT_REPAIR_DEPENDENCY = SemanticDependencyUse(
+    dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+)
+"""Module-level singleton for MeasuredValue.repair_dependency -- frozen, so
+sharing one instance across every fixture that doesn't need a
+deliberately-wrong or superseded dependency record is safe."""
 
 
 def _frame(**kwargs: object) -> CoordinateFrame:
@@ -150,6 +161,7 @@ def _mole_fraction_amount(value_ref: SourceRef, unit_ref: SourceRef, raw_text: s
         unit_normalized="1",
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=value_ref,
         unit_ref=unit_ref,
     )
@@ -164,6 +176,7 @@ def _equivalence_ratio_amount(value_ref: SourceRef, unit_ref: SourceRef, raw_tex
         unit_normalized="1",
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=value_ref,
         unit_ref=unit_ref,
     )
@@ -178,6 +191,7 @@ def _velocity_amount(value_ref: SourceRef, unit_ref: SourceRef, raw_text: str = 
         unit_normalized="cm/s",
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=value_ref,
         unit_ref=unit_ref,
     )
@@ -273,6 +287,7 @@ def _uncertainty(value_ref: SourceRef, unit_ref: SourceRef, quantity_kind: Quant
             unit_normalized=unit_normalized,
             conversion_table_sha256=TABLE_V1.sha256,
             repairs=(),
+            repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
             value_ref=_table_ref(value_ref.node_id, row=row, col=0),
             unit_ref=_table_ref(unit_ref.node_id, row=row, col=1),
         )
@@ -324,6 +339,7 @@ def _fully_populated_series(node_id: str = "paper") -> Series:
         unit_normalized="K",
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=_table_ref(node_id, row=11, col=0),
         unit_ref=_table_ref(node_id, row=11, col=1),
     )
@@ -355,6 +371,7 @@ def _fully_populated_series(node_id: str = "paper") -> Series:
         unit_normalized="cm/s",
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=_table_ref(node_id, row=21, col=0),
         unit_ref=_table_ref(node_id, row=21, col=1),
     )
@@ -537,6 +554,7 @@ def _mole_fraction_amount_citing(
         unit_normalized="1",
         conversion_table_sha256=conversion_table_sha256,
         repairs=(),
+        repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
         value_ref=value_ref,
         unit_ref=unit_ref,
     )
@@ -1099,6 +1117,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 unit_normalized="cm/s",
                 conversion_table_sha256=TABLE_V1.sha256,
                 repairs=(),
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
                 value_ref=_bbox_ref("crop"),
                 unit_ref=_bbox_ref("crop"),
             ),
