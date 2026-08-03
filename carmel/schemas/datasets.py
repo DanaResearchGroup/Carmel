@@ -710,12 +710,30 @@ class SourceNode(BaseModel):
         return value
 
 
+class TextSpace(StrEnum):
+    """Which string a :class:`CharSpanLocator`'s offsets index into.
+
+    Exactly one member today. :class:`~carmel.agents.tools.extract.ExtractedText`
+    carries BOTH a ``text`` and a ``normalized`` string
+    (``carmel/agents/tools/extract.py:143``), and the grounding gate
+    deliberately matches in NORMALIZED space but then maps the offsets it
+    RECORDS back to RAW ``text`` indices (``carmel/services/grounding.py``,
+    ``carmel/services/literature.py:985``). Offsets into the wrong one of
+    those two strings are silently, invisibly wrong -- same character count,
+    different characters at each index -- so the space a locator's offsets
+    index into is named explicitly here rather than assumed.
+    """
+
+    EXTRACTED_TEXT = "extracted_text"
+
+
 class LocatorKind(StrEnum):
     """Discriminator for :data:`SourceLocator`."""
 
     BBOX = "bbox"
     TABLE_CELL = "table_cell"
     XPATH = "xpath"
+    CHAR_SPAN = "char_span"
 
 
 class BBoxLocator(BaseModel):
@@ -794,8 +812,66 @@ class XPathLocator(BaseModel):
     xpath: str = Field(min_length=1)
 
 
+class CharSpanLocator(BaseModel):
+    """Locates a reference by a half-open character span ``[start, end)``
+    into a node's extracted text.
+
+    This is the ONE positional primitive the shipped pipeline actually
+    emits: nothing in this codebase renders a page (so no
+    :class:`CoordinateFrame` a :class:`BBoxLocator` could honestly cite),
+    the pypdf text extractor emits no table cells, and XPath is JATS-only
+    while the corpus is PDFs. A character offset into
+    ``EvidenceRef.quote_start``/``quote_end``
+    (``carmel/schemas/literature.py:244-246``, populated at
+    ``carmel/services/literature.py:985``) is the locator that names what
+    the runtime can actually produce AND what a replayer can actually
+    verify: re-extract, check the text digest, slice ``text[start:end]``,
+    compare.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[LocatorKind.CHAR_SPAN] = LocatorKind.CHAR_SPAN
+    text_space: TextSpace
+    """Which string ``start``/``end`` index into -- see :class:`TextSpace`.
+
+    DELIBERATELY HAS NO DEFAULT, like every other field in this module for
+    which "the producer forgot to say" and "the producer positively meant
+    this" must stay distinguishable (see
+    :attr:`ExtractionBinding.derivation_binding`'s docstring for the same
+    argument made at length). :class:`TextSpace` has exactly one member
+    today, so no caller can choose WRONG -- but a default would mean that
+    once a second space is added, every producer that simply forgot to say
+    which space it meant would be silently recorded as having POSITIVELY
+    CLAIMED ``extracted_text``. Requiring the value now, while there is
+    only one honest answer, costs nothing; it is the only way to make a
+    future omission a loud crash instead of a silent misattribution.
+    """
+    start: int = Field(ge=0)
+    """Inclusive start offset into the named text space."""
+    end: int = Field(ge=0)
+    """Exclusive end offset into the named text space."""
+
+    @model_validator(mode="after")
+    def _validate_span_nonempty(self) -> CharSpanLocator:
+        """The span is HALF-OPEN ``[start, end)`` over the named text
+        space, matching Python slicing and :attr:`TextSection.start`/
+        :attr:`TextSection.end`. ``end == start`` locates zero characters
+        and so cannot ground anything; ``end < start`` locates nothing at
+        all (a reversed range). Both are rejected -- only a positive-width
+        span is a locator that could ever verify against real text.
+        """
+        if self.end <= self.start:
+            raise ValueError(
+                f"CharSpanLocator: end={self.end!r} must be strictly greater than start={self.start!r} -- "
+                "the span [start, end) is half-open, so end == start locates zero characters and "
+                "end < start locates nothing at all"
+            )
+        return self
+
+
 SourceLocator = Annotated[
-    BBoxLocator | TableCellLocator | XPathLocator,
+    BBoxLocator | TableCellLocator | XPathLocator | CharSpanLocator,
     Field(discriminator="kind"),
 ]
 
@@ -2720,6 +2796,9 @@ _LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]
     LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
     LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
     LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML}),
+    LocatorKind.CHAR_SPAN: frozenset(
+        {SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}
+    ),
 }
 """Which :class:`SourceNodeKind`\\ s a given :class:`LocatorKind` may target.
 
@@ -2738,9 +2817,15 @@ box only makes sense against something that was actually RENDERED to a page
 (a PDF, an SI member that is itself a rendered document, or a figure crop);
 a table cell locator makes sense against anything that can carry a table (a
 PDF, JATS/XML, or an SI spreadsheet member) but not a figure crop, which has
-no tabular structure of its own. Which ARCHIVE a node was extracted from is
-not a locator concern at all -- see :class:`ArchiveOrigin` on
-:class:`SourceNode` -- so no ``LocatorKind`` addresses that here.
+no tabular structure of its own. A ``CharSpanLocator`` addresses the node's
+EXTRACTED TEXT, so it may target any node kind that has one -- a PDF, a
+JATS/XML document, or an SI member all get text extracted from them.
+``FIGURE_CROP`` is deliberately excluded from that row: a figure crop is an
+image region, and this project stores no OCR output or extracted text for
+one, so a character offset into it would address nothing that exists. Which
+ARCHIVE a node was extracted from is not a locator concern at all -- see
+:class:`ArchiveOrigin` on :class:`SourceNode` -- so no ``LocatorKind``
+addresses that here.
 """
 
 assert set(_LOCATOR_KIND_COMPATIBLE_NODE_KINDS) == set(LocatorKind), (
@@ -2848,7 +2933,7 @@ def _table_key_identity_payload(table_key: CaptionLabelKey | MemberSheetKey) -> 
 
 
 def _source_locator_identity_payload(
-    locator: BBoxLocator | TableCellLocator | XPathLocator,
+    locator: BBoxLocator | TableCellLocator | XPathLocator | CharSpanLocator,
 ) -> dict[str, Any]:
     if isinstance(locator, BBoxLocator):
         return {"kind": locator.kind.value, "bbox": _bbox_identity_payload(locator.bbox)}
@@ -2861,6 +2946,13 @@ def _source_locator_identity_payload(
         }
     if isinstance(locator, XPathLocator):
         return {"kind": locator.kind.value, "xpath": locator.xpath}
+    if isinstance(locator, CharSpanLocator):
+        return {
+            "kind": locator.kind.value,
+            "text_space": locator.text_space.value,
+            "start": locator.start,
+            "end": locator.end,
+        }
     raise TypeError(f"_source_locator_identity_payload: unhandled SourceLocator variant {locator!r}")
 
 
@@ -3336,6 +3428,37 @@ class DatasetEnvelope(BaseModel):
                         f"{table_key_kind.value!r} may only target nodes of kind "
                         f"{sorted(kind.value for kind in compatible_table_key_kinds)!r}"
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_char_span_requires_extraction(self) -> DatasetEnvelope:
+        """V6: a :class:`CharSpanLocator` addresses a node's EXTRACTED TEXT,
+        so its target node must actually HAVE one -- i.e.
+        ``SourceNode.extraction`` must be present, not :class:`Absent`.
+
+        Runs AFTER V1 (``_validate_refs_resolve``, declaration order), so
+        every ``ref.node_id`` looked up here via ``self.source_graph.node``
+        is already known to resolve.
+
+        This rule is scoped to ``CHAR_SPAN`` ONLY -- it is deliberately NOT
+        generalised to the other three locator kinds. A ``BBoxLocator``
+        addresses the node's RENDERED RAW bytes, an ``XPathLocator``
+        addresses its RAW XML, and a ``TableCellLocator`` addresses the
+        document's own table structure; none of those three is a claim
+        about extracted text, so requiring ``extraction`` for them would
+        reject legitimate graphs (e.g. a bounding box against a PDF that was
+        never text-extracted at all is still a real, verifiable locator).
+        """
+        for path, ref in iter_source_refs(self):
+            if not isinstance(ref.locator, CharSpanLocator):
+                continue
+            node = self.source_graph.node(ref.node_id)
+            if isinstance(node.extraction, Absent):
+                raise ValueError(
+                    f"SourceRef at {path!r} uses a CharSpanLocator against node {node.node_id!r}, but "
+                    f"that node's extraction is Absent ({node.extraction.reason.value!r}) -- a character "
+                    "offset into text that was never extracted addresses nothing"
+                )
         return self
 
     @model_validator(mode="after")

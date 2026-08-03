@@ -18,6 +18,7 @@ from carmel.schemas.datasets import (
     BBox,
     BBoxLocator,
     CaptionLabelKey,
+    CharSpanLocator,
     ComponentRole,
     Composition,
     CompositionBasis,
@@ -34,6 +35,7 @@ from carmel.schemas.datasets import (
     SourceNodeKind,
     SourceRef,
     TableCellLocator,
+    TextSpace,
     Uncertainty,
     UncertaintyBasis,
     UncertaintyKind,
@@ -609,6 +611,74 @@ class TestSourceGraph:
     def test_xpath_locator_ref_round_trips(self) -> None:
         ref = SourceRef(node_id="n1", locator=XPathLocator(xpath="//table/row[1]/cell[2]"))
         assert isinstance(ref.locator, XPathLocator)
+
+    def test_char_span_locator_ref_round_trips(self) -> None:
+        ref = SourceRef(
+            node_id="n1", locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=10, end=20)
+        )
+        assert isinstance(ref.locator, CharSpanLocator)
+        assert ref.locator.text_space is TextSpace.EXTRACTED_TEXT
+        assert ref.locator.start == 10
+        assert ref.locator.end == 20
+
+    def test_char_span_locator_accepts_end_greater_than_start(self) -> None:
+        locator = CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1)
+        assert locator.end > locator.start
+
+    def test_char_span_locator_rejects_end_equal_to_start(self) -> None:
+        """The span is half-open [start, end) -- end == start locates zero
+        characters, which cannot ground anything."""
+        with pytest.raises(ValidationError):
+            CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=5, end=5)
+
+    def test_char_span_locator_rejects_end_less_than_start(self) -> None:
+        with pytest.raises(ValidationError):
+            CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=5, end=4)
+
+    def test_char_span_locator_rejects_negative_start(self) -> None:
+        with pytest.raises(ValidationError):
+            CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=-1, end=1)
+
+    def test_char_span_locator_rejects_negative_end(self) -> None:
+        with pytest.raises(ValidationError):
+            CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=-1)
+
+    def test_char_span_locator_requires_text_space_with_no_default(self) -> None:
+        """text_space deliberately has no default (see its docstring) -- a
+        producer that forgot to say which text space it meant must crash
+        loudly, not be silently recorded as EXTRACTED_TEXT."""
+        with pytest.raises(ValidationError):
+            CharSpanLocator(start=0, end=1)  # type: ignore[call-arg]
+
+    def test_char_span_locator_rejects_unknown_extra_field(self) -> None:
+        with pytest.raises(ValidationError):
+            CharSpanLocator(  # type: ignore[call-arg]
+                text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1, extra_field="nope"
+            )
+
+    def test_char_span_locator_rejects_attribute_assignment(self) -> None:
+        locator = CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1)
+        with pytest.raises(ValidationError, match="frozen"):
+            locator.start = 5  # type: ignore[misc]
+
+    def test_source_ref_locator_discriminates_char_span_from_a_plain_dict(self) -> None:
+        """The discriminated union parses a plain dict with kind="char_span"
+        into a CharSpanLocator, exactly like the other three locator kinds."""
+        ref = SourceRef(
+            node_id="n1",
+            locator={"kind": "char_span", "text_space": "extracted_text", "start": 0, "end": 1},  # type: ignore[arg-type]
+        )
+        assert isinstance(ref.locator, CharSpanLocator)
+
+    def test_char_span_locator_identity_payload_projects_exactly_four_keys(self) -> None:
+        """CharSpanLocator's identity projection must carry exactly kind,
+        text_space, start, end -- no more, no less."""
+        from carmel.schemas.datasets import _source_locator_identity_payload  # type: ignore[attr-defined]
+
+        locator = CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=10, end=20)
+        payload = _source_locator_identity_payload(locator)
+        assert set(payload.keys()) == {"kind", "text_space", "start", "end"}
+        assert payload == {"kind": "char_span", "text_space": "extracted_text", "start": 10, "end": 20}
 
     def test_archive_origin_rejects_bad_sha(self) -> None:
         with pytest.raises(ValidationError):

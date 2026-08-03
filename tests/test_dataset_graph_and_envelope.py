@@ -32,6 +32,7 @@ from carmel.schemas.datasets import (
     BBox,
     BBoxLocator,
     CaptionLabelKey,
+    CharSpanLocator,
     ComponentRole,
     Composition,
     CompositionBasis,
@@ -58,6 +59,7 @@ from carmel.schemas.datasets import (
     SourceRef,
     TableCellLocator,
     TableKeyKind,
+    TextSpace,
     Uncertainty,
     UncertaintyBasis,
     UncertaintyKind,
@@ -296,25 +298,34 @@ def _resolved_single_component_composition(value_ref: SourceRef, unit_ref: Sourc
 
 
 def _graph_and_node_of_kind(
-    kind: SourceNodeKind, node_id: str = "target", sha256: str = SHA_A
+    kind: SourceNodeKind,
+    node_id: str = "target",
+    sha256: str = SHA_A,
+    extraction: ExtractionBinding | Absent = _NO_EXTRACTION,
 ) -> tuple[SourceGraph, str]:
     """Build the minimal SourceGraph containing exactly one node of `kind`
     (with whatever parent chain I4 requires), plus an unrelated PAPER_PDF
     root ("unit-root") to safely park a compatible unit_ref on -- so a
-    locator/kind-compatibility test can vary ONLY the value_ref's pairing."""
+    locator/kind-compatibility test can vary ONLY the value_ref's pairing.
+
+    `extraction` defaults to Absent, matching every pre-existing caller's
+    behavior; a CharSpanLocator compatibility test that also needs V6
+    (extraction-required) satisfied passes a present ExtractionBinding here."""
     unit_root = _node("unit-root", SourceNodeKind.PAPER_PDF, SHA_D)
     if kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML):
-        target = _node(node_id, kind, sha256)
+        target = _node(node_id, kind, sha256, extraction=extraction)
         return SourceGraph(nodes=(unit_root, target)), node_id
     if kind in (SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP):
         parent = _node("target-parent", SourceNodeKind.PAPER_PDF, SHA_C)
-        target = _node(node_id, kind, sha256, parent_node_id=parent.node_id)
+        target = _node(node_id, kind, sha256, parent_node_id=parent.node_id, extraction=extraction)
         return SourceGraph(nodes=(unit_root, parent, target)), node_id
     raise AssertionError(kind)
 
 
-def _envelope_with_value_ref_locator(locator: object, node_kind: SourceNodeKind) -> DatasetEnvelope:
-    graph, node_id = _graph_and_node_of_kind(node_kind)
+def _envelope_with_value_ref_locator(
+    locator: object, node_kind: SourceNodeKind, extraction: ExtractionBinding | Absent = _NO_EXTRACTION
+) -> DatasetEnvelope:
+    graph, node_id = _graph_and_node_of_kind(node_kind, extraction=extraction)
     amount = _mole_fraction_amount(
         value_ref=SourceRef(node_id=node_id, locator=locator),  # type: ignore[arg-type]
         unit_ref=_table_ref("unit-root"),
@@ -1631,6 +1642,63 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
     def test_bbox_locator_accepted_against_paper_pdf_si_member_and_figure_crop(self) -> None:
         for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP):
             _envelope_with_value_ref_locator(BBoxLocator(bbox=_bbox()), kind)
+
+    def test_char_span_locator_rejected_against_figure_crop_node(self) -> None:
+        """FIGURE_CROP is absent from CHAR_SPAN's compatible-kinds entry --
+        a figure crop has no extracted text of its own to index into."""
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_value_ref_locator(
+                CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1), SourceNodeKind.FIGURE_CROP
+            )
+        msg = str(excinfo.value).lower()
+        assert "char_span" in msg
+        assert SourceNodeKind.FIGURE_CROP.value in msg
+
+    def test_char_span_locator_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
+        """Also satisfies V6 (extraction-required, see
+        TestDatasetEnvelopeCharSpanRequiresExtraction below) by giving the
+        target node a present ExtractionBinding -- this class tests V3
+        (node-kind compatibility) in isolation."""
+        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
+            locator = CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1)
+            _envelope_with_value_ref_locator(locator, kind, extraction=_extraction_binding())
+
+
+class TestDatasetEnvelopeCharSpanRequiresExtraction:
+    """V6: a CharSpanLocator's target node must have a present (non-Absent)
+    `extraction` -- a character offset into text that was never extracted
+    addresses nothing. Scoped to CHAR_SPAN only; BBoxLocator against the
+    same kind of node with Absent extraction must NOT be rejected by this
+    rule (that is the MANDATORY paired test showing V6 is scoped, not a
+    blanket extraction-required rule for every locator kind)."""
+
+    def test_char_span_locator_rejected_when_target_node_extraction_absent(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_value_ref_locator(
+                CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1),
+                SourceNodeKind.PAPER_PDF,
+                extraction=_NO_EXTRACTION,
+            )
+        msg = str(excinfo.value).lower()
+        assert "char_span" in msg or "charspanlocator" in msg
+        assert "extraction is absent" in msg
+
+    def test_char_span_locator_accepted_when_target_node_extraction_present(self) -> None:
+        envelope = _envelope_with_value_ref_locator(
+            CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=0, end=1),
+            SourceNodeKind.PAPER_PDF,
+            extraction=_extraction_binding(),
+        )
+        assert envelope.composition == envelope.composition  # constructs without raising
+
+    def test_bbox_locator_against_same_node_with_absent_extraction_is_not_rejected_by_v6(self) -> None:
+        """Paired with the CHAR_SPAN-rejected test above: same node kind,
+        same Absent extraction, but a BBoxLocator instead of CharSpanLocator
+        -- V6 is scoped to CHAR_SPAN only, so this must construct fine."""
+        envelope = _envelope_with_value_ref_locator(
+            BBoxLocator(bbox=_bbox()), SourceNodeKind.PAPER_PDF, extraction=_NO_EXTRACTION
+        )
+        assert envelope.composition == envelope.composition  # constructs without raising
 
 
 class TestDatasetEnvelopeTableKeyKindCompatibility:
