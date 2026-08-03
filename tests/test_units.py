@@ -628,19 +628,30 @@ class TestShippedTablesAreNeverRemoved:
     table_for_sha's own docstring.
 
     This pins an explicit, frozen set of every sha256 TABLES_BY_SHA is
-    historically known to have shipped (seeded with TABLE_V1's, read at
-    runtime rather than hand-copied, so this test cannot itself go stale
-    relative to today's TABLE_V1) as a SUBSET check against the live
+    historically known to have shipped. The set below is a HARDCODED
+    STRING LITERAL, deliberately NOT computed from the live TABLE_V1 --
+    if it were derived from TABLE_V1.sha256, editing TABLE_V1 in place
+    would silently move the "historical" set along with it and this test
+    could never catch the very regression (removing/replacing a shipped
+    table) it exists to catch. It is a SUBSET check against the live
     registry: adding a new table alongside is fine (the registry only
     grows), but removing one -- or replacing TABLE_V1 in place so its
     sha256 changes -- fails this test.
 
     When a future commit legitimately adds a new shipped table version,
-    add its sha256 to _HISTORICALLY_SHIPPED_SHA256S below (append, do not
-    replace) in the same change.
+    APPEND its sha256 to _HISTORICALLY_SHIPPED_SHA256S below as a new
+    literal string. NEVER remove or alter an existing entry, and NEVER
+    replace this frozenset with one computed from TABLES_BY_SHA/TABLE_V1
+    -- doing either defeats the whole point of this tripwire.
     """
 
-    _HISTORICALLY_SHIPPED_SHA256S = frozenset({TABLE_V1.sha256})
+    _HISTORICALLY_SHIPPED_SHA256S = frozenset(
+        {
+            # TABLE_V1, shipped since the module's introduction. This is a
+            # literal historical constant -- see class docstring above.
+            "1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122",
+        }
+    )
 
     def test_every_historically_shipped_sha256_is_still_in_the_registry(self) -> None:
         missing = self._HISTORICALLY_SHIPPED_SHA256S - set(TABLES_BY_SHA)

@@ -23,6 +23,7 @@ import pytest
 from pydantic import BaseModel, ValidationError
 
 from carmel.schemas.datasets import (
+    _MAX_EMBEDDED_CANONICAL_JSON_LENGTH,
     AbsenceReason,
     Absent,
     ArchiveOrigin,
@@ -1589,6 +1590,36 @@ class TestEmbeddedConversionTableT1:
         assert embedded.sha256 == TABLE_V1.sha256
 
 
+class TestEmbeddedConversionTableUntrustedJsonResourceGuard:
+    """canonical_json arrives embedded in a stored dataset file -- untrusted
+    input -- and is handed to json.loads. Both of these prove the resource
+    guard actually bounds that untrusted input, rather than trusting
+    json.JSONDecodeError alone to cover every hostile shape."""
+
+    def test_oversized_canonical_json_rejected(self) -> None:
+        """A canonical_json string longer than
+        _MAX_EMBEDDED_CANONICAL_JSON_LENGTH must be rejected by pydantic's
+        own max_length, before json.loads is ever called on it."""
+        oversized = "[" + "1," * 1_048_576 + "1]"
+        with pytest.raises(ValidationError, match="at most"):
+            EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json=oversized)
+
+    def test_deeply_nested_canonical_json_rejected_not_a_bare_recursion_error(self) -> None:
+        """A canonical_json string that is well within the length bound but
+        nests deeply enough to raise a bare RecursionError from inside
+        json.loads itself -- proves the broadened `except` actually catches
+        it and converts it into a ValidationError, rather than letting the
+        RecursionError propagate uncaught out of model construction."""
+        depth = 100_000
+        deeply_nested = "[" * depth + "]" * depth
+        assert len(deeply_nested) <= _MAX_EMBEDDED_CANONICAL_JSON_LENGTH, (
+            "test setup bug: this payload must be short enough to pass the length guard, so it "
+            "actually exercises the RecursionError catch rather than the length check"
+        )
+        with pytest.raises(ValidationError, match="does not parse as JSON"):
+            EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json=deeply_nested)
+
+
 class TestDatasetEnvelopeConversionTablesCoverExactly:
     """T2: DatasetEnvelope.conversion_tables must embed exactly the tables
     actually cited by some MeasuredValue.conversion_table_sha256 reachable
@@ -1606,6 +1637,26 @@ class TestDatasetEnvelopeConversionTablesCoverExactly:
     def test_embedding_exactly_the_cited_tables_accepted(self) -> None:
         envelope = _fully_populated_envelope(conversion_tables=(_embedded_table_v1(),))
         assert envelope.conversion_tables == (_embedded_table_v1(),)
+
+
+class TestDatasetEnvelopeConversionTablesNoDuplicateSha256:
+    """DUPLICATE-CONVERSION-TABLE-SHA256-GUARD: conversion_tables must not
+    embed the same sha256 more than once. T2's cover-exactly check compares
+    SETS of embedded sha256s against cited sha256s, so a tuple like
+    ``(V1, V1)`` has the same embedded set as ``(V1,)`` and would otherwise
+    pass T2 unchanged -- this guard is what actually rejects the duplicate."""
+
+    def test_duplicate_embedded_table_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="embeds duplicate sha256"):
+            _fully_populated_envelope(conversion_tables=(_embedded_table_v1(), _embedded_table_v1()))
+
+    def test_distinct_tables_still_accepted(self) -> None:
+        with _registered_second_table():
+            first = _embedded_table_v1()
+            second = _embedded_second_table()
+            ascending = tuple(sorted((first, second), key=lambda table: table.sha256))
+            envelope = _envelope_citing_two_tables(ascending)
+            assert envelope.conversion_tables == ascending
 
 
 class TestDatasetEnvelopeConversionTablesSorted:

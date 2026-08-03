@@ -1086,8 +1086,8 @@ class TestComposition:
         assert mixture.components[0].role == ComponentRole.FUEL
 
     def test_unsorted_components_rejected(self) -> None:
-        """Components must be sorted ascending by species_raw_name, same
-        rationale as S2/S7/E1b for axes/points/series: it pins one
+        """Components must be sorted ascending by (species_raw_name, role),
+        same rationale as S2/S7/E1b for axes/points/series: it pins one
         canonical ordering so identity_payload() addresses a logically-
         identical mixture identically regardless of extraction order."""
         with pytest.raises(ValidationError, match="components must be sorted ascending by"):
@@ -1106,8 +1106,11 @@ class TestComposition:
                 ],
             )
 
-    def test_duplicate_component_species_rejected(self) -> None:
-        with pytest.raises(ValidationError, match="duplicate species_raw_name"):
+    def test_duplicate_component_species_and_role_rejected(self) -> None:
+        """The SAME species in the SAME role, listed twice, is still a
+        genuine duplicate -- keying on (species_raw_name, role) narrows what
+        is rejected, it does not stop rejecting the truly ambiguous case."""
+        with pytest.raises(ValidationError, match=r"duplicate \(species_raw_name, role\)"):
             Composition(
                 raw_name="CH4/CH4 mixture",
                 resolution=CompositionResolution.RESOLVED_COMPONENTS,
@@ -1122,6 +1125,61 @@ class TestComposition:
                     ),
                 ],
             )
+
+    def test_duplicate_component_species_both_role_absent_rejected(self) -> None:
+        """Same species, role Absent on BOTH entries, must still be rejected:
+        an unstated role carries no information that would distinguish the
+        two entries from one another, so this is not the "different roles"
+        case the fix carves out -- it is the same ambiguous duplicate as
+        before, just with role unstated rather than stated."""
+        with pytest.raises(ValidationError, match=r"duplicate \(species_raw_name, role\)"):
+            Composition(
+                raw_name="CH4/CH4 mixture, no roles stated",
+                resolution=CompositionResolution.RESOLVED_COMPONENTS,
+                basis=CompositionBasis.MOLE_FRACTION,
+                equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                components=[
+                    CompositionComponent(
+                        species_raw_name="CH4",
+                        amount=_mole_fraction_measured_value(),
+                        role=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+                    ),
+                    CompositionComponent(
+                        species_raw_name="CH4",
+                        amount=_mole_fraction_measured_value(),
+                        role=Absent(reason=AbsenceReason.UNKNOWN),
+                    ),
+                ],
+            )
+
+    def test_same_species_in_different_roles_accepted(self) -> None:
+        """FIX 4's positive case: the SAME species may legitimately appear
+        TWICE in one Composition's components, as long as the role differs
+        each time -- e.g. N2 as the oxidizer-diluent implicit within "air",
+        and N2 again as a separately-added diluent. Keying duplicate
+        detection on (species_raw_name, role) instead of species_raw_name
+        alone is what makes this representable; this test is the proof that
+        the fix isn't over-corrected back into rejecting it."""
+        mixture = Composition(
+            raw_name="4% H2 in air, plus extra N2 diluent",
+            resolution=CompositionResolution.RESOLVED_COMPONENTS,
+            basis=CompositionBasis.MOLE_FRACTION,
+            equivalence_ratio=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            components=[
+                CompositionComponent(
+                    species_raw_name="H2", amount=_mole_fraction_measured_value(), role=ComponentRole.FUEL
+                ),
+                CompositionComponent(
+                    species_raw_name="N2", amount=_mole_fraction_measured_value(), role=ComponentRole.BALANCE
+                ),
+                CompositionComponent(
+                    species_raw_name="N2", amount=_mole_fraction_measured_value(), role=ComponentRole.DILUENT
+                ),
+            ],
+        )
+        assert len(mixture.components) == 3
+        n2_roles = {c.role for c in mixture.components if c.species_raw_name == "N2"}
+        assert n2_roles == {ComponentRole.BALANCE, ComponentRole.DILUENT}
 
     def test_sorted_components_accepted(self) -> None:
         mixture = Composition(

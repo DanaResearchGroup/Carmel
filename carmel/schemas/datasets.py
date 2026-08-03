@@ -136,6 +136,18 @@ __all__ = [
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
+# UNTRUSTED-CANONICAL-JSON-RESOURCE-GUARD: bound on EmbeddedConversionTable.canonical_json's
+# length, in UTF-8 bytes-ish characters. canonical_json arrives embedded in a stored dataset
+# file -- untrusted input, not something this process generated -- and is parsed with
+# json.loads in _validate_canonical_json_reconstructs_to_sha256 below. TABLE_V1's own
+# canonical rendering is ~4KB (3986 bytes, measured directly); 1 MiB gives roughly 250x
+# headroom over the largest table shipped today while still bounding how much memory/CPU a
+# single hostile or corrupted embedding can force this process to spend on json.loads.
+# Mirrors the same defensive posture as carmel.services.dataset_store's own untrusted-input
+# guards (_MAX_JSON_DEPTH, _raw_bytes_nest_too_deeply) -- see that module's
+# _read_verified_canonical_dict for the precedent this follows.
+_MAX_EMBEDDED_CANONICAL_JSON_LENGTH = 1_048_576
+
 # carmel.services.dataset_store._HEALTHY_GLYPH_HEALTH is module-private (leading
 # underscore) -- reaching across a module boundary to import another module's private
 # name would tie this schema to dataset_store's internals, so this constant is
@@ -1326,6 +1338,29 @@ class ComponentRole(StrEnum):
     BALANCE = "balance"
 
 
+def _component_role_sort_key(role: Maybe[ComponentRole]) -> tuple[int, str]:
+    """A TOTAL, deterministic ordering over ``Maybe[ComponentRole]``, used to both
+    sort and de-duplicate-key :class:`CompositionComponent`.``role``.
+
+    ``role`` can be an actual :class:`ComponentRole` or an :class:`Absent` marker,
+    and the two are not otherwise comparable (``Absent`` carries no ordering of its
+    own, and mixing a ``StrEnum`` with an arbitrary ``BaseModel`` in one sort has no
+    default behavior Python would pick consistently). Rather than leave that
+    ambiguous, one explicit order is pinned here: every ``Absent`` role sorts
+    BEFORE every present ``ComponentRole``, and all ``Absent`` roles compare equal
+    to each other regardless of ``reason``/``note`` (an unstated role carries no
+    further distinguishing information to sort or de-duplicate on). Among present
+    roles, ordering is by the enum's own string value. This is address-bearing --
+    :class:`Composition`'s component order feeds ``identity_payload()`` -- so it
+    must be exactly this one stable order, not "whatever Python's default
+    comparison happens to do" (which would in fact be a ``TypeError``, since
+    ``Absent`` instances and ``ComponentRole`` members are not ``<``-comparable).
+    """
+    if isinstance(role, Absent):
+        return (0, "")
+    return (1, role.value)
+
+
 class CompositionComponent(BaseModel):
     """One resolved component of a :class:`Composition`."""
 
@@ -1403,38 +1438,61 @@ class Composition(BaseModel):
 
     @model_validator(mode="after")
     def _enforce_no_duplicate_component_species(self) -> Composition:
-        """Reject a repeated ``species_raw_name`` among ``components``.
+        """Reject a repeated ``(species_raw_name, role)`` pair among ``components``.
 
-        A duplicate species name would make "which component's amount is
-        THE amount for this species" ambiguous for any downstream consumer
-        that indexes components by species -- the same failure mode S1/S6
-        close one level down, for axes and points within a :class:`Series`.
+        Keying on ``species_raw_name`` alone would make a legitimate source shape
+        unrepresentable: a paper can list the same species twice in DIFFERENT roles
+        before mixture aggregation -- e.g. N2 as the oxidizer-diluent implicit
+        within "air", and N2 again as a separately-added diluent. Those are two
+        distinct, individually-sourced components that happen to share a species,
+        not a duplicate. Keying on the pair instead only rejects the case that is
+        actually ambiguous: the SAME species in the SAME role listed twice, which
+        would make "which component's amount is THE amount for this species in
+        this role" ambiguous for any downstream consumer that indexes components
+        by (species, role) -- the same failure mode S1/S6 close one level down,
+        for axes and points within a :class:`Series`.
+
+        ``role`` is compared via :func:`_component_role_sort_key` (see its
+        docstring for why ``Absent`` needs an explicit, total ordering here) so
+        that two components with the same species and both an ``Absent`` role are
+        still caught as a duplicate -- an unstated role carries no information
+        that would distinguish them.
         """
-        seen: set[str] = set()
+        seen: set[tuple[str, tuple[int, str]]] = set()
         for component in self.components:
-            if component.species_raw_name in seen:
+            key = (component.species_raw_name, _component_role_sort_key(component.role))
+            if key in seen:
                 raise ValueError(
-                    f"Composition(raw_name={self.raw_name!r}): duplicate species_raw_name "
-                    f"{component.species_raw_name!r} in components"
+                    f"Composition(raw_name={self.raw_name!r}): duplicate (species_raw_name, role) "
+                    f"{(component.species_raw_name, component.role)!r} in components"
                 )
-            seen.add(component.species_raw_name)
+            seen.add(key)
         return self
 
     @model_validator(mode="after")
     def _enforce_components_sorted_by_species(self) -> Composition:
-        """``components`` must be sorted ascending by ``species_raw_name``.
+        """``components`` must be sorted ascending by ``(species_raw_name, role)``.
 
         Pinning one canonical ordering here (rather than leaving component
         order to whatever sequence an extractor happened to emit) is what
         makes ``identity_payload()`` produce the same content address for
         logically-identical mixtures regardless of input order -- the same
-        rationale as S2/S7/E1b for ``axes``/``points``/``series``.
+        rationale as S2/S7/E1b for ``axes``/``points``/``series``. ``role`` is
+        included in the key (not just ``species_raw_name``) now that the same
+        species may legitimately appear more than once in different roles; see
+        :func:`_component_role_sort_key` for the ``Absent``-inclusive total order
+        this uses.
         """
-        expected = tuple(sorted(self.components, key=lambda component: component.species_raw_name))
+        expected = tuple(
+            sorted(
+                self.components,
+                key=lambda component: (component.species_raw_name, _component_role_sort_key(component.role)),
+            )
+        )
         if self.components != expected:
             raise ValueError(
                 f"Composition(raw_name={self.raw_name!r}): components must be sorted ascending by "
-                "species_raw_name"
+                "(species_raw_name, role)"
             )
         return self
 
@@ -2051,6 +2109,25 @@ class EmbeddedConversionTable(BaseModel):
     in place after validation with nothing here to notice, which has
     already shipped as a defect twice in this project. A ``str`` is
     immutable, closing that hole structurally rather than by convention.
+
+    SCOPE OF WHAT VALIDATION HERE PROVES (read before trusting a table):
+    :meth:`_validate_canonical_json_reconstructs_to_sha256` (T1) proves only
+    that ``canonical_json`` is *internally coherent* -- it parses, it
+    reconstructs a structurally valid ``ConversionTable`` whose own
+    ``__post_init__`` invariants all hold, and re-canonicalizing that
+    reconstruction reproduces ``canonical_json`` byte-for-byte. None of that
+    checks whether the table's numbers are SCIENTIFICALLY correct: a table
+    that declares ``atm -> Pa`` with ``scale="1"`` would pass every one of
+    these checks while being physically wrong (the true factor is 101325).
+    Reconstruction can only catch INTERNAL contradictions (a malformed
+    decimal, a duplicate rule, an unreachable base unit); it has no way to
+    know what the real conversion factor between two physical units is.
+    Actual trust that a table's numbers are right comes from a table's
+    membership in :data:`carmel.services.units.TABLES_BY_SHA` -- the
+    hand-reviewed, shipped registry -- not from this validator succeeding.
+    An ``EmbeddedConversionTable`` whose ``sha256`` is absent from
+    ``TABLES_BY_SHA`` may be internally coherent nonsense that no human ever
+    checked against reality.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -2060,9 +2137,15 @@ class EmbeddedConversionTable(BaseModel):
     that ``canonical_json`` decodes to; see
     :meth:`_validate_canonical_json_reconstructs_to_sha256` (T1)."""
 
-    canonical_json: str = Field(min_length=1)
+    canonical_json: str = Field(min_length=1, max_length=_MAX_EMBEDDED_CANONICAL_JSON_LENGTH)
     """The table's canonical identity-payload JSON, verbatim, as a str --
-    see the class docstring for why this is never a ``dict``."""
+    see the class docstring for why this is never a ``dict``.
+
+    Bounded by ``_MAX_EMBEDDED_CANONICAL_JSON_LENGTH`` -- see that constant's
+    comment for the resource-exhaustion guard this length bound enforces --
+    ``canonical_json`` arrives from a stored file (untrusted input), and an
+    unbounded string handed to ``json.loads`` is a resource-exhaustion
+    vector, not just a parsing convenience."""
 
     @field_validator("sha256")
     @classmethod
@@ -2096,10 +2179,27 @@ class EmbeddedConversionTable(BaseModel):
            ``canonical_json`` byte-for-byte -- this is what pins that the
            embedded bytes are the CANONICAL rendering, not merely some JSON
            that happens to parse to an equivalent object.
+
+        All four steps together prove internal shape/invariant COHERENCE
+        only -- NOT scientific or domain correctness of the table's
+        conversion factors. See the class docstring's "SCOPE OF WHAT
+        VALIDATION HERE PROVES" section for why (short version: an
+        internally coherent table can still be physically wrong, and actual
+        trust comes from membership in the shipped ``TABLES_BY_SHA``
+        registry, not from this validator passing).
         """
         try:
             parsed = json.loads(self.canonical_json)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, RecursionError) as exc:
+            # canonical_json is untrusted input (it arrives embedded in a stored file), so a
+            # deeply-nested payload can blow the interpreter's own call stack with a bare
+            # RecursionError from inside json.loads itself, before this validator gets a
+            # chance to react -- mirrors the same broadened except used around
+            # dataset_store._read_verified_canonical_dict's own json.loads call for the
+            # identical reason. The length bound on canonical_json (see
+            # _MAX_EMBEDDED_CANONICAL_JSON_LENGTH) is the primary defence; this catch is the
+            # backstop for the exceedingly deep-but-short payload the length bound alone would
+            # not catch.
             raise ValueError(
                 f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json does not parse as JSON: "
                 f"{exc}"
@@ -2315,7 +2415,13 @@ def _source_ref_identity_payload(ref: SourceRef) -> dict[str, Any]:
 
 
 def _archive_origin_identity_payload(origin: ArchiveOrigin) -> dict[str, Any]:
-    return {"archive_sha256": origin.archive_sha256, "member_display_path": origin.member_display_path}
+    # member_display_path is deliberately NOT projected here -- see
+    # ArchiveOrigin's class docstring and its entry in _UNADDRESSED_FIELDS
+    # below. It is display-only by contract; projecting it would make two
+    # envelopes that differ only in a cosmetic display path address
+    # differently, even though archive_sha256 (the actual identity-bearing
+    # field) is unchanged.
+    return {"archive_sha256": origin.archive_sha256}
 
 
 def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
@@ -2424,11 +2530,24 @@ def _embedded_conversion_table_identity_payload(table: EmbeddedConversionTable) 
     return {"sha256": table.sha256, "canonical_json": table.canonical_json}
 
 
-_UNADDRESSED_FIELDS: Mapping[tuple[str, str], str] = {}
+_UNADDRESSED_FIELDS: Mapping[tuple[str, str], str] = {
+    ("ArchiveOrigin", "member_display_path"): (
+        "Display-only by contract (see ArchiveOrigin's class docstring): "
+        "archive paths collide under normalization and can be adversarially "
+        "crafted to *look* like they identify one archive member while "
+        "actually addressing another, so this field carries no information "
+        "that can safely be treated as identity. archive_sha256 is the sole "
+        "identity-bearing field on this model and is projected instead. "
+        "This is the model entry for a field that is genuinely not "
+        "addressable, not a shortcut for having forgotten to project it --"
+        "see the completeness meta-test for how that distinction is "
+        "enforced."
+    ),
+}
 """``(model_name, field_name) -> reason`` registry of fields NOT covered by
 :meth:`DatasetEnvelope.identity_payload`'s hand-written projection.
 
-Deliberately EMPTY: every field of every pydantic model reachable from
+Every OTHER field of every pydantic model reachable from
 :class:`DatasetEnvelope` (``SourceGraph``, ``SourceNode``, ``ArchiveOrigin``,
 ``SourceRef`` and its locator/table-key discriminated-union arms, ``BBox``,
 ``CoordinateFrame``, ``MeasuredValue``, ``Uncertainty``, ``Composition``,
@@ -2548,6 +2667,34 @@ class DatasetEnvelope(BaseModel):
             raise ValueError(
                 f"DatasetEnvelope.conversion_tables embeds decorative table(s) {sorted(decorative)!r} that "
                 "no MeasuredValue actually cites -- an embedded table nothing needs is unearned provenance"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_conversion_tables_no_duplicate_sha256(self) -> DatasetEnvelope:
+        """DUPLICATE-CONVERSION-TABLE-SHA256-GUARD: ``conversion_tables`` must
+        not embed the same ``sha256`` more than once.
+
+        T2 (above) compares SETS of embedded sha256s against the set of
+        cited sha256s, so a tuple like ``(V1, V1)`` has exactly the same
+        embedded set as ``(V1,)`` and passes T2 unchanged; T3's adjacent-pair
+        sort check likewise accepts two equal, already-sorted entries. Left
+        unchecked, two envelopes that differ only in whether a table is
+        embedded once or twice have the SAME logical content but different
+        bytes, and therefore different content addresses -- an
+        address-uniqueness bug. This guard closes that gap directly, by
+        sha256 identity rather than by set arithmetic.
+        """
+        seen: set[str] = set()
+        duplicates: set[str] = set()
+        for table in self.conversion_tables:
+            if table.sha256 in seen:
+                duplicates.add(table.sha256)
+            seen.add(table.sha256)
+        if duplicates:
+            raise ValueError(
+                f"DatasetEnvelope.conversion_tables embeds duplicate sha256(s) {sorted(duplicates)!r} -- "
+                "each cited conversion table must be embedded exactly once"
             )
         return self
 
