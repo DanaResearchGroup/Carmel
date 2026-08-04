@@ -25,13 +25,9 @@ from carmel.agents.tools.extract import ExtractedText
 from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.datasets import (
     AxisRole,
-    CharSpanLocator,
-    DatasetEnvelope,
     ExtractionBinding,
     SourceNodeKind,
     ValueOrigin,
-    iter_measured_values,
-    iter_source_refs,
 )
 from carmel.schemas.literature import StoredArtifact
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
@@ -42,8 +38,9 @@ from carmel.services.dataset_producer import (
     ground_quote,
     produce_envelope_from_artifact,
 )
+from carmel.services.dataset_replay import ReplayOutcome, replay_envelope
 from carmel.services.dataset_store import compute_dataset_sha
-from carmel.services.evidence import artifact_dir, load_artifact_meta, store_artifact
+from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.numeric import QuoteRole
 from carmel.services.units import QuantityKind
 
@@ -104,82 +101,6 @@ def _store_synthetic_artifact(
     return store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
 
 
-def _independently_verified_text(workspace_root: Path, raw_sha256: str) -> str:
-    """Replayer-side read: re-read extracted.json's BYTES from disk, re-verify
-    their digest against StoredArtifact.extracted_sha256, and only then parse.
-
-    Deliberately independent of the producer's own loading code: it re-reads
-    the file and recomputes the digest here, so a producer bug cannot vouch
-    for itself.
-    """
-    meta = load_artifact_meta(workspace_root, raw_sha256)
-    assert meta is not None, f"no stored artifact under {raw_sha256!r}"
-    assert meta.extracted_sha256 is not None
-    raw_bytes = (artifact_dir(workspace_root, raw_sha256) / "extracted.json").read_bytes()
-    assert hashlib.sha256(raw_bytes).hexdigest() == meta.extracted_sha256, (
-        "extracted.json bytes on disk do not match the digest recorded at store time"
-    )
-    extracted = ExtractedText.model_validate(json.loads(raw_bytes))
-    return extracted.text
-
-
-def _assert_every_char_span_grounds(envelope: DatasetEnvelope, text: str) -> int:
-    """The replayer-style check: walk the ENTIRE envelope generically and
-    assert every reachable ``CharSpanLocator`` slices ``text`` to exactly the
-    verbatim string the envelope claims for it.
-
-    Three claim kinds exist in this schema, each walked generically (never
-    "the one span the test knows about"):
-
-    - every ``MeasuredValue``'s ``value_ref`` span must slice to its
-      ``raw_text`` (found via ``iter_measured_values``, the schema's own
-      shape-agnostic walker);
-    - every ``MeasuredValue``'s ``unit_ref`` span must slice to its
-      ``unit_raw``;
-    - every ``AxisDeclaration``'s ``label_ref`` span must slice to its
-      ``label_raw``.
-
-    Coverage is then proven, not assumed: the number of spans checked above
-    must equal the TOTAL number of ``CharSpanLocator``-bearing ``SourceRef``s
-    reachable via ``iter_source_refs`` -- so a char-span ref hanging anywhere
-    this pairing does not know about fails the test loudly instead of
-    escaping it.
-
-    Returns the number of spans checked (callers assert it is non-zero).
-    """
-    checked = 0
-    for path, value in iter_measured_values(envelope):
-        for which, ref, expected in (
-            ("value_ref", value.value_ref, value.raw_text),
-            ("unit_ref", value.unit_ref, value.unit_raw),
-        ):
-            locator = ref.locator
-            if isinstance(locator, CharSpanLocator):
-                actual = text[locator.start : locator.end]
-                assert actual == expected, (
-                    f"replay mismatch at {path}.{which}: text[{locator.start}:{locator.end}] == "
-                    f"{actual!r}, but the envelope claims {expected!r}"
-                )
-                checked += 1
-    for series in envelope.series:
-        for axis in series.axes:
-            locator = axis.label_ref.locator
-            if isinstance(locator, CharSpanLocator):
-                actual = text[locator.start : locator.end]
-                assert actual == axis.label_raw, (
-                    f"replay mismatch at series {series.series_id!r} axis {axis.axis_id!r} label_ref: "
-                    f"text[{locator.start}:{locator.end}] == {actual!r}, but the envelope claims "
-                    f"{axis.label_raw!r}"
-                )
-                checked += 1
-    total_char_span_refs = sum(
-        1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
-    )
-    assert checked == total_char_span_refs, (
-        f"replayer checked {checked} char-span ref(s) but iter_source_refs finds "
-        f"{total_char_span_refs}; some CharSpanLocator is reachable that this pairing never verified"
-    )
-    return checked
 
 
 class TestMeasurementSpecOccurrence:
@@ -1273,7 +1194,7 @@ class TestProducerEndToEnd:
     def test_produce_store_load_replay(self, tmp_path: Path) -> None:
         """The whole vertical slice: real store_artifact -> producer ->
         DatasetEnvelope -> store_dataset_envelope -> load_dataset_envelope ->
-        independent replayer-style verification of every grounded span."""
+        independent replay via the standalone ``dataset_replay`` service."""
         stored_artifact = _store_synthetic_artifact(tmp_path, _TEXT)
         datasets_root = tmp_path / "datasets"
 
@@ -1289,16 +1210,23 @@ class TestProducerEndToEnd:
 
         assert compute_dataset_sha(loaded.identity_payload()) == stored_dataset.sha256
 
-        # Replayer-style check: independently re-read + re-verify + re-parse
-        # the stored extraction, then generically verify every span in the
-        # LOADED envelope against it.
-        replayed_text = _independently_verified_text(tmp_path, stored_artifact.sha256)
-        checked = _assert_every_char_span_grounds(loaded, replayed_text)
+        # Replay: the standalone service independently re-reads and
+        # re-verifies extracted.json from disk and re-slices every span in
+        # the LOADED envelope against it.
+        report = replay_envelope(tmp_path, loaded)
+        assert report.outcome is ReplayOutcome.VERIFIED, report.findings
+        assert report.failures == ()
+        assert report.unverifiable == ()
         # 2 axes x (value_ref + unit_ref + label_ref) = 6 char-span refs.
-        assert checked == 6
+        assert report.checked_char_spans == 6
 
         # The loaded binding's extracted_text_sha256 must equal a digest
-        # recomputed here from the independently re-read, re-verified text.
+        # recomputed here from an independently re-read extracted.json --
+        # deliberately re-read again here, separate from replay_envelope's
+        # own internal re-read, so a bug in the service cannot vouch for
+        # itself.
+        raw_bytes = (artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json").read_bytes()
+        replayed_text = ExtractedText.model_validate(json.loads(raw_bytes)).text
         node = loaded.source_graph.node("paper")
         binding = node.extraction
         assert isinstance(binding, ExtractionBinding), "extraction must be present, not Absent"
@@ -1306,14 +1234,18 @@ class TestProducerEndToEnd:
         assert binding.extracted_sha256 == stored_artifact.extracted_sha256
 
     def test_replay_fails_against_single_character_mutation(self, tmp_path: Path) -> None:
-        """THE non-vacuousness proof for the replayer check: an envelope
-        grounded against the ORIGINAL text must FAIL the replay when checked
-        against a second stored artifact whose text differs by exactly one
-        character inside a grounded span ("1023 K" -> "1024 K")."""
+        """THE non-vacuousness proof for the replayer service: an envelope
+        grounded against the ORIGINAL text must FAIL replay once the
+        evidence store's own ``extracted.json`` for that same sha256 is
+        tampered with by exactly one character inside a grounded span
+        ("1023 K" -> "1024 K"). This proves the service performs a genuine
+        on-disk re-read at replay time rather than trusting any cached
+        text -- the content-addressed store makes it impossible for two
+        different texts to share one sha256, so the only way to exercise
+        the mismatch path is to mutate the evidence the envelope's own
+        recorded sha256 already points at."""
         original = _store_synthetic_artifact(tmp_path, _TEXT)
-        mutated = _store_synthetic_artifact(tmp_path, _MUTATED_TEXT)
-        assert original.sha256 != mutated.sha256
-        assert len(_TEXT) == len(_MUTATED_TEXT)
+        datasets_root = tmp_path / "datasets"
 
         envelope = produce_envelope_from_artifact(
             tmp_path,
@@ -1322,16 +1254,34 @@ class TestProducerEndToEnd:
             value_origin=ValueOrigin.EXPERIMENTAL,
             measurements=_SPECS,
         )
+        stored_dataset = store_dataset_envelope(datasets_root, envelope)
+        loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
 
-        # Sanity: the SAME check passes against the original artifact's text...
-        original_text = _independently_verified_text(tmp_path, original.sha256)
-        assert _assert_every_char_span_grounds(envelope, original_text) == 6
+        # Sanity: replay passes clean against the untouched evidence...
+        clean_report = replay_envelope(tmp_path, loaded)
+        assert clean_report.outcome is ReplayOutcome.VERIFIED
+        assert clean_report.checked_char_spans == 6
 
-        # ...and fails against the mutated artifact's (independently
-        # verified) text, on the exact claimed-vs-actual slice disagreement.
-        mutated_text = _independently_verified_text(tmp_path, mutated.sha256)
-        with pytest.raises(AssertionError, match="replay mismatch"):
-            _assert_every_char_span_grounds(envelope, mutated_text)
+        # ...then tamper with the SAME artifact's extracted.json on disk,
+        # in place, so the envelope still names the same sha256 but the
+        # evidence underneath it has changed by exactly one character.
+        assert len(_TEXT) == len(_MUTATED_TEXT)
+        mutated_extracted = ExtractedText(
+            text=_MUTATED_TEXT,
+            normalized=_MUTATED_TEXT.casefold(),
+            sections=[],
+            extractor="pdf:pypdf",
+            lossy=False,
+        )
+        extracted_path = artifact_dir(tmp_path, original.sha256) / "extracted.json"
+        extracted_path.write_text(json.dumps(mutated_extracted.model_dump(mode="json")), encoding="utf-8")
+
+        mutated_report = replay_envelope(tmp_path, loaded)
+        assert mutated_report.outcome is not ReplayOutcome.VERIFIED
+        assert any(
+            "extracted.json" in finding.reason or "extracted_text_sha256" in finding.reason
+            for finding in (mutated_report.failures + mutated_report.unverifiable)
+        )
 
 
 class TestProducerFailClosed:
