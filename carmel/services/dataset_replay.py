@@ -140,18 +140,30 @@ about whatever the caller happened to construct.
 
 **What boundary/admission re-checking now proves, and what it still does
 not.** :func:`verify_measured_value_unit_boundary` re-runs the same
-lexical (Layers 1-2) and table-admission (Layer 3) gate
-:func:`~carmel.services.dataset_producer.ground_quote` applies at write
-time, against independently re-read evidence text sliced at the RECORDED
-locator, and against the binding for the RECORDED
-``conversion_table_sha256`` -- so an envelope whose recorded unit locator
-would be refused by ``ground_quote`` today (e.g. it lands on a bare unit
-token glued to trailing unclassified characters, or the token is not in
-the recorded table's vocabulary at all) now replays ``FAILED``, not
-``VERIFIED``. This closes the previously-documented gap where boundary and
-admission were skipped entirely.
+lexical (Layers 1-2) gate :func:`~carmel.services.dataset_producer.ground_quote`
+applies at write time, against independently re-read evidence text sliced at
+the RECORDED locator; :func:`verify_measured_value_value_boundary` does the
+symmetric re-run for VALUE-role boundary/maximality. Both are re-run against
+independently re-read evidence text sliced at the RECORDED locator. The
+Layer 3 table-admission gate is re-run against the binding for the RECORDED
+``conversion_table_sha256`` specifically -- NOT against whatever table is
+"current" or "preferred" today. Those are two different claims, and it
+matters which one a ``VERIFIED`` result actually makes: a recorded table can
+be superseded (e.g. a future ``TABLE_V2`` replacing ``TABLE_V1`` as the
+codebase's preferred table) without the RECORDED envelope becoming wrong --
+it was admitted against the table it names, and replay re-confirms exactly
+that, historical or current. A ``VERIFIED`` boundary/admission result is
+therefore NOT the same claim as "``ground_quote`` would admit this exact
+quote if run today" -- it is the narrower, and permanently stable, claim
+that the recorded locator still slices to the recorded quote under the
+RECORDED table's own rules.
 
-What this still does NOT prove, even on a ``VERIFIED`` result:
+Stated plainly, without embellishment: replay proves the stored locators
+still slice to the recorded quotes in the named evidence, that unit
+normalization matches the recorded known table, and that char-span value
+and unit locators pass current lexical checks plus recorded-table admission.
+It does NOT prove value/label admission beyond the above, occurrence
+reconstruction, M-D4 grouping, or layout truth. In particular:
 
 - **M-D4 measurement grouping** -- that ``value_ref``, ``unit_ref``, and any
   label together describe ONE coherent measurement, rather than three
@@ -164,15 +176,20 @@ What this still does NOT prove, even on a ``VERIFIED`` result:
   trusts the RECORDED locator's offsets; it cannot reconstruct why the
   producer chose that occurrence over another one.
 - **A faithful recording of a wrong extraction** -- boundary/admission only
-  asks "would this exact span still be admitted." It cannot detect that
-  the span, while internally well-formed and admissible, was extracted
-  from the wrong place in the source document in the first place.
+  asks "would this exact span still be admitted against the recorded
+  table." It cannot detect that the span, while internally well-formed and
+  admissible, was extracted from the wrong place in the source document in
+  the first place.
+- **Layout truth** -- replay never re-derives page geometry, reading order,
+  or table structure; it only re-slices character offsets in already-
+  extracted text.
 
 Read a ``VERIFIED`` result accordingly: it proves the recorded facts are
-genuinely grounded, internally consistent with the table they recorded,
-and would still be admitted by today's boundary/admission rules -- not
+genuinely grounded, internally consistent with the table they recorded, and
+pass current lexical boundary checks plus RECORDED-table admission -- not
 that they constitute a correctly-grouped, correctly-disambiguated, or
-correctly-targeted measurement.
+correctly-targeted measurement, and not that today's policy (as opposed to
+the recorded table's policy) would admit them.
 """
 
 from __future__ import annotations
@@ -201,7 +218,14 @@ from carmel.services.dataset_producer import (
     binding_for_known_sha,
 )
 from carmel.services.evidence import artifact_dir, load_artifact_meta
-from carmel.services.numeric import unit_boundary_violation
+from carmel.services.numeric import (
+    NUMERAL_CANDIDATE_RE,
+    enclosing_numeric_construct,
+    find_numeral_extent,
+    has_clean_token_boundary,
+    unit_boundary_violation,
+)
+from carmel.services.units import QuantityKind
 
 __all__ = [
     "ReplayFinding",
@@ -211,6 +235,7 @@ __all__ = [
     "replay_stored_dataset",
     "verify_measured_value_unit",
     "verify_measured_value_unit_boundary",
+    "verify_measured_value_value_boundary",
 ]
 
 
@@ -628,6 +653,12 @@ def verify_measured_value_unit_boundary(
     :data:`carmel.services.units.TABLES_BY_SHA` registry and NEVER derived
     from a caller-supplied table. An unrecognised sha makes Layer 3
     ``UNVERIFIABLE`` (it never falls back to whatever table is current).
+    A ``unit_ref.locator`` that is not a :class:`CharSpanLocator`, and a
+    ``quantity_kind`` of :attr:`~carmel.services.units.QuantityKind.OTHER`
+    (which has no admission vocabulary at all -- see
+    :meth:`carmel.services.units._ActiveTableBinding.derive`), are each
+    reported ``UNVERIFIABLE`` rather than silently skipped or falsely
+    accused: neither case gives this gate anything honest to check.
 
     What this does NOT prove, even when it returns ``None``: that the value,
     unit, and label spans of one measurement genuinely belong together (see
@@ -636,13 +667,19 @@ def verify_measured_value_unit_boundary(
     the right one; or that a faithfully-recorded locator was pointed at the
     CORRECT extraction rather than merely a clean one. It proves only that
     the recorded locator, re-read from independently-verified evidence text,
-    still passes the SAME boundary/admission gate ``ground_quote`` would
-    apply today.
+    still passes the SAME lexical checks ``ground_quote`` applies today PLUS
+    admission against the table the envelope itself RECORDED -- not
+    necessarily whatever table is current or preferred today. A recorded
+    table can be superseded by a later one without the recorded envelope
+    becoming wrong; this gate re-confirms admission against the table named
+    in the envelope, which is a stable, historical claim, not a claim about
+    today's policy.
 
     Returns ``None`` if both layers pass cleanly. Otherwise a
     :class:`ReplayFinding`: ``FAILED`` if a layer ran and refused;
     ``UNVERIFIABLE`` if a layer could not run at all (missing/unreadable
-    node text, an unresolvable ``conversion_table_sha256``, or an
+    node text, an unresolvable ``conversion_table_sha256``, an unmodelled
+    ``QuantityKind.OTHER`` quantity, a non-``CharSpanLocator``, or an
     out-of-range locator). A skipped check never yields ``None`` silently --
     every early return above is paired with a named finding.
     """
@@ -653,9 +690,20 @@ def verify_measured_value_unit_boundary(
 
     if not isinstance(unit_locator, CharSpanLocator):
         # Every other SourceLocator kind (bbox, table cell, xpath) has no
-        # character span for this lexical/table gate to re-run against;
-        # check_char_spans already covers those kinds on their own terms.
-        return None
+        # character span for this lexical/table gate to re-run against.
+        # check_char_spans already re-slices those kinds on their own terms,
+        # but THIS gate -- boundary/admission -- simply cannot run against a
+        # locator that carries no character span. Reporting UNVERIFIABLE
+        # (never a silent None) keeps "not checked" from ever reading as
+        # "checked and clean": a skipped check must never verify.
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path_ref,
+            reason=f"unit_ref.locator is a {type(unit_locator).__name__}, not a CharSpanLocator -- "
+            "the boundary/admission gate re-runs the same character-span lexical and table checks "
+            "ground_quote applies at write time, so it has nothing to re-run against a locator that "
+            "carries no character span; this is reported as unverified, not silently skipped",
+        )
 
     if unit_node_id in node_problems:
         problem = node_problems[unit_node_id]
@@ -693,6 +741,26 @@ def verify_measured_value_unit_boundary(
             "a clean UNIT-role boundary; ground_quote would refuse this exact quote today",
         )
 
+    if value.quantity_kind is QuantityKind.OTHER:
+        # QuantityKind.OTHER is a deliberate wildcard for a quantity this
+        # codebase does not model at all: _ActiveTableBinding.derive()
+        # excludes it from spellings_by_quantity, so the Layer 3 admission
+        # lookup below always falls back to the empty-set default and
+        # therefore ALWAYS reports "unit_not_in_vocabulary" for OTHER,
+        # regardless of what the recorded text actually says. That is a
+        # false accusation, not a genuine admission failure -- OTHER has no
+        # admission vocabulary to check against, so replay cannot honestly
+        # say the recorded unit disagrees with one. Report the quantity as
+        # unmodelled, not wrong.
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path_ref,
+            reason="quantity_kind=QuantityKind.OTHER has no unit admission vocabulary -- "
+            "_ActiveTableBinding.derive() deliberately excludes OTHER from spellings_by_quantity, so "
+            "the table-driven admission/maximality gate (Layer 3) cannot honestly check this unit "
+            "against any recorded vocabulary; this quantity is unmodelled, not disagreeing",
+        )
+
     binding = binding_for_known_sha(value.conversion_table_sha256)
     if binding is None:
         return ReplayFinding(
@@ -712,6 +780,135 @@ def verify_measured_value_unit_boundary(
             reason="unit table admission/maximality re-check (Layer 3) failed against re-read "
             f"evidence text: {admission_violation!r} -- the recorded unit is no longer admitted "
             f"(or no longer maximal) against the RECORDED table {value.conversion_table_sha256!r}",
+        )
+
+    return None
+
+
+def _value_boundary_violation(text: str, start: int, end: int) -> str | None:
+    """Re-run VALUE-role boundary/maximality (the numeral half of D-U2) over
+    ``text[start:end]``, mirroring
+    :func:`carmel.services.dataset_producer.ground_quote`'s ``role=QuoteRole.VALUE``
+    branch exactly, but RETURNING a discriminant string instead of raising
+    :class:`~carmel.services.dataset_producer.QuoteGroundingError` -- the same
+    return-a-discriminant-or-None convention
+    :func:`carmel.services.numeric.unit_boundary_violation` and
+    :func:`carmel.services.numeric.label_boundary_violation` already use, kept
+    private to this module the same way
+    :func:`carmel.services.dataset_producer._unit_table_boundary_violation` is
+    kept private to ``dataset_producer.py``.
+
+    Built entirely from the same public :mod:`carmel.services.numeric`
+    primitives ``ground_quote`` itself uses for VALUE role
+    (:data:`~carmel.services.numeric.NUMERAL_CANDIDATE_RE`,
+    :func:`~carmel.services.numeric.find_numeral_extent`,
+    :func:`~carmel.services.numeric.enclosing_numeric_construct`,
+    :func:`~carmel.services.numeric.has_clean_token_boundary`) -- this
+    function re-derives no new policy, it only re-runs the existing one.
+
+    Returns ``None`` when the span is a clean, maximal VALUE-role quote;
+    otherwise a short discriminant string naming which check failed.
+    """
+    quote = text[start:end]
+    if NUMERAL_CANDIDATE_RE.fullmatch(quote):
+        extent = find_numeral_extent(text, start)
+        if extent is None:
+            return "value_no_clean_numeral_extent"
+        if extent != (start, end):
+            return "value_interior_numeral_fragment"
+        construct = enclosing_numeric_construct(text, start, end)
+        if construct == "ascii6_uncertainty":
+            return "value_ascii6_uncertainty_fragment"
+        if construct == "spaced_range":
+            return "value_spaced_range_fragment"
+        if construct == "flattened_scientific":
+            return "value_flattened_scientific_fragment"
+        return None
+    if not has_clean_token_boundary(text, start, end):
+        return "value_not_clean_token_boundary"
+    return None
+
+
+def verify_measured_value_value_boundary(
+    path: str,
+    value: MeasuredValue,
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding] | None = None,
+) -> ReplayFinding | None:
+    """Re-run VALUE-role boundary/maximality re-checking (the numeral half of
+    D-U2) against the INDEPENDENTLY RE-READ evidence text sliced at the
+    RECORDED ``value_ref`` locator -- symmetric with
+    :func:`verify_measured_value_unit_boundary`'s UNIT-role re-check.
+
+    :func:`check_char_spans` only re-slices ``value_ref`` and string-compares
+    it against the recorded ``raw_text``; it never re-runs VALUE-role
+    maximality. That means a ``value_ref`` moved to an interior fragment of a
+    larger numeral (e.g. pointing at ``"1023"`` inside ``"11023"``) still
+    replays ``VERIFIED`` under ``check_char_spans`` alone, because the
+    re-sliced substring still equals the recorded quote character-for-character
+    -- the re-slice check has no way to see that the recorded span is no
+    longer a MAXIMAL, boundary-clean numeral. This function closes that gap
+    the same way :func:`verify_measured_value_unit_boundary` closed the
+    analogous UNIT-role gap.
+
+    Returns ``None`` when the recorded ``value_ref`` cleanly re-verifies;
+    otherwise a :class:`ReplayFinding`: ``FAILED`` for a genuine boundary
+    violation (the re-read text no longer grounds the recorded span as a
+    clean, maximal VALUE-role quote), ``UNVERIFIABLE`` for anything this gate
+    could not run against (a non-:class:`CharSpanLocator` locator, missing or
+    unreadable node text, an out-of-range locator) -- a skipped check never
+    yields ``None`` unpaired with a finding.
+    """
+    node_problems = node_problems or {}
+    value_node_id = value.value_ref.node_id
+    value_locator = value.value_ref.locator
+    path_ref = f"{path}.value_ref"
+
+    if not isinstance(value_locator, CharSpanLocator):
+        # Every other SourceLocator kind carries no character span for this
+        # gate to re-run against; check_char_spans already re-slices those
+        # kinds on their own terms. Reported as UNVERIFIABLE, never a silent
+        # None, so a skipped check never reads as clean.
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path_ref,
+            reason=f"value_ref.locator is a {type(value_locator).__name__}, not a CharSpanLocator -- "
+            "the VALUE-role boundary/maximality gate has nothing to re-run against a locator that "
+            "carries no character span; this is reported as unverified, not silently skipped",
+        )
+
+    if value_node_id in node_problems:
+        problem = node_problems[value_node_id]
+        return ReplayFinding(category=problem.category, ref_path=path_ref, reason=problem.reason)
+
+    text = text_by_node_id.get(value_node_id)
+    if text is None:
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path_ref,
+            reason=f"references node_id={value_node_id!r}, which is not present in "
+            "envelope.source_graph and was never independently checked, so the VALUE-role "
+            "boundary/maximality gate cannot be re-run",
+        )
+
+    start, end = value_locator.start, value_locator.end
+    if not (0 <= start < end <= len(text)):
+        return ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path_ref,
+            reason=f"value_ref locator [{start}:{end}] is out of range for the independently "
+            f"re-verified text of node_id={value_node_id!r} (len={len(text)}) -- cannot re-slice "
+            "to re-run the boundary/maximality gate",
+        )
+
+    violation = _value_boundary_violation(text, start, end)
+    if violation is not None:
+        return ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path_ref,
+            reason="value boundary/maximality re-check failed against re-read evidence text: "
+            f"{violation!r} -- the recorded value locator no longer grounds a clean, maximal "
+            "VALUE-role quote; ground_quote would refuse this exact quote today",
         )
 
     return None
@@ -762,6 +959,9 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         boundary_finding = verify_measured_value_unit_boundary(path, value, text_by_node_id, node_problems)
         if boundary_finding is not None:
             unit_findings.append(boundary_finding)
+        value_boundary_finding = verify_measured_value_value_boundary(path, value, text_by_node_id, node_problems)
+        if value_boundary_finding is not None:
+            unit_findings.append(value_boundary_finding)
 
     # Every node's own problem is surfaced regardless of whether any
     # char-span ref happens to reach it -- an unreferenced node (or one

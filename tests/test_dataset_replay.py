@@ -36,6 +36,7 @@ from carmel.schemas.datasets import (
     SourceRef,
     TextSpace,
     ValueOrigin,
+    XPathLocator,
 )
 from carmel.schemas.literature import StoredArtifact
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
@@ -45,6 +46,7 @@ from carmel.services.dataset_replay import (
     replay_envelope,
     verify_measured_value_unit,
     verify_measured_value_unit_boundary,
+    verify_measured_value_value_boundary,
 )
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
@@ -607,6 +609,172 @@ class TestVerifyMeasuredValueUnitBoundary:
         )
         assert finding.category is ReplayOutcome.FAILED
         assert "unit_digit_glue_no_value_span" in finding.reason
+
+    def test_non_char_span_unit_locator_is_unverifiable_not_silently_clean(self) -> None:
+        # A unit_ref whose locator is NOT a CharSpanLocator (e.g. XPathLocator)
+        # used to make verify_measured_value_unit_boundary return a bare
+        # `None` -- indistinguishable from "checked and clean". Nothing in
+        # check_char_spans catches this either (it also only handles
+        # CharSpanLocator refs), so such a value was invisible to every
+        # boundary/admission check the replayer runs, yet still replayed
+        # VERIFIED. This must surface as a named UNVERIFIABLE finding.
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("paper", _TEXT.index("1023"), _TEXT.index("1023") + 4),
+            unit_ref=SourceRef(node_id="paper", locator=XPathLocator(kind=LocatorKind.XPATH, xpath="//p[1]")),
+        )
+
+        finding = verify_measured_value_unit_boundary("dummy.path", value, {"paper": _TEXT})
+        assert finding is not None, (
+            "a non-CharSpanLocator unit_ref must never silently verify -- the boundary/admission "
+            "gate cannot re-run against a locator that carries no character span, so this must be "
+            "reported, not skipped"
+        )
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "unit_ref" in finding.ref_path
+
+    def test_quantity_kind_other_is_unverifiable_not_failed(self) -> None:
+        # QuantityKind.OTHER has no admission vocabulary at all --
+        # binding.spellings_by_quantity has no entry for OTHER (by design,
+        # see _ActiveTableBinding.derive), so
+        # _unit_table_boundary_violation's `.get(quantity, frozenset())`
+        # always falls back to an empty set and unconditionally returns
+        # "unit_not_in_vocabulary" for OTHER, reported as FAILED -- as if the
+        # recorded unit were demonstrably wrong. It is not wrong; it is
+        # simply unmodelled, and ground_quote itself refuses to ever produce
+        # an OTHER unit quote at write time (Layer 0). Replay must report
+        # this honestly as UNVERIFIABLE, not FAILED.
+        text = "The reading was 5 widgets exactly."
+        start = text.index("widgets")
+        end = start + len("widgets")
+        assert text[start:end] == "widgets"
+
+        value = MeasuredValue.model_construct(
+            raw_text="5",
+            canonical_decimal_value="5",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.OTHER,
+            unit_raw="widgets",
+            unit_normalized="widgets",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("paper", text.index("5"), text.index("5") + 1),
+            unit_ref=self._ref("paper", start, end),
+        )
+
+        finding = verify_measured_value_unit_boundary("dummy.path", value, {"paper": text})
+        assert finding is not None, (
+            "QuantityKind.OTHER has no admission vocabulary to check against -- this must be "
+            "reported as unverifiable, not silently passed and not reported as a demonstrated "
+            "disagreement"
+        )
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "OTHER" in finding.reason
+
+
+class TestVerifyMeasuredValueValueBoundary:
+    """Focused tests for ``verify_measured_value_value_boundary`` -- closes
+    the symmetric gap ``verify_measured_value_unit_boundary`` closed for
+    UNIT, but for VALUE: ``check_char_spans`` only re-slices ``value_ref``
+    and string-compares to the recorded ``raw_text``, it never re-runs
+    VALUE-role maximality/boundary. A ``value_ref`` moved to land on "1023"
+    INSIDE "11023" replayed VERIFIED even though ``ground_quote`` would
+    refuse that exact quote at write time (an interior fragment of a larger
+    numeral). These tests build the adversarial ``MeasuredValue`` directly,
+    simulating a buggy/hostile producer.
+    """
+
+    @staticmethod
+    def _ref(node_id: str, start: int, end: int) -> SourceRef:
+        return SourceRef(
+            node_id=node_id,
+            locator=CharSpanLocator(
+                kind=LocatorKind.CHAR_SPAN, text_space=TextSpace.EXTRACTED_TEXT, start=start, end=end
+            ),
+        )
+
+    @staticmethod
+    def _repair_dependency() -> SemanticDependencyUse:
+        return SemanticDependencyUse(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+            input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+
+    def test_value_ref_moved_to_interior_numeral_fragment_fails_not_verified(self) -> None:
+        # "1023" glued inside "11023" -- a genuine interior fragment of the
+        # larger numeral "11023". check_char_spans alone would happily
+        # accept this (text[start:end] == "1023" == raw_text), but
+        # ground_quote's VALUE-role maximality check would refuse it at
+        # write time.
+        text = "The reading was 11023 units at closure."
+        start = text.index("11023") + 1
+        end = start + 4
+        assert text[start:end] == "1023"
+
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("paper", start, end),
+            unit_ref=self._ref("paper", 0, 1),
+        )
+
+        finding = verify_measured_value_value_boundary("dummy.path", value, {"paper": text})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert "value_" in finding.reason
+
+    def test_non_char_span_value_locator_is_unverifiable_not_silently_clean(self) -> None:
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=SourceRef(node_id="paper", locator=XPathLocator(kind=LocatorKind.XPATH, xpath="//p[1]")),
+            unit_ref=self._ref("paper", 0, 1),
+        )
+
+        finding = verify_measured_value_value_boundary("dummy.path", value, {"paper": _TEXT})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "value_ref" in finding.ref_path
+
+    def test_clean_measured_value_verifies(self) -> None:
+        start = _TEXT.index("1023")
+        end = start + 4
+        assert _TEXT[start:end] == "1023"
+
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("paper", start, end),
+            unit_ref=self._ref("paper", 0, 1),
+        )
+
+        assert verify_measured_value_value_boundary("dummy.path", value, {"paper": _TEXT}) is None
 
 
 class TestReplayEnvelopeCatchesUnitBoundaryViolation:
