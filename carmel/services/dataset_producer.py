@@ -269,10 +269,35 @@ def ground_quote(
         A ``CharSpanLocator`` with ``text[start:end] == quote``.
 
     Raises:
-        QuoteGroundingError: Empty quote; whitespace-padded quote; quote not
-            found; ambiguous quote with ``occurrence=None``; ``occurrence``
-            out of range; or a role-specific boundary violation.
+        QuoteGroundingError: ``role`` is not a genuine ``QuoteRole`` member
+            (checked FIRST, before any of the checks below, so it is never
+            masked by a later check surfacing first); empty quote;
+            whitespace-padded quote; quote not found; ambiguous quote with
+            ``occurrence=None``; ``occurrence`` out of range; or a
+            role-specific boundary violation.
     """
+    if not isinstance(role, QuoteRole):
+        # Exhaustive, fail-closed dispatch: EVERY call must resolve to one of
+        # the three role-specific boundary rules below, never fall through to
+        # the unconditional assert/return at the bottom of this function via
+        # unguarded substring search. A role that is not a genuine QuoteRole
+        # member -- a plain string that happens to equal a member's value
+        # (e.g. "value"), None, or any other object -- has no boundary rule
+        # that is safe to apply, so it is refused here, up front, rather than
+        # silently skipping every check below (the round-40 regression this
+        # guard exists to close for good). This guard runs FIRST, before even
+        # the empty-quote check, so an invalid role is never masked by a
+        # LATER check surfacing first (round 41: this guard used to run after
+        # the empty/whitespace/find/ambiguity/occurrence checks, so an
+        # invalid role on an ambiguous, padded, or absent quote surfaced as
+        # THAT check's message instead of the role error).
+        raise QuoteGroundingError(
+            f"ground_quote: role={role!r} is not a carmel.services.numeric.QuoteRole "
+            "member -- grounding has no default boundary rule that is safe for every "
+            "quote's job, so a role that is not a genuine QuoteRole member (a plain "
+            "string, None, or any other object) is refused outright rather than "
+            "silently skipping every boundary check"
+        )
     if not quote:
         # CharSpanLocator's own validator would eventually reject the
         # zero-width span this would produce, but with a generic
@@ -319,23 +344,6 @@ def ground_quote(
             )
         start = starts[occurrence]
     end = start + len(quote)
-    if not isinstance(role, QuoteRole):
-        # Exhaustive, fail-closed dispatch: EVERY call must resolve to one of
-        # the three role-specific boundary rules below, never fall through to
-        # the unconditional assert/return at the bottom of this function via
-        # unguarded substring search. A role that is not a genuine QuoteRole
-        # member -- a plain string that happens to equal a member's value
-        # (e.g. "value"), None, or any other object -- has no boundary rule
-        # that is safe to apply, so it is refused here, up front, rather than
-        # silently skipping every check below (the round-40 regression this
-        # guard exists to close for good).
-        raise QuoteGroundingError(
-            f"ground_quote: role={role!r} is not a carmel.services.numeric.QuoteRole "
-            "member -- grounding has no default boundary rule that is safe for every "
-            "quote's job, so a role that is not a genuine QuoteRole member (a plain "
-            "string, None, or any other object) is refused outright rather than "
-            "silently skipping every boundary check"
-        )
     if role is QuoteRole.VALUE:
         # Both VALUE branches below are conditional on a property of `quote`
         # itself (is it numeral-shaped, does it already sit at a clean
@@ -462,16 +470,45 @@ def ground_quote(
                 "'cm3/mol/s', or 'm/s' inside 'm/s2'); quote the full unit if that is "
                 "what is meant"
             )
-        if violation == "unit_digit_glue":
+        if violation == "unit_digit_glue_no_value_span":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} is glued to a preceding digit "
-                "run that is not confirmed as this measurement's own value -- either "
-                "no value_span was supplied, or the preceding digit run does not end "
-                "exactly at this quote (i.e. it is not itself a clean numeral matching "
-                "the value already grounded for this measurement); a unit may only "
-                "abut a digit run on its leading edge when that digit run IS the "
-                "value it is reporting (e.g. the '1023' in '1023K'), never merely "
-                "some other clean numeral (e.g. a run id like the '1' in '1K')"
+                "run, but no value_span was supplied to confirm that digit run is "
+                "this measurement's own value -- fail closed: without value_span the "
+                "leading-edge digit-glue exception never fires, even if the digit run "
+                "is itself a clean numeral (e.g. '1023K' is refused exactly like "
+                "'run3K' when neither call passes value_span); pass the already-"
+                "grounded VALUE locator's span to assert this digit run IS the value "
+                "being reported"
+            )
+        if violation == "unit_digit_glue_value_span_malformed":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is glued to a preceding digit "
+                "run, and the supplied value_span is malformed or out of range for "
+                "the supplied text -- value_span must be a (start, end) pair of ints "
+                "with 0 <= start < end <= len(text); a malformed span proves nothing "
+                "about this measurement's value, so the digit-glue exception is "
+                "refused rather than risk an IndexError/TypeError from inside this gate"
+            )
+        if violation == "unit_digit_glue_value_span_mismatch":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is glued to a preceding digit "
+                "run, but the supplied value_span does not end exactly where this "
+                "quote starts -- a unit may only abut a digit run on its leading edge "
+                "when that digit run IS the value it is reporting (e.g. the '1023' in "
+                "'1023K'), and value_span is how the caller asserts that; a value_span "
+                "ending anywhere else is not a claim about THIS glued digit run"
+            )
+        if violation == "unit_digit_glue_value_span_not_clean_numeral":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is glued to a preceding digit "
+                "run, and the supplied value_span ends exactly where this quote "
+                "starts, but that span is not itself a clean, maximal numeral in "
+                "place -- value_span must name a genuine numeral extent (as "
+                "carmel.services.numeric.find_numeral_extent computes it), never a "
+                "fabricated span drawn around an arbitrary digit run (e.g. a caller "
+                "cannot claim (0, 4) over 'run3K' or (0, 6) over 'case 1K' just "
+                "because the span's end lines up with the unit quote's start)"
             )
     elif role is QuoteRole.LABEL:
         # A label quote (role LABEL) is the strictest role: each edge is

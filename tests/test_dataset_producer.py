@@ -518,6 +518,57 @@ class TestGroundQuoteRoleDispatchIsExhaustive:
         ):
             ground_quote("Kinetics pressure 1023", "K", role=object())  # type: ignore[arg-type]
 
+    # -- Round 41: the guard must run FIRST, before any later check gets a
+    # chance to surface its own message instead. Each test below pairs an
+    # invalid role with a quote that WOULD trip a specific later check (an
+    # ambiguous quote, a quote absent from the text, a whitespace-padded
+    # quote, an out-of-range occurrence) -- previously the role guard ran
+    # after all of these, so the invalid role was masked and the LATER
+    # check's message surfaced instead. Each asserts the role error message
+    # and explicitly asserts the masking check's message text is NOT what
+    # was raised.
+
+    def test_rejects_invalid_role_before_reporting_an_ambiguous_quote(self) -> None:
+        # "300" appears twice with occurrence=None (the default) -- this
+        # would normally raise the "appears 2 times" ambiguity error. The
+        # role guard must preempt it.
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ) as excinfo:
+            ground_quote("300 K and 300 K again", "300", role=None)  # type: ignore[arg-type]
+        assert "appears" not in str(excinfo.value)
+
+    def test_rejects_invalid_role_before_reporting_a_quote_not_found(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ) as excinfo:
+            ground_quote("Kinetics pressure 1023", "xyz", role=None)  # type: ignore[arg-type]
+        assert "was not found" not in str(excinfo.value)
+
+    def test_rejects_invalid_role_before_reporting_whitespace_padding(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ) as excinfo:
+            ground_quote("Kinetics pressure 1023", " K", role=None)  # type: ignore[arg-type]
+        assert "leading or trailing whitespace" not in str(excinfo.value)
+
+    def test_rejects_invalid_role_before_reporting_an_out_of_range_occurrence(self) -> None:
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ) as excinfo:
+            ground_quote("abc abc", "abc", occurrence=5, role=None)  # type: ignore[arg-type]
+        assert "out of range" not in str(excinfo.value)
+
+    def test_rejects_invalid_role_with_an_empty_quote(self) -> None:
+        # The role guard is the VERY FIRST statement in the function body,
+        # ahead of even the empty-quote check, so an invalid role is refused
+        # here too, not with the empty-quote message.
+        with pytest.raises(
+            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
+        ) as excinfo:
+            ground_quote("Kinetics pressure 1023", "", role=None)  # type: ignore[arg-type]
+        assert "empty" not in str(excinfo.value)
+
 
 class TestGroundQuoteNonNumericTokenBoundary:
     """A non-numeric quote (a unit or a label) never fullmatches
@@ -614,11 +665,42 @@ class TestGroundQuoteNonNumericTokenBoundary:
 
     def test_rejects_unit_glued_to_a_non_numeral_digit_run(self) -> None:
         # "K" is immediately preceded by a digit ("3"), which is the leading-
-        # edge glue exception's shape -- but that "3" is the tail of the word
-        # "run3", not a clean numeral, and no value_span is supplied either.
-        # The exception must NOT fire here.
-        with pytest.raises(QuoteGroundingError, match="not itself a clean numeral"):
-            ground_quote("run3K reactor", "K", role=QuoteRole.UNIT)
+        # edge glue exception's shape. A caller supplies a value_span whose
+        # end lines up exactly with "K"'s start -- (3, 4) -- but that span is
+        # NOT a genuine numeral extent: find_numeral_extent(text, 3) is None
+        # because "3" is the tail of the word "run3", not a numeral in its
+        # own right (preceded by the letter "n"). Round 41: the FIRST fix
+        # only checked value_span[1] == start and would have wrongly let
+        # this fire; the current rule independently recomputes
+        # find_numeral_extent and refuses because the span names no real
+        # numeral at all.
+        with pytest.raises(
+            QuoteGroundingError, match="not itself a clean, maximal numeral in place"
+        ):
+            ground_quote("run3K reactor", "K", role=QuoteRole.UNIT, value_span=(3, 4))
+
+    def test_rejects_a_fabricated_value_span_with_no_numeral_at_its_start(self) -> None:
+        # Round 41's exact exploit: a caller fabricates value_span=(0, 4)
+        # over "run3K reactor" -- its end (4) lines up with "K"'s start, so
+        # the OLD (first-attempt) fix, which only checked that alignment,
+        # would have wrongly fired the glue exception. find_numeral_extent
+        # at index 0 is None ("r" is not a digit/sign), so the span names no
+        # real numeral and must be refused.
+        with pytest.raises(
+            QuoteGroundingError, match="not itself a clean, maximal numeral in place"
+        ):
+            ground_quote("run3K reactor", "K", role=QuoteRole.UNIT, value_span=(0, 4))
+
+    def test_rejects_a_fabricated_value_span_spanning_unrelated_text(self) -> None:
+        # A second shape of the same round-41 exploit: value_span=(0, 6)
+        # over "case 1K was run" ends exactly at "K"'s start (6) but starts
+        # at "c", not a numeral -- find_numeral_extent(text, 0) is None, so
+        # the span is refused as not naming a genuine numeral, regardless of
+        # where its end happens to land.
+        with pytest.raises(
+            QuoteGroundingError, match="not itself a clean, maximal numeral in place"
+        ):
+            ground_quote("case 1K was run", "K", role=QuoteRole.UNIT, value_span=(0, 6))
 
     def test_rejects_letter_quote_preceded_by_a_digit_without_a_value_span(self) -> None:
         # Round 40, defect 3: fail-closed by default. "1023" is a clean,
@@ -627,16 +709,26 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # caller to additionally supply value_span proving THIS digit run is
         # the measurement's own value; omitting it means the exception never
         # fires, even though the digit run is clean.
-        with pytest.raises(
-            QuoteGroundingError, match="not confirmed as this measurement's own value"
-        ):
+        with pytest.raises(QuoteGroundingError, match="no value_span was supplied to confirm"):
             ground_quote("1023K", "K", role=QuoteRole.UNIT)
 
-    def test_rejects_letter_quote_preceded_by_a_digit_with_a_mismatched_value_span(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not confirmed as this measurement's own value"
-        ):
+    def test_rejects_letter_quote_preceded_by_a_digit_with_a_malformed_value_span(self) -> None:
+        # value_span=(10, 12) is out of range for "1023K" (len 5): a
+        # malformed/out-of-range span proves nothing about this
+        # measurement's value and must be refused defensively, without ever
+        # risking an IndexError/TypeError from inside the boundary gate.
+        with pytest.raises(QuoteGroundingError, match="malformed or out of range"):
             ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(10, 12))
+
+    def test_rejects_letter_quote_preceded_by_a_digit_with_a_mismatched_value_span(self) -> None:
+        # value_span=(0, 3) is well-formed and IS a genuine numeral extent
+        # ("102" in "1023K"), but its end (3) does not equal "K"'s start
+        # (4) -- it is not a claim about THIS glued digit run, so the
+        # exception must not fire.
+        with pytest.raises(
+            QuoteGroundingError, match="does not end exactly where this quote starts"
+        ):
+            ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(0, 3))
 
     def test_accepts_letter_quote_immediately_preceded_by_a_digit(self) -> None:
         # Deliberate asymmetry, load-bearing: NUMERAL_EXTENT_RE's trailing
@@ -644,9 +736,16 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # groundable inside "1023K"). The symmetric consequence is that the
         # unit "K" glued to that same numeral must ALSO stay groundable --
         # this is the ONE exception `unit_boundary_violation` allows, now
-        # gated by an explicit value_span proving "1023" really is THIS
-        # measurement's own value, ending exactly where "K" starts (round 40,
-        # defect 3).
+        # gated by an explicit value_span proving "1023" really is a clean,
+        # maximal numeral ending exactly where "K" starts. This test proves
+        # only that a well-formed, clean, correctly-aligned value_span is
+        # ACCEPTED -- it does not by itself prove value_span is load-bearing
+        # (a stub that ignored value_span entirely would also pass this
+        # test); see
+        # test_value_span_prevents_grounding_a_run_id_digit_as_the_value for
+        # the companion test proving a wrong-but-well-formed value_span is
+        # refused, which is what actually demonstrates value_span is checked
+        # rather than merely accepted.
         locator = ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(0, 4))
         assert (locator.start, locator.end) == (4, 5)
 
@@ -655,15 +754,17 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # independently, so proving "some clean numeral ends here" is not the
         # same claim as "THIS measurement's value ends here". Occurrence 0 of
         # "K" is glued to the run id "1" in "1K" -- itself a clean, maximal
-        # numeral -- but it is NOT this measurement's value ("1023"), so it
-        # must be refused even though it looks exactly like the accepted
-        # shape above. Occurrence 1 is the real unit glued to the real value
-        # and must still be accepted.
+        # numeral -- but it is NOT this measurement's value ("1023"), so its
+        # value_span's end (44) does not match occurrence 0's start (6): a
+        # value_span/quote-start MISMATCH, not a malformed or non-numeral
+        # span, so it must be refused even though it looks exactly like the
+        # accepted shape above. Occurrence 1 is the real unit glued to the
+        # real value and must still be accepted.
         text = "case 1K was the run id. Temperature was 1023 K"
         value_locator = ground_quote(text, "1023", role=QuoteRole.VALUE)
         value_span = (value_locator.start, value_locator.end)
         with pytest.raises(
-            QuoteGroundingError, match="not confirmed as this measurement's own value"
+            QuoteGroundingError, match="does not end exactly where this quote starts"
         ):
             ground_quote(text, "K", role=QuoteRole.UNIT, occurrence=0, value_span=value_span)
         locator = ground_quote(text, "K", role=QuoteRole.UNIT, occurrence=1, value_span=value_span)

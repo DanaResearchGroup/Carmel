@@ -427,29 +427,72 @@ def unit_boundary_violation(
 
     ONE exception, leading edge only, gated by ``value_span``: the unit quote
     MAY abut a preceding digit run if -- and only if -- ``value_span`` is
-    supplied AND its end is exactly ``start``, i.e. the caller has already
-    independently grounded a VALUE quote and is asserting that THIS digit run
-    IS that value, not merely some clean numeral. This is deliberately
-    stricter than "is there a clean numeral here": round 40 found that
-    checking cleanliness alone (via :func:`find_numeral_extent`) proves "SOME
-    clean numeral ends here", not "THIS measurement's value ends here" --
-    value and unit are grounded independently, so e.g. the run id ``"1"`` in
-    ``"case 1K was the run id. Temperature was 1023 K"`` is itself a clean,
-    maximal numeral and would wrongly satisfy a cleanliness-only check. Without
-    a ``value_span`` (the default), the exception never fires -- fail closed,
-    not fail open -- which is why ``"1023K"`` + quote ``"K"`` with no
-    ``value_span`` now refuses exactly like ``"run3K"`` + quote ``"K"`` does;
-    only a caller that supplies the matching value span (as
-    :func:`carmel.services.dataset_producer._measured_value` does, from the
-    VALUE locator it already grounded) gets the glue exception.
+    supplied, well-formed, its end is exactly ``start``, AND it names a
+    genuine, maximal numeral extent in place (per :func:`find_numeral_extent`),
+    i.e. the caller has already independently grounded a VALUE quote and is
+    asserting that THIS digit run IS that value, not merely some clean
+    numeral. This is deliberately stricter than "is there a clean numeral
+    here": round 40 found that checking cleanliness alone proves "SOME clean
+    numeral ends here", not "THIS measurement's value ends here" -- value and
+    unit are grounded independently, so e.g. the run id ``"1"`` in ``"case 1K
+    was the run id. Temperature was 1023 K"`` is itself a clean, maximal
+    numeral and would wrongly satisfy a cleanliness-only check. Round 41
+    found the FIRST fix for this only checked ``value_span[1] == start`` and
+    never validated the span content at all, so a caller could fabricate an
+    arbitrary ``value_span`` (e.g. ``(0, 4)`` over ``"run3K"``) and the
+    exception would fire regardless -- this function now independently
+    recomputes :func:`find_numeral_extent` at ``value_span[0]`` and refuses
+    unless it equals ``value_span`` exactly, so the span must name a REAL
+    numeral, not just line up its end. ``value_span`` is also validated
+    defensively before any of this: it must be a ``(start, end)`` pair of
+    ints with ``0 <= start < end <= len(text)``, or the exception is refused
+    without ever risking an ``IndexError``/``TypeError`` from inside this
+    gate. Without a ``value_span`` (the default), the exception never fires
+    -- fail closed, not fail open -- which is why ``"1023K"`` + quote ``"K"``
+    with no ``value_span`` now refuses exactly like ``"run3K"`` + quote
+    ``"K"`` does; only a caller that supplies the matching, genuine value
+    span (as :func:`carmel.services.dataset_producer._measured_value` does,
+    from the VALUE locator it already grounded) gets the glue exception.
+
+    Four distinct discriminants distinguish the ways this exception can fail
+    to fire, each mapped to its own message by
+    :func:`carmel.services.dataset_producer.ground_quote` (the
+    enclosing_numeric_construct pattern again -- this project has hit masked,
+    indistinguishable refusals of this shape before):
+
+    - ``"unit_digit_glue_no_value_span"``: no ``value_span`` was supplied at
+      all.
+    - ``"unit_digit_glue_value_span_malformed"``: ``value_span`` was
+      supplied but is not a well-formed ``(start, end)`` int pair with
+      ``0 <= start < end <= len(text)``.
+    - ``"unit_digit_glue_value_span_mismatch"``: ``value_span`` is
+      well-formed but its end does not equal ``start`` (the unit quote's own
+      start).
+    - ``"unit_digit_glue_value_span_not_clean_numeral"``: ``value_span``'s
+      end matches, but the span is not itself a clean, maximal numeral
+      extent in place.
     """
     if start >= end:
         return None
     if start > 0:
         lead_prev = text[start - 1]
         if lead_prev.isdigit():
-            if value_span is None or value_span[1] != start:
-                return "unit_digit_glue"
+            if value_span is None:
+                return "unit_digit_glue_no_value_span"
+            if (
+                not isinstance(value_span, tuple)
+                or len(value_span) != 2
+                or isinstance(value_span[0], bool)
+                or isinstance(value_span[1], bool)
+                or not isinstance(value_span[0], int)
+                or not isinstance(value_span[1], int)
+                or not 0 <= value_span[0] < value_span[1] <= len(text)
+            ):
+                return "unit_digit_glue_value_span_malformed"
+            if value_span[1] != start:
+                return "unit_digit_glue_value_span_mismatch"
+            if find_numeral_extent(text, value_span[0]) != value_span:
+                return "unit_digit_glue_value_span_not_clean_numeral"
         elif not (lead_prev.isspace() or lead_prev in _UNIT_LEADING_ALLOWLIST):
             return "unit_leading_adjacency"
     if end < len(text):
