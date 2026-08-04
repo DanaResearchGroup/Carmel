@@ -953,7 +953,7 @@ def table_for_sha(sha256: str) -> ConversionTable:
         ) from None
 
 
-def normalize_unit(quantity: QuantityKind, unit_raw: str, *, table: ConversionTable = TABLE_V1) -> str:
+def normalize_unit(quantity: QuantityKind, unit_raw: str, *, table: ConversionTable) -> str:
     """Normalize ``unit_raw``'s SPELLING to this table's canonical spelling for ``quantity``.
 
     Strips surrounding whitespace ONLY -- no case folding, no NFC/NFKC
@@ -965,8 +965,9 @@ def normalize_unit(quantity: QuantityKind, unit_raw: str, *, table: ConversionTa
     Args:
         quantity: Which quantity ``unit_raw`` is claimed to measure.
         unit_raw: The raw, as-extracted unit spelling.
-        table: The conversion table to normalize against. Defaults to
-            :data:`TABLE_V1`.
+        table: The conversion table to normalize against. Required -- callers
+            must name the table explicitly rather than relying on a default
+            that could silently diverge from the table actually in force.
 
     Returns:
         - If ``quantity`` is ``QuantityKind.OTHER``: the stripped text,
@@ -1120,7 +1121,7 @@ def convert(
     quantity: QuantityKind,
     from_unit: str,
     to_unit: str,
-    table: ConversionTable = TABLE_V1,
+    table: ConversionTable,
 ) -> Converted:
     """Convert ``value`` from ``from_unit`` to ``to_unit`` for ``quantity``.
 
@@ -1163,7 +1164,9 @@ def convert(
         quantity: Which quantity is being converted.
         from_unit: The already-normalized source unit.
         to_unit: The already-normalized target unit.
-        table: The conversion table to use. Defaults to :data:`TABLE_V1`.
+        table: The conversion table to use. Required -- callers must name the
+            table explicitly rather than relying on a default that could
+            silently diverge from the table actually in force.
 
     Returns:
         A :class:`Converted` recording both the exact and the rounded result.

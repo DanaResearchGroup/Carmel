@@ -356,58 +356,58 @@ class TestTableInvariants:
 class TestNormalizeUnit:
     def test_micro_sign_spelling_of_microseconds(self) -> None:
         # U+00B5 MICRO SIGN
-        assert normalize_unit(QuantityKind.TIME, "µs") == "us"
+        assert normalize_unit(QuantityKind.TIME, "µs", table=TABLE_V1) == "us"
 
     def test_greek_mu_spelling_of_microseconds(self) -> None:
         # U+03BC GREEK SMALL LETTER MU
-        assert normalize_unit(QuantityKind.TIME, "μs") == "us"
+        assert normalize_unit(QuantityKind.TIME, "μs", table=TABLE_V1) == "us"
 
     def test_degrees_celsius_alias(self) -> None:
-        assert normalize_unit(QuantityKind.TEMPERATURE, "°C") == "C"
+        assert normalize_unit(QuantityKind.TEMPERATURE, "°C", table=TABLE_V1) == "C"
 
     def test_already_normalized_unit_returns_unchanged(self) -> None:
-        assert normalize_unit(QuantityKind.PRESSURE, "Pa") == "Pa"
+        assert normalize_unit(QuantityKind.PRESSURE, "Pa", table=TABLE_V1) == "Pa"
 
     def test_unknown_unit_raises_naming_known_units(self) -> None:
         with pytest.raises(UnknownUnitError, match="known units"):
-            normalize_unit(QuantityKind.LENGTH, "furlong")
+            normalize_unit(QuantityKind.LENGTH, "furlong", table=TABLE_V1)
 
     def test_case_is_not_folded_kelvin_normalizes(self) -> None:
-        assert normalize_unit(QuantityKind.TEMPERATURE, "K") == "K"
+        assert normalize_unit(QuantityKind.TEMPERATURE, "K", table=TABLE_V1) == "K"
 
     def test_case_is_not_folded_lowercase_k_is_unknown(self) -> None:
         # "k" (a kilo- prefix fragment) must never be silently treated as "K" (kelvin).
         with pytest.raises(UnknownUnitError):
-            normalize_unit(QuantityKind.TEMPERATURE, "k")
+            normalize_unit(QuantityKind.TEMPERATURE, "k", table=TABLE_V1)
 
     def test_other_quantity_passes_text_through_unchanged(self) -> None:
-        assert normalize_unit(QuantityKind.OTHER, "anything at all") == "anything at all"
+        assert normalize_unit(QuantityKind.OTHER, "anything at all", table=TABLE_V1) == "anything at all"
 
     def test_empty_string_raises(self) -> None:
         with pytest.raises(UnknownUnitError):
-            normalize_unit(QuantityKind.LENGTH, "")
+            normalize_unit(QuantityKind.LENGTH, "", table=TABLE_V1)
 
     def test_whitespace_only_raises(self) -> None:
         with pytest.raises(UnknownUnitError):
-            normalize_unit(QuantityKind.LENGTH, "   ")
+            normalize_unit(QuantityKind.LENGTH, "   ", table=TABLE_V1)
 
     def test_surrounding_whitespace_is_stripped(self) -> None:
-        assert normalize_unit(QuantityKind.LENGTH, "  cm  ") == "cm"
+        assert normalize_unit(QuantityKind.LENGTH, "  cm  ", table=TABLE_V1) == "cm"
 
     def test_ppm_is_a_known_mole_fraction_unit(self) -> None:
-        assert normalize_unit(QuantityKind.MOLE_FRACTION, "ppm") == "ppm"
+        assert normalize_unit(QuantityKind.MOLE_FRACTION, "ppm", table=TABLE_V1) == "ppm"
 
     def test_ppm_is_a_known_mass_fraction_unit(self) -> None:
-        assert normalize_unit(QuantityKind.MASS_FRACTION, "ppm") == "ppm"
+        assert normalize_unit(QuantityKind.MASS_FRACTION, "ppm", table=TABLE_V1) == "ppm"
 
     def test_ppmv_aliases_to_ppm_for_mole_fraction(self) -> None:
-        assert normalize_unit(QuantityKind.MOLE_FRACTION, "ppmv") == "ppm"
+        assert normalize_unit(QuantityKind.MOLE_FRACTION, "ppmv", table=TABLE_V1) == "ppm"
 
     def test_ppmv_is_not_a_mass_fraction_alias(self) -> None:
         # ppmv is explicitly volume/mole basis; it must not be usable as a
         # mass-fraction spelling even though bare "ppm" is representable there.
         with pytest.raises(UnknownUnitError):
-            normalize_unit(QuantityKind.MASS_FRACTION, "ppmv")
+            normalize_unit(QuantityKind.MASS_FRACTION, "ppmv", table=TABLE_V1)
 
 
 class TestConvertTemperatureAffineRounding:
@@ -420,7 +420,7 @@ class TestConvertTemperatureAffineRounding:
     """
 
     def test_25_degrees_exact_and_rounded_to_whole_kelvin(self) -> None:
-        result = convert("25", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K")
+        result = convert("25", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K", table=TABLE_V1)
         assert result.exact == "298.15"
         assert result.rounded == "298"
         assert result.rule_kind == "affine"
@@ -431,12 +431,12 @@ class TestConvertTemperatureAffineRounding:
         assert result.conversion_table_sha256 == TABLE_V1.sha256
 
     def test_25_point_0_degrees_rounds_to_tenths(self) -> None:
-        result = convert("25.0", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K")
+        result = convert("25.0", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K", table=TABLE_V1)
         assert result.exact == "298.15"
         assert result.rounded == "298.2"
 
     def test_25_point_00_degrees_needs_no_rounding(self) -> None:
-        result = convert("25.00", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K")
+        result = convert("25.00", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K", table=TABLE_V1)
         assert result.exact == "298.15"
         assert result.rounded == "298.15"
 
@@ -445,7 +445,7 @@ class TestConvertPressureScaleRounding:
     """1.23 atm -> Pa: scale rounding respects the source's RELATIVE precision (significant digits)."""
 
     def test_exact_and_rounded_values(self) -> None:
-        result = convert("1.23", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+        result = convert("1.23", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
         assert result.exact == "124629.75"
         assert result.rounded == "1.25E+5"
         assert result.rule_kind == "scale"
@@ -460,7 +460,7 @@ class TestConvertPressureScaleRounding:
         # any other canonical decimal; it is not an edge case this module
         # treats differently. Pinned here because the module docstring cites
         # this exact example as the significance-stance evidence.
-        result = convert("0", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+        result = convert("0", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
         assert result.exact == "0"
         assert result.rounded == "0"
 
@@ -469,12 +469,12 @@ class TestConvertMoleFractionPpmScaling:
     """1 ppm -> mole fraction: pins Item 1's new ScaleRule at its documented scale."""
 
     def test_one_ppm_is_one_millionth(self) -> None:
-        result = convert("1", quantity=QuantityKind.MOLE_FRACTION, from_unit="ppm", to_unit="1")
+        result = convert("1", quantity=QuantityKind.MOLE_FRACTION, from_unit="ppm", to_unit="1", table=TABLE_V1)
         assert result.exact == "0.000001"
         assert result.rule_kind == "scale"
 
     def test_mass_fraction_ppm_is_also_representable(self) -> None:
-        result = convert("1", quantity=QuantityKind.MASS_FRACTION, from_unit="ppm", to_unit="1")
+        result = convert("1", quantity=QuantityKind.MASS_FRACTION, from_unit="ppm", to_unit="1", table=TABLE_V1)
         assert result.exact == "0.000001"
 
 
@@ -483,7 +483,7 @@ class TestConvertVelocityScaleRounding:
         # cm/s -> m/s is a factor of exactly 0.01 (a power of ten), so shifting
         # the decimal point never manufactures extra coefficient digits --
         # exact and rounded coincide here only because of that, not in general.
-        result = convert("1.23", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s")
+        result = convert("1.23", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s", table=TABLE_V1)
         assert result.exact == "0.0123"
         assert result.rounded == "0.0123"
         assert result.quantity is QuantityKind.VELOCITY
@@ -495,8 +495,8 @@ class TestConvertVelocityScaleRounding:
         # "1.230" carries 4 significant figures, "1.23" carries 3; both are
         # numerically equal before conversion, but the ROUNDED result must
         # differ afterward because the two inputs claim different precision.
-        result_3sf = convert("1.23", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s")
-        result_4sf = convert("1.230", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s")
+        result_3sf = convert("1.23", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s", table=TABLE_V1)
+        result_4sf = convert("1.230", quantity=QuantityKind.VELOCITY, from_unit="cm/s", to_unit="m/s", table=TABLE_V1)
         assert result_3sf.rounded == "0.0123"
         assert result_4sf.rounded == "0.01230"
         assert result_3sf.rounded != result_4sf.rounded
@@ -522,7 +522,7 @@ class TestRoundHalfEvenPinnedMode:
         is either a power of ten (which never rounds) or 101325 (whose
         products do not land on an exact half at the source's significance).
         """
-        result = convert("0.5", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K")
+        result = convert("0.5", quantity=QuantityKind.TEMPERATURE, from_unit="C", to_unit="K", table=TABLE_V1)
         assert result.exact == "273.65"
         assert result.rounded == "273.6"
         # Demonstrate the disagreement rather than asserting it: the other mode
@@ -534,25 +534,25 @@ class TestRoundHalfEvenPinnedMode:
 class TestConvertQuantityUnitPairErrors:
     def test_refuses_cross_quantity_pair(self) -> None:
         with pytest.raises(UnknownQuantityUnitPairError):
-            convert("1", quantity=QuantityKind.TIME, from_unit="1/s", to_unit="s")
+            convert("1", quantity=QuantityKind.TIME, from_unit="1/s", to_unit="s", table=TABLE_V1)
 
     def test_refuses_non_canonical_input_value(self) -> None:
         with pytest.raises(UnitError):
-            convert("+1.5", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+            convert("+1.5", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
 
     def test_refuses_to_unit_that_is_not_the_quantity_base_unit(self) -> None:
         with pytest.raises(UnknownQuantityUnitPairError):
-            convert("1.23", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="atm")
+            convert("1.23", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="atm", table=TABLE_V1)
 
     def test_other_refuses_non_identity_pair_for_other_quantity(self) -> None:
         with pytest.raises(UnknownQuantityUnitPairError):
-            convert("1.23", quantity=QuantityKind.OTHER, from_unit="C", to_unit="F")
+            convert("1.23", quantity=QuantityKind.OTHER, from_unit="C", to_unit="F", table=TABLE_V1)
 
     def test_other_identity_pair_succeeds(self) -> None:
         # QuantityKind.OTHER has no registered rules at all (invariant 7), so
         # the only pair convert() can ever accept for it is from_unit ==
         # to_unit -- a pure passthrough with no fabricated factor.
-        result = convert("1.23", quantity=QuantityKind.OTHER, from_unit="anything", to_unit="anything")
+        result = convert("1.23", quantity=QuantityKind.OTHER, from_unit="anything", to_unit="anything", table=TABLE_V1)
         assert result.exact == "1.23"
         assert result.rounded == "1.23"
         assert result.rule_kind == "identity"
@@ -586,17 +586,17 @@ class TestConversionResultsStayRepresentable:
     def test_scale_result_past_the_adjusted_exponent_bound_is_refused(self) -> None:
         # 1E+999 atm is an acceptable canonical decimal; x101325 is not.
         with pytest.raises(UnitError, match="not a representable canonical decimal"):
-            convert("1E+999", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+            convert("1E+999", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
 
     def test_a_result_inside_the_bound_is_returned_unchanged(self) -> None:
         # The guard is a pure bounds check: str(Decimal) is already the
         # canonical rendering, so an in-range result keeps its exact characters.
-        result = convert("1E+900", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+        result = convert("1E+900", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
         assert result.exact == "1.01325E+905"
 
     def test_the_refusal_names_the_operands(self) -> None:
         with pytest.raises(UnitError, match="from 'atm' to 'Pa'"):
-            convert("1E+999", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+            convert("1E+999", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
 
     def test_the_exact_guard_is_load_bearing_on_its_own(self) -> None:
         """A result whose EXACT form overflows while its ROUNDED form does not.
@@ -611,7 +611,7 @@ class TestConversionResultsStayRepresentable:
         """
         value = "1." + "3" * 999
         with pytest.raises(UnitError, match="exact result"):
-            convert(value, quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa")
+            convert(value, quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa", table=TABLE_V1)
 
 
 class TestShippedTablesAreNeverRemoved:
@@ -662,3 +662,24 @@ class TestShippedTablesAreNeverRemoved:
             "be removed or replaced in place -- add a replacement table ALONGSIDE it instead, and "
             "keep the old sha256 in TABLES_BY_SHA (and in this test's historically-shipped set)"
         )
+
+
+class TestTableIsRequiredNotDefaulted:
+    """``table`` must be a required keyword-only argument on both functions.
+
+    A default of ``table: ConversionTable = TABLE_V1`` would let a call site
+    silently agree with TABLE_V1 by omission rather than by explicit choice,
+    which defeats any invariant that depends on every table-consuming site
+    naming its table. Pinning the ``TypeError`` here is what keeps a future
+    "helpful" default from being reintroduced unnoticed.
+    """
+
+    def test_normalize_unit_without_table_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            normalize_unit(QuantityKind.PRESSURE, "Pa")  # type: ignore[call-arg]
+
+    def test_convert_without_table_raises_type_error(self) -> None:
+        with pytest.raises(TypeError):
+            convert(  # type: ignore[call-arg]
+                "1.23", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa"
+            )
