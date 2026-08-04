@@ -594,11 +594,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # unit Kelvin. "K" is the first letter of "Kinetics", so this is a
         # TRAILING-edge violation (the "i" right after it).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("Kinetics pressure 1023", "K", role=QuoteRole.UNIT)
+            ground_quote(
+                "Kinetics pressure 1023", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+            )
 
     def test_rejects_quote_that_is_a_prefix_of_a_larger_word(self) -> None:
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("5 atm", "at", role=QuoteRole.UNIT)
+            ground_quote("5 atm", "at", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE)
 
     def test_rejects_unit_fragment_of_a_compound_unit(self) -> None:
         # "cm3" is a real unit-shaped token on its own, but here it is only
@@ -606,14 +608,18 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # "/" is not on the trailing allowlist, so this is a fragment, not
         # the whole unit.
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("k = 1.0 cm3/mol/s", "cm3", role=QuoteRole.UNIT)
+            ground_quote(
+                "k = 1.0 cm3/mol/s", "cm3", role=QuoteRole.UNIT, quantity=QuantityKind.VOLUME
+            )
 
     def test_rejects_unit_fragment_truncating_an_exponent(self) -> None:
         # "m/s" is a real unit on its own, but here it is truncating "m/s2"
         # -- the trailing "2" is a digit, not on the trailing allowlist, so
         # quoting only "m/s" silently drops the exponent.
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("a = 9.8 m/s2", "m/s", role=QuoteRole.UNIT)
+            ground_quote(
+                "a = 9.8 m/s2", "m/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY
+            )
 
     def test_rejects_unit_quote_followed_by_an_open_paren(self) -> None:
         # "(" is LEADING-only on the unit allowlist -- a unit may OPEN a
@@ -621,7 +627,9 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # trailing edge, so "bar" inside "bar(a)" is refused, not silently
         # accepted as plain "bar" (round 40, defect 2, confirmed-bad case).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("the pressure was 1 bar(a)", "bar", role=QuoteRole.UNIT)
+            ground_quote(
+                "the pressure was 1 bar(a)", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE
+            )
 
     def test_rejects_unit_quote_followed_by_a_unicode_minus_sign(self) -> None:
         # U+2212 MINUS SIGN -- not the ASCII hyphen, not on the trailing
@@ -629,19 +637,19 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # (`_UNIT_TOKEN_SYMBOLS`) missed this character entirely (round 40,
         # defect 2, confirmed-bad case).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("k = 3 s−1", "s", role=QuoteRole.UNIT)
+            ground_quote("k = 3 s−1", "s", role=QuoteRole.UNIT, quantity=QuantityKind.TIME)
 
     def test_rejects_unit_quote_followed_by_an_en_dash(self) -> None:
         # U+2013 EN DASH -- same story as the minus sign above (round 40,
         # defect 2, confirmed-bad case).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("k = 3 s–1", "s", role=QuoteRole.UNIT)
+            ground_quote("k = 3 s–1", "s", role=QuoteRole.UNIT, quantity=QuantityKind.TIME)
 
     def test_rejects_unit_quote_followed_by_a_superscript_minus(self) -> None:
         # U+207B SUPERSCRIPT MINUS -- same story again (round 40, defect 2,
         # confirmed-bad case).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote("k = 3 s⁻¹", "s", role=QuoteRole.UNIT)
+            ground_quote("k = 3 s⁻¹", "s", role=QuoteRole.UNIT, quantity=QuantityKind.TIME)
 
     # -- QuoteRole.UNIT: allowlist adjacency, leading edge ------------------
 
@@ -650,7 +658,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # whitespace and not on the leading allowlist -- so quoting bare "C"
         # silently strips the degree mark from "25°C".
         with pytest.raises(QuoteGroundingError, match="LEADING edge"):
-            ground_quote("T = 25°C", "C", role=QuoteRole.UNIT)
+            ground_quote("T = 25°C", "C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     def test_rejects_unit_quote_immediately_preceded_by_a_letter(self) -> None:
         # Isolates the LEADING-edge, non-digit branch in isolation from the
@@ -659,7 +667,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # check, not `unit_digit_glue` -- round 40 review noted no test
         # isolated this shape.
         with pytest.raises(QuoteGroundingError, match="LEADING edge"):
-            ground_quote("mK sensor", "K", role=QuoteRole.UNIT)
+            ground_quote("mK sensor", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     # -- QuoteRole.UNIT: digit-glue exception, and its refusal -------------
 
@@ -677,7 +685,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         with pytest.raises(
             QuoteGroundingError, match="not itself a clean, maximal numeral in place"
         ):
-            ground_quote("run3K reactor", "K", role=QuoteRole.UNIT, value_span=(3, 4))
+            ground_quote(
+                "run3K reactor",
+                "K",
+                role=QuoteRole.UNIT,
+                value_span=(3, 4),
+                quantity=QuantityKind.TEMPERATURE,
+            )
 
     def test_rejects_a_fabricated_value_span_with_no_numeral_at_its_start(self) -> None:
         # Round 41's exact exploit: a caller fabricates value_span=(0, 4)
@@ -689,7 +703,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         with pytest.raises(
             QuoteGroundingError, match="not itself a clean, maximal numeral in place"
         ):
-            ground_quote("run3K reactor", "K", role=QuoteRole.UNIT, value_span=(0, 4))
+            ground_quote(
+                "run3K reactor",
+                "K",
+                role=QuoteRole.UNIT,
+                value_span=(0, 4),
+                quantity=QuantityKind.TEMPERATURE,
+            )
 
     def test_rejects_a_fabricated_value_span_spanning_unrelated_text(self) -> None:
         # A second shape of the same round-41 exploit: value_span=(0, 6)
@@ -700,7 +720,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         with pytest.raises(
             QuoteGroundingError, match="not itself a clean, maximal numeral in place"
         ):
-            ground_quote("case 1K was run", "K", role=QuoteRole.UNIT, value_span=(0, 6))
+            ground_quote(
+                "case 1K was run",
+                "K",
+                role=QuoteRole.UNIT,
+                value_span=(0, 6),
+                quantity=QuantityKind.TEMPERATURE,
+            )
 
     def test_rejects_letter_quote_preceded_by_a_digit_without_a_value_span(self) -> None:
         # Round 40, defect 3: fail-closed by default. "1023" is a clean,
@@ -710,7 +736,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # the measurement's own value; omitting it means the exception never
         # fires, even though the digit run is clean.
         with pytest.raises(QuoteGroundingError, match="no value_span was supplied to confirm"):
-            ground_quote("1023K", "K", role=QuoteRole.UNIT)
+            ground_quote("1023K", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     def test_rejects_letter_quote_preceded_by_a_digit_with_a_malformed_value_span(self) -> None:
         # value_span=(10, 12) is out of range for "1023K" (len 5): a
@@ -718,7 +744,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # measurement's value and must be refused defensively, without ever
         # risking an IndexError/TypeError from inside the boundary gate.
         with pytest.raises(QuoteGroundingError, match="malformed or out of range"):
-            ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(10, 12))
+            ground_quote(
+                "1023K",
+                "K",
+                role=QuoteRole.UNIT,
+                value_span=(10, 12),
+                quantity=QuantityKind.TEMPERATURE,
+            )
 
     def test_rejects_letter_quote_preceded_by_a_digit_with_a_mismatched_value_span(self) -> None:
         # value_span=(0, 3) is well-formed and IS a genuine numeral extent
@@ -728,7 +760,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         with pytest.raises(
             QuoteGroundingError, match="does not end exactly where this quote starts"
         ):
-            ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(0, 3))
+            ground_quote(
+                "1023K",
+                "K",
+                role=QuoteRole.UNIT,
+                value_span=(0, 3),
+                quantity=QuantityKind.TEMPERATURE,
+            )
 
     def test_accepts_letter_quote_immediately_preceded_by_a_digit(self) -> None:
         # Deliberate asymmetry, load-bearing: NUMERAL_EXTENT_RE's trailing
@@ -746,7 +784,13 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # the companion test proving a wrong-but-well-formed value_span is
         # refused, which is what actually demonstrates value_span is checked
         # rather than merely accepted.
-        locator = ground_quote("1023K", "K", role=QuoteRole.UNIT, value_span=(0, 4))
+        locator = ground_quote(
+            "1023K",
+            "K",
+            role=QuoteRole.UNIT,
+            value_span=(0, 4),
+            quantity=QuantityKind.TEMPERATURE,
+        )
         assert (locator.start, locator.end) == (4, 5)
 
     def test_value_span_prevents_grounding_a_run_id_digit_as_the_value(self) -> None:
@@ -766,26 +810,48 @@ class TestGroundQuoteNonNumericTokenBoundary:
         with pytest.raises(
             QuoteGroundingError, match="does not end exactly where this quote starts"
         ):
-            ground_quote(text, "K", role=QuoteRole.UNIT, occurrence=0, value_span=value_span)
-        locator = ground_quote(text, "K", role=QuoteRole.UNIT, occurrence=1, value_span=value_span)
+            ground_quote(
+                text,
+                "K",
+                role=QuoteRole.UNIT,
+                occurrence=0,
+                value_span=value_span,
+                quantity=QuantityKind.TEMPERATURE,
+            )
+        locator = ground_quote(
+            text,
+            "K",
+            role=QuoteRole.UNIT,
+            occurrence=1,
+            value_span=value_span,
+            quantity=QuantityKind.TEMPERATURE,
+        )
         assert text[locator.start : locator.end] == "K"
 
     def test_accepts_letter_quote_in_parentheses(self) -> None:
-        locator = ground_quote("T (K) 1023", "K", role=QuoteRole.UNIT)
+        locator = ground_quote(
+            "T (K) 1023", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+        )
         assert (locator.start, locator.end) == (3, 4)
 
     def test_accepts_unit_quote_bounded_by_whitespace(self) -> None:
-        locator = ground_quote("the pressure was 1 bar", "bar", role=QuoteRole.UNIT)
+        locator = ground_quote(
+            "the pressure was 1 bar", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE
+        )
         assert (locator.start, locator.end) == (19, 22)
 
     def test_accepts_unit_quote_containing_a_slash(self) -> None:
-        locator = ground_quote("flame speed in cm/s", "cm/s", role=QuoteRole.UNIT)
+        locator = ground_quote(
+            "flame speed in cm/s", "cm/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY
+        )
         assert (locator.start, locator.end) == (15, 19)
 
     def test_accepts_unit_quote_containing_the_degree_mark(self) -> None:
         # The full unit "°C", quoted whole, is not a fragment of anything --
         # it is bounded by whitespace on both edges.
-        locator = ground_quote("T = 25 °C", "°C", role=QuoteRole.UNIT)
+        locator = ground_quote(
+            "T = 25 °C", "°C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+        )
         assert (locator.start, locator.end) == (7, 9)
 
     # -- QuoteRole.LABEL: strict letter/digit adjacency, no exception ------
@@ -918,7 +984,9 @@ class TestGroundQuoteNonNumericTokenBoundary:
 
     def test_rejects_unit_quote_padded_with_leading_whitespace(self) -> None:
         with pytest.raises(QuoteGroundingError, match="leading or trailing whitespace"):
-            ground_quote("T = 1023 K", " K", role=QuoteRole.UNIT)
+            ground_quote(
+                "T = 1023 K", " K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+            )
 
     def test_rejects_label_quote_padded_with_trailing_whitespace(self) -> None:
         with pytest.raises(QuoteGroundingError, match="leading or trailing whitespace"):
@@ -941,7 +1009,175 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # a clean, isolated unit -- ambiguity must still win.
         text = "Kelvin unit and 1023 K measured"
         with pytest.raises(QuoteGroundingError, match=r"appears 2 times"):
-            ground_quote(text, "K", role=QuoteRole.UNIT)
+            ground_quote(text, "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
+
+
+class TestGroundQuoteUnitAcceptanceMatrix:
+    """D-U2's mandatory, two-sided acceptance matrix for role=QuoteRole.UNIT:
+    every MUST-REFUSE row from Layer 0 (argument validation) and every
+    MUST-ACCEPT row proving a genuinely clean, maximal unit quote for several
+    distinct quantities still grounds successfully, all in one place so the
+    full boundary is visible at a glance rather than scattered one case per
+    class. Layers 1-3's individual refusal branches are already pinned above
+    (`TestGroundQuoteNonNumericTokenBoundary`) and are not re-duplicated
+    here."""
+
+    # -- MUST-REFUSE: Layer 0 argument validation ---------------------------
+
+    def test_refuses_unit_role_with_quantity_omitted(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="requires quantity="):
+            ground_quote("T = 1023 K", "K", role=QuoteRole.UNIT)
+
+    def test_refuses_unit_role_with_quantity_none(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="requires quantity="):
+            ground_quote("T = 1023 K", "K", role=QuoteRole.UNIT, quantity=None)
+
+    def test_refuses_unit_role_with_a_plain_string_quantity(self) -> None:
+        # QuantityKind is a StrEnum: a plain string equal to a member's VALUE
+        # (e.g. "temperature") compares == to that member but is not a
+        # genuine member and fails isinstance() -- the StrEnum equality
+        # trap. This must be refused, not silently accepted via ==.
+        with pytest.raises(QuoteGroundingError, match="not a genuine"):
+            ground_quote("T = 1023 K", "K", role=QuoteRole.UNIT, quantity="temperature")
+
+    def test_refuses_quantity_other(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="QuantityKind.OTHER has no unit vocabulary"):
+            ground_quote("T = 1023 K", "K", role=QuoteRole.UNIT, quantity=QuantityKind.OTHER)
+
+    def test_refuses_quantity_supplied_for_value_role(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="has no meaning for any other role"):
+            ground_quote(
+                "T = 1023 K", "1023", role=QuoteRole.VALUE, quantity=QuantityKind.TEMPERATURE
+            )
+
+    def test_refuses_quantity_supplied_for_label_role(self) -> None:
+        with pytest.raises(QuoteGroundingError, match="has no meaning for any other role"):
+            ground_quote(
+                "pressure was 1 bar",
+                "pressure",
+                role=QuoteRole.LABEL,
+                quantity=QuantityKind.PRESSURE,
+            )
+
+    # -- MUST-REFUSE: known, deliberate K^1 coverage gap ---------------------
+
+    def test_refuses_temperature_unit_followed_by_a_bare_superscript_one(self) -> None:
+        # "K¹" is lexically identical, from a single-adjacent-character
+        # check alone, whether the "¹" is a genuine exponent continuation or
+        # an unrelated footnote marker -- Layer 2 treats the superscript
+        # digit as a unit-token character either way and refuses. This is
+        # the documented, deliberate coverage gap from
+        # `unit_boundary_violation`'s docstring, pinned here as a test, not
+        # merely prose.
+        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+            ground_quote(
+                "T = 1023 K¹ (footnote)",
+                "K",
+                role=QuoteRole.UNIT,
+                quantity=QuantityKind.TEMPERATURE,
+            )
+
+    # -- MUST-REFUSE: Layer 3 table maximality, both directions -------------
+
+    def test_refuses_unit_that_is_a_prefix_of_a_longer_registered_spelling(self) -> None:
+        # "cm" is itself a registered LENGTH unit and sits at a clean Layer
+        # 1/2 boundary (bounded by spaces on both sides), but "cm s^-1" is a
+        # registered VELOCITY alias starting at the same position and
+        # extending past this quote's end -- claiming LENGTH does not dodge
+        # the check, because maximality is checked against the UNION over
+        # every quantity, not just the claimed one.
+        with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
+            ground_quote(
+                "u = 10 cm s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
+            )
+
+    def test_refuses_unit_that_is_a_suffix_of_a_longer_registered_spelling(self) -> None:
+        # "C" is itself a registered TEMPERATURE spelling (the normalized
+        # form of the "deg C"/"degC"/"°C" aliases) and sits at a clean Layer
+        # 1/2 boundary (preceded by whitespace), but "deg C" is a registered
+        # TEMPERATURE alias ending at this same position and starting before
+        # this quote -- a suffix fragment of a longer registered spelling.
+        with pytest.raises(QuoteGroundingError, match="unit_not_maximal_backward|LONGER"):
+            ground_quote(
+                "T = 10 deg C", "C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+            )
+
+    # -- MUST-REFUSE: Layer 2 lexer maximality at the trailing edge ---------
+
+    def test_refuses_unit_immediately_followed_by_an_unrelated_unit_token_char(self) -> None:
+        # "K" is itself a registered TEMPERATURE spelling and "Kq" is NOT any
+        # registered spelling for any quantity, so Layer 3's table-driven
+        # forward-maximality check (which only fires for a REGISTERED longer
+        # spelling) has nothing to catch here. This case isolates Layer 2's
+        # lexer-level rule instead: a bare letter run immediately followed by
+        # another unit-token character always looks like a fragment of some
+        # larger, possibly-unregistered unit token (cf. "K" inside "K*cm" in
+        # the docstring) and must be refused on that basis alone, regardless
+        # of what the vocabulary table does or doesn't contain.
+        #
+        # NOTE: the neighbouring "unclassified trailing character" branch
+        # (`unit_trailing_unclassified_char`) ALSO refuses any letter-like
+        # `nxt`, since unit-token characters are, by construction, disjoint
+        # from the whitespace/delimiter allow-list it checks -- so a generic
+        # "TRAILING edge" match would pass even if this specific
+        # `unit_trailing_not_maximal` branch were neutered entirely (that
+        # branch would then always fall through to the unclassified-char
+        # check, which still refuses, just under the wrong discriminant).
+        # The match string below is therefore pinned to wording that is
+        # UNIQUE to this branch's message, so the test can actually tell the
+        # two discriminants apart rather than merely observing "some
+        # refusal happened".
+        with pytest.raises(QuoteGroundingError, match="not maximal at that edge"):
+            ground_quote(
+                "the unit is Kq nearby", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+            )
+
+    # -- MUST-ACCEPT: a genuinely clean, maximal unit quote grounds ---------
+
+    def test_accepts_clean_temperature_unit(self) -> None:
+        locator = ground_quote(
+            "the temperature was 1023 K", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+        )
+        assert (locator.start, locator.end) == (25, 26)
+
+    def test_accepts_clean_pressure_unit(self) -> None:
+        locator = ground_quote(
+            "the pressure was 1 bar", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE
+        )
+        assert (locator.start, locator.end) == (19, 22)
+
+    def test_accepts_clean_time_unit(self) -> None:
+        locator = ground_quote("k = 3 s, done", "s", role=QuoteRole.UNIT, quantity=QuantityKind.TIME)
+        assert (locator.start, locator.end) == (6, 7)
+
+    def test_accepts_clean_volume_unit(self) -> None:
+        locator = ground_quote(
+            "k = 1.0 cm3 per mol", "cm3", role=QuoteRole.UNIT, quantity=QuantityKind.VOLUME
+        )
+        assert (locator.start, locator.end) == (8, 11)
+
+    def test_accepts_clean_velocity_unit(self) -> None:
+        locator = ground_quote(
+            "a = 9.8 m/s measured", "m/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY
+        )
+        assert (locator.start, locator.end) == (8, 11)
+
+    def test_accepts_unit_glued_to_its_own_verified_value(self) -> None:
+        # Companion accept-path to the digit-glue MUST-REFUSE rows already
+        # pinned in TestGroundQuoteNonNumericTokenBoundary: a well-formed,
+        # correctly-aligned value_span naming a genuine, maximal numeral
+        # extent lets the unit quote abut it directly.
+        text = "T = 1023K exactly"
+        value_locator = ground_quote(text, "1023", role=QuoteRole.VALUE)
+        value_span = (value_locator.start, value_locator.end)
+        locator = ground_quote(
+            text,
+            "K",
+            role=QuoteRole.UNIT,
+            value_span=value_span,
+            quantity=QuantityKind.TEMPERATURE,
+        )
+        assert text[locator.start : locator.end] == "K"
 
 
 class TestProducerEndToEnd:

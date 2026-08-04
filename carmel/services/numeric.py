@@ -12,7 +12,17 @@ other component decided is "the cell" and either reconstructs one trustworthy nu
 (or range) from it, or refuses -- it never widens its own search window.
 
 Pure and I/O-free by design: no network, no LLM calls, no file reads, no third-party
-dependencies beyond the standard library. Every function is deterministic given its
+dependencies beyond the standard library, and -- deliberately -- no ``carmel.*``
+dependencies either, in any form (eager, ``TYPE_CHECKING``-guarded, or function-local).
+``tests/test_semantic_deps.py::test_numeric_module_has_zero_carmel_imports`` enforces
+this at the AST level: :func:`compute_dependency_sha` computes its content-hash closure
+from this module's own source only, so if this module reached into another
+``carmel`` module the SHA could no longer be trusted to capture this module's full
+behaviour. Concretely, this means :func:`unit_boundary_violation`'s Layer 3 vocabulary
+cannot be looked up here against ``carmel.services.units.TABLE_V1`` -- the caller
+(:func:`carmel.services.dataset_producer.ground_quote`, which already legitimately
+imports ``carmel.services.units``) must compute the two vocabulary sets and pass them
+in as plain ``frozenset[str]`` data. Every function is deterministic given its
 arguments.
 
 Why this exists (measured on 8 real papers, corruption shapes reproduced here only as
@@ -385,28 +395,101 @@ def has_clean_token_boundary(text: str, start: int, end: int) -> bool:
     return not (trail.isdigit() and end < len(text) and (text[end].isdigit() or text[end] == ","))
 
 
-#: Characters permitted immediately BEFORE a UNIT-role quote (its leading edge),
-#: besides whitespace and start-of-string. Deliberately an ALLOWLIST of permitted
-#: separators, not a denylist of forbidden unit-token characters -- a denylist
-#: rots (round 40 found the old ``_UNIT_TOKEN_SYMBOLS`` denylist already missing
-#: U+2212 MINUS SIGN, U+2013 EN DASH, and superscript minus/one, none of which
-#: were "unit-token characters" under the old alnum+symbol test, yet all glue a
-#: unit quote to something that is not a clean boundary; it also silently
-#: accepted ``"bar"`` inside ``"bar(a)"``). ``(`` is leading-only -- a unit that
-#: opens a parenthetical, e.g. the ``K`` in ``"T (K) 1023"``, must accept ``(``
-#: immediately before it -- deliberately asymmetric with the trailing allowlist
-#: below, which does not include ``(``.
-_UNIT_LEADING_ALLOWLIST = frozenset("(=:,")
+#: D-U2: the UNIT boundary rule partitions the character space into exactly
+#: THREE buckets -- delimiters, unit-token characters, and everything else
+#: (refused, unclassified) -- instead of either prior, REJECTED formulation:
+#:
+#: - A pure DENYLIST of forbidden unit-token characters rots: round 40 found
+#:   the old ``_UNIT_TOKEN_SYMBOLS`` denylist already missing U+2212 MINUS
+#:   SIGN, U+2013 EN DASH, and superscript minus/one -- none of which were
+#:   "unit-token characters" under the old alnum+symbol test, yet all glue a
+#:   unit quote to something that is not a clean boundary -- and it silently
+#:   ACCEPTED ``"bar"`` inside ``"bar(a)"`` (over-accept: a denylist that
+#:   misses a character fails open).
+#: - A pure ALLOWLIST of permitted leading/trailing separator characters (the
+#:   design this replaces) over-refuses ordinary, unremarkable text such as
+#:   ``"T [K] 1023"`` or ``T "K" 1023"`` (``[``/``"`` were never on the old
+#:   allowlist) and cannot see multi-token units at all -- it happily quotes
+#:   ``"cm"`` out of ``"u = 10 cm s^-1"`` even though ``"cm s^-1"`` is a
+#:   registered VELOCITY alias (over-refuse on ordinary text, under-refuse on
+#:   multi-token units, simultaneously).
+#: - A pure TABLE-DRIVEN maximal-matching design (find the longest registered
+#:   spelling touching this position, full stop) was ALSO considered and
+#:   REJECTED: it reopens exactly the corruption shapes round 40 fixed --
+#:   ``"bar"`` inside ``"bar(a)"`` (nothing in the table forbids a spelling
+#:   from being followed by ``(``) and the Unicode-continuation refusals
+#:   (``"s−1"``, ``"cm³"``) that existing tests already pin as refusals
+#:   (nothing in the table says a superscript/minus-sign continuation isn't
+#:   "just more text after the unit") -- and it fails OPEN for any character
+#:   the table's author never anticipated, the same failure mode as the
+#:   denylist above.
+#:
+#: The fix keeps a real edge-adjacency rule (so ``bar(a)``/Unicode
+#: continuations stay refused) AND a real vocabulary rule (so multi-token
+#: aliases are seen), and closes the loophole common to all three prior
+#: designs -- an unclassified character silently defaulting to "accept" or
+#: "reject" -- by making the unclassified bucket ITS OWN discriminant that
+#: always refuses. This is the load-bearing point of the partition: MOST
+#: characters this project will ever see are letters, digits, or common
+#: separators, and land cleanly in one of the first two buckets; a character
+#: nobody has classified yet (an unexpected symbol, a mis-encoded glyph) is
+#: refused outright rather than rotting into either prior failure mode.
+#:
+#: :data:`_UNIT_DELIMITER_CHARS` -- characters that cleanly END a unit quote
+#: on EITHER edge: brackets/quotes that wrap a unit (``"T [K] 1023"``,
+#: ``T "K" 1023"``) and the punctuation separators the old allowlists already
+#: covered (``=``, ``:``, ``,``, ``;``, ``.``).
+_UNIT_DELIMITER_CHARS = frozenset("[]\"'“”=:,;.")
 
-#: Characters permitted immediately AFTER a UNIT-role quote (its trailing edge),
-#: besides whitespace and end-of-string. ``)`` closes a parenthetical the unit
-#: sat inside (the same ``"T (K) 1023"`` shape above) and is trailing-only,
-#: mirroring ``(`` being leading-only above.
-_UNIT_TRAILING_ALLOWLIST = frozenset(",;.)")
+#: ``(`` is a delimiter on the LEADING edge only -- a unit that opens a
+#: parenthetical, e.g. the ``K`` in ``"T (K) 1023"``, must accept ``(``
+#: immediately before it, but a unit immediately FOLLOWED by ``(`` (``"bar"``
+#: inside ``"bar(a)"``) is exactly the round-40 corruption shape that must
+#: stay refused -- so ``(`` is deliberately absent from the trailing side.
+_UNIT_LEADING_ONLY_DELIMITER = "("
+
+#: Mirror image of :data:`_UNIT_LEADING_ONLY_DELIMITER`: ``)`` closes a
+#: parenthetical the unit sat inside (the same ``"T (K) 1023"`` shape) and is
+#: TRAILING-only.
+_UNIT_TRAILING_ONLY_DELIMITER = ")"
+
+#: Extra (non-alnum) characters that count as part of a unit TOKEN rather
+#: than a delimiter or an unclassified character. ``str.isalnum()`` already
+#: covers letters, ASCII/superscript/subscript digits, and µ/μ (all
+#: categorized as letters/digits by Unicode), so this set only needs the
+#: remaining unit-shaped symbols: ``%``, ``°``, ``_``, superscript minus
+#: (U+207B), ``/``, ``^``, ``*``, ``-``, ``·``, MINUS SIGN (U+2212), and EN
+#: DASH (U+2013). Membership here means a neighbouring character on either
+#: edge makes the quote NOT maximal (Layer 2) -- it does not, by itself,
+#: mean the character is part of a valid unit spelling; Layer 3 is what
+#: checks actual vocabulary.
+_UNIT_TOKEN_EXTRA_CHARS = frozenset("%°_/^*-·") | {"⁻", "−", "–"}
+
+#: Trailing bare-operator characters that get TRIMMED off the end of a
+#: candidate trailing run before the Layer 2 trailing-maximality check runs,
+#: but ONLY when that run is not itself followed by another alphanumeric
+#: character. This is what lets ``"T = 1023 K*"`` accept (the ``*`` is a
+#: harmless trailing flourish at true end-of-run) while ``"K*cm"`` still
+#: refuses (the ``*`` there is gluing ``K`` to more unit text, ``cm``).
+#: Deliberately a NARROWER set than :data:`_UNIT_TOKEN_EXTRA_CHARS` -- it
+#: excludes ``%``, ``°``, ``_``, and superscript minus, none of which read as
+#: bare "operators" that could plausibly trail a unit with no meaning.
+_UNIT_TRAILING_OPERATOR_CHARS = frozenset("*/^-·") | {"−", "–"}
+
+
+def _is_unit_token_char(ch: str) -> bool:
+    """True if ``ch`` is part of a unit TOKEN (Layer 1's second bucket)."""
+    return ch.isalnum() or ch in _UNIT_TOKEN_EXTRA_CHARS
 
 
 def unit_boundary_violation(
-    text: str, start: int, end: int, *, value_span: tuple[int, int] | None = None
+    text: str,
+    start: int,
+    end: int,
+    *,
+    value_span: tuple[int, int] | None = None,
+    quantity_spellings: frozenset[str],
+    all_spellings: frozenset[str],
 ) -> str | None:
     """Return a discriminant name for why ``text[start:end]`` is not a clean
     UNIT-role quote, or ``None`` if it is clean.
@@ -416,46 +499,65 @@ def unit_boundary_violation(
     bare bool, so :func:`carmel.services.dataset_producer.ground_quote` can
     give each refusal reason its own distinct message.
 
-    Fail-closed ALLOWLIST, not a denylist: a unit quote (``"K"``,
-    ``"cm3/mol/s"``, ``"bar"``) is refused on an edge unless the character
-    immediately outside that edge is on the permitted-neighbour allowlist for
-    that edge (:data:`_UNIT_LEADING_ALLOWLIST` / :data:`_UNIT_TRAILING_ALLOWLIST`)
-    or whitespace/start-of-string/end-of-string. Anything else -- a letter, a
-    digit, or a symbol not on the allowlist -- means the quote is a fragment of
-    a larger unit (``"cm3"`` inside ``"cm3/mol/s"``, or ``"C"`` inside
-    ``"25°C"``).
+    D-U2: three layers, all three required together (see the rejected
+    alternatives documented above :data:`_UNIT_DELIMITER_CHARS`):
 
-    ONE exception, leading edge only, gated by ``value_span``: the unit quote
-    MAY abut a preceding digit run if -- and only if -- ``value_span`` is
-    supplied, well-formed, its end is exactly ``start``, AND it names a
-    genuine, maximal numeral extent in place (per :func:`find_numeral_extent`),
-    i.e. the caller has already independently grounded a VALUE quote and is
-    asserting that THIS digit run IS that value, not merely some clean
-    numeral. This is deliberately stricter than "is there a clean numeral
-    here": round 40 found that checking cleanliness alone proves "SOME clean
-    numeral ends here", not "THIS measurement's value ends here" -- value and
-    unit are grounded independently, so e.g. the run id ``"1"`` in ``"case 1K
-    was the run id. Temperature was 1023 K"`` is itself a clean, maximal
-    numeral and would wrongly satisfy a cleanliness-only check. Round 41
-    found the FIRST fix for this only checked ``value_span[1] == start`` and
-    never validated the span content at all, so a caller could fabricate an
-    arbitrary ``value_span`` (e.g. ``(0, 4)`` over ``"run3K"``) and the
-    exception would fire regardless -- this function now independently
-    recomputes :func:`find_numeral_extent` at ``value_span[0]`` and refuses
-    unless it equals ``value_span`` exactly, so the span must name a REAL
-    numeral, not just line up its end. ``value_span`` is also validated
-    defensively before any of this: it must be a ``(start, end)`` pair of
-    ints with ``0 <= start < end <= len(text)``, or the exception is refused
-    without ever risking an ``IndexError``/``TypeError`` from inside this
-    gate. Without a ``value_span`` (the default), the exception never fires
-    -- fail closed, not fail open -- which is why ``"1023K"`` + quote ``"K"``
-    with no ``value_span`` now refuses exactly like ``"run3K"`` + quote
-    ``"K"`` does; only a caller that supplies the matching, genuine value
-    span (as :func:`carmel.services.dataset_producer._measured_value` does,
-    from the VALUE locator it already grounded) gets the glue exception.
+    Layer 1 (character partition): every character is a delimiter
+    (:data:`_UNIT_DELIMITER_CHARS` plus the leading/trailing-only ``(``/``)``),
+    a unit-token character (:func:`_is_unit_token_char`), or unclassified --
+    and unclassified always refuses.
 
-    Four distinct discriminants distinguish the ways this exception can fail
-    to fire, each mapped to its own message by
+    Layer 2 (edge maximality): from each edge of ``text[start:end]``, the
+    immediately adjacent character must NOT be a unit-token character (an
+    adjacent token character means a longer token was available and this
+    quote is a fragment of it) unless it is whitespace, start/end-of-text, or
+    on that edge's delimiter set. Checking only the single adjacent character
+    is logically equivalent to checking full leftward/rightward expansion:
+    if the immediate neighbour is not a token character, expansion cannot
+    proceed past it either. This is an EDGE check, not a "one token" check --
+    a quote MAY legitimately contain an internal delimiter (e.g. the whole
+    alias ``"cm s^-1"``, which spans a space). A trailing run of BARE
+    operator characters (:data:`_UNIT_TRAILING_OPERATOR_CHARS`) not followed
+    by another alphanumeric is trimmed before this check, so ``"T = 1023 K*"``
+    accepts while ``"K*cm"`` still refuses (the trim does not apply there,
+    since ``*`` is followed by alphanumeric ``c``).
+
+    The leading edge also carries the ONE exception from round 40/41,
+    unchanged and gated by ``value_span`` exactly as before (see the four
+    ``unit_digit_glue_*`` discriminants below) -- the unit quote MAY abut a
+    preceding digit run if -- and only if -- ``value_span`` is supplied,
+    well-formed, its end is exactly ``start``, AND it names a genuine,
+    maximal numeral extent in place (per :func:`find_numeral_extent`). This
+    exception is intentionally LEFT-edge only; there is no corresponding
+    right-edge exception.
+
+    Layer 3 (table maximality, over caller-supplied vocabulary data): this
+    module has zero ``carmel.*`` dependencies (see the module docstring), so
+    it cannot look up ``carmel.services.units.TABLE_V1`` itself -- the caller
+    (:func:`carmel.services.dataset_producer.ground_quote`) computes the
+    vocabulary and passes it in as two plain ``frozenset[str]`` arguments.
+    ``text[start:end]`` must be a member of ``quantity_spellings`` (the
+    registered spellings -- known unit, or an alias's raw or normalized form
+    -- for the CLAIMED quantity) -- an unrecognised spelling is refused even
+    if it sits at a clean Layer 1/2 boundary. Separately, no LONGER spelling
+    in ``all_spellings`` -- the UNION over ALL quantities, not just the
+    claimed one (a caller could otherwise dodge the check entirely by
+    mis-claiming quantity -- e.g. grounding ``"cm"`` inside ``"cm s^-1"``
+    while claiming LENGTH, whose vocabulary does not contain the VELOCITY
+    alias ``"cm s^-1"``, would sail through a maximality check scoped only to
+    LENGTH's own spellings) -- may start at the same position and extend
+    past ``end`` (forward maximality), nor may one start before ``start`` and
+    end exactly at ``end`` (backward maximality). The backward-maximality
+    scan deliberately does NOT use ``str.startswith(spelling, negative_index)``
+    -- Python's negative-start-index footgun means a negative offset counts
+    from the END of the string instead of raising, so a spelling longer than
+    ``end`` would silently probe the wrong location; the candidate start is
+    instead computed and range-checked explicitly, and compared via a plain
+    slice equality.
+
+    Four distinct discriminants distinguish the ways the leading-edge
+    digit-glue exception can fail to fire, unchanged from round 40/41, each
+    mapped to its own message by
     :func:`carmel.services.dataset_producer.ground_quote` (the
     enclosing_numeric_construct pattern again -- this project has hit masked,
     indistinguishable refusals of this shape before):
@@ -471,9 +573,34 @@ def unit_boundary_violation(
     - ``"unit_digit_glue_value_span_not_clean_numeral"``: ``value_span``'s
       end matches, but the span is not itself a clean, maximal numeral
       extent in place.
+
+    The remaining discriminants, all new in D-U2:
+
+    - ``"unit_leading_not_maximal"`` / ``"unit_trailing_not_maximal"``: the
+      adjacent character on that edge is a unit-token character, so this
+      quote is not maximal there (Layer 2).
+    - ``"unit_leading_unclassified_char"`` / ``"unit_trailing_unclassified_char"``:
+      the adjacent character on that edge is neither whitespace, a
+      delimiter, nor a unit-token character (Layer 1's fail-closed bucket).
+    - ``"unit_not_in_vocabulary"``: ``text[start:end]`` is not a member of
+      ``quantity_spellings`` (Layer 3 admission).
+    - ``"unit_not_maximal_forward"`` / ``"unit_not_maximal_backward"``: a
+      longer registered spelling (any quantity) shares this quote's start
+      (forward) or end (backward) (Layer 3 maximality).
+
+    One known, deliberate coverage gap: a single trailing superscript digit
+    with no accompanying superscript minus (e.g. ``"K¹"``) is indistinguishable,
+    from a single adjacent character alone, between a genuine exponent
+    continuation and an unrelated footnote marker -- Layer 2 treats the
+    superscript digit as a unit-token character either way and refuses. This
+    is intentional fail-closed behaviour, not a bug: resolving it would
+    require look-ahead this function does not have (and should not grow),
+    since a footnote marker and an exponent are lexically identical at this
+    boundary.
     """
     if start >= end:
         return None
+
     if start > 0:
         lead_prev = text[start - 1]
         if lead_prev.isdigit():
@@ -493,12 +620,49 @@ def unit_boundary_violation(
                 return "unit_digit_glue_value_span_mismatch"
             if find_numeral_extent(text, value_span[0]) != value_span:
                 return "unit_digit_glue_value_span_not_clean_numeral"
-        elif not (lead_prev.isspace() or lead_prev in _UNIT_LEADING_ALLOWLIST):
-            return "unit_leading_adjacency"
+        elif _is_unit_token_char(lead_prev):
+            return "unit_leading_not_maximal"
+        elif not (
+            lead_prev.isspace()
+            or lead_prev in _UNIT_DELIMITER_CHARS
+            or lead_prev == _UNIT_LEADING_ONLY_DELIMITER
+        ):
+            return "unit_leading_unclassified_char"
+
     if end < len(text):
-        nxt = text[end]
-        if not (nxt.isspace() or nxt in _UNIT_TRAILING_ALLOWLIST):
-            return "unit_trailing_adjacency"
+        trimmed_end = end
+        while trimmed_end < len(text) and text[trimmed_end] in _UNIT_TRAILING_OPERATOR_CHARS:
+            if trimmed_end + 1 < len(text) and text[trimmed_end + 1].isalnum():
+                break
+            trimmed_end += 1
+        if trimmed_end < len(text):
+            nxt = text[trimmed_end]
+            if _is_unit_token_char(nxt):
+                return "unit_trailing_not_maximal"
+            if not (
+                nxt.isspace()
+                or nxt in _UNIT_DELIMITER_CHARS
+                or nxt == _UNIT_TRAILING_ONLY_DELIMITER
+            ):
+                return "unit_trailing_unclassified_char"
+
+    quote_len = end - start
+    if text[start:end] not in quantity_spellings:
+        return "unit_not_in_vocabulary"
+
+    for spelling in all_spellings:
+        if len(spelling) > quote_len and text.startswith(spelling, start):
+            return "unit_not_maximal_forward"
+
+    for spelling in all_spellings:
+        if len(spelling) <= quote_len:
+            continue
+        cand_start = end - len(spelling)
+        if cand_start < 0 or cand_start >= start:
+            continue
+        if text[cand_start:end] == spelling:
+            return "unit_not_maximal_backward"
+
     return None
 
 

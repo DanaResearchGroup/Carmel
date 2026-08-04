@@ -207,6 +207,64 @@ class DatasetProducerError(ValueError):
     unverified bytes or an unverifiable claim."""
 
 
+def _unit_spellings(quantity: QuantityKind) -> frozenset[str]:
+    """All registered spellings (known units plus every alias's raw and
+    normalized form) for one quantity, per :data:`units.TABLE_V1`.
+
+    Lives HERE, not in :mod:`carmel.services.numeric`, because that module is
+    deliberately zero-``carmel.*``-import (see its module docstring and
+    ``tests/test_semantic_deps.py::test_numeric_module_has_zero_carmel_imports``,
+    which enforces this at the AST level so :func:`compute_dependency_sha`'s
+    hash closure stays trustworthy). This module already legitimately imports
+    and uses ``carmel.services.units``/``units.TABLE_V1`` directly elsewhere
+    (e.g. :func:`units.normalize_unit`), so it is the correct home for
+    computing :func:`unit_boundary_violation`'s Layer 3 vocabulary; the
+    result is passed down as plain ``frozenset[str]`` data.
+    """
+    spellings: set[str] = set(units.TABLE_V1.known_units(quantity))
+    for alias in units.TABLE_V1.aliases:
+        if alias.quantity is quantity:
+            spellings.add(alias.raw)
+            spellings.add(alias.normalized)
+    return frozenset(spellings)
+
+
+#: Layer 3 admission vocabulary, keyed by the CLAIMED quantity -- a unit
+#: quote must be one of ITS quantity's own registered spellings to be
+#: admitted at all. Excludes ``QuantityKind.OTHER``, which has no vocabulary
+#: (:func:`units.normalize_unit` returns OTHER's raw string unchanged) and is
+#: refused outright by :func:`ground_quote`'s Layer 0 before
+#: :func:`unit_boundary_violation` is ever consulted. Computed lazily (on
+#: first use) and cached, matching the previous in-``numeric.py``
+#: implementation's caching behaviour.
+_unit_spellings_by_quantity_cache: dict[QuantityKind, frozenset[str]] | None = None
+
+#: Layer 3 maximality vocabulary: the UNION of every quantity's spellings,
+#: deliberately NOT scoped to the claimed quantity. Maximality must use the
+#: union rather than the claimed quantity's own spellings alone, or a caller
+#: could dodge the check entirely by mis-claiming quantity -- e.g. grounding
+#: ``"cm"`` inside ``"cm s^-1"`` while claiming LENGTH (whose vocabulary does
+#: not contain the VELOCITY alias ``"cm s^-1"``) would otherwise sail through
+#: a maximality check scoped only to LENGTH's own spellings.
+_unit_spellings_union_cache: frozenset[str] | None = None
+
+
+def _unit_spellings_by_quantity() -> dict[QuantityKind, frozenset[str]]:
+    global _unit_spellings_by_quantity_cache
+    if _unit_spellings_by_quantity_cache is None:
+        _unit_spellings_by_quantity_cache = {
+            q: _unit_spellings(q) for q in QuantityKind if q is not QuantityKind.OTHER
+        }
+    return _unit_spellings_by_quantity_cache
+
+
+def _unit_spellings_union() -> frozenset[str]:
+    global _unit_spellings_union_cache
+    if _unit_spellings_union_cache is None:
+        _unit_spellings_union_cache = frozenset().union(*_unit_spellings_by_quantity().values())
+    return _unit_spellings_union_cache
+
+
 def ground_quote(
     text: str,
     quote: str,
@@ -214,6 +272,7 @@ def ground_quote(
     role: QuoteRole,
     occurrence: int | None = None,
     value_span: tuple[int, int] | None = None,
+    quantity: QuantityKind | None = None,
 ) -> CharSpanLocator:
     """Locate ``quote`` in ``text`` by SEARCHING, returning a half-open
     :class:`CharSpanLocator` over ``TextSpace.EXTRACTED_TEXT``.
@@ -264,6 +323,21 @@ def ground_quote(
             being reported, not merely some other clean numeral (e.g. a run
             id). Omitted (``None``, the default) means the exception never
             fires -- fail closed.
+        quantity: REQUIRED for ``role=QuoteRole.UNIT`` (and refused for every
+            other role): the ``carmel.services.units.QuantityKind`` this unit
+            quote claims to measure, used to select which quantity's spelling
+            vocabulary in ``carmel.services.units.TABLE_V1`` a UNIT quote must
+            belong to (D-U2's table-maximality layer). Must be a genuine
+            ``QuantityKind`` member, not merely something that ``==``-compares
+            to one -- a plain string like ``"temperature"`` compares equal to
+            ``QuantityKind.TEMPERATURE`` in dict/set lookups (``StrEnum``) but
+            is not a real member, and admitting it would silently bypass the
+            vocabulary gate for whatever spellings happen to attach to that
+            string. ``QuantityKind.OTHER`` is refused outright:
+            ``carmel.services.units.normalize_unit`` returns OTHER's raw
+            string unchanged (OTHER has no vocabulary), so there is nothing
+            for this gate to verify admission against -- a deliberate, known
+            coverage gap, not a bug to route around.
 
     Returns:
         A ``CharSpanLocator`` with ``text[start:end] == quote``.
@@ -271,10 +345,12 @@ def ground_quote(
     Raises:
         QuoteGroundingError: ``role`` is not a genuine ``QuoteRole`` member
             (checked FIRST, before any of the checks below, so it is never
-            masked by a later check surfacing first); empty quote;
-            whitespace-padded quote; quote not found; ambiguous quote with
-            ``occurrence=None``; ``occurrence`` out of range; or a
-            role-specific boundary violation.
+            masked by a later check surfacing first); for ``role=QuoteRole.UNIT``,
+            ``quantity`` is missing, is not a genuine ``QuantityKind`` member,
+            or is ``QuantityKind.OTHER``; for any other role, ``quantity`` was
+            supplied at all; empty quote; whitespace-padded quote; quote not
+            found; ambiguous quote with ``occurrence=None``; ``occurrence``
+            out of range; or a role-specific boundary violation.
     """
     if not isinstance(role, QuoteRole):
         # Exhaustive, fail-closed dispatch: EVERY call must resolve to one of
@@ -297,6 +373,44 @@ def ground_quote(
             "quote's job, so a role that is not a genuine QuoteRole member (a plain "
             "string, None, or any other object) is refused outright rather than "
             "silently skipping every boundary check"
+        )
+    # D-U2 Layer 0: quantity is required for -- and only for -- role=UNIT.
+    # Runs immediately after the role guard above and before every other
+    # check (including the empty-quote check), for the same reason that
+    # guard runs first: a caller that gets this argument wrong must see
+    # THIS message, never a later, unrelated check's message surfacing
+    # first and masking it.
+    if role is QuoteRole.UNIT:
+        if quantity is None:
+            raise QuoteGroundingError(
+                "ground_quote: role=QuoteRole.UNIT requires quantity= -- a genuine "
+                "carmel.services.units.QuantityKind member naming which quantity this "
+                "unit quote claims to measure -- but quantity was not supplied (None); "
+                "UNIT grounding cannot check table maximality without knowing which "
+                "quantity's vocabulary to check against"
+            )
+        if not isinstance(quantity, QuantityKind):
+            raise QuoteGroundingError(
+                f"ground_quote: quantity={quantity!r} is not a genuine "
+                "carmel.services.units.QuantityKind member -- QuantityKind is a StrEnum, "
+                "so a plain string that happens to equal a member's value (e.g. "
+                "'temperature') compares equal in dict/set lookups but is not a real "
+                "member; refused outright rather than risk silently checking the wrong "
+                "(or no) vocabulary"
+            )
+        if quantity is QuantityKind.OTHER:
+            raise QuoteGroundingError(
+                "ground_quote: quantity=QuantityKind.OTHER has no unit vocabulary -- "
+                "carmel.services.units.normalize_unit returns OTHER's raw string "
+                "unchanged, so OTHER has no known spellings to check admission against; "
+                "UNIT grounding for OTHER is refused outright as a deliberate, known "
+                "coverage gap, not a bypass"
+            )
+    elif quantity is not None:
+        raise QuoteGroundingError(
+            f"ground_quote: quantity={quantity!r} was supplied but role={role!r} is not "
+            "QuoteRole.UNIT -- quantity only selects a vocabulary for UNIT-role table "
+            "maximality checking and has no meaning for any other role"
         )
     if not quote:
         # CharSpanLocator's own validator would eventually reject the
@@ -439,36 +553,97 @@ def ground_quote(
         # else: quote is a clean, non-numeral VALUE token already at a clean
         # boundary -- nothing to raise, fall through to the self-check below.
     elif role is QuoteRole.UNIT:
-        # A unit quote (role UNIT) uses its own ALLOWLIST-based adjacency
-        # rule, not has_clean_token_boundary above: each edge is refused
-        # unless the neighbouring character is whitespace, start/end of
-        # text, or on that edge's specific permitted-separator allowlist,
-        # with one narrow leading-edge exception for a value the unit is
-        # genuinely glued to (see carmel.services.numeric.unit_boundary_violation
-        # for the full rule -- the exception now requires the caller to pass
-        # value_span, matching exactly, not merely "some clean numeral").
-        # Each distinguishable cause gets its own message, mirroring the
-        # enclosing_numeric_construct pattern above -- this project has
-        # hit masked, indistinguishable refusals of this shape before.
-        violation = unit_boundary_violation(text, start, end, value_span=value_span)
-        if violation == "unit_leading_adjacency":
+        # A unit quote (role UNIT) uses its own three-layer boundary rule,
+        # not has_clean_token_boundary above (see
+        # carmel.services.numeric.unit_boundary_violation for the full
+        # rule): Layer 1 partitions the character space into delimiters,
+        # unit-token characters, and an unclassified bucket that fails
+        # closed; Layer 2 requires each edge to already be maximal over
+        # unit-token characters (with a narrow leading-edge exception for
+        # a value the unit is genuinely glued to, gated by value_span
+        # matching exactly, not merely "some clean numeral"); Layer 3
+        # requires the quote to be a registered spelling for the claimed
+        # quantity and to be maximal against the union of ALL quantities'
+        # spellings (so a caller cannot dodge maximality by mis-claiming
+        # quantity). Each distinguishable cause gets its own message,
+        # mirroring the enclosing_numeric_construct pattern above -- this
+        # project has hit masked, indistinguishable refusals of this shape
+        # before.
+        # Layer 0 above already guarantees quantity is a genuine, non-OTHER
+        # QuantityKind for every role=UNIT call that reaches here (it raises
+        # first otherwise); this assert only makes that guarantee visible to
+        # mypy, which cannot correlate the two separate `role is QuoteRole.UNIT`
+        # branches on its own.
+        assert isinstance(quantity, QuantityKind)
+        violation = unit_boundary_violation(
+            text,
+            start,
+            end,
+            value_span=value_span,
+            quantity_spellings=_unit_spellings_by_quantity().get(quantity, frozenset()),
+            all_spellings=_unit_spellings_union(),
+        )
+        if violation == "unit_leading_not_maximal":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} does not sit at a clean unit "
                 "boundary in the supplied text -- its LEADING edge is directly "
-                "adjacent to a character that is not whitespace, start-of-text, or "
-                "one of the permitted leading separators ('(', '=', ':', ',') -- that "
-                "makes it look like a fragment of a larger unit or token (e.g. 'C' "
-                "inside '25°C'); quote the full unit if that is what is meant"
+                "adjacent to another unit-token character, so this quote is not "
+                "maximal at that edge -- that makes it look like a fragment of a "
+                "larger unit or token (e.g. 'C' inside 'mC', or 'K' inside 'mK'); "
+                "quote the full unit if that is what is meant"
             )
-        if violation == "unit_trailing_adjacency":
+        if violation == "unit_leading_unclassified_char":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} does not sit at a clean unit "
+                "boundary in the supplied text -- its LEADING edge is directly "
+                "adjacent to a character that is neither whitespace, a recognised "
+                "unit-boundary delimiter, nor a unit-token character -- an "
+                "unclassified neighbour is refused outright rather than guessed at; "
+                "quote the full unit if that is what is meant"
+            )
+        if violation == "unit_trailing_not_maximal":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} does not sit at a clean unit "
                 "boundary in the supplied text -- its TRAILING edge is directly "
-                "adjacent to a character that is not whitespace, end-of-text, or one "
-                "of the permitted trailing separators (',', ';', '.', ')') -- that "
-                "makes it look like a fragment of a larger unit (e.g. 'cm3' inside "
-                "'cm3/mol/s', or 'm/s' inside 'm/s2'); quote the full unit if that is "
-                "what is meant"
+                "adjacent to another unit-token character (beyond any trimmed "
+                "trailing bare-operator run), so this quote is not maximal at that "
+                "edge -- that makes it look like a fragment of a larger unit (e.g. "
+                "'cm3' inside 'cm3/mol/s', or 'K' inside 'K*cm'); quote the full "
+                "unit if that is what is meant"
+            )
+        if violation == "unit_trailing_unclassified_char":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} does not sit at a clean unit "
+                "boundary in the supplied text -- its TRAILING edge is directly "
+                "adjacent to a character that is neither whitespace, a recognised "
+                "unit-boundary delimiter, nor a unit-token character -- an "
+                "unclassified neighbour is refused outright rather than guessed at; "
+                "quote the full unit if that is what is meant"
+            )
+        if violation == "unit_not_in_vocabulary":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is not a registered spelling "
+                "(known unit or alias, raw or normalized) for the claimed quantity "
+                "in carmel.services.units.TABLE_V1 -- an unrecognised unit spelling "
+                "is refused rather than admitted on the strength of merely sitting "
+                "at a clean boundary; register the spelling in TABLE_V1 first if it "
+                "is genuinely a unit this project should understand"
+            )
+        if violation == "unit_not_maximal_forward":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is a registered spelling, but "
+                "a LONGER registered spelling (for some quantity) starts at the same "
+                "position and extends past this quote's end -- e.g. quoting 'cm' "
+                "where the text actually reads the registered VELOCITY alias "
+                "'cm s^-1' -- quote the full, longer unit spelling instead"
+            )
+        if violation == "unit_not_maximal_backward":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is a registered spelling, but "
+                "a LONGER registered spelling (for some quantity) starts before this "
+                "quote and ends at the same position -- this quote is a suffix "
+                "fragment of that longer spelling; quote the full, longer unit "
+                "spelling instead"
             )
         if violation == "unit_digit_glue_no_value_span":
             raise QuoteGroundingError(
@@ -648,6 +823,7 @@ def _measured_value(
         role=QuoteRole.UNIT,
         occurrence=spec.unit_occurrence,
         value_span=(value_locator.start, value_locator.end),
+        quantity=spec.quantity_kind,
     )
     canary = normalize_numeric_span(
         spec.value_quote,
