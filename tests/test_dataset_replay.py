@@ -194,12 +194,13 @@ class TestReplayEnvelopeExtractedTextShaMismatch:
         raw_bytes = extracted_path.read_bytes()
         extracted = ExtractedText.model_validate(json.loads(raw_bytes))
         # Rewrite extracted.json with DIFFERENT text but keep the file's own
-        # bytes digest self-consistent by NOT touching meta.json -- so the
-        # extracted.json-bytes-vs-StoredArtifact.extracted_sha256 check
-        # would itself fail first for a naive re-read of raw bytes; to
-        # isolate the extracted_text_sha256 comparison specifically we craft
-        # extracted.json bytes whose sha256 we then also patch into
-        # meta.json, so the ONLY thing that disagrees is the recorded
+        # bytes digest self-consistent with what the ENVELOPE anchors on --
+        # the replayer authenticates extracted.json against the envelope's
+        # own ExtractionBinding.extracted_sha256 (never meta.json; see
+        # dataset_replay's module docstring for why), so to isolate the
+        # extracted_text_sha256 comparison specifically, both the envelope's
+        # own anchor AND meta.json's copy are patched to the new bytes'
+        # digest. That leaves the ONLY thing that disagrees as the recorded
         # ExtractionBinding.extracted_text_sha256 on the envelope itself.
         new_text = extracted.text + " EXTRA UNRECORDED SENTENCE."
         new_extracted = ExtractedText(
@@ -207,12 +208,21 @@ class TestReplayEnvelopeExtractedTextShaMismatch:
         )
         new_bytes = json.dumps(new_extracted.model_dump(mode="json")).encode("utf-8")
         extracted_path.write_bytes(new_bytes)
+        new_extracted_sha256 = hashlib.sha256(new_bytes).hexdigest()
         meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["extracted_sha256"] = hashlib.sha256(new_bytes).hexdigest()
+        meta["extracted_sha256"] = new_extracted_sha256
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
-        report = replay_envelope(tmp_path, loaded)
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        patched_extraction = node.extraction.model_copy(update={"extracted_sha256": new_extracted_sha256})
+        patched_node = node.model_copy(update={"extraction": patched_extraction})
+        patched_nodes = tuple(patched_node if n is node else n for n in loaded.source_graph.nodes)
+        patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})
+        tampered = loaded.model_copy(update={"source_graph": patched_graph})
+
+        report = replay_envelope(tmp_path, tampered)
         assert report.outcome is ReplayOutcome.FAILED
         assert any("extracted_text_sha256" in f.reason for f in report.failures)
 
@@ -356,3 +366,175 @@ class TestReplayEnvelopeGenericWalkExhaustiveness:
             1 for _, ref in iter_source_refs(loaded) if isinstance(ref.locator, CharSpanLocator)
         )
         assert report.checked_char_spans == total_char_span_refs
+
+
+class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
+    """P0 (round 45): the replayer must authenticate ``extracted.json``
+    against the ENVELOPE's own :class:`ExtractionBinding.extracted_sha256`
+    -- never against the evidence store's ``meta.json`` sidecar, which lives
+    right next to the very file it would otherwise authenticate and is
+    trivially rewritable.
+
+    The exploit: rewrite ``extracted.json`` changing a field OTHER than
+    ``.text`` (so the recorded ``extracted_text_sha256`` still matches),
+    then patch ``meta.json``'s ``extracted_sha256`` to the new bytes'
+    digest so a meta.json-anchored replayer sees a consistent-looking
+    sidecar. The envelope's own ``ExtractionBinding.extracted_sha256`` --
+    written once at production time and never touched -- still names the
+    ORIGINAL bytes. A replayer that trusts meta.json returns VERIFIED here;
+    that is vacuous, because the stored evidence has visibly changed.
+    """
+
+    def test_meta_json_sidecar_rewrite_does_not_launder_a_verified_result(self, tmp_path: Path) -> None:
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        clean_report = replay_envelope(tmp_path, loaded)
+        assert clean_report.outcome is ReplayOutcome.VERIFIED
+
+        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
+        raw_bytes = extracted_path.read_bytes()
+        extracted = ExtractedText.model_validate(json.loads(raw_bytes))
+
+        # Change a field OTHER than `.text` -- `.text` stays byte-identical
+        # so extracted_text_sha256 (which only ever digests `.text`) still
+        # matches what the envelope recorded. `lossy` flips from False to
+        # True: a forger silently marking previously-clean evidence as lossy
+        # without changing a single character of the text the char-spans
+        # actually re-slice.
+        forged = ExtractedText(
+            text=extracted.text,
+            normalized=extracted.normalized,
+            sections=extracted.sections,
+            page_count=extracted.page_count,
+            extractor=extracted.extractor,
+            lossy=True,
+        )
+        forged_bytes = json.dumps(forged.model_dump(mode="json")).encode("utf-8")
+        assert forged_bytes != raw_bytes
+        extracted_path.write_bytes(forged_bytes)
+
+        # Patch meta.json's extracted_sha256 to match the forged bytes, so
+        # a replayer that (wrongly) anchors on the mutable sidecar sees a
+        # self-consistent record.
+        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["extracted_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        report = replay_envelope(tmp_path, loaded)
+        assert report.outcome is not ReplayOutcome.VERIFIED, (
+            "replay must not launder a rewritten extracted.json just because meta.json was "
+            "patched to match it -- the envelope's own ExtractionBinding.extracted_sha256 is "
+            "the only acceptable anchor"
+        )
+        assert any(
+            "extracted_sha256" in f.reason or "extracted.json" in f.reason
+            for f in (report.failures + report.unverifiable)
+        )
+
+
+class TestReplayEnvelopeZeroCheckedSpansCannotVerify:
+    """Hole #1 (round 45): a replay that independently re-slices ZERO
+    character spans must never report VERIFIED -- that would launder the
+    "verified" label onto an envelope where nothing was actually checked.
+    """
+
+    def test_envelope_with_no_char_span_refs_is_unverifiable_not_verified(self, tmp_path: Path) -> None:
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+
+        # Strip every series so no CharSpanLocator remains reachable via
+        # iter_measured_values/axes -- the source graph and its evidence
+        # stay completely intact and verifiable; only the char-span-bearing
+        # content is gone.
+        empty_envelope = loaded.model_copy(update={"series": ()})
+
+        report = replay_envelope(tmp_path, empty_envelope)
+        assert report.checked_char_spans == 0
+        assert report.outcome is not ReplayOutcome.VERIFIED, (
+            "a replay that independently checked zero character spans must never report "
+            "VERIFIED -- there is nothing behind that label"
+        )
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("0" in f.reason or "zero" in f.reason.lower() for f in report.unverifiable)
+
+
+class TestReplayEnvelopeContainsParserExceptions:
+    """Hole #3 (round 45): a hash-consistent ``extracted.json`` that fails
+    to *parse* as :class:`ExtractedText` (e.g. pathologically deep nesting
+    that blows Python's recursion limit) must become a named UNVERIFIABLE
+    finding, never an escaping crash that takes down the whole replay run.
+    """
+
+    def test_recursion_error_while_parsing_extracted_json_is_unverifiable_not_a_crash(
+        self, tmp_path: Path
+    ) -> None:
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+
+        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
+
+        # Build a deeply, deeply nested JSON array as the value of a field
+        # ExtractedText doesn't even declare -- pydantic's `extra="forbid"`
+        # validation still has to walk/reject the payload, and json.loads
+        # itself recurses per nesting level, so a large enough depth blows
+        # the recursion limit during parse/validate, independent of the top
+        # -level dict's own shape.
+        deep_depth = 1_000_000
+        nested = "[" * deep_depth + "]" * deep_depth
+        payload = (
+            f'{{"text": {json.dumps("x")}, "normalized": {json.dumps("x")}, '
+            f'"extractor": "pdf:pypdf", "lossy": false, "bogus_extra_field": {nested}}}'
+        )
+        forged_bytes = payload.encode("utf-8")
+        extracted_path.write_bytes(forged_bytes)
+
+        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["extracted_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        # The envelope's own ExtractionBinding.extracted_sha256 must also
+        # name the forged bytes so the run gets PAST the P0 anchor check
+        # and actually reaches the parse step this test targets.
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        forged_extraction = node.extraction.model_copy(
+            update={"extracted_sha256": hashlib.sha256(forged_bytes).hexdigest()}
+        )
+        forged_node = node.model_copy(update={"extraction": forged_extraction})
+        forged_nodes = tuple(forged_node if n is node else n for n in loaded.source_graph.nodes)
+        forged_graph = loaded.source_graph.model_copy(update={"nodes": forged_nodes})
+        tampered = loaded.model_copy(update={"source_graph": forged_graph})
+
+        report = replay_envelope(tmp_path, tampered)  # must not raise
+        assert report.outcome is not ReplayOutcome.VERIFIED
+        assert any(
+            "parse" in f.reason.lower() or "RecursionError" in f.reason for f in report.unverifiable
+        )
+
+
+class TestReplayEnvelopeReportsPartialCounts:
+    def test_total_and_unchecked_char_spans_are_reported(self, tmp_path: Path) -> None:
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        report = replay_envelope(tmp_path, loaded)
+        assert report.total_char_spans == report.checked_char_spans
+        assert report.unchecked_char_spans == 0
+        assert report.total_char_spans == report.checked_char_spans + report.unchecked_char_spans
+
+
+class TestReplayEnvelopeSurfacesUnreferencedNodeProblems:
+    """Hole #2 (round 45): a problem on a node must be reported even when
+    no char-span ref happens to reach that node -- an unreferenced node's
+    tampered/missing evidence must never be silently invisible."""
+
+    def test_unreferenced_node_with_missing_evidence_is_reported(self, tmp_path: Path) -> None:
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+
+        extra_node = loaded.source_graph.node("paper").model_copy(
+            update={"node_id": "orphan", "parent_node_id": None, "sha256": "1" * 64}
+        )
+        extra_nodes = loaded.source_graph.nodes + (extra_node,)
+        extra_graph = loaded.source_graph.model_copy(update={"nodes": extra_nodes})
+        tampered = loaded.model_copy(update={"source_graph": extra_graph})
+
+        report = replay_envelope(tmp_path, tampered)
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("orphan" in f.reason for f in report.unverifiable)
