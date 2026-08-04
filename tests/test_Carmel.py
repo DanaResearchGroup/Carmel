@@ -1628,3 +1628,202 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
 
         assert code == 1
         assert "--budget-tokens is required" in capsys.readouterr().err
+
+
+class TestReextractCommand:
+    """The operator-facing verb for re-parsing a stored artifact's raw.bin and
+    appending a new, separately-addressed extraction record.
+
+    Dry run is the default (opposite polarity from ``corpus-pass --dry-run``): a
+    plain ``carmel reextract --sha ...`` must never write, only ``--apply`` does.
+    """
+
+    def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
+        from Carmel import main
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        return load_campaign(ws).campaign_id, ws
+
+    def _config(self, tmp_path: Path) -> Path:
+        # Any config with an 'agents' section works: --config is only there to supply
+        # budget.max_artifact_bytes, no default is invented in Carmel.py itself.
+        return _write_campaign_config(tmp_path)
+
+    def test_neither_sha_nor_all_is_a_usage_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, _ = self._campaign(tmp_path)
+        config = str(self._config(tmp_path))
+
+        code = main(["reextract", "--campaign", cid, "--workspaces", str(tmp_path), "--config", config])
+
+        assert code == 1
+        assert "--sha <raw_sha256> or --all is required" in capsys.readouterr().err
+
+    def test_dry_run_writes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Dry run source text"))
+
+        from carmel.services.extraction_record import list_extraction_records
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+            ]
+        )
+
+        assert code == 0
+        assert list_extraction_records(ws, raw_sha256=raw_sha256) == []
+
+    def test_dry_run_reports_the_would_be_sha(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from carmel.services.reextraction import preview_reextraction
+        from tests.test_reextraction import MAX_BYTES, _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Reported source text"))
+        expected_sha256, _ = preview_reextraction(ws, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+            ]
+        )
+
+        assert code == 0
+        assert expected_sha256 in capsys.readouterr().out
+
+    def test_apply_writes_a_new_extraction_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from carmel.services.extraction_record import list_extraction_records
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Apply source text"))
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+                "--apply",
+            ]
+        )
+
+        assert code == 0
+        assert len(list_extraction_records(ws, raw_sha256=raw_sha256)) == 1
+        assert "WRITTEN" in capsys.readouterr().out
+
+    def test_apply_twice_is_a_no_op(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from carmel.services.extraction_record import list_extraction_records
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Idempotent apply source text"))
+        config = str(self._config(tmp_path))
+
+        args = [
+            "reextract",
+            "--campaign",
+            cid,
+            "--workspaces",
+            str(tmp_path),
+            "--config",
+            config,
+            "--sha",
+            raw_sha256,
+            "--apply",
+        ]
+        assert main(args) == 0
+        capsys.readouterr()
+        assert main(args) == 0
+        out = capsys.readouterr().out
+
+        assert len(list_extraction_records(ws, raw_sha256=raw_sha256)) == 1
+        assert "ALREADY-PRESENT" in out
+
+    def test_all_reports_the_bad_artifact_and_still_processes_the_good_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from carmel.services.extraction_record import list_extraction_records
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        good_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Good artifact source text"))
+        bad_sha256 = _store_synthetic_artifact(ws, b"not a pdf at all, no header")
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--all",
+                "--apply",
+            ]
+        )
+
+        out = capsys.readouterr().out
+        assert code == 1
+        assert f"REFUSED         {bad_sha256}" in out
+        assert "does not sniff as a PDF" in out
+        assert f"WRITTEN         {good_sha256}" in out
+        assert len(list_extraction_records(ws, raw_sha256=good_sha256)) == 1
+
+    def test_no_consumer_notice_appears_in_run_output(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Notice source text"))
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "no consumer reads extraction records yet" in out.lower()
+
+    def test_no_consumer_notice_appears_in_help_text(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit):
+            main(["reextract", "--help"])
+        out = capsys.readouterr().out
+        # argparse line-wraps the description to the terminal width, so compare on
+        # whitespace-normalized text rather than requiring the phrase on one line.
+        normalized = " ".join(out.lower().split())
+        assert "no consumer reads extraction records yet" in normalized

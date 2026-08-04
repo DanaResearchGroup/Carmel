@@ -165,6 +165,48 @@ def create_parser() -> argparse.ArgumentParser:
         help="Append the action and stop, without running it",
     )
 
+    reextract = subparsers.add_parser(
+        "reextract",
+        help="Re-parse a stored artifact's raw.bin and append a new extraction record",
+        description=(
+            "Re-parse a stored artifact's raw.bin with today's extractor and append a new, "
+            "separately-addressed extraction record under evidence/literature/<raw_sha256>/"
+            "extractions/. NOTE: no consumer reads extraction records yet -- this command "
+            "only appends evidence for a future one. Dry run (the default) does the real "
+            "read/parse/cleanliness check and reports what it would do without writing "
+            "anything; pass --apply to actually write."
+        ),
+    )
+    reextract.add_argument("--campaign", help="Campaign ID")
+    reextract.add_argument(
+        "--sha",
+        default=None,
+        help="raw_sha256 of a single stored artifact to re-extract (mutually exclusive with --all)",
+    )
+    reextract.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-extract every artifact in the campaign's evidence store (mutually exclusive with --sha)",
+    )
+    reextract.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Actually append the new extraction record. Without this flag the command is a "
+            "dry run: it still does the real read/parse/cleanliness check, but writes nothing."
+        ),
+    )
+    reextract.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    reextract.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "Carmel config file with an 'agents' section (required; supplies "
+            "budget.max_artifact_bytes -- no default is invented here)"
+        ),
+    )
+
     return parser
 
 
@@ -282,6 +324,134 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     result = outcome.result
     print(f"Literature action {result.action_id} finished with outcome {result.outcome.value}")
     return 0
+
+
+_NO_CONSUMER_NOTICE = (
+    "NOTE: no consumer reads extraction records yet -- this command only appends "
+    "evidence for a future one."
+)
+
+
+def _looks_like_sha256(name: str) -> bool:
+    """True if ``name`` has the shape of a lowercase hex sha256 digest.
+
+    Used to scan ``evidence/literature/`` directly by directory name, deliberately
+    bypassing ``list_artifacts()``/``list_artifacts_with_unreadable()``: those helpers
+    read each artifact's meta.json to build their listing, so an artifact whose
+    meta.json is unreadable would silently drop out of a ``--all`` run instead of
+    being attempted and having its refusal reported.
+    """
+    return len(name) == 64 and all(c in "0123456789abcdef" for c in name)
+
+
+def _reextract_one(ws: Path, *, raw_sha256: str, max_bytes: int, apply: bool) -> int:
+    """Re-extract a single artifact and print its outcome. Never raises.
+
+    Always previews first (real read/parse/cleanliness check, no write) so both the
+    dry-run and --apply paths report "already present" from the exact same check --
+    they can never disagree about whether a write is needed. Only when --apply is set
+    AND the extraction is not already present does it actually write, via
+    reextract_artifact.
+
+    Returns 0 on success (including "already present" / dry-run preview), 1 on a
+    refusal (ReextractionError), so callers can count failures for --all.
+    """
+    from carmel.services.reextraction import ReextractionError, preview_reextraction, reextract_artifact
+
+    try:
+        extraction_sha256, already_present = preview_reextraction(ws, raw_sha256=raw_sha256, max_bytes=max_bytes)
+    except ReextractionError as exc:
+        print(f"REFUSED         {raw_sha256}: {exc}")
+        return 1
+
+    if not apply:
+        if already_present:
+            print(f"DRY-RUN         {raw_sha256}: extraction {extraction_sha256} already present; nothing to write")
+        else:
+            print(f"DRY-RUN         {raw_sha256}: would write extraction {extraction_sha256}; nothing written")
+        return 0
+
+    if already_present:
+        print(f"ALREADY-PRESENT {raw_sha256}: extraction {extraction_sha256}")
+        return 0
+
+    written_sha256 = reextract_artifact(ws, raw_sha256=raw_sha256, max_bytes=max_bytes)
+    print(f"WRITTEN         {raw_sha256}: extraction {written_sha256}")
+    return 0
+
+
+def _cmd_reextract(
+    campaign_id: str,
+    workspaces: Path | None,
+    config: Path | None,
+    *,
+    sha: str | None,
+    all_artifacts: bool,
+    apply: bool,
+) -> int:
+    """Re-parse a stored artifact's raw.bin and append a new extraction record.
+
+    Dry run is the default (opposite polarity from ``corpus-pass --dry-run``, which
+    opts IN to dry mode): here ``--apply`` opts IN to mutation, so an operator who
+    forgets the flag gets a safe preview rather than an accidental write.
+
+    No consumer reads extraction records yet -- see :mod:`carmel.services.reextraction`.
+    This command only appends evidence for a future one.
+    """
+    if sha is not None and all_artifacts:
+        print("--sha and --all are mutually exclusive. Use one or the other.", file=sys.stderr)
+        return 1
+    if sha is None and not all_artifacts:
+        print("Either --sha <raw_sha256> or --all is required.", file=sys.stderr)
+        return 1
+
+    from carmel.paths import resolve_workspaces_root
+    from carmel.services.campaigns import find_campaign_workspace
+    from carmel.services.evidence import EVIDENCE_LITERATURE_DIR
+
+    try:
+        agent_config = _load_agent_config(config)
+    except (OSError, ValueError) as e:
+        print(f"Failed to load config: {e}", file=sys.stderr)
+        return 1
+    if agent_config is None:
+        print(
+            "No agent config available: pass --config FILE whose 'agents' section "
+            "sets budget.max_artifact_bytes.",
+            file=sys.stderr,
+        )
+        return 1
+    max_bytes = agent_config.budget.max_artifact_bytes  # type: ignore[attr-defined]
+
+    workspaces_root = resolve_workspaces_root(workspaces)
+    ws = find_campaign_workspace(workspaces_root, campaign_id)
+    if ws is None:
+        print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
+        return 1
+
+    print(_NO_CONSUMER_NOTICE)
+
+    if sha is not None:
+        return _reextract_one(ws, raw_sha256=sha, max_bytes=max_bytes, apply=apply)
+
+    evidence_root = ws / EVIDENCE_LITERATURE_DIR
+    try:
+        candidates = sorted(p.name for p in evidence_root.iterdir() if p.is_dir() and _looks_like_sha256(p.name))
+    except OSError as exc:
+        print(f"Could not scan evidence store at {evidence_root}: {exc}", file=sys.stderr)
+        return 1
+
+    if not candidates:
+        print(f"No artifacts found under {evidence_root}.")
+        return 0
+
+    failures = 0
+    for raw_sha256 in candidates:
+        if _reextract_one(ws, raw_sha256=raw_sha256, max_bytes=max_bytes, apply=apply) != 0:
+            failures += 1
+
+    print(f"{len(candidates)} artifact(s) processed, {failures} refused.")
+    return 1 if failures else 0
 
 
 def _cmd_corpus_pass(
@@ -888,6 +1058,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "requests":
         return _cmd_requests(args.campaign, args.workspaces, args.add, args.slug, args.config, args.collect)
+
+    if args.command == "reextract":
+        return _cmd_reextract(
+            args.campaign,
+            args.workspaces,
+            args.config,
+            sha=args.sha,
+            all_artifacts=args.all,
+            apply=args.apply,
+        )
 
     parser.print_help()
     return 1

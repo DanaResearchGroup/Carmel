@@ -23,7 +23,7 @@ from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.literature import ArtifactProvenance
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.extraction_record import extraction_record_dir, list_extraction_records
-from carmel.services.reextraction import ReextractionError, reextract_artifact
+from carmel.services.reextraction import ReextractionError, preview_reextraction, reextract_artifact
 
 MAX_BYTES = 10_000_000
 
@@ -190,6 +190,51 @@ class TestIdempotence:
         assert len(records) == 1
 
 
+class TestPreview:
+    """preview_reextraction() must do the real read/parse/cleanliness work and
+    report the address reextract_artifact() would write to (or already has), while
+    writing nothing itself."""
+
+    def test_preview_writes_nothing_and_reports_not_yet_present(self, tmp_path: Path) -> None:
+        pdf_bytes = _build_tiny_pdf(b"Preview Before Apply")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+
+        extraction_sha256, already_present = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        assert already_present is False
+        assert extraction_record_dir(tmp_path, raw_sha256, extraction_sha256).exists() is False
+        assert list_extraction_records(tmp_path, raw_sha256) == []
+
+    def test_preview_reports_the_same_address_apply_would_write(self, tmp_path: Path) -> None:
+        pdf_bytes = _build_tiny_pdf(b"Preview Matches Apply")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+
+        previewed_sha256, _ = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+        written_sha256 = reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        assert previewed_sha256 == written_sha256
+
+    def test_preview_after_apply_reports_already_present(self, tmp_path: Path) -> None:
+        pdf_bytes = _build_tiny_pdf(b"Preview After Apply")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        written_sha256 = reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        extraction_sha256, already_present = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        assert extraction_sha256 == written_sha256
+        assert already_present is True
+        # Still exactly one record: preview must not have appended a duplicate.
+        assert len(list_extraction_records(tmp_path, raw_sha256)) == 1
+
+    def test_preview_of_a_refused_artifact_raises_without_writing(self, tmp_path: Path) -> None:
+        raw_sha256 = _store_synthetic_artifact(tmp_path, b"not a pdf at all")
+
+        with pytest.raises(ReextractionError, match=r"does not sniff as"):
+            preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        assert list_extraction_records(tmp_path, raw_sha256) == []
+
+
 class TestDeliberateRootRecordDivergence:
     def test_root_and_nested_record_deliberately_disagree_after_reextraction(self, tmp_path: Path) -> None:
         """Documents, explicitly, that nothing reconciles the root sidecar with the
@@ -245,6 +290,80 @@ class TestRefusals:
         raw_sha256 = _store_synthetic_artifact(tmp_path, data, content_type="application/pdf")
 
         with pytest.raises(ReextractionError, match=r"does not sniff as a PDF"):
+            reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+    def test_step3_refuses_raw_bin_symlink_escaping_artifact_directory(self, tmp_path: Path) -> None:
+        """A1: the artifact directory name is attacker-controlled input (just a
+        sha the caller supplies). If raw.bin were a symlink to a file OUTSIDE the
+        artifact directory, an attacker could name the directory after that
+        outside file's real sha256 and pass the content-address check while
+        pulling outside content into the evidence store. Build exactly that:
+        a real outside file, hash it for real, name the artifact directory that
+        hash, and point raw.bin at the outside file via symlink.
+        """
+        outside_dir = tmp_path.parent / "outside-the-workspace-root"
+        outside_dir.mkdir(exist_ok=True)
+        outside_file = outside_dir / "secret.bin"
+        # Must be a valid-sniffing PDF: pre-fix code has no resolve/containment
+        # check and would happily read straight through the symlink, sniff it as
+        # a PDF, and successfully append an extraction record built from OUTSIDE
+        # content -- that is the vulnerability this test proves is closed. Non-PDF
+        # bytes would incidentally be refused at the content-sniff step even on
+        # pre-fix code, which would prove nothing about the symlink escape itself.
+        outside_bytes = _build_tiny_pdf(b"Outside Content Must Never Enter The Store")
+        outside_file.write_bytes(outside_bytes)
+        raw_sha256 = hashlib.sha256(outside_bytes).hexdigest()
+
+        dest_dir = artifact_dir(tmp_path, raw_sha256)
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "raw.bin").symlink_to(outside_file)
+
+        with pytest.raises(ReextractionError, match=r"symlink escape"):
+            reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+    def test_step3_refuses_raw_bin_that_is_not_a_regular_file(self, tmp_path: Path) -> None:
+        """A1, second half: containment alone is not enough. A raw.bin that is a
+        DIRECTORY resolves happily inside its own artifact directory, so the
+        symlink-escape check beside this one passes it straight through -- and
+        then stat()/read_bytes() would blow up with IsADirectoryError instead of
+        failing closed with a reason. The regular-file check is what turns that
+        into a refusal.
+
+        A mutation audit found this guard SURVIVING -- nothing exercised it --
+        even after the symlink guard next to it was properly covered.
+        """
+        pdf_bytes = _build_tiny_pdf(b"Never Read")
+        raw_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+
+        dest_dir = artifact_dir(tmp_path, raw_sha256)
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "raw.bin").mkdir()
+
+        with pytest.raises(ReextractionError, match=r"does not resolve to a regular file"):
+            reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+    def test_step7_allows_absent_root_meta_json(self, tmp_path: Path) -> None:
+        """A2 control case: an absent meta.json is not fatal on its own -- the
+        sniff at step 6 already established the content type. This must keep
+        succeeding after the A2 fix, to prove absent and corrupt are genuinely
+        distinguished (not both collapsed to refusal)."""
+        pdf_bytes = _build_tiny_pdf(b"No Meta At All")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        (artifact_dir(tmp_path, raw_sha256) / "meta.json").unlink()
+
+        extraction_sha256 = reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+        assert extraction_sha256
+
+    def test_step7_refuses_a_present_but_corrupt_root_meta_json(self, tmp_path: Path) -> None:
+        """A2: a meta.json that EXISTS but fails to parse must be refused with
+        wording distinct from the absent case above -- load_artifact_meta()
+        collapses both to None, so this only works if reextraction.py checks
+        file existence separately from parse success."""
+        pdf_bytes = _build_tiny_pdf(b"Corrupt Meta Present")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        (artifact_dir(tmp_path, raw_sha256) / "meta.json").write_text("not valid json{{{", encoding="utf-8")
+
+        with pytest.raises(ReextractionError, match=r"exists but is corrupt or unreadable"):
             reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
     def test_step7_refuses_when_readable_root_meta_disagrees_with_sniffed_type(self, tmp_path: Path) -> None:

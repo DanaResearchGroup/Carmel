@@ -33,6 +33,24 @@ will: the correct replay anchor for anything built on top of a re-extraction is 
 extraction record's own address (``extraction_sha256``), never the root sidecar.
 Treat the resulting divergence between root and nested record as intended, not as
 a bug to "fix" by writing the new extraction back over the root files.
+
+On the serializer and "currentness": ``_canonical_extracted_json_bytes`` centralizes
+the one place that replicates ``carmel.services.artifacts.write_json``'s encoding.
+What that buys is narrow and mechanical -- the bytes this module persists cannot
+accidentally drift from what a root ``write_json`` call would have produced for the
+same ``ExtractedText``, because there is only one implementation of the encoding to
+drift. It does NOT make a stored record's "currentness" well-defined, and does not
+make serializer changes visible anywhere: ``current_extraction_records``
+(``carmel/services/extraction_record.py``) compares only a record's
+``extractor_code_sha256`` and ``pypdf_version`` against what ``extraction_identity()``
+reports right now. Serializer output is not part of the record's identity payload or
+its content address, and is not one of the fields ``current_extraction_records``
+compares -- so a serializer-only change (e.g. different key order, different float
+formatting) would mint a different ``extracted_sha256`` on the next re-extraction
+while every already-stored record, produced by the OLD serializer, keeps reporting as
+current. Centralizing the serializer prevents accidental byte drift between this path
+and root writes; it says nothing about whether a given serializer's output is still
+the one today's code would produce.
 """
 
 from __future__ import annotations
@@ -44,12 +62,18 @@ from pathlib import Path
 from carmel.agents.tools.extract import ExtractedText, extract_text
 from carmel.paths import normalize_path
 from carmel.services.evidence import artifact_dir, load_artifact_meta
-from carmel.services.extraction_record import store_extraction_record
+from carmel.services.extraction_record import (
+    _build_identity_payload,  # noqa: PLC2701 -- see preview_reextraction()'s docstring
+    compute_extraction_sha,
+    extraction_record_dir,
+    store_extraction_record,
+)
 from carmel.services.semantic_deps import extraction_identity
 
-__all__ = ["ReextractionError", "reextract_artifact"]
+__all__ = ["ReextractionError", "preview_reextraction", "reextract_artifact"]
 
 _RAW_NAME = "raw.bin"
+_META_NAME = "meta.json"
 _PDF_MAGIC = b"%PDF-"
 _SHA256_HEX_LEN = 64
 
@@ -76,35 +100,45 @@ def _canonical_extracted_json_bytes(extracted: ExtractedText) -> bytes:
     ``write_json`` writes ``json.dumps(data.model_dump(mode="json"), indent=2,
     default=str)`` encoded as UTF-8. This helper is the single place that
     replicates that contract, so the two serializations cannot drift apart.
+
+    What this buys: the bytes this module persists cannot accidentally diverge
+    from what a root ``write_json`` call would have produced for the same
+    ``ExtractedText``, because there is only one implementation of the encoding.
+    What it does NOT buy: serializer identity is not part of a record's identity
+    payload or its content address, and it is not one of the fields
+    ``current_extraction_records`` (``carmel/services/extraction_record.py``)
+    compares -- that function looks only at ``extractor_code_sha256`` and
+    ``pypdf_version``. A serializer-only change here would mint a different
+    ``extracted_sha256`` on the next re-extraction while every already-stored
+    record, produced by the old serializer, keeps reporting as current.
     """
     payload = extracted.model_dump(mode="json")
     return json.dumps(payload, indent=2, default=str).encode("utf-8")
 
 
-def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int) -> str:
-    """Re-parse a stored artifact's ``raw.bin`` and append a new extraction record.
+def _prepare_reextraction(
+    workspace_root: Path, *, raw_sha256: str, max_bytes: int
+) -> tuple[Path, ExtractedText, str, str, bytes]:
+    """Do every step of re-extraction that reads and parses, up to (not including) the write.
 
-    Never opens any root file (``raw.bin``, ``text.txt``, ``extracted.json``,
-    ``meta.json``) for writing, never calls ``store_artifact``, and never
-    reconciles the new record with the root sidecars -- see the module docstring.
-
-    Args:
-        workspace_root: Root of the campaign workspace.
-        raw_sha256: Content address of the already-stored artifact to re-extract.
-        max_bytes: Hard cap on the on-disk ``raw.bin`` size, checked via ``stat()``
-            before any bytes are read into memory. Callers pass their own budget
-            (e.g. ``config.budget.max_artifact_bytes``); this module has no default.
+    Shared by :func:`reextract_artifact` (which takes this result and writes it)
+    and :func:`preview_reextraction` (which takes the same result and computes
+    what WOULD be written, without writing). Both callers get the identical
+    real read-raw.bin / re-verify-digest / sniff / cross-check-meta /
+    re-parse / cleanliness-predicate work -- there is exactly one
+    implementation of "was this artifact genuinely re-extracted", so a dry run
+    can never silently diverge from what ``--apply`` would actually do.
 
     Returns:
-        The ``extraction_sha256`` of the appended (or, if byte-identical bytes were
-        already re-extracted before, pre-existing) extraction record.
+        A tuple of ``(root, extracted, extractor_code_sha256, pypdf_version,
+        extracted_json_bytes)``, where ``root`` is the normalized workspace root
+        (so callers do not redo that resolution), ``extracted`` is the freshly
+        re-parsed ``ExtractedText``, and the remaining fields are exactly the
+        arguments ``store_extraction_record`` needs beyond ``extractor`` (which
+        is ``extracted.extractor``) and ``extracted_json_bytes`` itself.
 
     Raises:
-        ReextractionError: If ``raw_sha256`` is malformed, ``raw.bin`` is missing,
-            oversized, or fails to hash to ``raw_sha256``, the bytes do not sniff as
-            a PDF, a readable root ``meta.json`` claims a different content type, or
-            the fresh extraction fails the cleanliness predicate (wrong extractor,
-            lossy, page failures, or empty text).
+        ReextractionError: See :func:`reextract_artifact`.
     """
     # Step 1: raw_sha256 must be a well-formed 64-char lowercase hex digest. This is
     # also the path-traversal guard: artifact_dir() joins this string directly onto
@@ -122,12 +156,33 @@ def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int)
         raise ReextractionError(f"refusing to read outside workspace root: {resolved_dest_dir} not under {root}")
     raw_path = dest_dir / _RAW_NAME
 
-    # Step 3: raw.bin must exist.
-    if not raw_path.exists():
-        raise ReextractionError(f"raw.bin does not exist for {raw_sha256}: {raw_path}")
+    # Step 3: raw.bin must exist AND -- resolved -- remain inside the resolved
+    # artifact directory, and must resolve to a regular file. This closes a
+    # symlink escape: the artifact directory name is attacker-controlled input (it
+    # is just a sha the caller supplies), so if raw.bin were a symlink, an attacker
+    # could point it at any readable file outside the workspace, compute THAT
+    # file's sha256, and name the directory that hash -- making the content-address
+    # check in Step 5 pass while pulling outside content into the evidence store.
+    # Resolving and containing here, before Step 4's size check and before any
+    # read, closes that: every later step operates on the resolved, contained path.
+    try:
+        resolved_raw_path = raw_path.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        raise ReextractionError(f"raw.bin does not exist for {raw_sha256}: {raw_path}") from None
+    if not resolved_raw_path.is_relative_to(resolved_dest_dir):
+        raise ReextractionError(
+            f"raw.bin for {raw_sha256} resolves outside its own artifact directory "
+            f"(symlink escape): {raw_path} resolves to {resolved_raw_path}, "
+            f"which is not under {resolved_dest_dir}"
+        )
+    if not resolved_raw_path.is_file():
+        raise ReextractionError(
+            f"raw.bin for {raw_sha256} does not resolve to a regular file: {resolved_raw_path}"
+        )
 
     # Step 4: refuse an oversized artifact via stat() BEFORE reading it into memory.
-    size = raw_path.stat().st_size
+    # stat() and the read below both go through the RESOLVED path, never raw_path.
+    size = resolved_raw_path.stat().st_size
     if size > max_bytes:
         raise ReextractionError(f"raw.bin size {size} exceeds max_bytes cap {max_bytes} for {raw_sha256}")
 
@@ -136,7 +191,7 @@ def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int)
     # deep=True) is deliberately NOT used here (it returns False for every one of the
     # 8 real legacy artifacts in the live corpus, which would make this path
     # unreachable for the entire corpus it exists to serve).
-    data = raw_path.read_bytes()
+    data = resolved_raw_path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     if digest != raw_sha256:
         raise ReextractionError(
@@ -147,10 +202,22 @@ def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int)
     if not _looks_like_pdf(data):
         raise ReextractionError(f"raw.bin for {raw_sha256} does not sniff as a PDF (missing %PDF- header)")
 
-    # Step 7: cross-check root meta.json, if it is readable. Unreadable/missing meta
-    # is not fatal -- the sniff above already established the content type -- but a
-    # readable meta.json that disagrees IS fatal.
+    # Step 7: cross-check root meta.json, if it is readable. ABSENT meta is not
+    # fatal -- the sniff above already established the content type. But
+    # ``load_artifact_meta`` collapses absent, malformed, invalid, and unreadable
+    # meta all down to None alike, so None alone cannot tell us whether meta.json
+    # was simply never written or whether it EXISTS but is corrupt -- and a
+    # corrupt-but-present meta.json must not silently bypass this check the way an
+    # absent one legitimately does. So check existence of the file itself,
+    # separately from whether it parsed: present-but-unparseable is fatal on its
+    # own, distinct from (and checked before) the content-type disagreement below.
+    meta_path = dest_dir / _META_NAME
     meta = load_artifact_meta(root, raw_sha256)
+    if meta is None and meta_path.exists():
+        raise ReextractionError(
+            f"root meta.json for {raw_sha256} exists but is corrupt or unreadable; "
+            "refusing to re-extract past unauthenticated root bookkeeping"
+        )
     if meta is not None and meta.content_type != "application/pdf":
         raise ReextractionError(
             f"root meta.json for {raw_sha256} claims content_type {meta.content_type!r}, "
@@ -186,6 +253,37 @@ def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int)
     # extracted.json write would have produced for the same ExtractedText.
     extracted_json_bytes = _canonical_extracted_json_bytes(extracted)
 
+    return root, extracted, identity.code_sha256, identity.pypdf_version, extracted_json_bytes
+
+
+def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int) -> str:
+    """Re-parse a stored artifact's ``raw.bin`` and append a new extraction record.
+
+    Never opens any root file (``raw.bin``, ``text.txt``, ``extracted.json``,
+    ``meta.json``) for writing, never calls ``store_artifact``, and never
+    reconciles the new record with the root sidecars -- see the module docstring.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        raw_sha256: Content address of the already-stored artifact to re-extract.
+        max_bytes: Hard cap on the on-disk ``raw.bin`` size, checked via ``stat()``
+            before any bytes are read into memory. Callers pass their own budget
+            (e.g. ``config.budget.max_artifact_bytes``); this module has no default.
+
+    Returns:
+        The ``extraction_sha256`` of the appended (or, if byte-identical bytes were
+        already re-extracted before, pre-existing) extraction record.
+
+    Raises:
+        ReextractionError: If ``raw_sha256`` is malformed, ``raw.bin`` is missing,
+            oversized, or fails to hash to ``raw_sha256``, the bytes do not sniff as
+            a PDF, a readable root ``meta.json`` claims a different content type, or
+            the fresh extraction fails the cleanliness predicate (wrong extractor,
+            lossy, page failures, or empty text).
+    """
+    root, extracted, extractor_code_sha256, pypdf_version, extracted_json_bytes = _prepare_reextraction(
+        workspace_root, raw_sha256=raw_sha256, max_bytes=max_bytes
+    )
     # Step 12: append the new extraction record. store_extraction_record() is
     # itself idempotent (byte-identical re-extraction returns the same address
     # unchanged) and append-only (mkdtemp + os.rename + EEXIST-compare); it is
@@ -194,7 +292,62 @@ def reextract_artifact(workspace_root: Path, *, raw_sha256: str, max_bytes: int)
         root,
         raw_sha256=raw_sha256,
         extractor=extracted.extractor,
-        extractor_code_sha256=identity.code_sha256,
-        pypdf_version=identity.pypdf_version,
+        extractor_code_sha256=extractor_code_sha256,
+        pypdf_version=pypdf_version,
         extracted_json_bytes=extracted_json_bytes,
     )
+
+
+def preview_reextraction(workspace_root: Path, *, raw_sha256: str, max_bytes: int) -> tuple[str, bool]:
+    """Do everything ``reextract_artifact`` does, except the write: report what it would do.
+
+    Runs the identical real read-raw.bin / re-verify-digest / sniff /
+    cross-check-meta / re-parse / cleanliness-predicate pipeline as
+    :func:`reextract_artifact` (via the shared :func:`_prepare_reextraction`
+    helper), then computes the ``extraction_sha256`` the write WOULD produce and
+    checks whether a record already lives at that address -- all without calling
+    :func:`~carmel.services.extraction_record.store_extraction_record` and
+    therefore without writing anything.
+
+    This deliberately reaches into ``carmel.services.extraction_record``'s
+    private ``_build_identity_payload`` rather than re-deriving the identity
+    payload's field set locally: that field set (which fields are included, and
+    when ``pypdf_version`` is folded in at all) is exactly what
+    ``store_extraction_record`` uses to compute the address it writes to, and it
+    is not part of that module's public contract (not in ``__all__``). Reusing it
+    here -- instead of guessing the same shape a second time -- is what makes this
+    preview's ``extraction_sha256`` provably the SAME address ``--apply`` would
+    write to, rather than a second, independently-written guess that could drift.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        raw_sha256: Content address of the already-stored artifact to preview
+            re-extraction for.
+        max_bytes: Hard cap on the on-disk ``raw.bin`` size -- see
+            :func:`reextract_artifact`.
+
+    Returns:
+        A ``(extraction_sha256, already_present)`` pair: the address a call to
+        ``reextract_artifact`` with the same arguments would return, and whether a
+        record already lives there (``True`` means ``--apply`` would be a no-op;
+        ``False`` means ``--apply`` would append a new record).
+
+    Raises:
+        ReextractionError: See :func:`reextract_artifact`.
+    """
+    root, extracted, extractor_code_sha256, pypdf_version, extracted_json_bytes = _prepare_reextraction(
+        workspace_root, raw_sha256=raw_sha256, max_bytes=max_bytes
+    )
+    extracted_sha256 = hashlib.sha256(extracted_json_bytes).hexdigest()
+    extracted_text_sha256 = hashlib.sha256(extracted.text.encode("utf-8")).hexdigest()
+    identity_payload = _build_identity_payload(
+        raw_sha256=raw_sha256,
+        extractor=extracted.extractor,
+        extractor_code_sha256=extractor_code_sha256,
+        pypdf_version=pypdf_version,
+        extracted_sha256=extracted_sha256,
+        extracted_text_sha256=extracted_text_sha256,
+    )
+    extraction_sha256 = compute_extraction_sha(identity_payload)
+    already_present = extraction_record_dir(root, raw_sha256, extraction_sha256).exists()
+    return extraction_sha256, already_present
