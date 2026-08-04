@@ -19,21 +19,29 @@ defines, and only for the reason each test intends.
 from __future__ import annotations
 
 import ast
+import dataclasses
 import inspect
+import sys
 
 import pytest
 
+from carmel.agents.tools import extract
 from carmel.services import numeric
 from carmel.services.semantic_deps import (
     CURRENT_SHA_BY_DEPENDENCY_ID,
     DEPENDENCIES_BY_SHA,
+    EXTRACT_TEXT_DEPENDENCY_ID,
+    ExtractionIdentity,
     InputPolicy,
     SemanticDependencyDefinition,
     SemanticDependencyInvariantError,
     UnknownSemanticDependencyError,
+    _assert_no_carmel_imports,
+    _pypdf_version,
     compute_dependency_sha,
     current_sha_for,
     dependency_for_sha,
+    extraction_identity,
 )
 
 # HARDCODED, not derived from the live registry (never `next(iter(DEPENDENCIES_BY_SHA))`
@@ -903,3 +911,246 @@ def test_module_level_match_statement_raises_invariant_error() -> None:
     with pytest.raises(SemanticDependencyInvariantError) as excinfo:
         compute_dependency_sha(source, ["normalize_numeric_span"])
     assert "match" in str(excinfo.value)
+
+
+# --- carmel.agents.tools.extract's extraction-code identity ------------------
+#
+# `_extractor_identity` in carmel.services.evidence records only the third-party
+# `pypdf` VERSION (e.g. "pdf:pypdf==6.14.2"). It records nothing about Carmel's own
+# extraction code (carmel/agents/tools/extract.py) -- two extractions produced by
+# materially different Carmel code, under the SAME pypdf version, are indistinguishable
+# in the store. The tests below pin a content_sha256 for extract.py's `extract_text`
+# closure on exactly the same append-only, hardcoded-pin terms as the numeric
+# dependencies above.
+
+# HARDCODED, not derived from the live registry -- see the identical rationale on
+# _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256 above. Independently verified once via:
+#   compute_dependency_sha(inspect.getsource(extract), ["extract_text"])
+# If this test ever fails, it means EITHER extract.py's extraction surface changed OR
+# this toolchain's ast.dump() rendering changed. Fix: ADD A NEW registry entry for the
+# new sha in carmel/services/semantic_deps.py -- never edit this literal in place.
+_PINNED_EXTRACT_TEXT_SHA256 = "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168"
+
+# The exact within-module closure of {"extract_text"} in the real extract.py module, as
+# of this test's writing -- pinned separately from the sha so a closure-membership
+# regression and an unparse/dump-format regression can be told apart by which of these
+# two tests fails. Deliberately EXCLUDES `raw_span` and the bibliography-region helpers
+# (`find_bibliography_like_regions`, `_is_citation_line`, `_BIB_*`): those are consumed
+# by carmel.services.grounding, not by extract_text, so their absence here is correct,
+# not a coverage gap.
+_EXPECTED_EXTRACT_TEXT_CLOSURE = frozenset(
+    {
+        "ExtractedText",
+        "MAX_EXTRACTED_TEXT_CHARS",
+        "MAX_PDF_PAGES",
+        "PageExtractionFailure",
+        "TextSection",
+        "_ABSTRACT_HEADING_RE",
+        "_ABSTRACT_MAX_LEN",
+        "_ABSTRACT_SEARCH_WINDOW",
+        "_HTMLTextExtractor",
+        "_HYPHEN_LINEBREAK_RE",
+        "_LIGATURES",
+        "_PATH_LIKE_RE",
+        "_PageKind",
+        "_REFERENCES_HEADING_RE",
+        "_REFERENCES_MIN_FRACTION",
+        "_WHITESPACE_RUN_RE",
+        "_cap_text",
+        "_char_map_transform",
+        "_classify_pdf_page",
+        "_decode_bytes",
+        "_describe_page_error",
+        "_extract_html",
+        "_extract_pdf",
+        "_extract_plain_text",
+        "_extract_xml",
+        "_find_abstract_region",
+        "_find_references_region",
+        "_hyphen_repl",
+        "_label_special_sections",
+        "_normalize_with_map_cached",
+        "_overlay_region",
+        "_pypdf_mute_depth",
+        "_pypdf_mute_lock",
+        "_pypdf_mute_previous",
+        "_quiet_pypdf",
+        "_regex_sub_with_map",
+        "_whitespace_repl",
+        "extract_text",
+        "normalize_for_match",
+        "normalize_with_map",
+    }
+)
+
+
+def _real_extract_source() -> str:
+    return inspect.getsource(extract)
+
+
+def test_extract_text_sha_matches_a_hardcoded_pin() -> None:
+    computed = compute_dependency_sha(_real_extract_source(), ["extract_text"])
+    assert computed == _PINNED_EXTRACT_TEXT_SHA256, (
+        "carmel/agents/tools/extract.py's extraction surface (or this toolchain's "
+        "ast.dump rendering) has changed since carmel.extraction.extract_text was "
+        "pinned. Fix: ADD A NEW entry to DEPENDENCIES_BY_SHA in "
+        "carmel/services/semantic_deps.py for the new sha -- do not edit or replace "
+        "the existing pinned entry or this test's hardcoded literal."
+    )
+
+
+def test_extract_text_registry_seed_agrees_with_the_pin() -> None:
+    assert _PINNED_EXTRACT_TEXT_SHA256 in DEPENDENCIES_BY_SHA
+    entry = DEPENDENCIES_BY_SHA[_PINNED_EXTRACT_TEXT_SHA256]
+    assert entry.dependency_id == EXTRACT_TEXT_DEPENDENCY_ID
+    assert entry.input_policy is InputPolicy.EXTERNAL_DIGEST_REQUIRED
+
+
+def test_current_sha_for_extract_text_matches_the_pin() -> None:
+    assert current_sha_for(EXTRACT_TEXT_DEPENDENCY_ID) == _PINNED_EXTRACT_TEXT_SHA256
+
+
+def test_extract_text_closure_is_exactly_the_expected_names() -> None:
+    source = _real_extract_source()
+    tree = ast.parse(source)
+    definitions: dict[str, object] = {}
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            definitions[node.name] = node
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    definitions[target.id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            definitions[node.target.id] = node
+
+    closure: set[str] = set()
+    frontier = ["extract_text"]
+    while frontier:
+        name = frontier.pop()
+        if name in closure or name not in definitions:
+            continue
+        closure.add(name)
+        for child in ast.walk(definitions[name]):
+            if isinstance(child, ast.Name) and child.id in definitions and child.id not in closure:
+                frontier.append(child.id)
+
+    assert closure == _EXPECTED_EXTRACT_TEXT_CLOSURE
+    assert "raw_span" not in closure
+    assert "find_bibliography_like_regions" not in closure
+    assert "_is_citation_line" not in closure
+    assert not any(name.startswith("_BIB_") for name in closure)
+
+
+def test_extract_module_has_zero_carmel_imports() -> None:
+    """Guards the within-module-only closure limitation for extract.py, exactly as
+    test_numeric_module_has_zero_carmel_imports guards it for numeric.py: if
+    extract.py ever imports from carmel.* itself, compute_dependency_sha's closure
+    can no longer be assumed to capture its full behavior."""
+    _assert_no_carmel_imports(_real_extract_source(), "carmel.agents.tools.extract")
+
+
+def test_assert_no_carmel_imports_raises_on_plain_import() -> None:
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_no_carmel_imports("import carmel.services.numeric\n", "carmel.example.mod")
+    assert "carmel.example.mod" in str(excinfo.value)
+
+
+def test_assert_no_carmel_imports_raises_on_import_from() -> None:
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_no_carmel_imports("from carmel.services import numeric\n", "carmel.example.mod")
+    assert "carmel.example.mod" in str(excinfo.value)
+
+
+def test_assert_no_carmel_imports_passes_on_clean_source() -> None:
+    _assert_no_carmel_imports("import re\n\ndef f():\n    return re.sub('a', 'b', '')\n", "carmel.example.mod")
+
+
+# --- Composite extraction identity (code sha + pypdf version) ----------------
+
+
+def test_extraction_identity_returns_the_current_code_sha() -> None:
+    identity = extraction_identity()
+    assert identity.code_sha256 == current_sha_for(EXTRACT_TEXT_DEPENDENCY_ID)
+
+
+def test_extraction_identity_returns_the_installed_pypdf_version() -> None:
+    pypdf = pytest.importorskip("pypdf")
+    identity = extraction_identity()
+    assert identity.pypdf_version == pypdf.__version__
+
+
+def test_extraction_identity_is_a_frozen_dataclass_instance() -> None:
+    identity = extraction_identity()
+    assert isinstance(identity, ExtractionIdentity)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        identity.code_sha256 = "0" * 64  # type: ignore[misc]
+
+
+def test_pypdf_version_falls_back_to_unknown_when_pypdf_is_absent(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "pypdf", None)
+    assert _pypdf_version() == "unknown"
+
+
+def test_extraction_identity_falls_back_to_unknown_pypdf_version_when_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "pypdf", None)
+    identity = extraction_identity()
+    assert identity.pypdf_version == "unknown"
+    assert identity.code_sha256 == current_sha_for(EXTRACT_TEXT_DEPENDENCY_ID)
+
+
+# --- Proof that the sha tracks behavior, using fabricated extraction-surface-shaped
+# --- SYNTHETIC source (never real extract.py source or real corpus text) -----------
+
+_SYNTHETIC_EXTRACT_SURFACE_TEMPLATE = '''
+"""A fabricated module shaped like an extraction surface, for sha-sensitivity tests only."""
+
+MAX_PAGES = {max_pages}
+
+
+def _classify_page(raw: str) -> str:
+    """Classify one page's raw text as a page kind."""
+    if not raw.strip():
+        return "blank"
+    return "body"
+
+
+def extract_text(pages: list[str]) -> list[str]:
+    """Extract normalized text from a fabricated list of page strings."""
+    kept = []
+    for page in pages[:MAX_PAGES]:
+        kind = _classify_page(page)
+        if kind != "blank":
+            kept.append(page)
+    return kept
+'''
+
+
+def test_synthetic_extraction_surface_sha_changes_on_a_meaningful_edit() -> None:
+    """A behavior-changing edit to an extraction-surface-shaped SYNTHETIC source (a
+    different MAX_PAGES cap, reachable from extract_text's own closure) must move the
+    sha. Uses a fabricated snippet, not real extract.py, per this suite's discipline of
+    never editing the real module to prove sha-sensitivity."""
+    original = _SYNTHETIC_EXTRACT_SURFACE_TEMPLATE.format(max_pages=5)
+    changed = _SYNTHETIC_EXTRACT_SURFACE_TEMPLATE.format(max_pages=6)
+    assert original != changed, "the two synthetic sources must differ textually"
+    sha_original = compute_dependency_sha(original, ["extract_text"])
+    sha_changed = compute_dependency_sha(changed, ["extract_text"])
+    assert sha_original != sha_changed, "a change to a value the closure depends on must move the sha"
+
+
+def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit() -> None:
+    """A docstring-only edit to the same fabricated extraction-surface-shaped SYNTHETIC
+    source must NOT move the sha -- compute_dependency_sha strips docstrings before
+    hashing, so text-only documentation changes are invisible to the identity."""
+    original = _SYNTHETIC_EXTRACT_SURFACE_TEMPLATE.format(max_pages=5)
+    redocumented = original.replace(
+        "Extract normalized text from a fabricated list of page strings.",
+        "Extract normalized text from a fabricated list of page strings -- rewritten wording.",
+    )
+    assert original != redocumented, "the two synthetic sources must differ textually"
+    sha_original = compute_dependency_sha(original, ["extract_text"])
+    sha_redocumented = compute_dependency_sha(redocumented, ["extract_text"])
+    assert sha_original == sha_redocumented, "a docstring-only difference must not change the sha"

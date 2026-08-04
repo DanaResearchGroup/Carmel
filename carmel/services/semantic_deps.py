@@ -69,6 +69,27 @@ This module also does not model FULL numeric parsing -- see
 what each seeded dependency does and does not cover. Glyph-health ASSESSMENT is
 a separate registered dependency (:data:`GLYPH_HEALTH_DEPENDENCY_ID`); the
 repair entry still does not cover it, and the two are deliberately not merged.
+
+4. **A fourth limitation applies specifically to
+   :data:`EXTRACT_TEXT_DEPENDENCY_ID` (the identity for
+   :func:`~carmel.agents.tools.extract.extract_text`): the third-party
+   ``pypdf`` package is imported LAZILY inside
+   :func:`~carmel.agents.tools.extract._extract_pdf`'s function body, not at
+   module scope.** :func:`compute_dependency_sha`'s within-module AST closure
+   (limitation 1, above) only ever walks ``ast.Name`` references against
+   OTHER module-level definitions found in the same source text -- it never
+   executes anything, so it cannot observe a name bound by a runtime-local
+   ``import`` statement, let alone attribute the behavior of the imported
+   package's own code to a hash. This means ``EXTRACT_TEXT_DEPENDENCY_ID``'s
+   ``content_sha256`` captures Carmel's own extraction code faithfully but
+   says NOTHING about which version of ``pypdf`` produced a given extraction
+   -- two extractions with the identical ``content_sha256`` can still differ
+   if the installed ``pypdf`` version differs. :class:`ExtractionIdentity`
+   and :func:`extraction_identity` exist to make that pypdf version a
+   required, separate component of a complete extraction identity, exactly
+   mirroring the pattern already used for exactly this purpose by
+   :func:`carmel.services.evidence._extractor_identity` (best-effort,
+   never-fatal version discovery via ``pypdf.__version__``).
 """
 
 from __future__ import annotations
@@ -86,8 +107,10 @@ from carmel.services.dataset_store import canonical_json_bytes
 __all__ = [
     "CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID",
     "GLYPH_HEALTH_DEPENDENCY_ID",
+    "EXTRACT_TEXT_DEPENDENCY_ID",
     "DEPENDENCIES_BY_SHA",
     "CURRENT_SHA_BY_DEPENDENCY_ID",
+    "ExtractionIdentity",
     "InputPolicy",
     "SemanticDependencyDefinition",
     "SemanticDependencyInvariantError",
@@ -95,6 +118,7 @@ __all__ = [
     "compute_dependency_sha",
     "current_sha_for",
     "dependency_for_sha",
+    "extraction_identity",
 ]
 
 GLYPH_HEALTH_DEPENDENCY_ID = "carmel.numeric.glyph_health"
@@ -124,6 +148,24 @@ particular) that need to pin ``MeasuredValue.repair_dependency`` to exactly
 this dependency never re-type the string literal by hand -- see
 :func:`_seed_registry`, which uses this same constant rather than an inline
 copy.
+"""
+
+EXTRACT_TEXT_DEPENDENCY_ID = "carmel.extraction.extract_text"
+"""The stable ``dependency_id`` for :func:`~carmel.agents.tools.extract.extract_text`.
+
+Its ``content_sha256`` is the within-module transitive closure of
+``extract_text`` in ``carmel/agents/tools/extract.py`` -- Carmel's own PDF/
+HTML/XML text-extraction code, page classification, and text normalization,
+but NOT the third-party ``pypdf`` package's own behavior (see the module
+docstring's fourth limitation, and :class:`ExtractionIdentity`).
+
+Like :data:`GLYPH_HEALTH_DEPENDENCY_ID`, this dependency's input is not a
+sibling field of the record that cites it -- it is a whole document's raw
+bytes -- so it carries :attr:`InputPolicy.EXTERNAL_DIGEST_REQUIRED`.
+
+This increment ONLY registers the identity in this module; wiring it into
+:mod:`carmel.services.evidence` or any schema/producer/replay code is a
+separate, later increment (out of scope here by design).
 """
 
 
@@ -541,24 +583,39 @@ def _numeric_module_source() -> str:
     return source
 
 
+def _extract_module_source() -> str:
+    import inspect
+
+    from carmel.agents.tools import extract
+
+    source = inspect.getsource(extract)
+    return source
+
+
 # The within-module-only closure limitation documented in this module's docstring is
-# only sound as long as carmel.services.numeric imports nothing from carmel.* itself.
+# only sound as long as the module being hashed imports nothing from carmel.* itself.
 #
 # This is a DEVELOPMENT-TIME invariant, so it is enforced from the test suite
-# (tests/test_semantic_deps.py walks numeric.py's AST independently) and deliberately
-# NOT at import time. Running it on import would make merely importing this module read
-# carmel/services/numeric.py off disk, which raises OSError under frozen/zipimport
-# deployments where inspect.getsource cannot reach a source file -- turning a packaging
-# change into an unexplained import crash in `carmel serve`. A check that can only fire
-# in a checkout, where the test suite already runs, belongs in the test suite.
-def _assert_no_carmel_imports(module_source: str) -> None:
+# (tests/test_semantic_deps.py walks the target module's AST independently) and
+# deliberately NOT at import time. Running it on import would make merely importing this
+# module read a target module's source off disk, which raises OSError under frozen/
+# zipimport deployments where inspect.getsource cannot reach a source file -- turning a
+# packaging change into an unexplained import crash in `carmel serve`. A check that can
+# only fire in a checkout, where the test suite already runs, belongs in the test suite.
+#
+# Generalized (module_source, module_name) rather than hardcoded to
+# carmel.services.numeric: this is now shared by that module's guard test and by
+# carmel.agents.tools.extract's guard test (see tests/test_semantic_deps.py), and would
+# otherwise have to be duplicated verbatim for every new within-module-only closure this
+# registry gains.
+def _assert_no_carmel_imports(module_source: str, module_name: str) -> None:
     tree = ast.parse(module_source)
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == "carmel" or alias.name.startswith("carmel."):
                     raise SemanticDependencyInvariantError(
-                        "carmel.services.numeric now imports from carmel.* "
+                        f"{module_name} now imports from carmel.* "
                         f"({alias.name!r}); compute_dependency_sha's transitive closure is "
                         "within-module only and can no longer be assumed to capture this "
                         "module's full behavior -- see the semantic_deps module docstring"
@@ -567,7 +624,7 @@ def _assert_no_carmel_imports(module_source: str) -> None:
             node.module == "carmel" or node.module.startswith("carmel.")
         ):
             raise SemanticDependencyInvariantError(
-                "carmel.services.numeric now imports from carmel.* "
+                f"{module_name} now imports from carmel.* "
                 f"({node.module!r}); compute_dependency_sha's transitive closure is "
                 "within-module only and can no longer be assumed to capture this "
                 "module's full behavior -- see the semantic_deps module docstring"
@@ -615,6 +672,20 @@ _CONTEXT_FREE_SPAN_REPAIR_SHA256 = "b29d34f644deff19a68e618340408839a138186a5a42
 # prevent).
 _GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a"
 
+# HARDCODED for exactly the same reasons as the two literals above; the whole comment on
+# _CONTEXT_FREE_SPAN_REPAIR_SHA256 applies here verbatim. Independently verified once via:
+#   compute_dependency_sha(
+#       inspect.getsource(carmel.agents.tools.extract), ["extract_text"]
+#   )
+# This closure captures Carmel's own extraction/normalization code (PDF page
+# classification, HTML/XML extraction, whitespace/hyphen/ligature repair, abstract- and
+# references-region detection) but NOT the third-party pypdf package's own behavior --
+# see the module docstring's fourth limitation and ExtractionIdentity, below. If this
+# test ever fails, it means extract.py's extraction surface (or this toolchain's
+# ast.dump rendering) changed -- the fix is to ADD A NEW registry entry at a new sha,
+# never to edit this literal or the registry row that uses it.
+_EXTRACT_TEXT_SHA256 = "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168"
+
 
 def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
     """Return the append-only registry's initial contents.
@@ -655,6 +726,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=GLYPH_HEALTH_DEPENDENCY_ID,
             content_sha256=_GLYPH_HEALTH_SHA256,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=True,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=EXTRACT_TEXT_DEPENDENCY_ID,
+            content_sha256=_EXTRACT_TEXT_SHA256,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=True,
         ),
@@ -792,3 +869,85 @@ def current_sha_for(dependency_id: str) -> str:
             f"no semantic dependency known for dependency_id {dependency_id!r}; known: "
             f"{sorted(CURRENT_SHA_BY_DEPENDENCY_ID)!r}"
         ) from None
+
+
+_PYPDF_VERSION_UNKNOWN = "unknown"
+"""Sentinel returned by :func:`_pypdf_version` when ``pypdf`` cannot be introspected.
+
+Deliberately a plain, obviously-not-a-real-version string (not ``None`` and not an
+empty string) so a caller that forgets to check for it produces an identity that is
+visibly wrong (``"unknown"``) rather than one that looks superficially plausible.
+"""
+
+
+def _pypdf_version() -> str:
+    """Best-effort installed ``pypdf`` version string, never fatal.
+
+    Mirrors :func:`carmel.services.evidence._extractor_identity`'s pattern for exactly
+    the same reason: version discovery for an optional/lazily-imported third-party
+    package must never be allowed to crash a caller that only wants an identity for
+    logging/comparison purposes. Any failure (package absent, import error, missing
+    ``__version__`` attribute, or anything else) collapses to
+    :data:`_PYPDF_VERSION_UNKNOWN` rather than propagating.
+    """
+    try:
+        import pypdf
+
+        return str(pypdf.__version__)
+    except Exception:  # noqa: BLE001 - version discovery is best-effort, never fatal
+        return _PYPDF_VERSION_UNKNOWN
+
+
+@dataclass(frozen=True)
+class ExtractionIdentity:
+    """The complete, two-part content identity for a run of
+    :func:`~carmel.agents.tools.extract.extract_text`.
+
+    A single ``content_sha256`` (:data:`EXTRACT_TEXT_DEPENDENCY_ID`'s current sha) is
+    NOT a complete extraction identity by itself -- see the module docstring's fourth
+    limitation: the AST closure that produces that sha is within-module only, and
+    ``pypdf`` is imported lazily inside
+    :func:`~carmel.agents.tools.extract._extract_pdf`'s function body, so the closure
+    cannot observe, and the sha says nothing about, which ``pypdf`` version actually
+    ran. Two extractions can share an identical ``code_sha256`` while having been
+    produced by genuinely different ``pypdf`` behavior. This dataclass makes both
+    components explicit and separately inspectable, rather than encoding them into one
+    opaque string a future consumer would have to parse (and could parse wrong) to
+    recover either half.
+
+    A frozen dataclass rather than a plain string was chosen deliberately: this module
+    already uses frozen dataclasses (:class:`SemanticDependencyDefinition`) for its
+    other identity-shaped values, and a struct keeps ``code_sha256`` and
+    ``pypdf_version`` independently accessible and comparable without a caller having
+    to agree on (and correctly parse) a delimiter convention.
+
+    Attributes:
+        code_sha256: The current ``content_sha256`` registered for
+            :data:`EXTRACT_TEXT_DEPENDENCY_ID` -- Carmel's own extraction code, and
+            nothing about ``pypdf``.
+        pypdf_version: The installed ``pypdf`` version string, or
+            :data:`_PYPDF_VERSION_UNKNOWN` if it could not be determined.
+    """
+
+    code_sha256: str
+    pypdf_version: str
+
+
+def extraction_identity() -> ExtractionIdentity:
+    """Return the current composite identity for Carmel's extraction code.
+
+    Combines :data:`EXTRACT_TEXT_DEPENDENCY_ID`'s current registered sha (Carmel's own
+    extraction/normalization code) with the installed ``pypdf`` version (the
+    third-party component the AST closure cannot see -- see the module docstring's
+    fourth limitation). Neither half alone is a complete extraction identity; see
+    :class:`ExtractionIdentity`.
+
+    This increment ONLY exposes this helper from :mod:`carmel.services.semantic_deps`.
+    Wiring it into :mod:`carmel.services.evidence` (e.g. alongside or in place of
+    ``_extractor_identity``) or any schema/producer/replay code is a separate, later
+    increment, out of scope here by design.
+    """
+    return ExtractionIdentity(
+        code_sha256=current_sha_for(EXTRACT_TEXT_DEPENDENCY_ID),
+        pypdf_version=_pypdf_version(),
+    )
