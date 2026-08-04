@@ -200,6 +200,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import NamedTuple
 
 from carmel.agents.tools.extract import ExtractedText
 from carmel.schemas.datasets import (
@@ -304,7 +305,25 @@ class ReplayReport:
         return tuple(f for f in self.findings if f.category is ReplayOutcome.UNVERIFIABLE)
 
 
-def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> tuple[str | None, ReplayFinding | None]:
+class NodeVerification(NamedTuple):
+    """Outcome of independently re-verifying one node against the store."""
+
+    text: str | None
+    problem: ReplayFinding | None
+    problem_is_text_only: bool
+    """``True`` iff ``problem`` is non-``None`` and its ONLY complaint is
+    that ``node.extraction`` is ``Absent`` -- the node's bytes (``raw.bin``)
+    were read and hashed cleanly, and there is simply no extracted text
+    recorded for this node. That is a legitimate state for a non-textual
+    node (e.g. a ``FIGURE_CROP`` targeted only by a ``BBoxLocator``), not a
+    defect of the envelope, so callers must surface it as a node-level
+    finding only where something text-dependent actually targets the node.
+    Always ``False`` when ``problem`` is ``None``, and ``False`` for every
+    other kind of problem (missing/tampered ``raw.bin``, or any extraction
+    record disagreement)."""
+
+
+def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> NodeVerification:
     """Re-derive ``node``'s extracted text from the evidence store, from
     bytes, independent of anything the envelope itself carries.
 
@@ -316,19 +335,22 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
     hash the parsed text and compare against the RECORDED
     ``extracted_text_sha256``.
 
-    Returns ``(text, None)`` on success, or ``(None, finding)`` naming
+    The node's bytes are checked FIRST and unconditionally: every node
+    admitted into a VERIFIED envelope must have ``raw.bin`` present and
+    hashing to its recorded ``sha256``, whether or not it carries an
+    ExtractionBinding. Only after that check passes does this function look
+    at whether there is any extracted text to re-verify at all.
+
+    Returns ``NodeVerification(text, None, False)`` on success, or
+    ``NodeVerification(None, finding, problem_is_text_only)`` naming
     exactly which step failed and whether that step could not run at all
     (``UNVERIFIABLE``) or ran and disagreed (``FAILED``).
+    ``problem_is_text_only`` is ``True`` for exactly one case: the node's
+    bytes verified cleanly and the only complaint is that ``extraction`` is
+    ``Absent`` (see :class:`NodeVerification`).
     """
     path = f"source_graph.node({node.node_id!r})"
     extraction = node.extraction
-    if isinstance(extraction, Absent):
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"node {node.node_id!r} has no ExtractionBinding (extraction is Absent); "
-            "there is nothing recorded to independently re-verify",
-        )
     raw_path = artifact_dir(workspace_root, node.sha256) / "raw.bin"
     try:
         raw_bin_bytes = raw_path.read_bytes()
@@ -341,21 +363,40 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
         # is positive evidence that the store's raw bytes were tampered with
         # or corrupted, so that case is reported as FAILED instead. The two
         # must never be conflated into a single outcome.
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"no readable raw.bin for node {node.node_id!r} (sha256={node.sha256!r}): {exc}",
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"no readable raw.bin for node {node.node_id!r} (sha256={node.sha256!r}): {exc}",
+            ),
+            False,
         )
     actual_raw_sha256 = hashlib.sha256(raw_bin_bytes).hexdigest()
     if actual_raw_sha256 != node.sha256:
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"raw.bin on disk for node {node.node_id!r} hashes to {actual_raw_sha256!r}, not "
-            f"the node.sha256={node.sha256!r} it is stored under -- the evidence store's raw bytes "
-            "have been tampered with or corrupted since this node was recorded",
-            expected=node.sha256,
-            actual=actual_raw_sha256,
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"raw.bin on disk for node {node.node_id!r} hashes to {actual_raw_sha256!r}, not "
+                f"the node.sha256={node.sha256!r} it is stored under -- the evidence store's raw bytes "
+                "have been tampered with or corrupted since this node was recorded",
+                expected=node.sha256,
+                actual=actual_raw_sha256,
+            ),
+            False,
+        )
+    if isinstance(extraction, Absent):
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"node {node.node_id!r} has no ExtractionBinding (extraction is Absent); "
+                "there is nothing recorded to independently re-verify",
+            ),
+            True,
         )
     # Resolve the ADDRESSED extraction record -- (parent_raw_sha256,
     # extraction_sha256) -- never the OLD single-extraction-per-raw-sha
@@ -369,23 +410,31 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
         )
     except ExtractionRecordError as exc:
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"extraction record meta.json for node {node.node_id!r} at address "
-            f"(parent_raw_sha256={extraction.parent_raw_sha256!r}, "
-            f"extraction_sha256={extraction.extraction_sha256!r}) is unreadable: {exc}",
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"extraction record meta.json for node {node.node_id!r} at address "
+                f"(parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+                f"extraction_sha256={extraction.extraction_sha256!r}) is unreadable: {exc}",
+            ),
+            False,
         )
     if record_meta is None:
         # No record stored at that address, or its meta.json does not
         # authenticate to it -- either way this is inability to check, not
         # positive evidence of anything wrong.
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"no extraction record stored (or its meta.json does not authenticate) for node "
-            f"{node.node_id!r} at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
-            f"extraction_sha256={extraction.extraction_sha256!r})",
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"no extraction record stored (or its meta.json does not authenticate) for node "
+                f"{node.node_id!r} at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+                f"extraction_sha256={extraction.extraction_sha256!r})",
+            ),
+            False,
         )
     # The addressed record is present and self-authenticated to its own
     # address; now cross-check the identity fields the ENVELOPE carries
@@ -417,17 +466,21 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
         record_identity["pypdf_version"] = record_meta.pypdf_version
     if binding_identity != record_identity:
         disagreeing = sorted(k for k in binding_identity if binding_identity[k] != record_identity[k])
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"node {node.node_id!r}'s ExtractionBinding identity fields "
-            f"({', '.join(disagreeing)}) disagree with the stored extraction record's own meta.json "
-            f"at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
-            f"extraction_sha256={extraction.extraction_sha256!r}) -- the envelope's carried "
-            "extractor identity was never the one hashed into the record it addresses; one of the "
-            "two was altered outside validated construction",
-            expected=repr({k: record_identity[k] for k in disagreeing}),
-            actual=repr({k: binding_identity[k] for k in disagreeing}),
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"node {node.node_id!r}'s ExtractionBinding identity fields "
+                f"({', '.join(disagreeing)}) disagree with the stored extraction record's own meta.json "
+                f"at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+                f"extraction_sha256={extraction.extraction_sha256!r}) -- the envelope's carried "
+                "extractor identity was never the one hashed into the record it addresses; one of the "
+                "two was altered outside validated construction",
+                expected=repr({k: record_identity[k] for k in disagreeing}),
+                actual=repr({k: binding_identity[k] for k in disagreeing}),
+            ),
+            False,
         )
     extracted_path = extraction_record_dir(
         workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
@@ -435,12 +488,16 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
     try:
         raw_bytes = extracted_path.read_bytes()
     except (FileNotFoundError, OSError) as exc:
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"no readable extracted.json for node {node.node_id!r}'s extraction record "
-            f"(parent_raw_sha256={extraction.parent_raw_sha256!r}, "
-            f"extraction_sha256={extraction.extraction_sha256!r}): {exc}",
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"no readable extracted.json for node {node.node_id!r}'s extraction record "
+                f"(parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+                f"extraction_sha256={extraction.extraction_sha256!r}): {exc}",
+            ),
+            False,
         )
     actual_extracted_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     # The ONLY acceptable anchor is the envelope's own ExtractionBinding --
@@ -451,14 +508,18 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
     # together and still get a VERIFIED result. See this module's
     # docstring ("Evidence identity").
     if actual_extracted_sha256 != extraction.extracted_sha256:
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"extracted.json bytes on disk for node {node.node_id!r}'s extraction record do "
-            "not match ExtractionBinding.extracted_sha256 recorded on the envelope -- the stored "
-            "evidence has been tampered with or corrupted since the envelope was produced",
-            expected=extraction.extracted_sha256,
-            actual=actual_extracted_sha256,
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"extracted.json bytes on disk for node {node.node_id!r}'s extraction record do "
+                "not match ExtractionBinding.extracted_sha256 recorded on the envelope -- the stored "
+                "evidence has been tampered with or corrupted since the envelope was produced",
+                expected=extraction.extracted_sha256,
+                actual=actual_extracted_sha256,
+            ),
+            False,
         )
     # record_meta.json is cross-checked only AFTER the envelope's own anchor
     # has already passed, and purely as an early-warning signal: a
@@ -467,16 +528,20 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
     # never updated), which is itself worth reporting even though the
     # envelope-anchored check above is what actually decided pass/fail.
     if record_meta.extracted_sha256 != actual_extracted_sha256:
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"extraction record meta.json for node {node.node_id!r} records "
-            f"extracted_sha256={record_meta.extracted_sha256!r}, which disagrees with the bytes "
-            "actually on disk (and with the envelope's own anchor, already verified above) -- the "
-            "store's own sidecar bookkeeping is inconsistent and is reported rather than silently "
-            "reconciled",
-            expected=actual_extracted_sha256,
-            actual=record_meta.extracted_sha256,
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"extraction record meta.json for node {node.node_id!r} records "
+                f"extracted_sha256={record_meta.extracted_sha256!r}, which disagrees with the bytes "
+                "actually on disk (and with the envelope's own anchor, already verified above) -- the "
+                "store's own sidecar bookkeeping is inconsistent and is reported rather than silently "
+                "reconciled",
+                expected=actual_extracted_sha256,
+                actual=record_meta.extracted_sha256,
+            ),
+            False,
         )
     try:
         extracted = ExtractedText.model_validate(json.loads(raw_bytes))
@@ -492,11 +557,15 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
         # deep enough to blow the interpreter's recursion limit during
         # json.loads or pydantic validation, and that must become a named
         # UNVERIFIABLE finding, never an escaping crash.
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"verified extracted.json for node {node.node_id!r} does not parse as "
-            f"ExtractedText: {exc!r}",
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"verified extracted.json for node {node.node_id!r} does not parse as "
+                f"ExtractedText: {exc!r}",
+            ),
+            False,
         )
     if extracted.lossy:
         # Mirrors dataset_producer.produce_envelope_from_artifact's own
@@ -511,37 +580,49 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
         page_note = (
             f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
         )
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"verified extracted.json for node {node.node_id!r} is a lossy extraction "
-            f"(extractor={extracted.extractor!r}){page_note}; a knowingly-partial extraction cannot "
-            "be independently re-verified as a faithful re-derivation of the document text",
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"verified extracted.json for node {node.node_id!r} is a lossy extraction "
+                f"(extractor={extracted.extractor!r}){page_note}; a knowingly-partial extraction cannot "
+                "be independently re-verified as a faithful re-derivation of the document text",
+            ),
+            False,
         )
     actual_text_sha256 = hashlib.sha256(extracted.text.encode("utf-8")).hexdigest()
     if actual_text_sha256 != extraction.extracted_text_sha256:
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"independently re-read text for node {node.node_id!r} hashes to "
-            f"{actual_text_sha256!r}, but the envelope's ExtractionBinding.extracted_text_sha256 "
-            f"recorded {extraction.extracted_text_sha256!r} at production time",
-            expected=extraction.extracted_text_sha256,
-            actual=actual_text_sha256,
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"independently re-read text for node {node.node_id!r} hashes to "
+                f"{actual_text_sha256!r}, but the envelope's ExtractionBinding.extracted_text_sha256 "
+                f"recorded {extraction.extracted_text_sha256!r} at production time",
+                expected=extraction.extracted_text_sha256,
+                actual=actual_text_sha256,
+            ),
+            False,
         )
     if record_meta.extracted_text_sha256 != actual_text_sha256:
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"extraction record meta.json for node {node.node_id!r} records "
-            f"extracted_text_sha256={record_meta.extracted_text_sha256!r}, which disagrees with the "
-            "independently re-read text actually stored (and with the envelope's own anchor, already "
-            "verified above) -- the store's own sidecar bookkeeping is inconsistent and is reported "
-            "rather than silently reconciled",
-            expected=actual_text_sha256,
-            actual=record_meta.extracted_text_sha256,
+        return NodeVerification(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"extraction record meta.json for node {node.node_id!r} records "
+                f"extracted_text_sha256={record_meta.extracted_text_sha256!r}, which disagrees with the "
+                "independently re-read text actually stored (and with the envelope's own anchor, already "
+                "verified above) -- the store's own sidecar bookkeeping is inconsistent and is reported "
+                "rather than silently reconciled",
+                expected=actual_text_sha256,
+                actual=record_meta.extracted_text_sha256,
+            ),
+            False,
         )
-    return extracted.text, None
+    return NodeVerification(extracted.text, None, False)
 
 
 def _redacted(text: str, locator: CharSpanLocator | None = None) -> str:
@@ -1079,10 +1160,13 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     """
     text_by_node_id: dict[str, str] = {}
     node_problems: dict[str, ReplayFinding] = {}
+    node_level_problems: dict[str, ReplayFinding] = {}
     for node in envelope.source_graph.nodes:
-        text, problem = _independently_verify_node_text(workspace_root, node)
+        text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
         if problem is not None:
             node_problems[node.node_id] = problem
+            if not problem_is_text_only:
+                node_level_problems[node.node_id] = problem
         else:
             assert text is not None
             text_by_node_id[node.node_id] = text
@@ -1103,12 +1187,19 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         if value_boundary_finding is not None:
             unit_findings.append(value_boundary_finding)
 
-    # Every node's own problem is surfaced regardless of whether any
-    # char-span ref happens to reach it -- an unreferenced node (or one
-    # only reachable via parent_node_id, never a SourceRef) must never be
-    # silently invisible just because check_char_spans never had a reason
-    # to look at it.
-    node_level_findings = tuple(node_problems.values())
+    # Every node's own STORE-INTEGRITY problem is surfaced regardless of
+    # whether any char-span ref happens to reach it -- an unreferenced node
+    # (or one only reachable via parent_node_id, never a SourceRef) must
+    # never be silently invisible just because check_char_spans never had a
+    # reason to look at it. A missing extraction is different in kind,
+    # though: "this node has no ExtractionBinding" is a fact about a
+    # non-textual node (e.g. a FIGURE_CROP targeted only by a BBoxLocator),
+    # not a defect of the envelope, so it is excluded from
+    # ``node_level_problems`` and instead only becomes a finding wherever
+    # ``check_char_spans`` finds a text-dependent ref (a CharSpanLocator)
+    # actually targeting that node -- ``node_problems`` (used above) still
+    # carries it for that purpose.
+    node_level_findings = tuple(node_level_problems.values())
 
     all_findings = tuple(span_findings) + tuple(unit_findings) + node_level_findings
 

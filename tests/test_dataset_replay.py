@@ -29,7 +29,10 @@ from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
     AxisRole,
+    BBox,
+    BBoxLocator,
     CharSpanLocator,
+    CoordinateFrame,
     DatasetEnvelope,
     ExtractionBinding,
     LocatorKind,
@@ -1373,7 +1376,7 @@ class TestIndependentNodeVerificationOutcomeCategories:
             extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         )
-        text, finding = _independently_verify_node_text(tmp_path, node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.UNVERIFIABLE
@@ -1381,6 +1384,9 @@ class TestIndependentNodeVerificationOutcomeCategories:
         # recorded for this node (the binding itself is absent) -- not "a
         # recorded artifact is missing or damaged on disk".
         assert "ExtractionBinding" in finding.reason
+        # The node's bytes verified cleanly (raw.bin was intact); the only
+        # complaint is the absent extraction, so this is text-only.
+        assert problem_is_text_only is True
 
     def test_corrupt_record_meta_json_is_unverifiable_not_failed(self, tmp_path: Path) -> None:
         """Guards satisfied by construction: raw.bin is untouched (identity
@@ -1399,7 +1405,7 @@ class TestIndependentNodeVerificationOutcomeCategories:
         )
         (record_dir / "meta.json").write_text("{this is not json", encoding="utf-8")
 
-        text, finding = _independently_verify_node_text(tmp_path, node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.UNVERIFIABLE
@@ -1408,6 +1414,9 @@ class TestIndependentNodeVerificationOutcomeCategories:
         # raw.bin-related guard.
         assert "meta.json" in finding.reason
         assert "unreadable" in finding.reason
+        # This node HAS an ExtractionBinding; the corrupt sidecar is a
+        # distinct problem, not the absent-extraction case.
+        assert problem_is_text_only is False
 
     def test_missing_extracted_json_with_intact_meta_is_unverifiable_not_failed(self, tmp_path: Path) -> None:
         """Guards satisfied by construction: raw.bin verifies, ``meta.json``
@@ -1425,11 +1434,14 @@ class TestIndependentNodeVerificationOutcomeCategories:
         )
         (record_dir / "extracted.json").unlink()
 
-        text, finding = _independently_verify_node_text(tmp_path, node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.UNVERIFIABLE
         assert "extracted.json" in finding.reason
+        # This node HAS an ExtractionBinding; the missing evidence file is a
+        # distinct problem, not the absent-extraction case.
+        assert problem_is_text_only is False
 
 
 class TestReplaySidecarBookkeepingInconsistencyIsFailed:
@@ -1515,7 +1527,7 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         forged_node, decoy_sha, real_sha = self._forge_record_with(tmp_path, loaded, "extracted_sha256")
 
-        text, finding = _independently_verify_node_text(tmp_path, forged_node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, forged_node)
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
@@ -1523,6 +1535,7 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         # inconsistent claim vs the digest of the bytes actually on disk.
         assert finding.actual == decoy_sha
         assert finding.expected == real_sha
+        assert problem_is_text_only is False
 
     def test_record_meta_extracted_text_sha256_disagreeing_with_reread_text_is_failed(self, tmp_path: Path) -> None:
         """Additionally passes the sibling ``extracted_sha256`` sidecar
@@ -1531,12 +1544,13 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         forged_node, decoy_sha, real_sha = self._forge_record_with(tmp_path, loaded, "extracted_text_sha256")
 
-        text, finding = _independently_verify_node_text(tmp_path, forged_node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, forged_node)
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
         assert finding.actual == decoy_sha
         assert finding.expected == real_sha
+        assert problem_is_text_only is False
 
 
 class TestCheckCharSpansOutcomeCategories:
@@ -1759,3 +1773,97 @@ class TestValueBoundaryOutcomeCategories:
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
         assert "out of range" in finding.reason
+
+
+class TestReplayEnvelopeMixedTextAndBBoxNodes:
+    """A `SourceGraph` may legitimately mix a text-grounded node with a node
+    that carries no extracted text at all.
+
+    ``V6`` (``carmel/schemas/datasets.py``) states the rule the replayer has to
+    honour: a `CharSpanLocator` requires an extraction, and a `BBoxLocator`
+    against a never-text-extracted node "is still a real, verifiable locator".
+    `FIGURE_CROP` is exactly that shape -- ``_LOCATOR_KIND_COMPATIBLE_NODE_KINDS``
+    forbids `CHAR_SPAN` on a crop precisely because no text is stored for one.
+
+    So "this node has no `ExtractionBinding`" is a FACT about the node, not a
+    defect of the envelope. It becomes a finding only when a text-dependent
+    check actually targets that node. What is NOT optional is the node's BYTES:
+    a node admitted into a VERIFIED envelope must still have its ``raw.bin``
+    present and hashing to its recorded ``sha256``, or the "verified" label is
+    laundered onto bytes nobody checked.
+    """
+
+    @staticmethod
+    def _mixed_envelope(loaded: DatasetEnvelope, *, crop_sha256: str) -> DatasetEnvelope:
+        """Add a `FIGURE_CROP` with NO extraction, targeted ONLY by a `BBoxLocator`.
+
+        The crop takes over one axis's ``label_ref`` so it is not a decorative
+        node (V2). ``label_ref`` is the only ref slot no boundary gate inspects,
+        so a non-`CharSpanLocator` there cannot make the envelope UNVERIFIABLE
+        for some second, unrelated reason -- the test stays a test of ONE thing.
+        """
+        root = loaded.source_graph.nodes[0]
+        crop = SourceNode(
+            node_id="crop",
+            kind=SourceNodeKind.FIGURE_CROP,
+            sha256=crop_sha256,
+            parent_node_id=root.node_id,
+            origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            extraction=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            glyph_health=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+        graph = loaded.source_graph.model_copy(update={"nodes": (*loaded.source_graph.nodes, crop)})
+        frame = CoordinateFrame(
+            render_fingerprint="fp-1",
+            cropbox=("0", "0", "612", "792"),
+            mediabox=("0", "0", "612", "792"),
+            rotation=0,
+            units="pt",
+            dpi="300",
+            render_settings="antialias=on",
+        )
+        bbox_ref = SourceRef(
+            node_id="crop",
+            locator=BBoxLocator(bbox=BBox(frame=frame, x0="10", y0="20", x1="30", y1="40")),
+        )
+        series = loaded.series[0]
+        axes = (series.axes[0].model_copy(update={"label_ref": bbox_ref}), *series.axes[1:])
+        envelope = loaded.model_copy(
+            update={"source_graph": graph, "series": (series.model_copy(update={"axes": axes}),)}
+        )
+        # Round-trip through full validation: the schema layer must ACCEPT this
+        # envelope, or the replayer is being asked to verify something illegal.
+        return DatasetEnvelope.model_validate(json.loads(envelope.model_dump_json()))
+
+    def test_mixed_text_and_bbox_envelope_verifies(self, tmp_path: Path) -> None:
+        """The crop shares its parent's ``sha256`` (legal per I5) so its bytes
+        ARE in the store. Nothing text-dependent targets it. It must verify."""
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.failures == ()
+        assert report.unverifiable == ()
+        # One char-span label_ref became a BBox ref, so 5 of the original 6 remain.
+        assert report.checked_char_spans == 5
+
+    def test_bbox_only_node_with_missing_raw_bytes_is_still_unverifiable(self, tmp_path: Path) -> None:
+        """The over-correction guard: waiving the TEXT requirement must not
+        waive the BYTES requirement. A crop whose ``raw.bin`` is not in the
+        store was never checked at all and must never ride into a VERIFIED
+        envelope on the back of its parent."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        envelope = self._mixed_envelope(loaded, crop_sha256="c" * 64)
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.failures == ()
+        # Pin the REASON, not merely the outcome. Before the text/bytes split
+        # this test passed vacuously -- the envelope was UNVERIFIABLE because
+        # the crop had no extraction, and the missing raw.bin was never even
+        # reached. Asserting the byte-level reason is what makes it a real test.
+        reasons = [f.reason for f in report.unverifiable]
+        assert any("no readable raw.bin" in r and "'crop'" in r for r in reasons), reasons
