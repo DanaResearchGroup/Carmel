@@ -368,12 +368,21 @@ def _build_identity_payload(
     record's address.
 
     Args:
-        identity_payload_version: The identity-payload SHAPE version to stamp into
-            the payload. Defaults to the module's current
+        identity_payload_version: The identity-payload SHAPE version STRING to
+            stamp into the payload. Defaults to the module's current
             :data:`_IDENTITY_PAYLOAD_VERSION`; callers re-authenticating an
             EXISTING record pass that record's own recorded value instead (see
-            :func:`_load_meta`), so re-authentication reproduces exactly the
-            payload that was hashed when the record was first stored.
+            :func:`_load_meta`). Note this only reproduces the version STRING
+            that was stamped into the original payload -- it does NOT
+            reproduce the KEY-SET rule (which fields, e.g. ``pypdf_version``,
+            get included) as it stood when that version was current. The
+            key-set rule below (``if extractor in _PYPDF_DEPENDENT_EXTRACTORS``)
+            always applies TODAY's logic, regardless of which
+            ``identity_payload_version`` is passed in. If that rule ever
+            changes, a record stamped with an older
+            ``identity_payload_version`` will have its payload rebuilt under
+            the NEW rule, not reinterpreted under the rule that was current
+            when it was stored.
     """
     payload = {
         "identity_payload_version": identity_payload_version,
@@ -395,9 +404,20 @@ def _identity_payload_from_meta(meta: ExtractionRecordMeta) -> dict[str, str]:
     ``meta``'s other recorded fields and confirm the two agree -- the
     self-authenticating property the whole address scheme depends on (see the
     module docstring). Deliberately uses ``meta.identity_payload_version`` (the
-    version THIS record claims), not today's module-level constant, so
-    re-authentication reproduces the exact payload shape that was hashed when the
-    record was stored.
+    version THIS record claims), not today's module-level constant, for the
+    version STRING stamped into the rebuilt payload.
+
+    This does NOT guarantee the rebuild reproduces the exact payload shape
+    that was hashed when the record was stored: :func:`_build_identity_payload`
+    decides which keys to include (e.g. whether ``pypdf_version`` is present)
+    using TODAY's :data:`_PYPDF_DEPENDENT_EXTRACTORS`/key-set rule, not a rule
+    keyed off ``identity_payload_version``. For a record whose
+    ``identity_payload_version`` differs from the module's current
+    :data:`_IDENTITY_PAYLOAD_VERSION`, the rebuild still applies today's
+    key-set rule -- so such a record fails to authenticate (its recomputed
+    address will not match ``meta.extraction_sha256``) rather than being
+    correctly reinterpreted under the rule that was current for its own
+    version.
     """
     return _build_identity_payload(
         identity_payload_version=meta.identity_payload_version,

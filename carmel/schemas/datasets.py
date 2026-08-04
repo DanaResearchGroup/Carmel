@@ -612,17 +612,28 @@ class ExtractionBinding(BaseModel):
 
     @model_validator(mode="after")
     def _validate_extraction_sha256_recomputes_from_identity_fields(self) -> ExtractionBinding:
-        """This binding is SELF-AUTHENTICATING: it carries every field that
+        """This binding is INTERNALLY COHERENT, not self-authenticating: it
+        carries every field that
         :func:`carmel.services.extraction_record.compute_extraction_sha`
         folds into an extraction record's content address, and this
         validator recomputes that address (via the same
         ``_build_identity_payload``/``compute_extraction_sha`` pair the
         store itself uses -- never a second implementation that could
         drift) and requires it to equal ``extraction_sha256``. A binding
-        that merely CLAIMS an address it cannot recompute from its own
-        identity fields never comes into existence, so a replayer can trust
-        the binding's identity fields to be exactly the ones hashed into
-        the address it resolves.
+        whose ``extraction_sha256`` is inconsistent with its own identity
+        fields -- one field edited, the address left stale -- never comes
+        into existence.
+
+        What this does NOT prove: this recomputes the address from the
+        binding's OWN fields, so it cannot detect a CONSISTENTLY forged
+        binding -- one whose identity fields were edited and whose address
+        was recomputed to match. It buys internal coherence, not
+        authenticity. The actual authenticity check happens at replay time,
+        when the binding's identity fields are compared against the
+        extraction record's own ``meta.json`` as loaded from the store (see
+        ``carmel/services/dataset_replay.py``); that comparison is what
+        makes forgery detectable, because the store's record is not under
+        the envelope author's control.
         """
         if self.extractor in _PYPDF_DEPENDENT_EXTRACTORS:
             if isinstance(self.pypdf_version, Absent):

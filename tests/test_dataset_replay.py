@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1531,10 +1532,16 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
+        assert finding.ref_path == "source_graph.node('paper')"
         # The finding must name the disagreement itself: the sidecar's
         # inconsistent claim vs the digest of the bytes actually on disk.
         assert finding.actual == decoy_sha
         assert finding.expected == real_sha
+        assert re.search(
+            r"extraction record meta\.json for node 'paper' records extracted_sha256=.* "
+            r"disagrees with the bytes actually on disk .*store's own sidecar bookkeeping is inconsistent",
+            finding.reason,
+        )
         assert problem_is_text_only is False
 
     def test_record_meta_extracted_text_sha256_disagreeing_with_reread_text_is_failed(self, tmp_path: Path) -> None:
@@ -1548,8 +1555,15 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
+        assert finding.ref_path == "source_graph.node('paper')"
         assert finding.actual == decoy_sha
         assert finding.expected == real_sha
+        assert re.search(
+            r"extraction record meta\.json for node 'paper' records extracted_text_sha256=.* "
+            r"disagrees with the independently re-read text actually stored .*"
+            r"store's own sidecar bookkeeping is inconsistent",
+            finding.reason,
+        )
         assert problem_is_text_only is False
 
 

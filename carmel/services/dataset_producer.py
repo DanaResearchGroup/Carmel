@@ -1419,17 +1419,21 @@ def produce_envelope_from_artifact(
     # that resolves to nothing on disk -- a replayer handed an address with
     # no backing record can never do better than report it UNVERIFIABLE
     # forever, which is worse than no replayer at all. So this producer does
-    # not compute the address in isolation; it calls
-    # store_extraction_record(), which parses+content-addresses+durably
-    # persists this same extracted.json under
+    # not compute the address in isolation; it calls store_extraction_record(),
+    # which parses+content-addresses+durably MIRRORS the ALREADY-STORED root
+    # extracted.json bytes read above (via extracted_json_bytes) into
     # evidence/literature/<sha256>/extractions/<extraction_sha256>/ (a no-op
     # if that exact record is already stored -- idempotent on re-run), and
-    # returns the address that record now durably occupies. The extractor
-    # code identity is today's, from semantic_deps.extraction_identity() --
-    # the old store never recorded a separate extractor_code_sha256, so this
-    # producer cannot honestly claim to know what code identity produced a
-    # legacy artifact's extraction; it only claims what identity is stamping
-    # THIS extraction record, now.
+    # returns the address that record now durably occupies. This is NOT a
+    # fresh extraction: no re-parsing of raw.bin happens here, and a genuine
+    # re-extraction path (re-running the extractor against raw.bin to
+    # produce new bytes) does not exist yet. The extractor code identity
+    # stamped onto the record IS today's, from
+    # semantic_deps.extraction_identity() -- the old store never recorded a
+    # separate extractor_code_sha256, so this producer cannot honestly claim
+    # to know what code identity produced a legacy artifact's extraction; it
+    # only claims what identity is stamping this mirrored record's metadata,
+    # now.
     identity = extraction_identity()
     try:
         extraction_sha256 = store_extraction_record(
