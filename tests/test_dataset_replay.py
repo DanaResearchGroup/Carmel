@@ -23,7 +23,7 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
-from carmel.agents.tools.extract import ExtractedText
+from carmel.agents.tools.extract import ExtractedText, PageExtractionFailure
 from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.datasets import (
     AbsenceReason,
@@ -905,3 +905,132 @@ class TestReplayEnvelopeSurfacesUnreferencedNodeProblems:
         report = replay_envelope(tmp_path, tampered)
         assert report.outcome is ReplayOutcome.UNVERIFIABLE
         assert any("orphan" in f.reason for f in report.unverifiable)
+
+
+class TestReplayEnvelopeVerifiesRawBinIntegrity:
+    """Replay never touched ``raw.bin`` at all: it hashed and cross-checked
+    ``extracted.json`` and its parsed text, but a node's ``sha256`` is a
+    content-address of ``raw.bin``, and nothing ever confirmed that file
+    exists or hashes to it. A missing or corrupted ``raw.bin`` behind a node
+    was therefore invisible to replay as long as ``extracted.json`` still
+    checked out -- a vacuous pass on the very artifact the node claims to be
+    the content-address of.
+    """
+
+    def test_replay_is_unverifiable_when_raw_bin_is_missing(self, tmp_path: Path) -> None:
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        raw_path = artifact_dir(tmp_path, stored_artifact.sha256) / "raw.bin"
+        raw_path.unlink()
+
+        report = replay_envelope(tmp_path, loaded)
+
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("raw.bin" in f.reason for f in report.unverifiable)
+
+    def test_replay_fails_when_raw_bin_does_not_hash_to_node_sha256(self, tmp_path: Path) -> None:
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        raw_path = artifact_dir(tmp_path, stored_artifact.sha256) / "raw.bin"
+        raw_path.write_bytes(b"forged raw bytes that do not hash to node.sha256")
+
+        report = replay_envelope(tmp_path, loaded)
+
+        assert report.outcome is ReplayOutcome.FAILED
+        assert any("raw.bin" in f.reason for f in report.failures)
+
+
+class TestReplayEnvelopeChecksLossyExtraction:
+    """Replay ignored ``ExtractedText.lossy``/``page_failures`` entirely.
+    ``dataset_producer.produce_envelope_from_artifact`` itself refuses to
+    produce an envelope from a knowingly-partial extraction, but replay had
+    no equivalent check: an existing envelope whose stored ``extracted.json``
+    was later mutated to ``lossy=True`` (e.g. by re-running extraction after
+    a pypdf upgrade that now surfaces a previously-silent page failure) would
+    still be reported VERIFIED by replay, because every digest it checks
+    still lines up -- lossiness just isn't one of the things checked.
+    """
+
+    def test_replay_is_unverifiable_against_a_lossy_extraction(self, tmp_path: Path) -> None:
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
+        raw_bytes = extracted_path.read_bytes()
+        extracted = ExtractedText.model_validate(json.loads(raw_bytes))
+
+        # Flip lossy=True and record a page failure -- extracted.text itself
+        # is untouched, so extracted_text_sha256 (the digest of the TEXT)
+        # still matches; only extracted_sha256 (the digest of the whole
+        # extracted.json FILE) moves, because lossy/page_failures are part
+        # of that file. Patch meta.json and the envelope's own anchor the
+        # same way the existing extracted_sha256-mismatch tests do, so the
+        # lossy flag is isolated as the sole variable under test.
+        lossy_extracted = extracted.model_copy(
+            update={
+                "lossy": True,
+                "page_failures": (PageExtractionFailure(page=3, error="ValueError: bad xref"),),
+            }
+        )
+        new_bytes = json.dumps(lossy_extracted.model_dump(mode="json")).encode("utf-8")
+        extracted_path.write_bytes(new_bytes)
+        new_extracted_sha256 = hashlib.sha256(new_bytes).hexdigest()
+
+        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["extracted_sha256"] = new_extracted_sha256
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        patched_extraction = node.extraction.model_copy(update={"extracted_sha256": new_extracted_sha256})
+        patched_node = node.model_copy(update={"extraction": patched_extraction})
+        patched_nodes = tuple(patched_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
+        patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})
+        tampered = loaded.model_copy(update={"source_graph": patched_graph})
+
+        report = replay_envelope(tmp_path, tampered)
+
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("lossy" in f.reason and "1 page" in f.reason for f in report.unverifiable)
+
+
+class TestReplayEnvelopeVerifiesDerivationBinding:
+    """``ExtractionBinding.derivation_binding`` was carried on every node but
+    replay never looked at it at all: a forged or rolled-back
+    ``derivation_binding`` -- or one simply Absent, as on a legacy record --
+    was invisible to replay as long as the text digests still matched.
+    """
+
+    def test_replay_fails_when_carried_derivation_binding_disagrees_with_the_store(self, tmp_path: Path) -> None:
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        assert not isinstance(node.extraction.derivation_binding, Absent)
+
+        bogus_binding = "0" * 64
+        assert bogus_binding != node.extraction.derivation_binding
+        patched_extraction = node.extraction.model_copy(update={"derivation_binding": bogus_binding})
+        patched_node = node.model_copy(update={"extraction": patched_extraction})
+        patched_nodes = tuple(patched_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
+        patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})
+        tampered = loaded.model_copy(update={"source_graph": patched_graph})
+
+        report = replay_envelope(tmp_path, tampered)
+
+        assert report.outcome is ReplayOutcome.FAILED
+        assert any("derivation_binding" in f.reason for f in report.failures)
+
+    def test_replay_is_unverifiable_when_no_derivation_binding_is_carried(self, tmp_path: Path) -> None:
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+
+        legacy_extraction = node.extraction.model_copy(
+            update={"derivation_binding": Absent(reason=AbsenceReason.UNKNOWN)}
+        )
+        legacy_node = node.model_copy(update={"extraction": legacy_extraction})
+        legacy_nodes = tuple(legacy_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
+        legacy_graph = loaded.source_graph.model_copy(update={"nodes": legacy_nodes})
+        legacy = loaded.model_copy(update={"source_graph": legacy_graph})
+
+        report = replay_envelope(tmp_path, legacy)
+
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("derivation_binding" in f.reason for f in report.unverifiable)

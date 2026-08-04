@@ -217,7 +217,7 @@ from carmel.services.dataset_producer import (
     _unit_table_boundary_violation,
     binding_for_known_sha,
 )
-from carmel.services.evidence import artifact_dir, load_artifact_meta
+from carmel.services.evidence import _derivation_binding, artifact_dir, load_artifact_meta
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
     enclosing_numeric_construct,
@@ -324,6 +324,34 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             reason=f"node {node.node_id!r} has no ExtractionBinding (extraction is Absent); "
             "there is nothing recorded to independently re-verify",
         )
+    raw_path = artifact_dir(workspace_root, node.sha256) / "raw.bin"
+    try:
+        raw_bin_bytes = raw_path.read_bytes()
+    except (FileNotFoundError, OSError) as exc:
+        # Absence is inability to check: raw.bin may simply have been
+        # garbage-collected or never fetched into this workspace, which says
+        # nothing about whether the node's identity is trustworthy -- report
+        # UNVERIFIABLE, not FAILED. A raw.bin that IS present but hashes to
+        # something other than node.sha256 (below) is different in kind: it
+        # is positive evidence that the store's raw bytes were tampered with
+        # or corrupted, so that case is reported as FAILED instead. The two
+        # must never be conflated into a single outcome.
+        return None, ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"no readable raw.bin for node {node.node_id!r} (sha256={node.sha256!r}): {exc}",
+        )
+    actual_raw_sha256 = hashlib.sha256(raw_bin_bytes).hexdigest()
+    if actual_raw_sha256 != node.sha256:
+        return None, ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path,
+            reason=f"raw.bin on disk for node {node.node_id!r} hashes to {actual_raw_sha256!r}, not "
+            f"the node.sha256={node.sha256!r} it is stored under -- the evidence store's raw bytes "
+            "have been tampered with or corrupted since this node was recorded",
+            expected=node.sha256,
+            actual=actual_raw_sha256,
+        )
     extracted_path = artifact_dir(workspace_root, node.sha256) / "extracted.json"
     try:
         raw_bytes = extracted_path.read_bytes()
@@ -390,6 +418,26 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             reason=f"verified extracted.json for node {node.node_id!r} does not parse as "
             f"ExtractedText: {exc!r}",
         )
+    if extracted.lossy:
+        # Mirrors dataset_producer.produce_envelope_from_artifact's own
+        # refusal to produce an envelope from a knowingly-partial
+        # extraction: `extracted.text` here is by definition a partial view
+        # of the document (missing pages, a parse failure, or truncation),
+        # so no char-span re-slice or grounded quote drawn from it can be
+        # trusted to represent the actual document, no matter how cleanly
+        # its digests line up. Report UNVERIFIABLE rather than silently
+        # replaying partial text as though it were a faithful, complete
+        # re-derivation.
+        page_note = (
+            f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
+        )
+        return None, ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"verified extracted.json for node {node.node_id!r} is a lossy extraction "
+            f"(extractor={extracted.extractor!r}){page_note}; a knowingly-partial extraction cannot "
+            "be independently re-verified as a faithful re-derivation of the document text",
+        )
     actual_text_sha256 = hashlib.sha256(extracted.text.encode("utf-8")).hexdigest()
     if actual_text_sha256 != extraction.extracted_text_sha256:
         return None, ReplayFinding(
@@ -400,6 +448,57 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             f"recorded {extraction.extracted_text_sha256!r} at production time",
             expected=extraction.extracted_text_sha256,
             actual=actual_text_sha256,
+        )
+    if isinstance(extraction.derivation_binding, Absent):
+        # A legacy record predating ExtractionBinding.derivation_binding (or
+        # one explicitly stripped) carries nothing to cross-check the
+        # extractor identity against. This is inability-to-check, not
+        # positive evidence of anything wrong -- UNVERIFIABLE, not FAILED.
+        return None, ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"node {node.node_id!r}'s ExtractionBinding carries no derivation_binding "
+            "(Absent, e.g. a legacy record predating that field); there is nothing recorded to "
+            "independently cross-check the extractor identity binding against",
+        )
+    if meta is None or meta.extractor_version is None or meta.extracted_sha256 is None:
+        return None, ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"evidence store meta.json for node {node.node_id!r} (sha256={node.sha256!r}) is "
+            "missing, or predates extractor_version/extracted_sha256, so the envelope's carried "
+            "derivation_binding cannot be independently recomputed and cross-checked",
+        )
+    # Recompute using meta.json's OWN FROZEN extractor_version -- the
+    # identity string `_extractor_identity()` computed and stored ONCE, at
+    # store time -- rather than calling `_extractor_identity()` live here.
+    # A live call would fold in whatever pypdf version happens to be
+    # installed on the machine doing the replaying right now; pypdf is
+    # unpinned in this project (`pypdf>=5.0`), so that version string can
+    # legitimately differ from what was installed when the envelope was
+    # produced. Requiring live-recomputed bit-for-bit equality would fail
+    # closed on a routine pypdf upgrade -- indistinguishable from tampering
+    # -- and would also fail every legacy artifact stored with
+    # extractor_version=None. Reusing the frozen meta.extractor_version
+    # avoids both traps, at the cost of only proving what
+    # ExtractionBinding.derivation_binding's own docstring says it proves:
+    # internal consistency between the envelope's carried binding and the
+    # store's current record -- NOT that extracted.json was actually
+    # re-derived from raw.bin, and no defence against a forger who updates
+    # all three fields together. See evidence._derivation_binding_intact,
+    # which this mirrors but against the envelope's carried value instead
+    # of only meta.json's own internal fields.
+    recomputed_binding = _derivation_binding(meta.sha256, meta.extracted_sha256, meta.extractor_version)
+    if recomputed_binding != extraction.derivation_binding:
+        return None, ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path,
+            reason=f"node {node.node_id!r}'s ExtractionBinding.derivation_binding="
+            f"{extraction.derivation_binding!r} does not match sha256(extractor_identity|raw_sha256|"
+            f"extracted_sha256) recomputed from evidence store meta.json ({recomputed_binding!r}) -- "
+            "the envelope's carried binding disagrees with the store's own record",
+            expected=recomputed_binding,
+            actual=extraction.derivation_binding,
         )
     return extracted.text, None
 
