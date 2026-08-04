@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import math
 
+import pytest
+
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
     NUMERAL_EXTENT_RE,
@@ -33,6 +35,7 @@ from carmel.services.numeric import (
     find_numeral_extent,
     normalize_numeric_span,
     parse_numeric_span,
+    unit_boundary_violation,
 )
 
 #: A GlyphHealth for a document that shows no sign of dash corruption at all: it
@@ -597,3 +600,29 @@ class TestEnclosingNumericConstruct:
         text = "k = 3.94 x 10 03 s-1."
         start = text.index(" 10 ") + 1
         assert enclosing_numeric_construct(text, start, start + 2) == "flattened_scientific"
+
+
+class TestUnitBoundaryViolationHasNoVocabularySeam:
+    """Round 43 finding (P1-2): ``unit_boundary_violation`` used to accept
+    caller-supplied ``quantity_spellings``/``all_spellings`` keyword-only
+    ``frozenset[str]`` vocabulary parameters, exported from this
+    zero-``carmel``-import module but validated not at all -- an
+    unvalidated policy-injection seam. Layer 3 (table-driven admission and
+    maximality against ``carmel.services.units.TABLE_V1``) moved out of this
+    module entirely, into a private function in
+    ``carmel.services.dataset_producer``, so this function is LEXICAL ONLY
+    now: no vocabulary parameter of any kind. This test pins that the old
+    keywords are gone -- not merely unused -- so the seam cannot silently
+    return."""
+
+    def test_old_vocabulary_keywords_are_rejected(self) -> None:
+        with pytest.raises(TypeError, match="quantity_spellings"):
+            unit_boundary_violation(  # type: ignore[call-arg]
+                "u = 10 cm", 8, 10, quantity_spellings=frozenset({"cm"}), all_spellings=frozenset({"cm"})
+            )
+
+    def test_lexically_clean_unit_with_no_vocabulary_param_is_not_refused(self) -> None:
+        # Confirms the lexical-only signature still works for a genuinely
+        # clean case -- Layers 1-2 alone have nothing to refuse here, and
+        # there is no vocabulary parameter to supply at all.
+        assert unit_boundary_violation("the temperature was 1023 K", 25, 26) is None

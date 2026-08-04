@@ -228,6 +228,39 @@ class TestMeasurementSpecOccurrence:
         assert spec.value_occurrence is None
 
 
+class TestMeasurementSpecRole:
+    """Round 43 finding: ``AxisRole`` is a ``StrEnum``, so a plain string
+    equal to one of its members' VALUES (e.g. ``role="coordinate"``) compares
+    ``==`` equal to ``AxisRole.COORDINATE`` but fails ``isinstance``/``is`` --
+    the same trap this codebase already guards against for ``QuoteRole`` and
+    ``QuantityKind`` elsewhere (see ``ground_quote``'s own ``isinstance``
+    checks). ``__post_init__`` previously validated only the occurrence
+    fields, so a bare string silently survived construction here."""
+
+    def test_plain_string_role_rejected_even_though_value_equal(self) -> None:
+        assert AxisRole.COORDINATE == "coordinate"  # StrEnum value equality holds
+        with pytest.raises(DatasetProducerError, match="role='coordinate'"):
+            MeasurementSpec(
+                axis_id="temperature",
+                role="coordinate",
+                quantity_kind=QuantityKind.TEMPERATURE,
+                label_quote="temperature",
+                value_quote="1023",
+                unit_quote="K",
+            )
+
+    def test_genuine_axis_role_member_still_accepted(self) -> None:
+        spec = MeasurementSpec(
+            axis_id="temperature",
+            role=AxisRole.COORDINATE,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_quote="temperature",
+            value_quote="1023",
+            unit_quote="K",
+        )
+        assert spec.role is AxisRole.COORDINATE
+
+
 class TestGroundQuote:
     def test_grounds_unique_quote_by_search(self) -> None:
         locator = ground_quote(_TEXT, "1023", role=QuoteRole.VALUE)
@@ -1059,17 +1092,17 @@ class TestGroundQuoteUnitAcceptanceMatrix:
                 quantity=QuantityKind.PRESSURE,
             )
 
-    # -- MUST-REFUSE: known, deliberate K^1 coverage gap ---------------------
+    # -- MUST-REFUSE: K^1 exponent-vs-footnote ambiguity ---------------------
 
     def test_refuses_temperature_unit_followed_by_a_bare_superscript_one(self) -> None:
         # "K¹" is lexically identical, from a single-adjacent-character
         # check alone, whether the "¹" is a genuine exponent continuation or
-        # an unrelated footnote marker -- Layer 2 treats the superscript
-        # digit as a unit-token character either way and refuses. This is
-        # the documented, deliberate coverage gap from
-        # `unit_boundary_violation`'s docstring, pinned here as a test, not
-        # merely prose.
-        with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
+        # an unrelated footnote marker. This has its own discriminant,
+        # `unit_trailing_exponent_or_footnote_ambiguous`, carved out of the
+        # generic trailing-not-maximal bucket specifically so this
+        # ambiguity is visible to an operator by name (round 43 finding:
+        # collapsing it into the generic message hid the coverage gap).
+        with pytest.raises(QuoteGroundingError, match="superscript or subscript digit"):
             ground_quote(
                 "T = 1023 K¹ (footnote)",
                 "K",
@@ -1100,6 +1133,62 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         with pytest.raises(QuoteGroundingError, match="unit_not_maximal_backward|LONGER"):
             ground_quote(
                 "T = 10 deg C", "C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
+            )
+
+    # -- MUST-REFUSE: whitespace-variant forward maximality (P1-1, round 43) -
+
+    def test_refuses_unit_prefix_of_longer_spelling_separated_by_double_space(self) -> None:
+        # Same corruption as test_refuses_unit_that_is_a_prefix_of_a_longer_
+        # registered_spelling above, but the registered VELOCITY alias "cm
+        # s^-1" is separated by TWO ASCII spaces in the source text instead
+        # of one. A literal `text.startswith(spelling, start)` check would
+        # miss this (the literal spelling contains only a single space), so
+        # forward maximality must be whitespace-equivalent -- matching one
+        # or more whitespace characters of ANY kind -- rather than an exact
+        # string match, or this quote is silently admitted as LENGTH when
+        # the source text actually reads the VELOCITY alias.
+        with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
+            ground_quote(
+                "u = 10 cm  s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
+            )
+
+    def test_refuses_unit_prefix_of_longer_spelling_separated_by_nbsp(self) -> None:
+        # Same as above, but the separator is U+00A0 NO-BREAK SPACE rather
+        # than an ASCII space -- a plausible artefact of PDF text
+        # extraction. `str.isspace()` is True for NBSP and `\s+` matches it,
+        # so this must refuse identically to the double-space and ASCII-
+        # single-space cases.
+        with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
+            ground_quote(
+                "u = 10 cm s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
+            )
+
+    def test_refuses_unit_prefix_of_longer_spelling_separated_by_newline(self) -> None:
+        # Same as above, but the separator is a newline -- another
+        # plausible PDF-extraction artefact (a line break landing between a
+        # unit and its per-time suffix). Must refuse identically.
+        with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
+            ground_quote(
+                "u = 10 cm\ns^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
+            )
+
+    def test_refuses_whitespace_variant_alias_quoted_whole_as_not_in_vocabulary(self) -> None:
+        # Deliberate, documented coverage gap (round 43, P1-1): unlike
+        # maximality, ADMISSION stays EXACT -- `units.normalize_unit` only
+        # strips LEADING/TRAILING whitespace, never internal whitespace, so
+        # admitting "cm  s^-1" (double space) as a whole quote would let the
+        # gate accept a string that `normalize_unit` would then itself
+        # reject downstream. Closing this gap by making admission
+        # whitespace-equivalent too would be wrong for that reason, so this
+        # quote is refused as unrecognised vocabulary, not accepted -- this
+        # test pins that refusal so the gap cannot silently regress into an
+        # accept without a test failing.
+        with pytest.raises(QuoteGroundingError, match="unit_not_in_vocabulary|not a registered spelling"):
+            ground_quote(
+                "u = 10 cm  s^-1",
+                "cm  s^-1",
+                role=QuoteRole.UNIT,
+                quantity=QuantityKind.VELOCITY,
             )
 
     # -- MUST-REFUSE: Layer 2 lexer maximality at the trailing edge ---------

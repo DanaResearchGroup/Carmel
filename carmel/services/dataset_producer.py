@@ -60,8 +60,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 
 from carmel.agents.tools.extract import ExtractedText
 from carmel.schemas.datasets import (
@@ -218,8 +221,9 @@ def _unit_spellings(quantity: QuantityKind) -> frozenset[str]:
     hash closure stays trustworthy). This module already legitimately imports
     and uses ``carmel.services.units``/``units.TABLE_V1`` directly elsewhere
     (e.g. :func:`units.normalize_unit`), so it is the correct home for
-    computing :func:`unit_boundary_violation`'s Layer 3 vocabulary; the
-    result is passed down as plain ``frozenset[str]`` data.
+    computing :func:`_unit_table_boundary_violation`'s Layer 3 vocabulary,
+    consumed directly from this module's own module-level constants rather
+    than passed as a parameter to any exported function.
     """
     spellings: set[str] = set(units.TABLE_V1.known_units(quantity))
     for alias in units.TABLE_V1.aliases:
@@ -234,10 +238,15 @@ def _unit_spellings(quantity: QuantityKind) -> frozenset[str]:
 #: admitted at all. Excludes ``QuantityKind.OTHER``, which has no vocabulary
 #: (:func:`units.normalize_unit` returns OTHER's raw string unchanged) and is
 #: refused outright by :func:`ground_quote`'s Layer 0 before
-#: :func:`unit_boundary_violation` is ever consulted. Computed lazily (on
-#: first use) and cached, matching the previous in-``numeric.py``
-#: implementation's caching behaviour.
-_unit_spellings_by_quantity_cache: dict[QuantityKind, frozenset[str]] | None = None
+#: :func:`_unit_table_boundary_violation` is ever consulted. Computed ONCE at
+#: import time as an immutable constant (``MappingProxyType`` over
+#: ``frozenset`` values) rather than lazily behind a mutable module-global --
+#: ``units.TABLE_V1`` is itself a fixed, import-time-constant table, so there
+#: is nothing to gain from deferring this computation and a mutable lazy
+#: cache is one more piece of global state that does not need to exist.
+_UNIT_SPELLINGS_BY_QUANTITY: Mapping[QuantityKind, frozenset[str]] = MappingProxyType(
+    {q: _unit_spellings(q) for q in QuantityKind if q is not QuantityKind.OTHER}
+)
 
 #: Layer 3 maximality vocabulary: the UNION of every quantity's spellings,
 #: deliberately NOT scoped to the claimed quantity. Maximality must use the
@@ -246,23 +255,107 @@ _unit_spellings_by_quantity_cache: dict[QuantityKind, frozenset[str]] | None = N
 #: ``"cm"`` inside ``"cm s^-1"`` while claiming LENGTH (whose vocabulary does
 #: not contain the VELOCITY alias ``"cm s^-1"``) would otherwise sail through
 #: a maximality check scoped only to LENGTH's own spellings.
-_unit_spellings_union_cache: frozenset[str] | None = None
+_UNIT_SPELLINGS_UNION: frozenset[str] = frozenset().union(*_UNIT_SPELLINGS_BY_QUANTITY.values())
+
+#: P1-1 (round-43 review): a registered multi-token spelling's separator is
+#: not necessarily a single ASCII space in the SOURCE TEXT -- a PDF/XML
+#: extraction can glue tokens together with a double space, an NBSP
+#: (U+00A0), a newline, or a tab. Exact ``str.startswith``/slice comparisons
+#: (as Layer 3 maximality originally used) treat those as a DIFFERENT string
+#: from the registered spelling, so a whitespace variant of a longer
+#: registered alias silently fails to trigger maximality and a fragment is
+#: wrongly admitted under the wrong quantity (e.g. grounding ``"cm"`` as
+#: LENGTH inside ``"cm s^-1"``, a VELOCITY alias). This maps every
+#: whitespace-containing registered spelling to a precompiled regex that
+#: matches the SAME parts joined by ``\s+`` (one-or-more characters of ANY
+#: whitespace, Unicode mode -- verified to match ASCII space runs, NBSP, and
+#: newline/tab), so maximality can detect a whitespace-glued occurrence of a
+#: longer spelling without ever rewriting or normalizing the source text
+#: itself. ADMISSION (is ``text[start:end]`` itself a registered spelling)
+#: deliberately stays EXACT, not whitespace-equivalent -- see
+#: :func:`_unit_table_boundary_violation`.
+_UNIT_SPELLING_WHITESPACE_PATTERNS: Mapping[str, re.Pattern[str]] = MappingProxyType(
+    {
+        spelling: re.compile(r"\s+".join(re.escape(part) for part in spelling.split(" ")))
+        for spelling in _UNIT_SPELLINGS_UNION
+        if any(ch.isspace() for ch in spelling)
+    }
+)
 
 
-def _unit_spellings_by_quantity() -> dict[QuantityKind, frozenset[str]]:
-    global _unit_spellings_by_quantity_cache
-    if _unit_spellings_by_quantity_cache is None:
-        _unit_spellings_by_quantity_cache = {
-            q: _unit_spellings(q) for q in QuantityKind if q is not QuantityKind.OTHER
-        }
-    return _unit_spellings_by_quantity_cache
+def _unit_table_boundary_violation(
+    text: str, start: int, end: int, quantity: QuantityKind
+) -> str | None:
+    """Layer 3 of the UNIT-role boundary gate (D-U2): table-driven admission
+    plus maximality against :data:`units.TABLE_V1`'s registered vocabulary.
 
+    Moved HERE from :func:`carmel.services.numeric.unit_boundary_violation`
+    (round-43 review, P1-2): that function is an EXPORTED, public API, so a
+    vocabulary fed to it via caller-supplied keyword arguments
+    (``quantity_spellings=``/``all_spellings=``) was an unvalidated
+    policy-injection seam -- any caller could pass a fabricated or empty
+    vocabulary and every Layer-3 refusal below would simply never fire, with
+    nothing in that function (or anywhere else) to catch it. Rather than add
+    validation for caller-supplied policy data (this project's sixth
+    instance of exactly that anti-pattern), the fix REMOVES the seam: this
+    function is PRIVATE, takes no vocabulary parameter from any caller, and
+    reads ``units.TABLE_V1`` directly via the module-level constants above.
+    :func:`ground_quote` calls :func:`carmel.services.numeric.unit_boundary_violation`
+    (the lexical Layers 1-2) first and only calls this function if that
+    returns ``None`` clean, preserving the original layer order.
 
-def _unit_spellings_union() -> frozenset[str]:
-    global _unit_spellings_union_cache
-    if _unit_spellings_union_cache is None:
-        _unit_spellings_union_cache = frozenset().union(*_unit_spellings_by_quantity().values())
-    return _unit_spellings_union_cache
+    Returns the same discriminant strings the old in-``numeric.py``
+    implementation returned, unchanged in name and meaning:
+
+    - ``"unit_not_in_vocabulary"``: ``text[start:end]`` is not a member of
+      the CLAIMED quantity's registered spellings. Admission is EXACT --
+      not whitespace-equivalent -- deliberately: :func:`units.normalize_unit`
+      only strips LEADING/TRAILING whitespace, not internal whitespace, so
+      admitting a quote like ``"cm  s^-1"`` (double space) here would accept
+      a string that the normalizer then rejects. A gate/normalizer
+      disagreement is worse than a refusal, so this quote is refused; the
+      real fix is teaching ``normalize_unit`` to collapse internal
+      whitespace, which is out of scope here.
+    - ``"unit_not_maximal_forward"`` / ``"unit_not_maximal_backward"``: a
+      longer registered spelling (any quantity, via
+      :data:`_UNIT_SPELLINGS_UNION`) shares this quote's start (forward) or
+      end (backward). Unlike admission, maximality IS whitespace-equivalent
+      (:data:`_UNIT_SPELLING_WHITESPACE_PATTERNS`) for any spelling that
+      contains whitespace, so a whitespace-glued occurrence of a longer
+      spelling in the SOURCE TEXT is still detected even when its separator
+      is not a single ASCII space.
+    """
+    quote_len = end - start
+    quantity_spellings = _UNIT_SPELLINGS_BY_QUANTITY.get(quantity, frozenset())
+    if text[start:end] not in quantity_spellings:
+        return "unit_not_in_vocabulary"
+
+    for spelling in _UNIT_SPELLINGS_UNION:
+        pattern = _UNIT_SPELLING_WHITESPACE_PATTERNS.get(spelling)
+        if pattern is not None:
+            match = pattern.match(text, start)
+            if match is not None and match.end() > end:
+                return "unit_not_maximal_forward"
+            continue
+        if len(spelling) > quote_len and text.startswith(spelling, start):
+            return "unit_not_maximal_forward"
+
+    for spelling in _UNIT_SPELLINGS_UNION:
+        pattern = _UNIT_SPELLING_WHITESPACE_PATTERNS.get(spelling)
+        if pattern is not None:
+            for match in pattern.finditer(text, 0, end):
+                if match.end() == end and match.start() < start:
+                    return "unit_not_maximal_backward"
+            continue
+        if len(spelling) <= quote_len:
+            continue
+        cand_start = end - len(spelling)
+        if cand_start < 0 or cand_start >= start:
+            continue
+        if text[cand_start:end] == spelling:
+            return "unit_not_maximal_backward"
+
+    return None
 
 
 def ground_quote(
@@ -554,35 +647,49 @@ def ground_quote(
         # boundary -- nothing to raise, fall through to the self-check below.
     elif role is QuoteRole.UNIT:
         # A unit quote (role UNIT) uses its own three-layer boundary rule,
-        # not has_clean_token_boundary above (see
-        # carmel.services.numeric.unit_boundary_violation for the full
-        # rule): Layer 1 partitions the character space into delimiters,
-        # unit-token characters, and an unclassified bucket that fails
-        # closed; Layer 2 requires each edge to already be maximal over
-        # unit-token characters (with a narrow leading-edge exception for
-        # a value the unit is genuinely glued to, gated by value_span
-        # matching exactly, not merely "some clean numeral"); Layer 3
-        # requires the quote to be a registered spelling for the claimed
-        # quantity and to be maximal against the union of ALL quantities'
-        # spellings (so a caller cannot dodge maximality by mis-claiming
-        # quantity). Each distinguishable cause gets its own message,
-        # mirroring the enclosing_numeric_construct pattern above -- this
-        # project has hit masked, indistinguishable refusals of this shape
-        # before.
+        # not has_clean_token_boundary above: Layer 1 (in
+        # carmel.services.numeric.unit_boundary_violation) partitions the
+        # character space into delimiters, unit-token characters, and an
+        # unclassified bucket that fails closed; Layer 2 (same function)
+        # requires each edge to already be maximal over unit-token
+        # characters (with a narrow leading-edge exception for a value the
+        # unit is genuinely glued to, gated by value_span matching exactly,
+        # not merely "some clean numeral"); Layer 3 (private to this module,
+        # _unit_table_boundary_violation below -- see its docstring for why
+        # it does not live in carmel.services.numeric) requires the quote to
+        # be a registered spelling for the claimed quantity and to be
+        # maximal against the union of ALL quantities' spellings (so a
+        # caller cannot dodge maximality by mis-claiming quantity). Each
+        # distinguishable cause gets its own message, mirroring the
+        # enclosing_numeric_construct pattern above -- this project has hit
+        # masked, indistinguishable refusals of this shape before.
         # Layer 0 above already guarantees quantity is a genuine, non-OTHER
         # QuantityKind for every role=UNIT call that reaches here (it raises
         # first otherwise); this assert only makes that guarantee visible to
         # mypy, which cannot correlate the two separate `role is QuoteRole.UNIT`
         # branches on its own.
         assert isinstance(quantity, QuantityKind)
-        violation = unit_boundary_violation(
-            text,
-            start,
-            end,
-            value_span=value_span,
-            quantity_spellings=_unit_spellings_by_quantity().get(quantity, frozenset()),
-            all_spellings=_unit_spellings_union(),
-        )
+        # Layers 1-2 (lexical, no vocabulary) first; Layer 3 (table-driven,
+        # private to this module -- see _unit_table_boundary_violation) only
+        # if the lexical check comes back clean, preserving the original
+        # layer order from the single three-layer function this was split
+        # out of.
+        violation = unit_boundary_violation(text, start, end, value_span=value_span)
+        if violation is None:
+            violation = _unit_table_boundary_violation(text, start, end, quantity)
+        # unit_leading_not_maximal and unit_leading_unclassified_char (like
+        # their trailing counterparts below) overlap in EFFECT -- both refuse
+        # a quote whose edge is not clean -- but differ in DIAGNOSIS: the
+        # first fires when the adjacent character IS a unit-token character
+        # (a fragment of a larger unit), the second when it is neither
+        # whitespace, a delimiter, NOR a unit-token character (something
+        # Layer 1 could not classify at all). This is deliberate defence in
+        # depth, not redundancy to be merged or deleted: keeping the two
+        # discriminants (and the message-pinning tests that keep them
+        # separable) distinct lets an operator reading a refusal tell "this
+        # looks like a real unit fragment" from "this text has something
+        # unexpected right next to the quote" without re-deriving it from
+        # the source text by hand.
         if violation == "unit_leading_not_maximal":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} does not sit at a clean unit "
@@ -601,6 +708,14 @@ def ground_quote(
                 "unclassified neighbour is refused outright rather than guessed at; "
                 "quote the full unit if that is what is meant"
             )
+        # unit_trailing_not_maximal / unit_trailing_unclassified_char: the
+        # same overlap-in-effect, differ-in-diagnosis relationship as the
+        # LEADING pair above -- see that comment. Also note
+        # unit_trailing_exponent_or_footnote_ambiguous (checked earlier,
+        # inside unit_boundary_violation itself) is carved OUT of this
+        # not_maximal bucket for a superscript/subscript-digit neighbour
+        # specifically, so that ambiguity gets its own name instead of
+        # collapsing into this generic one.
         if violation == "unit_trailing_not_maximal":
             raise QuoteGroundingError(
                 f"ground_quote: unit quote {display!r} does not sit at a clean unit "
@@ -619,6 +734,16 @@ def ground_quote(
                 "unit-boundary delimiter, nor a unit-token character -- an "
                 "unclassified neighbour is refused outright rather than guessed at; "
                 "quote the full unit if that is what is meant"
+            )
+        if violation == "unit_trailing_exponent_or_footnote_ambiguous":
+            raise QuoteGroundingError(
+                f"ground_quote: unit quote {display!r} is immediately followed by a "
+                "superscript or subscript digit, which is lexically identical, from a "
+                "single-adjacent-character check alone, to either a genuine exponent "
+                "continuation of this unit or an unrelated footnote marker -- this "
+                "ambiguity is refused outright rather than guessed at; quote the full "
+                "unit including its exponent if that is what is meant, or otherwise "
+                "disambiguate the source text"
             )
         if violation == "unit_not_in_vocabulary":
             raise QuoteGroundingError(
@@ -758,6 +883,22 @@ class MeasurementSpec:
     unit_occurrence: int | None = None
 
     def __post_init__(self) -> None:
+        # AxisRole is a StrEnum, so a plain string equal to one of its
+        # members' VALUES (e.g. role="coordinate") compares `==` equal to
+        # AxisRole.COORDINATE but fails `isinstance`/`is` -- the same trap
+        # this codebase already guards against for QuoteRole/QuantityKind
+        # elsewhere (see ground_quote's own isinstance checks). A caller
+        # that passes a bare string here would silently construct a
+        # MeasurementSpec whose `.role` looks right under `==` but is not
+        # actually an AxisRole member, so this is checked explicitly rather
+        # than trusted from the type annotation alone.
+        if not isinstance(self.role, AxisRole):
+            raise DatasetProducerError(
+                f"MeasurementSpec.role={self.role!r} must be a genuine AxisRole member, "
+                f"not {type(self.role).__name__} -- AxisRole is a StrEnum, so a plain "
+                "string equal to a member's value would compare `==` equal without "
+                "actually being that member"
+            )
         # A plain dataclass has no field validation of its own, and this one is
         # slotted/frozen so nothing downstream re-checks its fields either. ``bool``
         # is a subclass of ``int`` in Python, so a bare ``isinstance(x, int)`` check

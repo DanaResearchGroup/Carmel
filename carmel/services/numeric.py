@@ -18,12 +18,16 @@ dependencies either, in any form (eager, ``TYPE_CHECKING``-guarded, or function-
 this at the AST level: :func:`compute_dependency_sha` computes its content-hash closure
 from this module's own source only, so if this module reached into another
 ``carmel`` module the SHA could no longer be trusted to capture this module's full
-behaviour. Concretely, this means :func:`unit_boundary_violation`'s Layer 3 vocabulary
-cannot be looked up here against ``carmel.services.units.TABLE_V1`` -- the caller
-(:func:`carmel.services.dataset_producer.ground_quote`, which already legitimately
-imports ``carmel.services.units``) must compute the two vocabulary sets and pass them
-in as plain ``frozenset[str]`` data. Every function is deterministic given its
-arguments.
+behaviour. Concretely, this means :func:`unit_boundary_violation` cannot look up
+``carmel.services.units.TABLE_V1`` itself: it implements only the LEXICAL boundary
+checks (character-class partitioning and edge maximality), and has no vocabulary
+parameter of any kind. The table-driven maximality check formerly lived here behind
+a caller-supplied ``frozenset[str]`` vocabulary; that made this exported function an
+unvalidated policy-injection seam, so it was removed from this module entirely and
+now lives as a private function in
+:func:`carmel.services.dataset_producer._unit_table_boundary_violation` (which already
+legitimately imports ``carmel.services.units``), called only after the lexical check
+here returns clean. Every function is deterministic given its arguments.
 
 Why this exists (measured on 8 real papers, corruption shapes reproduced here only as
 short synthetic strings for copyright reasons):
@@ -482,14 +486,25 @@ def _is_unit_token_char(ch: str) -> bool:
     return ch.isalnum() or ch in _UNIT_TOKEN_EXTRA_CHARS
 
 
+#: Superscript/subscript digit characters. ``str.isalnum()`` (and therefore
+#: :func:`_is_unit_token_char`) already treats these as unit-token
+#: characters, so without a dedicated check a trailing superscript digit
+#: (e.g. the ``"¹"`` in ``"K¹"``) would fall into the generic
+#: ``"unit_trailing_not_maximal"`` bucket, indistinguishable from an
+#: ordinary glued-word fragment. It deserves its own discriminant because
+#: the ambiguity it names is qualitatively different: a genuine exponent
+#: continuation and an unrelated footnote marker are LEXICALLY IDENTICAL at
+#: a single-adjacent-character boundary, so this is refused for a reason no
+#: amount of vocabulary lookup (Layer 3) could ever resolve.
+_SUPERSCRIPT_SUBSCRIPT_DIGITS = frozenset("⁰¹²³⁴⁵⁶⁷⁸⁹₀₁₂₃₄₅₆₇₈₉")
+
+
 def unit_boundary_violation(
     text: str,
     start: int,
     end: int,
     *,
     value_span: tuple[int, int] | None = None,
-    quantity_spellings: frozenset[str],
-    all_spellings: frozenset[str],
 ) -> str | None:
     """Return a discriminant name for why ``text[start:end]`` is not a clean
     UNIT-role quote, or ``None`` if it is clean.
@@ -531,29 +546,27 @@ def unit_boundary_violation(
     exception is intentionally LEFT-edge only; there is no corresponding
     right-edge exception.
 
-    Layer 3 (table maximality, over caller-supplied vocabulary data): this
-    module has zero ``carmel.*`` dependencies (see the module docstring), so
-    it cannot look up ``carmel.services.units.TABLE_V1`` itself -- the caller
-    (:func:`carmel.services.dataset_producer.ground_quote`) computes the
-    vocabulary and passes it in as two plain ``frozenset[str]`` arguments.
-    ``text[start:end]`` must be a member of ``quantity_spellings`` (the
-    registered spellings -- known unit, or an alias's raw or normalized form
-    -- for the CLAIMED quantity) -- an unrecognised spelling is refused even
-    if it sits at a clean Layer 1/2 boundary. Separately, no LONGER spelling
-    in ``all_spellings`` -- the UNION over ALL quantities, not just the
-    claimed one (a caller could otherwise dodge the check entirely by
-    mis-claiming quantity -- e.g. grounding ``"cm"`` inside ``"cm s^-1"``
-    while claiming LENGTH, whose vocabulary does not contain the VELOCITY
-    alias ``"cm s^-1"``, would sail through a maximality check scoped only to
-    LENGTH's own spellings) -- may start at the same position and extend
-    past ``end`` (forward maximality), nor may one start before ``start`` and
-    end exactly at ``end`` (backward maximality). The backward-maximality
-    scan deliberately does NOT use ``str.startswith(spelling, negative_index)``
-    -- Python's negative-start-index footgun means a negative offset counts
-    from the END of the string instead of raising, so a spelling longer than
-    ``end`` would silently probe the wrong location; the candidate start is
-    instead computed and range-checked explicitly, and compared via a plain
-    slice equality.
+    Layer 3 (table maximality, over the registered vocabulary in
+    ``carmel.services.units.TABLE_V1``) is NOT implemented here. This module
+    has zero ``carmel.*`` dependencies (see the module docstring), so it
+    cannot look up ``TABLE_V1`` itself; round-43 review found that an
+    earlier version of this function instead took the vocabulary as two
+    caller-supplied ``frozenset[str]`` keyword arguments
+    (``quantity_spellings=``/``all_spellings=``), which made this exported
+    function an unvalidated POLICY-INJECTION SEAM -- any caller could pass a
+    fabricated or empty vocabulary and vocabulary-dependent refusals would
+    simply never fire, with no check in this function (or anywhere else) to
+    catch it. Rather than validate caller-supplied policy data (the sixth
+    instance of this project hitting exactly that anti-pattern), Layer 3 was
+    REMOVED from this function entirely and moved to a PRIVATE function,
+    :func:`carmel.services.dataset_producer._unit_table_boundary_violation`,
+    which reads ``TABLE_V1`` directly and takes no vocabulary from any
+    caller. :func:`carmel.services.dataset_producer.ground_quote` calls this
+    (lexical-only) function first and, only if it returns ``None``, calls
+    the private table-driven function second -- see that module for Layer
+    3's ``"unit_not_in_vocabulary"``/``"unit_not_maximal_forward"``/
+    ``"unit_not_maximal_backward"`` discriminants, which still exist, just no
+    longer here.
 
     Four distinct discriminants distinguish the ways the leading-edge
     digit-glue exception can fail to fire, unchanged from round 40/41, each
@@ -582,21 +595,27 @@ def unit_boundary_violation(
     - ``"unit_leading_unclassified_char"`` / ``"unit_trailing_unclassified_char"``:
       the adjacent character on that edge is neither whitespace, a
       delimiter, nor a unit-token character (Layer 1's fail-closed bucket).
-    - ``"unit_not_in_vocabulary"``: ``text[start:end]`` is not a member of
-      ``quantity_spellings`` (Layer 3 admission).
+    - ``"unit_not_in_vocabulary"``: ``text[start:end]`` is not a member of the
+      claimed quantity's registered spellings (Layer 3 admission -- now
+      computed by :func:`carmel.services.dataset_producer._unit_table_boundary_violation`).
     - ``"unit_not_maximal_forward"`` / ``"unit_not_maximal_backward"``: a
       longer registered spelling (any quantity) shares this quote's start
-      (forward) or end (backward) (Layer 3 maximality).
-
-    One known, deliberate coverage gap: a single trailing superscript digit
-    with no accompanying superscript minus (e.g. ``"K¹"``) is indistinguishable,
-    from a single adjacent character alone, between a genuine exponent
-    continuation and an unrelated footnote marker -- Layer 2 treats the
-    superscript digit as a unit-token character either way and refuses. This
-    is intentional fail-closed behaviour, not a bug: resolving it would
-    require look-ahead this function does not have (and should not grow),
-    since a footnote marker and an exponent are lexically identical at this
-    boundary.
+      (forward) or end (backward) (Layer 3 maximality -- same private
+      function).
+    - ``"unit_trailing_exponent_or_footnote_ambiguous"``: the trailing edge's
+      adjacent character is a superscript/subscript digit
+      (:data:`_SUPERSCRIPT_SUBSCRIPT_DIGITS`). A single trailing superscript
+      digit with no accompanying superscript minus (e.g. the ``"¹"`` in
+      ``"K¹"``) is indistinguishable, from a single adjacent character alone,
+      between a genuine exponent continuation and an unrelated footnote
+      marker. This is a DEDICATED discriminant (not folded into the generic
+      ``"unit_trailing_not_maximal"`` bucket) precisely because the ambiguity
+      it names cannot be resolved lexically -- it deserves its own name so
+      operators reading refusal logs see the real cause rather than an
+      unqualified "not maximal". This is intentional fail-closed behaviour,
+      not a bug: resolving it would require look-ahead this function does not
+      have (and should not grow), since a footnote marker and an exponent are
+      lexically identical at this boundary.
     """
     if start >= end:
         return None
@@ -637,6 +656,8 @@ def unit_boundary_violation(
             trimmed_end += 1
         if trimmed_end < len(text):
             nxt = text[trimmed_end]
+            if nxt in _SUPERSCRIPT_SUBSCRIPT_DIGITS:
+                return "unit_trailing_exponent_or_footnote_ambiguous"
             if _is_unit_token_char(nxt):
                 return "unit_trailing_not_maximal"
             if not (
@@ -645,23 +666,6 @@ def unit_boundary_violation(
                 or nxt == _UNIT_TRAILING_ONLY_DELIMITER
             ):
                 return "unit_trailing_unclassified_char"
-
-    quote_len = end - start
-    if text[start:end] not in quantity_spellings:
-        return "unit_not_in_vocabulary"
-
-    for spelling in all_spellings:
-        if len(spelling) > quote_len and text.startswith(spelling, start):
-            return "unit_not_maximal_forward"
-
-    for spelling in all_spellings:
-        if len(spelling) <= quote_len:
-            continue
-        cand_start = end - len(spelling)
-        if cand_start < 0 or cand_start >= start:
-            continue
-        if text[cand_start:end] == spelling:
-            return "unit_not_maximal_backward"
 
     return None
 
