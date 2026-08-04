@@ -542,6 +542,76 @@ def test_numeric_module_has_zero_carmel_imports() -> None:
     )
 
 
+def test_dataset_producer_names_table_v1_exactly_once_via_active_binding() -> None:
+    """``carmel.services.dataset_producer`` must read ``units.TABLE_V1``
+    through the single ``_ActiveTableBinding`` singleton ``_ACTIVE``, never
+    independently at more than one site.
+
+    Four call sites in that module derive artifacts from the active
+    conversion table (the spelling vocabulary, unit normalization, the
+    recorded ``conversion_table_sha256``, and the embedded table in a
+    produced envelope). If any one of them named ``units.TABLE_V1`` directly
+    instead of reading through ``_ACTIVE``, that site could silently
+    disagree with the others the moment a future table swap changed
+    ``_ACTIVE`` without also updating every direct reference -- exactly the
+    "disagreement merely asserted, not unrepresentable" failure mode this
+    project treats as a defect class. Pinning both "exactly one attribute
+    access" and "no separate import of the name" at the AST level makes a
+    reintroduced second reference to ``units.TABLE_V1`` fail this test
+    immediately, rather than waiting for a scientific-correctness bug to
+    surface it.
+    """
+    from carmel.services import dataset_producer
+
+    source = inspect.getsource(dataset_producer)
+    tree = ast.parse(source)
+
+    table_v1_attribute_accesses: list[int] = []
+    table_v1_direct_imports: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == "TABLE_V1":
+            table_v1_attribute_accesses.append(node.lineno)
+        elif isinstance(node, ast.ImportFrom) and node.module == "carmel.services.units":
+            for alias in node.names:
+                if alias.name == "TABLE_V1":
+                    table_v1_direct_imports.append(alias.asname or alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "carmel.services.units.TABLE_V1":
+                    table_v1_direct_imports.append(alias.asname or alias.name)
+
+    assert not table_v1_direct_imports, (
+        f"dataset_producer.py imports TABLE_V1 directly ({table_v1_direct_imports!r}); it must "
+        "only be reachable via qualified `units.TABLE_V1` on the single `_ACTIVE = "
+        "_ActiveTableBinding.derive(units.TABLE_V1)` line, never via a name that could be used "
+        "at other sites without going through `_ACTIVE`"
+    )
+    assert len(table_v1_attribute_accesses) == 1, (
+        f"expected exactly one `units.TABLE_V1` attribute access in dataset_producer.py (on the "
+        f"`_ACTIVE = _ActiveTableBinding.derive(units.TABLE_V1)` line), found "
+        f"{len(table_v1_attribute_accesses)} at lines {table_v1_attribute_accesses!r}; every other "
+        "site must read through `_ACTIVE` instead of naming `units.TABLE_V1` a second time"
+    )
+
+    normalize_unit_calls_missing_table_kwarg: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "normalize_unit"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "units"
+            and not any(kw.arg == "table" for kw in node.keywords)
+        ):
+            normalize_unit_calls_missing_table_kwarg.append(node.lineno)
+
+    assert normalize_unit_calls_missing_table_kwarg == [], (
+        f"units.normalize_unit call(s) in dataset_producer.py without an explicit `table=` keyword "
+        f"at lines {normalize_unit_calls_missing_table_kwarg!r}; every call must name its table "
+        "explicitly rather than relying on any default"
+    )
+
+
 def test_current_sha_by_dependency_id_agrees_with_dependencies_by_sha() -> None:
     for dependency_id, sha in CURRENT_SHA_BY_DEPENDENCY_ID.items():
         assert sha in DEPENDENCIES_BY_SHA

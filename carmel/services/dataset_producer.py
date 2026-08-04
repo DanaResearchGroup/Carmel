@@ -210,77 +210,132 @@ class DatasetProducerError(ValueError):
     unverified bytes or an unverifiable claim."""
 
 
-def _unit_spellings(quantity: QuantityKind) -> frozenset[str]:
-    """All registered spellings (known units plus every alias's raw and
-    normalized form) for one quantity, per :data:`units.TABLE_V1`.
+@dataclass(frozen=True, slots=True)
+class _ActiveTableBinding:
+    """Every unit-table-derived artifact this module reads, bound to ONE
+    :class:`units.ConversionTable` by construction.
 
-    Lives HERE, not in :mod:`carmel.services.numeric`, because that module is
-    deliberately zero-``carmel.*``-import (see its module docstring and
-    ``tests/test_semantic_deps.py::test_numeric_module_has_zero_carmel_imports``,
-    which enforces this at the AST level so :func:`compute_dependency_sha`'s
-    hash closure stays trustworthy). This module already legitimately imports
-    and uses ``carmel.services.units``/``units.TABLE_V1`` directly elsewhere
-    (e.g. :func:`units.normalize_unit`), so it is the correct home for
-    computing :func:`_unit_table_boundary_violation`'s Layer 3 vocabulary,
-    consumed directly from this module's own module-level constants rather
-    than passed as a parameter to any exported function.
+    This module used to read ``units.TABLE_V1`` at four independent sites
+    (the spelling vocabulary below, unit normalization, the recorded
+    ``conversion_table_sha256``, and the embedded table in the produced
+    envelope); those sites agreed only by coincidence of each one separately
+    naming the same global. Binding all four derived artifacts into one
+    frozen object, built by a single pure constructor, makes disagreement
+    UNREPRESENTABLE rather than merely unlikely: there is no seam left where
+    one site could reference a different table than the others.
+
+    :meth:`derive` is the ONLY constructor path and is a pure function of its
+    ``table`` argument -- it must never reference ``units.TABLE_V1`` itself,
+    or the binding it built would once again be able to disagree with the
+    table it claims to be derived from.
     """
-    spellings: set[str] = set(units.TABLE_V1.known_units(quantity))
-    for alias in units.TABLE_V1.aliases:
-        if alias.quantity is quantity:
-            spellings.add(alias.raw)
-            spellings.add(alias.normalized)
-    return frozenset(spellings)
+
+    table: units.ConversionTable
+    spellings_by_quantity: Mapping[QuantityKind, frozenset[str]]
+    spellings_union: frozenset[str]
+    whitespace_patterns: Mapping[str, re.Pattern[str]]
+    embedded: EmbeddedConversionTable
+
+    @classmethod
+    def derive(cls, table: units.ConversionTable) -> _ActiveTableBinding:
+        """Derive every artifact this module needs from ``table`` alone.
+
+        Lives HERE, not in :mod:`carmel.services.numeric`, because that
+        module is deliberately zero-``carmel.*``-import (see its module
+        docstring and
+        ``tests/test_semantic_deps.py::test_numeric_module_has_zero_carmel_imports``,
+        which enforces this at the AST level so
+        :func:`compute_dependency_sha`'s hash closure stays trustworthy).
+        This module already legitimately imports and uses
+        ``carmel.services.units`` directly elsewhere (e.g.
+        :func:`units.normalize_unit`), so it is the correct home for
+        computing :func:`_unit_table_boundary_violation`'s Layer 3
+        vocabulary.
+        """
+        spellings_by_quantity_mut: dict[QuantityKind, frozenset[str]] = {}
+        for quantity in QuantityKind:
+            if quantity is QuantityKind.OTHER:
+                # Layer 3 admission vocabulary excludes ``QuantityKind.OTHER``,
+                # which has no vocabulary (:func:`units.normalize_unit`
+                # returns OTHER's raw string unchanged) and is refused
+                # outright by :func:`ground_quote`'s Layer 0 before
+                # :func:`_unit_table_boundary_violation` is ever consulted.
+                continue
+            found: set[str] = set(table.known_units(quantity))
+            for alias in table.aliases:
+                if alias.quantity is quantity:
+                    found.add(alias.raw)
+                    found.add(alias.normalized)
+            spellings_by_quantity_mut[quantity] = frozenset(found)
+        # A frozen dataclass does not freeze its NESTED containers -- a plain
+        # dict/set assigned to a frozen field would still be mutable in
+        # place. Wrap in MappingProxyType/frozenset explicitly, exactly as
+        # the module-level constants this replaces used to.
+        spellings_by_quantity = MappingProxyType(dict(spellings_by_quantity_mut))
+
+        # Layer 3 maximality vocabulary: the UNION of every quantity's
+        # spellings, deliberately NOT scoped to the claimed quantity.
+        # Maximality must use the union rather than the claimed quantity's
+        # own spellings alone, or a caller could dodge the check entirely by
+        # mis-claiming quantity -- e.g. grounding ``"cm"`` inside
+        # ``"cm s^-1"`` while claiming LENGTH (whose vocabulary does not
+        # contain the VELOCITY alias ``"cm s^-1"``) would otherwise sail
+        # through a maximality check scoped only to LENGTH's own spellings.
+        spellings_union: frozenset[str] = frozenset().union(*spellings_by_quantity.values())
+
+        # P1-1 (round-43 review): a registered multi-token spelling's
+        # separator is not necessarily a single ASCII space in the SOURCE
+        # TEXT -- a PDF/XML extraction can glue tokens together with a
+        # double space, an NBSP (U+00A0), a newline, or a tab. Exact
+        # ``str.startswith``/slice comparisons (as Layer 3 maximality
+        # originally used) treat those as a DIFFERENT string from the
+        # registered spelling, so a whitespace variant of a longer
+        # registered alias silently fails to trigger maximality and a
+        # fragment is wrongly admitted under the wrong quantity (e.g.
+        # grounding ``"cm"`` as LENGTH inside ``"cm s^-1"``, a VELOCITY
+        # alias). This maps every whitespace-containing registered spelling
+        # to a precompiled regex that matches the SAME parts joined by
+        # ``\s+`` (one-or-more characters of ANY whitespace, Unicode mode --
+        # verified to match ASCII space runs, NBSP, and newline/tab), so
+        # maximality can detect a whitespace-glued occurrence of a longer
+        # spelling without ever rewriting or normalizing the source text
+        # itself. ADMISSION (is ``text[start:end]`` itself a registered
+        # spelling) deliberately stays EXACT, not whitespace-equivalent --
+        # see :func:`_unit_table_boundary_violation`.
+        whitespace_patterns = MappingProxyType(
+            {
+                spelling: re.compile(r"\s+".join(re.escape(part) for part in spelling.split(" ")))
+                for spelling in spellings_union
+                if any(ch.isspace() for ch in spelling)
+            }
+        )
+
+        canonical_json = canonical_json_bytes(table.identity_payload()).decode("utf-8")
+        embedded = EmbeddedConversionTable(sha256=table.sha256, canonical_json=canonical_json)
+        if embedded.sha256 != table.sha256 or embedded.canonical_json != canonical_json:
+            raise DatasetProducerError(
+                f"internal invariant violated deriving _ActiveTableBinding from table "
+                f"{table.table_id!r}: the embedded table must record exactly this table's own "
+                f"sha256 and canonical identity payload, never a different table's"
+            )
+
+        return cls(
+            table=table,
+            spellings_by_quantity=spellings_by_quantity,
+            spellings_union=spellings_union,
+            whitespace_patterns=whitespace_patterns,
+            embedded=embedded,
+        )
 
 
-#: Layer 3 admission vocabulary, keyed by the CLAIMED quantity -- a unit
-#: quote must be one of ITS quantity's own registered spellings to be
-#: admitted at all. Excludes ``QuantityKind.OTHER``, which has no vocabulary
-#: (:func:`units.normalize_unit` returns OTHER's raw string unchanged) and is
-#: refused outright by :func:`ground_quote`'s Layer 0 before
-#: :func:`_unit_table_boundary_violation` is ever consulted. Computed ONCE at
-#: import time as an immutable constant (``MappingProxyType`` over
-#: ``frozenset`` values) rather than lazily behind a mutable module-global --
-#: ``units.TABLE_V1`` is itself a fixed, import-time-constant table, so there
-#: is nothing to gain from deferring this computation and a mutable lazy
-#: cache is one more piece of global state that does not need to exist.
-_UNIT_SPELLINGS_BY_QUANTITY: Mapping[QuantityKind, frozenset[str]] = MappingProxyType(
-    {q: _unit_spellings(q) for q in QuantityKind if q is not QuantityKind.OTHER}
-)
-
-#: Layer 3 maximality vocabulary: the UNION of every quantity's spellings,
-#: deliberately NOT scoped to the claimed quantity. Maximality must use the
-#: union rather than the claimed quantity's own spellings alone, or a caller
-#: could dodge the check entirely by mis-claiming quantity -- e.g. grounding
-#: ``"cm"`` inside ``"cm s^-1"`` while claiming LENGTH (whose vocabulary does
-#: not contain the VELOCITY alias ``"cm s^-1"``) would otherwise sail through
-#: a maximality check scoped only to LENGTH's own spellings.
-_UNIT_SPELLINGS_UNION: frozenset[str] = frozenset().union(*_UNIT_SPELLINGS_BY_QUANTITY.values())
-
-#: P1-1 (round-43 review): a registered multi-token spelling's separator is
-#: not necessarily a single ASCII space in the SOURCE TEXT -- a PDF/XML
-#: extraction can glue tokens together with a double space, an NBSP
-#: (U+00A0), a newline, or a tab. Exact ``str.startswith``/slice comparisons
-#: (as Layer 3 maximality originally used) treat those as a DIFFERENT string
-#: from the registered spelling, so a whitespace variant of a longer
-#: registered alias silently fails to trigger maximality and a fragment is
-#: wrongly admitted under the wrong quantity (e.g. grounding ``"cm"`` as
-#: LENGTH inside ``"cm s^-1"``, a VELOCITY alias). This maps every
-#: whitespace-containing registered spelling to a precompiled regex that
-#: matches the SAME parts joined by ``\s+`` (one-or-more characters of ANY
-#: whitespace, Unicode mode -- verified to match ASCII space runs, NBSP, and
-#: newline/tab), so maximality can detect a whitespace-glued occurrence of a
-#: longer spelling without ever rewriting or normalizing the source text
-#: itself. ADMISSION (is ``text[start:end]`` itself a registered spelling)
-#: deliberately stays EXACT, not whitespace-equivalent -- see
-#: :func:`_unit_table_boundary_violation`.
-_UNIT_SPELLING_WHITESPACE_PATTERNS: Mapping[str, re.Pattern[str]] = MappingProxyType(
-    {
-        spelling: re.compile(r"\s+".join(re.escape(part) for part in spelling.split(" ")))
-        for spelling in _UNIT_SPELLINGS_UNION
-        if any(ch.isspace() for ch in spelling)
-    }
-)
+#: Computed ONCE at import time as an immutable constant rather than lazily
+#: behind a mutable module-global -- ``units.TABLE_V1`` is itself a fixed,
+#: import-time-constant table, so there is nothing to gain from deferring
+#: this computation, and a mutable lazy cache is one more piece of global
+#: state that does not need to exist. This is the ONLY place
+#: ``units.TABLE_V1`` is named in this module; every other site reads
+#: through ``_ACTIVE`` so they cannot independently drift apart.
+_ACTIVE: _ActiveTableBinding = _ActiveTableBinding.derive(units.TABLE_V1)
 
 
 def _unit_table_boundary_violation(
@@ -299,7 +354,7 @@ def _unit_table_boundary_violation(
     validation for caller-supplied policy data (this project's sixth
     instance of exactly that anti-pattern), the fix REMOVES the seam: this
     function is PRIVATE, takes no vocabulary parameter from any caller, and
-    reads ``units.TABLE_V1`` directly via the module-level constants above.
+    reads the active table's vocabulary via :data:`_ACTIVE` above.
     :func:`ground_quote` calls :func:`carmel.services.numeric.unit_boundary_violation`
     (the lexical Layers 1-2) first and only calls this function if that
     returns ``None`` clean, preserving the original layer order.
@@ -318,20 +373,20 @@ def _unit_table_boundary_violation(
       whitespace, which is out of scope here.
     - ``"unit_not_maximal_forward"`` / ``"unit_not_maximal_backward"``: a
       longer registered spelling (any quantity, via
-      :data:`_UNIT_SPELLINGS_UNION`) shares this quote's start (forward) or
-      end (backward). Unlike admission, maximality IS whitespace-equivalent
-      (:data:`_UNIT_SPELLING_WHITESPACE_PATTERNS`) for any spelling that
+      :data:`_ACTIVE`'s ``spellings_union``) shares this quote's start
+      (forward) or end (backward). Unlike admission, maximality IS
+      whitespace-equivalent (:data:`_ACTIVE`'s ``whitespace_patterns``) for any spelling that
       contains whitespace, so a whitespace-glued occurrence of a longer
       spelling in the SOURCE TEXT is still detected even when its separator
       is not a single ASCII space.
     """
     quote_len = end - start
-    quantity_spellings = _UNIT_SPELLINGS_BY_QUANTITY.get(quantity, frozenset())
+    quantity_spellings = _ACTIVE.spellings_by_quantity.get(quantity, frozenset())
     if text[start:end] not in quantity_spellings:
         return "unit_not_in_vocabulary"
 
-    for spelling in _UNIT_SPELLINGS_UNION:
-        pattern = _UNIT_SPELLING_WHITESPACE_PATTERNS.get(spelling)
+    for spelling in _ACTIVE.spellings_union:
+        pattern = _ACTIVE.whitespace_patterns.get(spelling)
         if pattern is not None:
             match = pattern.match(text, start)
             if match is not None and match.end() > end:
@@ -340,8 +395,8 @@ def _unit_table_boundary_violation(
         if len(spelling) > quote_len and text.startswith(spelling, start):
             return "unit_not_maximal_forward"
 
-    for spelling in _UNIT_SPELLINGS_UNION:
-        pattern = _UNIT_SPELLING_WHITESPACE_PATTERNS.get(spelling)
+    for spelling in _ACTIVE.spellings_union:
+        pattern = _ACTIVE.whitespace_patterns.get(spelling)
         if pattern is not None:
             for match in pattern.finditer(text, 0, end):
                 if match.end() == end and match.start() < start:
@@ -997,7 +1052,7 @@ def _measured_value(
             f"{normalized.text!r}, which is not a valid canonical decimal string: {exc}"
         ) from exc
     try:
-        unit_normalized = units.normalize_unit(spec.quantity_kind, spec.unit_quote, table=units.TABLE_V1)
+        unit_normalized = units.normalize_unit(spec.quantity_kind, spec.unit_quote, table=_ACTIVE.table)
     except units.UnknownUnitError as exc:
         raise DatasetProducerError(
             f"unit quote {spec.unit_quote!r} for axis {spec.axis_id!r} is not a known unit or alias "
@@ -1011,7 +1066,7 @@ def _measured_value(
         quantity_kind=spec.quantity_kind,
         unit_raw=spec.unit_quote,
         unit_normalized=unit_normalized,
-        conversion_table_sha256=units.TABLE_V1.sha256,
+        conversion_table_sha256=_ACTIVE.embedded.sha256,
         value_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=value_locator),
         unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=unit_locator),
     )
@@ -1370,13 +1425,9 @@ def produce_envelope_from_artifact(
         constants=(),
         points=(point,),
     )
-    embedded_table = EmbeddedConversionTable(
-        sha256=units.TABLE_V1.sha256,
-        canonical_json=canonical_json_bytes(units.TABLE_V1.identity_payload()).decode("utf-8"),
-    )
     return DatasetEnvelope(
         source_graph=graph,
         composition=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         series=(series,),
-        conversion_tables=(embedded_table,),
+        conversion_tables=(_ACTIVE.embedded,),
     )

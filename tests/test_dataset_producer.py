@@ -1627,3 +1627,74 @@ class TestGroundingIsIndependentPerQuote:
         )
         # Reachable and schema-valid today: this IS the gap P1-F describes.
         assert envelope.series[0].points[0].observations[0].axis_id == "pressure"
+
+
+class TestActiveTableBindingTracksItsArgument:
+    """``_ActiveTableBinding.derive`` must be a PURE function of the table it
+    is given -- every derived artifact must move when the table itself
+    differs, never stay pinned to whatever table production happens to use.
+
+    A regression where one derived artifact silently kept reading
+    ``units.TABLE_V1`` directly (instead of the ``table`` argument actually
+    passed to ``derive``) would be invisible from ``_ACTIVE`` alone, because
+    production always derives from ``TABLE_V1`` -- the only way to catch it
+    is to derive from a table that is genuinely DIFFERENT and check that the
+    difference is visible in every derived field.
+    """
+
+    def test_derive_from_a_different_table_moves_every_derived_artifact(self) -> None:
+        import dataclasses
+
+        from carmel.services import units
+        from carmel.services.dataset_producer import _ActiveTableBinding
+
+        # A table that differs from TABLE_V1 by one EXTRA alias -- a new raw
+        # spelling for PRESSURE's base unit "Pa" that TABLE_V1 does not
+        # register. This is a genuine difference in the table's ALIASES (and
+        # therefore its spelling vocabulary and content-address), not merely
+        # a version-string difference that a lazy/broken derive() could pass
+        # through unnoticed.
+        extra_alias = units.UnitAlias(
+            quantity=QuantityKind.PRESSURE, raw="Pa_test_variant", normalized="Pa"
+        )
+        assert extra_alias not in units.TABLE_V1.aliases
+        other_table = dataclasses.replace(
+            units.TABLE_V1,
+            table_id="carmel-unit-conversions-test-variant",
+            aliases=units.TABLE_V1.aliases + (extra_alias,),
+        )
+        assert other_table.sha256 != units.TABLE_V1.sha256
+
+        active_default = _ActiveTableBinding.derive(units.TABLE_V1)
+        active_other = _ActiveTableBinding.derive(other_table)
+
+        # 1. The bound table itself moved.
+        assert active_other.table is other_table
+        assert active_other.table.sha256 != active_default.table.sha256
+
+        # 2. The new raw spelling is now in PRESSURE's spelling vocabulary,
+        #    and was not before.
+        assert "Pa_test_variant" not in active_default.spellings_by_quantity[QuantityKind.PRESSURE]
+        assert "Pa_test_variant" in active_other.spellings_by_quantity[QuantityKind.PRESSURE]
+
+        # 3. The union vocabulary (used for Layer-3 maximality regardless of
+        #    claimed quantity) moved too.
+        assert "Pa_test_variant" not in active_default.spellings_union
+        assert "Pa_test_variant" in active_other.spellings_union
+
+        # 4. whitespace_patterns is keyed only by whitespace-containing
+        #    spellings; confirm each binding's key set is computed from its
+        #    OWN (different) spellings_union rather than shared/cached state.
+        assert set(active_other.whitespace_patterns) == {
+            s for s in active_other.spellings_union if any(ch.isspace() for ch in s)
+        }
+        assert set(active_default.whitespace_patterns) == {
+            s for s in active_default.spellings_union if any(ch.isspace() for ch in s)
+        }
+
+        # 5. The embedded table's recorded sha256 and canonical_json moved,
+        #    and each binding's own embedded table matches its own bound
+        #    table -- never the other one's.
+        assert active_other.embedded.sha256 == other_table.sha256
+        assert active_other.embedded.sha256 != active_default.embedded.sha256
+        assert active_default.embedded.sha256 == units.TABLE_V1.sha256
