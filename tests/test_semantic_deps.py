@@ -611,6 +611,201 @@ def test_dataset_producer_names_table_v1_exactly_once_via_active_binding() -> No
         "explicitly rather than relying on any default"
     )
 
+    for lineno in _tables_by_sha_registry_violations(tree):
+        pytest.fail(
+            f"dataset_producer.py consults `units.TABLES_BY_SHA` at line {lineno}, outside the "
+            "single permitted `_BINDINGS_BY_SHA = {...for sha, table in units.TABLES_BY_SHA.items()}` "
+            "derivation; every other site (including a hardcoded-sha lookup, a `next(iter(...))` "
+            "walk, or a bare subscript) must go through `binding_for_known_sha(sha256)` instead of "
+            "consulting the registry directly, or it could silently disagree with that one binding"
+        )
+
+    for lineno in _bindings_by_sha_bypass_violations(tree):
+        pytest.fail(
+            f"dataset_producer.py references the private `_BINDINGS_BY_SHA` registry at line "
+            f"{lineno}, outside its own definition and outside `binding_for_known_sha` (the ONE "
+            "function permitted to consult it); every other site must call "
+            "`binding_for_known_sha(sha256)` rather than reading the registry directly"
+        )
+
+    for lineno in _active_table_sha256_violations(tree):
+        pytest.fail(
+            f"dataset_producer.py reads `_ACTIVE.table.sha256` at line {lineno}; the RECORDED "
+            "conversion-table sha and the embedded table must always come from `_ACTIVE.embedded` "
+            "(sha256 and canonical_json derived together, see `_ActiveTableBinding.derive`'s own "
+            "invariant check), never re-derived from `_ACTIVE.table.sha256` at a second site"
+        )
+
+
+def _tables_by_sha_registry_violations(tree: ast.Module) -> list[int]:
+    """Every AST line where ``units.TABLES_BY_SHA`` is referenced, outside the
+    single permitted ``_BINDINGS_BY_SHA = {... for ... in
+    units.TABLES_BY_SHA.items()}`` derivation.
+
+    Catches every route to the registry generically -- ``units.TABLES_BY_SHA[sha]``,
+    ``next(iter(units.TABLES_BY_SHA.values()))``, a hardcoded-sha subscript, or any
+    other attribute-then-whatever chain -- by flagging the ``TABLES_BY_SHA``
+    attribute access itself rather than pattern-matching individual call shapes.
+    """
+    permitted_range: tuple[int, int] | None = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_BINDINGS_BY_SHA" for target in node.targets
+        ):
+            permitted_range = (node.lineno, node.end_lineno or node.lineno)
+            break
+        if (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "_BINDINGS_BY_SHA"
+        ):
+            permitted_range = (node.lineno, node.end_lineno or node.lineno)
+            break
+    assert permitted_range is not None, "could not locate the `_BINDINGS_BY_SHA = ...` assignment"
+
+    violations: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "TABLES_BY_SHA"
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "units"
+            and not (permitted_range[0] <= node.lineno <= permitted_range[1])
+        ):
+            violations.append(node.lineno)
+    return violations
+
+
+def _bindings_by_sha_bypass_violations(tree: ast.Module) -> list[int]:
+    """Every AST line where the private ``_BINDINGS_BY_SHA`` registry is
+    referenced by name, outside its own definition and outside
+    ``binding_for_known_sha`` -- the one function permitted to consult it.
+    """
+    permitted_ranges: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.stmt):
+            continue
+        is_bindings_assign = isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "_BINDINGS_BY_SHA" for target in node.targets
+        )
+        is_bindings_ann_assign = (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "_BINDINGS_BY_SHA"
+        )
+        is_binding_for_known_sha = isinstance(node, ast.FunctionDef) and node.name == "binding_for_known_sha"
+        if is_bindings_assign or is_bindings_ann_assign or is_binding_for_known_sha:
+            permitted_ranges.append((node.lineno, node.end_lineno or node.lineno))
+    assert permitted_ranges, "could not locate `_BINDINGS_BY_SHA`'s definition or `binding_for_known_sha`"
+
+    violations: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Name)
+            and node.id == "_BINDINGS_BY_SHA"
+            and not any(lo <= node.lineno <= hi for lo, hi in permitted_ranges)
+        ):
+            violations.append(node.lineno)
+    return violations
+
+
+def _active_table_sha256_violations(tree: ast.Module) -> list[int]:
+    """Every AST line where ``_ACTIVE.table.sha256`` is read directly, instead
+    of through ``_ACTIVE.embedded`` (the recorded-sha/embedded-table site).
+    """
+    violations: list[int] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Attribute)
+            and node.attr == "sha256"
+            and isinstance(node.value, ast.Attribute)
+            and node.value.attr == "table"
+            and isinstance(node.value.value, ast.Name)
+            and node.value.value.id == "_ACTIVE"
+        ):
+            violations.append(node.lineno)
+    return violations
+
+
+def test_table_policy_guard_catches_a_registry_bypass_via_subscript() -> None:
+    """Proves :func:`_tables_by_sha_registry_violations` actually fires,
+    rather than merely never having anything to catch: a synthetic module
+    that consults ``units.TABLES_BY_SHA`` a second time via a bare subscript
+    (bypassing ``binding_for_known_sha``) must be flagged.
+    """
+    source = (
+        "_BINDINGS_BY_SHA = {sha: derive(t) for sha, t in units.TABLES_BY_SHA.items()}\n"
+        "\n"
+        "def rogue_lookup(sha256):\n"
+        "    return units.TABLES_BY_SHA[sha256]\n"
+    )
+    violations = _tables_by_sha_registry_violations(ast.parse(source))
+    assert violations == [4], f"expected the rogue subscript on line 4 to be flagged, got {violations!r}"
+
+
+def test_table_policy_guard_catches_a_registry_bypass_via_next_iter_values() -> None:
+    """Proves the same guard also catches the ``next(iter(...values()))``
+    shape, not merely a bare subscript."""
+    source = (
+        "_BINDINGS_BY_SHA = {sha: derive(t) for sha, t in units.TABLES_BY_SHA.items()}\n"
+        "\n"
+        "def rogue_lookup():\n"
+        "    return next(iter(units.TABLES_BY_SHA.values()))\n"
+    )
+    violations = _tables_by_sha_registry_violations(ast.parse(source))
+    assert violations == [4], f"expected the rogue next(iter(...)) on line 4 to be flagged, got {violations!r}"
+
+
+def test_table_policy_guard_permits_the_one_legitimate_registry_site() -> None:
+    """The `_BINDINGS_BY_SHA` derivation itself, the one legitimate consumer
+    of the registry, must never be flagged by its own guard."""
+    source = "_BINDINGS_BY_SHA = {sha: derive(t) for sha, t in units.TABLES_BY_SHA.items()}\n"
+    assert _tables_by_sha_registry_violations(ast.parse(source)) == []
+
+
+def test_table_policy_guard_permits_the_annotated_registry_site() -> None:
+    """The real `dataset_producer.py` module declares `_BINDINGS_BY_SHA` with
+    an explicit type annotation (`ast.AnnAssign`, not a bare `ast.Assign`) --
+    the guard must recognise that shape too, not just the unannotated one."""
+    source = (
+        "_BINDINGS_BY_SHA: Mapping[str, X] = MappingProxyType(\n"
+        "    {sha: derive(t) for sha, t in units.TABLES_BY_SHA.items()}\n"
+        ")\n"
+    )
+    assert _tables_by_sha_registry_violations(ast.parse(source)) == []
+
+
+def test_table_policy_guard_catches_a_bindings_by_sha_bypass() -> None:
+    """Proves :func:`_bindings_by_sha_bypass_violations` fires when a second
+    function reads `_BINDINGS_BY_SHA` directly instead of calling
+    `binding_for_known_sha`."""
+    source = (
+        "_BINDINGS_BY_SHA = {sha: derive(t) for sha, t in units.TABLES_BY_SHA.items()}\n"
+        "\n"
+        "def binding_for_known_sha(sha256):\n"
+        "    return _BINDINGS_BY_SHA.get(sha256)\n"
+        "\n"
+        "def rogue_hardcoded_lookup():\n"
+        "    return _BINDINGS_BY_SHA['deadbeef' * 8]\n"
+    )
+    violations = _bindings_by_sha_bypass_violations(ast.parse(source))
+    assert violations == [7], f"expected the rogue hardcoded lookup on line 7 to be flagged, got {violations!r}"
+
+
+def test_table_policy_guard_catches_active_table_sha256_instead_of_embedded() -> None:
+    """Proves :func:`_active_table_sha256_violations` fires when a site reads
+    `_ACTIVE.table.sha256` instead of `_ACTIVE.embedded.sha256`."""
+    source = "conversion_table_sha256 = _ACTIVE.table.sha256\n"
+    violations = _active_table_sha256_violations(ast.parse(source))
+    assert violations == [1], f"expected the `_ACTIVE.table.sha256` read on line 1 to be flagged, got {violations!r}"
+
+
+def test_table_policy_guard_permits_active_embedded_sha256() -> None:
+    """`_ACTIVE.embedded.sha256` -- the correct recorded-sha site -- must
+    never be flagged."""
+    source = "conversion_table_sha256 = _ACTIVE.embedded.sha256\n"
+    assert _active_table_sha256_violations(ast.parse(source)) == []
+
 
 def test_current_sha_by_dependency_id_agrees_with_dependencies_by_sha() -> None:
     for dependency_id, sha in CURRENT_SHA_BY_DEPENDENCY_ID.items():

@@ -1657,11 +1657,25 @@ class TestActiveTableBindingTracksItsArgument:
         extra_alias = units.UnitAlias(
             quantity=QuantityKind.PRESSURE, raw="Pa_test_variant", normalized="Pa"
         )
+        # A SECOND extra alias whose raw spelling contains whitespace. Without
+        # this one, check 4 below is vacuous: `Pa_test_variant` has no
+        # whitespace at all, so `active_other.whitespace_patterns` and
+        # `active_default.whitespace_patterns` would come out IDENTICAL (both
+        # empty of this alias) even if `whitespace_patterns` were silently
+        # computed from TABLE_V1's own spellings_union instead of the
+        # `table` argument actually passed to `derive` -- the exact
+        # regression this test class exists to catch. A whitespace-containing
+        # spelling is required to make that regression move a value this
+        # test actually reads.
+        extra_whitespace_alias = units.UnitAlias(
+            quantity=QuantityKind.PRESSURE, raw="Pa test variant", normalized="Pa"
+        )
         assert extra_alias not in units.TABLE_V1.aliases
+        assert extra_whitespace_alias not in units.TABLE_V1.aliases
         other_table = dataclasses.replace(
             units.TABLE_V1,
             table_id="carmel-unit-conversions-test-variant",
-            aliases=units.TABLE_V1.aliases + (extra_alias,),
+            aliases=units.TABLE_V1.aliases + (extra_alias, extra_whitespace_alias),
         )
         assert other_table.sha256 != units.TABLE_V1.sha256
 
@@ -1691,6 +1705,14 @@ class TestActiveTableBindingTracksItsArgument:
         assert set(active_default.whitespace_patterns) == {
             s for s in active_default.spellings_union if any(ch.isspace() for ch in s)
         }
+        # 4b. The two key sets must actually DIFFER -- otherwise a
+        #     `whitespace_patterns` computation silently pinned to
+        #     TABLE_V1's own spellings_union (ignoring the `table` argument
+        #     `derive` was actually given) would pass 4 above undetected,
+        #     since both bindings would independently "match themselves".
+        assert "Pa test variant" not in active_default.whitespace_patterns
+        assert "Pa test variant" in active_other.whitespace_patterns
+        assert set(active_other.whitespace_patterns) != set(active_default.whitespace_patterns)
 
         # 5. The embedded table's recorded sha256 and canonical_json moved,
         #    and each binding's own embedded table matches its own bound
