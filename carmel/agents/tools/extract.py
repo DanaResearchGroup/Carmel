@@ -140,6 +140,28 @@ class TextSection(BaseModel):
     page: int | None = None
 
 
+class PageExtractionFailure(BaseModel):
+    """Records that a single PDF page's ``extract_text()`` call raised.
+
+    A page-level failure must never discard the pages around it (see the
+    per-page ``try`` in :func:`_extract_pdf`): the surviving pages are kept,
+    and this record is the audit trail for the page that was skipped.
+
+    Attributes:
+        page: 1-indexed PDF page number that failed.
+        error: A short, redacted description of the exception (type name plus
+            a path-scrubbed message). Never contains filesystem paths -- the
+            input PDF bytes come from content-addressed storage, and a raw
+            exception message could otherwise leak a local path into a stored
+            artifact.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int
+    error: str
+
+
 class ExtractedText(BaseModel):
     """The result of extracting text from a fetched document.
 
@@ -158,7 +180,14 @@ class ExtractedText(BaseModel):
         extractor: Which extractor produced this: "pdf:pypdf", "pdf:unavailable",
             "html", "text", or "unknown".
         lossy: True when extraction is known to have dropped or approximated content
-            (missing optional dependency, unsupported content type, or a parse error).
+            (missing optional dependency, unsupported content type, a parse error,
+            or one or more individual PDF pages failing -- see ``page_failures``).
+        page_failures: PDF pages whose ``extract_text()`` raised and were skipped.
+            Always empty for non-PDF extractors. When every attempted page fails,
+            ``text`` and ``sections`` end up empty (the same "total failure" shape
+            downstream consumers already fail closed on), but this field still
+            carries WHY, rather than the bare empty result -- an already-loud
+            refusal is strictly better with a reason attached than without.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -169,6 +198,7 @@ class ExtractedText(BaseModel):
     page_count: int | None = None
     extractor: str
     lossy: bool = False
+    page_failures: tuple[PageExtractionFailure, ...] = ()
 
 
 def normalize_for_match(s: str) -> str:
@@ -603,6 +633,24 @@ def _quiet_pypdf() -> Iterator[None]:
                 _pypdf_mute_previous = None
 
 
+_PATH_LIKE_RE = re.compile(r"(?:[A-Za-z]:)?(?:[\\/][^\s\\/:*?\"<>|]+){2,}")
+
+
+def _describe_page_error(exc: Exception) -> str:
+    """Render a per-page extraction exception as a short, path-redacted string.
+
+    Stored in :class:`PageExtractionFailure.error`, which lands in a
+    content-addressed artifact -- so a raw ``str(exc)`` is not safe to keep
+    verbatim. ``pypdf`` exceptions do not normally embed local filesystem
+    paths (extraction here always reads from an in-memory ``io.BytesIO``,
+    never a file path), but nothing in its API contract guarantees that for
+    every code path or future version, so any path-shaped substring is
+    scrubbed defensively rather than trusted to be absent.
+    """
+    message = _PATH_LIKE_RE.sub("<redacted-path>", str(exc))
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
 def _extract_pdf(data: bytes) -> ExtractedText:
     """Extract text from a PDF via the optional ``pypdf`` dependency.
 
@@ -631,8 +679,10 @@ def _extract_pdf(data: bytes) -> ExtractedText:
 
     parts: list[str] = []
     sections: list[TextSection] = []
+    page_failures: list[PageExtractionFailure] = []
     cursor = 0
     separator = "\n\n"
+    have_prior_page = False
     # `truncated` (-> `lossy=True`) covers BOTH ways a PDF can exceed the bounds we
     # enforce: too many pages, or too many characters. Either one means the returned
     # text is a partial view of the document, and `lossy=True` is load-bearing: the
@@ -640,32 +690,47 @@ def _extract_pdf(data: bytes) -> ExtractedText:
     # partial document.
     truncated = page_count > MAX_PDF_PAGES
     pages_to_process = min(page_count, MAX_PDF_PAGES)
-    try:
-        with _quiet_pypdf():
-            for i in range(pages_to_process):
-                # Stop calling `extract_text()` -- the expensive, memory-allocating step
-                # -- the moment the running character count would already exceed the cap,
-                # rather than materializing every remaining page and trimming only the
-                # RETURNED value afterwards. That "trim after the fact" ordering is
-                # exactly the gap this fix closes: it let a compression-bomb PDF blow past
-                # peak memory before `_cap_text` (below) ever got a chance to run.
-                if cursor >= MAX_EXTRACTED_TEXT_CHARS:
-                    truncated = True
-                    break
+    with _quiet_pypdf():
+        for i in range(pages_to_process):
+            # Stop calling `extract_text()` -- the expensive, memory-allocating step
+            # -- the moment the running character count would already exceed the cap,
+            # rather than materializing every remaining page and trimming only the
+            # RETURNED value afterwards. That "trim after the fact" ordering is
+            # exactly the gap this fix closes: it let a compression-bomb PDF blow past
+            # peak memory before `_cap_text` (below) ever got a chance to run.
+            if cursor >= MAX_EXTRACTED_TEXT_CHARS:
+                truncated = True
+                break
+            # Per-page, not per-document: a single damaged page (pypdf's layout mode
+            # raises e.g. `KeyError('/Contents')` on a contentless page in real corpus
+            # PDFs) must not discard every page around it. Catching around just this
+            # call keeps the pages that DO extract cleanly and records the ones that
+            # don't, instead of the old behavior of losing an entire multi-page paper
+            # to one bad page.
+            try:
                 page_text = reader.pages[i].extract_text() or ""
-                start = cursor
-                parts.append(page_text)
-                cursor += len(page_text)
-                sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
-                if i < pages_to_process - 1:
-                    parts.append(separator)
-                    cursor += len(separator)
-    except Exception:
-        return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
+            except Exception as exc:
+                page_failures.append(PageExtractionFailure(page=i + 1, error=_describe_page_error(exc)))
+                continue
+            if have_prior_page:
+                parts.append(separator)
+                cursor += len(separator)
+            start = cursor
+            parts.append(page_text)
+            cursor += len(page_text)
+            sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
+            have_prior_page = True
 
     text = "".join(parts)
     text, sections, cap_truncated = _cap_text(text, sections)
-    truncated = truncated or cap_truncated
+    # Any page failure makes this extraction partial, exactly like truncation does:
+    # the surviving text is real but incomplete, so `lossy=True` must follow even
+    # when only one page out of many failed. When EVERY attempted page fails, `parts`
+    # stays empty and `text`/`sections` naturally collapse to the same "total failure"
+    # shape the grounding gate and `produce_envelope_from_artifact` already fail
+    # closed on -- but `page_failures` still carries why, rather than a bare empty
+    # result.
+    truncated = truncated or cap_truncated or bool(page_failures)
     sections = _label_special_sections(text, sections)
     return ExtractedText(
         text=text,
@@ -674,6 +739,7 @@ def _extract_pdf(data: bytes) -> ExtractedText:
         page_count=page_count,
         extractor="pdf:pypdf",
         lossy=truncated,
+        page_failures=tuple(page_failures),
     )
 
 

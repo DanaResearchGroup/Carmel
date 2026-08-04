@@ -267,6 +267,10 @@ class TestExtractPdf:
         assert "Page two content." in result.text
         pages_seen = {sec.page for sec in result.sections if sec.page is not None}
         assert pages_seen == {1, 2}
+        # Regression guard: a fully-successful extraction must carry no page
+        # failures at all -- the new field must not manifest anything for the
+        # common, unbroken case.
+        assert result.page_failures == ()
 
     def test_pdf_parse_error_via_fake_pypdf(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Deterministically exercise the "pypdf installed but parsing raises" fallback
@@ -283,6 +287,100 @@ class TestExtractPdf:
         assert result.extractor == "pdf:pypdf"
         assert result.lossy is True
         assert result.text == ""
+
+    def test_pdf_middle_page_failure_preserves_surrounding_pages(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The defect this guards against: a single damaged page (pypdf's layout
+        # mode is known to raise KeyError('/Contents') on a contentless page in
+        # real corpus documents) used to discard EVERY successfully-extracted
+        # page around it. Page 2 of 3 raises here; pages 1 and 3 must survive,
+        # the failure must be recorded with its page index, and the result must
+        # be visibly partial (lossy=True) rather than indistinguishable from a
+        # clean extraction.
+        class _FakePage:
+            def __init__(self, text: str | None, *, raises: bool = False) -> None:
+                self._text = text
+                self._raises = raises
+
+            def extract_text(self) -> str:
+                if self._raises:
+                    raise KeyError("/Contents")
+                assert self._text is not None
+                return self._text
+
+        class _FakeReader:
+            def __init__(self, _stream: object) -> None:
+                self.pages = [
+                    _FakePage("Page one content."),
+                    _FakePage(None, raises=True),
+                    _FakePage("Page three content."),
+                ]
+
+        fake_pypdf = types.ModuleType("pypdf")
+        fake_pypdf.PdfReader = _FakeReader  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+        result = extract_text(b"%PDF-1.4 irrelevant", "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        assert result.page_count == 3
+        assert "Page one content." in result.text
+        assert "Page three content." in result.text
+        pages_seen = {sec.page for sec in result.sections if sec.page is not None}
+        assert pages_seen == {1, 3}
+        assert result.lossy is True
+        assert len(result.page_failures) == 1
+        assert result.page_failures[0].page == 2
+        assert "KeyError" in result.page_failures[0].error
+
+    def test_pdf_all_pages_failing_is_a_loud_refusal_not_silent_empty_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When every page fails, the OLD behavior (empty text, lossy=True, no
+        # further detail) was indistinguishable from any other total failure.
+        # The new behavior must still fail closed (empty text, lossy=True --
+        # so grounding/dataset-producer refusals still fire) but must ALSO
+        # carry a page_failures record per page, so the refusal is loud about
+        # why rather than just quietly empty.
+        class _FakePage:
+            def extract_text(self) -> str:
+                raise ValueError("page is corrupt")
+
+        class _FakeReader:
+            def __init__(self, _stream: object) -> None:
+                self.pages = [_FakePage(), _FakePage()]
+
+        fake_pypdf = types.ModuleType("pypdf")
+        fake_pypdf.PdfReader = _FakeReader  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+        result = extract_text(b"%PDF-1.4 irrelevant", "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        assert result.text == ""
+        assert result.sections == []
+        assert result.lossy is True
+        assert len(result.page_failures) == 2
+        assert [f.page for f in result.page_failures] == [1, 2]
+        assert all("page is corrupt" in f.error for f in result.page_failures)
+
+    def test_pdf_page_error_message_redacts_file_paths(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Per-page failures are recorded into a content-addressed artifact, so
+        # a raw exception message is not safe to keep verbatim: it must never
+        # leak a local filesystem path into stored output.
+        class _FakePage:
+            def extract_text(self) -> str:
+                raise RuntimeError("could not read /home/alice/secret/paper.pdf stream")
+
+        class _FakeReader:
+            def __init__(self, _stream: object) -> None:
+                self.pages = [_FakePage()]
+
+        fake_pypdf = types.ModuleType("pypdf")
+        fake_pypdf.PdfReader = _FakeReader  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+        result = extract_text(b"%PDF-1.4 irrelevant", "application/pdf")
+        assert len(result.page_failures) == 1
+        assert "/home/alice/secret/paper.pdf" not in result.page_failures[0].error
+        assert "<redacted-path>" in result.page_failures[0].error
 
     def test_pdf_huge_page_count_stops_before_extracting_every_page(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # P1-10 regression: a PDF whose page TREE claims far more pages than
