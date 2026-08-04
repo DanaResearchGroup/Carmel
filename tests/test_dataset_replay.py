@@ -44,10 +44,11 @@ from carmel.services.dataset_replay import (
     ReplayOutcome,
     replay_envelope,
     verify_measured_value_unit,
+    verify_measured_value_unit_boundary,
 )
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
-from carmel.services.units import QuantityKind
+from carmel.services.units import TABLE_V1, QuantityKind
 
 MAX_BYTES = 10_000_000
 
@@ -455,6 +456,204 @@ class TestReplayEnvelopeZeroCheckedSpansCannotVerify:
         )
         assert report.outcome is ReplayOutcome.UNVERIFIABLE
         assert any("0" in f.reason or "zero" in f.reason.lower() for f in report.unverifiable)
+
+
+class TestVerifyMeasuredValueUnitBoundary:
+    """Focused tests for ``verify_measured_value_unit_boundary`` -- the
+    closed gap this module's docstring used to describe as deliberate and
+    open. Replay used to re-verify evidence identity, every character span,
+    and unit NORMALIZATION against the recorded table, but never re-ran
+    boundary/admission: an envelope that RECORDED ``unit_raw="bar"`` with a
+    unit locator pointing inside evidence text ``"1 bar(a)"`` replayed
+    ``VERIFIED`` even though ``ground_quote`` would refuse that exact quote
+    at write time. These tests build the adversarial ``MeasuredValue`` via
+    ``model_construct``/direct construction, deliberately WITHOUT going
+    through ``ground_quote``/the producer's gate, simulating a buggy or
+    malicious producer whose output the replayer must still catch on its
+    own.
+    """
+
+    @staticmethod
+    def _ref(node_id: str, start: int, end: int) -> SourceRef:
+        return SourceRef(
+            node_id=node_id,
+            locator=CharSpanLocator(
+                kind=LocatorKind.CHAR_SPAN, text_space=TextSpace.EXTRACTED_TEXT, start=start, end=end
+            ),
+        )
+
+    @staticmethod
+    def _repair_dependency() -> SemanticDependencyUse:
+        return SemanticDependencyUse(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+            input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+
+    def test_bar_glued_to_parenthetical_fails_not_verified(self) -> None:
+        # Empirically confirmed (see numeric.unit_boundary_violation) that
+        # "bar" inside "1 bar(a)" is refused by Layers 1-2 ALONE, table-free,
+        # via the "unit_trailing_unclassified_char" discriminant -- exactly
+        # the quote ground_quote would refuse at write time.
+        text = "The pressure was 1 bar(a) at steady state."
+        start = text.index("bar")
+        end = start + len("bar")
+        assert text[start:end] == "bar"
+
+        value = MeasuredValue.model_construct(
+            raw_text="1",
+            canonical_decimal_value="1",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.PRESSURE,
+            unit_raw="bar",
+            unit_normalized="Pa",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("other_node", 0, 1),
+            unit_ref=self._ref("paper", start, end),
+        )
+
+        finding = verify_measured_value_unit_boundary("dummy.path", value, {"paper": text})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert "unit_trailing_unclassified_char" in finding.reason
+
+    def test_unknown_recorded_table_sha_stays_unverifiable(self) -> None:
+        # The unit itself ("K" in "... 1023 K while ...") passes Layers 1-2
+        # cleanly on its own -- only Layer 3 (table admission) is blocked,
+        # by a conversion_table_sha256 that names no known table. This must
+        # stay UNVERIFIABLE, never FAILED (no disagreement was demonstrated)
+        # and never VERIFIED (Layer 3 never actually ran).
+        start = _TEXT.index("1023 K") + len("1023 ")
+        end = start + 1
+        assert _TEXT[start:end] == "K"
+
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256="0" * 64,
+            value_ref=self._ref("paper", _TEXT.index("1023"), _TEXT.index("1023") + 4),
+            unit_ref=self._ref("paper", start, end),
+        )
+
+        finding = verify_measured_value_unit_boundary("dummy.path", value, {"paper": _TEXT})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "0" * 64 in finding.reason
+
+    def test_clean_measured_value_boundary_verifies(self) -> None:
+        start = _TEXT.index("1023 K") + len("1023 ")
+        end = start + 1
+        assert _TEXT[start:end] == "K"
+
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("paper", _TEXT.index("1023"), _TEXT.index("1023") + 4),
+            unit_ref=self._ref("paper", start, end),
+        )
+
+        assert verify_measured_value_unit_boundary("dummy.path", value, {"paper": _TEXT}) is None
+
+    def test_unrecoverable_value_span_still_fails_closed_not_verified(self) -> None:
+        # Digit-glue shape: unit token immediately abutting a digit run with
+        # no delimiter between them ("1023K", no space). Layer 2's narrow
+        # digit-glue exception can only forgive this when it is handed a
+        # well-formed value_span naming the adjacent numeral. Empirically
+        # confirmed (carmel.services.numeric.unit_boundary_violation): with
+        # no value_span this text refuses with
+        # "unit_digit_glue_no_value_span"; supplying the correct value_span
+        # makes it clean.
+        #
+        # Here value_ref names a DIFFERENT node than unit_ref, so
+        # _recover_value_span deliberately returns None (it will not borrow
+        # a value_span across nodes) -- the value_span the exception would
+        # need is therefore NOT recoverable from what the envelope recorded.
+        # This must fail closed (FAILED, the check ran and refused) rather
+        # than silently verify-by-omission (never a bare None/VERIFIED).
+        text = "The value was 1023K exactly."
+        start = text.index("K")
+        end = start + 1
+        assert text[start:end] == "K"
+
+        value = MeasuredValue.model_construct(
+            raw_text="1023",
+            canonical_decimal_value="1023",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.TEMPERATURE,
+            unit_raw="K",
+            unit_normalized="K",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._ref("some_other_node", 0, 4),
+            unit_ref=self._ref("paper", start, end),
+        )
+
+        finding = verify_measured_value_unit_boundary("dummy.path", value, {"paper": text})
+        assert finding is not None, (
+            "an unrecoverable value_span must never silently verify -- the digit-glue-shaped "
+            "text still needs an explanation, and none was recoverable from the recorded refs"
+        )
+        assert finding.category is ReplayOutcome.FAILED
+        assert "unit_digit_glue_no_value_span" in finding.reason
+
+
+class TestReplayEnvelopeCatchesUnitBoundaryViolation:
+    """End-to-end (round D-U2 gap closure): a full ``replay_envelope`` call
+    against a tampered envelope whose recorded unit locator points at a
+    quote ``ground_quote`` would refuse today must report ``FAILED``, not
+    ``VERIFIED`` -- this is the headline scenario the reviewer brief names
+    explicitly (``unit_raw="bar"`` grounded inside evidence text
+    ``"1 bar(a)"``).
+    """
+
+    def test_replay_fails_when_recorded_unit_locator_lands_on_glued_bar(self, tmp_path: Path) -> None:
+        text_with_glued_bar = _TEXT + " The pressure was 1 bar(a) at closure."
+        _stored_artifact, loaded = _produce_and_load(tmp_path, text=text_with_glued_bar)
+        clean_report = replay_envelope(tmp_path, loaded)
+        assert clean_report.outcome is ReplayOutcome.VERIFIED
+
+        series = loaded.series[0]
+        point = series.points[0]
+        coordinate = point.coordinates[0]
+        value = coordinate.value
+
+        start = text_with_glued_bar.index("bar", text_with_glued_bar.index("1 bar(a)"))
+        end = start + len("bar")
+        assert text_with_glued_bar[start:end] == "bar"
+        glued_locator = CharSpanLocator(
+            kind=LocatorKind.CHAR_SPAN, text_space=TextSpace.EXTRACTED_TEXT, start=start, end=end
+        )
+        # A buggy/malicious producer recording a unit locator that ground_quote
+        # would have refused, WITHOUT going through ground_quote's own gate --
+        # `model_copy` bypasses validation the same way the rest of this
+        # module's tamper tests do.
+        glued_unit_ref = value.unit_ref.model_copy(update={"locator": glued_locator})
+        tampered_value = value.model_copy(update={"unit_raw": "bar", "unit_ref": glued_unit_ref})
+        tampered_coordinate = coordinate.model_copy(update={"value": tampered_value})
+        tampered_coordinates = tuple(
+            tampered_coordinate if c is coordinate else c for c in point.coordinates
+        )
+        tampered_point = point.model_copy(update={"coordinates": tampered_coordinates})
+        tampered_points = tuple(tampered_point if p is point else p for p in series.points)
+        tampered_series_obj = series.model_copy(update={"points": tampered_points})
+        tampered_series = tuple(tampered_series_obj if s is series else s for s in loaded.series)
+        tampered = loaded.model_copy(update={"series": tampered_series})
+
+        report = replay_envelope(tmp_path, tampered)
+        assert report.outcome is ReplayOutcome.FAILED
+        assert any("unit_trailing_unclassified_char" in f.reason for f in report.failures)
 
 
 class TestReplayEnvelopeContainsParserExceptions:

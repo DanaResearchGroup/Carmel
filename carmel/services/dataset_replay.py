@@ -9,7 +9,7 @@ that wrote the record. This module is deliberately the OTHER path: given
 nothing but a workspace root (the content-addressed evidence store) and an
 already-loaded envelope, it re-derives every fact the envelope claims from
 scratch and reports whether the envelope's claims still hold against that
-independent re-derivation. Three things are re-proven, none of them taken on
+independent re-derivation. Four things are re-proven, none of them taken on
 the envelope's own say-so:
 
 1. **Evidence identity.** For every :class:`~carmel.schemas.datasets.SourceNode`
@@ -50,6 +50,29 @@ the envelope's own say-so:
    self-consistency is not the same thing as being a table anyone has
    actually reviewed (see ``EmbeddedConversionTable``'s docstring for the
    "internally coherent nonsense" framing this module takes at face value).
+
+4. **Every unit's boundary/admission, against the RECORDED locator and the
+   RECORDED table.** For every reachable ``MeasuredValue``,
+   :func:`verify_measured_value_unit_boundary` re-runs the SAME three-layer
+   UNIT-role gate :func:`~carmel.services.dataset_producer.ground_quote`
+   applies at write time -- Layers 1-2
+   (:func:`carmel.services.numeric.unit_boundary_violation`, table-free and
+   version-independent) and Layer 3 (table-driven admission/maximality,
+   :func:`carmel.services.dataset_producer._unit_table_boundary_violation`)
+   -- against the INDEPENDENTLY RE-READ evidence text, sliced at the
+   RECORDED ``unit_ref`` locator, and against the binding for the RECORDED
+   ``conversion_table_sha256`` (resolved through
+   :func:`carmel.services.dataset_producer.binding_for_known_sha`, bounded
+   strictly by :data:`carmel.services.units.TABLES_BY_SHA`; an unrecognised
+   sha is ``UNVERIFIABLE`` and never falls back to any other table). The
+   digit-glue exception's ``value_span`` is recovered from the envelope's OWN
+   recorded ``value_ref`` locator when it names the SAME node as ``unit_ref``
+   (see :func:`_recover_value_span`); when it does not (or is not itself a
+   char-span locator), ``value_span`` is ``None`` -- a unit whose text
+   actually needs the glue exception then fails closed with
+   ``"unit_digit_glue_no_value_span"`` rather than being silently skipped, so
+   an unrecoverable ``value_span`` can still surface a ``FAILED``, never a
+   silently-omitted check.
 
 Every check reports one of exactly three outcomes -- never a bare bool:
 
@@ -115,19 +138,41 @@ root, loads the envelope through
 replays THAT -- so it proves a claim about what is actually on disk, not
 about whatever the caller happened to construct.
 
-**Known, deliberate gap -- boundary/admission is NOT re-run.** Replay
-re-verifies evidence identity, every character span, and every unit's
-normalization against the table it recorded, but it does NOT re-run
-boundary/admission (the check that decides whether a given unit would still
-be ADMITTED at all under today's rules). An envelope whose recorded unit
-would no longer be admitted can still replay as ``VERIFIED``. This is not
-an oversight: admission is currently wired through four hardcoded
-``TABLE_V1`` call sites (see ``dataset_producer.py``), and making replay
-admission-aware is blocked on removing that hardcoding first, which is
-scoped as a later milestone. Read a ``VERIFIED`` result accordingly: it
-proves the recorded facts are genuinely grounded and internally consistent
-with the table they recorded, not that those facts would be re-admitted
-under current policy.
+**What boundary/admission re-checking now proves, and what it still does
+not.** :func:`verify_measured_value_unit_boundary` re-runs the same
+lexical (Layers 1-2) and table-admission (Layer 3) gate
+:func:`~carmel.services.dataset_producer.ground_quote` applies at write
+time, against independently re-read evidence text sliced at the RECORDED
+locator, and against the binding for the RECORDED
+``conversion_table_sha256`` -- so an envelope whose recorded unit locator
+would be refused by ``ground_quote`` today (e.g. it lands on a bare unit
+token glued to trailing unclassified characters, or the token is not in
+the recorded table's vocabulary at all) now replays ``FAILED``, not
+``VERIFIED``. This closes the previously-documented gap where boundary and
+admission were skipped entirely.
+
+What this still does NOT prove, even on a ``VERIFIED`` result:
+
+- **M-D4 measurement grouping** -- that ``value_ref``, ``unit_ref``, and any
+  label together describe ONE coherent measurement, rather than three
+  independently-true-but-unrelated facts stitched into a
+  ``MeasuredValue``. Replay checks each ref's locator and boundary in
+  isolation; it has no way to re-derive "these three spans belong
+  together" from the evidence text alone.
+- **The original caller's occurrence/search disambiguation** -- when a unit
+  or value string appears more than once in the source text, replay
+  trusts the RECORDED locator's offsets; it cannot reconstruct why the
+  producer chose that occurrence over another one.
+- **A faithful recording of a wrong extraction** -- boundary/admission only
+  asks "would this exact span still be admitted." It cannot detect that
+  the span, while internally well-formed and admissible, was extracted
+  from the wrong place in the source document in the first place.
+
+Read a ``VERIFIED`` result accordingly: it proves the recorded facts are
+genuinely grounded, internally consistent with the table they recorded,
+and would still be admitted by today's boundary/admission rules -- not
+that they constitute a correctly-grouped, correctly-disambiguated, or
+correctly-targeted measurement.
 """
 
 from __future__ import annotations
@@ -151,7 +196,12 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import units
 from carmel.services.dataset_bridge import load_dataset_envelope
+from carmel.services.dataset_producer import (
+    _unit_table_boundary_violation,
+    binding_for_known_sha,
+)
 from carmel.services.evidence import artifact_dir, load_artifact_meta
+from carmel.services.numeric import unit_boundary_violation
 
 __all__ = [
     "ReplayFinding",
@@ -160,6 +210,7 @@ __all__ = [
     "replay_envelope",
     "replay_stored_dataset",
     "verify_measured_value_unit",
+    "verify_measured_value_unit_boundary",
 ]
 
 
@@ -517,13 +568,164 @@ def verify_measured_value_unit(path: str, value: MeasuredValue) -> ReplayFinding
     return None
 
 
+def _recover_value_span(value: MeasuredValue, unit_node_id: str) -> tuple[int, int] | None:
+    """Recover the ``value_span`` Layer 2's digit-glue exception
+    (:func:`carmel.services.numeric.unit_boundary_violation`) needs, from
+    the envelope's OWN recorded ``value_ref`` locator -- never fabricated.
+
+    Returns ``None`` (never a guessed span) whenever ``value_ref`` cannot
+    honestly stand in for ``value_span`` in the UNIT's re-read text: when it
+    does not point at the SAME node as ``unit_ref`` (the digit-glue
+    exception is about a digit run immediately adjacent to the unit IN THAT
+    TEXT; a value grounded in a different node's text cannot supply that),
+    or when its locator is not itself a :class:`CharSpanLocator`. This is
+    deliberately fail-closed rather than verified-by-omission: when
+    ``None`` is returned but the unit's re-read text actually has a
+    digit-glue shape that needs a value_span,
+    :func:`~carmel.services.numeric.unit_boundary_violation` itself refuses
+    with ``"unit_digit_glue_no_value_span"`` -- the check still runs and can
+    still FAIL, it just cannot use the narrow glue exception.
+    """
+    if value.value_ref.node_id != unit_node_id:
+        return None
+    locator = value.value_ref.locator
+    if not isinstance(locator, CharSpanLocator):
+        return None
+    return (locator.start, locator.end)
+
+
+def verify_measured_value_unit_boundary(
+    path: str,
+    value: MeasuredValue,
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding] | None = None,
+) -> ReplayFinding | None:
+    """Re-run the UNIT-role boundary/admission gate (D-U2,
+    :func:`carmel.services.dataset_producer.ground_quote`'s own three-layer
+    rule) against the INDEPENDENTLY RE-READ evidence text, at the RECORDED
+    ``unit_ref`` locator -- never against the envelope's own say-so that the
+    unit was admitted.
+
+    This closes the gap this module's docstring used to describe as
+    deliberate and open: until this function existed, replay re-verified
+    evidence identity, every character
+    span, and unit NORMALIZATION against the recorded table, but never
+    re-ran boundary/admission -- so an envelope that RECORDED
+    ``unit_raw="bar"`` with a unit locator pointing inside evidence text
+    ``"1 bar(a)"`` replayed ``VERIFIED`` even though
+    :func:`~carmel.services.dataset_producer.ground_quote` would refuse that
+    exact quote at write time. A faithfully-recorded locator into
+    genuinely-corrupted evidence text is exactly what this function is for.
+
+    Layers 1-2 (:func:`carmel.services.numeric.unit_boundary_violation`,
+    table-free and version-independent) run first, then Layer 3 (the
+    table-driven admission/maximality check,
+    :func:`carmel.services.dataset_producer._unit_table_boundary_violation`)
+    against the binding for the envelope's OWN RECORDED
+    ``conversion_table_sha256`` -- resolved through
+    :func:`carmel.services.dataset_producer.binding_for_known_sha`, which is
+    bounded strictly by the hand-reviewed
+    :data:`carmel.services.units.TABLES_BY_SHA` registry and NEVER derived
+    from a caller-supplied table. An unrecognised sha makes Layer 3
+    ``UNVERIFIABLE`` (it never falls back to whatever table is current).
+
+    What this does NOT prove, even when it returns ``None``: that the value,
+    unit, and label spans of one measurement genuinely belong together (see
+    this module's own docstring, M-D4 grouping); that the original writer's
+    occurrence/search disambiguation among multiple candidate matches was
+    the right one; or that a faithfully-recorded locator was pointed at the
+    CORRECT extraction rather than merely a clean one. It proves only that
+    the recorded locator, re-read from independently-verified evidence text,
+    still passes the SAME boundary/admission gate ``ground_quote`` would
+    apply today.
+
+    Returns ``None`` if both layers pass cleanly. Otherwise a
+    :class:`ReplayFinding`: ``FAILED`` if a layer ran and refused;
+    ``UNVERIFIABLE`` if a layer could not run at all (missing/unreadable
+    node text, an unresolvable ``conversion_table_sha256``, or an
+    out-of-range locator). A skipped check never yields ``None`` silently --
+    every early return above is paired with a named finding.
+    """
+    node_problems = node_problems or {}
+    unit_node_id = value.unit_ref.node_id
+    unit_locator = value.unit_ref.locator
+    path_ref = f"{path}.unit_ref"
+
+    if not isinstance(unit_locator, CharSpanLocator):
+        # Every other SourceLocator kind (bbox, table cell, xpath) has no
+        # character span for this lexical/table gate to re-run against;
+        # check_char_spans already covers those kinds on their own terms.
+        return None
+
+    if unit_node_id in node_problems:
+        problem = node_problems[unit_node_id]
+        return ReplayFinding(category=problem.category, ref_path=path_ref, reason=problem.reason)
+
+    text = text_by_node_id.get(unit_node_id)
+    if text is None:
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path_ref,
+            reason=f"references node_id={unit_node_id!r}, which is not present in "
+            "envelope.source_graph and was never independently checked, so the unit "
+            "boundary/admission gate cannot be re-run",
+        )
+
+    start, end = unit_locator.start, unit_locator.end
+    if not (0 <= start < end <= len(text)):
+        return ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path_ref,
+            reason=f"unit_ref locator [{start}:{end}] is out of range for the independently "
+            f"re-verified text of node_id={unit_node_id!r} (len={len(text)}) -- cannot re-slice "
+            "to re-run the boundary/admission gate",
+        )
+
+    value_span = _recover_value_span(value, unit_node_id)
+
+    lexical_violation = unit_boundary_violation(text, start, end, value_span=value_span)
+    if lexical_violation is not None:
+        return ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path_ref,
+            reason="unit boundary re-check (Layers 1-2, table-free) failed against re-read "
+            f"evidence text: {lexical_violation!r} -- the recorded unit locator no longer grounds "
+            "a clean UNIT-role boundary; ground_quote would refuse this exact quote today",
+        )
+
+    binding = binding_for_known_sha(value.conversion_table_sha256)
+    if binding is None:
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=f"{path}.conversion_table_sha256",
+            reason=f"conversion_table_sha256={value.conversion_table_sha256!r} does not name any "
+            "known conversion table in TABLES_BY_SHA -- the table-driven admission/maximality gate "
+            "(Layer 3) is re-run against the RECORDED table only, never against 'the current "
+            "table', so this is refused rather than silently re-checked against something else",
+        )
+
+    admission_violation = _unit_table_boundary_violation(text, start, end, value.quantity_kind, binding)
+    if admission_violation is not None:
+        return ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path_ref,
+            reason="unit table admission/maximality re-check (Layer 3) failed against re-read "
+            f"evidence text: {admission_violation!r} -- the recorded unit is no longer admitted "
+            f"(or no longer maximal) against the RECORDED table {value.conversion_table_sha256!r}",
+        )
+
+    return None
+
+
 def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_text: bool = False) -> ReplayReport:
     """Independently re-verify an already-loaded ``envelope`` OBJECT against
     the evidence store rooted at ``workspace_root``.
 
-    Combines all three checks this module performs (evidence identity,
-    every character span, every measured unit against its recorded table)
-    into one :class:`ReplayReport`. Never trusts anything the envelope
+    Combines all four checks this module performs (evidence identity,
+    every character span, every measured unit's normalization against its
+    recorded table, and every measured unit's boundary/admission against
+    its recorded locator and recorded table) into one :class:`ReplayReport`.
+    Never trusts anything the envelope
     itself carries as pre-verified -- every fact is re-derived from the
     evidence store or from the hand-reviewed
     :data:`~carmel.services.units.TABLES_BY_SHA` registry.
@@ -557,6 +759,9 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         finding = verify_measured_value_unit(path, value)
         if finding is not None:
             unit_findings.append(finding)
+        boundary_finding = verify_measured_value_unit_boundary(path, value, text_by_node_id, node_problems)
+        if boundary_finding is not None:
+            unit_findings.append(boundary_finding)
 
     # Every node's own problem is surfaced regardless of whether any
     # char-span ref happens to reach it -- an unreferenced node (or one

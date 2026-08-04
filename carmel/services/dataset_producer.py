@@ -339,10 +339,10 @@ _ACTIVE: _ActiveTableBinding = _ActiveTableBinding.derive(units.TABLE_V1)
 
 
 def _unit_table_boundary_violation(
-    text: str, start: int, end: int, quantity: QuantityKind
+    text: str, start: int, end: int, quantity: QuantityKind, binding: _ActiveTableBinding
 ) -> str | None:
     """Layer 3 of the UNIT-role boundary gate (D-U2): table-driven admission
-    plus maximality against :data:`units.TABLE_V1`'s registered vocabulary.
+    plus maximality against ``binding``'s registered vocabulary.
 
     Moved HERE from :func:`carmel.services.numeric.unit_boundary_violation`
     (round-43 review, P1-2): that function is an EXPORTED, public API, so a
@@ -353,8 +353,22 @@ def _unit_table_boundary_violation(
     nothing in that function (or anywhere else) to catch it. Rather than add
     validation for caller-supplied policy data (this project's sixth
     instance of exactly that anti-pattern), the fix REMOVES the seam: this
-    function is PRIVATE, takes no vocabulary parameter from any caller, and
-    reads the active table's vocabulary via :data:`_ACTIVE` above.
+    function is PRIVATE and takes no vocabulary parameter from an arbitrary
+    caller.
+
+    ``binding`` IS parameterised (round-N review, dataset-replay admission
+    gap): unlike the vocabulary this function used to read directly off the
+    module-global :data:`_ACTIVE`, ``binding`` is now an explicit argument so
+    that :mod:`carmel.services.dataset_replay` can re-run this exact check
+    against a DIFFERENT, registry-bounded binding derived from the envelope's
+    OWN recorded ``conversion_table_sha256`` -- never against whatever table
+    happens to be current. This is not a new policy-injection seam: the
+    caller still cannot supply an arbitrary vocabulary, only select AMONG
+    ``_ActiveTableBinding`` objects that are each themselves derived, via the
+    same pure :meth:`_ActiveTableBinding.derive`, from a table already
+    registered in :data:`carmel.services.units.TABLES_BY_SHA`. This
+    module's own production call site below passes :data:`_ACTIVE`
+    unconditionally, so producer behavior is unchanged.
     :func:`ground_quote` calls :func:`carmel.services.numeric.unit_boundary_violation`
     (the lexical Layers 1-2) first and only calls this function if that
     returns ``None`` clean, preserving the original layer order.
@@ -372,21 +386,21 @@ def _unit_table_boundary_violation(
       real fix is teaching ``normalize_unit`` to collapse internal
       whitespace, which is out of scope here.
     - ``"unit_not_maximal_forward"`` / ``"unit_not_maximal_backward"``: a
-      longer registered spelling (any quantity, via
-      :data:`_ACTIVE`'s ``spellings_union``) shares this quote's start
-      (forward) or end (backward). Unlike admission, maximality IS
-      whitespace-equivalent (:data:`_ACTIVE`'s ``whitespace_patterns``) for any spelling that
-      contains whitespace, so a whitespace-glued occurrence of a longer
-      spelling in the SOURCE TEXT is still detected even when its separator
-      is not a single ASCII space.
+      longer registered spelling (any quantity, via ``binding``'s
+      ``spellings_union``) shares this quote's start (forward) or end
+      (backward). Unlike admission, maximality IS whitespace-equivalent
+      (``binding``'s ``whitespace_patterns``) for any spelling that contains
+      whitespace, so a whitespace-glued occurrence of a longer spelling in
+      the SOURCE TEXT is still detected even when its separator is not a
+      single ASCII space.
     """
     quote_len = end - start
-    quantity_spellings = _ACTIVE.spellings_by_quantity.get(quantity, frozenset())
+    quantity_spellings = binding.spellings_by_quantity.get(quantity, frozenset())
     if text[start:end] not in quantity_spellings:
         return "unit_not_in_vocabulary"
 
-    for spelling in _ACTIVE.spellings_union:
-        pattern = _ACTIVE.whitespace_patterns.get(spelling)
+    for spelling in binding.spellings_union:
+        pattern = binding.whitespace_patterns.get(spelling)
         if pattern is not None:
             match = pattern.match(text, start)
             if match is not None and match.end() > end:
@@ -395,8 +409,8 @@ def _unit_table_boundary_violation(
         if len(spelling) > quote_len and text.startswith(spelling, start):
             return "unit_not_maximal_forward"
 
-    for spelling in _ACTIVE.spellings_union:
-        pattern = _ACTIVE.whitespace_patterns.get(spelling)
+    for spelling in binding.spellings_union:
+        pattern = binding.whitespace_patterns.get(spelling)
         if pattern is not None:
             for match in pattern.finditer(text, 0, end):
                 if match.end() == end and match.start() < start:
@@ -411,6 +425,34 @@ def _unit_table_boundary_violation(
             return "unit_not_maximal_backward"
 
     return None
+
+
+#: Registry-bounded lookup from a table's own sha256 to the
+#: :class:`_ActiveTableBinding` derived from it, covering EXACTLY the tables
+#: :data:`carmel.services.units.TABLES_BY_SHA` already hand-reviews -- never
+#: an arbitrary caller-supplied table. Built once at import time (mirroring
+#: :data:`_ACTIVE`'s own rationale: a fixed table registry needs no lazy
+#: mutable cache) so :func:`carmel.services.dataset_replay.replay_envelope`
+#: can re-run Layer 3 against the binding for an envelope's RECORDED
+#: ``conversion_table_sha256`` -- an unknown sha simply has no entry here and
+#: must be treated as UNVERIFIABLE, never silently mapped onto ``_ACTIVE``.
+_BINDINGS_BY_SHA: Mapping[str, _ActiveTableBinding] = MappingProxyType(
+    {sha: _ActiveTableBinding.derive(table) for sha, table in units.TABLES_BY_SHA.items()}
+)
+
+
+def binding_for_known_sha(sha256: str) -> _ActiveTableBinding | None:
+    """Look up the :class:`_ActiveTableBinding` for a conversion-table
+    ``sha256`` that is a member of the hand-reviewed
+    :data:`carmel.services.units.TABLES_BY_SHA` registry.
+
+    Returns ``None`` for a sha256 this registry does not recognise -- there
+    is deliberately no fallback to :data:`_ACTIVE` or any other table: a
+    caller that cannot resolve a KNOWN binding for the exact sha it holds
+    must treat that value as UNVERIFIABLE, never re-check it against a
+    different table than the one it actually recorded.
+    """
+    return _BINDINGS_BY_SHA.get(sha256)
 
 
 def ground_quote(
@@ -731,7 +773,7 @@ def ground_quote(
         # out of.
         violation = unit_boundary_violation(text, start, end, value_span=value_span)
         if violation is None:
-            violation = _unit_table_boundary_violation(text, start, end, quantity)
+            violation = _unit_table_boundary_violation(text, start, end, quantity, _ACTIVE)
         # unit_leading_not_maximal and unit_leading_unclassified_char (like
         # their trailing counterparts below) overlap in EFFECT -- both refuse
         # a quote whose edge is not clean -- but differ in DIAGNOSIS: the
