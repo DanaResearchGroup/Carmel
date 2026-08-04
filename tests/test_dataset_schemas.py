@@ -44,6 +44,7 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import semantic_deps
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.extraction_record import _build_identity_payload, compute_extraction_sha
 from carmel.services.numeric import GlyphHealth
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
@@ -72,12 +73,12 @@ _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 """Module-level singleton default for SourceNode.glyph_health, matching
 _NO_ORIGIN's reasoning."""
 
-_NO_DERIVATION_BINDING = Absent(reason=AbsenceReason.UNKNOWN)
-"""Module-level singleton default for ExtractionBinding.derivation_binding,
-matching _NO_ORIGIN's reasoning. Reason is UNKNOWN, not NOT_EXTRACTED_YET:
-see ExtractionBinding.derivation_binding's docstring in carmel/schemas/datasets.py --
-NOT_EXTRACTED_YET promises a remedy (re-run extraction) that provably cannot
-recover this field, since re-extraction is not byte-reproducible."""
+_NO_PYPDF_VERSION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""Module-level singleton default for ExtractionBinding.pypdf_version on a
+non-pypdf extractor, matching _NO_ORIGIN's reasoning. Reason is
+NOT_APPLICABLE: the fixtures' default extractor ("text") folds no pypdf
+version into its identity address at all, so the concept does not apply --
+see ExtractionBinding.pypdf_version's docstring in carmel/schemas/datasets.py."""
 
 _HEALTHY_GLYPH_HEALTH = GlyphHealth(
     suspects_dash_corruption=False,
@@ -91,16 +92,39 @@ _HEALTHY_GLYPH_HEALTH = GlyphHealth(
 def _extraction_binding(
     extracted_sha256: str = SHA_A,
     extracted_text_sha256: str = SHA_B,
-    derivation_binding: Maybe[str] = _NO_DERIVATION_BINDING,
     parent_raw_sha256: str = SHA_A,
-    extraction_sha256: str = SHA_C,
+    extractor: str = "text",
+    extractor_code_sha256: str = SHA_C,
+    pypdf_version: Maybe[str] = _NO_PYPDF_VERSION,
 ) -> ExtractionBinding:
+    """Build a valid, SELF-AUTHENTICATING binding: ``extraction_sha256`` is
+    always COMPUTED from the other identity fields (via the same
+    ``_build_identity_payload``/``compute_extraction_sha`` pair the schema's
+    own validator uses), because an ExtractionBinding whose address does not
+    recompute from its own fields is schema-invalid and cannot be
+    constructed at all. Two calls with the same identity fields therefore
+    produce the same address, and any differing identity field produces a
+    different address -- exactly the store's behaviour."""
+    extraction_sha256 = compute_extraction_sha(
+        _build_identity_payload(
+            identity_payload_version="2",
+            raw_sha256=parent_raw_sha256,
+            extractor=extractor,
+            extractor_code_sha256=extractor_code_sha256,
+            pypdf_version=pypdf_version if isinstance(pypdf_version, str) else "not-applicable",
+            extracted_sha256=extracted_sha256,
+            extracted_text_sha256=extracted_text_sha256,
+        )
+    )
     return ExtractionBinding(
         parent_raw_sha256=parent_raw_sha256,
         extraction_sha256=extraction_sha256,
         extracted_sha256=extracted_sha256,
         extracted_text_sha256=extracted_text_sha256,
-        derivation_binding=derivation_binding,
+        extractor=extractor,
+        extractor_code_sha256=extractor_code_sha256,
+        identity_payload_version="2",
+        pypdf_version=pypdf_version,
     )
 
 
@@ -513,7 +537,10 @@ class TestSourceGraph:
                 extraction_sha256=SHA_C,
                 extracted_sha256="not-a-sha",
                 extracted_text_sha256=SHA_B,
-                derivation_binding=_NO_DERIVATION_BINDING,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=_NO_PYPDF_VERSION,
             )
         with pytest.raises(ValidationError):
             ExtractionBinding(
@@ -521,7 +548,10 @@ class TestSourceGraph:
                 extraction_sha256=SHA_C,
                 extracted_sha256=SHA_A,
                 extracted_text_sha256="not-a-sha",
-                derivation_binding=_NO_DERIVATION_BINDING,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=_NO_PYPDF_VERSION,
             )
 
     def test_extraction_binding_rejects_uppercase_hex(self) -> None:
@@ -531,7 +561,10 @@ class TestSourceGraph:
                 extraction_sha256=SHA_C,
                 extracted_sha256="A" * 64,
                 extracted_text_sha256=SHA_B,
-                derivation_binding=_NO_DERIVATION_BINDING,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=_NO_PYPDF_VERSION,
             )
 
     def test_extraction_binding_rejects_wrong_length_hex(self) -> None:
@@ -541,7 +574,10 @@ class TestSourceGraph:
                 extraction_sha256=SHA_C,
                 extracted_sha256="a" * 63,
                 extracted_text_sha256=SHA_B,
-                derivation_binding=_NO_DERIVATION_BINDING,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=_NO_PYPDF_VERSION,
             )
 
     def test_extraction_binding_round_trips(self) -> None:
@@ -549,7 +585,10 @@ class TestSourceGraph:
         assert binding.extracted_sha256 == SHA_A
         assert binding.extracted_text_sha256 == SHA_B
         assert binding.parent_raw_sha256 == SHA_A
-        assert binding.extraction_sha256 == SHA_C
+        # The address is computed (the binding is self-authenticating), so
+        # the round-trip property to pin is determinism: the same identity
+        # fields always produce the same address.
+        assert binding.extraction_sha256 == _extraction_binding().extraction_sha256
 
     def test_extraction_binding_rejects_bad_hex_parent_raw_sha256(self) -> None:
         """Isolates the shape check on `parent_raw_sha256` specifically:
@@ -562,7 +601,10 @@ class TestSourceGraph:
                 extraction_sha256=SHA_C,
                 extracted_sha256=SHA_A,
                 extracted_text_sha256=SHA_B,
-                derivation_binding=_NO_DERIVATION_BINDING,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=_NO_PYPDF_VERSION,
             )
 
     def test_extraction_binding_rejects_bad_hex_extraction_sha256(self) -> None:
@@ -573,7 +615,10 @@ class TestSourceGraph:
                 extraction_sha256="not-a-sha",
                 extracted_sha256=SHA_A,
                 extracted_text_sha256=SHA_B,
-                derivation_binding=_NO_DERIVATION_BINDING,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=_NO_PYPDF_VERSION,
             )
 
     def test_source_node_rejects_extraction_naming_a_different_parent_raw_sha256(self) -> None:
@@ -591,7 +636,7 @@ class TestSourceGraph:
                 kind=SourceNodeKind.PAPER_PDF,
                 sha256=SHA_A,
                 origin=_NO_ORIGIN,
-                extraction=_extraction_binding(parent_raw_sha256=SHA_B, extraction_sha256=SHA_C),
+                extraction=_extraction_binding(parent_raw_sha256=SHA_B),
                 glyph_health=_NO_GLYPH_HEALTH,
             )
 
@@ -2014,40 +2059,157 @@ class TestModelsAreFrozen:
         assert len(mixture.components) == 1
 
 
-class TestDerivationBindingAbsenceReasonIsConstrained:
-    """The only honest absence reason for ``derivation_binding`` is UNKNOWN.
-
-    ``NOT_EXTRACTED_YET`` is the tempting wrong answer and is rejected on
-    purpose: it names the remedy "re-run extraction and the gap closes", and
-    that remedy provably cannot work for this field. Re-running the extractor
-    is not guaranteed to reproduce byte-identical output, which is precisely
-    why the evidence store never recomputes the digest -- so a legacy
-    artifact's binding is unrecoverable, not merely un-extracted-yet.
-
-    Round-31 review found the docstring asserting this while the validator
-    accepted any reason at all.
+class TestExtractionBindingIsSelfAuthenticating:
+    """Contract (c): an ``ExtractionBinding`` carries every field needed to
+    recompute its own ``extraction_sha256`` (the same named-field identity
+    payload :mod:`carmel.services.extraction_record` hashes at store time),
+    and one whose address does NOT recompute from its own identity fields is
+    SCHEMA-INVALID at construction -- a binding that merely claims an
+    address without being able to authenticate it never comes into
+    existence, so no producer bug or hand-edit can smuggle one into an
+    envelope through validated construction.
     """
 
-    def test_absent_for_unknown_is_accepted(self) -> None:
+    def test_binding_whose_address_recomputes_from_its_own_fields_constructs(self) -> None:
+        address = compute_extraction_sha(
+            _build_identity_payload(
+                identity_payload_version="2",
+                raw_sha256=SHA_A,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                pypdf_version="not-applicable",
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+            )
+        )
         binding = ExtractionBinding(
             parent_raw_sha256=SHA_A,
-            extraction_sha256=SHA_C,
+            extraction_sha256=address,
             extracted_sha256=SHA_A,
             extracted_text_sha256=SHA_B,
-            derivation_binding=Absent(reason=AbsenceReason.UNKNOWN),
+            extractor="text",
+            extractor_code_sha256=SHA_C,
+            identity_payload_version="2",
+            pypdf_version=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
-        assert isinstance(binding.derivation_binding, Absent)
+        assert binding.extraction_sha256 == address
+
+    def test_binding_whose_address_does_not_recompute_is_schema_invalid(self) -> None:
+        """The one and only defect here is the address: every field is
+        individually well-formed (``"0" * 64`` is perfectly valid hex, the
+        extractor vocabulary is honest, pypdf absence matches the
+        extractor), so the ONLY guard that can reject this input is the
+        recompute-and-compare model validator -- and the match below pins
+        that it is the one that fired.
+        """
+        with pytest.raises(ValidationError, match="does not recompute"):
+            ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256="0" * 64,
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+
+    def test_pypdf_version_is_required_for_a_pypdf_dependent_extractor(self) -> None:
+        """extractor="pdf:pypdf" folds the pypdf version into its identity;
+        a binding for one that carries no pypdf_version cannot recompute its
+        own address and is rejected with the requiredness message (matched
+        specifically -- the generic recompute mismatch would be a different
+        failure)."""
+        with pytest.raises(ValidationError, match="pypdf_version must be present"):
+            ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256="0" * 64,
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                extractor="pdf:pypdf",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            )
+
+    def test_pypdf_version_is_forbidden_for_a_non_pypdf_extractor(self) -> None:
+        """The address for extractor="text" ignores pypdf entirely (see
+        _PYPDF_DEPENDENT_EXTRACTORS in carmel.services.extraction_record), so
+        a binding that nonetheless claims a concrete pypdf_version asserts an
+        identity fact its own address provably does not carry. The address
+        below is the CORRECT recomputed one, so the recompute guard passes
+        this input -- only the forbidden-field rule can reject it.
+        """
+        address = compute_extraction_sha(
+            _build_identity_payload(
+                identity_payload_version="2",
+                raw_sha256=SHA_A,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                pypdf_version="5.0.0",
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+            )
+        )
+        with pytest.raises(ValidationError, match="pypdf_version must be Absent"):
+            ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=address,
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version="5.0.0",
+            )
+
+
+class TestPypdfVersionAbsenceReasonIsConstrained:
+    """The only honest absence reason for ``pypdf_version`` is NOT_APPLICABLE.
+
+    Absence here means exactly "this extractor's identity does not involve
+    pypdf at all" -- a structural fact about the extractor, not a gap. Any
+    other reason misdescribes it: ``UNKNOWN`` would claim a version existed
+    but was lost (a binding like that could never recompute its own address
+    and must not exist), and ``NOT_EXTRACTED_YET`` would promise a remedy
+    (re-run extraction) for something that is not missing in the first
+    place. Mirrors the old ``derivation_binding`` absence-reason constraint
+    idiom: an argument only a docstring makes is a comment, not a rule.
+    """
+
+    def test_absent_for_not_applicable_is_accepted(self) -> None:
+        binding = _extraction_binding()
+        assert isinstance(binding.pypdf_version, Absent)
+        assert binding.pypdf_version.reason is AbsenceReason.NOT_APPLICABLE
 
     @pytest.mark.parametrize(
         "reason",
-        [r for r in AbsenceReason if r is not AbsenceReason.UNKNOWN],
+        [r for r in AbsenceReason if r is not AbsenceReason.NOT_APPLICABLE],
     )
     def test_every_other_absence_reason_is_rejected(self, reason: AbsenceReason) -> None:
-        with pytest.raises(ValidationError, match="may only be Absent for reason"):
-            ExtractionBinding(
-                parent_raw_sha256=SHA_A,
-                extraction_sha256=SHA_C,
+        """Every field but ``pypdf_version`` is valid, and the address is
+        the CORRECTLY computed one for the no-pypdf payload, so the only
+        guard that can reject this input is the absence-reason rule --
+        pinned by the match below."""
+        address = compute_extraction_sha(
+            _build_identity_payload(
+                identity_payload_version="2",
+                raw_sha256=SHA_A,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                pypdf_version="not-applicable",
                 extracted_sha256=SHA_A,
                 extracted_text_sha256=SHA_B,
-                derivation_binding=Absent(reason=reason),
+            )
+        )
+        with pytest.raises(ValidationError, match="pypdf_version may only be Absent for reason"):
+            ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=address,
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                extractor="text",
+                extractor_code_sha256=SHA_C,
+                identity_payload_version="2",
+                pypdf_version=Absent(reason=reason),
             )

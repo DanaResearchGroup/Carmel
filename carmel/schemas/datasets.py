@@ -80,6 +80,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationIn
 
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
+from carmel.services.extraction_record import (
+    _PYPDF_DEPENDENT_EXTRACTORS,
+    _build_identity_payload,
+    compute_extraction_sha,
+)
 from carmel.services.numeric import (
     REPAIR_NAMES,
     GlyphHealth,
@@ -532,82 +537,146 @@ class ExtractionBinding(BaseModel):
     """Digest of the stored ``extracted.json`` file's bytes -- the integrity anchor."""
     extracted_text_sha256: str = Field(min_length=64, max_length=64)
     """Digest of ``extracted.text.encode("utf-8")`` as recorded in that ``extracted.json``."""
-    derivation_binding: Maybe[str]
-    """Mirrors :attr:`carmel.schemas.literature.StoredArtifact.derivation_binding`:
-    ``sha256(f"{extractor_version}|{sha256}|{extracted_sha256}")`` as recorded in
-    the evidence store's ``meta.json``, or :class:`Absent` (reason ``UNKNOWN``)
-    for records stored before that field existed.
+    extractor: str = Field(min_length=1)
+    """The extractor string the addressed record claims produced its text
+    (e.g. ``"pdf:pypdf"``, ``"html"``, ``"text"`` -- see
+    :class:`carmel.agents.tools.extract.ExtractedText` for the authoritative
+    vocabulary). Identity-bearing: it is folded into the extraction address,
+    and it decides whether ``pypdf_version`` below is part of that address at
+    all."""
+    extractor_code_sha256: str = Field(min_length=64, max_length=64)
+    """Carmel's own extraction/normalization code identity at the time the
+    addressed record was stored -- see
+    :func:`carmel.services.semantic_deps.current_sha_for` for
+    ``EXTRACT_TEXT_DEPENDENCY_ID``. Identity-bearing (folded into the
+    extraction address)."""
+    identity_payload_version: str = Field(min_length=1)
+    """The identity-payload SHAPE version the addressed record's address was
+    computed under -- see ``_IDENTITY_PAYLOAD_VERSION`` in
+    :mod:`carmel.services.extraction_record`. Carried so the address stays
+    recomputable from this binding alone even after the shape version moves
+    on."""
+    pypdf_version: Maybe[str]
+    """The installed ``pypdf`` version at extraction time, iff ``extractor``
+    is one of the ``pypdf``-dependent extractors named by
+    ``_PYPDF_DEPENDENT_EXTRACTORS`` in
+    :mod:`carmel.services.extraction_record` -- REQUIRED for those extractors
+    (their identity genuinely depends on it) and FORBIDDEN for every other
+    (their address provably does not fold it in, so a binding claiming one
+    would assert an identity fact its own address does not carry; see the
+    model validator below, which mirrors that module's rule rather than
+    inventing a new one).
 
-    DELIBERATELY HAS NO DEFAULT, like every other ``Maybe[...]`` field in this
-    module. A default would silently convert "the producer forgot to carry the
-    binding across" into "this artifact genuinely never had one" -- and those
-    two must stay distinguishable, which is the entire reason :class:`Absent`
-    carries a reason instead of the field being ``| None``. Callers state the
-    absence explicitly or they do not build the binding.
-
-    The reason is ``UNKNOWN``, NOT ``NOT_EXTRACTED_YET``, and the distinction is
-    load-bearing rather than pedantic. ``NOT_EXTRACTED_YET`` names a remedy:
-    re-run extraction and the gap closes. That remedy provably does not exist
-    here. A legacy artifact's derivation binding cannot be recovered by
-    re-extracting, because re-running the extractor is not guaranteed to
-    reproduce byte-identical output -- which is precisely why the store never
-    recomputes this digest (see
-    :attr:`carmel.schemas.literature.StoredArtifact.derivation_binding`). The
-    extractor identity in play when those bytes were stored was never recorded
-    and is unrecoverable, so the fact is genuinely indeterminate: ``UNKNOWN``.
-    Using ``NOT_EXTRACTED_YET`` would promise a fix that no amount of
-    re-extraction can deliver.
-
-    Read exactly what this proves, and no more -- it is NOT proof that
-    ``extracted.json`` was actually re-derived from ``raw.bin``: re-running the
-    extractor is not guaranteed to reproduce byte-identical output, so this
-    digest is never recomputed from a fresh extraction. All it proves is
-    INTERNAL CONSISTENCY of the stored ``meta.json`` record -- that
-    ``extracted_sha256`` was not changed independently of
-    ``derivation_binding`` after the two were bound together at store time. It
-    is no defence against a forger who updates both fields together. Without
-    carrying it here, a replayer wanting to trust the raw-bytes-to-extracted
-    edge would have to trust the mutable, external ``meta.json`` file directly
-    -- outside this dataset's own content address -- for a fact this field lets
-    the dataset assert about itself.
-
-    Deliberately does NOT instead store ``extractor_version`` as a free-form
-    string: that is the anti-pattern :class:`SemanticDependencyUse` replaces
-    elsewhere in this module. ``derivation_binding`` is a single computed
-    digest that already folds extractor identity into itself, so there is no
-    separate free-text field to keep in sync or let drift.
+    DELIBERATELY HAS NO DEFAULT, like every other ``Maybe[...]`` field in
+    this module: "the producer forgot to say" and "the concept does not apply
+    to this extractor" must stay distinguishable, so callers state the
+    absence explicitly (reason ``NOT_APPLICABLE`` -- the only honest reason,
+    enforced below) or they do not build the binding.
     """
 
-    @field_validator("parent_raw_sha256", "extraction_sha256", "extracted_sha256", "extracted_text_sha256")
+    @field_validator(
+        "parent_raw_sha256",
+        "extraction_sha256",
+        "extracted_sha256",
+        "extracted_text_sha256",
+        "extractor_code_sha256",
+    )
     @classmethod
     def _validate_sha256_shape(cls, value: str) -> str:
         if not _SHA256_RE.match(value):
             raise ValueError(f"invalid sha256: {value!r} (expected 64 lowercase hex characters)")
         return value
 
-    @field_validator("derivation_binding")
+    @field_validator("pypdf_version")
     @classmethod
-    def _validate_derivation_binding_shape(cls, value: Maybe[str]) -> Maybe[str]:
+    def _validate_pypdf_version_shape(cls, value: Maybe[str]) -> Maybe[str]:
         if isinstance(value, Absent):
-            # The docstring above argues at length that UNKNOWN is the only
-            # honest reason here and that NOT_EXTRACTED_YET actively lies (it
-            # names the remedy "re-run extraction", which cannot recover this
-            # digest). An argument nothing enforces is a comment, not a rule --
-            # so enforce it. Round-31 review caught that the prose and the code
-            # disagreed, and the prose was the load-bearing-looking half.
-            if value.reason is not AbsenceReason.UNKNOWN:
+            # NOT_APPLICABLE is the only honest reason: an absent
+            # pypdf_version on a valid binding means exactly "this
+            # extractor's identity does not involve pypdf" (the model
+            # validator below rejects absence outright for the
+            # pypdf-dependent extractors). UNKNOWN would claim the version
+            # existed but was lost -- a binding like that could never
+            # recompute its own address and must not exist at all.
+            if value.reason is not AbsenceReason.NOT_APPLICABLE:
                 raise ValueError(
-                    f"derivation_binding may only be Absent for reason {AbsenceReason.UNKNOWN.value!r}, "
-                    f"not {value.reason.value!r}: a stored artifact either recorded this digest or "
-                    "predates the field entirely, and in the latter case the extractor identity in "
-                    "play at store time is unrecoverable -- re-extraction is not byte-reproducible, "
-                    "which is exactly why the evidence store never recomputes it. Any other reason "
-                    "claims a remedy that does not exist"
+                    f"pypdf_version may only be Absent for reason "
+                    f"{AbsenceReason.NOT_APPLICABLE.value!r}, not {value.reason.value!r}: absence "
+                    "here means the extractor's identity does not involve pypdf at all, never that "
+                    "a version existed but went unrecorded"
                 )
             return value
-        if not _SHA256_RE.match(value):
-            raise ValueError(f"invalid derivation_binding: {value!r} (expected 64 lowercase hex characters)")
+        if not value:
+            raise ValueError("pypdf_version, when present, must be a non-empty string")
         return value
+
+    @model_validator(mode="after")
+    def _validate_extraction_sha256_recomputes_from_identity_fields(self) -> ExtractionBinding:
+        """This binding is SELF-AUTHENTICATING: it carries every field that
+        :func:`carmel.services.extraction_record.compute_extraction_sha`
+        folds into an extraction record's content address, and this
+        validator recomputes that address (via the same
+        ``_build_identity_payload``/``compute_extraction_sha`` pair the
+        store itself uses -- never a second implementation that could
+        drift) and requires it to equal ``extraction_sha256``. A binding
+        that merely CLAIMS an address it cannot recompute from its own
+        identity fields never comes into existence, so a replayer can trust
+        the binding's identity fields to be exactly the ones hashed into
+        the address it resolves.
+        """
+        if self.extractor in _PYPDF_DEPENDENT_EXTRACTORS:
+            if isinstance(self.pypdf_version, Absent):
+                raise ValueError(
+                    f"pypdf_version must be present for extractor {self.extractor!r}: that "
+                    "extractor's identity depends on the installed pypdf version, so an address "
+                    "computed without one is not recomputable and the binding cannot authenticate "
+                    "itself"
+                )
+            pypdf_version = self.pypdf_version
+        else:
+            if not isinstance(self.pypdf_version, Absent):
+                raise ValueError(
+                    f"pypdf_version must be Absent (reason "
+                    f"{AbsenceReason.NOT_APPLICABLE.value!r}) for extractor {self.extractor!r}: "
+                    "that extractor's address does not fold a pypdf version in (see "
+                    "_PYPDF_DEPENDENT_EXTRACTORS in carmel.services.extraction_record), so a "
+                    "concrete value here would be an identity claim the address provably does not "
+                    "carry"
+                )
+            # _build_identity_payload drops pypdf_version from the payload
+            # entirely for a non-pypdf-dependent extractor, so this
+            # placeholder provably never reaches the hashed payload -- it
+            # only satisfies the helper's signature.
+            pypdf_version = "not-applicable"
+        try:
+            recomputed = compute_extraction_sha(
+                _build_identity_payload(
+                    identity_payload_version=self.identity_payload_version,
+                    raw_sha256=self.parent_raw_sha256,
+                    extractor=self.extractor,
+                    extractor_code_sha256=self.extractor_code_sha256,
+                    pypdf_version=pypdf_version,
+                    extracted_sha256=self.extracted_sha256,
+                    extracted_text_sha256=self.extracted_text_sha256,
+                )
+            )
+        except ValueError as exc:
+            # Includes UnknownPypdfVersionError: a pdf:pypdf binding whose
+            # pypdf_version is the "could not determine" sentinel can never
+            # authenticate and is refused an existence, mirroring
+            # store_extraction_record's own refusal to mint such an address.
+            raise ValueError(
+                f"ExtractionBinding's identity fields do not form an addressable extraction "
+                f"identity payload: {exc}"
+            ) from exc
+        if recomputed != self.extraction_sha256:
+            raise ValueError(
+                f"extraction_sha256={self.extraction_sha256!r} does not recompute from this "
+                f"binding's own identity fields (recomputed {recomputed!r}); a binding that cannot "
+                "authenticate its own address must never exist -- either the address or the "
+                "identity fields are wrong, and there is no way to say which"
+            )
+        return self
 
 
 class GlyphHealthAssessment(BaseModel):
@@ -901,7 +970,7 @@ class CharSpanLocator(BaseModel):
     DELIBERATELY HAS NO DEFAULT, like every other field in this module for
     which "the producer forgot to say" and "the producer positively meant
     this" must stay distinguishable (see
-    :attr:`ExtractionBinding.derivation_binding`'s docstring for the same
+    :attr:`ExtractionBinding.pypdf_version`'s docstring for the same
     argument made at length). :class:`TextSpace` has exactly one member
     today, so no caller can choose WRONG -- but a default would mean that
     once a second space is added, every producer that simply forgot to say
@@ -1173,17 +1242,18 @@ class SourceGraph(BaseModel):
         # I5c: two nodes that name the SAME extraction address -- the pair
         # (extraction.parent_raw_sha256, extraction.extraction_sha256) -- must
         # agree on their whole ExtractionBinding, when both have one present.
-        # The evidence store now allows MANY extraction records per raw-bytes
-        # directory (see carmel.services.extraction_record:
+        # This is the STRICTER within-one-graph case: even when two nodes
+        # agree on which extraction record they are naming (see
+        # carmel.services.extraction_record:
         # evidence/literature/<raw sha256>/extractions/<extraction sha256>/
-        # {extracted.json,text.txt,meta.json}), so two nodes that merely SHARE
-        # a raw sha256 while naming DIFFERENT extraction_sha256 values are no
-        # longer a conflict: each addresses its own independently-resolvable
-        # extraction record, and both can be verified on their own terms.
-        # What remains a conflict is two nodes naming the IDENTICAL extraction
-        # address while disagreeing on the binding recorded for it -- at most
-        # one of two disagreeing bindings for the same address can match what
-        # is actually stored there, so the other is guaranteed unresolvable.
+        # {extracted.json,text.txt,meta.json}), they must also agree on what
+        # that record actually contains -- at most one of two disagreeing
+        # bindings for the same address can match what is actually stored
+        # there, so the other is guaranteed unresolvable by any replayer.
+        # (Whether two nodes may name DIFFERENT extraction addresses for the
+        # SAME raw sha256 at all is a separate question, answered NO within
+        # one graph -- see I5d below, which is the actual guard for that
+        # case.)
         # This compares the WHOLE ExtractionBinding via `==` (the model is
         # frozen, so this is value equality over every field) rather than
         # field-by-field, so that a future field added to ExtractionBinding is
@@ -1215,14 +1285,85 @@ class SourceGraph(BaseModel):
                 continue
             extraction_by_address[address] = (node.node_id, node.extraction)
 
+        # I5d: all PRESENT ExtractionBindings within this one SourceGraph
+        # that share a parent_raw_sha256 must name the SAME extraction_sha256.
+        #
+        # This is deliberately narrower than "the evidence store may hold
+        # many extraction records per raw document" (see I5c above) -- that
+        # breadth is a property of the STORE ACROSS TIME: a pypdf upgrade, or
+        # a change to Carmel's own extraction code, mints a new extraction
+        # record beside an older one for the same raw bytes, and every
+        # docstring in this codebase that justifies multiple extraction
+        # records per raw sha256 makes exactly that temporal-supersession
+        # argument. A single SourceGraph is not the store across time -- it
+        # is the output of ONE producer run against ONE extraction of each
+        # raw document. If two nodes in that one graph name the same
+        # parent_raw_sha256 but DIFFERENT extraction_sha256 values, they are
+        # claiming this graph's evidence for that document was read from two
+        # different texts. A CharSpanLocator's offsets index into the
+        # extracted text identified by extraction_sha256, not into the raw
+        # bytes -- so two different extraction addresses for one raw
+        # document mean their character offsets index into two DIFFERENT
+        # texts. An envelope could then carry two claims, each individually
+        # "verified" against its own extraction address, that are
+        # nonetheless grounded in mutually inconsistent readings of the same
+        # underlying document. That is not the legal
+        # independently-resolvable-extraction-record case I5c's address
+        # keying protects; it is a coherence violation this graph must
+        # reject.
+        #
+        # A previous change re-keyed I5c onto the (raw sha256,
+        # extraction_sha256) pair and, in doing so, made "same raw bytes,
+        # different extraction addresses" legal *within one graph* -- that
+        # was over-broad: it imported the store's cross-time breadth into a
+        # single graph, where it does not belong. This invariant restores
+        # what the original single-extraction-per-raw-sha256 check actually
+        # protected, with the correct justification this time.
+        #
+        # Absent extractions do not participate: silence is not a
+        # contradiction, exactly as I5c (above) and I5b (below) do not treat
+        # an Absent extraction/glyph_health as disagreeing with anything.
+        # This is SEPARATE from, and composes with, I5c's same-address
+        # full-binding equality check above: I5c fires when two nodes name
+        # the IDENTICAL address and disagree on its contents; I5d fires when
+        # two nodes name DIFFERENT addresses for the same raw document at
+        # all, regardless of what their bindings say.
+        extraction_sha_by_raw_sha: dict[str, tuple[str, str]] = {}
+        for node in self.nodes:
+            if isinstance(node.extraction, Absent):
+                continue
+            raw_sha256 = node.extraction.parent_raw_sha256
+            extraction_sha256 = node.extraction.extraction_sha256
+            if raw_sha256 in extraction_sha_by_raw_sha:
+                other_node_id, other_extraction_sha256 = extraction_sha_by_raw_sha[raw_sha256]
+                if other_extraction_sha256 != extraction_sha256:
+                    raise ValueError(
+                        f"node {node.node_id!r} and node {other_node_id!r} both name raw document "
+                        f"parent_raw_sha256={raw_sha256!r} but recorded DIFFERENT extraction_sha256 "
+                        f"values ({extraction_sha256!r} vs {other_extraction_sha256!r}) within this "
+                        "one SourceGraph; a CharSpanLocator's offsets index into the text identified "
+                        "by extraction_sha256, so two extraction addresses for one raw document mean "
+                        "an envelope could carry two claims each individually 'verified' against "
+                        "mutually inconsistent readings of the same document -- this is a CONFLICT, "
+                        "not the legal cross-time case of many extraction records for one raw "
+                        "document (that breadth belongs to the evidence store across time, not to a "
+                        "single graph produced by one producer run)"
+                    )
+                continue
+            extraction_sha_by_raw_sha[raw_sha256] = (node.node_id, extraction_sha256)
+
         # I5b: two nodes that name the SAME extraction address (see I5c
         # above) must agree on glyph health, if both have any recorded. The
         # health assessment describes THE EXTRACTED TEXT that address names,
-        # not the raw bytes it was derived from -- so two nodes that merely
-        # SHARE a raw sha256 while naming DIFFERENT extraction addresses may
-        # legitimately disagree (they are assessments of different extracted
-        # text, e.g. a re-extraction under a newer pypdf). Keying this on the
-        # extraction address rather than raw sha256 is safe: `SourceNode.
+        # not the raw bytes it was derived from. (Two nodes sharing a raw
+        # sha256 while naming DIFFERENT extraction addresses -- which would
+        # let them legitimately disagree, since they'd be assessments of
+        # different extracted text -- cannot occur within one graph at all:
+        # I5d below forbids that combination outright. So by the time this
+        # loop runs, any two nodes sharing a raw sha256 are already known to
+        # share one extraction address too, and keying on the extraction
+        # address here is equivalent to keying on the raw sha256.) Keying
+        # this on the extraction address rather than raw sha256 is safe: `SourceNode.
         # _validate_glyph_health_binds_to_this_nodes_extraction` already
         # guarantees `extraction` is present whenever `glyph_health` is, so
         # every node reaching this loop with a glyph_health also has an
@@ -3138,7 +3279,10 @@ def _extraction_binding_identity_payload(binding: ExtractionBinding) -> dict[str
         "extraction_sha256": binding.extraction_sha256,
         "extracted_sha256": binding.extracted_sha256,
         "extracted_text_sha256": binding.extracted_text_sha256,
-        "derivation_binding": _project_maybe(binding.derivation_binding),
+        "extractor": binding.extractor,
+        "extractor_code_sha256": binding.extractor_code_sha256,
+        "identity_payload_version": binding.identity_payload_version,
+        "pypdf_version": _project_maybe(binding.pypdf_version),
     }
 
 

@@ -98,8 +98,10 @@ from carmel.services.dataset_store import (
 )
 from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_artifact
 from carmel.services.extraction_record import (
+    _PYPDF_DEPENDENT_EXTRACTORS,
     ExtractionRecordError,
     UnknownPypdfVersionError,
+    load_extraction_record,
     store_extraction_record,
 )
 from carmel.services.numeric import (
@@ -1139,10 +1141,10 @@ _CONTENT_TYPE_TO_NODE_KIND: dict[str, SourceNodeKind] = {
 
 def _load_verified_extracted_text(
     workspace_root: Path, sha256: str
-) -> tuple[ExtractedText, str, str, str, bytes]:
+) -> tuple[ExtractedText, str, str, bytes]:
     """Resolve, verify, and parse the stored extraction for ``sha256``.
 
-    Returns ``(extracted, extracted_sha256, derivation_binding, content_type,
+    Returns ``(extracted, extracted_sha256, content_type,
     raw_bytes)``, where ``raw_bytes`` is the exact, already-verified
     ``extracted.json`` bytes read from disk -- returned so a caller that needs
     to re-address this same extraction (e.g. via
@@ -1192,11 +1194,8 @@ def _load_verified_extracted_text(
        one that predates ``derivation_binding`` but does carry
        ``extracted_sha256``. round-36: this carve-out's raise means
        :func:`produce_envelope_from_artifact` is never even reached for such
-       an artifact -- an earlier version of this docstring described that
-       function as handling this case "below via ``AbsenceReason.UNKNOWN``",
-       which was never true: the ``None`` this function's own return type
-       still admits for ``derivation_binding`` is unreachable in practice,
-       because every path that would produce it raises first, right here.
+       an artifact -- every path that would otherwise let a legacy artifact
+       through raises first, right here.
     4. :func:`carmel.services.evidence.verify_artifact` with ``deep=True``:
        confirms ``raw.bin`` exists and hashes to ``sha256`` (the parameter),
        that ``extracted.json`` matches its recorded digest (the same check
@@ -1206,10 +1205,12 @@ def _load_verified_extracted_text(
        ``derivation_binding`` (checks 2 above ran first) -- that the recorded
        ``derivation_binding`` is internally consistent: recomputed from
        ``meta.json``'s own ``extractor_version``/``sha256``/``extracted_sha256``
-       fields, it still matches the recorded value. That closes the gap this
-       function used to leave open: ``derivation_binding`` is carried verbatim
-       into the produced envelope (see ``produce_envelope_from_artifact``
-       below), so it is worth re-checking rather than trusted blind.
+       fields, it still matches the recorded value. ``derivation_binding`` is
+       NOT carried into the produced envelope (the envelope's
+       ``ExtractionBinding`` authenticates the extraction-record store's own
+       identity fields instead -- see ``produce_envelope_from_artifact``
+       below); this deep check remains purely as an integrity gate on the
+       legacy evidence store this producer reads its input from.
 
        Read exactly what this buys, and no more -- quoting
        :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding`'s
@@ -1300,7 +1301,7 @@ def _load_verified_extracted_text(
         raise DatasetProducerError(
             f"artifact {sha256!r}: verified {_EXTRACTED_NAME} bytes do not parse as an ExtractedText: {exc}"
         ) from exc
-    return extracted, meta.extracted_sha256, meta.derivation_binding, meta.content_type, raw_bytes
+    return extracted, meta.extracted_sha256, meta.content_type, raw_bytes
 
 
 def produce_envelope_from_artifact(
@@ -1375,7 +1376,7 @@ def produce_envelope_from_artifact(
                 "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
             )
 
-    extracted, extracted_sha256, derivation_binding, content_type, extracted_json_bytes = (
+    extracted, extracted_sha256, content_type, extracted_json_bytes = (
         _load_verified_extracted_text(workspace_root, sha256)
     )
     if extracted.lossy:
@@ -1413,19 +1414,6 @@ def produce_envelope_from_artifact(
     # this closes.
     document_source_context = _source_context_for(extracted)
     document_glyph_health = assess_glyph_health(text)
-    # CRITICAL: hash extracted.text (the field inside the verified, parsed
-    # ExtractedText), NEVER text.txt on disk -- text.txt is presence-checked
-    # only, never digest-checked (see ExtractionBinding.extracted_text_sha256's
-    # docstring), so a digest of it would be anchored to the one unverified
-    # file in the store.
-    extracted_text_sha256 = hashlib.sha256(extracted.text.encode("utf-8")).hexdigest()
-    # round-36: no Absent(reason=AbsenceReason.UNKNOWN) branch belongs here.
-    # _load_verified_extracted_text already raises DatasetProducerError for
-    # any artifact whose meta.derivation_binding is None (the legacy
-    # carve-out at its own "predates derivation_binding" check) -- this
-    # function is never reached for such an artifact at all, so
-    # derivation_binding here is always the verified str the type says it is.
-    #
     # ExtractionBinding.parent_raw_sha256/extraction_sha256 must name a
     # genuinely RESOLVABLE extraction record, not merely a computed address
     # that resolves to nothing on disk -- a replayer handed an address with
@@ -1464,12 +1452,39 @@ def produce_envelope_from_artifact(
             f"artifact {sha256!r}: could not durably store a resolvable extraction record for its "
             f"extracted.json: {exc}"
         ) from exc
+    # The binding's identity fields are populated from what the store
+    # ACTUALLY stored -- the record is loaded back (which self-authenticates
+    # its meta.json against the address store_extraction_record just
+    # returned), never re-asserted from this function's local variables. An
+    # ExtractionBinding recomputes its own extraction_sha256 from these
+    # fields at construction, so building it from the authenticated record
+    # guarantees the binding recomputes to the address the store returned;
+    # inventing any value here would make the binding schema-invalid, loudly.
+    record_meta = load_extraction_record(workspace_root, sha256, extraction_sha256)
+    if record_meta is None:
+        raise DatasetProducerError(
+            f"artifact {sha256!r}: store_extraction_record returned extraction address "
+            f"{extraction_sha256!r}, but no self-authenticating record resolves at that address; "
+            "the extraction record store is inconsistent and no binding can honestly be produced"
+        )
     binding = ExtractionBinding(
-        parent_raw_sha256=sha256,
-        extraction_sha256=extraction_sha256,
-        extracted_sha256=extracted_sha256,
-        extracted_text_sha256=extracted_text_sha256,
-        derivation_binding=derivation_binding,
+        parent_raw_sha256=record_meta.parent_raw_sha256,
+        extraction_sha256=record_meta.extraction_sha256,
+        extracted_sha256=record_meta.extracted_sha256,
+        extracted_text_sha256=record_meta.extracted_text_sha256,
+        extractor=record_meta.extractor,
+        extractor_code_sha256=record_meta.extractor_code_sha256,
+        identity_payload_version=record_meta.identity_payload_version,
+        pypdf_version=(
+            record_meta.pypdf_version
+            if record_meta.extractor in _PYPDF_DEPENDENT_EXTRACTORS
+            # For every other extractor the record's pypdf_version is a
+            # diagnostics-only field that is not part of the identity
+            # address; the binding states the inapplicability explicitly
+            # rather than carrying an identity claim the address does not
+            # fold in.
+            else Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        ),
     )
     root_node = SourceNode(
         node_id=_ROOT_NODE_ID,

@@ -217,7 +217,7 @@ from carmel.services.dataset_producer import (
     _unit_table_boundary_violation,
     binding_for_known_sha,
 )
-from carmel.services.evidence import _derivation_binding, artifact_dir, load_artifact_meta
+from carmel.services.evidence import artifact_dir
 from carmel.services.extraction_record import (
     ExtractionRecordError,
     extraction_record_dir,
@@ -387,6 +387,48 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             f"{node.node_id!r} at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
             f"extraction_sha256={extraction.extraction_sha256!r})",
         )
+    # The addressed record is present and self-authenticated to its own
+    # address; now cross-check the identity fields the ENVELOPE carries
+    # against the ones the RECORD recorded at store time. Both sides
+    # recompute to the same content address in the honest case, so a
+    # disagreement here is positive evidence that one of them was altered
+    # outside validated construction (a forged envelope field, a
+    # hand-edited record) -- the record exists and was readable throughout,
+    # so this is FAILED, never inability-to-check. ``pypdf_version`` is
+    # compared only when the binding carries one (i.e. for the
+    # pypdf-dependent extractors): for every other extractor the record's
+    # ``pypdf_version`` is a diagnostics-only field that is deliberately
+    # NOT part of the identity address (see ``_records_identical`` and
+    # ``_build_identity_payload`` in carmel.services.extraction_record), so
+    # comparing it would fail closed on a routine pypdf upgrade that
+    # legitimately cannot change the record's identity.
+    binding_identity: dict[str, str] = {
+        "extractor": extraction.extractor,
+        "extractor_code_sha256": extraction.extractor_code_sha256,
+        "identity_payload_version": extraction.identity_payload_version,
+    }
+    record_identity: dict[str, str] = {
+        "extractor": record_meta.extractor,
+        "extractor_code_sha256": record_meta.extractor_code_sha256,
+        "identity_payload_version": record_meta.identity_payload_version,
+    }
+    if not isinstance(extraction.pypdf_version, Absent):
+        binding_identity["pypdf_version"] = extraction.pypdf_version
+        record_identity["pypdf_version"] = record_meta.pypdf_version
+    if binding_identity != record_identity:
+        disagreeing = sorted(k for k in binding_identity if binding_identity[k] != record_identity[k])
+        return None, ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path,
+            reason=f"node {node.node_id!r}'s ExtractionBinding identity fields "
+            f"({', '.join(disagreeing)}) disagree with the stored extraction record's own meta.json "
+            f"at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+            f"extraction_sha256={extraction.extraction_sha256!r}) -- the envelope's carried "
+            "extractor identity was never the one hashed into the record it addresses; one of the "
+            "two was altered outside validated construction",
+            expected=repr({k: record_identity[k] for k in disagreeing}),
+            actual=repr({k: binding_identity[k] for k in disagreeing}),
+        )
     extracted_path = extraction_record_dir(
         workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
     ) / "extracted.json"
@@ -498,65 +540,6 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             "rather than silently reconciled",
             expected=actual_text_sha256,
             actual=record_meta.extracted_text_sha256,
-        )
-    if isinstance(extraction.derivation_binding, Absent):
-        # A legacy record predating ExtractionBinding.derivation_binding (or
-        # one explicitly stripped) carries nothing to cross-check the
-        # extractor identity against. This is inability-to-check, not
-        # positive evidence of anything wrong -- UNVERIFIABLE, not FAILED.
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"node {node.node_id!r}'s ExtractionBinding carries no derivation_binding "
-            "(Absent, e.g. a legacy record predating that field); there is nothing recorded to "
-            "independently cross-check the extractor identity binding against",
-        )
-    # This cross-check is orthogonal to the extraction-record verification
-    # above: derivation_binding was bound at store time against the OLD,
-    # single-extraction-per-raw-sha evidence store's own meta.json (see
-    # dataset_producer._load_verified_extracted_text and
-    # evidence._derivation_binding), not against the extraction record. It
-    # is re-loaded here, independently, by node.sha256 (the raw artifact),
-    # never by the extraction address.
-    raw_meta = load_artifact_meta(workspace_root, node.sha256)
-    if raw_meta is None or raw_meta.extractor_version is None or raw_meta.extracted_sha256 is None:
-        return None, ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"evidence store meta.json for node {node.node_id!r} (sha256={node.sha256!r}) is "
-            "missing, or predates extractor_version/extracted_sha256, so the envelope's carried "
-            "derivation_binding cannot be independently recomputed and cross-checked",
-        )
-    # Recompute using meta.json's OWN FROZEN extractor_version -- the
-    # identity string `_extractor_identity()` computed and stored ONCE, at
-    # store time -- rather than calling `_extractor_identity()` live here.
-    # A live call would fold in whatever pypdf version happens to be
-    # installed on the machine doing the replaying right now; pypdf is
-    # unpinned in this project (`pypdf>=5.0`), so that version string can
-    # legitimately differ from what was installed when the envelope was
-    # produced. Requiring live-recomputed bit-for-bit equality would fail
-    # closed on a routine pypdf upgrade -- indistinguishable from tampering
-    # -- and would also fail every legacy artifact stored with
-    # extractor_version=None. Reusing the frozen meta.extractor_version
-    # avoids both traps, at the cost of only proving what
-    # ExtractionBinding.derivation_binding's own docstring says it proves:
-    # internal consistency between the envelope's carried binding and the
-    # store's current record -- NOT that extracted.json was actually
-    # re-derived from raw.bin, and no defence against a forger who updates
-    # all three fields together. See evidence._derivation_binding_intact,
-    # which this mirrors but against the envelope's carried value instead
-    # of only meta.json's own internal fields.
-    recomputed_binding = _derivation_binding(raw_meta.sha256, raw_meta.extracted_sha256, raw_meta.extractor_version)
-    if recomputed_binding != extraction.derivation_binding:
-        return None, ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"node {node.node_id!r}'s ExtractionBinding.derivation_binding="
-            f"{extraction.derivation_binding!r} does not match sha256(extractor_identity|raw_sha256|"
-            f"extracted_sha256) recomputed from evidence store meta.json ({recomputed_binding!r}) -- "
-            "the envelope's carried binding disagrees with the store's own record",
-            expected=recomputed_binding,
-            actual=extraction.derivation_binding,
         )
     return extracted.text, None
 

@@ -30,10 +30,13 @@ from carmel.schemas.datasets import (
     Absent,
     AxisRole,
     CharSpanLocator,
+    DatasetEnvelope,
     ExtractionBinding,
     LocatorKind,
     MeasuredValue,
     SemanticDependencyUse,
+    SourceNode,
+    SourceNodeKind,
     SourceRef,
     TextSpace,
     ValueOrigin,
@@ -43,7 +46,10 @@ from carmel.schemas.literature import StoredArtifact
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
 from carmel.services.dataset_producer import MeasurementSpec, produce_envelope_from_artifact
 from carmel.services.dataset_replay import (
+    ReplayFinding,
     ReplayOutcome,
+    _independently_verify_node_text,
+    check_char_spans,
     replay_envelope,
     verify_measured_value_unit,
     verify_measured_value_unit_boundary,
@@ -446,11 +452,21 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
     """
 
     def test_meta_json_sidecar_rewrite_does_not_launder_a_verified_result(self, tmp_path: Path) -> None:
-        stored_artifact, loaded = _produce_and_load(tmp_path)
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
         assert clean_report.outcome is ReplayOutcome.VERIFIED
 
-        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
+        # Tamper with the files replay actually reads: the ADDRESSED
+        # extraction record's extracted.json and the meta.json sidecar
+        # right next to it (the root evidence store's copies are no longer
+        # an input to replay at all -- see
+        # TestReplayVerifiesAgainstTheRecordNotTheRootSidecar).
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        record_dir = extraction_record_dir(
+            tmp_path, node.extraction.parent_raw_sha256, node.extraction.extraction_sha256
+        )
+        extracted_path = record_dir / "extracted.json"
         raw_bytes = extracted_path.read_bytes()
         extracted = ExtractedText.model_validate(json.loads(raw_bytes))
 
@@ -472,10 +488,22 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
         assert forged_bytes != raw_bytes
         extracted_path.write_bytes(forged_bytes)
 
-        # Patch meta.json's extracted_sha256 to match the forged bytes, so
-        # a replayer that (wrongly) anchors on the mutable sidecar sees a
-        # self-consistent record.
-        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        # First, with the record's meta.json sidecar UNTOUCHED (it still
+        # authenticates to its address): the envelope's own
+        # ExtractionBinding.extracted_sha256 anchor must catch the rewrite
+        # as a definite FAILED, naming the anchor.
+        report = replay_envelope(tmp_path, loaded)
+        assert report.outcome is ReplayOutcome.FAILED
+        assert any("ExtractionBinding.extracted_sha256" in f.reason for f in report.failures)
+
+        # Then patch the record's meta.json extracted_sha256 to match the
+        # forged bytes, so a replayer that (wrongly) anchored on the
+        # mutable sidecar would see a self-consistent record. The record's
+        # digest fields are folded into its own content ADDRESS, so the
+        # patched sidecar no longer authenticates to the address the
+        # envelope names -- the record becomes unresolvable (UNVERIFIABLE),
+        # and no combination of sidecar edits can ever launder VERIFIED.
+        meta_path = record_dir / "meta.json"
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         meta["extracted_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
@@ -487,7 +515,7 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
             "the only acceptable anchor"
         )
         assert any(
-            "extracted_sha256" in f.reason or "extracted.json" in f.reason
+            "does not authenticate" in f.reason or "extracted_sha256" in f.reason or "extracted.json" in f.reason
             for f in (report.failures + report.unverifiable)
         )
 
@@ -1133,22 +1161,107 @@ class TestReplayEnvelopeChecksLossyExtraction:
         assert any("lossy" in f.reason and "1 page" in f.reason for f in report.unverifiable)
 
 
-class TestReplayEnvelopeVerifiesDerivationBinding:
-    """``ExtractionBinding.derivation_binding`` was carried on every node but
-    replay never looked at it at all: a forged or rolled-back
-    ``derivation_binding`` -- or one simply Absent, as on a legacy record --
-    was invisible to replay as long as the text digests still matched.
+class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
+    """The addressed extraction record is self-authenticating: its own
+    ``meta.json`` must recompute to the address it is stored under, and the
+    envelope's ``ExtractionBinding`` carries every identity field needed to
+    recompute that same address. The ROOT ``evidence/literature/<raw_sha>/
+    meta.json`` sidecar is therefore not consulted by replay at all -- it
+    proves only that a mutable sidecar agrees with itself, never anything
+    about the addressed record. These tests pin both directions of that
+    contract: a perfect record must VERIFY with the root sidecar gone
+    (contract a), and no mutation of the root sidecar may move the outcome
+    (contract d).
     """
 
-    def test_replay_fails_when_carried_derivation_binding_disagrees_with_the_store(self, tmp_path: Path) -> None:
+    def test_replay_verifies_when_root_meta_json_is_missing(self, tmp_path: Path) -> None:
+        """Contract (a): the nested record is present, self-authenticating,
+        and agrees with the envelope on every digest -- deleting the ROOT
+        sidecar removes nothing replay legitimately needs, so the outcome
+        must be VERIFIED with no findings at all (not UNVERIFIABLE: nothing
+        replay checks is missing). raw.bin stays in place, so the only thing
+        that could turn this input non-VERIFIED is a replay-side dependence
+        on the root sidecar itself -- the exact dependence this test exists
+        to keep out.
+        """
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        root_meta_path.unlink()
+
+        report = replay_envelope(tmp_path, loaded)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.findings == ()
+
+    def test_replay_outcome_is_unmoved_by_a_tampered_root_meta_json(self, tmp_path: Path) -> None:
+        """Contract (d), tamper flavour: rewrite the root sidecar's own
+        identity claims (extractor_version, derivation_binding) to garbage
+        that would have FAILED the old root-derived cross-check. The
+        addressed record and the envelope are untouched, so the outcome must
+        remain VERIFIED with no findings -- the root sidecar is not part of
+        what an envelope asserts about itself.
+        """
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        assert replay_envelope(tmp_path, loaded).outcome is ReplayOutcome.VERIFIED
+
+        root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        raw_meta = json.loads(root_meta_path.read_text(encoding="utf-8"))
+        raw_meta["extractor_version"] = "forged-extractor-identity"
+        raw_meta["derivation_binding"] = "0" * 64
+        root_meta_path.write_text(json.dumps(raw_meta), encoding="utf-8")
+
+        report = replay_envelope(tmp_path, loaded)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.findings == ()
+
+    def test_replay_outcome_is_unmoved_by_an_unparseable_root_meta_json(self, tmp_path: Path) -> None:
+        """Contract (d), corruption flavour: the root sidecar is not even
+        JSON any more. A replayer that still consulted it would crash or
+        report UNVERIFIABLE; one that honestly ignores it must still return
+        VERIFIED with no findings.
+        """
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        assert replay_envelope(tmp_path, loaded).outcome is ReplayOutcome.VERIFIED
+
+        root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
+        root_meta_path.write_bytes(b"\x00not json at all")
+
+        report = replay_envelope(tmp_path, loaded)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.findings == ()
+
+
+class TestReplayCrossChecksRecordIdentityAgainstTheBinding:
+    """Contract (b): the envelope's ``ExtractionBinding`` and the stored
+    record's ``meta.json`` each claim the extractor identity that produced
+    the extraction; replay must cross-check the two and report a definite
+    disagreement as FAILED -- the record is present and readable, so this is
+    never inability-to-check (UNVERIFIABLE).
+    """
+
+    def test_replay_fails_when_binding_extractor_code_sha256_disagrees_with_the_record(
+        self, tmp_path: Path
+    ) -> None:
+        """The binding's ``extractor_code_sha256`` is forged (via
+        ``model_copy``, which bypasses schema validation exactly like a
+        producer bug or a hand-edited envelope would) while
+        ``extraction_sha256`` still addresses the real stored record. Every
+        guard ahead of the identity cross-check passes on this input:
+        raw.bin verifies, the record self-authenticates at its own address,
+        extracted.json matches ``extracted_sha256``, and the text matches
+        ``extracted_text_sha256`` -- only the identity cross-check can
+        reject it, and it must say FAILED (the record exists and disagrees;
+        the operator remedy is an integrity investigation, not a re-fetch).
+        """
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         node = loaded.source_graph.node("paper")
         assert not isinstance(node.extraction, Absent)
-        assert not isinstance(node.extraction.derivation_binding, Absent)
 
-        bogus_binding = "0" * 64
-        assert bogus_binding != node.extraction.derivation_binding
-        patched_extraction = node.extraction.model_copy(update={"derivation_binding": bogus_binding})
+        forged_code_sha = "0" * 64
+        assert forged_code_sha != getattr(node.extraction, "extractor_code_sha256", None)
+        patched_extraction = node.extraction.model_copy(update={"extractor_code_sha256": forged_code_sha})
         patched_node = node.model_copy(update={"extraction": patched_extraction})
         patched_nodes = tuple(patched_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
         patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})
@@ -1157,22 +1270,492 @@ class TestReplayEnvelopeVerifiesDerivationBinding:
         report = replay_envelope(tmp_path, tampered)
 
         assert report.outcome is ReplayOutcome.FAILED
-        assert any("derivation_binding" in f.reason for f in report.failures)
+        assert any("extractor_code_sha256" in f.reason for f in report.failures)
+        # The record was present and readable throughout -- nothing about
+        # this input is inability-to-check.
+        assert not any("extractor_code_sha256" in f.reason for f in report.unverifiable)
 
-    def test_replay_is_unverifiable_when_no_derivation_binding_is_carried(self, tmp_path: Path) -> None:
+    def test_replay_fails_when_binding_pypdf_version_disagrees_with_the_record(self, tmp_path: Path) -> None:
+        """Same contract, for the pypdf-dependent identity half: the
+        synthetic artifact is stored with extractor="pdf:pypdf", so the
+        record's identity includes the pypdf version that ran, and a binding
+        claiming a different one is a definite disagreement -- FAILED.
+        """
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         node = loaded.source_graph.node("paper")
         assert not isinstance(node.extraction, Absent)
 
-        legacy_extraction = node.extraction.model_copy(
-            update={"derivation_binding": Absent(reason=AbsenceReason.UNKNOWN)}
+        patched_extraction = node.extraction.model_copy(update={"pypdf_version": "0.0.0-forged"})
+        patched_node = node.model_copy(update={"extraction": patched_extraction})
+        patched_nodes = tuple(patched_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
+        patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})
+        tampered = loaded.model_copy(update={"source_graph": patched_graph})
+
+        report = replay_envelope(tmp_path, tampered)
+
+        assert report.outcome is ReplayOutcome.FAILED
+        assert any("pypdf_version" in f.reason for f in report.failures)
+
+
+def _char_span_ref(node_id: str, start: int, end: int) -> SourceRef:
+    return SourceRef(
+        node_id=node_id,
+        locator=CharSpanLocator(kind=LocatorKind.CHAR_SPAN, text_space=TextSpace.EXTRACTED_TEXT, start=start, end=end),
+    )
+
+
+def _constructed_measured_value(
+    *,
+    quantity_kind: QuantityKind = QuantityKind.TEMPERATURE,
+    unit_raw: str = "K",
+    unit_normalized: str = "K",
+    conversion_table_sha256: str = TABLE_V1.sha256,
+    value_ref: SourceRef,
+    unit_ref: SourceRef,
+) -> MeasuredValue:
+    """A ``MeasuredValue`` built via ``model_construct`` -- the established
+    idiom in this module (see ``TestVerifyMeasuredValueUnit``) for shapes a
+    validated constructor would refuse, which can only arise from a
+    corrupted or forged record."""
+    return MeasuredValue.model_construct(
+        raw_text="1023",
+        canonical_decimal_value="1023",
+        repairs=(),
+        repair_dependency=SemanticDependencyUse(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+            input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        ),
+        quantity_kind=quantity_kind,
+        unit_raw=unit_raw,
+        unit_normalized=unit_normalized,
+        conversion_table_sha256=conversion_table_sha256,
+        value_ref=value_ref,
+        unit_ref=unit_ref,
+    )
+
+
+_SYNTHETIC_NODE_PROBLEM = ReplayFinding(
+    category=ReplayOutcome.FAILED,
+    ref_path="source_graph.node('paper')",
+    reason="synthetic node-level FAILED problem: raw bytes on disk do not hash to node.sha256",
+)
+"""A node-level problem whose category is FAILED -- the discriminating case
+for the propagation guards: a mutation that disables propagation falls
+through to the unknown-node branch, which reports UNVERIFIABLE, so only a
+FAILED problem can tell propagation apart from that fallback."""
+
+
+class TestIndependentNodeVerificationOutcomeCategories:
+    """Pins the outcome CATEGORY of ``_independently_verify_node_text``'s
+    inability-to-check guards, each isolated so that the guard under test is
+    the only thing between the input and a clean ``(text, None)`` return.
+
+    The three-outcome model is load-bearing: UNVERIFIABLE ("cannot check";
+    operator re-fetches evidence or shrugs at a GC'd store) must never be
+    conflated with FAILED ("checked and caught tampering"; operator starts an
+    integrity investigation)."""
+
+    def test_node_without_extraction_binding_is_unverifiable_even_with_intact_raw_bin(self, tmp_path: Path) -> None:
+        """Guards satisfied by construction: the artifact is genuinely
+        stored, so ``raw.bin`` exists AND hashes to ``node.sha256`` --
+        neither the missing-raw.bin guard (UNVERIFIABLE) nor the
+        tampered-raw.bin guard (FAILED) can produce this finding, and the
+        record-address checks further down would crash on an ``Absent``
+        binding rather than report this category. Only the absent-binding
+        guard stands between this node and the rest of the function."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        node = SourceNode(
+            node_id="raw-only",
+            kind=SourceNodeKind.PAPER_PDF,
+            sha256=stored.sha256,
+            origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         )
-        legacy_node = node.model_copy(update={"extraction": legacy_extraction})
-        legacy_nodes = tuple(legacy_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
-        legacy_graph = loaded.source_graph.model_copy(update={"nodes": legacy_nodes})
-        legacy = loaded.model_copy(update={"source_graph": legacy_graph})
+        text, finding = _independently_verify_node_text(tmp_path, node)
+        assert text is None
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        # The operationally meaningful distinction: NOTHING was ever
+        # recorded for this node (the binding itself is absent) -- not "a
+        # recorded artifact is missing or damaged on disk".
+        assert "ExtractionBinding" in finding.reason
 
-        report = replay_envelope(tmp_path, legacy)
+    def test_corrupt_record_meta_json_is_unverifiable_not_failed(self, tmp_path: Path) -> None:
+        """Guards satisfied by construction: raw.bin is untouched (identity
+        checks pass), and the record DIRECTORY exists at the addressed
+        location -- only its ``meta.json`` is rewritten to non-JSON, which
+        ``load_extraction_record`` surfaces as ``ExtractionRecordError``
+        (corruption-of-the-sidecar, distinct from the record-absent path
+        that returns ``None``). An unreadable sidecar blocks the check from
+        running; it is not itself proof the EVIDENCE was tampered with, so
+        the category must be UNVERIFIABLE, never FAILED."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        record_dir = extraction_record_dir(
+            tmp_path, node.extraction.parent_raw_sha256, node.extraction.extraction_sha256
+        )
+        (record_dir / "meta.json").write_text("{this is not json", encoding="utf-8")
 
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert any("derivation_binding" in f.reason for f in report.unverifiable)
+        text, finding = _independently_verify_node_text(tmp_path, node)
+        assert text is None
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        # Distinguish "the sidecar is unreadable" from "no record stored at
+        # this address" (the record-meta-None guard) and from every
+        # raw.bin-related guard.
+        assert "meta.json" in finding.reason
+        assert "unreadable" in finding.reason
+
+    def test_missing_extracted_json_with_intact_meta_is_unverifiable_not_failed(self, tmp_path: Path) -> None:
+        """Guards satisfied by construction: raw.bin verifies, ``meta.json``
+        is left fully intact and self-authenticating (so the unreadable-meta
+        and record-absent guards pass), and the binding's identity fields
+        still match the record's (so the identity cross-check passes). Only
+        ``extracted.json`` is deleted -- absence of the evidence file is
+        inability to check (re-fetch and retry), never positive evidence of
+        tampering, so the category must be UNVERIFIABLE."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        record_dir = extraction_record_dir(
+            tmp_path, node.extraction.parent_raw_sha256, node.extraction.extraction_sha256
+        )
+        (record_dir / "extracted.json").unlink()
+
+        text, finding = _independently_verify_node_text(tmp_path, node)
+        assert text is None
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "extracted.json" in finding.reason
+
+
+class TestReplaySidecarBookkeepingInconsistencyIsFailed:
+    """The two late sidecar cross-checks in ``_independently_verify_node_text``:
+    a record that IS present, readable, and self-authenticated to its own
+    address, whose ``meta.json`` nevertheless records an ``extracted_sha256``
+    (or ``extracted_text_sha256``) that disagrees with the bytes actually on
+    disk. The record existed and was readable throughout, so this is FAILED
+    (inconsistent bookkeeping is positive evidence of alteration outside
+    validated construction), never inability-to-check.
+
+    Reaching these guards requires a record forged to self-authenticate at a
+    FORGED address (its identity payload hashes to the directory name it
+    lives under) plus a binding altered outside validated construction to
+    point there -- exactly the "forged envelope field, hand-edited record"
+    scenario the module docstring names. ``model_copy`` bypasses
+    ``ExtractionBinding``'s self-authentication validator the same way the
+    established forged-binding tests in this module do
+    (``TestReplayCrossChecksRecordIdentityAgainstTheBinding``); through
+    fully-validated construction these two guards are unreachable, which is
+    exactly why they exist as defense-in-depth -- replay never trusts the
+    envelope's validators to have run.
+    """
+
+    @staticmethod
+    def _forge_record_with(tmp_path: Path, loaded: DatasetEnvelope, forged_field: str) -> tuple[SourceNode, str, str]:
+        """Clone the real extraction record to a new address whose identity
+        payload carries a decoy sha in ``forged_field``, so the forged
+        ``meta.json`` STILL self-authenticates (its own fields hash to the
+        directory name it lives under) and ``load_extraction_record``
+        returns it rather than ``None``. Returns ``(forged_node,
+        decoy_sha, real_sha_for_that_field)``.
+
+        Guards satisfied by construction, in order: raw.bin verifies (the
+        store is untouched); the forged record authenticates at its own
+        address (record-absent and unreadable-meta guards pass); the
+        identity cross-check passes (extractor, extractor_code_sha256,
+        identity_payload_version, and pypdf_version are all copied from the
+        real record on BOTH the forged meta and the forged binding); and
+        the envelope-anchored digest checks pass (the binding keeps the
+        REAL ``extracted_sha256``/``extracted_text_sha256``, and the copied
+        ``extracted.json`` bytes are the real ones). Only the sidecar
+        cross-check under test can reject this input."""
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        binding = node.extraction
+        real_dir = extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
+        meta = json.loads((real_dir / "meta.json").read_text(encoding="utf-8"))
+        decoy_sha = hashlib.sha256(b"synthetic decoy digest").hexdigest()
+        real_sha = meta[forged_field]
+        assert decoy_sha != real_sha
+
+        forged_payload = {
+            "identity_payload_version": meta["identity_payload_version"],
+            "parent_raw_sha256": meta["parent_raw_sha256"],
+            "extractor": meta["extractor"],
+            "extractor_code_sha256": meta["extractor_code_sha256"],
+            "pypdf_version": meta["pypdf_version"],
+            "extracted_sha256": meta["extracted_sha256"],
+            "extracted_text_sha256": meta["extracted_text_sha256"],
+        }
+        forged_payload[forged_field] = decoy_sha
+        forged_address = compute_extraction_sha(forged_payload)
+
+        forged_dir = extraction_record_dir(tmp_path, binding.parent_raw_sha256, forged_address)
+        forged_dir.mkdir(parents=True)
+        for item in real_dir.iterdir():
+            (forged_dir / item.name).write_bytes(item.read_bytes())
+        forged_meta = dict(meta)
+        forged_meta[forged_field] = decoy_sha
+        forged_meta["extraction_sha256"] = forged_address
+        (forged_dir / "meta.json").write_text(json.dumps(forged_meta), encoding="utf-8")
+
+        # Isolation probe: the forged record must genuinely authenticate at
+        # its forged address -- otherwise this test would only be
+        # re-exercising the record-absent guard, not the one under test.
+        assert load_extraction_record(tmp_path, binding.parent_raw_sha256, forged_address) is not None
+
+        forged_binding = binding.model_copy(update={"extraction_sha256": forged_address})
+        return node.model_copy(update={"extraction": forged_binding}), decoy_sha, real_sha
+
+    def test_record_meta_extracted_sha256_disagreeing_with_bytes_on_disk_is_failed(self, tmp_path: Path) -> None:
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        forged_node, decoy_sha, real_sha = self._forge_record_with(tmp_path, loaded, "extracted_sha256")
+
+        text, finding = _independently_verify_node_text(tmp_path, forged_node)
+        assert text is None
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        # The finding must name the disagreement itself: the sidecar's
+        # inconsistent claim vs the digest of the bytes actually on disk.
+        assert finding.actual == decoy_sha
+        assert finding.expected == real_sha
+
+    def test_record_meta_extracted_text_sha256_disagreeing_with_reread_text_is_failed(self, tmp_path: Path) -> None:
+        """Additionally passes the sibling ``extracted_sha256`` sidecar
+        cross-check (that field is left real), so the LAST guard in the
+        function is the only one that can reject this input."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        forged_node, decoy_sha, real_sha = self._forge_record_with(tmp_path, loaded, "extracted_text_sha256")
+
+        text, finding = _independently_verify_node_text(tmp_path, forged_node)
+        assert text is None
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert finding.actual == decoy_sha
+        assert finding.expected == real_sha
+
+
+class TestCheckCharSpansOutcomeCategories:
+    """Pins the outcome CATEGORY of ``check_char_spans``'s per-ref guards by
+    calling it directly, so no earlier stage of ``replay_envelope`` (node
+    verification, node-level findings) can mask which branch produced the
+    finding."""
+
+    def test_node_problem_category_and_reason_are_propagated_to_span_findings(self, tmp_path: Path) -> None:
+        """A ref pointing at a node with a recorded node-level problem must
+        inherit that problem's CATEGORY and REASON -- the propagation guard
+        chooses no literal category of its own. Using a FAILED problem is
+        the discriminating construction: with propagation disabled, the
+        lookup falls through to the unknown-node branch, which reports
+        UNVERIFIABLE, so a FAILED problem is the only way to tell the two
+        apart. Other guards satisfied by construction: the envelope is
+        produced and loaded for real, so every ref is a well-formed
+        CharSpanLocator (the isinstance early-return does not fire)."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        checked, total, findings = check_char_spans(loaded, {}, {"paper": _SYNTHETIC_NODE_PROBLEM})
+        assert checked == 0
+        assert total > 0
+        assert len(findings) == total
+        assert all(f.category is ReplayOutcome.FAILED for f in findings)
+        assert all(f.reason == _SYNTHETIC_NODE_PROBLEM.reason for f in findings)
+
+    def test_ref_to_unknown_node_is_unverifiable_never_failed(self, tmp_path: Path) -> None:
+        """A ref whose node has neither verified text nor a recorded node
+        problem was never independently checked at all -- that is inability
+        to check, never demonstrated disagreement, so every finding must be
+        UNVERIFIABLE. Other guards satisfied by construction: node_problems
+        is empty (the propagation guard cannot fire), and the refs are real
+        CharSpanLocators from a produced envelope (the isinstance
+        early-return does not fire); with this guard disabled the code
+        would crash slicing ``None``."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        checked, total, findings = check_char_spans(loaded, {}, {})
+        assert checked == 0
+        assert total > 0
+        assert len(findings) == total
+        assert all(f.category is ReplayOutcome.UNVERIFIABLE for f in findings)
+        assert all("never independently checked" in f.reason for f in findings)
+        assert not any(f.category is ReplayOutcome.FAILED for f in findings)
+
+    def test_reachable_ref_unpaired_by_the_field_walk_trips_the_accounting_guard(self, tmp_path: Path) -> None:
+        """The count cross-check against ``iter_source_refs`` exists to catch
+        a FUTURE ref-bearing field added without updating
+        ``check_char_spans``'s field-by-field pairing. This test simulates
+        exactly that future: a subclass declares one extra ``SourceRef``
+        field that ``iter_source_refs`` (generic over model fields) sees but
+        the pairing never checks. Other guards satisfied by construction:
+        every PAIRED ref checks cleanly (the real text is supplied for the
+        real node), so the accounting guard's finding is the only finding.
+        The category must be FAILED: a reachable-but-unchecked ref means
+        the replayer's own coverage claim is wrong, which must never read
+        as a mere inability to check."""
+
+        class _EnvelopeWithUncheckedRef(DatasetEnvelope):
+            decoy_ref: SourceRef
+
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        envelope = _EnvelopeWithUncheckedRef.model_construct(**dict(loaded), decoy_ref=_char_span_ref("paper", 0, 3))
+        checked, total, findings = check_char_spans(envelope, {"paper": _TEXT}, {})
+        assert checked == total - 1
+        assert len(findings) == 1
+        finding = findings[0]
+        assert finding.category is ReplayOutcome.FAILED
+        assert "iter_source_refs" in finding.reason
+
+
+class TestVerifyMeasuredValueUnitNormalizationDisagreement:
+    def test_recorded_normalization_disagreeing_with_recorded_table_is_failed(self) -> None:
+        """``unit_raw`` IS admitted by the recorded table (so the
+        unknown-unit guard, which the existing not-a-real-unit test
+        exercises, passes), and the table sha names a real table (so the
+        unknown-table guard passes) -- the only thing left to reject this
+        input is the final comparison of the recorded ``unit_normalized``
+        against the table's own re-derived normalization. A resolvable
+        table that disagrees is a completed check that did not pass:
+        FAILED, never UNVERIFIABLE."""
+        value = _constructed_measured_value(
+            unit_raw="K",
+            unit_normalized="degR",
+            value_ref=_char_span_ref("paper", 0, 4),
+            unit_ref=_char_span_ref("paper", 5, 6),
+        )
+        finding = verify_measured_value_unit("p", value)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        # The finding targets the normalization field specifically, not the
+        # raw unit (which the table admits) and not the table sha (which
+        # resolves).
+        assert finding.ref_path == "p.unit_normalized"
+        assert finding.actual == "degR"
+        assert finding.expected == "K"
+
+
+class TestUnitBoundaryOutcomeCategories:
+    """Pins the outcome CATEGORY of each ``verify_measured_value_unit_boundary``
+    guard via direct calls, constructed so the guard under test is the only
+    one standing between the input and a clean ``None`` return."""
+
+    def test_node_problem_category_and_reason_are_propagated(self) -> None:
+        """Same discriminating construction as the ``check_char_spans``
+        propagation test: a FAILED node problem, because with propagation
+        disabled the lookup falls through to the unknown-node branch and
+        reports UNVERIFIABLE. Guards satisfied by construction: the
+        unit_ref locator IS a CharSpanLocator, so the non-char-span guard
+        ahead of propagation passes."""
+        value = _constructed_measured_value(
+            value_ref=_char_span_ref("other", 0, 4),
+            unit_ref=_char_span_ref("paper", 5, 6),
+        )
+        finding = verify_measured_value_unit_boundary("p", value, {}, {"paper": _SYNTHETIC_NODE_PROBLEM})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert finding.reason == _SYNTHETIC_NODE_PROBLEM.reason
+        assert finding.ref_path == "p.unit_ref"
+
+    def test_unknown_node_is_unverifiable_never_failed(self) -> None:
+        """Guards satisfied by construction: CharSpanLocator (non-char-span
+        guard passes) and empty node_problems (propagation guard passes).
+        With this guard disabled the code would crash on ``len(None)``. An
+        unchecked node is inability to check: UNVERIFIABLE, never FAILED."""
+        value = _constructed_measured_value(
+            value_ref=_char_span_ref("ghost", 0, 4),
+            unit_ref=_char_span_ref("ghost", 5, 6),
+        )
+        finding = verify_measured_value_unit_boundary("p", value, {}, None)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "never independently checked" in finding.reason
+
+    def test_out_of_range_locator_is_failed_naming_the_range(self) -> None:
+        """An out-of-range locator against text whose identity ALREADY
+        verified is a definite disagreement between the envelope's claim
+        and the evidence -- FAILED. Guards satisfied by construction:
+        CharSpanLocator, no node problem, text present. The reason must
+        name the range problem: with the guard disabled, Python's
+        clamping slice semantics would hand the boundary layers a
+        DIFFERENT quote and produce some other finding (or none), so
+        asserting the range-specific reason is what actually pins this
+        guard rather than its neighbours."""
+        text = "held at 1023 K in the reactor"
+        value = _constructed_measured_value(
+            value_ref=_char_span_ref("other", 8, 12),
+            unit_ref=_char_span_ref("paper", 13, 999),
+        )
+        finding = verify_measured_value_unit_boundary("p", value, {"paper": text}, None)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert "out of range" in finding.reason
+
+    def test_layer3_admission_violation_is_failed(self) -> None:
+        """Layers 1-2 pass by construction: the span slices exactly the
+        whitespace-delimited token "Zz" (clean boundaries on both sides, no
+        digit run glued to it, and value_ref points at a DIFFERENT node so
+        no value_span is recovered or needed). The table sha resolves (so
+        the unknown-table UNVERIFIABLE guard passes) and quantity_kind is
+        not OTHER (so the unmodelled-quantity guard passes). "Zz" is not in
+        the recorded table's TEMPERATURE vocabulary, so only the Layer 3
+        admission re-check can reject this input -- a check that ran and
+        refused: FAILED, never UNVERIFIABLE."""
+        text = "held at 1023 Zz in the reactor"
+        value = _constructed_measured_value(
+            unit_raw="Zz",
+            unit_normalized="Zz",
+            value_ref=_char_span_ref("other", 8, 12),
+            unit_ref=_char_span_ref("paper", 13, 15),
+        )
+        assert text[13:15] == "Zz"
+        finding = verify_measured_value_unit_boundary("p", value, {"paper": text}, None)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        # Layer 3 (table admission), not the table-free Layers 1-2, must be
+        # what rejected it.
+        assert "admission" in finding.reason
+
+
+class TestValueBoundaryOutcomeCategories:
+    """Symmetric with ``TestUnitBoundaryOutcomeCategories``, for
+    ``verify_measured_value_value_boundary``'s guards."""
+
+    def test_node_problem_category_and_reason_are_propagated(self) -> None:
+        """FAILED node problem as the discriminating construction (see the
+        unit-boundary twin). CharSpanLocator by construction, so the
+        non-char-span guard passes."""
+        value = _constructed_measured_value(
+            value_ref=_char_span_ref("paper", 8, 12),
+            unit_ref=_char_span_ref("other", 13, 14),
+        )
+        finding = verify_measured_value_value_boundary("p", value, {}, {"paper": _SYNTHETIC_NODE_PROBLEM})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert finding.reason == _SYNTHETIC_NODE_PROBLEM.reason
+        assert finding.ref_path == "p.value_ref"
+
+    def test_unknown_node_is_unverifiable_never_failed(self) -> None:
+        """CharSpanLocator and empty node_problems by construction; with
+        this guard disabled the code would crash on ``len(None)``."""
+        value = _constructed_measured_value(
+            value_ref=_char_span_ref("ghost", 8, 12),
+            unit_ref=_char_span_ref("ghost", 13, 14),
+        )
+        finding = verify_measured_value_value_boundary("p", value, {}, None)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "never independently checked" in finding.reason
+
+    def test_out_of_range_locator_is_failed_naming_the_range(self) -> None:
+        """Same construction and rationale as the unit-boundary twin: the
+        range-specific reason is asserted because a disabled guard would
+        clamp the slice and produce a different finding (or none)."""
+        text = "held at 1023 K in the reactor"
+        value = _constructed_measured_value(
+            value_ref=_char_span_ref("paper", 8, 999),
+            unit_ref=_char_span_ref("other", 13, 14),
+        )
+        finding = verify_measured_value_value_boundary("p", value, {"paper": text}, None)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert "out of range" in finding.reason
