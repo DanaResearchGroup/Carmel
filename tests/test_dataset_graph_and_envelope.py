@@ -113,6 +113,17 @@ _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 """Module-level singleton default for SourceNode.glyph_health, matching
 _NO_ORIGIN's reasoning."""
 
+_NO_EXTRACTION_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+_NO_GLYPH_HEALTH_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""FIGURE_CROP-specific counterparts of _NO_EXTRACTION/_NO_GLYPH_HEALTH
+above: a crop is an image region with no extracted text ever to come, so
+NOT_APPLICABLE -- not NOT_EXTRACTED_YET -- is the only reason SourceNode's
+I6 invariant accepts for it. `_node()` below substitutes these in for any
+FIGURE_CROP node that would otherwise get the plain _NO_EXTRACTION/
+_NO_GLYPH_HEALTH default; every other kind (SI_MEMBER, JATS_XML, PAPER_PDF)
+keeps the originals unchanged, since extraction genuinely just hasn't
+happened yet for those."""
+
 _NO_PYPDF_VERSION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """Module-level singleton default for ExtractionBinding.pypdf_version on a
 non-pypdf extractor, matching _NO_ORIGIN's reasoning. Reason is
@@ -229,6 +240,17 @@ def _node(
     extraction: ExtractionBinding | Absent = _NO_EXTRACTION,
     glyph_health: GlyphHealthAssessment | Absent = _NO_GLYPH_HEALTH,
 ) -> SourceNode:
+    # A FIGURE_CROP that would otherwise get the plain "not extracted yet"
+    # defaults must get the crop-specific NOT_APPLICABLE ones instead --
+    # SourceNode's I6 invariant forbids anything else on a FIGURE_CROP. Only
+    # swap the exact singleton defaults (identity check), so a caller that
+    # deliberately passes something else through -- e.g. a present binding
+    # on a non-crop kind -- is left alone.
+    if kind == SourceNodeKind.FIGURE_CROP:
+        if extraction is _NO_EXTRACTION:
+            extraction = _NO_EXTRACTION_CROP
+        if glyph_health is _NO_GLYPH_HEALTH:
+            glyph_health = _NO_GLYPH_HEALTH_CROP
     return SourceNode(
         node_id=node_id,
         kind=kind,
@@ -238,6 +260,44 @@ def _node(
         extraction=extraction,
         glyph_health=glyph_health,
     )
+
+
+def _sha_sharing_node_with_extraction(
+    node_id: str,
+    sha256: str,
+    parent_node_id: str,
+    extraction: ExtractionBinding | Absent,
+    glyph_health: GlyphHealthAssessment | Absent = _NO_GLYPH_HEALTH,
+) -> SourceNode:
+    """Build a node that shares raw bytes with another node in the graph
+    (same `sha256`) while carrying a PRESENT `extraction`/`glyph_health`, to
+    exercise SourceGraph's I5b/I5c/I5d cross-node conflict guards.
+
+    A FIGURE_CROP cannot do this: SourceNode's own I6 invariant forbids a
+    FIGURE_CROP from ever carrying anything but
+    ``Absent(reason=NOT_APPLICABLE)`` for either field. So this helper uses
+    SI_MEMBER instead: I5's "different role, same bytes" exemption
+    (documented on `SourceGraph`'s I5 comment via its PAPER_PDF+FIGURE_CROP
+    example) keys only on `(kind, sha256, parent_node_id)`, so any kind that
+    differs from its sha256-sharing sibling is equally exempt -- SI_MEMBER
+    just happens to be the one kind that can ALSO carry a present extraction
+    without tripping I6.
+
+    The `extraction`/`glyph_health` are injected via `model_copy` onto an
+    already-valid SI_MEMBER node rather than passed straight into
+    `SourceNode`'s own constructor: pydantic reruns a nested model's own
+    `@model_validator`s (e.g. `ExtractionBinding`'s self-authentication
+    check, or a forged/disagreeing binding built via `model_copy` per
+    `_extraction_binding`'s docstring) whenever that model is assigned as a
+    field value in ANY fresh constructor call -- including `SourceNode`'s
+    own. Going through `SourceNode.model_copy(update=...)` instead skips
+    validation of the updated fields entirely, so a forged or disagreeing
+    `extraction`/`glyph_health` can reach `SourceGraph` unmolested. This
+    does NOT also blind `SourceGraph`'s own I5b/I5c/I5d guards: those still
+    run, because `SourceGraph(nodes=(...))` itself is a fresh constructor
+    call, not a `model_copy`."""
+    node = _node(node_id, SourceNodeKind.SI_MEMBER, sha256, parent_node_id=parent_node_id)
+    return node.model_copy(update={"extraction": extraction, "glyph_health": glyph_health})
 
 
 def _bbox_ref(node_id: str) -> SourceRef:
@@ -995,6 +1055,65 @@ class TestSourceGraphKindParentRules:
         assert graph.node("crop").parent_node_id == "si"
 
 
+class TestSourceNodeFigureCropExtractionInvariant:
+    """I6: a FIGURE_CROP's extraction/glyph_health must both be
+    Absent(reason=NOT_APPLICABLE) -- an image region has no extracted text to
+    bind or assess. This is a SourceNode-level invariant, so it fires on the
+    lone node's own construction, with no SourceGraph needed to trigger it."""
+
+    def test_figure_crop_with_present_extraction_rejected(self) -> None:
+        binding = _extraction_binding()
+        with pytest.raises(ValidationError, match=r"extraction must be Absent\(reason=AbsenceReason.NOT_APPLICABLE\)"):
+            _node(
+                "crop",
+                SourceNodeKind.FIGURE_CROP,
+                SHA_A,
+                parent_node_id="paper",
+                extraction=binding,
+            )
+
+    def test_figure_crop_with_not_extracted_yet_extraction_rejected(self) -> None:
+        # A freshly-built Absent(reason=NOT_EXTRACTED_YET) -- NOT the
+        # `_NO_EXTRACTION` singleton itself -- so `_node()`'s identity-based
+        # ("is") auto-correct for FIGURE_CROP defaults doesn't silently swap
+        # this wrong-reason value out from under the test.
+        wrong_reason_extraction = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+        with pytest.raises(ValidationError, match=r"extraction must be Absent\(reason=AbsenceReason.NOT_APPLICABLE\)"):
+            _node(
+                "crop",
+                SourceNodeKind.FIGURE_CROP,
+                SHA_A,
+                parent_node_id="paper",
+                extraction=wrong_reason_extraction,
+            )
+
+    def test_figure_crop_with_not_extracted_yet_glyph_health_rejected(self) -> None:
+        # Same identity concern as above, this time for `glyph_health`.
+        wrong_reason_glyph_health = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+        expected = r"glyph_health must be Absent\(reason=AbsenceReason.NOT_APPLICABLE\)"
+        with pytest.raises(ValidationError, match=expected):
+            _node(
+                "crop",
+                SourceNodeKind.FIGURE_CROP,
+                SHA_A,
+                parent_node_id="paper",
+                extraction=_NO_EXTRACTION_CROP,
+                glyph_health=wrong_reason_glyph_health,
+            )
+
+    def test_figure_crop_with_not_applicable_extraction_and_glyph_health_accepted(self) -> None:
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            extraction=_NO_EXTRACTION_CROP,
+            glyph_health=_NO_GLYPH_HEALTH_CROP,
+        )
+        assert crop.extraction == _NO_EXTRACTION_CROP
+        assert crop.glyph_health == _NO_GLYPH_HEALTH_CROP
+
+
 class TestSourceGraphDuplicateNodes:
     """I5: no two nodes may share (kind, sha256, parent_node_id), but the
     same bytes in a genuinely different role (different kind or parent) is
@@ -1039,23 +1158,28 @@ class TestSourceGraphConflictingGlyphHealth:
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
             glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
+        # DELIBERATELY the SAME extraction binding as `paper`, not a different
+        # one. Both nodes must agree here or I5c fires first and this test
+        # silently stops testing I5b at all -- which is exactly what happened
+        # when I5c was introduced: the two nodes carried different bindings,
+        # I5c rejected the graph before I5b was ever consulted, and the test
+        # stayed green because BOTH messages contain the word "CONFLICT".
+        # Round-31 review caught it. Hence also the wording assertion below.
+        #
+        # A present ExtractionBinding/glyph_health is unconstructible on a
+        # FIGURE_CROP through normal validation (SourceNode's I6 invariant),
+        # so this sha256-sharing sibling is an SI_MEMBER instead (see
+        # `_sha_sharing_node_with_extraction`'s docstring) to isolate this
+        # graph-level I5b guard from the node-level I6 guard.
+        si = _sha_sharing_node_with_extraction(
+            "si",
             SHA_A,
-            parent_node_id="paper",
-            # DELIBERATELY the SAME extraction binding as `paper`, not a different
-            # one. Both nodes must agree here or I5c fires first and this test
-            # silently stops testing I5b at all -- which is exactly what happened
-            # when I5c was introduced: the two nodes carried different bindings,
-            # I5c rejected the graph before I5b was ever consulted, and the test
-            # stayed green because BOTH messages contain the word "CONFLICT".
-            # Round-31 review caught it. Hence also the wording assertion below.
+            "paper",
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
             glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_UNHEALTHY_GLYPH_HEALTH),
         )
         with pytest.raises(ValidationError, match="CONFLICT") as excinfo:
-            SourceGraph(nodes=(paper, crop))
+            SourceGraph(nodes=(paper, si))
         # Pin WHICH conflict: matching "CONFLICT" alone cannot distinguish I5b from
         # I5c, so it would not notice this test being captured by I5c a second time.
         assert "glyph-health story" in str(excinfo.value)
@@ -1081,16 +1205,19 @@ class TestSourceGraphConflictingGlyphHealth:
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
             glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
+        # Present extraction/glyph_health on a FIGURE_CROP is unconstructible
+        # through normal validation (SourceNode's I6 invariant), so this
+        # sha256-sharing sibling is an SI_MEMBER instead (see
+        # `_sha_sharing_node_with_extraction`'s docstring).
+        si = _sha_sharing_node_with_extraction(
+            "si",
             SHA_A,
-            parent_node_id="paper",
+            "paper",
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
             glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
         )
-        graph = SourceGraph(nodes=(paper, crop))
-        assert graph.node("crop").sha256 == graph.node("paper").sha256
+        graph = SourceGraph(nodes=(paper, si))
+        assert graph.node("si").sha256 == graph.node("paper").sha256
 
     def test_exact_duplicate_still_reports_duplicate_wording_not_conflict(self) -> None:
         """A true (kind, sha256, parent_node_id) duplicate must still raise
@@ -1179,15 +1306,13 @@ class TestSourceGraphConflictingExtractionBinding:
             parent_node_id=None,
             extraction=binding,
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
-            SHA_A,
-            parent_node_id="paper",
-            extraction=binding,
-        ).model_copy(update={"extraction": forged})
+        # Present extraction on a FIGURE_CROP is unconstructible through
+        # normal validation (SourceNode's I6 invariant), so this
+        # sha256-sharing sibling is an SI_MEMBER instead (see
+        # `_sha_sharing_node_with_extraction`'s docstring).
+        si = _sha_sharing_node_with_extraction("si", SHA_A, "paper", extraction=forged)
         with pytest.raises(ValidationError, match="ExtractionBinding values disagree") as excinfo:
-            SourceGraph(nodes=(paper, crop))
+            SourceGraph(nodes=(paper, si))
         assert "CONFLICT" in str(excinfo.value)
 
     def test_same_bytes_one_extraction_absent_is_allowed(self) -> None:
@@ -1238,28 +1363,20 @@ class TestSourceGraphConflictingExtractionBinding:
             extraction=binding,
             glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
         )
-        # The forged binding and the disagreeing health are both injected
-        # via model_copy on the node: SourceNode construction would
-        # re-validate the forged binding (and the health/text-digest pair)
-        # through its Maybe unions, and this test needs the graph-level
-        # I5c/I5b guards to be the ones doing the rejecting.
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
+        # The forged binding and the disagreeing health are both carried by
+        # an SI_MEMBER sibling built via `_sha_sharing_node_with_extraction`:
+        # a present binding/health on a FIGURE_CROP would be re-validated
+        # against SourceNode's own I6 invariant, and this test needs the
+        # graph-level I5c/I5b guards to be the ones doing the rejecting.
+        si = _sha_sharing_node_with_extraction(
+            "si",
             SHA_A,
-            parent_node_id="paper",
-            extraction=binding,
-            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
-        ).model_copy(
-            update={
-                "extraction": forged,
-                "glyph_health": _glyph_health_assessment(
-                    input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH
-                ),
-            }
+            "paper",
+            extraction=forged,
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH),
         )
         with pytest.raises(ValidationError, match="ExtractionBinding values disagree") as excinfo:
-            SourceGraph(nodes=(paper, crop))
+            SourceGraph(nodes=(paper, si))
         message = str(excinfo.value)
         assert "CONFLICT" in message
         assert "glyph_health assessments disagree" not in message
@@ -1326,20 +1443,20 @@ class TestSourceGraphExtractionAddressCoherence:
             parent_node_id=None,
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
-            SHA_A,
-            parent_node_id="paper",
-            # Same raw sha256 (SHA_A) as `paper`, but a DIFFERENT extraction
-            # address (recomputed because extracted_text_sha256 differs) --
-            # and, deliberately, a disagreeing extracted_text_sha256 (SHA_C,
-            # not SHA_B) too, to prove I5d fires purely on the address
-            # mismatch, independent of what the disagreeing content is.
-            extraction=_extraction_binding(extracted_text_sha256=SHA_C),
+        # Same raw sha256 (SHA_A) as `paper`, but a DIFFERENT extraction
+        # address (recomputed because extracted_text_sha256 differs) --
+        # and, deliberately, a disagreeing extracted_text_sha256 (SHA_C, not
+        # SHA_B) too, to prove I5d fires purely on the address mismatch,
+        # independent of what the disagreeing content is. Present extraction
+        # on a FIGURE_CROP is unconstructible through normal validation
+        # (SourceNode's I6 invariant), so this sha256-sharing sibling is an
+        # SI_MEMBER instead (see `_sha_sharing_node_with_extraction`'s
+        # docstring).
+        si = _sha_sharing_node_with_extraction(
+            "si", SHA_A, "paper", extraction=_extraction_binding(extracted_text_sha256=SHA_C)
         )
         with pytest.raises(ValidationError, match="DIFFERENT extraction_sha256") as excinfo:
-            SourceGraph(nodes=(paper, crop))
+            SourceGraph(nodes=(paper, si))
         assert "CONFLICT" in str(excinfo.value)
 
     def test_same_raw_sha_different_extraction_address_disagreeing_health_is_rejected(self) -> None:
@@ -1367,16 +1484,19 @@ class TestSourceGraphExtractionAddressCoherence:
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
             glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
+        # Present extraction/glyph_health on a FIGURE_CROP is unconstructible
+        # through normal validation (SourceNode's I6 invariant), so this
+        # sha256-sharing sibling is an SI_MEMBER instead (see
+        # `_sha_sharing_node_with_extraction`'s docstring).
+        si = _sha_sharing_node_with_extraction(
+            "si",
             SHA_A,
-            parent_node_id="paper",
+            "paper",
             extraction=_extraction_binding(extracted_text_sha256=SHA_C),
             glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH),
         )
         with pytest.raises(ValidationError, match="DIFFERENT extraction_sha256") as excinfo:
-            SourceGraph(nodes=(paper, crop))
+            SourceGraph(nodes=(paper, si))
         assert "CONFLICT" in str(excinfo.value)
 
     def test_same_raw_sha_same_extraction_address_is_still_allowed(self) -> None:
@@ -1394,15 +1514,13 @@ class TestSourceGraphExtractionAddressCoherence:
             parent_node_id=None,
             extraction=binding,
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
-            SHA_A,
-            parent_node_id="paper",
-            extraction=binding,
-        )
-        graph = SourceGraph(nodes=(paper, crop))
-        assert graph.node("crop").extraction.extraction_sha256 == graph.node("paper").extraction.extraction_sha256
+        # Present extraction on a FIGURE_CROP is unconstructible through
+        # normal validation (SourceNode's I6 invariant), so this
+        # sha256-sharing sibling is an SI_MEMBER instead (see
+        # `_sha_sharing_node_with_extraction`'s docstring).
+        si = _sha_sharing_node_with_extraction("si", SHA_A, "paper", extraction=binding)
+        graph = SourceGraph(nodes=(paper, si))
+        assert graph.node("si").extraction.extraction_sha256 == graph.node("paper").extraction.extraction_sha256
 
     def test_one_side_absent_extraction_is_still_allowed(self) -> None:
         """An Absent extraction on either side does not participate in I5d:

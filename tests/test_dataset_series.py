@@ -86,6 +86,15 @@ def _embedded_table_v1() -> EmbeddedConversionTable:
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 _NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+_NO_EXTRACTION_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+_NO_GLYPH_HEALTH_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""FIGURE_CROP-specific counterparts of ``_NO_EXTRACTION``/``_NO_GLYPH_HEALTH``:
+a crop is an image region with no extracted text ever to come, so
+``NOT_APPLICABLE`` -- not ``NOT_EXTRACTED_YET`` -- is the only legal reason
+for it (SourceNode's I6 invariant). ``_node`` below picks these for
+FIGURE_CROP nodes and leaves every other kind on ``_NO_EXTRACTION``/
+``_NO_GLYPH_HEALTH``, since extraction genuinely just hasn't happened yet
+for those."""
 
 
 # ---------------------------------------------------------------------------
@@ -99,14 +108,15 @@ def _node(
     sha256: str = SHA_A,
     parent_node_id: str | None = None,
 ) -> SourceNode:
+    is_crop = kind == SourceNodeKind.FIGURE_CROP
     return SourceNode(
         node_id=node_id,
         kind=kind,
         sha256=sha256,
         parent_node_id=parent_node_id,
         origin=_NO_ORIGIN,
-        extraction=_NO_EXTRACTION,
-        glyph_health=_NO_GLYPH_HEALTH,
+        extraction=_NO_EXTRACTION_CROP if is_crop else _NO_EXTRACTION,
+        glyph_health=_NO_GLYPH_HEALTH_CROP if is_crop else _NO_GLYPH_HEALTH,
     )
 
 

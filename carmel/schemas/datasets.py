@@ -834,6 +834,56 @@ class SourceNode(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_figure_crop_has_no_extraction(self) -> SourceNode:
+        """I6: a ``FIGURE_CROP`` node's ``extraction`` (and, if present,
+        ``glyph_health``) must be exactly ``Absent(reason=NOT_APPLICABLE)``.
+
+        A ``FIGURE_CROP`` is an image region -- there is no flat text layer
+        for it to have been extracted from, which is exactly why no
+        ``CharSpanLocator`` may target one (see
+        ``_LOCATOR_KIND_COMPATIBLE_NODE_KINDS`` and
+        ``_validate_locator_kind_compatibility``). ``NOT_EXTRACTED_YET``
+        would misstate that: it says extraction merely hasn't happened yet,
+        implying it validly could later, when for an image region it never
+        will -- there is no text to extract. ``NOT_APPLICABLE`` is the only
+        reason that actually describes a crop, and since these ``reason``
+        values are recorded evidence (what a future extraction run, or an
+        auditor, should conclude from them) rather than decoration, the
+        wrong one is a real defect, not a cosmetic one.
+
+        This also closes a sha256-sharing hole: a crop is allowed to share
+        its parent PAPER_PDF's ``sha256`` (see ``SourceGraph``'s I5 duplicate
+        -triple rule), so a crop that carried a PRESENT ``ExtractionBinding``
+        could name that same parent's extraction address -- claiming the
+        parent's extracted text as its own, when no locator on a crop can
+        legitimately slice any of it.
+
+        ``glyph_health`` is folded into the same requirement for the same
+        reason: it assesses the quality of extracted OCR'd text, and a crop
+        has none to assess, so an Absent ``glyph_health`` on a crop must
+        also carry ``NOT_APPLICABLE`` rather than ``NOT_EXTRACTED_YET``.
+        (``_validate_glyph_health_binds_to_this_nodes_extraction``, above,
+        already forces ``glyph_health`` to be ``Absent`` whenever
+        ``extraction`` is; this validator only additionally pins down WHICH
+        ``AbsenceReason`` is legal for a crop.)
+        """
+        if self.kind != SourceNodeKind.FIGURE_CROP:
+            return self
+        if not isinstance(self.extraction, Absent) or self.extraction.reason != AbsenceReason.NOT_APPLICABLE:
+            raise ValueError(
+                f"node {self.node_id!r} has kind={self.kind.value!r}, which is an image region with no "
+                "extracted text to bind -- extraction must be Absent(reason=AbsenceReason.NOT_APPLICABLE), "
+                f"not {self.extraction!r}"
+            )
+        if not isinstance(self.glyph_health, Absent) or self.glyph_health.reason != AbsenceReason.NOT_APPLICABLE:
+            raise ValueError(
+                f"node {self.node_id!r} has kind={self.kind.value!r}, which has no extracted text for a "
+                "glyph-health assessment to describe -- glyph_health must be "
+                f"Absent(reason=AbsenceReason.NOT_APPLICABLE), not {self.glyph_health!r}"
+            )
+        return self
+
     @field_validator("sha256")
     @classmethod
     def _validate_sha256(cls, value: str) -> str:
