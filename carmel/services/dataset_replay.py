@@ -668,6 +668,18 @@ def check_char_spans(
     envelope -- so a newly added ref-bearing field that this pairing forgot
     to check surfaces as a loud, named finding instead of a silent gap.
 
+    Unlike ``value_ref``/``unit_ref`` -- each of which has its own
+    compensating gate elsewhere in this module
+    (:func:`verify_measured_value_value_boundary`,
+    :func:`verify_measured_value_unit_boundary`) that reports UNVERIFIABLE
+    for any non-``CharSpanLocator`` locator -- ``label_ref`` has no such
+    compensating gate. So a ``label_ref`` whose locator is NOT a
+    ``CharSpanLocator`` is reported UNVERIFIABLE right here, at the axis
+    loop: ``label_raw`` is text, and this replayer (there is no renderer in
+    this codebase) can only independently re-derive text through a char
+    span, so a bbox/xpath/table-cell locator can attest a region or cell
+    exists but can never attest to the text recorded in ``label_raw``.
+
     By default, a mismatch finding's ``expected``/``actual`` are redacted
     (see :func:`_redacted`) rather than literal, EXCEPT for the ``unit_ref``
     call site: ``unit_raw`` is short, controlled-vocabulary unit
@@ -677,11 +689,24 @@ def check_char_spans(
     literal excerpts everywhere (e.g. for a human debugging a specific
     finding with the corpus license already accounted for).
 
-    Returns ``(checked, total_char_span_refs, findings)``.
+    Returns ``(checked, total_char_span_refs, findings)``, where ``findings``
+    also includes the UNVERIFIABLE findings for any non-``CharSpanLocator``
+    ``label_ref`` described above; ``total_char_span_refs`` (and the
+    ``checked``/``findings`` self-audit it feeds) counts only
+    ``CharSpanLocator`` refs, so those non-char-span findings are excluded
+    from that count on purpose.
     """
     node_problems = node_problems or {}
     checked = 0
     findings: list[ReplayFinding] = []
+    # Findings for non-char-span label_ref locators (see the docstring
+    # above): these do NOT correspond to any CharSpanLocator reachable via
+    # iter_source_refs, so they must stay OUT of `findings` -- the
+    # `accounted_for == total_char_span_refs` self-audit below would
+    # falsely trip if they inflated `len(findings)` against a
+    # `total_char_span_refs` count that never counted them in the first
+    # place. Concatenated into the returned list only at the very end.
+    non_char_span_findings: list[ReplayFinding] = []
 
     def _check(
         path: str, node_id: str, locator: object, expected: str, *, always_literal: bool = False
@@ -738,6 +763,20 @@ def check_char_spans(
     for series in envelope.series:
         for axis in series.axes:
             axis_path = f"series[{series.series_id!r}].axes[{axis.axis_id!r}].label_ref"
+            label_locator = axis.label_ref.locator
+            if not isinstance(label_locator, CharSpanLocator):
+                non_char_span_findings.append(
+                    ReplayFinding(
+                        category=ReplayOutcome.UNVERIFIABLE,
+                        ref_path=axis_path,
+                        reason=f"label_ref.locator is a {type(label_locator).__name__}, not a "
+                        "CharSpanLocator -- label_raw is text, and this replayer (there is no "
+                        "renderer in this codebase) can only independently verify text through a "
+                        "CharSpanLocator's re-sliced character span, so it cannot re-derive or "
+                        "confirm the text recorded in label_raw from this locator kind",
+                    )
+                )
+                continue
             _check(axis_path, axis.label_ref.node_id, axis.label_ref.locator, axis.label_raw)
 
     total_char_span_refs = sum(
@@ -757,7 +796,13 @@ def check_char_spans(
             )
         )
 
-    return checked, total_char_span_refs, findings
+    # Concatenated here, at the very end, and NOT earlier: `findings` alone
+    # feeds `accounted_for` above, which is checked against
+    # `total_char_span_refs` (a CharSpanLocator-only count). Merging
+    # non_char_span_findings into `findings` before that check would inflate
+    # accounted_for with findings that have no matching char-span ref and
+    # falsely trip the self-audit -- keep the two lists separate up to here.
+    return checked, total_char_span_refs, findings + non_char_span_findings
 
 
 def verify_measured_value_unit(path: str, value: MeasuredValue) -> ReplayFinding | None:

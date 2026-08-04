@@ -1786,11 +1786,16 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
     forbids `CHAR_SPAN` on a crop precisely because no text is stored for one.
 
     So "this node has no `ExtractionBinding`" is a FACT about the node, not a
-    defect of the envelope. It becomes a finding only when a text-dependent
-    check actually targets that node. What is NOT optional is the node's BYTES:
-    a node admitted into a VERIFIED envelope must still have its ``raw.bin``
-    present and hashing to its recorded ``sha256``, or the "verified" label is
-    laundered onto bytes nobody checked.
+    defect of the envelope, and must never itself become a finding. But a
+    `BBoxLocator` `label_ref` is a SEPARATE story: `label_raw` is text, and a
+    `BBoxLocator` can attest that a region exists but can never attest to the
+    text recorded there, because this replayer has no renderer to re-derive
+    text from a region with. So the mixed envelope below is UNVERIFIABLE --
+    for the label, not for the absent extraction. What is NOT optional
+    either way is the node's BYTES: a node admitted into a VERIFIED envelope
+    must still have its ``raw.bin`` present and hashing to its recorded
+    ``sha256``, or the "verified" label is laundered onto bytes nobody
+    checked.
     """
 
     @staticmethod
@@ -1835,19 +1840,61 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         # envelope, or the replayer is being asked to verify something illegal.
         return DatasetEnvelope.model_validate(json.loads(envelope.model_dump_json()))
 
-    def test_mixed_text_and_bbox_envelope_verifies(self, tmp_path: Path) -> None:
+    def test_mixed_text_and_bbox_envelope_is_unverifiable_for_the_label_only(
+        self, tmp_path: Path
+    ) -> None:
         """The crop shares its parent's ``sha256`` (legal per I5) so its bytes
-        ARE in the store. Nothing text-dependent targets it. It must verify."""
+        ARE in the store, and nothing text-dependent targets the crop node
+        itself -- so the envelope must NOT be UNVERIFIABLE for the absent
+        extraction. It must, however, be UNVERIFIABLE for the BBox-backed
+        ``label_ref``: a `BBoxLocator` can attest the region exists but can
+        never attest to the text recorded in ``label_raw``, and this
+        replayer has no renderer to re-derive that text with."""
         stored_artifact, loaded = _produce_and_load(tmp_path)
         envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
         assert report.failures == ()
-        assert report.unverifiable == ()
         # One char-span label_ref became a BBox ref, so 5 of the original 6 remain.
         assert report.checked_char_spans == 5
+        reasons = [f.reason for f in report.unverifiable]
+        assert any(
+            "label_ref" in r and "BBoxLocator" in r for r in reasons
+        ), reasons
+        # Pins commit 8e052cc: a node with no extraction is a FACT about the
+        # node, not a defect, and must never itself become a node-level
+        # complaint -- only the text-dependent label_ref check may complain.
+        assert not any("has no ExtractionBinding" in r for r in reasons), reasons
+
+    def test_mixed_text_and_bbox_envelope_rejects_a_fabricated_label(
+        self, tmp_path: Path
+    ) -> None:
+        """A `BBoxLocator` can attest that a region exists, but it can NEVER
+        attest to the text stored in ``label_raw`` -- there is no renderer in
+        this codebase to re-derive text from a region with. So a fabricated
+        ``label_raw`` on the BBox-backed axis must never ride into a VERIFIED
+        envelope; the outcome must stay non-VERIFIED regardless of what text
+        was written there."""
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
+        series = envelope.series[0]
+        fabricated_axes = (
+            series.axes[0].model_copy(update={"label_raw": "not in the crop"}),
+            *series.axes[1:],
+        )
+        fabricated_envelope = DatasetEnvelope.model_validate(
+            json.loads(
+                envelope.model_copy(
+                    update={"series": (series.model_copy(update={"axes": fabricated_axes}),)}
+                ).model_dump_json()
+            )
+        )
+
+        report = replay_envelope(tmp_path, fabricated_envelope)
+
+        assert report.outcome is not ReplayOutcome.VERIFIED
 
     def test_bbox_only_node_with_missing_raw_bytes_is_still_unverifiable(self, tmp_path: Path) -> None:
         """The over-correction guard: waiving the TEXT requirement must not
