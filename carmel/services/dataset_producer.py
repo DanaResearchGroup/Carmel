@@ -1367,6 +1367,22 @@ def produce_envelope_from_artifact(
     extracted, extracted_sha256, derivation_binding, content_type = _load_verified_extracted_text(
         workspace_root, sha256
     )
+    if extracted.lossy:
+        # `ground_quote` below is a simple substring search, not the full
+        # carmel.services.grounding gate -- it has no equivalent of that gate's
+        # `unreadable_reason`/ARTIFACT_DEGRADED checks, so a lossy extraction
+        # (missing pages, a parse failure, or truncation) could otherwise let a
+        # measurement quietly ground against a partial document, or (worse) an
+        # empty one that happens to substring-match nothing and fail for the
+        # wrong reason. Refuse up front instead of letting a knowingly-partial
+        # extraction feed a dataset envelope at all.
+        page_note = (
+            f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
+        )
+        raise DatasetProducerError(
+            f"artifact {sha256!r} was extracted lossily (extractor={extracted.extractor!r}){page_note}; "
+            "refusing to produce a dataset envelope from a knowingly-partial extraction"
+        )
     node_kind = _CONTENT_TYPE_TO_NODE_KIND.get(content_type)
     if node_kind is None:
         # P1-C: fail closed rather than guess. This producer's single root

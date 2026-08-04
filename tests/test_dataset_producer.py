@@ -84,6 +84,7 @@ def _store_synthetic_artifact(
     *,
     content_type: str = "application/pdf",
     extractor: str = "pdf:pypdf",
+    lossy: bool = False,
 ) -> StoredArtifact:
     """Store a synthetic artifact through the REAL evidence.store_artifact API."""
     data = text.encode("utf-8")
@@ -96,7 +97,7 @@ def _store_synthetic_artifact(
         fetched_at=datetime.now(UTC),
     )
     extracted = ExtractedText(
-        text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=False
+        text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=lossy
     )
     return store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
 
@@ -1528,6 +1529,39 @@ class TestProducerNodeKind:
                 value_origin=ValueOrigin.EXPERIMENTAL,
                 measurements=_SPECS,
             )
+
+
+class TestProducerRefusesLossyExtraction:
+    """A ``lossy=True`` extraction (missing pages, a parse failure, or plain
+    truncation) must never reach ``ground_quote`` here: unlike the full
+    ``carmel.services.grounding`` gate, ``ground_quote`` is a bare substring
+    search with no ``unreadable_reason``/ARTIFACT_DEGRADED equivalent of its
+    own, so a partial document could otherwise silently ground a measurement
+    against text the extractor already knows is incomplete."""
+
+    def test_lossy_extraction_is_refused(self, tmp_path: Path) -> None:
+        stored = _store_synthetic_artifact(tmp_path, _TEXT, lossy=True)
+        with pytest.raises(DatasetProducerError, match="extracted lossily"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+    def test_non_lossy_extraction_still_succeeds(self, tmp_path: Path) -> None:
+        """Regression guard: the new refusal must not fire on ordinary, fully
+        successful extractions -- the vast majority of stored artifacts."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT, lossy=False)
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        assert envelope.source_graph.nodes[0].kind == SourceNodeKind.PAPER_PDF
 
 
 class TestProducerGlyphHealthQuarantine:
