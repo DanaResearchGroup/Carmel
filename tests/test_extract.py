@@ -248,6 +248,9 @@ class TestExtractPdf:
             def __init__(self, text: str) -> None:
                 self._text = text
 
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 return self._text
 
@@ -301,6 +304,9 @@ class TestExtractPdf:
                 self._text = text
                 self._raises = raises
 
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 if self._raises:
                     raise KeyError("/Contents")
@@ -341,6 +347,9 @@ class TestExtractPdf:
         # carry a page_failures record per page, so the refusal is loud about
         # why rather than just quietly empty.
         class _FakePage:
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 raise ValueError("page is corrupt")
 
@@ -366,6 +375,9 @@ class TestExtractPdf:
         # a raw exception message is not safe to keep verbatim: it must never
         # leak a local filesystem path into stored output.
         class _FakePage:
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 raise RuntimeError("could not read /home/alice/secret/paper.pdf stream")
 
@@ -393,6 +405,9 @@ class TestExtractPdf:
         call_count = 0
 
         class _FakePage:
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 nonlocal call_count
                 call_count += 1
@@ -434,6 +449,9 @@ class TestExtractPdf:
         huge_chunk = "y" * (MAX_EXTRACTED_TEXT_CHARS // 2 + 1)
 
         class _FakePage:
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 nonlocal call_count
                 call_count += 1
@@ -619,6 +637,9 @@ class TestExtractedTextCap:
             def __init__(self, text: str) -> None:
                 self._text = text
 
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 return self._text
 
@@ -701,6 +722,212 @@ def _build_tiny_pdf(text: bytes) -> bytes:
         out += f"{off:010d} 00000 n \n".encode()
     out += f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode()
     return bytes(out)
+
+
+def _build_pdf_with_pages(
+    page_texts: list[bytes],
+    *,
+    omit_type_indices: frozenset[int] = frozenset(),
+    phantom_kid_at: int | None = None,
+) -> bytes:
+    """Build a minimal, syntactically valid multi-page PDF for exercising
+    ``_extract_pdf``'s real-page-vs-phantom-``/Kids``-entry filtering.
+
+    Hand-built (same approach as :func:`_build_tiny_pdf`), so the fixture has no
+    dependency on a PDF-writing library -- only on pypdf's reader, which is what's
+    actually under test.
+
+    ``omit_type_indices``: 0-based indices of pages whose page dict omits
+    ``/Type /Page`` while still keeping ``/Contents`` -- the sloppy-but-real page
+    case the fix must still keep (regression guard against a strict ``/Type``
+    filter).
+
+    ``phantom_kid_at``: if given, a linearization-parameter-style dict (no
+    ``/Type``, no ``/Contents``; carries ``/Linearized /H /L /N /O`` like a real
+    linearized PDF's parameter dict) is spliced into ``/Pages /Kids`` at this
+    0-based position -- reproducing the actual defect: ``pypdf``'s ``reader.pages``
+    walks ``/Kids`` without checking ``/Type``, so this phantom entry is counted as
+    a page even though it has neither key a real page needs.
+    """
+    n = len(page_texts)
+    font_obj = 4
+    phantom_obj = 3
+
+    def page_obj(i: int) -> int:
+        return 5 + 2 * i
+
+    def content_obj(i: int) -> int:
+        return 5 + 2 * i + 1
+
+    kids_refs: list[str] = []
+    for i in range(n):
+        if phantom_kid_at == i:
+            kids_refs.append(f"{phantom_obj} 0 R")
+        kids_refs.append(f"{page_obj(i)} 0 R")
+    if phantom_kid_at == n:
+        kids_refs.append(f"{phantom_obj} 0 R")
+    kids = "[" + " ".join(kids_refs) + "]"
+
+    objects: dict[int, bytes] = {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: f"<< /Type /Pages /Kids {kids} /Count {n} >>".encode(),
+        phantom_obj: b"<< /Linearized 1 /H [123 456] /L 789 /N " + str(n).encode() + b" /O 7 >>",
+        font_obj: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    }
+    for i, text in enumerate(page_texts):
+        type_entry = b"" if i in omit_type_indices else b"/Type /Page "
+        objects[page_obj(i)] = (
+            b"<< "
+            + type_entry
+            + b"/Parent 2 0 R /Resources << /Font << /F1 "
+            + str(font_obj).encode()
+            + b" 0 R >> >> /MediaBox [0 0 612 792] /Contents "
+            + str(content_obj(i)).encode()
+            + b" 0 R >>"
+        )
+        content_stream = f"BT /F1 24 Tf 72 700 Td ({text.decode('utf-8')}) Tj ET".encode()
+        objects[content_obj(i)] = (
+            b"<< /Length " + str(len(content_stream)).encode() + b" >>\nstream\n" + content_stream + b"\nendstream"
+        )
+
+    max_obj = max(objects)
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: dict[int, int] = {}
+    for num in range(1, max_obj + 1):
+        offsets[num] = len(out)
+        body = objects.get(num, b"<< >>")
+        out += f"{num} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref_offset = len(out)
+    out += f"xref\n0 {max_obj + 1}\n".encode()
+    out += b"0000000000 65535 f \n"
+    for num in range(1, max_obj + 1):
+        out += f"{offsets[num]:010d} 00000 n \n".encode()
+    out += f"trailer\n<< /Size {max_obj + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF".encode()
+    return bytes(out)
+
+
+class TestExtractPdfPhantomKidsEntries:
+    """P1-11 regression: a linearized PDF can carry its linearization parameter
+    dict as a ``/Pages /Kids`` entry. ``pypdf``'s ``reader.pages`` walks ``/Kids``
+    without checking ``/Type``, so it counts that phantom dict as a page --
+    inflating ``page_count`` and shifting every subsequent page's 1-indexed
+    ``TextSection.page``/``PageExtractionFailure.page`` by one.
+    """
+
+    def test_phantom_kid_is_excluded_from_page_count_and_numbering(self) -> None:
+        pytest.importorskip("pypdf")
+        pdf_bytes = _build_pdf_with_pages(
+            [b"Page one content.", b"Page two content.", b"Page three content."],
+            phantom_kid_at=1,
+        )
+        result = extract_text(pdf_bytes, "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        assert result.page_count == 3
+        assert "Page one content." in result.text
+        assert "Page two content." in result.text
+        assert "Page three content." in result.text
+        pages_seen = [sec.page for sec in result.sections if sec.page is not None]
+        assert pages_seen == [1, 2, 3]
+        assert result.lossy is False
+        assert result.page_failures == ()
+
+    def test_page_missing_type_but_with_contents_is_kept(self) -> None:
+        # Regression guard against the strict-filter mistake: the PDF spec
+        # requires /Type /Page on a real page, but a real-but-sloppy page that
+        # omits it must still be kept and extracted, because it carries /Contents.
+        pytest.importorskip("pypdf")
+        pdf_bytes = _build_pdf_with_pages([b"Sloppy page content."], omit_type_indices={0})
+        result = extract_text(pdf_bytes, "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        assert result.page_count == 1
+        assert "Sloppy page content." in result.text
+        assert [sec.page for sec in result.sections if sec.page is not None] == [1]
+
+    def test_uninspectable_entry_is_classified_uninspectable_not_dropped(self) -> None:
+        # The fail-safe direction is "never drop text". An entry whose keys cannot
+        # even be READ is not evidence that it holds no text, so it must be KEPT --
+        # classified as UNINSPECTABLE (kept, but structurally uncertain) rather than
+        # PHANTOM (excluded). Dropping it would mean a future `pypdf` change that
+        # made these lookups raise would silently empty out every document at once,
+        # recording no failure at all.
+        import carmel.agents.tools.extract as extract_mod
+
+        class _UninspectablePage:
+            def get(self, key: str, default: object = None) -> object:
+                raise RuntimeError("key lookup exploded")
+
+            def __contains__(self, key: object) -> bool:
+                raise RuntimeError("membership test exploded")
+
+        assert extract_mod._classify_pdf_page(_UninspectablePage()) is extract_mod._PageKind.UNINSPECTABLE
+
+    def test_uninspectable_entry_kept_and_makes_extraction_lossy_even_when_extract_text_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # This is the core regression guard: keeping an uninspectable entry is only
+        # actually fail-safe if the result is marked `lossy=True` even when its
+        # `extract_text()` call happens to succeed. Silently absorbing it as clean
+        # would trade "silently drop a page" for "silently include a phantom as
+        # clean" -- both are silent, only the direction changed.
+        from carmel.agents.tools import extract as extract_mod
+
+        class _UninspectablePage:
+            def get(self, key: str, default: object = None) -> object:
+                raise RuntimeError("key lookup exploded")
+
+            def __contains__(self, key: object) -> bool:
+                raise RuntimeError("membership test exploded")
+
+            def extract_text(self) -> str:
+                return "Recovered text."
+
+        fake_reader = types.SimpleNamespace(pages=[_UninspectablePage()])
+        monkeypatch.setitem(sys.modules, "pypdf", types.SimpleNamespace(PdfReader=lambda _stream: fake_reader))
+
+        result = extract_mod._extract_pdf(b"%PDF-1.4 whatever")
+
+        assert result.page_count == 1
+        assert "Recovered text." in result.text
+        assert result.lossy is True
+        assert len(result.page_failures) == 1
+        assert result.page_failures[0].page == 1
+
+    def test_ordinary_multi_page_pdf_is_unaffected(self) -> None:
+        pytest.importorskip("pypdf")
+        pdf_bytes = _build_pdf_with_pages([b"First page.", b"Second page."])
+        result = extract_text(pdf_bytes, "application/pdf")
+        assert result.extractor == "pdf:pypdf"
+        assert result.page_count == 2
+        assert "First page." in result.text
+        assert "Second page." in result.text
+        assert [sec.page for sec in result.sections if sec.page is not None] == [1, 2]
+        assert result.lossy is False
+
+    def test_phantom_kids_do_not_consume_the_max_pdf_pages_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # A phantom /Kids entry must not count against MAX_PDF_PAGES: with the cap
+        # lowered to exactly the REAL page count, and phantom entries spliced in
+        # both before and after those real pages, the true (real) page total must
+        # still fit under the cap -- the old, buggy count (real + phantoms) would
+        # have exceeded it and wrongly marked the result lossy/truncated.
+        import carmel.agents.tools.extract as extract_mod
+
+        monkeypatch.setattr(extract_mod, "MAX_PDF_PAGES", 3)
+        pdf_bytes = _build_pdf_with_pages(
+            [b"Page one content.", b"Page two content.", b"Page three content."],
+            phantom_kid_at=0,
+        )
+        # Splice a second phantom onto the end too, by rebuilding with phantom at
+        # the end position as well: reuse the builder's "at len(pages)" support.
+        pdf_bytes_two_phantoms = _build_pdf_with_pages(
+            [b"Page one content.", b"Page two content.", b"Page three content."],
+            phantom_kid_at=3,
+        )
+        for pdf in (pdf_bytes, pdf_bytes_two_phantoms):
+            result = extract_mod._extract_pdf(pdf)
+            assert result.extractor == "pdf:pypdf"
+            assert result.page_count == 3
+            assert result.lossy is False
+            assert [sec.page for sec in result.sections if sec.page is not None] == [1, 2, 3]
 
 
 class TestPypdfNoiseIsMuted:

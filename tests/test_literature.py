@@ -483,6 +483,9 @@ class TestValidateDocument:
 
     def test_application_pdf_with_real_content_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _FakePage:
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 return QUOTE
 

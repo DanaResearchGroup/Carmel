@@ -14,6 +14,7 @@ before recording an offset.
 from __future__ import annotations
 
 import contextlib
+import enum
 import io
 import logging
 import re
@@ -141,16 +142,25 @@ class TextSection(BaseModel):
 
 
 class PageExtractionFailure(BaseModel):
-    """Records that a single PDF page's ``extract_text()`` call raised.
+    """Records that a single PDF page is not fully trustworthy.
 
-    A page-level failure must never discard the pages around it (see the
-    per-page ``try`` in :func:`_extract_pdf`): the surviving pages are kept,
-    and this record is the audit trail for the page that was skipped.
+    Two distinct causes land here, and both keep the page rather than dropping
+    it (see the per-page ``try`` in :func:`_extract_pdf`): the surviving text is
+    kept, and this record is the audit trail for why the result is `lossy=True`.
+
+    1. The page's ``extract_text()`` call raised -- the text for that page is
+       genuinely missing.
+    2. The page-tree entry itself was UNINSPECTABLE (its ``/Type``/``/Contents``
+       keys could not even be read), so it was kept on the fail-safe assumption
+       that it might be a real page -- even if ``extract_text()`` on it then
+       succeeded. This case is a structural uncertainty about whether the entry
+       is a page at all, not an extraction exception.
 
     Attributes:
-        page: 1-indexed PDF page number that failed.
+        page: 1-indexed PDF page number that failed or was uninspectable.
         error: A short, redacted description of the exception (type name plus
-            a path-scrubbed message). Never contains filesystem paths -- the
+            a path-scrubbed message), or a static message for the
+            uninspectable-entry case. Never contains filesystem paths -- the
             input PDF bytes come from content-addressed storage, and a raw
             exception message could otherwise leak a local path into a stored
             artifact.
@@ -651,6 +661,61 @@ def _describe_page_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
 
 
+class _PageKind(enum.Enum):
+    """Three-state classification of a ``/Pages /Kids`` entry.
+
+    REAL: carries ``/Type /Page`` or a ``/Contents`` key -- kept, counted, and
+        extracted normally.
+    PHANTOM: inspected without error, but has neither key (e.g. a linearized
+        PDF's linearization parameter dict reachable via ``/Kids``) -- excluded
+        from ``page_count`` and from extraction.
+    UNINSPECTABLE: the inspection itself raised, so it is unknown whether the
+        entry is a real page -- kept and counted (never dropped), but the
+        uncertainty must surface as ``lossy=True`` rather than being absorbed
+        silently.
+    """
+
+    REAL = "real"
+    PHANTOM = "phantom"
+    UNINSPECTABLE = "uninspectable"
+
+
+def _classify_pdf_page(page: object) -> _PageKind:
+    """Classify a ``/Pages /Kids`` entry as real, phantom, or uninspectable.
+
+    ``pypdf``'s ``reader.pages`` walks ``/Kids`` without checking ``/Type``: a
+    linearized PDF can carry its linearization parameter dictionary as a ``/Kids``
+    entry, and ``reader.pages`` counts it as a page even though it has no
+    ``/Contents`` and no ``/MediaBox``.
+
+    The fail-safe direction here is to never drop real text, so the test for a
+    REAL page is deliberately permissive rather than the spec-strict
+    ``/Type == "/Page"``: a page is REAL if it carries EITHER ``/Type /Page`` OR a
+    ``/Contents`` key. A strict ``/Type`` test would silently discard a
+    real-but-sloppy page that omits the spec-required ``/Type`` (accepted by
+    pypdf and most viewers regardless); this classifier cannot do that, because
+    any content-bearing page is REAL regardless of whether ``/Type`` is present.
+    A linearization dict has neither key, so it is PHANTOM. The one case this
+    still misses is a genuinely BLANK page that omits both ``/Type`` and
+    ``/Contents`` -- it carries no text either way, so only its position in the
+    document is lost, never any content.
+    """
+    try:
+        if page.get("/Type") == "/Page":  # type: ignore[attr-defined]
+            return _PageKind.REAL
+        return _PageKind.REAL if "/Contents" in page else _PageKind.PHANTOM  # type: ignore[operator]
+    except Exception:
+        # An entry we cannot even INSPECT is kept, not dropped. Excluding it would
+        # contradict the fail-safe direction above: "could not read this entry's
+        # keys" is not evidence that it holds no text, and a `pypdf` change that
+        # made these lookups raise would otherwise silently empty out every
+        # document at once. Keeping it costs an honest `lossy=True`: the caller
+        # records this as a structural uncertainty (distinct from an
+        # `extract_text()` exception) so the extraction is never reported clean
+        # while carrying a page it could not verify.
+        return _PageKind.UNINSPECTABLE
+
+
 def _extract_pdf(data: bytes) -> ExtractedText:
     """Extract text from a PDF via the optional ``pypdf`` dependency.
 
@@ -672,8 +737,36 @@ def _extract_pdf(data: bytes) -> ExtractedText:
             reader = pypdf.PdfReader(io.BytesIO(data))
             # `len(reader.pages)` is cheap (it reads the page tree, not page content), so
             # checking it before calling any `extract_text()` bounds the page count up
-            # front rather than after the fact.
-            page_count = len(reader.pages)
+            # front rather than after the fact. But `reader.pages` itself walks
+            # `/Pages /Kids` WITHOUT checking `/Type`, so a linearized PDF's
+            # linearization parameter dict (also reachable via `/Kids`) gets counted
+            # as a page -- filter those out here, once, before anything downstream
+            # (page numbering, MAX_PDF_PAGES bounding) sees an inflated count.
+            #
+            # Counted lazily and RETAINED only up to `MAX_PDF_PAGES`, rather than
+            # materializing every page object into one list first. A plain
+            # comprehension over `reader.pages` would hold a wrapper per entry for a
+            # PDF declaring a huge page tree -- reintroducing, at the page-object
+            # layer, exactly the "allocate everything, bound it afterwards" ordering
+            # that the character cap below was written to close. `page_count` still
+            # counts every real page, so it stays exact for the density check in
+            # `carmel.services.grounding`; only retention is bounded.
+            real_pages: list[pypdf.PageObject] = []
+            # 1-indexed positions within `real_pages` (which is exactly the future
+            # `i + 1` page numbering below) whose page-tree entry was UNINSPECTABLE:
+            # kept because we cannot prove it holds no text, but the extraction must
+            # still surface `lossy=True` for it even if `extract_text()` succeeds.
+            uninspectable_page_numbers: set[int] = set()
+            page_count = 0
+            for page in reader.pages:
+                kind = _classify_pdf_page(page)
+                if kind is _PageKind.PHANTOM:
+                    continue
+                page_count += 1
+                if len(real_pages) < MAX_PDF_PAGES:
+                    real_pages.append(page)
+                    if kind is _PageKind.UNINSPECTABLE:
+                        uninspectable_page_numbers.add(len(real_pages))
     except Exception:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
 
@@ -708,10 +801,24 @@ def _extract_pdf(data: bytes) -> ExtractedText:
             # don't, instead of the old behavior of losing an entire multi-page paper
             # to one bad page.
             try:
-                page_text = reader.pages[i].extract_text() or ""
+                page_text = real_pages[i].extract_text() or ""
             except Exception as exc:
                 page_failures.append(PageExtractionFailure(page=i + 1, error=_describe_page_error(exc)))
                 continue
+            if (i + 1) in uninspectable_page_numbers:
+                # `extract_text()` succeeded, but the page-tree entry itself could
+                # not be inspected, so we still cannot verify this is actually a
+                # page. Record it as a structural uncertainty -- distinct from an
+                # `extract_text()` exception -- so `lossy=True` follows even though
+                # the text (appended below) is kept in full. One record per page:
+                # the `except` branch above already handles the case where
+                # `extract_text()` also fails, so this only fires on the success path.
+                page_failures.append(
+                    PageExtractionFailure(
+                        page=i + 1,
+                        error="page-tree entry could not be inspected; kept as a possible page",
+                    )
+                )
             if have_prior_page:
                 parts.append(separator)
                 cursor += len(separator)
