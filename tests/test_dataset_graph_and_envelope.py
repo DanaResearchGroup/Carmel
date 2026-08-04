@@ -140,8 +140,12 @@ def _extraction_binding(
     extracted_sha256: str = SHA_A,
     extracted_text_sha256: str = SHA_B,
     derivation_binding: Maybe[str] = _NO_DERIVATION_BINDING,
+    parent_raw_sha256: str = SHA_A,
+    extraction_sha256: str = SHA_D,
 ) -> ExtractionBinding:
     return ExtractionBinding(
+        parent_raw_sha256=parent_raw_sha256,
+        extraction_sha256=extraction_sha256,
         extracted_sha256=extracted_sha256,
         extracted_text_sha256=extracted_text_sha256,
         derivation_binding=derivation_binding,
@@ -1112,11 +1116,20 @@ class TestSourceGraphConflictingGlyphHealth:
 
 
 class TestSourceGraphConflictingExtractionBinding:
-    """I5c: two nodes that share raw bytes (the same sha256) must agree on
-    their whole ExtractionBinding, when both have one present. This fires
-    independently of glyph_health -- the evidence store lays out exactly one
-    extracted.json per raw-bytes directory, so two disagreeing bindings can
-    have at most one satisfied by a replayer."""
+    """I5c: two nodes that name the SAME extraction address -- the pair
+    (extraction.parent_raw_sha256, extraction.extraction_sha256) -- must
+    agree on their whole ExtractionBinding, when both have one present. This
+    fires independently of glyph_health. The evidence store now allows MANY
+    extraction records per raw-bytes directory (see
+    carmel.services.extraction_record:
+    evidence/literature/<raw sha256>/extractions/<extraction sha256>/), so
+    two nodes that merely SHARE a raw sha256 while naming DIFFERENT
+    extraction_sha256 values are NOT a conflict -- each addresses its own
+    independently-resolvable extraction record. What remains a conflict is
+    two nodes naming the IDENTICAL extraction address while disagreeing on
+    the binding recorded for it: at most one of two disagreeing bindings for
+    the same address can match what is actually stored there, so the other
+    is guaranteed unresolvable by any replayer."""
 
     def test_same_bytes_disagreeing_on_extraction_neither_has_health_is_rejected(self) -> None:
         """I5c must fire even when NEITHER node carries any glyph_health at
@@ -1196,6 +1209,84 @@ class TestSourceGraphConflictingExtractionBinding:
         assert "CONFLICT" in message
         assert "glyph_health assessments disagree" not in message
         assert "duplicates an earlier node" not in message
+
+    def test_same_raw_sha_different_extraction_address_disagreeing_bindings_is_allowed(self) -> None:
+        """Invariant point 4 (the actual bug fix): two nodes that share raw
+        bytes (the same sha256) but name DIFFERENT extraction_sha256 values
+        are NOT a conflict, even when their ExtractionBinding values
+        disagree on every other field -- each addresses its own
+        independently-resolvable extraction record under
+        evidence/literature/<raw sha256>/extractions/<extraction sha256>/,
+        so there is nothing to reconcile between them.
+
+        Before this fix, I5c keyed only on raw sha256 and would have
+        wrongly rejected this exact pair as a CONFLICT -- that was the hole
+        this test closes. The ONLY guard that could reject this input is
+        I5c's address-equality check (the `if address in
+        extraction_by_address` branch in SourceGraph's validator): every
+        other invariant in this file is satisfied by construction (the two
+        nodes differ in kind, so the (kind, sha256, parent_node_id)
+        duplicate check never fires; neither carries glyph_health, so I5b
+        never fires). If I5c is reverted to keying on raw sha256 alone
+        (dropping extraction_sha256 from the key), this test starts
+        raising and must fail.
+        """
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extraction_sha256=SHA_D, extracted_text_sha256=SHA_B),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            # Same raw sha256 (SHA_A) as `paper`, but a DIFFERENT extraction
+            # address (SHA_E, not SHA_D) -- and, deliberately, a disagreeing
+            # extracted_text_sha256 (SHA_C, not SHA_B) too, to prove the
+            # disagreement itself is irrelevant once the addresses differ.
+            extraction=_extraction_binding(extraction_sha256=SHA_E, extracted_text_sha256=SHA_C),
+        )
+        graph = SourceGraph(nodes=(paper, crop))
+        assert graph.node("crop").sha256 == graph.node("paper").sha256
+        assert graph.node("crop").extraction.extraction_sha256 != graph.node("paper").extraction.extraction_sha256
+
+    def test_same_raw_sha_different_extraction_address_disagreeing_health_is_allowed(self) -> None:
+        """I5b's address-keying, mirrored from the I5c test above: two nodes
+        sharing raw bytes but naming DIFFERENT extraction addresses may
+        legitimately disagree on glyph_health, because glyph_health
+        describes the EXTRACTED TEXT that address names, not the raw bytes.
+        A re-extraction under a newer pypdf can genuinely produce different
+        text with a different health story from the same raw PDF.
+
+        The ONLY guard that could reject this input is I5b's
+        address-equality check (the `if address in health_by_address`
+        branch): the two nodes differ in kind, so the duplicate check never
+        fires, and I5c never fires because the two ExtractionBinding values
+        are only compared when the addresses match (they do not here). If
+        I5b is reverted to keying on raw sha256 alone, this test starts
+        raising and must fail.
+        """
+        paper = _node(
+            "paper",
+            SourceNodeKind.PAPER_PDF,
+            SHA_A,
+            parent_node_id=None,
+            extraction=_extraction_binding(extraction_sha256=SHA_D, extracted_text_sha256=SHA_B),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_HEALTHY_GLYPH_HEALTH),
+        )
+        crop = _node(
+            "crop",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_A,
+            parent_node_id="paper",
+            extraction=_extraction_binding(extraction_sha256=SHA_E, extracted_text_sha256=SHA_C),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_C, health=_UNHEALTHY_GLYPH_HEALTH),
+        )
+        graph = SourceGraph(nodes=(paper, crop))
+        assert graph.node("crop").glyph_health.health != graph.node("paper").glyph_health.health
 
 
 class TestSourceGraphLookupAPI:

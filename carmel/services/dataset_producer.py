@@ -97,6 +97,11 @@ from carmel.services.dataset_store import (
     canonical_json_bytes,
 )
 from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_artifact
+from carmel.services.extraction_record import (
+    ExtractionRecordError,
+    UnknownPypdfVersionError,
+    store_extraction_record,
+)
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
     GlyphHealth,
@@ -114,6 +119,7 @@ from carmel.services.numeric import (
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     current_sha_for,
+    extraction_identity,
 )
 from carmel.services.units import QuantityKind
 
@@ -1133,10 +1139,15 @@ _CONTENT_TYPE_TO_NODE_KIND: dict[str, SourceNodeKind] = {
 
 def _load_verified_extracted_text(
     workspace_root: Path, sha256: str
-) -> tuple[ExtractedText, str, str, str]:
+) -> tuple[ExtractedText, str, str, str, bytes]:
     """Resolve, verify, and parse the stored extraction for ``sha256``.
 
-    Returns ``(extracted, extracted_sha256, derivation_binding, content_type)``.
+    Returns ``(extracted, extracted_sha256, derivation_binding, content_type,
+    raw_bytes)``, where ``raw_bytes`` is the exact, already-verified
+    ``extracted.json`` bytes read from disk -- returned so a caller that needs
+    to re-address this same extraction (e.g. via
+    :func:`carmel.services.extraction_record.store_extraction_record`) can do
+    so without a second, redundant read-and-reverify of the same file.
     The bytes of ``extracted.json`` are read directly from disk and their digest is
     compared against ``StoredArtifact.extracted_sha256`` BEFORE any parsing
     -- unverified bytes are never parsed. (``extracted_sha256`` really is the
@@ -1289,7 +1300,7 @@ def _load_verified_extracted_text(
         raise DatasetProducerError(
             f"artifact {sha256!r}: verified {_EXTRACTED_NAME} bytes do not parse as an ExtractedText: {exc}"
         ) from exc
-    return extracted, meta.extracted_sha256, meta.derivation_binding, meta.content_type
+    return extracted, meta.extracted_sha256, meta.derivation_binding, meta.content_type, raw_bytes
 
 
 def produce_envelope_from_artifact(
@@ -1364,8 +1375,8 @@ def produce_envelope_from_artifact(
                 "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
             )
 
-    extracted, extracted_sha256, derivation_binding, content_type = _load_verified_extracted_text(
-        workspace_root, sha256
+    extracted, extracted_sha256, derivation_binding, content_type, extracted_json_bytes = (
+        _load_verified_extracted_text(workspace_root, sha256)
     )
     if extracted.lossy:
         # `ground_quote` below is a simple substring search, not the full
@@ -1414,7 +1425,48 @@ def produce_envelope_from_artifact(
     # carve-out at its own "predates derivation_binding" check) -- this
     # function is never reached for such an artifact at all, so
     # derivation_binding here is always the verified str the type says it is.
+    #
+    # ExtractionBinding.parent_raw_sha256/extraction_sha256 must name a
+    # genuinely RESOLVABLE extraction record, not merely a computed address
+    # that resolves to nothing on disk -- a replayer handed an address with
+    # no backing record can never do better than report it UNVERIFIABLE
+    # forever, which is worse than no replayer at all. So this producer does
+    # not compute the address in isolation; it calls
+    # store_extraction_record(), which parses+content-addresses+durably
+    # persists this same extracted.json under
+    # evidence/literature/<sha256>/extractions/<extraction_sha256>/ (a no-op
+    # if that exact record is already stored -- idempotent on re-run), and
+    # returns the address that record now durably occupies. The extractor
+    # code identity is today's, from semantic_deps.extraction_identity() --
+    # the old store never recorded a separate extractor_code_sha256, so this
+    # producer cannot honestly claim to know what code identity produced a
+    # legacy artifact's extraction; it only claims what identity is stamping
+    # THIS extraction record, now.
+    identity = extraction_identity()
+    try:
+        extraction_sha256 = store_extraction_record(
+            workspace_root,
+            raw_sha256=sha256,
+            extractor=extracted.extractor,
+            extractor_code_sha256=identity.code_sha256,
+            pypdf_version=identity.pypdf_version,
+            extracted_json_bytes=extracted_json_bytes,
+        )
+    except UnknownPypdfVersionError as exc:
+        raise DatasetProducerError(
+            f"artifact {sha256!r} was extracted with extractor={extracted.extractor!r}, which is "
+            "pypdf-version-dependent, but the installed pypdf version could not be determined; "
+            "refusing to mint an extraction address that cannot honestly claim which pypdf produced "
+            f"it: {exc}"
+        ) from exc
+    except ExtractionRecordError as exc:
+        raise DatasetProducerError(
+            f"artifact {sha256!r}: could not durably store a resolvable extraction record for its "
+            f"extracted.json: {exc}"
+        ) from exc
     binding = ExtractionBinding(
+        parent_raw_sha256=sha256,
+        extraction_sha256=extraction_sha256,
         extracted_sha256=extracted_sha256,
         extracted_text_sha256=extracted_text_sha256,
         derivation_binding=derivation_binding,

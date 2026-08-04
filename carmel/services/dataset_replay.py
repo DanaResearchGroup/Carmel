@@ -218,6 +218,11 @@ from carmel.services.dataset_producer import (
     binding_for_known_sha,
 )
 from carmel.services.evidence import _derivation_binding, artifact_dir, load_artifact_meta
+from carmel.services.extraction_record import (
+    ExtractionRecordError,
+    extraction_record_dir,
+    load_extraction_record,
+)
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
     enclosing_numeric_construct,
@@ -352,18 +357,52 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             expected=node.sha256,
             actual=actual_raw_sha256,
         )
-    extracted_path = artifact_dir(workspace_root, node.sha256) / "extracted.json"
+    # Resolve the ADDRESSED extraction record -- (parent_raw_sha256,
+    # extraction_sha256) -- never the OLD single-extraction-per-raw-sha
+    # evidence.load_artifact_meta path used above only for raw.bin. One raw
+    # document can now legitimately have MANY extraction records (see
+    # SourceGraph's I5c/I5b docstrings in carmel.schemas.datasets), so the
+    # node's own ExtractionBinding is the only honest anchor for which one
+    # this node claims.
+    try:
+        record_meta = load_extraction_record(
+            workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
+        )
+    except ExtractionRecordError as exc:
+        return None, ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"extraction record meta.json for node {node.node_id!r} at address "
+            f"(parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+            f"extraction_sha256={extraction.extraction_sha256!r}) is unreadable: {exc}",
+        )
+    if record_meta is None:
+        # No record stored at that address, or its meta.json does not
+        # authenticate to it -- either way this is inability to check, not
+        # positive evidence of anything wrong.
+        return None, ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"no extraction record stored (or its meta.json does not authenticate) for node "
+            f"{node.node_id!r} at address (parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+            f"extraction_sha256={extraction.extraction_sha256!r})",
+        )
+    extracted_path = extraction_record_dir(
+        workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
+    ) / "extracted.json"
     try:
         raw_bytes = extracted_path.read_bytes()
     except (FileNotFoundError, OSError) as exc:
         return None, ReplayFinding(
             category=ReplayOutcome.UNVERIFIABLE,
             ref_path=path,
-            reason=f"no readable extracted.json for node {node.node_id!r} (sha256={node.sha256!r}): {exc}",
+            reason=f"no readable extracted.json for node {node.node_id!r}'s extraction record "
+            f"(parent_raw_sha256={extraction.parent_raw_sha256!r}, "
+            f"extraction_sha256={extraction.extraction_sha256!r}): {exc}",
         )
     actual_extracted_sha256 = hashlib.sha256(raw_bytes).hexdigest()
     # The ONLY acceptable anchor is the envelope's own ExtractionBinding --
-    # never the evidence store's meta.json sidecar. meta.json lives right
+    # never the extraction record's meta.json sidecar. meta.json lives right
     # next to the very file it would otherwise authenticate and is
     # trivially rewritable by anyone who can write to the store; trusting
     # it as an anchor lets a forger rewrite extracted.json and meta.json
@@ -373,30 +412,29 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
         return None, ReplayFinding(
             category=ReplayOutcome.FAILED,
             ref_path=path,
-            reason=f"extracted.json bytes on disk for node {node.node_id!r} (sha256={node.sha256!r}) do "
+            reason=f"extracted.json bytes on disk for node {node.node_id!r}'s extraction record do "
             "not match ExtractionBinding.extracted_sha256 recorded on the envelope -- the stored "
             "evidence has been tampered with or corrupted since the envelope was produced",
             expected=extraction.extracted_sha256,
             actual=actual_extracted_sha256,
         )
-    # meta.json is cross-checked only AFTER the envelope's own anchor has
-    # already passed, and purely as an early-warning signal: a
-    # disagreement here means the evidence store's own bookkeeping is
-    # inconsistent with the envelope (rewritten independently of it, or
+    # record_meta.json is cross-checked only AFTER the envelope's own anchor
+    # has already passed, and purely as an early-warning signal: a
+    # disagreement here means the extraction record store's own bookkeeping
+    # is inconsistent with the envelope (rewritten independently of it, or
     # never updated), which is itself worth reporting even though the
     # envelope-anchored check above is what actually decided pass/fail.
-    meta = load_artifact_meta(workspace_root, node.sha256)
-    if meta is not None and meta.extracted_sha256 is not None and meta.extracted_sha256 != actual_extracted_sha256:
+    if record_meta.extracted_sha256 != actual_extracted_sha256:
         return None, ReplayFinding(
             category=ReplayOutcome.FAILED,
             ref_path=path,
-            reason=f"evidence store meta.json for node {node.node_id!r} (sha256={node.sha256!r}) "
-            f"records extracted_sha256={meta.extracted_sha256!r}, which disagrees with the bytes "
+            reason=f"extraction record meta.json for node {node.node_id!r} records "
+            f"extracted_sha256={record_meta.extracted_sha256!r}, which disagrees with the bytes "
             "actually on disk (and with the envelope's own anchor, already verified above) -- the "
             "store's own sidecar bookkeeping is inconsistent and is reported rather than silently "
             "reconciled",
             expected=actual_extracted_sha256,
-            actual=meta.extracted_sha256,
+            actual=record_meta.extracted_sha256,
         )
     try:
         extracted = ExtractedText.model_validate(json.loads(raw_bytes))
@@ -449,6 +487,18 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             expected=extraction.extracted_text_sha256,
             actual=actual_text_sha256,
         )
+    if record_meta.extracted_text_sha256 != actual_text_sha256:
+        return None, ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path,
+            reason=f"extraction record meta.json for node {node.node_id!r} records "
+            f"extracted_text_sha256={record_meta.extracted_text_sha256!r}, which disagrees with the "
+            "independently re-read text actually stored (and with the envelope's own anchor, already "
+            "verified above) -- the store's own sidecar bookkeeping is inconsistent and is reported "
+            "rather than silently reconciled",
+            expected=actual_text_sha256,
+            actual=record_meta.extracted_text_sha256,
+        )
     if isinstance(extraction.derivation_binding, Absent):
         # A legacy record predating ExtractionBinding.derivation_binding (or
         # one explicitly stripped) carries nothing to cross-check the
@@ -461,7 +511,15 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
             "(Absent, e.g. a legacy record predating that field); there is nothing recorded to "
             "independently cross-check the extractor identity binding against",
         )
-    if meta is None or meta.extractor_version is None or meta.extracted_sha256 is None:
+    # This cross-check is orthogonal to the extraction-record verification
+    # above: derivation_binding was bound at store time against the OLD,
+    # single-extraction-per-raw-sha evidence store's own meta.json (see
+    # dataset_producer._load_verified_extracted_text and
+    # evidence._derivation_binding), not against the extraction record. It
+    # is re-loaded here, independently, by node.sha256 (the raw artifact),
+    # never by the extraction address.
+    raw_meta = load_artifact_meta(workspace_root, node.sha256)
+    if raw_meta is None or raw_meta.extractor_version is None or raw_meta.extracted_sha256 is None:
         return None, ReplayFinding(
             category=ReplayOutcome.UNVERIFIABLE,
             ref_path=path,
@@ -488,7 +546,7 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> t
     # all three fields together. See evidence._derivation_binding_intact,
     # which this mirrors but against the envelope's carried value instead
     # of only meta.json's own internal fields.
-    recomputed_binding = _derivation_binding(meta.sha256, meta.extracted_sha256, meta.extractor_version)
+    recomputed_binding = _derivation_binding(raw_meta.sha256, raw_meta.extracted_sha256, raw_meta.extractor_version)
     if recomputed_binding != extraction.derivation_binding:
         return None, ReplayFinding(
             category=ReplayOutcome.FAILED,

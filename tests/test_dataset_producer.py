@@ -41,6 +41,7 @@ from carmel.services.dataset_producer import (
 from carmel.services.dataset_replay import ReplayOutcome, replay_envelope
 from carmel.services.dataset_store import compute_dataset_sha
 from carmel.services.evidence import artifact_dir, store_artifact
+from carmel.services.extraction_record import extraction_record_dir
 from carmel.services.numeric import QuoteRole
 from carmel.services.units import QuantityKind
 
@@ -1244,7 +1245,23 @@ class TestProducerEndToEnd:
         text -- the content-addressed store makes it impossible for two
         different texts to share one sha256, so the only way to exercise
         the mismatch path is to mutate the evidence the envelope's own
-        recorded sha256 already points at."""
+        recorded sha256 already points at.
+
+        The tamper target is the EXTRACTION-RECORD store
+        (``extraction_record_dir(parent_raw_sha256, extraction_sha256)``),
+        not the older single-extraction-per-raw-sha ``artifact_dir``:
+        ``_independently_verify_node_text`` resolves ``extracted.json``
+        exclusively via the node's own ``ExtractionBinding`` address, so
+        mutating the ``artifact_dir`` copy would tamper with evidence the
+        replayer never re-reads and this test would go green vacuously. The
+        ONLY guard capable of turning this mutation into a non-VERIFIED
+        outcome is the ``actual_extracted_sha256 != extraction.extracted_sha256``
+        digest comparison in ``_independently_verify_node_text``
+        (``carmel/services/dataset_replay.py``) -- if that comparison were
+        ever removed or short-circuited, this is the test that would catch
+        it, because everything else about the envelope (its own sha256,
+        its stored dataset, its grounding spans) is left completely
+        untouched."""
         original = _store_synthetic_artifact(tmp_path, _TEXT)
         datasets_root = tmp_path / "datasets"
 
@@ -1263,9 +1280,17 @@ class TestProducerEndToEnd:
         assert clean_report.outcome is ReplayOutcome.VERIFIED
         assert clean_report.checked_char_spans == 6
 
-        # ...then tamper with the SAME artifact's extracted.json on disk,
-        # in place, so the envelope still names the same sha256 but the
-        # evidence underneath it has changed by exactly one character.
+        # ...then tamper with the SAME extraction record's extracted.json on
+        # disk, in place, so the envelope still names the same
+        # (parent_raw_sha256, extraction_sha256) address but the evidence
+        # underneath it has changed by exactly one character. The node's own
+        # ExtractionBinding is the only honest anchor for which extraction
+        # record this node claims -- mirrors the addressing the replayer
+        # itself uses.
+        node = loaded.source_graph.node("paper")
+        binding = node.extraction
+        assert isinstance(binding, ExtractionBinding), "extraction must be present, not Absent"
+
         assert len(_TEXT) == len(_MUTATED_TEXT)
         mutated_extracted = ExtractedText(
             text=_MUTATED_TEXT,
@@ -1274,7 +1299,10 @@ class TestProducerEndToEnd:
             extractor="pdf:pypdf",
             lossy=False,
         )
-        extracted_path = artifact_dir(tmp_path, original.sha256) / "extracted.json"
+        extracted_path = (
+            extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
+            / "extracted.json"
+        )
         extracted_path.write_text(json.dumps(mutated_extracted.model_dump(mode="json")), encoding="utf-8")
 
         mutated_report = replay_envelope(tmp_path, loaded)

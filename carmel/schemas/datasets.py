@@ -508,6 +508,26 @@ class ExtractionBinding(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    parent_raw_sha256: str = Field(min_length=64, max_length=64)
+    """sha256 of the raw artifact this extraction was derived from -- must equal
+    the owning :class:`SourceNode`'s own ``sha256`` (enforced by
+    ``SourceNode._validate_extraction_parent_matches_node_sha256``). Named to
+    match :class:`carmel.services.extraction_record.ExtractionRecordMeta`'s
+    field of the same name: this is half of the resolvable extraction address
+    that field pairs with ``extraction_sha256`` below."""
+    extraction_sha256: str = Field(min_length=64, max_length=64)
+    """The content address of the specific extraction record this binding
+    describes, i.e. the ``extraction_sha256`` computed by
+    :func:`carmel.services.extraction_record.compute_extraction_sha` and
+    returned by :func:`carmel.services.extraction_record.store_extraction_record`.
+
+    The evidence store now allows MANY extraction records per raw-bytes
+    directory (``evidence/literature/<raw sha256>/extractions/<extraction
+    sha256>/``, see :mod:`carmel.services.extraction_record`) -- a ``pypdf``
+    upgrade, or a change to Carmel's own extraction code, produces a NEW
+    extraction record alongside any earlier ones rather than replacing them.
+    This field is what makes a binding resolvable to exactly ONE of those
+    records rather than assuming there is only ever one to find."""
     extracted_sha256: str = Field(min_length=64, max_length=64)
     """Digest of the stored ``extracted.json`` file's bytes -- the integrity anchor."""
     extracted_text_sha256: str = Field(min_length=64, max_length=64)
@@ -558,7 +578,7 @@ class ExtractionBinding(BaseModel):
     separate free-text field to keep in sync or let drift.
     """
 
-    @field_validator("extracted_sha256", "extracted_text_sha256")
+    @field_validator("parent_raw_sha256", "extraction_sha256", "extracted_sha256", "extracted_text_sha256")
     @classmethod
     def _validate_sha256_shape(cls, value: str) -> str:
         if not _SHA256_RE.match(value):
@@ -722,6 +742,26 @@ class SourceNode(BaseModel):
                 f"{input_sha256!r} does not equal this node's extraction.extracted_text_sha256="
                 f"{self.extraction.extracted_text_sha256!r}; an assessment whose input digest doesn't "
                 "match the node's extracted text cannot be attributed to that node"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_extraction_parent_matches_node_sha256(self) -> SourceNode:
+        """A recorded ``extraction`` must address a record derived from THIS
+        node's own raw bytes, not merely be present alongside them.
+
+        ``extraction.parent_raw_sha256`` is the sha256 of the raw artifact the
+        addressed extraction record was actually derived from -- it must equal
+        this node's own ``sha256``, or the binding names an extraction of some
+        OTHER node's bytes while claiming to describe this one.
+        """
+        if isinstance(self.extraction, Absent):
+            return self
+        if self.extraction.parent_raw_sha256 != self.sha256:
+            raise ValueError(
+                f"node {self.node_id!r} has sha256={self.sha256!r} but its extraction binding names "
+                f"parent_raw_sha256={self.extraction.parent_raw_sha256!r}; an extraction record derived "
+                "from different raw bytes cannot be attributed to this node"
             )
         return self
 
@@ -1130,49 +1170,67 @@ class SourceGraph(BaseModel):
         # this invariant does not treat that distinction as enough on its
         # own to admit both -- widening the triple to include origin is a
         # deliberate future change, not an oversight here.
-        # I5c: two nodes that share raw bytes (the same sha256) must agree on
-        # their whole ExtractionBinding, when both have one present. The
-        # evidence store lays out
-        # evidence/literature/<raw sha256>/{raw.bin,text.txt,extracted.json,meta.json}
-        # -- exactly ONE extracted.json per raw-bytes directory, so two
-        # disagreeing bindings can have at most one satisfied by a replayer;
-        # the other is guaranteed unresolvable. This compares the WHOLE
-        # ExtractionBinding via `==` (the model is frozen, so this is value
-        # equality over every field) rather than field-by-field, so that a
-        # future field added to ExtractionBinding is automatically covered
-        # here without needing to be remembered. An Absent extraction on
-        # either side is deliberately NOT a conflict -- only compare when
-        # BOTH nodes have a present binding; silence is not a contradiction,
-        # exactly as I5b (below) does not treat an Absent glyph_health as
-        # disagreeing with anything. This check is not gated on glyph_health
-        # in any way and must fire even when NEITHER node has any
-        # glyph_health at all -- that is the widest part of the hole it
+        # I5c: two nodes that name the SAME extraction address -- the pair
+        # (extraction.parent_raw_sha256, extraction.extraction_sha256) -- must
+        # agree on their whole ExtractionBinding, when both have one present.
+        # The evidence store now allows MANY extraction records per raw-bytes
+        # directory (see carmel.services.extraction_record:
+        # evidence/literature/<raw sha256>/extractions/<extraction sha256>/
+        # {extracted.json,text.txt,meta.json}), so two nodes that merely SHARE
+        # a raw sha256 while naming DIFFERENT extraction_sha256 values are no
+        # longer a conflict: each addresses its own independently-resolvable
+        # extraction record, and both can be verified on their own terms.
+        # What remains a conflict is two nodes naming the IDENTICAL extraction
+        # address while disagreeing on the binding recorded for it -- at most
+        # one of two disagreeing bindings for the same address can match what
+        # is actually stored there, so the other is guaranteed unresolvable.
+        # This compares the WHOLE ExtractionBinding via `==` (the model is
+        # frozen, so this is value equality over every field) rather than
+        # field-by-field, so that a future field added to ExtractionBinding is
+        # automatically covered here without needing to be remembered. An
+        # Absent extraction on either side is deliberately NOT a conflict --
+        # only compare when BOTH nodes have a present binding; silence is not
+        # a contradiction, exactly as I5b (below) does not treat an Absent
+        # glyph_health as disagreeing with anything. This check is not gated
+        # on glyph_health in any way and must fire even when NEITHER node has
+        # any glyph_health at all -- that is the widest part of the hole it
         # closes.
-        extraction_by_sha: dict[str, tuple[str, ExtractionBinding]] = {}
+        extraction_by_address: dict[tuple[str, str], tuple[str, ExtractionBinding]] = {}
         for node in self.nodes:
             if isinstance(node.extraction, Absent):
                 continue
-            if node.sha256 in extraction_by_sha:
-                other_node_id, other_extraction = extraction_by_sha[node.sha256]
+            address = (node.extraction.parent_raw_sha256, node.extraction.extraction_sha256)
+            if address in extraction_by_address:
+                other_node_id, other_extraction = extraction_by_address[address]
                 if other_extraction != node.extraction:
                     raise ValueError(
-                        f"node {node.node_id!r} and node {other_node_id!r} share sha256={node.sha256!r} "
-                        "but their recorded ExtractionBinding values disagree; this is a CONFLICT, not "
-                        "a legal 'different role' duplicate: the evidence store lays out "
-                        "evidence/literature/<raw sha256>/{raw.bin,text.txt,extracted.json,meta.json} -- "
-                        "exactly one extracted.json per raw-bytes directory, so two disagreeing bindings "
-                        "can have at most one satisfied by a replayer; the other is guaranteed "
-                        "unresolvable and must be reconciled before this graph can validate"
+                        f"node {node.node_id!r} and node {other_node_id!r} both name extraction address "
+                        f"(parent_raw_sha256={address[0]!r}, extraction_sha256={address[1]!r}) but their "
+                        "recorded ExtractionBinding values disagree; this is a CONFLICT, not a legal "
+                        "'different role' duplicate: at most one of two disagreeing bindings for the "
+                        "same extraction address can match what is actually stored under "
+                        "evidence/literature/<raw sha256>/extractions/<extraction sha256>/ -- the other "
+                        "is guaranteed unresolvable and must be reconciled before this graph can validate"
                     )
                 continue
-            extraction_by_sha[node.sha256] = (node.node_id, node.extraction)
+            extraction_by_address[address] = (node.node_id, node.extraction)
 
-        # I5b: two nodes that share raw bytes (the same sha256) must agree
-        # on glyph health, if both have any recorded. The same bytes can
-        # only actually have one glyph-health story, so a disagreement here
-        # is not a legal "different role" case like the duplicate check
-        # below (which is about kind/parent, not about the underlying
-        # bytes) -- it is a CONFLICT between two assessments of the same
+        # I5b: two nodes that name the SAME extraction address (see I5c
+        # above) must agree on glyph health, if both have any recorded. The
+        # health assessment describes THE EXTRACTED TEXT that address names,
+        # not the raw bytes it was derived from -- so two nodes that merely
+        # SHARE a raw sha256 while naming DIFFERENT extraction addresses may
+        # legitimately disagree (they are assessments of different extracted
+        # text, e.g. a re-extraction under a newer pypdf). Keying this on the
+        # extraction address rather than raw sha256 is safe: `SourceNode.
+        # _validate_glyph_health_binds_to_this_nodes_extraction` already
+        # guarantees `extraction` is present whenever `glyph_health` is, so
+        # every node reaching this loop with a glyph_health also has an
+        # extraction to key on. Two nodes naming the SAME address can only
+        # actually have one glyph-health story, so a disagreement there is
+        # not a legal "different role" case like the duplicate check below
+        # (which is about kind/parent, not about the underlying extracted
+        # text) -- it is a CONFLICT between two assessments of the same
         # text, and must be rejected as such rather than silently admitted.
         #
         # THE ORDER OF THESE CHECKS IS LOAD-BEARING, not stylistic.
@@ -1187,7 +1245,7 @@ class SourceGraph(BaseModel):
         # starts reporting a duplicate, these blocks have been reordered.
         #
         # I5c (above) must run before I5b, for the same reason one level up:
-        # when two same-sha256 nodes disagree on BOTH extraction and glyph
+        # when two same-address nodes disagree on BOTH extraction and glyph
         # health, the extraction disagreement is the ROOT CAUSE (different
         # extracted text naturally produces different health) and the health
         # disagreement is only a downstream SYMPTOM of it -- reporting the
@@ -1196,23 +1254,26 @@ class SourceGraph(BaseModel):
         # was written correctly but placed after the duplicate check, so for
         # the case that mattered it was unreachable. Do not recreate that
         # mistake by placing I5c after I5b.
-        health_by_sha: dict[str, tuple[str, GlyphHealth]] = {}
+        health_by_address: dict[tuple[str, str], tuple[str, GlyphHealth]] = {}
         for node in self.nodes:
             if isinstance(node.glyph_health, Absent):
                 continue
+            assert not isinstance(node.extraction, Absent)  # guaranteed above; see docstring
+            address = (node.extraction.parent_raw_sha256, node.extraction.extraction_sha256)
             health = node.glyph_health.health
-            if node.sha256 in health_by_sha:
-                other_node_id, other_health = health_by_sha[node.sha256]
+            if address in health_by_address:
+                other_node_id, other_health = health_by_address[address]
                 if other_health != health:
                     raise ValueError(
-                        f"node {node.node_id!r} and node {other_node_id!r} share sha256={node.sha256!r} "
-                        "but their recorded glyph_health assessments disagree; the same bytes can only "
+                        f"node {node.node_id!r} and node {other_node_id!r} both name extraction address "
+                        f"(parent_raw_sha256={address[0]!r}, extraction_sha256={address[1]!r}) but their "
+                        "recorded glyph_health assessments disagree; the same extracted text can only "
                         "have one true glyph-health story, so this is a CONFLICT between two "
                         "assessments of the same text -- not a legal 'different role' duplicate -- and "
                         "must be reconciled before this graph can validate"
                     )
                 continue
-            health_by_sha[node.sha256] = (node.node_id, health)
+            health_by_address[address] = (node.node_id, health)
 
         seen_triples: set[tuple[SourceNodeKind, str, str | None]] = set()
         for node in self.nodes:
@@ -3073,6 +3134,8 @@ def _archive_origin_identity_payload(origin: ArchiveOrigin) -> dict[str, Any]:
 
 def _extraction_binding_identity_payload(binding: ExtractionBinding) -> dict[str, Any]:
     return {
+        "parent_raw_sha256": binding.parent_raw_sha256,
+        "extraction_sha256": binding.extraction_sha256,
         "extracted_sha256": binding.extracted_sha256,
         "extracted_text_sha256": binding.extracted_text_sha256,
         "derivation_binding": _project_maybe(binding.derivation_binding),

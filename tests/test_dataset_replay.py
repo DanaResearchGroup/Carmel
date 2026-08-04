@@ -30,6 +30,7 @@ from carmel.schemas.datasets import (
     Absent,
     AxisRole,
     CharSpanLocator,
+    ExtractionBinding,
     LocatorKind,
     MeasuredValue,
     SemanticDependencyUse,
@@ -49,6 +50,12 @@ from carmel.services.dataset_replay import (
     verify_measured_value_value_boundary,
 )
 from carmel.services.evidence import artifact_dir, store_artifact
+from carmel.services.extraction_record import (
+    compute_extraction_sha,
+    extraction_record_dir,
+    load_extraction_record,
+    store_extraction_record,
+)
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1, QuantityKind
 
@@ -157,13 +164,26 @@ class TestReplayEnvelopeCatchesMutation:
         # way a real re-extraction divergence would surface: by replaying
         # against evidence whose extracted text differs from what the
         # envelope's ExtractionBinding recorded. We simulate that by
-        # physically overwriting extracted.json on disk for the ORIGINAL
-        # sha256 with the mutated text's ExtractedText payload, while
-        # leaving StoredArtifact.meta.extracted_sha256 stale (pointing at
-        # the original bytes) -- exactly the "extracted.json bytes on disk
-        # were tampered with after store time" scenario, which must FAIL,
-        # not silently re-verify.
-        extracted_path = artifact_dir(tmp_path, original.sha256) / "extracted.json"
+        # physically overwriting extracted.json on disk, in place, at the
+        # extraction-RECORD store's own address -- NOT the older
+        # ``artifact_dir(raw_sha256)`` layout. ``_independently_verify_node_text``
+        # (carmel/services/dataset_replay.py) resolves a node's extracted.json
+        # exclusively via that node's own ExtractionBinding
+        # (parent_raw_sha256, extraction_sha256); mutating the old
+        # ``artifact_dir`` path instead would tamper with evidence the
+        # replayer never re-reads, and this test would go green vacuously
+        # (report would stay VERIFIED even though the assertion below claims
+        # otherwise). The ONLY guard capable of turning this mutation into a
+        # non-VERIFIED outcome is the
+        # ``actual_extracted_sha256 != extraction.extracted_sha256`` digest
+        # comparison in ``_independently_verify_node_text``.
+        node = loaded.source_graph.node("paper")
+        binding = node.extraction
+        assert isinstance(binding, ExtractionBinding), "extraction must be present, not Absent"
+        extracted_path = (
+            extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
+            / "extracted.json"
+        )
         mutated_extracted = ExtractedText(
             text=_MUTATED_TEXT, normalized=_MUTATED_TEXT.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
         )
@@ -189,37 +209,74 @@ class TestReplayEnvelopeMissingEvidence:
         assert report.failures == ()
         assert report.unverifiable != ()
 
+    def test_absent_extraction_record_is_unverifiable_naming_the_missing_record(self, tmp_path: Path) -> None:
+        """The missing-record branch must report WHY, not merely UNVERIFIABLE.
+
+        Deleting the extraction record also breaks a LATER check -- the read of
+        ``extracted.json`` -- and that one yields UNVERIFIABLE too. So asserting the
+        outcome alone tests nothing here: delete the missing-record branch entirely
+        and the outcome is unchanged. The two are distinguishable only by the reason
+        they give, and that distinction is the point. "No extraction record is stored
+        at this address" says the envelope references evidence that was never present
+        or has been garbage-collected; "could not read extracted.json" says the record
+        is there but damaged. Those imply different operator actions.
+
+        Hence: assert the reason names the missing RECORD, and delete only the record
+        directory, leaving ``raw.bin`` and the artifact intact so every earlier guard
+        passes and this branch is the first thing able to fire.
+        """
+        import shutil
+
+        _stored, loaded = _produce_and_load(tmp_path)
+        node = next(n for n in loaded.source_graph.nodes if not isinstance(n.extraction, Absent))
+        shutil.rmtree(
+            extraction_record_dir(
+                tmp_path,
+                node.extraction.parent_raw_sha256,
+                node.extraction.extraction_sha256,
+            )
+        )
+
+        report = replay_envelope(tmp_path, loaded)
+
+        assert report.outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.failures == ()
+        reasons = " ".join(finding.reason for finding in report.unverifiable)
+        assert "no extraction record" in reasons.lower()
+        assert node.extraction.extraction_sha256 in reasons
+
 
 class TestReplayEnvelopeExtractedTextShaMismatch:
     def test_mismatched_extracted_text_sha256_fails_with_named_reason(self, tmp_path: Path) -> None:
-        stored_artifact, loaded = _produce_and_load(tmp_path)
-        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
-        raw_bytes = extracted_path.read_bytes()
-        extracted = ExtractedText.model_validate(json.loads(raw_bytes))
-        # Rewrite extracted.json with DIFFERENT text but keep the file's own
-        # bytes digest self-consistent with what the ENVELOPE anchors on --
-        # the replayer authenticates extracted.json against the envelope's
-        # own ExtractionBinding.extracted_sha256 (never meta.json; see
-        # dataset_replay's module docstring for why), so to isolate the
-        # extracted_text_sha256 comparison specifically, both the envelope's
-        # own anchor AND meta.json's copy are patched to the new bytes'
-        # digest. That leaves the ONLY thing that disagrees as the recorded
-        # ExtractionBinding.extracted_text_sha256 on the envelope itself.
-        new_text = extracted.text + " EXTRA UNRECORDED SENTENCE."
-        new_extracted = ExtractedText(
-            text=new_text, normalized=new_text.casefold(), sections=[], extractor=extracted.extractor, lossy=False
-        )
-        new_bytes = json.dumps(new_extracted.model_dump(mode="json")).encode("utf-8")
-        extracted_path.write_bytes(new_bytes)
-        new_extracted_sha256 = hashlib.sha256(new_bytes).hexdigest()
-        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["extracted_sha256"] = new_extracted_sha256
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+        # The extraction-record store is self-authenticating: its address
+        # (extraction_sha256) is recomputed from meta.json's OWN fields on
+        # every load (see carmel/services/extraction_record.py's
+        # load_extraction_record / _load_meta). Editing meta.json's
+        # extracted_sha256 in place -- the pattern the OLD, single-record
+        # artifact_dir store used -- therefore either breaks self-
+        # authentication (UNVERIFIABLE, never reaching the guard this test
+        # targets) or, if left untouched, trips an EARLIER "sidecar
+        # bookkeeping inconsistent" FAILED check in
+        # _independently_verify_node_text before the extracted_text_sha256
+        # comparison this test isolates is ever reached. So this test does
+        # not tamper any file on disk at all: it leaves the on-disk
+        # extraction record (extracted.json/text.txt/meta.json) exactly as
+        # produced, and patches ONLY the loaded envelope's own
+        # ExtractionBinding.extracted_text_sha256 to a value that disagrees
+        # with the untouched evidence. Every OTHER field the replayer checks
+        # (extracted_sha256, the sidecar's own extracted_sha256/
+        # extracted_text_sha256, parse-ability, lossy flag) still agrees, so
+        # the ONLY guard capable of rejecting this input is the
+        # ``actual_text_sha256 != extraction.extracted_text_sha256``
+        # comparison in _independently_verify_node_text (guard 8 in the
+        # module's ordered check sequence).
+        _, loaded = _produce_and_load(tmp_path)
 
         node = loaded.source_graph.node("paper")
         assert not isinstance(node.extraction, Absent)
-        patched_extraction = node.extraction.model_copy(update={"extracted_sha256": new_extracted_sha256})
+        wrong_text_sha256 = hashlib.sha256(b"not the real extracted text").hexdigest()
+        assert wrong_text_sha256 != node.extraction.extracted_text_sha256
+        patched_extraction = node.extraction.model_copy(update={"extracted_text_sha256": wrong_text_sha256})
         patched_node = node.model_copy(update={"extraction": patched_extraction})
         patched_nodes = tuple(patched_node if n is node else n for n in loaded.source_graph.nodes)
         patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})
@@ -834,9 +891,41 @@ class TestReplayEnvelopeContainsParserExceptions:
     def test_recursion_error_while_parsing_extracted_json_is_unverifiable_not_a_crash(
         self, tmp_path: Path
     ) -> None:
-        stored_artifact, loaded = _produce_and_load(tmp_path)
+        # ``store_extraction_record`` (the real front door) itself calls
+        # ``ExtractedText.model_validate(json.loads(extracted_json_bytes))``
+        # BEFORE hashing/writing anything, so it cannot be used to create
+        # this fixture: the RecursionError this test needs to happen INSIDE
+        # the replayer would instead happen inside the store call itself,
+        # crashing test setup. And the OLD tamper-in-place pattern (editing
+        # an existing record's meta.json to match forged bytes at its
+        # UNCHANGED address) fails self-authentication -- the store
+        # recomputes extraction_sha256 from meta.json's own fields on every
+        # load, so a meta.json edited to claim a different extracted_sha256
+        # no longer authenticates to the address it lives at, and
+        # load_extraction_record returns None (UNVERIFIABLE for a different
+        # reason, never reaching the parse guard this test targets).
+        #
+        # So this test hand-builds a brand-new, self-authenticating record
+        # at a FRESH address computed from the forged bytes' own digest --
+        # exactly what store_extraction_record would compute, just without
+        # running the parse it would perform along the way -- reusing the
+        # real record's own extractor/extractor_code_sha256/pypdf_version/
+        # identity_payload_version so only extracted_sha256 (and therefore
+        # the address) differs. The envelope's ExtractionBinding is then
+        # repointed at this new address. Every guard before the parse step
+        # (raw.bin integrity, record self-authentication, extracted_sha256
+        # anchor, sidecar extracted_sha256 cross-check) passes cleanly; the
+        # ONLY thing that can reject this input is the
+        # ``except (ValueError, RecursionError):`` parse guard around
+        # ``ExtractedText.model_validate(json.loads(raw_bytes))`` in
+        # ``_independently_verify_node_text``.
+        _, loaded = _produce_and_load(tmp_path)
 
-        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        binding = node.extraction
+        existing_meta = load_extraction_record(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
+        assert existing_meta is not None
 
         # Build a deeply, deeply nested JSON array as the value of a field
         # ExtractedText doesn't even declare -- pydantic's `extra="forbid"`
@@ -851,20 +940,47 @@ class TestReplayEnvelopeContainsParserExceptions:
             f'"extractor": "pdf:pypdf", "lossy": false, "bogus_extra_field": {nested}}}'
         )
         forged_bytes = payload.encode("utf-8")
-        extracted_path.write_bytes(forged_bytes)
+        forged_extracted_sha256 = hashlib.sha256(forged_bytes).hexdigest()
+        # Reuse the real record's own extracted_text_sha256: this fixture
+        # targets the parse guard, not the text-sha guard, so every OTHER
+        # identity field is left exactly as the real record recorded it.
+        identity_payload = {
+            "identity_payload_version": existing_meta.identity_payload_version,
+            "parent_raw_sha256": existing_meta.parent_raw_sha256,
+            "extractor": existing_meta.extractor,
+            "extractor_code_sha256": existing_meta.extractor_code_sha256,
+            "extracted_sha256": forged_extracted_sha256,
+            "extracted_text_sha256": existing_meta.extracted_text_sha256,
+            "pypdf_version": existing_meta.pypdf_version,
+        }
+        forged_extraction_sha256 = compute_extraction_sha(identity_payload)
+        forged_dir = extraction_record_dir(tmp_path, existing_meta.parent_raw_sha256, forged_extraction_sha256)
+        forged_dir.mkdir(parents=True)
+        (forged_dir / "extracted.json").write_bytes(forged_bytes)
+        (forged_dir / "text.txt").write_text("x", encoding="utf-8")
+        (forged_dir / "meta.json").write_text(
+            json.dumps(
+                {
+                    "extraction_sha256": forged_extraction_sha256,
+                    "parent_raw_sha256": existing_meta.parent_raw_sha256,
+                    "extractor": existing_meta.extractor,
+                    "extractor_code_sha256": existing_meta.extractor_code_sha256,
+                    "pypdf_version": existing_meta.pypdf_version,
+                    "extracted_sha256": forged_extracted_sha256,
+                    "extracted_text_sha256": existing_meta.extracted_text_sha256,
+                    "identity_payload_version": existing_meta.identity_payload_version,
+                    "stored_at": existing_meta.stored_at,
+                }
+            ),
+            encoding="utf-8",
+        )
+        # Confirm the fixture really does self-authenticate before using it
+        # -- if it didn't, the test would vacuously pass via the WRONG
+        # guard (UNVERIFIABLE from a failed record load, not from parsing).
+        assert load_extraction_record(tmp_path, existing_meta.parent_raw_sha256, forged_extraction_sha256) is not None
 
-        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["extracted_sha256"] = hashlib.sha256(forged_bytes).hexdigest()
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
-
-        # The envelope's own ExtractionBinding.extracted_sha256 must also
-        # name the forged bytes so the run gets PAST the P0 anchor check
-        # and actually reaches the parse step this test targets.
-        node = loaded.source_graph.node("paper")
-        assert not isinstance(node.extraction, Absent)
-        forged_extraction = node.extraction.model_copy(
-            update={"extracted_sha256": hashlib.sha256(forged_bytes).hexdigest()}
+        forged_extraction = binding.model_copy(
+            update={"extraction_sha256": forged_extraction_sha256, "extracted_sha256": forged_extracted_sha256}
         )
         forged_node = node.model_copy(update={"extraction": forged_extraction})
         forged_nodes = tuple(forged_node if n is node else n for n in loaded.source_graph.nodes)
@@ -950,18 +1066,42 @@ class TestReplayEnvelopeChecksLossyExtraction:
     """
 
     def test_replay_is_unverifiable_against_a_lossy_extraction(self, tmp_path: Path) -> None:
-        stored_artifact, loaded = _produce_and_load(tmp_path)
-        extracted_path = artifact_dir(tmp_path, stored_artifact.sha256) / "extracted.json"
-        raw_bytes = extracted_path.read_bytes()
-        extracted = ExtractedText.model_validate(json.loads(raw_bytes))
+        # As with the RecursionError fixture above, in-place tampering under
+        # the record's UNCHANGED address cannot isolate this guard: editing
+        # meta.json to match mutated extracted.json bytes breaks self-
+        # authentication (a stale meta.json's recomputed extraction_sha256
+        # would no longer equal the address it lives at), so
+        # load_extraction_record would return None -- UNVERIFIABLE for
+        # "no such record", never reaching the lossy check this test
+        # targets. Unlike the RecursionError fixture, though, `lossy=True`
+        # parses perfectly cleanly as ExtractedText, so this one can go
+        # through the REAL store_extraction_record front door: mint a
+        # legitimate new record at a fresh, genuinely self-authenticating
+        # address, reusing the existing record's own extractor/
+        # extractor_code_sha256/pypdf_version so only lossy/page_failures
+        # (and, as a consequence, extracted_sha256/extraction_sha256) differ
+        # from the real record. extracted_text_sha256 is untouched: the text
+        # itself doesn't change, only the lossy metadata wrapped around it,
+        # so store_extraction_record recomputes the SAME extracted_text_sha256
+        # from the SAME text -- leaving the envelope's own
+        # extracted_text_sha256 field valid without needing to patch it.
+        # After repointing the envelope at the new record, every guard
+        # before the lossy check (raw.bin integrity, record self-
+        # authentication, extracted_sha256 anchor + sidecar cross-check,
+        # parse, extracted_text_sha256 + its sidecar cross-check) passes
+        # cleanly; the ONLY thing that can reject this input is the
+        # ``if extracted.lossy:`` guard in
+        # ``_independently_verify_node_text``.
+        _, loaded = _produce_and_load(tmp_path)
 
-        # Flip lossy=True and record a page failure -- extracted.text itself
-        # is untouched, so extracted_text_sha256 (the digest of the TEXT)
-        # still matches; only extracted_sha256 (the digest of the whole
-        # extracted.json FILE) moves, because lossy/page_failures are part
-        # of that file. Patch meta.json and the envelope's own anchor the
-        # same way the existing extracted_sha256-mismatch tests do, so the
-        # lossy flag is isolated as the sole variable under test.
+        node = loaded.source_graph.node("paper")
+        assert not isinstance(node.extraction, Absent)
+        binding = node.extraction
+        existing_meta = load_extraction_record(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
+        assert existing_meta is not None
+        existing_record_dir = extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
+        extracted = ExtractedText.model_validate(json.loads((existing_record_dir / "extracted.json").read_bytes()))
+
         lossy_extracted = extracted.model_copy(
             update={
                 "lossy": True,
@@ -969,17 +1109,19 @@ class TestReplayEnvelopeChecksLossyExtraction:
             }
         )
         new_bytes = json.dumps(lossy_extracted.model_dump(mode="json")).encode("utf-8")
-        extracted_path.write_bytes(new_bytes)
+        new_extraction_sha256 = store_extraction_record(
+            tmp_path,
+            raw_sha256=existing_meta.parent_raw_sha256,
+            extractor=existing_meta.extractor,
+            extractor_code_sha256=existing_meta.extractor_code_sha256,
+            pypdf_version=existing_meta.pypdf_version,
+            extracted_json_bytes=new_bytes,
+        )
         new_extracted_sha256 = hashlib.sha256(new_bytes).hexdigest()
 
-        meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        meta["extracted_sha256"] = new_extracted_sha256
-        meta_path.write_text(json.dumps(meta), encoding="utf-8")
-
-        node = loaded.source_graph.node("paper")
-        assert not isinstance(node.extraction, Absent)
-        patched_extraction = node.extraction.model_copy(update={"extracted_sha256": new_extracted_sha256})
+        patched_extraction = binding.model_copy(
+            update={"extraction_sha256": new_extraction_sha256, "extracted_sha256": new_extracted_sha256}
+        )
         patched_node = node.model_copy(update={"extraction": patched_extraction})
         patched_nodes = tuple(patched_node if n.node_id == node.node_id else n for n in loaded.source_graph.nodes)
         patched_graph = loaded.source_graph.model_copy(update={"nodes": patched_nodes})

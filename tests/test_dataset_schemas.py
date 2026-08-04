@@ -56,6 +56,7 @@ from carmel.services.units import TABLE_V1
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
+SHA_C = "c" * 64
 
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """Module-level singleton default for SourceNode.origin -- Absent is frozen,
@@ -91,8 +92,12 @@ def _extraction_binding(
     extracted_sha256: str = SHA_A,
     extracted_text_sha256: str = SHA_B,
     derivation_binding: Maybe[str] = _NO_DERIVATION_BINDING,
+    parent_raw_sha256: str = SHA_A,
+    extraction_sha256: str = SHA_C,
 ) -> ExtractionBinding:
     return ExtractionBinding(
+        parent_raw_sha256=parent_raw_sha256,
+        extraction_sha256=extraction_sha256,
         extracted_sha256=extracted_sha256,
         extracted_text_sha256=extracted_text_sha256,
         derivation_binding=derivation_binding,
@@ -504,12 +509,16 @@ class TestSourceGraph:
     def test_extraction_binding_rejects_bad_hex(self) -> None:
         with pytest.raises(ValidationError):
             ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=SHA_C,
                 extracted_sha256="not-a-sha",
                 extracted_text_sha256=SHA_B,
                 derivation_binding=_NO_DERIVATION_BINDING,
             )
         with pytest.raises(ValidationError):
             ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=SHA_C,
                 extracted_sha256=SHA_A,
                 extracted_text_sha256="not-a-sha",
                 derivation_binding=_NO_DERIVATION_BINDING,
@@ -518,6 +527,8 @@ class TestSourceGraph:
     def test_extraction_binding_rejects_uppercase_hex(self) -> None:
         with pytest.raises(ValidationError):
             ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=SHA_C,
                 extracted_sha256="A" * 64,
                 extracted_text_sha256=SHA_B,
                 derivation_binding=_NO_DERIVATION_BINDING,
@@ -526,6 +537,8 @@ class TestSourceGraph:
     def test_extraction_binding_rejects_wrong_length_hex(self) -> None:
         with pytest.raises(ValidationError):
             ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=SHA_C,
                 extracted_sha256="a" * 63,
                 extracted_text_sha256=SHA_B,
                 derivation_binding=_NO_DERIVATION_BINDING,
@@ -535,6 +548,52 @@ class TestSourceGraph:
         binding = _extraction_binding()
         assert binding.extracted_sha256 == SHA_A
         assert binding.extracted_text_sha256 == SHA_B
+        assert binding.parent_raw_sha256 == SHA_A
+        assert binding.extraction_sha256 == SHA_C
+
+    def test_extraction_binding_rejects_bad_hex_parent_raw_sha256(self) -> None:
+        """Isolates the shape check on `parent_raw_sha256` specifically:
+        every other field here is valid, so a rejection can only come from
+        this one field's own validator, not from some other guard firing
+        first."""
+        with pytest.raises(ValidationError):
+            ExtractionBinding(
+                parent_raw_sha256="not-a-sha",
+                extraction_sha256=SHA_C,
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                derivation_binding=_NO_DERIVATION_BINDING,
+            )
+
+    def test_extraction_binding_rejects_bad_hex_extraction_sha256(self) -> None:
+        """Isolates the shape check on `extraction_sha256` specifically."""
+        with pytest.raises(ValidationError):
+            ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256="not-a-sha",
+                extracted_sha256=SHA_A,
+                extracted_text_sha256=SHA_B,
+                derivation_binding=_NO_DERIVATION_BINDING,
+            )
+
+    def test_source_node_rejects_extraction_naming_a_different_parent_raw_sha256(self) -> None:
+        """A node's `extraction.parent_raw_sha256` must equal that node's
+        own `sha256` -- an extraction record derived from some OTHER node's
+        raw bytes cannot be attributed to this one, even though every other
+        field here (shape, I5c, I5b) is individually satisfiable. This
+        isolates SourceNode's own
+        `_validate_extraction_parent_matches_node_sha256` guard: the
+        binding is internally well-formed and belongs to no OTHER node in
+        this single-node construction, so nothing else can reject it first."""
+        with pytest.raises(ValidationError, match="parent_raw_sha256"):
+            SourceNode(
+                node_id="n1",
+                kind=SourceNodeKind.PAPER_PDF,
+                sha256=SHA_A,
+                origin=_NO_ORIGIN,
+                extraction=_extraction_binding(parent_raw_sha256=SHA_B, extraction_sha256=SHA_C),
+                glyph_health=_NO_GLYPH_HEALTH,
+            )
 
     def test_glyph_health_assessment_rejects_wrong_dependency_id(self) -> None:
         with pytest.raises(ValidationError):
@@ -1971,6 +2030,8 @@ class TestDerivationBindingAbsenceReasonIsConstrained:
 
     def test_absent_for_unknown_is_accepted(self) -> None:
         binding = ExtractionBinding(
+            parent_raw_sha256=SHA_A,
+            extraction_sha256=SHA_C,
             extracted_sha256=SHA_A,
             extracted_text_sha256=SHA_B,
             derivation_binding=Absent(reason=AbsenceReason.UNKNOWN),
@@ -1984,6 +2045,8 @@ class TestDerivationBindingAbsenceReasonIsConstrained:
     def test_every_other_absence_reason_is_rejected(self, reason: AbsenceReason) -> None:
         with pytest.raises(ValidationError, match="may only be Absent for reason"):
             ExtractionBinding(
+                parent_raw_sha256=SHA_A,
+                extraction_sha256=SHA_C,
                 extracted_sha256=SHA_A,
                 extracted_text_sha256=SHA_B,
                 derivation_binding=Absent(reason=reason),
