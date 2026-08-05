@@ -27,6 +27,7 @@ import os
 import shutil
 import socket
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1680,6 +1681,50 @@ def _research_loop(
             return
 
 
+def _permission_from(parameters: Mapping[str, Any], name: str, state: _RunState) -> bool:
+    """Read one permission out of an action's untyped parameter bag, strictly.
+
+    ``PlannedAction.parameters`` is a plain ``dict[str, Any]`` reloaded from
+    ``plan.json``, so what arrives here is whatever JSON happened to hold -- and
+    ``bool()`` was the wrong reader for it. ``bool("false")`` is True. So is
+    ``bool("no")``, ``bool(0.1)``, and ``bool([])``'s inverse for any non-empty list.
+    A parameter bag carrying the STRING ``"false"`` therefore GRANTED the permission
+    it was plainly trying to decline, which is a fail-open in the one place that
+    decides whether unauthenticated text may be read at all.
+
+    Only the literal booleans are honoured. Anything else is refused AND surfaced as
+    a warning on the pass, rather than quietly treated as either answer: a value that
+    is neither True nor False is a corrupt plan, and an operator who wrote one needs
+    to see that their intent did not take effect. Refusing silently would leave them
+    believing a permission was granted (or withheld) on evidence that never existed --
+    the same assertion-for-observation conflation this module refuses elsewhere.
+
+    Args:
+        parameters: The action's parameter bag, exactly as reloaded from disk.
+        name: The permission to read.
+        state: Run state, for recording a warning when the value is malformed.
+
+    Returns:
+        True only when ``name`` maps to the literal ``True``; False when it is absent
+        or maps to the literal ``False``; False, with a warning, for anything else.
+    """
+    if name not in parameters:
+        return False
+    value = parameters[name]
+    # `is` rather than `==`, deliberately: `1 == True` and `0 == False` in Python, so
+    # `==` would let an int back in through the door this function exists to close.
+    if value is True:
+        return True
+    if value is False:
+        return False
+    state.warnings.append(
+        f"action parameter {name!r} is not a boolean (got {type(value).__name__} {value!r}); "
+        "the permission was NOT granted"
+    )
+    logger.warning("action parameter %r is not a boolean (%r); permission refused", name, value)
+    return False
+
+
 def _load_corpus(
     workspace_root: Path,
     *,
@@ -2269,14 +2314,14 @@ def _run_pass(
         # What earlier passes already mined. `reread_all` is the operator's escape
         # hatch: coverage is recorded per document, so re-reading is otherwise never
         # automatic, and a changed prompt or a newer model is a real reason to want it.
-        reread_all = bool(action.parameters.get("reread_all", False))
+        reread_all = _permission_from(action.parameters, "reread_all", state)
         # Opt-in to reading a held artifact whose stored text carries no digest
         # binding it to anything (`CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT`).
         # Meaningless outside the corpus path -- a search pass has no held corpus to
         # gate -- so it is read here but only ever threaded through on that branch
         # below, rather than added to `_research_loop`'s signature where it would
         # silently do nothing.
-        allow_unverifiable_legacy_roots = bool(action.parameters.get("allow_unverifiable_legacy_roots", False))
+        allow_unverifiable_legacy_roots = _permission_from(action.parameters, "allow_unverifiable_legacy_roots", state)
         already_covered: frozenset[tuple[str, str]] = frozenset()
         if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
             already_covered = frozenset(

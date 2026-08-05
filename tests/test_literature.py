@@ -3723,3 +3723,75 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
 
         assert report.stop_reason == StopReason.SELF_TERMINATED
         assert len(report.findings) == 1
+
+
+class TestAPermissionIsReadStrictlyFromThePlan:
+    """`bool()` was the wrong reader for an untyped parameter bag.
+
+    `PlannedAction.parameters` is a plain dict reloaded from `plan.json`, so what
+    arrives is whatever JSON held. `bool("false")` is True -- so a plan carrying the
+    STRING "false" GRANTED the permission it was plainly trying to decline, in the one
+    place that decides whether unauthenticated text may be read at all.
+
+    Found by spar round 64, on code shipped the same session. Review did not catch it
+    and neither did 20 new tests, because every test built its parameters in Python
+    where a bool stays a bool -- the defect only exists on the round trip through disk.
+    """
+
+    def _state(self) -> Any:
+        return literature_module._RunState(queries=[], artifacts=[], findings=[], rejected=[], warnings=[])
+
+    def test_d1_the_string_false_does_not_grant_a_permission(self) -> None:
+        """D1. The exact fail-open: truthy string, falsy intent."""
+        state = self._state()
+        name = "allow_unverifiable_legacy_roots"
+        assert literature_module._permission_from({name: "false"}, name, state) is False
+
+    def test_d2_a_malformed_value_is_surfaced_not_silently_swallowed(self) -> None:
+        """D2. Refusing quietly would leave the operator believing their plan took effect."""
+        state = self._state()
+        literature_module._permission_from({"reread_all": "false"}, "reread_all", state)
+        assert any("reread_all" in w and "NOT granted" in w for w in state.warnings), (
+            "an operator who wrote a non-boolean must be told their intent did not take effect"
+        )
+
+    def test_d3_the_literal_true_still_grants(self) -> None:
+        """D3. Guards against a fix that refuses everything."""
+        state = self._state()
+        assert literature_module._permission_from({"reread_all": True}, "reread_all", state) is True
+        assert state.warnings == []
+
+    def test_d4_an_int_one_does_not_grant(self) -> None:
+        """D4. `1 == True` in Python, so an `==` comparison would let this back in."""
+        state = self._state()
+        assert literature_module._permission_from({"reread_all": 1}, "reread_all", state) is False
+
+    def test_d5_an_absent_permission_is_a_clean_refusal_with_no_warning(self) -> None:
+        """D5. Absence is the normal case and must not become noise."""
+        state = self._state()
+        assert literature_module._permission_from({}, "reread_all", state) is False
+        assert state.warnings == []
+
+    def test_d6_the_literal_false_is_a_clean_refusal_with_no_warning(self) -> None:
+        """D6. An explicitly-declined permission is well-formed, not malformed."""
+        state = self._state()
+        assert literature_module._permission_from({"reread_all": False}, "reread_all", state) is False
+        assert state.warnings == []
+
+    def test_d7_end_to_end_a_plan_carrying_the_string_false_does_not_read_a_legacy_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D7. The only test that proves the strict read is on the PATH, not just callable.
+
+        Goes through a real corpus pass with the parameter as it would survive a JSON
+        round trip, rather than asserting on the helper in isolation.
+        """
+        _patch_chem_success(monkeypatch)
+        _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([])
+        action = _action()
+        action.parameters["allow_unverifiable_legacy_roots"] = "false"
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
+
+        assert report.passes[0].covered == [], "a string must never grant the permission to read unauthenticated text"
