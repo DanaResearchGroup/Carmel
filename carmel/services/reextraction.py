@@ -381,7 +381,13 @@ def preview_reextraction(workspace_root: Path, *, raw_sha256: str, max_bytes: in
         ) from exc
     if authentic:
         return extraction_sha256, True
-    if record_dir.exists():
+    # Use os.path.lexists() rather than Path.exists(): the latter FOLLOWS
+    # symlinks, so a dangling symlink at the computed record directory would
+    # report as absent and let this preview say "would be written" -- when a
+    # dangling symlink is exactly the present-but-unreadable case that must
+    # refuse, the same defect already fixed for the root meta.json in
+    # ``reextract_artifact``.
+    if os.path.lexists(record_dir):
         raise ReextractionError(
             f"extraction record directory for {raw_sha256} at {record_dir} exists but does not "
             "authenticate as a stored extraction record; refusing to report already-present or "

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import types
 from datetime import UTC, datetime
@@ -234,6 +235,26 @@ class TestPreview:
 
         assert list_extraction_records(tmp_path, raw_sha256) == []
 
+    def test_h4_preview_of_an_ordinary_absent_record_dir_is_unchanged(self, tmp_path: Path) -> None:
+        """H4: the ordinary absent case is unchanged by the H3 fix.
+
+        With no record directory at all (not even a symlink), preview still
+        reports the record as not present -- the ``os.path.lexists`` fix for H3
+        must not turn this ordinary absent case into a refusal.
+        """
+        pdf_bytes = _build_tiny_pdf(b"Ordinary Absent Record Dir Preview")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        extraction_sha256, _ = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+        record_dir = extraction_record_dir(tmp_path, raw_sha256, extraction_sha256)
+        assert not os.path.lexists(record_dir)
+
+        extraction_sha256_again, already_present = preview_reextraction(
+            tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES
+        )
+
+        assert already_present is False
+        assert extraction_sha256_again == extraction_sha256
+
 
 class TestBogusRecordDirectoryIsNotAlreadyPresent:
     """"Already present" must mean an AUTHENTICATED record
@@ -293,6 +314,33 @@ class TestBogusRecordDirectoryIsNotAlreadyPresent:
 
         with pytest.raises(
             ReextractionError, match=r"exists but its meta\.json does not authenticate"
+        ):
+            preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+    def test_h3_preview_refuses_a_dangling_symlink_at_the_record_directory(self, tmp_path: Path) -> None:
+        """H3: a dangling symlink at the record directory must not read as absent.
+
+        ``Path.exists()`` FOLLOWS symlinks, so a dangling symlink at the computed
+        record directory would report as ABSENT and let preview say the record
+        "would be written" -- the mutating path would then proceed against a path
+        that is a broken symlink rather than refusing cleanly. Must use
+        ``os.path.lexists()`` instead, which is true for a dangling symlink.
+        """
+        pdf_bytes = _build_tiny_pdf(b"Dangling Symlink Record Dir Preview")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        extraction_sha256, already_present = preview_reextraction(
+            tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES
+        )
+        assert already_present is False
+
+        dangling_target = tmp_path / "does-not-exist-h3"
+        assert not dangling_target.exists()
+        record_dir = extraction_record_dir(tmp_path, raw_sha256, extraction_sha256)
+        record_dir.parent.mkdir(parents=True, exist_ok=True)
+        record_dir.symlink_to(dangling_target)
+
+        with pytest.raises(
+            ReextractionError, match=r"exists but does not authenticate as a stored extraction record"
         ):
             preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 

@@ -313,7 +313,13 @@ def _validate_sha(value: str, *, label: str) -> None:
     Raises:
         ValueError: If ``value`` is not exactly 64 lowercase hex characters.
     """
-    if not isinstance(value, str) or not _SHA256_RE.match(value):
+    # Matched with `fullmatch`, never `match`. `re.match` only anchors at the
+    # start of the string, so `$` also matches just before a trailing
+    # newline -- `"a" * 64 + "\n"` would pass a `match`-based check and go on
+    # to be used as a filesystem path component and as an identity field.
+    # `fullmatch` requires the whole string to be the 64 lowercase-hex
+    # characters, with nothing before or after.
+    if not isinstance(value, str) or not _SHA256_RE.fullmatch(value):
         raise ValueError(f"invalid {label}: {value!r} (expected 64 lowercase hex characters)")
 
 
@@ -973,7 +979,7 @@ def list_extraction_records(workspace_root: Path, raw_sha256: str) -> list[Extra
 
     records: list[ExtractionRecordMeta] = []
     for entry in entries:
-        if not _SHA256_RE.match(entry.name):
+        if not _SHA256_RE.fullmatch(entry.name):
             continue
         try:
             resolved_entry = entry.resolve()
@@ -1199,8 +1205,9 @@ def _load_authenticated_record_text(
     Raises:
         ExtractionSelectionError: the record's ``extracted.json`` is
             missing/unreadable, its bytes disagree with the digest recorded
-            in ``meta.json``, or the bytes do not parse as
-            :class:`ExtractedText`.
+            in ``meta.json``, the bytes do not parse as
+            :class:`ExtractedText`, or the parsed text disagrees with
+            ``meta.extracted_text_sha256``.
     """
     dest_dir = extraction_record_dir(workspace_root, raw_sha256, extraction_sha256)
     try:
@@ -1218,7 +1225,7 @@ def _load_authenticated_record_text(
             f"records extracted_sha256={meta.extracted_sha256!r}"
         )
     try:
-        return ExtractedText.model_validate(json.loads(raw_bytes))
+        extracted = ExtractedText.model_validate(json.loads(raw_bytes))
     except (ValueError, RecursionError) as exc:
         # PEP 758 (Python 3.14) permits an unparenthesized multi-exception
         # `except A, B:`, but only without an `as` binding -- with `as`,
@@ -1233,6 +1240,14 @@ def _load_authenticated_record_text(
             f"extraction record raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r} has "
             f"digest-authentic but unparseable extracted.json: {exc}"
         ) from exc
+    actual_text_sha256 = hashlib.sha256(extracted.text.encode("utf-8")).hexdigest()
+    if actual_text_sha256 != meta.extracted_text_sha256:
+        raise ExtractionSelectionError(
+            f"extraction record raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r} does not "
+            f"authenticate: parsed extracted.json text hashes to {actual_text_sha256!r}, but meta.json "
+            f"records extracted_text_sha256={meta.extracted_text_sha256!r}"
+        )
+    return extracted
 
 
 def select_extraction(

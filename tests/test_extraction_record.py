@@ -22,6 +22,7 @@ from carmel.services.extraction_record import (
     UnknownPypdfVersionError,
     compute_extraction_sha,
     current_extraction_records,
+    extraction_record_dir,
     list_extraction_records,
     load_extraction_record,
     select_extraction,
@@ -491,6 +492,25 @@ class TestPathAndShaValidation:
         with pytest.raises(ValueError):
             list_extraction_records(tmp_path, "../etc")
 
+    # -- H5/H6: `_validate_sha` must use `fullmatch`, not `match` -----------------
+
+    def test_h5_rejects_a_sha_with_a_trailing_newline(self, tmp_path: Path) -> None:
+        """H5: ``re.match``'s ``$`` also matches just before a trailing newline.
+
+        ``"a" * 64 + "\\n"`` must never pass validation -- it would otherwise go
+        on to be used as a filesystem path component and as an identity field.
+        Exercised through a PUBLIC entry point (``load_extraction_record``), not
+        ``_validate_sha`` directly.
+        """
+        sha_with_trailing_newline = "a" * 64 + "\n"
+
+        with pytest.raises(ValueError, match="invalid extraction_sha256"):
+            load_extraction_record(tmp_path, RAW_SHA, sha_with_trailing_newline)
+
+    def test_h6_accepts_an_ordinary_valid_sha(self, tmp_path: Path) -> None:
+        """H6: guards against a fix that rejects everything, not just the newline case."""
+        assert load_extraction_record(tmp_path, RAW_SHA, "a" * 64) is None
+
 
 class TestLoadAndVerifyExtractionRecord:
     def test_round_trip_load_matches_stored_fields(self, tmp_path: Path) -> None:
@@ -933,3 +953,127 @@ class TestSelectExtraction:
 
         # Fail closed: the tampered text must not reach the caller by any route.
         assert "TAMPERED TEXT S17" not in str(exc_info.value)
+
+    def test_s18_exact_raises_when_bytes_are_tampered_but_the_text_is_unchanged(
+        self, tmp_path: Path
+    ) -> None:
+        """S18: the ONLY scenario that isolates the extracted.json BYTES digest guard.
+
+        S17 no longer does. Once the parsed text is also authenticated against
+        ``meta.extracted_text_sha256``, S17's swapped body is caught by EITHER guard,
+        so neutering the bytes comparison leaves S17 green -- a mutation audit found
+        exactly that regression the moment the text check landed.
+
+        The scenario that only the BYTES guard can catch is a record whose
+        ``extracted.json`` is modified in a way that leaves ``.text`` byte-identical.
+        That is not a contrived case: ``lossy`` is precisely such a field, and flipping
+        it from true to false makes a known-lossy extraction present itself as a clean
+        one while every character of the text stays exactly the same. ``page_failures``
+        and ``sections`` behave the same way.
+        """
+        raw_sha = _store_root_artifact(tmp_path, text="root text s18")
+        same_text = "identical text either way"
+        honest = json.loads(_extracted_text_bytes(same_text))
+        honest["lossy"] = True
+        extraction_sha = _store(
+            tmp_path, raw_sha256=raw_sha, extracted_json_bytes=json.dumps(honest).encode("utf-8")
+        )
+        dest = tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha
+
+        # Flip ONLY the lossy flag. The text is untouched, so the parsed-text digest
+        # still matches meta.extracted_text_sha256 and cannot be what refuses this.
+        tampered = dict(honest)
+        tampered["lossy"] = False
+        tampered_bytes = json.dumps(tampered).encode("utf-8")
+        (dest / "extracted.json").write_bytes(tampered_bytes)
+
+        meta_on_disk = json.loads((dest / "meta.json").read_text(encoding="utf-8"))
+        assert (
+            hashlib.sha256(same_text.encode("utf-8")).hexdigest()
+            == meta_on_disk["extracted_text_sha256"]
+        ), "the text digest must still agree, or this test is just S17 again"
+
+        with pytest.raises(ExtractionSelectionError, match="extracted.json bytes on disk hash to"):
+            select_extraction(
+                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
+            )
+
+    # -- H1/H2: the PARSED text is authenticated against extracted_text_sha256, not just extracted_sha256 --
+
+    def test_h1_exact_raises_when_parsed_text_does_not_match_meta_extracted_text_sha256(
+        self, tmp_path: Path
+    ) -> None:
+        """H1: a record whose two digests disagree, but which still self-authenticates.
+
+        ``extracted_sha256`` and ``extracted_text_sha256`` disagree with each
+        other here, but the record still genuinely self-authenticates to its own
+        address.
+
+        Unlike S17, this cannot be built by editing an already-stored record's
+        ``meta.json`` in place: ``extracted_text_sha256`` is itself folded into the
+        identity payload that the record's address is computed from (see
+        :func:`carmel.services.extraction_record._build_identity_payload`), so
+        changing it after the fact would change the address the record's OWN meta
+        claims to authenticate to, and ``load_extraction_record`` would return
+        ``None`` -- the neighbouring address-authentication guard would refuse
+        first, and this test would certify the wrong thing.
+
+        Instead, the record is built by hand: choose a WRONG
+        ``extracted_text_sha256`` up front, fold it into the identity payload that
+        computes the record's address, and write ``extracted.json``/``text.txt``/
+        ``meta.json`` directly at that computed address. The result: ``extracted.
+        json`` bytes hash correctly to ``meta.extracted_sha256`` (first digest
+        check passes), the whole record authenticates to its own address (address
+        check passes), but the PARSED ``.text`` does not hash to
+        ``meta.extracted_text_sha256`` (the new digest check must refuse).
+        """
+        text = "the genuinely parsed text h1"
+        extracted_json_bytes = _extracted_text_bytes(text)
+        extracted_sha256 = hashlib.sha256(extracted_json_bytes).hexdigest()
+        wrong_text_sha256 = hashlib.sha256(b"a completely different, unrelated text").hexdigest()
+
+        identity_payload = _identity_payload(
+            extracted_sha256=extracted_sha256,
+            extracted_text_sha256=wrong_text_sha256,
+        )
+        extraction_sha256 = compute_extraction_sha(identity_payload)
+
+        dest_dir = extraction_record_dir(tmp_path, RAW_SHA, extraction_sha256)
+        dest_dir.mkdir(parents=True)
+        (dest_dir / "extracted.json").write_bytes(extracted_json_bytes)
+        (dest_dir / "text.txt").write_text(text, encoding="utf-8")
+        meta_payload = {
+            "extraction_sha256": extraction_sha256,
+            "parent_raw_sha256": RAW_SHA,
+            "extractor": identity_payload["extractor"],
+            "extractor_code_sha256": identity_payload["extractor_code_sha256"],
+            "pypdf_version": identity_payload["pypdf_version"],
+            "extracted_sha256": extracted_sha256,
+            "extracted_text_sha256": wrong_text_sha256,
+            "identity_payload_version": identity_payload["identity_payload_version"],
+            "stored_at": datetime.now(UTC).isoformat(),
+        }
+        (dest_dir / "meta.json").write_text(json.dumps(meta_payload), encoding="utf-8")
+
+        # Prove the record genuinely self-authenticates to its own address BEFORE
+        # asserting the refusal below, so it is impossible for this test to pass
+        # for the neighbouring address-authentication guard's reason instead of
+        # the text-digest guard this test exists to certify.
+        assert load_extraction_record(tmp_path, RAW_SHA, extraction_sha256) is not None
+
+        with pytest.raises(ExtractionSelectionError, match="extracted_text_sha256"):
+            select_extraction(
+                tmp_path, RAW_SHA, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha256
+            )
+
+    def test_h2_exact_with_agreeing_digests_still_returns_normally(self, tmp_path: Path) -> None:
+        """H2: the honest case is unaffected -- guards against a fix that refuses everything."""
+        raw_sha = _store_root_artifact(tmp_path, text="root text h2")
+        extraction_sha = _store(tmp_path, raw_sha256=raw_sha, text="honest record text h2")
+
+        result = select_extraction(
+            tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
+        )
+
+        assert result.extraction_id == extraction_sha
+        assert result.extracted.text == "honest record text h2"
