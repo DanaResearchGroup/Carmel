@@ -57,16 +57,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from carmel.agents.tools.extract import ExtractedText, extract_text
 from carmel.paths import normalize_path
 from carmel.services.evidence import artifact_dir, load_artifact_meta
 from carmel.services.extraction_record import (
+    ExtractionRecordError,
     _build_identity_payload,  # noqa: PLC2701 -- see preview_reextraction()'s docstring
     compute_extraction_sha,
     extraction_record_dir,
     store_extraction_record,
+    verify_extraction_record,
 )
 from carmel.services.semantic_deps import extraction_identity
 
@@ -211,9 +214,13 @@ def _prepare_reextraction(
     # absent one legitimately does. So check existence of the file itself,
     # separately from whether it parsed: present-but-unparseable is fatal on its
     # own, distinct from (and checked before) the content-type disagreement below.
+    # Use os.path.lexists() rather than Path.exists(): the latter FOLLOWS symlinks,
+    # so a meta.json that is a symlink to a missing target would report as absent
+    # and take the permissive "no meta, proceed" path below -- when a dangling
+    # symlink is exactly the present-but-unreadable case that must refuse.
     meta_path = dest_dir / _META_NAME
     meta = load_artifact_meta(root, raw_sha256)
-    if meta is None and meta_path.exists():
+    if meta is None and os.path.lexists(meta_path):
         raise ReextractionError(
             f"root meta.json for {raw_sha256} exists but is corrupt or unreadable; "
             "refusing to re-extract past unauthenticated root bookkeeping"
@@ -309,6 +316,17 @@ def preview_reextraction(workspace_root: Path, *, raw_sha256: str, max_bytes: in
     :func:`~carmel.services.extraction_record.store_extraction_record` and
     therefore without writing anything.
 
+    "Already present" is decided by
+    :func:`~carmel.services.extraction_record.verify_extraction_record`, never by
+    a directory's mere existence: a directory at the computed address that is
+    empty, half-written, or holds forged/corrupt contents is NOT an authenticated
+    record, and must not be reported as one. Such a directory occupying the
+    address without authenticating to it is itself a distinct, fatal collision --
+    :func:`~carmel.services.extraction_record.store_extraction_record` refuses to
+    overwrite it (append-only), so ``--apply`` can neither report success nor
+    silently clobber it; this raises :exc:`ReextractionError` instead, surfacing
+    the collision as an explicit refusal.
+
     This deliberately reaches into ``carmel.services.extraction_record``'s
     private ``_build_identity_payload`` rather than re-deriving the identity
     payload's field set locally: that field set (which fields are included, and
@@ -333,7 +351,10 @@ def preview_reextraction(workspace_root: Path, *, raw_sha256: str, max_bytes: in
         ``False`` means ``--apply`` would append a new record).
 
     Raises:
-        ReextractionError: See :func:`reextract_artifact`.
+        ReextractionError: See :func:`reextract_artifact`. Also raised when a
+            directory already occupies the computed address but does not
+            authenticate as a stored extraction record (present-but-not-authentic
+            collision) -- see the "Already present" paragraph above.
     """
     root, extracted, extractor_code_sha256, pypdf_version, extracted_json_bytes = _prepare_reextraction(
         workspace_root, raw_sha256=raw_sha256, max_bytes=max_bytes
@@ -349,5 +370,21 @@ def preview_reextraction(workspace_root: Path, *, raw_sha256: str, max_bytes: in
         extracted_text_sha256=extracted_text_sha256,
     )
     extraction_sha256 = compute_extraction_sha(identity_payload)
-    already_present = extraction_record_dir(root, raw_sha256, extraction_sha256).exists()
-    return extraction_sha256, already_present
+    record_dir = extraction_record_dir(root, raw_sha256, extraction_sha256)
+    try:
+        authentic = verify_extraction_record(root, raw_sha256, extraction_sha256)
+    except ExtractionRecordError as exc:
+        raise ReextractionError(
+            f"extraction record directory for {raw_sha256} at {record_dir} exists but its "
+            f"meta.json does not authenticate: {exc}; refusing to report already-present or to "
+            "overwrite an append-only record"
+        ) from exc
+    if authentic:
+        return extraction_sha256, True
+    if record_dir.exists():
+        raise ReextractionError(
+            f"extraction record directory for {raw_sha256} at {record_dir} exists but does not "
+            "authenticate as a stored extraction record; refusing to report already-present or "
+            "to overwrite an append-only record"
+        )
+    return extraction_sha256, False

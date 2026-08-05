@@ -235,6 +235,68 @@ class TestPreview:
         assert list_extraction_records(tmp_path, raw_sha256) == []
 
 
+class TestBogusRecordDirectoryIsNotAlreadyPresent:
+    """"Already present" must mean an AUTHENTICATED record
+    (:func:`~carmel.services.extraction_record.verify_extraction_record`), never
+    merely a directory existing at the computed address. A directory occupying
+    that address without authenticating to it (empty, half-written, or holding
+    forged/junk contents) is a distinct, fatal collision: it must neither be
+    reported as already-present (that would be a false success) nor be
+    overwritten/clobbered (records are append-only)."""
+
+    def test_preview_refuses_a_bogus_record_directory_as_already_present(self, tmp_path: Path) -> None:
+        pdf_bytes = _build_tiny_pdf(b"Bogus Record Dir Preview")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        extraction_sha256, already_present = preview_reextraction(
+            tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES
+        )
+        assert already_present is False
+
+        bogus_dir = extraction_record_dir(tmp_path, raw_sha256, extraction_sha256)
+        bogus_dir.mkdir(parents=True)  # exists, but authenticates to nothing: empty.
+
+        with pytest.raises(
+            ReextractionError, match=r"exists but does not authenticate as a stored extraction record"
+        ):
+            preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+    def test_preview_of_a_bogus_record_directory_holding_junk_leaves_it_untouched(self, tmp_path: Path) -> None:
+        pdf_bytes = _build_tiny_pdf(b"Bogus Record Dir Apply")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        extraction_sha256, _ = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        bogus_dir = extraction_record_dir(tmp_path, raw_sha256, extraction_sha256)
+        bogus_dir.mkdir(parents=True)
+        (bogus_dir / "junk.txt").write_text("not a record", encoding="utf-8")
+
+        with pytest.raises(
+            ReextractionError, match=r"exists but does not authenticate as a stored extraction record"
+        ):
+            preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        # Preview never writes: the junk contents are untouched, and no real
+        # record files (extracted.json / text.txt / meta.json) were written.
+        assert (bogus_dir / "junk.txt").read_text(encoding="utf-8") == "not a record"
+        assert not (bogus_dir / "meta.json").exists()
+
+    def test_preview_of_a_record_directory_with_unparseable_meta_also_refuses(self, tmp_path: Path) -> None:
+        """A directory whose meta.json exists but fails to parse must raise the
+        same present-but-not-authentic collision, not propagate a raw, unrelated
+        ExtractionRecordError past preview_reextraction's own contract."""
+        pdf_bytes = _build_tiny_pdf(b"Bogus Record Dir Corrupt Meta")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        extraction_sha256, _ = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        bogus_dir = extraction_record_dir(tmp_path, raw_sha256, extraction_sha256)
+        bogus_dir.mkdir(parents=True)
+        (bogus_dir / "meta.json").write_text("not valid json{{{", encoding="utf-8")
+
+        with pytest.raises(
+            ReextractionError, match=r"exists but its meta\.json does not authenticate"
+        ):
+            preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+
 class TestDeliberateRootRecordDivergence:
     def test_root_and_nested_record_deliberately_disagree_after_reextraction(self, tmp_path: Path) -> None:
         """Documents, explicitly, that nothing reconciles the root sidecar with the
@@ -362,6 +424,24 @@ class TestRefusals:
         pdf_bytes = _build_tiny_pdf(b"Corrupt Meta Present")
         raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
         (artifact_dir(tmp_path, raw_sha256) / "meta.json").write_text("not valid json{{{", encoding="utf-8")
+
+        with pytest.raises(ReextractionError, match=r"exists but is corrupt or unreadable"):
+            reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+    def test_step7_refuses_a_root_meta_json_that_is_a_dangling_symlink(self, tmp_path: Path) -> None:
+        """A2/lexists: ``Path.exists()`` FOLLOWS symlinks, so a meta.json that is a
+        symlink to a missing target would report as absent and take the
+        permissive "no meta, proceed" path -- when a dangling symlink is exactly
+        the present-but-unreadable case that must refuse, same as the
+        present-but-corrupt case above. Must raise with the SAME wording as that
+        case (present, not absent) to prove the fix routes it into the refusal
+        branch rather than merely failing some other, unrelated way."""
+        pdf_bytes = _build_tiny_pdf(b"Dangling Symlink Meta")
+        raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
+        dest_dir = artifact_dir(tmp_path, raw_sha256)
+        meta_path = dest_dir / "meta.json"
+        meta_path.unlink()
+        meta_path.symlink_to(dest_dir / "does-not-exist.json")
 
         with pytest.raises(ReextractionError, match=r"exists but is corrupt or unreadable"):
             reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)

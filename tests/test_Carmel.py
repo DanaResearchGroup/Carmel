@@ -1795,6 +1795,46 @@ class TestReextractCommand:
         assert f"WRITTEN         {good_sha256}" in out
         assert len(list_extraction_records(ws, raw_sha256=good_sha256)) == 1
 
+    def test_apply_refuses_a_bogus_record_directory_instead_of_reporting_already_present(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """"Already present" must mean an AUTHENTICATED record, never merely a
+        directory existing at the computed address. A directory occupying that
+        address without authenticating to it (here: empty) is a distinct, fatal
+        collision -- ``--apply`` must neither report it as ALREADY-PRESENT (a
+        false success) nor silently exit 0; it must surface an explicit refusal,
+        same as any other ``REFUSED`` case."""
+        from carmel.services.extraction_record import extraction_record_dir
+        from carmel.services.reextraction import preview_reextraction
+        from tests.test_reextraction import MAX_BYTES, _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Bogus record dir CLI source text"))
+        extraction_sha256, _ = preview_reextraction(ws, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+        bogus_dir = extraction_record_dir(ws, raw_sha256, extraction_sha256)
+        bogus_dir.mkdir(parents=True)  # exists, but authenticates to nothing: empty.
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+                "--apply",
+            ]
+        )
+
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "ALREADY-PRESENT" not in out
+        assert f"REFUSED         {raw_sha256}" in out
+        assert "does not authenticate as a stored extraction record" in out
+
     def test_no_consumer_notice_appears_in_run_output(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
 
