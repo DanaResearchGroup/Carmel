@@ -2270,6 +2270,13 @@ def _run_pass(
         # hatch: coverage is recorded per document, so re-reading is otherwise never
         # automatic, and a changed prompt or a newer model is a real reason to want it.
         reread_all = bool(action.parameters.get("reread_all", False))
+        # Opt-in to reading a held artifact whose stored text carries no digest
+        # binding it to anything (`CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT`).
+        # Meaningless outside the corpus path -- a search pass has no held corpus to
+        # gate -- so it is read here but only ever threaded through on that branch
+        # below, rather than added to `_research_loop`'s signature where it would
+        # silently do nothing.
+        allow_unverifiable_legacy_roots = bool(action.parameters.get("allow_unverifiable_legacy_roots", False))
         already_covered: frozenset[tuple[str, str]] = frozenset()
         if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
             already_covered = frozenset(
@@ -2280,18 +2287,31 @@ def _run_pass(
         try:
             session_budget().acquire_run_slot(config.budget.max_concurrent_runs)
             slot_acquired = True
-            loop = _corpus_loop if mode == LiteraturePassMode.CORPUS else _research_loop
-            loop(
-                workspace_root,
-                campaign,
-                deps,
-                config=config,
-                state=state,
-                log_path=log_path,
-                action_id=action.action_id,
-                run_id=run_id,
-                already_covered=already_covered,
-            )
+            if mode == LiteraturePassMode.CORPUS:
+                _corpus_loop(
+                    workspace_root,
+                    campaign,
+                    deps,
+                    config=config,
+                    state=state,
+                    log_path=log_path,
+                    action_id=action.action_id,
+                    run_id=run_id,
+                    already_covered=already_covered,
+                    allow_unverifiable_legacy_roots=allow_unverifiable_legacy_roots,
+                )
+            else:
+                _research_loop(
+                    workspace_root,
+                    campaign,
+                    deps,
+                    config=config,
+                    state=state,
+                    log_path=log_path,
+                    action_id=action.action_id,
+                    run_id=run_id,
+                    already_covered=already_covered,
+                )
         except BudgetExceededError as exc:
             state.stop_reason = STOP_REASON_FOR_DIMENSION[exc.dimension]
             state.warnings.append(f"budget exceeded: {exc}")

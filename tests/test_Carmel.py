@@ -1629,6 +1629,142 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
         assert code == 1
         assert "--budget-tokens is required" in capsys.readouterr().err
 
+    def test_allow_unverifiable_legacy_roots_is_recorded_on_the_queued_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C1. The flag must actually reach the queued action's parameters, not
+        merely be accepted and dropped -- that is the operator's authorisation for
+        the next dispatch, recorded the same way ``reread_all`` is."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "250000",
+                "--workspaces",
+                str(tmp_path),
+                "--allow-unverifiable-legacy-roots",
+                "--dry-run",
+            ]
+        )
+
+        assert code == 0
+        capsys.readouterr()
+        actions = load_plan(ws).actions
+        corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert corpus_action.parameters.get("allow_unverifiable_legacy_roots") is True
+
+    def test_the_key_is_absent_without_the_flag(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C2. Absent, not present-and-False -- matching ``reread_all``'s own
+        convention, so a downstream ``.get(..., False)`` reads the fail-closed
+        default rather than an explicit but redundant False."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "250000", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 0
+        capsys.readouterr()
+        actions = load_plan(ws).actions
+        corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert "allow_unverifiable_legacy_roots" not in corpus_action.parameters
+
+    def test_the_planner_grants_no_permission_a_caller_did_not_ask_for(self, tmp_path: Path) -> None:
+        """C7. The DEFAULTS, pinned at the API boundary rather than through the CLI.
+
+        Every CLI path passes both flags explicitly, so a mutation flipping either
+        default to True survives the whole suite -- found by a raise-guard audit, not
+        by review. The default is what a programmatic caller that never considered the
+        question gets, and for a permission that must be the refusal: a caller who did
+        not ask to read unauthenticated text has not authorised reading it.
+        """
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import append_corpus_pass_action, load_plan
+
+        _cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        append_corpus_pass_action(ws, budget_tokens=100_000, model_name="m")
+
+        action = next(a for a in load_plan(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert action.parameters == {}, (
+            "a call that named neither flag must grant neither permission -- an empty "
+            "parameters dict is the only shape that says 'nothing was authorised here'"
+        )
+
+    def test_allow_unverifiable_legacy_roots_composes_with_reread_all(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C3. The composition trap: two independent boolean flags, each recorded
+        under its own key, must not let one clobber the other's dict entry."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "250000",
+                "--workspaces",
+                str(tmp_path),
+                "--allow-unverifiable-legacy-roots",
+                "--reread-all",
+                "--dry-run",
+            ]
+        )
+
+        assert code == 0
+        capsys.readouterr()
+        actions = load_plan(ws).actions
+        corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert corpus_action.parameters.get("allow_unverifiable_legacy_roots") is True
+        assert corpus_action.parameters.get("reread_all") is True
+
+    def test_allow_unverifiable_legacy_roots_may_not_be_combined_with_dispatch_queued(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C4. The queued pass already carries the parameters it was approved
+        under; bolting a fresh permission on at dispatch time would defeat the
+        approval -- exactly the reasoning that already refuses --budget-tokens
+        there."""
+        from Carmel import main
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--dispatch-queued",
+                "--allow-unverifiable-legacy-roots",
+            ]
+        )
+
+        assert code == 1
+        assert "cannot be combined" in capsys.readouterr().err
+        assert ws  # nothing was appended under the rejected authorisation
+
 
 class TestReextractCommand:
     """The operator-facing verb for re-parsing a stored artifact's raw.bin and

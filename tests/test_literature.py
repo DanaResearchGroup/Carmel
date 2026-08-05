@@ -3677,3 +3677,49 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         corrupt_segment = segments[CorpusReadOutcome.FAILED_INTEGRITY.value]
         assert legacy_sha[:12] in legacy_segment and corrupt_sha[:12] not in legacy_segment
         assert corrupt_sha[:12] in corrupt_segment and legacy_sha[:12] not in corrupt_segment
+
+    def test_g13_a_legacy_artifact_is_not_covered_without_the_action_parameter(
+        self, campaign: Campaign
+    ) -> None:
+        """G13. End to end through the queued action, not just ``_load_corpus``
+        directly: an action carrying no ``allow_unverifiable_legacy_roots`` key at
+        all leaves the sole held legacy artifact unread and uncovered."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert [c.raw_sha256 for c in report.latest.covered] == []
+        assert deps.ledger.usage().model_calls == 0
+        assert legacy_sha  # the artifact exists; it is simply not among the covered
+
+    def test_g14_a_legacy_artifact_is_covered_when_the_action_carries_the_parameter(
+        self, campaign: Campaign
+    ) -> None:
+        """G14. The parameter must actually reach ``_load_corpus`` from the queued
+        action's ``parameters``, not merely be recorded and dropped -- the only test
+        in this suite that proves that end-to-end wiring, as opposed to the gating
+        logic (G2/G3) or the recorded standard (G7), which are covered separately."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([])])
+        action = _action().model_copy(update={"parameters": {"allow_unverifiable_legacy_roots": True}})
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
+
+        assert [c.raw_sha256 for c in report.latest.covered] == [legacy_sha]
+
+    def test_g15_the_parameter_is_not_passed_to_a_search_mode_pass(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G15. A SEARCH-mode pass has no held corpus to gate, so
+        ``allow_unverifiable_legacy_roots`` must not reach ``_research_loop`` at all
+        -- and a search pass whose action happens to carry the key regardless must
+        still run normally rather than being refused by an unexpected keyword."""
+        _patch_chem_success(monkeypatch)
+        deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
+        action = _action().model_copy(update={"parameters": {"allow_unverifiable_legacy_roots": True}})
+
+        report = run_literature_research(campaign.workspace_root, campaign, action, deps, config=config)
+
+        assert report.stop_reason == StopReason.SELF_TERMINATED
+        assert len(report.findings) == 1

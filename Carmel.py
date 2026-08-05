@@ -152,6 +152,19 @@ def create_parser() -> argparse.ArgumentParser:
             "a revised prompt."
         ),
     )
+    corpus.add_argument(
+        "--allow-unverifiable-legacy-roots",
+        action="store_true",
+        help=(
+            "Read held artifacts whose stored text cannot be authenticated against "
+            "anything, because they were stored before the digest that would bind it "
+            "existed. By default a corpus pass refuses these -- the honest "
+            "alternative is to re-extract the document into an authenticated record "
+            "instead of setting this flag. This does NOT admit an artifact whose "
+            "bytes are actually damaged; a failed integrity check is refused "
+            "regardless of this flag."
+        ),
+    )
     corpus.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
     corpus.add_argument(
         "--config",
@@ -463,6 +476,7 @@ def _cmd_corpus_pass(
     dry_run: bool,
     reread_all: bool = False,
     dispatch_queued: bool = False,
+    allow_unverifiable_legacy_roots: bool = False,
 ) -> int:
     """Append a corpus pass to a campaign's plan and run it.
 
@@ -491,6 +505,14 @@ def _cmd_corpus_pass(
             print(
                 "--reread-all cannot be combined with --dispatch-queued: re-read scope is "
                 "fixed when the pass is appended, not when it is dispatched.",
+                file=sys.stderr,
+            )
+            return 1
+        if allow_unverifiable_legacy_roots:
+            print(
+                "--allow-unverifiable-legacy-roots cannot be combined with --dispatch-queued: "
+                "the queued pass already carries the parameters it was approved under, and "
+                "bolting a fresh permission on at dispatch time would defeat the approval.",
                 file=sys.stderr,
             )
             return 1
@@ -564,7 +586,11 @@ def _cmd_corpus_pass(
     assert budget_tokens is not None
     try:
         action = append_corpus_pass_action(
-            ws, budget_tokens=budget_tokens, model_name=model_name, reread_all=reread_all
+            ws,
+            budget_tokens=budget_tokens,
+            model_name=model_name,
+            reread_all=reread_all,
+            allow_unverifiable_legacy_roots=allow_unverifiable_legacy_roots,
         )
     except FileNotFoundError:
         # Distinguished from the generic OSError below because the remedy is
@@ -1051,6 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             reread_all=args.reread_all,
             dispatch_queued=args.dispatch_queued,
+            allow_unverifiable_legacy_roots=args.allow_unverifiable_legacy_roots,
         )
 
     if args.command == "new-campaign":
