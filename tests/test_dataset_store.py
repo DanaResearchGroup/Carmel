@@ -245,6 +245,17 @@ class TestDatasetPath:
         path = dataset_path(tmp_path, sha)
         assert path == (tmp_path / DATASET_STORE_DIR / f"{sha}.json").resolve()
 
+    def test_rejects_trailing_newline(self, tmp_path: Path) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it."""
+        digest_with_newline = "a" * 64 + "\n"
+        with pytest.raises(ValueError, match="invalid dataset sha256"):
+            dataset_path(tmp_path, digest_with_newline)
+
+    def test_accepts_well_formed_digest(self, tmp_path: Path) -> None:
+        well_formed_digest = "a" * 64
+        path = dataset_path(tmp_path, well_formed_digest)
+        assert path == (tmp_path / DATASET_STORE_DIR / f"{well_formed_digest}.json").resolve()
+
 
 class TestComputeDatasetSha:
     def test_returns_64_char_lowercase_hex(self) -> None:
@@ -360,6 +371,33 @@ class TestListDatasets:
 
         assert all(len(sha) == 64 for sha in result)
         assert "not-a-sha" not in result
+
+    def test_rejects_trailing_newline_before_json_suffix(self, tmp_path: Path) -> None:
+        """A POSIX-legal filename ``"<64 hex>\\n.json"`` must not be listed as a genuine digest.
+
+        ``$`` matches just BEFORE a trailing newline under ``match``, and
+        ``Path.stem`` on such a filename yields the hex digits plus the embedded
+        newline; ``fullmatch`` closes the hole.
+        """
+        datasets_dir = tmp_path / DATASET_STORE_DIR
+        datasets_dir.mkdir(parents=True, exist_ok=True)
+        digest_with_newline = "a" * 64 + "\n"
+        (datasets_dir / f"{digest_with_newline}.json").write_text("{}", encoding="utf-8")
+
+        result = list_datasets(tmp_path)
+
+        assert digest_with_newline not in result
+        assert result == []
+
+    def test_accepts_well_formed_digest_filename(self, tmp_path: Path) -> None:
+        datasets_dir = tmp_path / DATASET_STORE_DIR
+        datasets_dir.mkdir(parents=True, exist_ok=True)
+        well_formed_digest = "a" * 64
+        (datasets_dir / f"{well_formed_digest}.json").write_text("{}", encoding="utf-8")
+
+        result = list_datasets(tmp_path)
+
+        assert result == [well_formed_digest]
 
 
 class TestLoadDatasetVerifiesContentAddress:

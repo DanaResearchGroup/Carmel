@@ -25,6 +25,7 @@ from carmel.schemas.datasets import (
     CompositionComponent,
     CompositionResolution,
     CoordinateFrame,
+    EmbeddedConversionTable,
     ExtractionBinding,
     GlyphHealthAssessment,
     Maybe,
@@ -485,6 +486,21 @@ class TestSourceGraph:
                 glyph_health=_NO_GLYPH_HEALTH,
             )
 
+    def test_source_node_rejects_trailing_newline_in_sha256(self) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it.
+
+        Calls the validator classmethod directly: ``sha256`` also carries
+        ``Field(min_length=64, max_length=64)``, which rejects a
+        65-character string before the custom validator ever runs, so
+        constructing a ``SourceNode`` would exercise that neighbouring
+        length guard instead of the ``.fullmatch`` guard under test.
+        """
+        with pytest.raises(ValueError, match="invalid sha256"):
+            SourceNode._validate_sha256("a" * 64 + "\n")
+
+    def test_source_node_accepts_well_formed_sha256(self) -> None:
+        assert SourceNode._validate_sha256(SHA_A) == SHA_A
+
     def test_si_member_can_link_to_parent_paper(self) -> None:
         parent = _node(node_id="paper", kind=SourceNodeKind.PAPER_PDF, sha256=SHA_A)
         member = SourceNode(
@@ -579,6 +595,34 @@ class TestSourceGraph:
                 identity_payload_version="2",
                 pypdf_version=_NO_PYPDF_VERSION,
             )
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "parent_raw_sha256",
+            "extraction_sha256",
+            "extracted_sha256",
+            "extracted_text_sha256",
+            "extractor_code_sha256",
+        ],
+    )
+    def test_extraction_binding_rejects_trailing_newline(self, field_name: str) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it.
+
+        Calls the validator classmethod directly: every one of these five
+        fields also carries ``Field(min_length=64, max_length=64)``, which
+        rejects a 65-character string before the shared custom validator
+        ever runs, so constructing an ``ExtractionBinding`` would exercise
+        that neighbouring length guard instead of the ``.fullmatch`` guard
+        under test. ``_validate_sha256_shape`` is the single validator body
+        bound to all five fields, so calling it directly exercises exactly
+        the guard each field named in ``field_name`` shares.
+        """
+        with pytest.raises(ValueError, match="invalid sha256"):
+            ExtractionBinding._validate_sha256_shape("a" * 64 + "\n")
+
+    def test_extraction_binding_accepts_well_formed_sha256(self) -> None:
+        assert ExtractionBinding._validate_sha256_shape(SHA_A) == SHA_A
 
     def test_extraction_binding_round_trips(self) -> None:
         binding = _extraction_binding()
@@ -787,6 +831,22 @@ class TestSourceGraph:
     def test_archive_origin_rejects_bad_sha(self) -> None:
         with pytest.raises(ValidationError):
             ArchiveOrigin(archive_sha256="not-a-sha")
+
+    def test_archive_origin_rejects_trailing_newline(self) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it.
+
+        Calls the validator classmethod directly rather than constructing the
+        model: the field also carries ``Field(min_length=64, max_length=64)``,
+        which rejects a 65-character string before the custom validator ever
+        runs, so going through ``ArchiveOrigin(...)`` would exercise that
+        neighbouring length guard instead of the ``.fullmatch`` guard under test.
+        """
+        with pytest.raises(ValueError, match="invalid archive_sha256"):
+            ArchiveOrigin._validate_archive_sha256("a" * 64 + "\n")
+
+    def test_archive_origin_accepts_well_formed_digest(self) -> None:
+        origin = ArchiveOrigin(archive_sha256=SHA_A)
+        assert origin.archive_sha256 == SHA_A
 
     def test_archive_origin_member_display_path_is_optional(self) -> None:
         origin = ArchiveOrigin(archive_sha256=SHA_B)
@@ -1190,6 +1250,41 @@ class TestMeasuredValue:
     # analogous sign-corruption surface left in this schema to test. Flagged
     # in the migration report rather than silently dropped.
 
+    def test_conversion_table_sha256_rejects_trailing_newline(self) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it.
+
+        ``conversion_table_sha256`` carries only ``Field(min_length=1)``, no
+        ``max_length``, so this exploit string reaches the shape validator
+        itself.
+        """
+        with pytest.raises(ValidationError, match="invalid conversion_table_sha256"):
+            _measured_value(conversion_table_sha256="a" * 64 + "\n")
+
+    def test_conversion_table_sha256_accepts_well_formed_digest(self) -> None:
+        mv = _measured_value(conversion_table_sha256=TABLE_V1.sha256)
+        assert mv.conversion_table_sha256 == TABLE_V1.sha256
+
+
+class TestEmbeddedConversionTable:
+    """EmbeddedConversionTable.sha256 has only ``Field(min_length=1)``, no
+    ``max_length``, so a trailing-newline exploit string reaches the shape
+    validator itself through ordinary model construction."""
+
+    def test_sha256_rejects_trailing_newline(self) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it."""
+        with pytest.raises(ValidationError, match="EmbeddedConversionTable.sha256"):
+            EmbeddedConversionTable(
+                sha256="a" * 64 + "\n",
+                canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
+            )
+
+    def test_sha256_accepts_well_formed_digest(self) -> None:
+        table = EmbeddedConversionTable(
+            sha256=TABLE_V1.sha256,
+            canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
+        )
+        assert table.sha256 == TABLE_V1.sha256
+
 
 class TestSemanticDependencyUse:
     """SemanticDependencyUse is what closes the defect this commit exists
@@ -1227,6 +1322,41 @@ class TestSemanticDependencyUse:
         message = str(excinfo.value)
         assert "disagrees with the dependency that" in message
         assert "is a forgery attempt, not a typo, and is rejected as such" in message
+
+    def test_input_sha256_rejects_trailing_newline(self) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it.
+
+        Unlike the sha256 fields on ``ArchiveOrigin``/``ExtractionBinding``/
+        ``SourceNode``, ``input_sha256`` carries no ``max_length`` bound, so
+        this exploit string reaches the shape validator itself rather than
+        being turned away by a neighbouring length guard.
+        """
+        with pytest.raises(ValidationError, match="invalid input_sha256"):
+            SemanticDependencyUse(
+                dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                input_sha256="a" * 64 + "\n",
+            )
+
+    def test_input_sha256_accepts_well_formed_digest(self) -> None:
+        """Proves the ``.fullmatch`` fix above isn't overly strict: an ordinary
+        64-lowercase-hex digest still clears the shape guard (this is also
+        exercised, via a different dependency, by
+        ``test_input_sha256_present_when_policy_requires_present_succeeds``
+        below)."""
+        extra = SemanticDependencyDefinition(
+            dependency_id="carmel.numeric.a_shape_test_only_heuristic",
+            content_sha256="a" * 64,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        )
+        with _registered_extra_dependency(extra):
+            use = SemanticDependencyUse(
+                dependency_id=extra.dependency_id,
+                content_sha256=extra.content_sha256,
+                input_sha256="e" * 64,
+            )
+        assert use.input_sha256 == "e" * 64
 
     def test_input_sha256_present_when_policy_requires_absent_is_rejected(self) -> None:
         """The one seeded dependency's input_policy is SIBLING_FIELD, which

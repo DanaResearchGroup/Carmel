@@ -722,6 +722,17 @@ class TestSha256Validation:
         with pytest.raises(ValueError, match="invalid sha256"):
             verify_artifact(tmp_path, short_digest)
 
+    def test_load_artifact_text_rejects_trailing_newline(self, tmp_path: Path) -> None:
+        """``$`` matches just BEFORE a trailing newline under ``match``; ``fullmatch`` closes it."""
+        digest_with_newline = "a" * 64 + "\n"
+        with pytest.raises(ValueError, match="invalid sha256"):
+            load_artifact_text(tmp_path, digest_with_newline)
+
+    def test_load_artifact_text_accepts_well_formed_digest(self, tmp_path: Path) -> None:
+        """A genuine 64-lowercase-hex digest still clears validation (nothing stored under it here)."""
+        well_formed_digest = "a" * 64
+        assert load_artifact_text(tmp_path, well_formed_digest) is None
+
 
 class TestLoadArtifactMeta:
     """`load_artifact_meta`: direct by-sha metadata lookup (added for the

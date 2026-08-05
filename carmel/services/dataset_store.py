@@ -543,7 +543,9 @@ def dataset_path(root: Path, dataset_sha: str) -> Path:
             characters, or if the resolved path would fall outside the resolved
             workspace root.
     """
-    if not _SHA256_RE.match(dataset_sha):
+    # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+    # trailing newline, so match would let "a" * 64 + "\n" through.
+    if not _SHA256_RE.fullmatch(dataset_sha):
         raise ValueError(f"invalid dataset sha256: {dataset_sha!r} (expected 64 lowercase hex characters)")
     resolved_root = normalize_path(root)
     candidate = resolved_root / DATASET_STORE_DIR / f"{dataset_sha}.json"
@@ -1082,6 +1084,9 @@ def list_datasets(root: Path) -> list[str]:
         if not entry.is_file() or entry.suffix != ".json":
             continue
         stem = entry.stem
-        if _SHA256_RE.match(stem):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let a POSIX-legal filename like
+        # "<64 hex>\n.json" through as if its stem were a genuine 64-hex digest.
+        if _SHA256_RE.fullmatch(stem):
             shas.append(stem)
     return sorted(shas)

@@ -485,7 +485,9 @@ class ArchiveOrigin(BaseModel):
     @field_validator("archive_sha256")
     @classmethod
     def _validate_archive_sha256(cls, value: str) -> str:
-        if not _SHA256_RE.match(value):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let "a" * 64 + "\n" through.
+        if not _SHA256_RE.fullmatch(value):
             raise ValueError(f"invalid archive_sha256: expected 64 lowercase hex chars, got {value!r}")
         return value
 
@@ -583,7 +585,10 @@ class ExtractionBinding(BaseModel):
     )
     @classmethod
     def _validate_sha256_shape(cls, value: str) -> str:
-        if not _SHA256_RE.match(value):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let "a" * 64 + "\n" through. Guards all
+        # five sha256 fields above (this validator body runs once per field).
+        if not _SHA256_RE.fullmatch(value):
             raise ValueError(f"invalid sha256: {value!r} (expected 64 lowercase hex characters)")
         return value
 
@@ -898,7 +903,9 @@ class SourceNode(BaseModel):
     @field_validator("sha256")
     @classmethod
     def _validate_sha256(cls, value: str) -> str:
-        if not _SHA256_RE.match(value):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let "a" * 64 + "\n" through.
+        if not _SHA256_RE.fullmatch(value):
             raise ValueError(f"invalid sha256: {value!r} (expected 64 lowercase hex characters)")
         return value
 
@@ -1583,7 +1590,9 @@ class SemanticDependencyUse(BaseModel):
     def _validate_input_sha256_shape(cls, value: Maybe[str]) -> Maybe[str]:
         if isinstance(value, Absent):
             return value
-        if not _SHA256_RE.match(value):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let "a" * 64 + "\n" through.
+        if not _SHA256_RE.fullmatch(value):
             raise ValueError(f"invalid input_sha256: {value!r} (expected 64 lowercase hex characters)")
         return value
 
@@ -1808,7 +1817,9 @@ class MeasuredValue(BaseModel):
     @field_validator("conversion_table_sha256")
     @classmethod
     def _validate_conversion_table_sha256(cls, value: str) -> str:
-        if not _SHA256_RE.match(value):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let "a" * 64 + "\n" through.
+        if not _SHA256_RE.fullmatch(value):
             raise ValueError(f"invalid conversion_table_sha256: {value!r} (expected 64 lowercase hex characters)")
         return value
 
@@ -2966,7 +2977,9 @@ class EmbeddedConversionTable(BaseModel):
     @field_validator("sha256")
     @classmethod
     def _validate_sha256_shape(cls, value: str) -> str:
-        if not _SHA256_RE.match(value):
+        # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+        # trailing newline, so match would let "a" * 64 + "\n" through.
+        if not _SHA256_RE.fullmatch(value):
             raise ValueError(
                 f"EmbeddedConversionTable.sha256 {value!r} is not 64 lowercase hex characters"
             )

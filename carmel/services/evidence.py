@@ -448,7 +448,9 @@ def _validate_sha256(workspace_root: Path, sha256: str) -> Path:
             the resolved artifact directory would fall outside the resolved
             workspace root.
     """
-    if not _SHA256_RE.match(sha256):
+    # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+    # trailing newline, so match would let "a" * 64 + "\n" through.
+    if not _SHA256_RE.fullmatch(sha256):
         raise ValueError(f"invalid sha256 digest: {sha256!r} (expected 64 lowercase hex characters)")
     root = normalize_path(workspace_root)
     return _assert_contained(root, artifact_dir(root, sha256))
@@ -484,7 +486,7 @@ def list_artifacts_with_unreadable(workspace_root: Path) -> tuple[list[StoredArt
     artifacts: list[StoredArtifact] = []
     unreadable: list[str] = []
     for entry in entries:
-        if not entry.is_dir() or not _SHA256_RE.match(entry.name):
+        if not entry.is_dir() or not _SHA256_RE.fullmatch(entry.name):
             continue
         meta = _load_meta(entry / _META_NAME)
         if meta is None:

@@ -267,6 +267,13 @@ class EvidenceRef(BaseModel):
     page: int | None = None
     section_label: str | None = None
 
+    @field_validator("artifact_sha256")
+    @classmethod
+    def _validate_artifact_sha256_shape(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"invalid artifact_sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
     @field_validator("extraction_id")
     @classmethod
     def _validate_extraction_id_shape(cls, value: str) -> str:

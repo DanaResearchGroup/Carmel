@@ -81,6 +81,37 @@ class TestCitation:
             Citation(title="x", url="https://example.com", surprise="y")  # type: ignore[call-arg]
 
 
+class TestEvidenceRefArtifactSha256Shape:
+    """``artifact_sha256`` names the stored document a finding's quote came from and
+    is used to locate that document's directory -- it must be a genuine 64-lowercase-hex
+    digest, never a path fragment or a look-alike string."""
+
+    def test_rejects_a_path_traversal_string(self) -> None:
+        with pytest.raises(ValidationError, match="invalid artifact_sha256"):
+            EvidenceRef(artifact_sha256="../x", extraction_id=ROOT_EXTRACTION_ID)
+
+    def test_rejects_a_trailing_newline(self) -> None:
+        """Python's ``$`` matches just BEFORE a trailing newline, so a validator
+        written with ``re.match`` accepts this. ``fullmatch`` is what refuses it."""
+        with pytest.raises(ValidationError, match="invalid artifact_sha256"):
+            EvidenceRef(artifact_sha256="a" * 64 + "\n", extraction_id=ROOT_EXTRACTION_ID)
+
+    @pytest.mark.parametrize(
+        "bad_digest",
+        [
+            pytest.param("A" * 64, id="uppercase_hex"),
+            pytest.param("a" * 63, id="too_short"),
+        ],
+    )
+    def test_rejects_the_wrong_shape(self, bad_digest: str) -> None:
+        with pytest.raises(ValidationError, match="invalid artifact_sha256"):
+            EvidenceRef(artifact_sha256=bad_digest, extraction_id=ROOT_EXTRACTION_ID)
+
+    def test_accepts_a_well_formed_digest(self) -> None:
+        ref = EvidenceRef(artifact_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID)
+        assert ref.artifact_sha256 == "a" * 64
+
+
 class TestFindingPayloadDiscriminatedUnion:
     def test_experimental_benchmark_selected(self) -> None:
         finding = _make_finding(_experimental_payload())
