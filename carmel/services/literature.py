@@ -86,6 +86,7 @@ from carmel.schemas.literature import (
     CURRENT_REPORT_SCHEMA_VERSION,
     ROOT_EXTRACTION_ID,
     STOP_REASON_FOR_DIMENSION,
+    CorpusReadOutcome,
     CoveredDocument,
     CredenceVerdict,
     EvidenceRef,
@@ -279,6 +280,8 @@ def migrate_report_payload(payload: object) -> object:
         migrated = _migrate_v3_to_v4(migrated)
     if version < 5:
         migrated = _migrate_v4_to_v5(migrated)
+    if version < 6:
+        migrated = _migrate_v5_to_v6(migrated)
     # Not a literal. This produces whatever the CURRENT schema is, so hardcoding the
     # number means the next version bump silently stamps migrated reports with a
     # stale version -- and the `version == CURRENT` early return above then treats
@@ -401,6 +404,46 @@ def _migrate_v4_to_v5(payload: dict[str, Any]) -> dict[str, Any]:
             else:
                 new_findings.append(f)
         migrated["findings"] = new_findings
+    return migrated
+
+
+def _migrate_v5_to_v6(payload: dict[str, Any]) -> dict[str, Any]:
+    """Stamp ``"unrecorded"`` onto every pass's ``covered`` entries'
+    ``verification_standard``.
+
+    ``"unrecorded"`` is a fact, not a guess: no pre-v6 writer ever considered which
+    :class:`~carmel.schemas.literature.CorpusReadOutcome` a document was read under,
+    because the field did not exist, so the honest value for every existing record is
+    "this was never recorded" rather than a reconstruction from the store's CURRENT
+    state (which may since have changed, and in any case cannot speak for what the
+    pass actually checked at the time).
+
+    Assigned unconditionally, NOT via setdefault. A pre-v6 payload cannot legitimately
+    carry this key at all -- ``CoveredDocument`` sets ``extra="forbid"``, so one that
+    did was REJECTED outright -- and honouring such a value would quietly turn that
+    refusal into acceptance of a claim ("this was read to standard <x>") that no v5
+    writer could have had grounds to make. A mutation audit previously caught exactly
+    this ``setdefault`` substitution in ``_migrate_v4_to_v5``; the same guard applies
+    here.
+    """
+    migrated = dict(payload)
+    passes = migrated.get("passes")
+    if isinstance(passes, list):
+        new_passes = []
+        for p in passes:
+            if not isinstance(p, dict):
+                new_passes.append(p)
+                continue
+            covered = p.get("covered")
+            if isinstance(covered, list):
+                new_p = dict(p)
+                new_p["covered"] = [
+                    {**c, "verification_standard": "unrecorded"} if isinstance(c, dict) else c for c in covered
+                ]
+                new_passes.append(new_p)
+            else:
+                new_passes.append(p)
+        migrated["passes"] = new_passes
     return migrated
 
 
@@ -1639,9 +1682,12 @@ def _research_loop(
 
 def _load_corpus(
     workspace_root: Path,
-) -> tuple[list[tuple[StoredArtifact, ExtractedText, str]], list[str]]:
+    *,
+    allow_unverifiable_legacy_roots: bool = False,
+) -> tuple[list[tuple[StoredArtifact, ExtractedText, str]], dict[str, CorpusReadOutcome]]:
     """Every held artifact paired with its extracted text and the extraction it was
-    read from, and the shas that were not.
+    read from, plus the typed outcome EVERY held artifact was actually classified
+    under -- read or not.
 
     The extraction identity is always :data:`ROOT_EXTRACTION_ID` today, because this
     function loads text only via :func:`load_artifact_text`, which reads the root
@@ -1649,19 +1695,14 @@ def _load_corpus(
     record is a separate, later increment -- this function reports what it actually
     read, not what it could have read.
 
-    An artifact whose text cannot be loaded is skipped: it cannot be quoted from, so
-    including it in the listing would only invite the agent to propose a finding that
-    the gate must then reject.
-
-    The skipped shas are RETURNED rather than dropped (spar round 7, P2). A pass that
-    silently reads 6 of 8 held papers and reports nothing looks exactly like a pass
-    that read all 8 and found nothing, and the two call for opposite responses -- fix
-    the corrupt sidecar, or accept that the corpus is exhausted. Coverage the operator
-    cannot see is coverage they will assume.
-
-    "Skipped" therefore spans all three ways a held document can go unread: an
-    unreadable ``meta.json`` (which never yields a StoredArtifact at all), a failed
-    digest verification, and missing extracted text.
+    The outcomes mapping is RETURNED rather than a bare skipped-shas list dropped
+    (spar round 7, P2, now generalised). A pass that silently reads 6 of 8 held
+    papers and reports nothing looks exactly like a pass that read all 8 and found
+    nothing, and the two call for opposite responses -- fix the corrupt sidecar, or
+    accept that the corpus is exhausted. Coverage the operator cannot see is coverage
+    they will assume. Every artifact this function considered, read or not, gets
+    exactly one :class:`CorpusReadOutcome` entry: one mechanism, total coverage,
+    rather than a "skipped" list that only ever named the failures.
 
     Every artifact is VERIFIED against its digest before it is read (spar round 8). The
     search pass fetches and extracts in the same breath, so its text is necessarily
@@ -1670,35 +1711,82 @@ def _load_corpus(
     :func:`verify_artifact` re-hashes ``raw.bin`` and refuses the artifact if the stored
     bytes no longer match the directory naming them.
 
-    What this does NOT prove, stated plainly rather than left implied: ``extracted.json``
-    is a DERIVED cache, and verifying ``raw.bin`` does not establish that the cache was
-    derived from those bytes. Someone able to rewrite the sidecar in place could still
-    present text that the raw bytes do not contain. Closing that would mean re-extracting
-    every document on every pass, and it buys little here -- anyone who can write into
-    the evidence store can equally rewrite the report, so this is not a privilege
-    boundary. The realistic failure this DOES catch is the non-adversarial one: bytes
-    truncated by a full disk or an interrupted write.
+    Two tiers of verification are distinguished rather than one boolean, because
+    ``deep=True`` verification requires a ``derivation_binding`` that no artifact
+    stored before that field existed carries -- which describes every document in a
+    long-lived real corpus, not a corrupted one. ``VERIFIED_DEEP`` passed the strict
+    check; ``VERIFIED_SHALLOW`` only ever had its raw bytes and (if present) its
+    sidecar digest checked, with no binding tying the two together;
+    ``UNVERIFIABLE_LEGACY_ROOT`` never had even its sidecar digest recorded, so
+    nothing at all authenticates the text it would serve. Only the first two are read
+    by default; the third is read only when ``allow_unverifiable_legacy_roots=True``.
+    ``FAILED_INTEGRITY`` -- the default check itself failing -- is never read,
+    regardless of that flag: the opt-in exists for artifacts that are merely
+    unauthenticated, not for ones whose bytes are actually damaged.
+
+    What deep verification does NOT prove, stated plainly rather than left implied:
+    ``extracted.json`` is a DERIVED cache, and verifying ``raw.bin`` does not
+    establish that the cache was derived from those bytes. Someone able to rewrite the
+    sidecar in place could still present text that the raw bytes do not contain.
+    Closing that would mean re-extracting every document on every pass, and it buys
+    little here -- anyone who can write into the evidence store can equally rewrite
+    the report, so this is not a privilege boundary. The realistic failure this DOES
+    catch is the non-adversarial one: bytes truncated by a full disk or an
+    interrupted write.
+
+    Args:
+        workspace_root: Root workspace.
+        allow_unverifiable_legacy_roots: Opt-in to read artifacts classified
+            ``UNVERIFIABLE_LEGACY_ROOT``. Defaults to False (fail-closed): an
+            unauthenticated root sidecar is refused unless the operator explicitly
+            says so.
     """
     corpus: list[tuple[StoredArtifact, ExtractedText, str]] = []
+    outcomes: dict[str, CorpusReadOutcome] = {}
     # An artifact directory with no readable meta.json never becomes a StoredArtifact,
-    # so it cannot be skipped by the loop below -- it would vanish from the corpus AND
-    # from the coverage this function reports. Seed the skipped list with those (F11).
-    artifacts, skipped = list_artifacts_with_unreadable(workspace_root)
+    # so it cannot be classified by the loop below -- it would vanish from the corpus
+    # AND from the coverage this function reports. Seed the outcomes with those (F11).
+    artifacts, unreadable = list_artifacts_with_unreadable(workspace_root)
+    for sha256 in unreadable:
+        outcomes[sha256] = CorpusReadOutcome.UNREADABLE_META
     for artifact in artifacts:
         try:
-            intact = verify_artifact(workspace_root, artifact.sha256, deep=True)
+            shallow_intact = verify_artifact(workspace_root, artifact.sha256, deep=False)
         except ValueError:
-            intact = False
-        if not intact:
+            shallow_intact = False
+        if not shallow_intact:
             logger.warning("evidence store: %s failed digest verification and was not read", artifact.sha256)
-            skipped.append(artifact.sha256)
+            outcomes[artifact.sha256] = CorpusReadOutcome.FAILED_INTEGRITY
             continue
+        try:
+            deep_intact = verify_artifact(workspace_root, artifact.sha256, deep=True)
+        except ValueError:
+            deep_intact = False
+        if deep_intact:
+            outcome = CorpusReadOutcome.VERIFIED_DEEP
+        elif artifact.extracted_sha256 is not None:
+            outcome = CorpusReadOutcome.VERIFIED_SHALLOW
+        else:
+            outcome = CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT
+
+        if outcome == CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT and not allow_unverifiable_legacy_roots:
+            logger.warning(
+                "evidence store: %s has no derivation binding AND no extracted_sha256, "
+                "so it cannot be authenticated at all -- was NOT read. Re-extract it into "
+                "an authenticated record, or re-run this pass with the explicit opt-in "
+                "to read unverifiable legacy roots",
+                artifact.sha256,
+            )
+            outcomes[artifact.sha256] = outcome
+            continue
+
         extracted = load_artifact_text(workspace_root, artifact.sha256)
         if extracted is None:
-            skipped.append(artifact.sha256)
+            outcomes[artifact.sha256] = CorpusReadOutcome.MISSING_TEXT
         else:
+            outcomes[artifact.sha256] = outcome
             corpus.append((artifact, extracted, ROOT_EXTRACTION_ID))
-    return corpus, skipped
+    return corpus, outcomes
 
 
 #: Characters per token, used to size a budget reservation from a prompt.
@@ -1777,6 +1865,7 @@ def _corpus_loop(
     action_id: str,
     run_id: str,
     already_covered: frozenset[tuple[str, str]] = frozenset(),
+    allow_unverifiable_legacy_roots: bool = False,
 ) -> None:
     """The corpus-only pass: read what is held, propose, ground, verify.
 
@@ -1808,7 +1897,20 @@ def _corpus_loop(
     here the document is in front of the agent immediately, and a second round would
     re-read identical input at full cost.
     """
-    corpus, skipped = _load_corpus(workspace_root)
+    corpus, outcomes = _load_corpus(
+        workspace_root, allow_unverifiable_legacy_roots=allow_unverifiable_legacy_roots
+    )
+    read_shas = {artifact.sha256 for artifact, _, _ in corpus}
+    skipped = [sha256 for sha256 in outcomes if sha256 not in read_shas]
+    # Grouped by REASON, not merely counted. Flattening every unread class back into
+    # one list here would reproduce, one layer up, the exact conflation the typed
+    # outcomes exist to remove -- and this is the only version a human ever sees. The
+    # classes call for opposite responses: an unverifiable legacy root wants
+    # re-extraction or the explicit opt-in, damaged bytes want the paper re-acquired,
+    # and an unreadable meta.json wants the directory itself looked at.
+    unread_by_reason: dict[str, list[str]] = {}
+    for sha256 in skipped:
+        unread_by_reason.setdefault(outcomes[sha256].value, []).append(sha256)
     if already_covered:
         before = len(corpus)
         corpus = [(a, e, x) for a, e, x in corpus if (a.sha256, x) not in already_covered]
@@ -1827,15 +1929,20 @@ def _corpus_loop(
             )
     if skipped:
         state.warnings.append(
-            f"{len(skipped)} held artifact(s) could not be read and were NOT covered by this pass: "
-            + ", ".join(sha[:12] for sha in skipped)
+            f"{len(skipped)} held artifact(s) were NOT covered by this pass -- "
+            + "; ".join(
+                f"{reason}: " + ", ".join(sha[:12] for sha in shas)
+                for reason, shas in sorted(unread_by_reason.items())
+            )
         )
         append_typed_event(
             log_path,
             event="literature.corpus_artifacts_unreadable",
             action_id=action_id,
             run_id=run_id,
-            payload={"sha256": skipped, "n_skipped": len(skipped)},
+            # `sha256` is kept as it was so nothing reading this event breaks, and the
+            # per-reason grouping is ADDED beside it rather than replacing it.
+            payload={"sha256": skipped, "n_skipped": len(skipped), "unread_by_reason": unread_by_reason},
         )
     if not corpus:
         state.stop_reason = StopReason.NO_NEW_INFORMATION
@@ -1869,7 +1976,13 @@ def _corpus_loop(
         #   * Before the proposal is processed, so a document that WAS paid for and
         #     then failed downstream (grounding, validation) is not re-bought. That
         #     is the case the original ordering was reaching for, and it is kept.
-        state.covered.append(CoveredDocument(raw_sha256=artifact.sha256, extraction_id=extraction_id))
+        state.covered.append(
+            CoveredDocument(
+                raw_sha256=artifact.sha256,
+                extraction_id=extraction_id,
+                verification_standard=outcomes[artifact.sha256].value,
+            )
+        )
         proposal = CorpusProposal.model_validate(result.output)
         append_typed_event(
             log_path,

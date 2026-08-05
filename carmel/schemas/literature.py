@@ -500,6 +500,63 @@ class LiteraturePassMode(StrEnum):
     CORPUS = "corpus"
 
 
+class CorpusReadOutcome(StrEnum):
+    """What actually happened when a corpus pass considered ONE held artifact.
+
+    Replaces a single undifferentiated ``skipped`` list, which reported an intact
+    legacy artifact -- one whose bytes are fine but predates ``derivation_binding`` --
+    identically to one whose ``raw.bin`` genuinely no longer hashes to its own name.
+    Those two demand opposite operator responses ("re-extract, or opt in" versus
+    "re-acquire the paper"), so conflating them is forbidden in this project.
+
+    The tiering below is keyed on ``extracted_sha256`` being present, NOT on
+    ``derivation_binding`` being present, and that choice is load-bearing rather than
+    incidental. Keying a tier on the ABSENCE of ``derivation_binding`` would be a
+    downgrade attack with extra steps: "the field was never written" (a legacy
+    artifact) and "the field was deleted" (an artifact someone tampered with) are
+    indistinguishable in the store, so an attacker able to delete the field could
+    manufacture the more permissive tier at will. Keying on ``extracted_sha256``
+    instead is safe in a way that is not, because of its DIRECTION -- deleting
+    ``extracted_sha256`` does not promote an artifact, it DEMOTES one, moving it from
+    ``VERIFIED_SHALLOW`` down into ``UNVERIFIABLE_LEGACY_ROOT``, which is refused by
+    default. The same attack that would have laundered a downgrade through
+    ``derivation_binding`` therefore buys the attacker only a refusal here, never an
+    admission.
+    """
+
+    VERIFIED_DEEP = "verified_deep"
+    """``verify_artifact(..., deep=True)`` passed: the sidecar's ``derivation_binding``
+    is intact, so both the raw bytes AND the claim that the text was derived from them
+    are authenticated."""
+
+    VERIFIED_SHALLOW = "verified_shallow"
+    """Deep verification failed, but the default (non-deep) check passed AND
+    ``meta.extracted_sha256`` is not ``None`` -- the sidecar actually read WAS digest-
+    checked at some point, there is simply no ``derivation_binding`` recording that it
+    came from these particular raw bytes."""
+
+    UNVERIFIABLE_LEGACY_ROOT = "unverifiable_legacy_root"
+    """The default check passed, but ``meta.extracted_sha256`` is ``None``: nothing ever
+    bound ``extracted.json`` to anything, so the text this artifact would serve cannot
+    be authenticated at all. Refused by default; readable only under an explicit
+    operator opt-in."""
+
+    FAILED_INTEGRITY = "failed_integrity"
+    """The default (non-deep) check itself failed: ``raw.bin`` is absent or no longer
+    hashes to the directory naming it, or a RECORDED sidecar digest no longer matches.
+    Never read, regardless of any opt-in -- an opt-in for unauthenticated-but-intact
+    bytes must not launder bytes that are not even intact."""
+
+    MISSING_TEXT = "missing_text"
+    """Verification (at whichever tier applies) passed, but ``load_artifact_text``
+    returned ``None`` anyway: there is nothing to quote from."""
+
+    UNREADABLE_META = "unreadable_meta"
+    """Seeded from :func:`~carmel.services.evidence.list_artifacts_with_unreadable`: a
+    directory with no readable ``meta.json`` never becomes a :class:`StoredArtifact` at
+    all, so none of the checks above ever ran against it."""
+
+
 #: Matched with ``fullmatch``, never ``match``. Python's ``$`` also matches just BEFORE a
 #: trailing newline, so ``re.match`` on this pattern accepts ``"a" * 64 + "\n"`` -- a value
 #: that is not a sha256 but would be carried around as though it were one. The anchors are
@@ -535,6 +592,23 @@ class CoveredDocument(BaseModel):
     raw_sha256: str = Field(min_length=1)
     extraction_id: str = Field(min_length=1)
     """Either :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex extraction sha256."""
+    verification_standard: str = Field(min_length=1)
+    """Which :class:`CorpusReadOutcome` this document was actually read under: one of
+    ``VERIFIED_DEEP``, ``VERIFIED_SHALLOW``, ``UNVERIFIABLE_LEGACY_ROOT``, or the
+    literal ``"unrecorded"``.
+
+    REQUIRED, with no default, for the same reason :attr:`EvidenceRef.extraction_id`
+    has none. Reports are APPEND-ONLY: if a pass does not record whether a document
+    was read deep, shallow, or unauthenticated, no future reader can ever reconstruct
+    it, because the answer depended on the store's state and the operator's flag at
+    that instant, and neither is recoverable afterwards. A default would let a
+    producer that never considered the question silently claim a standard it did not
+    check, which is exactly the ambiguity this field exists to close.
+
+    ``"unrecorded"`` is for MIGRATED records only -- stamped onto every ``covered``
+    entry that predates this field, because no earlier writer could have had grounds
+    to claim any real standard. A live pass must never write it.
+    """
 
     @field_validator("raw_sha256")
     @classmethod
@@ -550,6 +624,23 @@ class CoveredDocument(BaseModel):
             raise ValueError(
                 f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or "
                 "64 lowercase hex characters)"
+            )
+        return value
+
+    @field_validator("verification_standard")
+    @classmethod
+    def _validate_verification_standard_shape(cls, value: str) -> str:
+        allowed = {
+            CorpusReadOutcome.VERIFIED_DEEP.value,
+            CorpusReadOutcome.VERIFIED_SHALLOW.value,
+            CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT.value,
+            "unrecorded",
+        }
+        if value not in allowed:
+            raise ValueError(
+                f"invalid verification_standard: {value!r} (expected one of "
+                f"{sorted(allowed)!r} -- the other CorpusReadOutcome members name ways a "
+                "document was NOT read, so nothing could have been read under them)"
             )
         return value
 
@@ -604,7 +695,7 @@ class PassRecord(BaseModel):
 #: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
 #: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
 #: truncate) a report written by a newer one.
-CURRENT_REPORT_SCHEMA_VERSION = 5
+CURRENT_REPORT_SCHEMA_VERSION = 6
 
 
 class LiteratureReport(BaseModel):
