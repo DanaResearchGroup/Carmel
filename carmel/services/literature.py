@@ -84,7 +84,9 @@ from carmel.schemas.acquisition import AcquisitionReason
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
     CURRENT_REPORT_SCHEMA_VERSION,
+    ROOT_EXTRACTION_ID,
     STOP_REASON_FOR_DIMENSION,
+    CoveredDocument,
     CredenceVerdict,
     EvidenceRef,
     GroundingStatus,
@@ -230,6 +232,15 @@ def migrate_report_payload(payload: object) -> object:
     the corpus once. That is the conservative direction: re-reading costs tokens,
     while inventing coverage would silently skip documents nobody has mined.
 
+    v4 re-keys coverage from a bare raw sha256 to the PAIR (raw sha256, extraction
+    identity), because a single stored document can hold more than one extraction
+    (the root sidecar, plus whatever re-extraction has since produced) and coverage
+    of one must not be read as coverage of another. The v3->v4 step maps each raw
+    sha in ``covered_sha256`` to a pair with ``extraction_id`` set to
+    :data:`ROOT_EXTRACTION_ID`. That mapping is not a guess: `_load_corpus` in this
+    module has only ever loaded text via `load_artifact_text`, which reads the ROOT
+    sidecar, so root text is the only thing any v3 pass could possibly have mined.
+
     This is a CHAIN, applied step by step from the payload's own version. It used to
     be a single branch that ran the v1 lift for ANY version below current, which was
     correct only while current was 2: at v3 a v2 payload would have been fed through
@@ -264,6 +275,8 @@ def migrate_report_payload(payload: object) -> object:
         migrated = _migrate_v1_to_v2(migrated)
     if version < 3:
         migrated = _migrate_v2_to_v3(migrated)
+    if version < 4:
+        migrated = _migrate_v3_to_v4(migrated)
     # Not a literal. This produces whatever the CURRENT schema is, so hardcoding the
     # number means the next version bump silently stamps migrated reports with a
     # stale version -- and the `version == CURRENT` early return above then treats
@@ -317,6 +330,35 @@ def _migrate_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
         migrated["passes"] = [
             {**p, "covered_sha256": p.get("covered_sha256", [])} if isinstance(p, dict) else p for p in passes
         ]
+    return migrated
+
+
+def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
+    """Re-key each pass's ``covered_sha256`` to ``covered``, a list of (raw sha256,
+    extraction identity) pairs.
+
+    Every raw sha in the old list is mapped to ``ROOT_EXTRACTION_ID``. This is not a
+    guess: `_load_corpus` in this module has only ever loaded document text via
+    `load_artifact_text`, which reads the ROOT `extracted.json` sidecar, so root text
+    is the only thing any v3 pass could possibly have mined. The old
+    ``covered_sha256`` key is removed, not left alongside the new one -- `PassRecord`
+    sets ``extra="forbid"``, so a payload still carrying it would be rejected.
+    """
+    migrated = dict(payload)
+    passes = migrated.get("passes")
+    if isinstance(passes, list):
+        new_passes = []
+        for p in passes:
+            if not isinstance(p, dict):
+                new_passes.append(p)
+                continue
+            new_p = dict(p)
+            old_covered = new_p.pop("covered_sha256", [])
+            new_p["covered"] = [
+                {"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID} for sha in old_covered
+            ]
+            new_passes.append(new_p)
+        migrated["passes"] = new_passes
     return migrated
 
 
@@ -826,12 +868,17 @@ class _RunState:
     parsing warning text."""
     acquisition_slugs: list[str] = field(default_factory=list)
     """Slugs queued for manual acquisition during this run, for the run summary."""
-    covered: list[str] = field(default_factory=list)
-    """Artifact shas this pass actually READ, whether or not they yielded a finding.
+    covered: list[CoveredDocument] = field(default_factory=list)
+    """(artifact sha, extraction identity) pairs this pass actually READ, whether or
+    not they yielded a finding.
 
-    Appended BEFORE the model call, not after: a document the budget cut short was
-    still paid for and partially processed, and recording it only on success would
-    make the next pass re-read exactly the documents that already proved expensive."""
+    Keyed by the pair, not the raw sha alone, because a single stored document can
+    have more than one extraction on disk, and re-reading a paper under a NEW
+    extraction is real work, not a repeat.
+
+    Appended AFTER the model call returns and BEFORE its proposal is processed -- see
+    the ordering comment at the append site in ``_corpus_loop`` for why both halves of
+    that ordering matter."""
 
     def query_records(self, pass_record: PassRecord) -> list[QueryRecord]:
         """This run's executed queries, attributed to the pass that ran them."""
@@ -1422,7 +1469,7 @@ def _research_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
-    already_covered: frozenset[str] = frozenset(),
+    already_covered: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
     """The bounded propose->ground->verify loop. Mutates ``state`` in place."""
     # A search pass discovers documents rather than re-reading held ones, so prior
@@ -1538,8 +1585,17 @@ def _research_loop(
             return
 
 
-def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, ExtractedText]], list[str]]:
-    """Every held artifact paired with its extracted text, and the shas that were not.
+def _load_corpus(
+    workspace_root: Path,
+) -> tuple[list[tuple[StoredArtifact, ExtractedText, str]], list[str]]:
+    """Every held artifact paired with its extracted text and the extraction it was
+    read from, and the shas that were not.
+
+    The extraction identity is always :data:`ROOT_EXTRACTION_ID` today, because this
+    function loads text only via :func:`load_artifact_text`, which reads the root
+    ``extracted.json`` sidecar. Choosing between the root and a nested re-extraction
+    record is a separate, later increment -- this function reports what it actually
+    read, not what it could have read.
 
     An artifact whose text cannot be loaded is skipped: it cannot be quoted from, so
     including it in the listing would only invite the agent to propose a finding that
@@ -1571,7 +1627,7 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     boundary. The realistic failure this DOES catch is the non-adversarial one: bytes
     truncated by a full disk or an interrupted write.
     """
-    corpus: list[tuple[StoredArtifact, ExtractedText]] = []
+    corpus: list[tuple[StoredArtifact, ExtractedText, str]] = []
     # An artifact directory with no readable meta.json never becomes a StoredArtifact,
     # so it cannot be skipped by the loop below -- it would vanish from the corpus AND
     # from the coverage this function reports. Seed the skipped list with those (F11).
@@ -1589,7 +1645,7 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
         if extracted is None:
             skipped.append(artifact.sha256)
         else:
-            corpus.append((artifact, extracted))
+            corpus.append((artifact, extracted, ROOT_EXTRACTION_ID))
     return corpus, skipped
 
 
@@ -1668,7 +1724,7 @@ def _corpus_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
-    already_covered: frozenset[str] = frozenset(),
+    already_covered: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
     """The corpus-only pass: read what is held, propose, ground, verify.
 
@@ -1703,7 +1759,7 @@ def _corpus_loop(
     corpus, skipped = _load_corpus(workspace_root)
     if already_covered:
         before = len(corpus)
-        corpus = [(a, e) for a, e in corpus if a.sha256 not in already_covered]
+        corpus = [(a, e, x) for a, e, x in corpus if (a.sha256, x) not in already_covered]
         n_skipped = before - len(corpus)
         if n_skipped:
             state.warnings.append(
@@ -1741,7 +1797,7 @@ def _corpus_loop(
         return
 
     agent = build_corpus_agent(model=deps.model, ledger=deps.ledger)
-    for artifact, extracted in corpus:
+    for artifact, extracted, extraction_id in corpus:
         deps.ledger.check_wall_clock()
         # Only the document actually shown is resolvable. The agent is looking at one
         # paper, so a digest naming any other is a mistake worth surfacing, even when
@@ -1761,7 +1817,7 @@ def _corpus_loop(
         #   * Before the proposal is processed, so a document that WAS paid for and
         #     then failed downstream (grounding, validation) is not re-bought. That
         #     is the case the original ordering was reaching for, and it is kept.
-        state.covered.append(artifact.sha256)
+        state.covered.append(CoveredDocument(raw_sha256=artifact.sha256, extraction_id=extraction_id))
         proposal = CorpusProposal.model_validate(result.output)
         append_typed_event(
             log_path,
@@ -2048,9 +2104,11 @@ def _run_pass(
         # hatch: coverage is recorded per document, so re-reading is otherwise never
         # automatic, and a changed prompt or a newer model is a real reason to want it.
         reread_all = bool(action.parameters.get("reread_all", False))
-        already_covered: frozenset[str] = frozenset()
+        already_covered: frozenset[tuple[str, str]] = frozenset()
         if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
-            already_covered = frozenset(sha for record in previous.passes for sha in record.covered_sha256)
+            already_covered = frozenset(
+                (cd.raw_sha256, cd.extraction_id) for record in previous.passes for cd in record.covered
+            )
 
         slot_acquired = False
         try:
@@ -2102,7 +2160,7 @@ def _run_pass(
                 stop_reason=state.stop_reason,
                 usage=deps.ledger.usage(),
                 warnings=state.warnings,
-                covered_sha256=list(state.covered),
+                covered=list(state.covered),
             ),
             state=state,
             report_id=report_id,

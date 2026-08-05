@@ -50,10 +50,13 @@ from carmel.schemas import (
 from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
+    ROOT_EXTRACTION_ID,
     ArtifactProvenance,
+    CoveredDocument,
     GroundingStatus,
     LiteraturePassMode,
     LiteratureReport,
+    PassRecord,
     StopReason,
 )
 from carmel.services import chem
@@ -1156,6 +1159,94 @@ class TestSchemas:
         assessment = VerifierAssessment.model_validate(_assessment())
         assert assessment.credence == pytest.approx(0.9)
 
+    @pytest.mark.parametrize(
+        "bad_extraction_id",
+        [
+            pytest.param("root2", id="short_string"),
+            pytest.param("a" * 63 + "g", id="non_hex_char"),
+            pytest.param("A" * 64, id="uppercase_hex"),
+            # Python's ``$`` matches just before a trailing newline, so a validator
+            # written with ``re.match`` accepts this and carries a value that is not a
+            # sha256 around as though it were one. ``fullmatch`` is what refuses it.
+            pytest.param("a" * 64 + "\n", id="trailing_newline"),
+        ],
+    )
+    def test_t9_covered_document_rejects_a_bad_extraction_id(self, bad_extraction_id: str) -> None:
+        """T9. ``extraction_id`` must be either the ``"root"`` sentinel or 64
+        lowercase-hex characters -- anything else is refused, not coerced."""
+        with pytest.raises(ValueError):
+            CoveredDocument(raw_sha256="a" * 64, extraction_id=bad_extraction_id)
+
+    @pytest.mark.parametrize(
+        "bad_raw_sha256",
+        [
+            pytest.param("deadbeef", id="short_string"),
+            pytest.param("a" * 63 + "g", id="non_hex_char"),
+            pytest.param("A" * 64, id="uppercase_hex"),
+            pytest.param("a" * 64 + "\n", id="trailing_newline"),
+        ],
+    )
+    def test_t10_covered_document_rejects_a_bad_raw_sha256(self, bad_raw_sha256: str) -> None:
+        """T10. ``raw_sha256`` must be 64 lowercase-hex characters."""
+        with pytest.raises(ValueError):
+            CoveredDocument(raw_sha256=bad_raw_sha256, extraction_id=ROOT_EXTRACTION_ID)
+
+    def test_t11_pass_record_rejects_the_old_covered_sha256_key(self) -> None:
+        """T11. ``PassRecord`` sets ``extra="forbid"``, so a payload still carrying
+        the retired ``covered_sha256`` key proves the rename is real, not merely
+        additive."""
+        with pytest.raises(ValueError):
+            PassRecord.model_validate(
+                {
+                    "run_id": "r",
+                    "action_id": "a",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered_sha256": ["a" * 64],
+                }
+            )
+
+    def test_t12_a_report_round_trips_several_covered_pairs(self, campaign: Campaign) -> None:
+        """T12. A report written with a pass carrying several covered pairs reads
+        back with exactly those pairs -- schema round trip, not just construction."""
+        pairs = [
+            CoveredDocument(raw_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID),
+            CoveredDocument(raw_sha256="b" * 64, extraction_id="c" * 64),
+        ]
+        pass_record = PassRecord(
+            run_id="r",
+            action_id="a",
+            created_at=datetime.now(UTC),
+            mode=LiteraturePassMode.CORPUS,
+            model_name="mock",
+            stop_reason=StopReason.SELF_TERMINATED,
+            usage=BudgetUsage(model_calls=1, tokens=100, cost_usd=0.01, fetches=0, fetch_bytes=0, elapsed_s=1.0),
+            warnings=[],
+            covered=pairs,
+        )
+        report = LiteratureReport(
+            report_id="rep-1",
+            campaign_id=campaign.campaign_id,
+            created_at=datetime.now(UTC),
+            passes=[pass_record],
+        )
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(report.model_dump_json())
+
+        reloaded = load_literature_report(campaign.workspace_root)
+
+        assert reloaded.passes[0].covered == pairs
+
 
 class _StatusFetchTool:
     """Fetch tool that fails every URL with a chosen HTTP status.
@@ -1785,6 +1876,114 @@ class TestReportSchemaVersionGate:
         assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION
         assert len(migrated["passes"]) == 1
 
+    def _v3_pass(self, *, covered_sha256: list[str]) -> dict[str, Any]:
+        return {
+            "run_id": "r",
+            "action_id": "a",
+            "created_at": datetime.now(UTC).isoformat(),
+            "mode": LiteraturePassMode.CORPUS.value,
+            "model_name": "mock",
+            "stop_reason": StopReason.SELF_TERMINATED.value,
+            "usage": {
+                "model_calls": 1,
+                "tokens": 100,
+                "cost_usd": 0.01,
+                "fetches": 0,
+                "fetch_bytes": 0,
+                "elapsed_s": 1.0,
+            },
+            "warnings": [],
+            "covered_sha256": covered_sha256,
+        }
+
+    def test_t5_a_v3_payloads_covered_sha256_migrates_to_covered_pairs_with_root(self) -> None:
+        """T5. A v3 payload's ``covered_sha256: [a, b]`` migrates to a v4 ``covered``
+        equal to those two shas each paired with ``ROOT_EXTRACTION_ID``, and the
+        payload's ``schema_version`` is 4."""
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        sha_a, sha_b = "a" * 64, "b" * 64
+        payload = {"schema_version": 3, "passes": [self._v3_pass(covered_sha256=[sha_a, sha_b])]}
+
+        migrated = migrate_report_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION == 4
+        assert migrated["passes"][0]["covered"] == [
+            {"raw_sha256": sha_a, "extraction_id": ROOT_EXTRACTION_ID},
+            {"raw_sha256": sha_b, "extraction_id": ROOT_EXTRACTION_ID},
+        ]
+
+    def test_t6_the_old_covered_sha256_key_is_gone_after_migration(self) -> None:
+        """T6. ``covered_sha256`` must be removed, not left alongside ``covered`` --
+        ``PassRecord`` forbids extra fields, so leaving it would break validation."""
+        from carmel.services.literature import migrate_report_payload
+
+        payload = {"schema_version": 3, "passes": [self._v3_pass(covered_sha256=["a" * 64])]}
+
+        migrated = migrate_report_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert "covered_sha256" not in migrated["passes"][0]
+
+    def test_t7_v1_and_v2_reports_still_migrate_to_an_empty_covered_list(self) -> None:
+        """T7. What a v1/v2 pass covered was never written down, so migration must
+        not invent it -- an empty ``covered`` list stays the honest answer."""
+        from carmel.services.literature import migrate_report_payload
+
+        v1_migrated = migrate_report_payload(
+            {"schema_version": 1, "run_id": "r", "action_id": "a", "queries": []}
+        )
+        assert isinstance(v1_migrated, dict)
+        assert v1_migrated["passes"][0]["covered"] == []
+
+        v2_payload = {
+            "schema_version": 2,
+            "passes": [
+                {
+                    "run_id": "r",
+                    "action_id": "a",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.SEARCH.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                }
+            ],
+        }
+        v2_migrated = migrate_report_payload(v2_payload)
+        assert isinstance(v2_migrated, dict)
+        assert v2_migrated["passes"][0]["covered"] == []
+
+    def test_t8_a_v4_payload_passes_through_unchanged(self) -> None:
+        """T8. A payload already at the current version (4) is idempotent -- returned
+        as-is, not re-migrated."""
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        assert CURRENT_REPORT_SCHEMA_VERSION == 4
+        payload = {
+            "schema_version": 4,
+            "passes": [
+                {
+                    **self._v3_pass(covered_sha256=[]),
+                    "covered": [{"raw_sha256": "a" * 64, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+        }
+        del payload["passes"][0]["covered_sha256"]
+
+        assert migrate_report_payload(payload) is payload
+
 
 class TestReportAccumulatesAcrossPasses:
     """Decision 0004/D1: one report per campaign, appended to, with every finding and
@@ -1825,7 +2024,7 @@ class TestReportAccumulatesAcrossPasses:
         # v1 recorded no coverage, so the migration must not invent any -- an empty
         # list reads as "not recorded" and makes the next corpus pass re-read once,
         # which is the conservative direction.
-        assert report.passes[0].covered_sha256 == []
+        assert report.passes[0].covered == []
         assert report.run_id == "run-1"
         assert report.action_id == "act-1"
         assert report.stop_reason == StopReason.SELF_TERMINATED
@@ -2177,7 +2376,7 @@ class TestCorpusPass:
         report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         assert report.findings == []
-        assert sorted(report.latest.covered_sha256) == sorted([first, second])
+        assert sorted(cd.raw_sha256 for cd in report.latest.covered) == sorted([first, second])
 
     def test_a_second_pass_does_not_re_read_what_the_first_already_mined(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
@@ -2189,7 +2388,7 @@ class TestCorpusPass:
         first_deps, _, first_config = _make_deps([_corpus_proposal([])])
         first = run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
         assert first_deps.ledger.usage().model_calls == 1
-        assert len(first.latest.covered_sha256) == 1
+        assert len(first.latest.covered) == 1
 
         # A second pass with NO new documents must make no model call at all.
         second_deps, _, second_config = _make_deps([_corpus_proposal([])])
@@ -2216,8 +2415,8 @@ class TestCorpusPass:
         report = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
 
         assert second_deps.ledger.usage().model_calls == 1
-        assert report.latest.covered_sha256 == [new]
-        assert old not in report.latest.covered_sha256
+        assert [cd.raw_sha256 for cd in report.latest.covered] == [new]
+        assert old not in [cd.raw_sha256 for cd in report.latest.covered]
 
     def test_a_document_the_budget_refused_is_not_recorded_as_covered(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
@@ -2248,8 +2447,8 @@ class TestCorpusPass:
         assert deps.ledger.usage().model_calls == 1
         assert report.latest.stop_reason == StopReason.MAX_MODEL_CALLS
         # The heart of it: one call read one document, so exactly one is covered.
-        assert len(report.latest.covered_sha256) == 1, (
-            f"a refused reservation was recorded as covered: {report.latest.covered_sha256}"
+        assert len(report.latest.covered) == 1, (
+            f"a refused reservation was recorded as covered: {report.latest.covered}"
         )
 
         # And the refused document is still reachable -- not silently skipped forever.
@@ -2258,7 +2457,7 @@ class TestCorpusPass:
         second = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
 
         assert second_deps.ledger.usage().model_calls == 1, "the unread document was skipped by the next pass"
-        assert len(second.latest.covered_sha256) == 1
+        assert len(second.latest.covered) == 1
 
     def test_reread_all_overrides_the_scoping(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
         """The operator's escape hatch: a changed model or prompt is a real reason."""
@@ -2272,7 +2471,7 @@ class TestCorpusPass:
         report = run_corpus_pass(campaign.workspace_root, campaign, forced, second_deps, config=second_config)
 
         assert second_deps.ledger.usage().model_calls == 1
-        assert report.latest.covered_sha256 == [sha]
+        assert [cd.raw_sha256 for cd in report.latest.covered] == [sha]
 
     def test_a_corpus_pass_appends_to_an_existing_search_report(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
@@ -2293,6 +2492,224 @@ class TestCorpusPass:
         assert [p.run_id for p in report.passes] == [first.run_id, report.run_id]
         assert [q.text for q in report.queries] == ["first query"], "a corpus pass contributes no queries"
         assert report.findings_for(report.run_id) == report.findings
+
+
+class TestCoverageIsKeyedByExtractionIdentity:
+    """Coverage must be keyed by (raw_sha256, extraction_id), not raw_sha256 alone.
+
+    A single stored document can have more than one extraction (the root
+    ``extracted.json`` sidecar today, plus per-extraction sidecars re-extraction can
+    produce later). Recording coverage as a bare raw sha256 makes "this raw document
+    was covered" indistinguishable from "this SPECIFIC extraction of it was covered"
+    -- so a document mined under one extraction identity would be silently skipped
+    forever, even once a materially different extraction of the same document became
+    available to read.
+    """
+
+    def test_t1_red_a_document_covered_under_a_different_extraction_identity_is_not_skipped(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T1, and the RED test required before any non-test file was touched.
+
+        Writes a previous report directly (rather than through a real pass) because
+        this increment deliberately keeps ``_load_corpus`` root-sidecar-only (see
+        Non-goals) -- it cannot itself discover a non-root extraction to read, so the
+        only way to exercise "covered under a DIFFERENT extraction identity" is to
+        assert it into the previous report's ``covered`` records directly.
+
+        Against the schema this branch starts from, a bare raw sha256 is the entire
+        coverage key: once ``sha`` is covered, EVERY reading of that raw document is
+        skipped, with no way to say "but not that extraction." That is exactly the
+        bug this test is written to prove.
+        """
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        other_extraction_id = "b" * 64
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": other_extraction_id}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 1, (
+            "a document covered under a DIFFERENT extraction identity was skipped as "
+            "already mined; raw sha256 alone is not a valid coverage key -- "
+            f"warnings={report.latest.warnings}"
+        )
+
+    def test_t2_a_document_covered_under_the_same_extraction_identity_is_skipped(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T2. The mirror of T1: same raw sha256 AND same extraction identity ->
+        the document is skipped, exactly as bare raw-sha coverage always was."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 0, (
+            "a document covered under the SAME (raw sha256, extraction identity) pair "
+            f"was re-read; warnings={report.latest.warnings}"
+        )
+        assert report.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+
+    def test_t3_only_the_uncovered_document_of_two_is_read(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T3. A corpus of two documents where exactly one (raw sha256, extraction
+        identity) pair is covered -> only the uncovered document is read."""
+        _patch_chem_success(monkeypatch)
+        covered_sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        uncovered_sha = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": covered_sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 1, (
+            f"expected exactly one new document to be read; warnings={report.latest.warnings}"
+        )
+        assert [cd.raw_sha256 for cd in report.latest.covered] == [uncovered_sha]
+
+    def test_t4_when_every_held_document_is_covered_the_pass_still_stops_as_already_mined(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T4. When every held document's (raw sha256, extraction identity) pair is
+        covered, the pass still stops with the existing "already mined" stop reason
+        and warning -- re-keying coverage must not disturb that outcome."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 0
+        assert report.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+        assert any("already" in w and "mined" in w for w in report.latest.warnings), (
+            f"expected an 'already mined' warning; warnings={report.latest.warnings}"
+        )
 
 
 class TestTheDailyCapIsActuallyWired:

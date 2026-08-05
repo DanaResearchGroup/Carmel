@@ -10,6 +10,7 @@ directly comparable.
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
@@ -22,6 +23,7 @@ from carmel.schemas.campaign import ReactorType
 __all__ = [
     "STOP_REASON_FOR_DIMENSION",
     "Citation",
+    "CoveredDocument",
     "CredenceVerdict",
     "EvidenceRef",
     "ExperimentalBenchmarkPayload",
@@ -38,6 +40,7 @@ __all__ = [
     "QMProperty",
     "Quantity",
     "RejectedFinding",
+    "ROOT_EXTRACTION_ID",
     "SpeciesRef",
     "StopReason",
     "StoredArtifact",
@@ -463,6 +466,60 @@ class LiteraturePassMode(StrEnum):
     CORPUS = "corpus"
 
 
+#: Matched with ``fullmatch``, never ``match``. Python's ``$`` also matches just BEFORE a
+#: trailing newline, so ``re.match`` on this pattern accepts ``"a" * 64 + "\n"`` -- a value
+#: that is not a sha256 but would be carried around as though it were one. The anchors are
+#: kept for readability; ``fullmatch`` is what actually closes that hole.
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+#: Sentinel ``extraction_id`` naming the root ``extracted.json`` sidecar -- the text
+#: extracted directly from a stored artifact's own bytes, as opposed to a later
+#: re-extraction under ``evidence/literature/<raw_sha256>/extractions/<extraction_sha256>/``
+#: (see ``carmel.services.reextraction``). Deliberately the literal string ``"root"``
+#: rather than a 64-hex digest: a root sidecar is not content-addressed by its own hash.
+#: Its identity is the raw document's address, not its own bytes', so it has no sha256 of
+#: its own to key on. That identity is stable precisely because root sidecars are
+#: immutable -- this project never rewrites one, not even to upgrade a legacy one.
+#: A short literal also can never collide with a genuine 64-lowercase-hex extraction_id,
+#: so "root" and "some specific extraction" are always distinguishable by shape alone.
+ROOT_EXTRACTION_ID = "root"
+
+
+class CoveredDocument(BaseModel):
+    """One (document, extraction) pair a corpus pass actually read.
+
+    Coverage keyed by raw sha256 alone cannot distinguish "this raw document was
+    read" from "this SPECIFIC extraction of it was read" -- a single stored document
+    can have more than one extraction on disk (the root sidecar, plus whatever
+    re-extraction has produced since). Keying by the pair means a document covered
+    under one extraction identity is correctly NOT skipped when a later pass would
+    read it under a different one.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw_sha256: str = Field(min_length=1)
+    extraction_id: str = Field(min_length=1)
+    """Either :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex extraction sha256."""
+
+    @field_validator("raw_sha256")
+    @classmethod
+    def _validate_raw_sha256_shape(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"invalid raw_sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
+    @field_validator("extraction_id")
+    @classmethod
+    def _validate_extraction_id_shape(cls, value: str) -> str:
+        if value != ROOT_EXTRACTION_ID and not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or "
+                "64 lowercase hex characters)"
+            )
+        return value
+
+
 class QueryRecord(BaseModel):
     """One executed search query, attributed to the pass that ran it."""
 
@@ -489,16 +546,23 @@ class PassRecord(BaseModel):
     stop_reason: StopReason
     usage: BudgetUsage
     warnings: list[str] = Field(default_factory=list)
-    covered_sha256: list[str] = Field(default_factory=list)
-    """The artifacts this pass actually READ, whether or not they yielded a finding.
+    covered: list[CoveredDocument] = Field(default_factory=list)
+    """The (document, extraction) pairs this pass actually READ, whether or not they
+    yielded a finding.
 
     Recorded so a later corpus pass can skip what has already been mined. Findings
     alone cannot answer that: a document read and found barren produces nothing to
     attribute, and is exactly the document a later pass must not pay to re-read.
 
+    Keyed by the PAIR, not the raw sha256 alone: a single stored document can have
+    more than one extraction on disk, and coverage of one extraction must not be
+    read as coverage of a different one (see :class:`CoveredDocument`).
+
     Empty on a search pass, and on any v2 report migrated forward -- for those, what
     was covered was never written down, so the honest value is "nothing recorded"
-    rather than a guess reconstructed from findings.
+    rather than a guess reconstructed from findings. A v3 report migrates its
+    ``covered_sha256`` forward with every entry's ``extraction_id`` set to
+    :data:`ROOT_EXTRACTION_ID`, since that field only ever recorded root-sidecar reads.
     """
 
 
@@ -506,7 +570,7 @@ class PassRecord(BaseModel):
 #: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
 #: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
 #: truncate) a report written by a newer one.
-CURRENT_REPORT_SCHEMA_VERSION = 3
+CURRENT_REPORT_SCHEMA_VERSION = 4
 
 
 class LiteratureReport(BaseModel):
