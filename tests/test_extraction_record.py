@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from carmel.agents.tools.extract import ExtractedText
+from carmel.agents.tools.fetch import FetchedArtifact
+from carmel.schemas.literature import ROOT_EXTRACTION_ID, ArtifactProvenance
 from carmel.services import semantic_deps
+from carmel.services.evidence import store_artifact
 from carmel.services.extraction_record import (
+    ExtractionPreference,
     ExtractionRecordError,
+    ExtractionSelectionError,
+    SelectedExtraction,
     UnknownPypdfVersionError,
     compute_extraction_sha,
     current_extraction_records,
     list_extraction_records,
     load_extraction_record,
+    select_extraction,
     store_extraction_record,
     stored_extraction_sha256,
     verify_extraction_record,
@@ -23,6 +32,7 @@ from carmel.services.extraction_record import (
 
 RAW_SHA = "a" * 64
 OTHER_RAW_SHA = "b" * 64
+MAX_BYTES = 10_000_000
 
 
 def _extracted_text_bytes(text: str = "hello", *, extractor: str = "pdf:pypdf") -> bytes:
@@ -73,6 +83,46 @@ def _store(
         pypdf_version=pypdf_version,
         extracted_json_bytes=extracted_json_bytes,
     )
+
+
+def _fetched_artifact(
+    data: bytes, *, url: str = "https://example.org/paper.pdf", content_type: str = "application/pdf"
+) -> FetchedArtifact:
+    """Synthetic :class:`FetchedArtifact`, following ``tests/test_reextraction.py``'s pattern."""
+    return FetchedArtifact(
+        url=url,
+        final_url=url,
+        sha256=hashlib.sha256(data).hexdigest(),
+        content_type=content_type,
+        n_bytes=len(data),
+        fetched_at=datetime.now(UTC),
+    )
+
+
+def _store_root_artifact(tmp_path: Path, *, data: bytes = b"%PDF-1.4\nsynthetic\n%%EOF", text: str) -> str:
+    """Store a synthetic artifact whose ROOT ``extracted.json`` sidecar has ``text``.
+
+    Reuses ``carmel.services.evidence.store_artifact`` directly, exactly as
+    ``tests/test_reextraction.py::_store_synthetic_artifact`` does, so the root
+    sidecar's text is independently controllable from any extraction record's
+    text stored under the same ``raw_sha256`` via :func:`_store`.
+
+    Returns:
+        The stored artifact's ``raw_sha256``.
+    """
+    artifact = _fetched_artifact(data)
+    root_extracted = ExtractedText(
+        text=text, normalized=text.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
+    )
+    stored = store_artifact(
+        tmp_path,
+        data=data,
+        artifact=artifact,
+        extracted=root_extracted,
+        provenance=ArtifactProvenance.MANUAL,
+        max_bytes=MAX_BYTES,
+    )
+    return stored.sha256
 
 
 class TestComputeExtractionSha:
@@ -584,3 +634,302 @@ class TestLoadAndVerifyDistinguishAbsentFromCorruptMeta:
         (dest / "meta.json").write_text(json.dumps(raw), encoding="utf-8")
 
         assert load_extraction_record(tmp_path, RAW_SHA, extraction_sha) is None
+
+
+class TestSelectExtraction:
+    """The explicit, caller-stated extraction-selection rule: never a silent fallback.
+
+    One test per condition S1-S16 from the brief. Every fixture is synthetic.
+    """
+
+    # -- S1/S2: ROOT --------------------------------------------------------
+
+    def test_s1_root_returns_root_sidecar_even_when_records_exist(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S1")
+        _store(tmp_path, raw_sha256=raw_sha, text="a record, not the root")
+
+        result = select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.ROOT)
+
+        assert isinstance(result, SelectedExtraction)
+        assert result.extraction_id == ROOT_EXTRACTION_ID
+        assert result.extracted.text == "ROOT TEXT S1"
+
+    def test_s2_root_raises_when_sidecar_missing(self, tmp_path: Path) -> None:
+        with pytest.raises(ExtractionSelectionError):
+            select_extraction(tmp_path, RAW_SHA, prefer=ExtractionPreference.ROOT)
+
+    # -- S3-S7: EXACT ---------------------------------------------------------
+
+    def test_s3_exact_with_authentic_record_returns_it(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+        extraction_sha = _store(tmp_path, raw_sha256=raw_sha, text="exact record text s3")
+
+        result = select_extraction(
+            tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
+        )
+
+        assert result.extraction_id == extraction_sha
+        assert result.extracted.text == "exact record text s3"
+
+    def test_s4_exact_raises_when_no_record_at_address_and_does_not_fall_back_to_root(
+        self, tmp_path: Path
+    ) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S4")
+        never_stored_sha = "f" * 64
+
+        with pytest.raises(ExtractionSelectionError) as exc_info:
+            select_extraction(
+                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=never_stored_sha
+            )
+
+        # The exact defect being prevented is a silent root fallback: prove its
+        # absence by confirming EXACT's only failure mode here is a raise --
+        # never a SelectedExtraction carrying the root's text.
+        assert "ROOT TEXT S4" not in str(exc_info.value)
+
+    def test_s5_exact_raises_when_record_does_not_authenticate_to_its_address(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+        extraction_sha = _store(tmp_path, raw_sha256=raw_sha, text="record that will be forged")
+        dest = tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha
+        raw = json.loads((dest / "meta.json").read_text(encoding="utf-8"))
+        raw["parent_raw_sha256"] = OTHER_RAW_SHA
+        (dest / "meta.json").write_text(json.dumps(raw), encoding="utf-8")
+
+        with pytest.raises(ExtractionSelectionError):
+            select_extraction(
+                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
+            )
+
+    def test_s6_exact_raises_when_extraction_sha256_is_none(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+
+        with pytest.raises(ExtractionSelectionError):
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=None)
+
+    def test_s7_exact_raises_when_extraction_sha256_is_malformed(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+
+        with pytest.raises(ValueError):
+            select_extraction(
+                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256="not-a-sha"
+            )
+
+    # -- S8-S12: CURRENT --------------------------------------------------------
+
+    def test_s8_current_with_exactly_one_authentic_current_record_returns_it(self, tmp_path: Path) -> None:
+        identity = semantic_deps.extraction_identity()
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+        extraction_sha = _store(
+            tmp_path,
+            raw_sha256=raw_sha,
+            extractor_code_sha256=identity.code_sha256,
+            pypdf_version=identity.pypdf_version,
+            text="current text s8",
+        )
+
+        result = select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT)
+
+        assert result.extraction_id == extraction_sha
+        assert result.extracted.text == "current text s8"
+
+    def test_s9_current_raises_when_no_records_at_all_and_does_not_fall_back_to_root(
+        self, tmp_path: Path
+    ) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S9")
+
+        with pytest.raises(ExtractionSelectionError) as exc_info:
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT)
+
+        assert "ROOT TEXT S9" not in str(exc_info.value)
+
+    def test_s10_current_raises_when_records_exist_but_none_is_current(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+        _store(tmp_path, raw_sha256=raw_sha, extractor_code_sha256="0" * 64, text="stale")
+
+        with pytest.raises(ExtractionSelectionError):
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT)
+
+    def test_s11_current_raises_when_two_records_are_current_at_once_and_names_both(
+        self, tmp_path: Path
+    ) -> None:
+        identity = semantic_deps.extraction_identity()
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+        sha_a = _store(
+            tmp_path,
+            raw_sha256=raw_sha,
+            extractor_code_sha256=identity.code_sha256,
+            pypdf_version=identity.pypdf_version,
+            text="current a",
+        )
+        sha_b = _store(
+            tmp_path,
+            raw_sha256=raw_sha,
+            extractor_code_sha256=identity.code_sha256,
+            pypdf_version=identity.pypdf_version,
+            text="current b",
+        )
+        assert sha_a != sha_b
+
+        with pytest.raises(ExtractionSelectionError) as exc_info:
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT)
+
+        message = str(exc_info.value)
+        assert sha_a in message
+        assert sha_b in message
+
+    def test_s12_current_raises_when_the_single_current_record_fails_authentication(
+        self, tmp_path: Path
+    ) -> None:
+        identity = semantic_deps.extraction_identity()
+        raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S12")
+        extraction_sha = _store(
+            tmp_path,
+            raw_sha256=raw_sha,
+            extractor_code_sha256=identity.code_sha256,
+            pypdf_version=identity.pypdf_version,
+            text="current text s12",
+        )
+        # Corrupt the record's extracted.json body (not its meta.json identity
+        # fields), so the record is still "current" -- current_extraction_records
+        # only compares extractor_code_sha256/pypdf_version -- but its stored
+        # text no longer authenticates against meta.json's recorded digest.
+        dest = tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha
+        (dest / "extracted.json").write_bytes(b"corrupted, does not match the recorded digest")
+
+        with pytest.raises(ExtractionSelectionError) as exc_info:
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT)
+
+        # Must name the record that failed authentication -- never skip it and
+        # never quietly fall back to the root or to a non-current record.
+        assert extraction_sha in str(exc_info.value)
+        assert "ROOT TEXT S12" not in str(exc_info.value)
+
+    # -- S13/S14: ambiguous requests --------------------------------------------
+
+    def test_s13_root_raises_when_extraction_sha256_is_supplied(self, tmp_path: Path) -> None:
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+
+        with pytest.raises(ExtractionSelectionError):
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.ROOT, extraction_sha256="a" * 64)
+
+    def test_s14_current_raises_when_extraction_sha256_is_supplied(self, tmp_path: Path) -> None:
+        """S14: CURRENT plus an explicit address is an ambiguous request, so it refuses.
+
+        Note what this test has to do to be worth anything. The obvious version --
+        an artifact with NO records, asserting only that some ExtractionSelectionError
+        is raised -- PASSES EVEN WITH THE AMBIGUITY GUARD DELETED, because execution
+        then falls through to the "no current records exist" refusal and raises there
+        instead. A mutation audit caught exactly that: neutering this guard left the
+        suite green.
+
+        So the artifact here holds one genuinely CURRENT record, which means removing
+        the guard would make the call SUCCEED and return that record rather than raise.
+        The message is matched too, so passing for the neighbouring guard's reason is
+        not enough.
+        """
+        identity = semantic_deps.extraction_identity()
+        raw_sha = _store_root_artifact(tmp_path, text="root text")
+        extraction_sha = _store(
+            tmp_path,
+            raw_sha256=raw_sha,
+            extractor_code_sha256=identity.code_sha256,
+            pypdf_version=identity.pypdf_version,
+            text="a current record s14",
+        )
+
+        with pytest.raises(ExtractionSelectionError, match="ambiguous"):
+            select_extraction(
+                tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT, extraction_sha256=extraction_sha
+            )
+
+    # -- S15: malformed raw_sha256 --------------------------------------------
+
+    def test_s15_raises_on_malformed_raw_sha256(self, tmp_path: Path) -> None:
+        with pytest.raises(ValueError):
+            select_extraction(tmp_path, "not-a-sha", prefer=ExtractionPreference.ROOT)
+
+    # -- S16: the load-bearing test -----------------------------------------
+
+    def test_s16_exact_and_root_return_genuinely_different_text(self, tmp_path: Path) -> None:
+        """The load-bearing test: root and record text are DELIBERATELY different.
+
+        If they were identical, an implementation that ignored ``prefer`` and
+        always read the root sidecar would pass every other test in this
+        class. This test dies on that defect specifically because it asserts
+        (a) EXACT returns the record's text, (b) ROOT returns the root's text,
+        and (c) the two texts are not equal to begin with.
+        """
+        root_text = "ROOT TEXT S16 -- the root sidecar"
+        record_text = "RECORD TEXT S16 -- a completely different string"
+        assert root_text != record_text  # self-check: the fixture is not degenerate
+
+        raw_sha = _store_root_artifact(tmp_path, text=root_text)
+        extraction_sha = _store(tmp_path, raw_sha256=raw_sha, text=record_text)
+
+        root_result = select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.ROOT)
+        exact_result = select_extraction(
+            tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
+        )
+
+        assert root_result.extraction_id == ROOT_EXTRACTION_ID
+        assert root_result.extracted.text == root_text
+        assert exact_result.extraction_id == extraction_sha
+        assert exact_result.extracted.text == record_text
+
+        # The final, explicit self-check: the two texts actually differ, so a
+        # buggy "always read root" implementation could not have passed both
+        # of the assertions above by accident.
+        assert root_result.extracted.text != exact_result.extracted.text
+
+    # -- S17: the record body is authenticated, not just the record address ----
+
+    def test_s17_exact_raises_when_extracted_json_bytes_do_not_match_the_meta_digest(
+        self, tmp_path: Path
+    ) -> None:
+        """S17: a record whose ``extracted.json`` was swapped underneath an intact meta.
+
+        This is NOT the same scenario as S5. S5 forges ``meta.json`` so the record no
+        longer authenticates to its own ADDRESS. Here the meta is untouched and still
+        authenticates perfectly -- only the extracted OUTPUT bytes are replaced.
+
+        That gap is real rather than theoretical, because a record's address is computed
+        from its identity payload (extractor code sha, pypdf version, parent raw sha),
+        and the extracted digests are OUTPUTS of the extractor that the address does not
+        cover. So address authentication alone cannot notice a swapped body; the digest
+        comparison against ``meta.extracted_sha256`` is the only thing that does.
+
+        A mutation audit found that comparison SURVIVING -- nothing in the suite
+        exercised it -- so a tampered record would have been handed to a consumer as
+        authentic text.
+        """
+        raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S17")
+        extraction_sha = _store(tmp_path, raw_sha256=raw_sha, text="the genuine record text")
+        dest = tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha
+
+        # Swap the body for a well-formed ExtractedText that simply is not the one the
+        # meta attests to. Well-formed matters: this must fail the DIGEST check, not the
+        # later parse, or the test would certify the wrong guard.
+        forged = ExtractedText(
+            text="TAMPERED TEXT S17",
+            normalized="tampered text s17",
+            sections=[],
+            extractor="pdf:pypdf",
+            lossy=False,
+        )
+        (dest / "extracted.json").write_text(forged.model_dump_json(), encoding="utf-8")
+
+        # The meta is still intact and still authenticates to its ADDRESS, so the
+        # address check that EXACT performs first cannot be what refuses this -- it
+        # hands back a meta quite happily. Only the body-digest comparison refuses.
+        # (`verify_extraction_record` is stricter and does catch this swap, but
+        # `select_extraction` does not route through it, which is precisely why the
+        # comparison below has to exist on this path in its own right.)
+        assert load_extraction_record(tmp_path, raw_sha, extraction_sha) is not None
+
+        with pytest.raises(ExtractionSelectionError, match="does not authenticate") as exc_info:
+            select_extraction(
+                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
+            )
+
+        # Fail closed: the tampered text must not reach the caller by any route.
+        assert "TAMPERED TEXT S17" not in str(exc_info.value)

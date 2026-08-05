@@ -81,27 +81,38 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from carmel.agents.tools.extract import ExtractedText
 from carmel.logger import get_logger
 from carmel.paths import normalize_path
+
+# ROOT_EXTRACTION_ID lives beside the corpus-coverage key that consumes it
+# (carmel.schemas.CoveredDocument.extraction_id); imported here rather than
+# redefined so there is exactly one definition of the sentinel. This import
+# direction (services -> schemas) is the one this codebase allows.
+from carmel.schemas.literature import ROOT_EXTRACTION_ID
 from carmel.services.artifacts import read_bytes, read_json, write_bytes, write_json, write_text
 from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.evidence import artifact_dir
+from carmel.services.evidence import artifact_dir, load_artifact_text
 from carmel.services.semantic_deps import _PYPDF_VERSION_UNKNOWN, extraction_identity
 
 __all__ = [
     "EXTRACTIONS_SUBDIR",
+    "ExtractionPreference",
     "ExtractionRecordError",
     "ExtractionRecordMeta",
+    "ExtractionSelectionError",
+    "SelectedExtraction",
     "UnknownPypdfVersionError",
     "compute_extraction_sha",
     "current_extraction_records",
     "extraction_record_dir",
     "list_extraction_records",
     "load_extraction_record",
+    "select_extraction",
     "store_extraction_record",
     "stored_extraction_sha256",
     "verify_extraction_record",
@@ -1120,3 +1131,207 @@ def current_extraction_records(workspace_root: Path, raw_sha256: str) -> list[Ex
             continue
         current.append(record)
     return current
+
+
+class ExtractionSelectionError(ExtractionRecordError):
+    """No single extraction could be resolved under the requested policy.
+
+    Raised by :func:`select_extraction` in place of ANY silent fallback.
+    Every raise site names the artifact (``raw_sha256``, and where relevant
+    ``extraction_sha256``) and what was actually found on disk, so a caller
+    reading the message alone can tell why the request was refused.
+    """
+
+
+class ExtractionPreference(StrEnum):
+    """The caller-stated policy :func:`select_extraction` resolves against.
+
+    There is deliberately no "prefer current, else root" or "newest wins"
+    member: an ambiguous or unsatisfiable request is a refusal
+    (:exc:`ExtractionSelectionError`), never a tie-break decided for the
+    caller.
+    """
+
+    #: Read the root ``extracted.json`` sidecar
+    #: (``evidence/literature/<raw_sha256>/extracted.json``). Extraction
+    #: records under ``extractions/`` are not consulted at all.
+    ROOT = "root"
+
+    #: Read the ONE extraction record named by the caller's
+    #: ``extraction_sha256``. Never falls back to the root sidecar or to
+    #: any other record.
+    EXACT = "exact"
+
+    #: Read the single CURRENT extraction record -- and only if there is
+    #: exactly one. "Current" is a weak, mutable, derived property (see
+    #: :func:`current_extraction_records`'s docstring): zero, one, or
+    #: several records can be current at once, and "current" is never used
+    #: to pick a winner among several.
+    CURRENT = "current"
+
+
+@dataclass(frozen=True)
+class SelectedExtraction:
+    """The one extraction :func:`select_extraction` resolved to, and its text."""
+
+    #: :data:`ROOT_EXTRACTION_ID` for the root sidecar, else the winning
+    #: record's 64-lowercase-hex ``extraction_sha256``.
+    extraction_id: str
+
+    #: The text that was actually selected.
+    extracted: ExtractedText
+
+
+def _load_authenticated_record_text(
+    workspace_root: Path, raw_sha256: str, extraction_sha256: str, meta: ExtractionRecordMeta
+) -> ExtractedText:
+    """Read and authenticate one extraction record's stored ``extracted.json``.
+
+    Reuses the digest-then-parse shape already established by
+    :func:`carmel.services.dataset_replay`'s node-verification path (read
+    bytes, hash-compare against a trusted anchor, ``json.loads``, then
+    :meth:`ExtractedText.model_validate`) rather than inventing a second way
+    to read a record's ``extracted.json``. There is no envelope in scope
+    here, so the anchor is ``meta.extracted_sha256`` from the record's own
+    self-authenticated ``meta.json`` -- the same anchor
+    :func:`verify_extraction_record` checks against.
+
+    Raises:
+        ExtractionSelectionError: the record's ``extracted.json`` is
+            missing/unreadable, its bytes disagree with the digest recorded
+            in ``meta.json``, or the bytes do not parse as
+            :class:`ExtractedText`.
+    """
+    dest_dir = extraction_record_dir(workspace_root, raw_sha256, extraction_sha256)
+    try:
+        raw_bytes = read_bytes(dest_dir / _EXTRACTED_NAME)
+    except FileNotFoundError as exc:
+        raise ExtractionSelectionError(
+            f"extraction record raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r} "
+            f"has a meta.json but no readable extracted.json: {exc}"
+        ) from exc
+    actual_extracted_sha256 = hashlib.sha256(raw_bytes).hexdigest()
+    if actual_extracted_sha256 != meta.extracted_sha256:
+        raise ExtractionSelectionError(
+            f"extraction record raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r} does not "
+            f"authenticate: extracted.json bytes on disk hash to {actual_extracted_sha256!r}, but meta.json "
+            f"records extracted_sha256={meta.extracted_sha256!r}"
+        )
+    try:
+        return ExtractedText.model_validate(json.loads(raw_bytes))
+    except (ValueError, RecursionError) as exc:
+        # PEP 758 (Python 3.14) permits an unparenthesized multi-exception
+        # `except A, B:`, but only without an `as` binding -- with `as`,
+        # the grammar still requires parentheses around the tuple, which is
+        # what this clause uses. RecursionError is caught explicitly
+        # (never a bare `except Exception`, which would also swallow
+        # KeyboardInterrupt/SystemExit-adjacent BaseException-only
+        # escapes it shouldn't): a digest-verified extracted.json can
+        # still be pathologically deep enough to blow the interpreter's
+        # recursion limit during json.loads or pydantic validation.
+        raise ExtractionSelectionError(
+            f"extraction record raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r} has "
+            f"digest-authentic but unparseable extracted.json: {exc}"
+        ) from exc
+
+
+def select_extraction(
+    workspace_root: Path,
+    raw_sha256: str,
+    *,
+    prefer: ExtractionPreference,
+    extraction_sha256: str | None = None,
+) -> SelectedExtraction:
+    """Resolve exactly the extraction the caller asked for, or raise.
+
+    This is the ONLY entry point in this module that decides which of an
+    artifact's several possible extractions (the root sidecar, plus zero or
+    more content-addressed records under ``extractions/``) a consumer reads.
+    It is deliberately explicit and caller-stated: every path either returns
+    the extraction the caller asked for, or raises
+    :exc:`ExtractionSelectionError` (or :exc:`ValueError` for a malformed
+    ``raw_sha256``/``extraction_sha256`` argument). There is no path that
+    silently substitutes a different extraction than the one requested --
+    not the root sidecar, not "the newest record", not "the first current
+    record". See :class:`ExtractionPreference` for the three policies.
+
+    Args:
+        workspace_root: Root campaign workspace.
+        raw_sha256: sha256 of the parent artifact.
+        prefer: which policy to resolve under.
+        extraction_sha256: the extraction record's own content address.
+            REQUIRED for :attr:`ExtractionPreference.EXACT`; FORBIDDEN
+            (raises -- the request is ambiguous) for
+            :attr:`ExtractionPreference.ROOT` and
+            :attr:`ExtractionPreference.CURRENT`.
+
+    Returns:
+        The one :class:`SelectedExtraction` the caller asked for.
+
+    Raises:
+        ValueError: ``raw_sha256`` (or, for ``EXACT``, ``extraction_sha256``)
+            is not a well-formed 64-lowercase-hex digest.
+        ExtractionSelectionError: no single extraction can be resolved under
+            the requested policy -- see :class:`ExtractionPreference` and
+            this module's docstring for the exact per-policy rules.
+    """
+    _validate_sha(raw_sha256, label="raw_sha256")
+
+    if prefer is ExtractionPreference.ROOT:
+        if extraction_sha256 is not None:
+            raise ExtractionSelectionError(
+                f"ambiguous request: prefer=ROOT for raw_sha256={raw_sha256!r} was given "
+                f"extraction_sha256={extraction_sha256!r}, but ROOT never takes an extraction_sha256"
+            )
+        root_extracted = load_artifact_text(workspace_root, raw_sha256)
+        if root_extracted is None:
+            raise ExtractionSelectionError(
+                f"prefer=ROOT for raw_sha256={raw_sha256!r}: no readable root extracted.json sidecar "
+                "is stored for this artifact"
+            )
+        return SelectedExtraction(extraction_id=ROOT_EXTRACTION_ID, extracted=root_extracted)
+
+    if prefer is ExtractionPreference.EXACT:
+        if extraction_sha256 is None:
+            raise ExtractionSelectionError(
+                f"prefer=EXACT for raw_sha256={raw_sha256!r} requires an extraction_sha256, but None "
+                "was given"
+            )
+        _validate_sha(extraction_sha256, label="extraction_sha256")
+        meta = load_extraction_record(workspace_root, raw_sha256, extraction_sha256)
+        if meta is None:
+            raise ExtractionSelectionError(
+                f"prefer=EXACT for raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r}: no "
+                "extraction record is stored at that address (or it does not authenticate to it); EXACT "
+                "never falls back to the root sidecar or to any other record"
+            )
+        extracted = _load_authenticated_record_text(workspace_root, raw_sha256, extraction_sha256, meta)
+        return SelectedExtraction(extraction_id=extraction_sha256, extracted=extracted)
+
+    if prefer is ExtractionPreference.CURRENT:
+        if extraction_sha256 is not None:
+            raise ExtractionSelectionError(
+                f"ambiguous request: prefer=CURRENT for raw_sha256={raw_sha256!r} was given "
+                f"extraction_sha256={extraction_sha256!r}, but CURRENT never takes an extraction_sha256"
+            )
+        candidates = current_extraction_records(workspace_root, raw_sha256)
+        if not candidates:
+            raise ExtractionSelectionError(
+                f"prefer=CURRENT for raw_sha256={raw_sha256!r}: no extraction record is current for "
+                "today's extractor identity (either no records exist, or none of the ones that do match "
+                "today's extractor_code_sha256/pypdf_version); CURRENT never falls back to the root sidecar"
+            )
+        if len(candidates) > 1:
+            addresses = ", ".join(sorted(record.extraction_sha256 for record in candidates))
+            raise ExtractionSelectionError(
+                f"prefer=CURRENT for raw_sha256={raw_sha256!r}: {len(candidates)} extraction records are "
+                f"current at once ({addresses}); 'current' is never used to pick a winner among several -- "
+                "this is a refusal, not a ranking problem"
+            )
+        (winner,) = candidates
+        extracted = _load_authenticated_record_text(
+            workspace_root, raw_sha256, winner.extraction_sha256, winner
+        )
+        return SelectedExtraction(extraction_id=winner.extraction_sha256, extracted=extracted)
+
+    raise ExtractionSelectionError(f"unknown ExtractionPreference: {prefer!r}")
