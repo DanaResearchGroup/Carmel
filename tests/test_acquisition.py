@@ -2112,7 +2112,7 @@ class TestReadmeRecipeInstructions:
         readme = self._readme(tmp_path)
         for reason in AcquisitionReason:
             assert reason.value not in readme, f"raw enum value {reason.value!r} leaked into the README"
-            assert acquisition._reason_phrase(reason) in readme
+            assert acquisition.reason_phrase(reason) in readme
 
     def test_multiple_format_preferences_render_as_preferred_and_alternative_bullets(self, tmp_path: Path) -> None:
         """The generic recipe offers PDF then conditional XML; both used to render as a

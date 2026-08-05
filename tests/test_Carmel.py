@@ -686,6 +686,38 @@ class TestRequestsCommand:
         assert "awaiting a human" in out
         assert "--add" in out and "--slug" in out
 
+    def test_the_listing_never_prints_a_raw_reason_value(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The "why" line must render the operator-facing phrase, never the enum value.
+
+        A raw value reaches the operator as ``oa_lookup_not_attempted``, underscores
+        intact -- exactly the leak the phrase table exists to prevent, and a leak that
+        widens silently every time a member is added. Asserting the ABSENCE of the raw
+        value is the load-bearing half: asserting only that the phrase is present would
+        still pass if both were printed.
+        """
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import reason_phrase, record_request
+        from carmel.services.campaigns import load_campaign
+
+        cid, ws = self._campaign_with_request(tmp_path)
+        record_request(
+            ws,
+            title="Laminar burning velocity of syngas at elevated pressure",
+            doi="10.1016/j.test.2020.02.002",
+            landing_url="https://doi.org/10.1016/j.test.2020.02.002",
+            reason=AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED,
+            detail="no open-access resolver is configured, so no lookup could run",
+        )
+        assert load_campaign(ws).campaign_id == cid
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path)]) == 0
+        out = capsys.readouterr().out
+        assert AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED.value not in out
+        assert reason_phrase(AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED) in out
+
     def test_the_wrong_paper_is_rejected_and_nothing_is_admitted(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:

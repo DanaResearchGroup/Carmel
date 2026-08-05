@@ -55,6 +55,7 @@ from carmel.agents.literature_agent import (
 from carmel.agents.models import build_model
 from carmel.agents.tools.academic import (
     CrossrefSearchTool,
+    OaLookupCoverage,
     OpenAccessResolver,
     OpenAccessResolverProtocol,
     OpenAlexSearchTool,
@@ -1268,7 +1269,7 @@ def _attempt_oa_fetch(
 
 def _resolve_oa_candidates(
     paper_doi: str | None, paper_title: str | None, deps: LiteratureDeps
-) -> tuple[list[str], str, bool]:
+) -> tuple[list[str], str, OaLookupCoverage]:
     """Deterministically resolve a wanted paper's OA candidates, with an honest note.
 
     Args:
@@ -1279,28 +1280,32 @@ def _resolve_oa_candidates(
         deps: Injected dependencies (the resolver in particular).
 
     Returns:
-        ``(candidates, note, complete)``: candidate URLs capped at
+        ``(candidates, note, coverage)``: candidate URLs capped at
         :data:`MAX_OA_FETCH_ATTEMPTS_PER_PAPER`, a note describing what resolution did
-        (or why it could not run) for the operator-facing ``detail``, and whether every
-        enabled provider actually answered. ``complete=False`` means an empty
-        ``candidates`` establishes nothing -- see
-        :attr:`~carmel.agents.tools.academic.OaResolution.complete`.
+        (or why it could not run) for the operator-facing ``detail``, and how much of
+        resolution actually ran -- see :class:`~carmel.agents.tools.academic.OaLookupCoverage`.
+        Anything short of :attr:`~carmel.agents.tools.academic.OaLookupCoverage.COMPLETE`
+        means an empty ``candidates`` establishes nothing.
 
-        The two early returns below are ``complete=True`` deliberately: "this paper has
-        no DOI" and "no resolver is configured" are fully-established facts about why
-        resolution did not run, not truncated attempts.
+        The two early returns below synthesise
+        :attr:`~carmel.agents.tools.academic.OaLookupCoverage.NOT_ATTEMPTED` directly:
+        no resolution object exists in either case, because no provider ever ran.
     """
     if paper_doi is None:
-        return [], "paper has no DOI, so automated open-access resolution was not attempted", True
+        return (
+            [],
+            "paper has no DOI, so automated open-access resolution was not attempted",
+            OaLookupCoverage.NOT_ATTEMPTED,
+        )
     if deps.oa_resolver is None:
-        return [], "no open-access resolver is configured for this run", True
+        return [], "no open-access resolver is configured for this run", OaLookupCoverage.NOT_ATTEMPTED
     resolution = deps.oa_resolver.resolve(paper_doi, title=paper_title)
     candidates = list(resolution.candidates)
     note = resolution.note
     if len(candidates) > MAX_OA_FETCH_ATTEMPTS_PER_PAPER:
         note = f"{note}; trying the first {MAX_OA_FETCH_ATTEMPTS_PER_PAPER} of {len(candidates)} candidates"
         candidates = candidates[:MAX_OA_FETCH_ATTEMPTS_PER_PAPER]
-    return candidates, note, resolution.complete
+    return candidates, note, resolution.coverage
 
 
 def _queue_wanted_paper(
@@ -1341,7 +1346,7 @@ def _queue_wanted_paper(
         state.warnings.append(f"ignored a requested paper with neither a DOI nor a URL: {paper.title!r}")
         return
 
-    candidates, resolution_note, resolution_complete = _resolve_oa_candidates(doi, paper.title or None, deps)
+    candidates, resolution_note, resolution_coverage = _resolve_oa_candidates(doi, paper.title or None, deps)
 
     attempts: list[tuple[str, str]] = []
     observed_reason: AcquisitionReason | None = None
@@ -1368,10 +1373,15 @@ def _queue_wanted_paper(
     if observed_reason is None:
         # No candidate was even attempted. Only claim "no open-access copy exists" when
         # resolution actually finished; if it was cut short (per-paper lookup cap, or a
-        # provider failing in transit) nothing has been established, so say exactly that.
-        reason = (
-            AcquisitionReason.NO_OPEN_ACCESS_COPY if resolution_complete else AcquisitionReason.OA_LOOKUP_INCOMPLETE
-        )
+        # provider failing in transit) nothing has been established, so say exactly
+        # that; and if no provider ever ran (no DOI, no resolver, consent withheld) say
+        # that instead of either. Total map, no else and no default: a coverage value
+        # this dict does not know about must fail loudly, not silently fall through.
+        reason = {
+            OaLookupCoverage.NOT_ATTEMPTED: AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED,
+            OaLookupCoverage.PARTIAL: AcquisitionReason.OA_LOOKUP_INCOMPLETE,
+            OaLookupCoverage.COMPLETE: AcquisitionReason.NO_OPEN_ACCESS_COPY,
+        }[resolution_coverage]
         observed = resolution_note
     else:
         reason = observed_reason

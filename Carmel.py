@@ -927,6 +927,7 @@ def _cmd_requests(
         drop_path_for,
         inbox_dir,
         pending_requests,
+        reason_phrase,
     )
     from carmel.services.campaigns import find_campaign_workspace
 
@@ -1035,7 +1036,7 @@ def _cmd_requests(
             print(f"    doi   : {request.doi}")
         print(f"    get   : {request.landing_url}")
         detail = f" -- {request.detail}" if request.detail else ""
-        print(f"    why   : {request.reason.value}{detail}")
+        print(f"    why   : {reason_phrase(request.reason)}{detail}")
         if request.status == AcquisitionStatus.REJECTED and request.identity_note:
             print(f"    last  : REJECTED -- {request.identity_note}")
         print(f"    then  : carmel requests --campaign {campaign_id} --add <file> --slug {request.slug}")

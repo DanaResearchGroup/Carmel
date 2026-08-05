@@ -28,7 +28,7 @@ from carmel.agents.literature_agent import (
     VerifierAssessment,
 )
 from carmel.agents.models import AgentBridgeError, MockModel
-from carmel.agents.tools.academic import OaResolution, OpenAccessResolver
+from carmel.agents.tools.academic import OaLookupCoverage, OaResolution, OpenAccessResolver
 from carmel.agents.tools.extract import extract_text
 from carmel.agents.tools.fetch import FetchedArtifact, FetchError, HttpFetchTool, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
@@ -63,7 +63,14 @@ from carmel.schemas.literature import (
 )
 from carmel.services import chem
 from carmel.services import literature as literature_module
-from carmel.services.acquisition import inbox_dir, load_manifest, record_request
+from carmel.services.acquisition import (
+    _REASON_PHRASES,
+    README_NAME,
+    REQUESTS_DIR,
+    inbox_dir,
+    load_manifest,
+    record_request,
+)
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
 from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
@@ -1509,6 +1516,18 @@ OA_PDF_URL = "https://pubs.rsc.org/en/content/articlepdf/2020/re/c9re00429g"
 RELEVANCE = "direct benchmark at the campaign's exact conditions"
 
 
+def _fully_resolved(candidates: tuple[str, ...], note: str) -> OaResolution:
+    """An :class:`OaResolution` from a lookup that fully ran -- the common fixture shape.
+
+    ``coverage`` is deliberately required with no default, so every construction site
+    must state what it observed. Most fixtures below exercise the FETCH path and only
+    need a resolution that ran; they say so once through this helper. The tests that are
+    about coverage itself build :class:`OaResolution` directly, so the value they turn on
+    stays visible in the test body.
+    """
+    return OaResolution(candidates=candidates, note=note, coverage=OaLookupCoverage.COMPLETE)
+
+
 class _FakeOaResolver:
     """Canned DOI -> OaResolution, recording every resolution request."""
 
@@ -1521,7 +1540,7 @@ class _FakeOaResolver:
         self.calls.append(doi)
         self.titles.append(title)
         return self._resolutions.get(
-            doi, OaResolution(candidates=(), note="no open-access copy advertised by any open-access index")
+            doi, _fully_resolved((), "no open-access copy advertised by any open-access index")
         )
 
 
@@ -1556,7 +1575,7 @@ class TestWantedPaperOpenAccessResolution:
 
     def test_an_open_access_copy_is_fetched_and_stored_instead_of_queued(self, campaign: Campaign) -> None:
         resolver = _FakeOaResolver(
-            {WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="OpenAlex: 1 OA PDF candidate")}
+            {WANTED_DOI: _fully_resolved((OA_PDF_URL,), "OpenAlex: 1 OA PDF candidate")}
         )
         deps, _, config = _make_deps(
             [_wanted_proposal()],
@@ -1581,7 +1600,7 @@ class TestWantedPaperOpenAccessResolution:
 
     def test_candidates_are_tried_in_order_until_one_succeeds(self, campaign: Campaign) -> None:
         second = "https://zenodo.org/records/1/files/green.pdf"
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL, second), "2 candidates")})
         fetch = _RoutedFetchTool(ok={second: (DOC.encode(), "text/plain")}, statuses={OA_PDF_URL: 404})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = fetch
@@ -1593,7 +1612,7 @@ class TestWantedPaperOpenAccessResolution:
         assert [a.sha256 for a in report.artifacts] == [hashlib.sha256(DOC.encode()).hexdigest()]
 
     def test_a_403_on_the_oa_copy_is_queued_as_an_observed_paywall(self, campaign: Campaign) -> None:
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _StatusFetchTool(403)
 
@@ -1622,7 +1641,7 @@ class TestWantedPaperOpenAccessResolution:
         provenance out of the store.
         """
         hostile = "https://evil.example.net/looks-like-a-paper.pdf"
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(hostile,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((hostile,), "1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         fetched: list[str] = []
 
@@ -1653,7 +1672,7 @@ class TestWantedPaperOpenAccessResolution:
         assert not host_is_admissible("https://proxy.my-university.edu.evil.net/p.pdf", ["proxy.my-university.edu"])
 
     def test_a_404_on_the_oa_copy_is_queued_as_fetch_failed_not_paywalled(self, campaign: Campaign) -> None:
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _StatusFetchTool(404)
 
@@ -1667,7 +1686,7 @@ class TestWantedPaperOpenAccessResolution:
         """403 is the reason the operator can act on (a subscription): if ANY candidate
         observed one, that is the request's reason, not whichever failure came first."""
         second = "https://arxiv.org/pdf/2401.00002v1"
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL, second), "2 candidates")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _RoutedFetchTool(ok={}, statuses={OA_PDF_URL: 404, second: 403})
 
@@ -1681,7 +1700,7 @@ class TestWantedPaperOpenAccessResolution:
         """The live probe found 5 of 11 advertised PDF URLs served an HTML landing page;
         storing one as 'the paper' would silently retire the acquisition request while
         leaving Carmel with no readable full text."""
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (b"<html><body>Please sign in</body></html>", "text/html")},
@@ -1700,7 +1719,7 @@ class TestWantedPaperOpenAccessResolution:
         received zero bytes, and stored it as a successful acquisition -- suppressing
         the manual queue that is the whole fallback. A zero-byte fetch must be treated
         as a failed acquisition, not evidence."""
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (b"", "text/plain")},
@@ -1721,7 +1740,7 @@ class TestWantedPaperOpenAccessResolution:
     def test_a_response_with_bytes_but_no_extractable_text_is_queued_as_empty(self, campaign: Campaign) -> None:
         """Non-empty bytes that extract to whitespace-only text are just as unusable
         as zero bytes and must be rejected the same way."""
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (b"   \n\t  ", "text/plain")},
@@ -1758,7 +1777,7 @@ class TestWantedPaperOpenAccessResolution:
         truncated = OaResolution(
             candidates=(),
             note="OpenAlex: 0 OA PDF candidates; arXiv: lookup failed (read operation timed out)",
-            complete=False,
+            coverage=OaLookupCoverage.PARTIAL,
         )
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver({WANTED_DOI: truncated}))
 
@@ -1771,7 +1790,9 @@ class TestWantedPaperOpenAccessResolution:
     def test_a_completed_resolution_that_found_nothing_is_still_no_open_access_copy(self, campaign: Campaign) -> None:
         """The complement of the test above -- the honest negative must survive."""
         exhausted = OaResolution(
-            candidates=(), note="OpenAlex: 0 OA PDF candidates; Unpaywall: 0 OA PDF candidates", complete=True
+            candidates=(),
+            note="OpenAlex: 0 OA PDF candidates; Unpaywall: 0 OA PDF candidates",
+            coverage=OaLookupCoverage.COMPLETE,
         )
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver({WANTED_DOI: exhausted}))
 
@@ -1781,17 +1802,31 @@ class TestWantedPaperOpenAccessResolution:
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
 
     def test_without_a_resolver_the_paper_is_still_queued_without_asserting_a_paywall(self, campaign: Campaign) -> None:
-        """Even with no resolver wired (mock tier), 'paywalled' must not be recorded:
-        nothing observed a paywall."""
+        """Even with no resolver wired (mock tier), neither 'paywalled' nor 'no open-access
+        copy was found' must be recorded: nothing observed a paywall, and no lookup ran at
+        all, so the honest state is OA_LOOKUP_NOT_ATTEMPTED, not the honest-negative
+        NO_OPEN_ACCESS_COPY -- that reason is reserved for a lookup that actually ran and
+        came back empty.
+        """
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=None)
 
         run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         requests = load_manifest(campaign.workspace_root).requests
-        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED]
+        assert requests[0].reason != AcquisitionReason.NO_OPEN_ACCESS_COPY
+        assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
         assert "resolver" in requests[0].detail
 
+        readme = (campaign.workspace_root / REQUESTS_DIR / README_NAME).read_text(encoding="utf-8")
+        assert "no open-access copy was found" not in readme
+
     def test_a_wanted_paper_without_a_doi_skips_resolution(self, campaign: Campaign) -> None:
+        """A paper with no DOI is not a special case that earns the honest-negative
+        NO_OPEN_ACCESS_COPY: the title-matched providers (arXiv, ChemRxiv) exist
+        precisely so a paper can be found without a DOI, so no lookup ran and the honest
+        state is OA_LOOKUP_NOT_ATTEMPTED.
+        """
         resolver = _FakeOaResolver()
         proposal = _proposal(findings=[])
         proposal["wanted"] = [{"title": WANTED_TITLE, "landing_url": "https://example.org/paper"}]
@@ -1801,12 +1836,24 @@ class TestWantedPaperOpenAccessResolution:
 
         assert resolver.calls == []
         requests = load_manifest(campaign.workspace_root).requests
-        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED]
+        assert requests[0].reason != AcquisitionReason.NO_OPEN_ACCESS_COPY
+        assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
         assert "no DOI" in requests[0].detail
 
     def test_consent_withheld_makes_zero_network_calls_end_to_end(self, campaign: Campaign) -> None:
         """A run with consent withheld, wired with the REAL resolver and REAL fetch
-        tool, must never open a socket: the booby-trapped opener proves it."""
+        tool, must never open a socket: the booby-trapped opener proves it.
+
+        The consent-withheld branch inside ``OpenAccessResolver.resolve`` is
+        unreachable in production today -- ``build_deps`` returns early with no
+        resolver at all for the mock provider (the default), and for any real
+        provider ``build_model`` raises ``AgentBridgeError`` before this resolver is
+        ever constructed when consent is withheld. This test constructs the resolver
+        directly, the same way ``_make_deps`` wires it below, so it still reaches
+        that branch; no provider ran, so the honest state is OA_LOOKUP_NOT_ATTEMPTED,
+        not the honest-negative NO_OPEN_ACCESS_COPY.
+        """
 
         def _boom(url: str, **kwargs: Any) -> Any:
             raise AssertionError(f"network call attempted without consent: {url}")
@@ -1828,7 +1875,8 @@ class TestWantedPaperOpenAccessResolution:
         run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         requests = load_manifest(campaign.workspace_root).requests
-        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED]
+        assert requests[0].reason != AcquisitionReason.NO_OPEN_ACCESS_COPY
         assert "consent" in requests[0].detail
 
     def test_every_provider_answering_404_is_no_open_access_copy_not_incomplete(self, campaign: Campaign) -> None:
@@ -1860,6 +1908,16 @@ class TestWantedPaperOpenAccessResolution:
         requests = load_manifest(campaign.workspace_root).requests
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
         assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
+
+    def test_every_acquisition_reason_has_an_operator_facing_phrase(self) -> None:
+        """Total mapping check: `_REASON_PHRASES` must cover every member of
+        `AcquisitionReason`, `OA_LOOKUP_NOT_ATTEMPTED` included. The dict has no
+        `else`/default branch by design -- an unmapped reason must fail loudly
+        (`KeyError`) at render time rather than silently leaking `reason.value`, so
+        this test is the only thing that catches a newly added reason before an
+        operator does.
+        """
+        assert set(_REASON_PHRASES) == set(AcquisitionReason)
 
 
 class TestReportSchemaVersionGate:

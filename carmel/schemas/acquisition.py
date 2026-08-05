@@ -36,13 +36,13 @@ class AcquisitionReason(StrEnum):
     was known to try at all, the reason is :attr:`NO_OPEN_ACCESS_COPY` instead."""
     NO_OPEN_ACCESS_COPY = "no_open_access_copy"
     """Automated open-access resolution RAN TO COMPLETION and produced no fetchable
-    candidate URL -- either the OA indexes advertise none for this DOI, or resolution
-    could not run at all (no DOI, no resolver configured, consent withheld);
-    ``detail`` says which. Unlike :attr:`PAYWALLED` this asserts nothing about how
-    any host responded, because no host was ever asked.
+    candidate URL -- the OA indexes advertise none for this DOI. ``detail`` carries
+    the resolver's per-provider note. Unlike :attr:`PAYWALLED` this asserts nothing
+    about how any host responded, because no host was ever asked.
 
     Requires that every enabled provider actually answered. If resolution was cut
-    short, the reason is :attr:`OA_LOOKUP_INCOMPLETE` instead."""
+    short, the reason is :attr:`OA_LOOKUP_INCOMPLETE` instead; if resolution never ran
+    at all, the reason is :attr:`OA_LOOKUP_NOT_ATTEMPTED` instead."""
     OA_LOOKUP_INCOMPLETE = "oa_lookup_incomplete"
     """Open-access resolution was CUT SHORT, so nothing is established about whether a
     copy exists: the per-paper lookup cap was reached, or a provider's lookup failed in
@@ -63,6 +63,25 @@ class AcquisitionReason(StrEnum):
     contributed nothing, so it counts toward :attr:`NO_OPEN_ACCESS_COPY` instead --
     the mirror image of the same overstatement this reason was introduced to fix. See
     :class:`carmel.agents.tools.search.SearchNotFound`."""
+    OA_LOOKUP_NOT_ATTEMPTED = "oa_lookup_not_attempted"
+    """Open-access resolution never ran at all: the paper has no DOI, no resolver is
+    configured for this run, or consent for external providers was withheld;
+    ``detail`` says which. The distinguishing line against :attr:`NO_OPEN_ACCESS_COPY`
+    is this: that reason requires that at least one provider actually answered; here
+    none did, so nothing is established about whether a copy exists, not even the
+    honest negative.
+
+    A paper with no DOI is NOT a special case that earns :attr:`NO_OPEN_ACCESS_COPY`:
+    the title-matched providers (arXiv, ChemRxiv) exist precisely so a paper can be
+    found without a DOI, so "no open-access copy was found" would be just as false
+    there as for a missing resolver or withheld consent -- a lookup that never ran
+    must not be reported as a finding.
+
+    Exists because :attr:`NO_OPEN_ACCESS_COPY`'s "resolution ran to completion" claim
+    was, one level down, also being used for the three cases where resolution could
+    not run at all -- the same asserted-vs-observed defect already fixed twice on this
+    exact path (first :attr:`PAYWALLED` vs. :attr:`NO_OPEN_ACCESS_COPY`, then
+    :attr:`NO_OPEN_ACCESS_COPY` vs. :attr:`OA_LOOKUP_INCOMPLETE`)."""
     HOST_NOT_ADMISSIBLE = "host_not_admissible"
     """The URL's host is not on the list of sources whose documents may enter the
     evidence store automatically.

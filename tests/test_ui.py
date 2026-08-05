@@ -2749,6 +2749,34 @@ class TestAcquisitionQueuePanel:
         assert "10.1115-1.4036254.pdf" in body
         assert "High pressure shock tube ignition delay measurements" in body
 
+    def test_the_panel_never_renders_a_raw_reason_value(self, client: FlaskClient, tmp_path: Path) -> None:
+        """The queue panel must show the operator-facing phrase, never the enum value.
+
+        Jinja cannot call the phrase helper itself, so the view passes the rendered
+        phrases in; a template that slipped back to ``paper.reason.value`` would show
+        ``oa_lookup_not_attempted``, underscores intact. Asserting the ABSENCE of the raw
+        value is the load-bearing half -- checking only for the phrase would still pass
+        if both were rendered.
+        """
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import reason_phrase, record_request
+
+        cid = _create_via_form(client)
+        ws = find_campaign_workspace(tmp_path, cid)
+        record_request(
+            ws,
+            title="Laminar burning velocity of syngas at elevated pressure",
+            doi="10.1016/j.test.2020.02.002",
+            landing_url="https://doi.org/10.1016/j.test.2020.02.002",
+            reason=AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED,
+            detail="no open-access resolver is configured, so no lookup could run",
+        )
+
+        body = client.get(f"/campaigns/{cid}").data.decode()
+
+        assert AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED.value not in body
+        assert reason_phrase(AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED) in body
+
     def test_no_panel_is_rendered_when_nothing_is_queued(self, client: FlaskClient) -> None:
         cid = _create_via_form(client)
         body = client.get(f"/campaigns/{cid}").data.decode()

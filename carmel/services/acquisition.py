@@ -67,12 +67,13 @@ logger = get_logger("services.acquisition")
 #: ``detail`` (e.g. "HTTP 403") is appended separately and is unaffected by this
 #: mapping. Keyed on the enum member, not its ``.value``, so a future member that is
 #: added here without updating this dict fails loudly (``KeyError`` in
-#: :func:`_reason_phrase`) rather than silently falling back to the raw value it
+#: :func:`reason_phrase`) rather than silently falling back to the raw value it
 #: exists to hide.
 _REASON_PHRASES: dict[AcquisitionReason, str] = {
     AcquisitionReason.PAYWALLED: "blocked by a publisher paywall",
     AcquisitionReason.NO_OPEN_ACCESS_COPY: "no open-access copy was found",
     AcquisitionReason.OA_LOOKUP_INCOMPLETE: "the open-access lookup did not finish",
+    AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED: "the open-access lookup was never attempted",
     AcquisitionReason.HOST_NOT_ADMISSIBLE: "the source is not on Carmel's auto-admit list",
     AcquisitionReason.NOT_A_DOCUMENT: "the link did not serve an actual document",
     AcquisitionReason.EMPTY_DOCUMENT: "the fetched file was empty",
@@ -81,7 +82,7 @@ _REASON_PHRASES: dict[AcquisitionReason, str] = {
 }
 
 
-def _reason_phrase(reason: AcquisitionReason) -> str:
+def reason_phrase(reason: AcquisitionReason) -> str:
     """Human phrase for ``reason``, for the README's "Why manual" line.
 
     Raises:
@@ -1755,7 +1756,7 @@ def _readme_text(manifest: AcquisitionManifest, *, today: date | None = None) ->
                 lines.append(f"- DOI: `{request.doi}`")
             lines.append(f"- Obtain from: {_sanitize_markdown_url(recipe.open_url)}")
             detail = f" ({_sanitize_markdown_text(request.detail)})" if request.detail else ""
-            lines.append(f"- Why manual: {_reason_phrase(request.reason)}{detail}")
+            lines.append(f"- Why manual: {reason_phrase(request.reason)}{detail}")
             for note in recipe.notes:
                 lines.append(f"- Note: {note}")
             lines.append("")

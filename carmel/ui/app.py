@@ -399,7 +399,7 @@ def create_app(
         # an empty-looking report with a full acquisition queue is the normal outcome and
         # would otherwise read as "the agent found nothing".
         from carmel.schemas.acquisition import AcquisitionRequest, AcquisitionStatus
-        from carmel.services.acquisition import ManifestUnreadable, inbox_dir, load_manifest
+        from carmel.services.acquisition import ManifestUnreadable, inbox_dir, load_manifest, reason_phrase
 
         pending_papers: list[AcquisitionRequest] = []
         rejected_papers: list[AcquisitionRequest] = []
@@ -415,6 +415,11 @@ def create_app(
         else:
             pending_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REQUESTED]
             rejected_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REJECTED]
+        # Rendered here, not in the template: the template must never import Python
+        # (`reason_phrase`) into Jinja, and a raw `paper.reason.value` would leak an
+        # enum's underscored wire value (e.g. `oa_lookup_not_attempted`) straight into
+        # operator-facing text -- exactly the leak `reason_phrase` exists to prevent.
+        reason_phrases = {r.slug: reason_phrase(r.reason) for r in pending_papers}
 
         return render_template(
             "campaign_dashboard.html",
@@ -429,6 +434,7 @@ def create_app(
             literature_report=literature_report,
             pending_papers=pending_papers,
             rejected_papers=rejected_papers,
+            reason_phrases=reason_phrases,
             inbox_path=str(inbox_dir(ws)),
             diagnostics=diagnostics,
             arc_diagnostics=arc_diagnostics,
