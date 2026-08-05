@@ -362,7 +362,7 @@ def append_corpus_pass_action(
     model_name: str | None = None,
     rationale: str = "",
     reread_all: bool = False,
-    allow_unverifiable_legacy_roots: bool = False,
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> PlannedAction:
     """Append a corpus-pass action to the campaign's plan, on operator command.
 
@@ -395,9 +395,9 @@ def append_corpus_pass_action(
             "unknown", never as "free".
         rationale: Optional operator note recorded on the action.
         reread_all: Re-read documents an earlier pass already mined.
-        allow_unverifiable_legacy_roots: Opt-in to reading held artifacts whose
+        allow_unauthenticated_legacy_roots: Opt-in to reading held artifacts whose
             stored text has no digest binding it to anything (an unauthenticated
-            legacy root -- see ``CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT``).
+            legacy root -- see ``CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT``).
             Recorded on the action's ``parameters``, the same way ``reread_all`` is,
             so the operator who names it is the one whose authorisation runs.
 
@@ -425,7 +425,7 @@ def append_corpus_pass_action(
             model_name,
             rationale,
             reread_all,
-            allow_unverifiable_legacy_roots,
+            allow_unauthenticated_legacy_roots,
         )
 
 
@@ -435,7 +435,7 @@ def _append_corpus_pass_action_locked(
     model_name: str | None,
     rationale: str,
     reread_all: bool = False,
-    allow_unverifiable_legacy_roots: bool = False,
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> PlannedAction:
     """Body of :func:`append_corpus_pass_action`, with the workspace lock held."""
     plan = load_plan(workspace_root)
@@ -496,12 +496,12 @@ def _append_corpus_pass_action_locked(
         # AUTO_APPROVED here is what let a corpus pass bypass the approval gate.
         approval_requirement=ApprovalRequirement.AUTO_APPROVED,
         # Carried on the action, not passed at dispatch: the operator authorised THIS
-        # pass to re-read and/or read unverifiable legacy roots, and the action is
+        # pass to re-read and/or read unauthenticated legacy roots, and the action is
         # the record of what they authorised. Each key is added independently so the
         # two flags compose rather than one replacing the other.
         parameters={
             **({"reread_all": True} if reread_all else {}),
-            **({"allow_unverifiable_legacy_roots": True} if allow_unverifiable_legacy_roots else {}),
+            **({"allow_unauthenticated_legacy_roots": True} if allow_unauthenticated_legacy_roots else {}),
         },
     )
     # Run the SAME policy gate the search action goes through. Without this,

@@ -1193,6 +1193,20 @@ class TestSchemas:
         with pytest.raises(ValueError):
             CoveredDocument(raw_sha256=bad_raw_sha256, extraction_id=ROOT_EXTRACTION_ID)
 
+    def test_t10b_covered_document_refuses_the_retired_verified_deep_value(self) -> None:
+        """``CoveredDocument`` must refuse a ``verification_standard`` of the OLD,
+        retired value ``"verified_deep"``. That vocabulary was retired precisely
+        because it overclaimed (it named a conclusion, not the check actually
+        performed), so a permanent record must not silently accept it -- an operator
+        reading `verified_deep` off a report years later would believe something the
+        rename exists to stop anyone from claiming."""
+        with pytest.raises(ValueError, match="invalid verification_standard"):
+            CoveredDocument(
+                raw_sha256="a" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                verification_standard="verified_deep",
+            )
+
     def test_t11_pass_record_rejects_the_old_covered_sha256_key(self) -> None:
         """T11. ``PassRecord`` sets ``extra="forbid"``, so a payload still carrying
         the retired ``covered_sha256`` key proves the rename is real, not merely
@@ -1226,12 +1240,12 @@ class TestSchemas:
             CoveredDocument(
                 raw_sha256="a" * 64,
                 extraction_id=ROOT_EXTRACTION_ID,
-                verification_standard=CorpusReadOutcome.VERIFIED_DEEP.value,
+                verification_standard=CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
             ),
             CoveredDocument(
                 raw_sha256="b" * 64,
                 extraction_id="c" * 64,
-                verification_standard=CorpusReadOutcome.VERIFIED_DEEP.value,
+                verification_standard=CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
             ),
         ]
         pass_record = PassRecord(
@@ -3384,7 +3398,7 @@ def _corrupt_raw_bytes(workspace_root: Path, sha256: str) -> None:
     (workspace_root / "evidence" / "literature" / sha256 / "raw.bin").write_bytes(b"not the stored bytes")
 
 
-class TestALegacyRootIsUnverifiableNotCorrupt:
+class TestALegacyRootIsUnauthenticatedNotCorrupt:
     """A corpus pass must not report "your bytes are broken" about intact bytes.
 
     ``_load_corpus`` gates every held artifact on ``verify_artifact(deep=True)``, which
@@ -3393,9 +3407,9 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
     list as an artifact whose ``raw.bin`` genuinely no longer hashes to its own name,
     logged with the same "failed digest verification" line. Their digests are fine.
 
-    That is the UNVERIFIABLE/FAILED conflation this project forbids, and the two call
-    for opposite operator responses: one is "re-extract, or opt in"; the other is
-    "these bytes are damaged, re-acquire the paper."
+    That is the UNAUTHENTICATED/INTEGRITY_FAILED conflation this project forbids, and
+    the two call for opposite operator responses: one is "re-extract, or opt in"; the
+    other is "these bytes are damaged, re-acquire the paper."
     """
 
     def test_g1_red_a_legacy_root_is_reported_differently_from_corrupt_bytes(self, campaign: Campaign) -> None:
@@ -3412,7 +3426,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
         assert [artifact.sha256 for artifact, _, _ in corpus] == [], (
-            "neither document should be READ here: the legacy one is unverifiable and the "
+            "neither document should be READ here: the legacy one is unauthenticated and the "
             "corrupt one is broken -- this test is about how they are REPORTED"
         )
         assert outcomes[legacy_sha] != outcomes[corrupt_sha], (
@@ -3421,7 +3435,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         )
 
     def test_g2_a_legacy_root_is_read_when_the_operator_opts_in(self, campaign: Campaign) -> None:
-        """G2. ``allow_unverifiable_legacy_roots=True`` actually reads a legacy root.
+        """G2. ``allow_unauthenticated_legacy_roots=True`` actually reads a legacy root.
 
         The opt-in exists precisely so an operator who has decided the risk is
         acceptable can get their 8 real papers read at all -- if the flag flipped the
@@ -3431,38 +3445,38 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
 
         corpus, outcomes = literature_module._load_corpus(
-            campaign.workspace_root, allow_unverifiable_legacy_roots=True
+            campaign.workspace_root, allow_unauthenticated_legacy_roots=True
         )
 
         assert [artifact.sha256 for artifact, _, _ in corpus] == [legacy_sha]
-        assert outcomes[legacy_sha] == CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT
+        assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
 
     def test_g3_a_legacy_root_is_not_read_by_default(self, campaign: Campaign) -> None:
         """G3. The opt-in defaults to False -- fail closed unless the operator says
         otherwise. Calling ``_load_corpus`` with no keyword at all must behave exactly
-        like the explicit ``allow_unverifiable_legacy_roots=False`` case."""
+        like the explicit ``allow_unauthenticated_legacy_roots=False`` case."""
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
 
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
         assert [artifact.sha256 for artifact, _, _ in corpus] == []
-        assert outcomes[legacy_sha] == CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT
+        assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
 
     def test_g4_corrupt_bytes_stay_unread_even_with_the_opt_in(self, campaign: Campaign) -> None:
         """G4. The opt-in is for artifacts that are merely unauthenticated, not for
-        ones whose bytes are actually damaged -- ``allow_unverifiable_legacy_roots=True``
+        ones whose bytes are actually damaged -- ``allow_unauthenticated_legacy_roots=True``
         must not launder a corrupt artifact into being read."""
         corrupt_sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         _corrupt_raw_bytes(campaign.workspace_root, corrupt_sha)
 
         corpus, outcomes = literature_module._load_corpus(
-            campaign.workspace_root, allow_unverifiable_legacy_roots=True
+            campaign.workspace_root, allow_unauthenticated_legacy_roots=True
         )
 
         assert [artifact.sha256 for artifact, _, _ in corpus] == []
-        assert outcomes[corrupt_sha] == CorpusReadOutcome.FAILED_INTEGRITY
+        assert outcomes[corrupt_sha] == CorpusReadOutcome.INTEGRITY_FAILED
 
-    def test_g5_a_fully_bound_artifact_is_verified_deep_and_read_with_no_opt_in(
+    def test_g5_a_fully_bound_artifact_is_self_consistent_metadata_and_read_with_no_opt_in(
         self, campaign: Campaign
     ) -> None:
         """G5. A modern artifact with an intact ``derivation_binding`` needs no opt-in
@@ -3473,14 +3487,14 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
         assert [artifact.sha256 for artifact, _, _ in corpus] == [sha]
-        assert outcomes[sha] == CorpusReadOutcome.VERIFIED_DEEP
+        assert outcomes[sha] == CorpusReadOutcome.SELF_CONSISTENT_METADATA
 
-    def test_g6_a_binding_dropped_artifact_is_verified_shallow_and_read_with_no_opt_in(
+    def test_g6_a_binding_dropped_artifact_is_sidecar_digest_only_and_read_with_no_opt_in(
         self, campaign: Campaign
     ) -> None:
         """G6. An artifact that still carries ``extracted_sha256`` but has lost its
         ``derivation_binding`` is a real, distinct middle tier: not the strict
-        ``VERIFIED_DEEP`` case, but also not the wholly-unauthenticated legacy case --
+        ``SELF_CONSISTENT_METADATA`` case, but also not the wholly-unauthenticated legacy case --
         so it is read WITHOUT the opt-in, unlike a legacy root."""
         sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         meta_path = campaign.workspace_root / "evidence" / "literature" / sha / "meta.json"
@@ -3491,13 +3505,13 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
         assert [artifact.sha256 for artifact, _, _ in corpus] == [sha]
-        assert outcomes[sha] == CorpusReadOutcome.VERIFIED_SHALLOW
+        assert outcomes[sha] == CorpusReadOutcome.SIDECAR_DIGEST_ONLY
 
     def test_g7_a_document_read_under_the_opt_in_is_covered_at_the_legacy_standard(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """G7. When ``_corpus_loop`` reads a document that ``_load_corpus`` classified
-        ``UNVERIFIABLE_LEGACY_ROOT``, the ``CoveredDocument`` it appends must carry
+        ``UNAUTHENTICATED_LEGACY_ROOT``, the ``CoveredDocument`` it appends must carry
         THAT standard, not a stronger one it never actually met. This is the single
         write site in ``_corpus_loop`` that maps ``outcomes[sha256]`` onto
         ``CoveredDocument.verification_standard`` -- forcing the outcome here isolates
@@ -3508,7 +3522,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
 
         def _forced_legacy(workspace_root: Path, **kwargs: Any) -> Any:
             corpus, _ = real_load_corpus(workspace_root, **kwargs)
-            return corpus, {artifact.sha256: CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT for artifact, _, _ in corpus}
+            return corpus, {artifact.sha256: CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT for artifact, _, _ in corpus}
 
         monkeypatch.setattr(literature_module, "_load_corpus", _forced_legacy)
         deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
@@ -3517,7 +3531,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
 
         covered = report.passes[0].covered
         assert [c.raw_sha256 for c in covered] == [sha]
-        assert covered[0].verification_standard == CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT.value
+        assert covered[0].verification_standard == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value
 
     def test_g8_the_v5_to_v6_migration_stamps_unrecorded_on_an_existing_covered_record(
         self,
@@ -3565,7 +3579,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
                         {
                             "raw_sha256": "a" * 64,
                             "extraction_id": ROOT_EXTRACTION_ID,
-                            "verification_standard": "verified_deep",
+                            "verification_standard": "self_consistent_metadata",
                         }
                     ],
                 }
@@ -3591,7 +3605,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
             CoveredDocument(
                 raw_sha256="a" * 64,
                 extraction_id=ROOT_EXTRACTION_ID,
-                verification_standard=CorpusReadOutcome.FAILED_INTEGRITY.value,
+                verification_standard=CorpusReadOutcome.INTEGRITY_FAILED.value,
             )
         with pytest.raises(ValidationError, match="verification_standard"):
             CoveredDocument(
@@ -3662,10 +3676,10 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         unreadable = [w for w in report.passes[0].warnings if legacy_sha[:12] in w]
         assert unreadable, "the operator must be told about the artifact that went unread"
         warning = unreadable[0]
-        assert CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT.value in warning, (
+        assert CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value in warning, (
             "the warning must name WHY this document went unread, not merely that it did"
         )
-        assert CorpusReadOutcome.FAILED_INTEGRITY.value in warning, (
+        assert CorpusReadOutcome.INTEGRITY_FAILED.value in warning, (
             "and it must name the different reason for the genuinely damaged one"
         )
         # Each sha must sit under its OWN reason. Asserting only that both reasons
@@ -3673,8 +3687,8 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         # lists every reason and every sha together -- which tells the operator nothing
         # about which document is which, the very thing this test exists to pin.
         segments = {seg.split(":")[0].strip(): seg for seg in warning.split("--", 1)[1].split(";")}
-        legacy_segment = segments[CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT.value]
-        corrupt_segment = segments[CorpusReadOutcome.FAILED_INTEGRITY.value]
+        legacy_segment = segments[CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value]
+        corrupt_segment = segments[CorpusReadOutcome.INTEGRITY_FAILED.value]
         assert legacy_sha[:12] in legacy_segment and corrupt_sha[:12] not in legacy_segment
         assert corrupt_sha[:12] in corrupt_segment and legacy_sha[:12] not in corrupt_segment
 
@@ -3682,7 +3696,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         self, campaign: Campaign
     ) -> None:
         """G13. End to end through the queued action, not just ``_load_corpus``
-        directly: an action carrying no ``allow_unverifiable_legacy_roots`` key at
+        directly: an action carrying no ``allow_unauthenticated_legacy_roots`` key at
         all leaves the sole held legacy artifact unread and uncovered."""
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         deps, _, config = _make_deps([])
@@ -3702,7 +3716,7 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         logic (G2/G3) or the recorded standard (G7), which are covered separately."""
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         deps, _, config = _make_deps([_corpus_proposal([])])
-        action = _action().model_copy(update={"parameters": {"allow_unverifiable_legacy_roots": True}})
+        action = _action().model_copy(update={"parameters": {"allow_unauthenticated_legacy_roots": True}})
 
         report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
 
@@ -3712,12 +3726,12 @@ class TestALegacyRootIsUnverifiableNotCorrupt:
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """G15. A SEARCH-mode pass has no held corpus to gate, so
-        ``allow_unverifiable_legacy_roots`` must not reach ``_research_loop`` at all
+        ``allow_unauthenticated_legacy_roots`` must not reach ``_research_loop`` at all
         -- and a search pass whose action happens to carry the key regardless must
         still run normally rather than being refused by an unexpected keyword."""
         _patch_chem_success(monkeypatch)
         deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
-        action = _action().model_copy(update={"parameters": {"allow_unverifiable_legacy_roots": True}})
+        action = _action().model_copy(update={"parameters": {"allow_unauthenticated_legacy_roots": True}})
 
         report = run_literature_research(campaign.workspace_root, campaign, action, deps, config=config)
 
@@ -3744,7 +3758,7 @@ class TestAPermissionIsReadStrictlyFromThePlan:
     def test_d1_the_string_false_does_not_grant_a_permission(self) -> None:
         """D1. The exact fail-open: truthy string, falsy intent."""
         state = self._state()
-        name = "allow_unverifiable_legacy_roots"
+        name = "allow_unauthenticated_legacy_roots"
         assert literature_module._permission_from({name: "false"}, name, state) is False
 
     def test_d2_a_malformed_value_is_surfaced_not_silently_swallowed(self) -> None:
@@ -3790,7 +3804,7 @@ class TestAPermissionIsReadStrictlyFromThePlan:
         _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         deps, _, config = _make_deps([])
         action = _action()
-        action.parameters["allow_unverifiable_legacy_roots"] = "false"
+        action.parameters["allow_unauthenticated_legacy_roots"] = "false"
 
         report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
 

@@ -1728,7 +1728,7 @@ def _permission_from(parameters: Mapping[str, Any], name: str, state: _RunState)
 def _load_corpus(
     workspace_root: Path,
     *,
-    allow_unverifiable_legacy_roots: bool = False,
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> tuple[list[tuple[StoredArtifact, ExtractedText, str]], dict[str, CorpusReadOutcome]]:
     """Every held artifact paired with its extracted text and the extraction it was
     read from, plus the typed outcome EVERY held artifact was actually classified
@@ -1759,13 +1759,13 @@ def _load_corpus(
     Two tiers of verification are distinguished rather than one boolean, because
     ``deep=True`` verification requires a ``derivation_binding`` that no artifact
     stored before that field existed carries -- which describes every document in a
-    long-lived real corpus, not a corrupted one. ``VERIFIED_DEEP`` passed the strict
-    check; ``VERIFIED_SHALLOW`` only ever had its raw bytes and (if present) its
+    long-lived real corpus, not a corrupted one. ``SELF_CONSISTENT_METADATA`` passed the strict
+    check; ``SIDECAR_DIGEST_ONLY`` only ever had its raw bytes and (if present) its
     sidecar digest checked, with no binding tying the two together;
-    ``UNVERIFIABLE_LEGACY_ROOT`` never had even its sidecar digest recorded, so
+    ``UNAUTHENTICATED_LEGACY_ROOT`` never had even its sidecar digest recorded, so
     nothing at all authenticates the text it would serve. Only the first two are read
-    by default; the third is read only when ``allow_unverifiable_legacy_roots=True``.
-    ``FAILED_INTEGRITY`` -- the default check itself failing -- is never read,
+    by default; the third is read only when ``allow_unauthenticated_legacy_roots=True``.
+    ``INTEGRITY_FAILED`` -- the default check itself failing -- is never read,
     regardless of that flag: the opt-in exists for artifacts that are merely
     unauthenticated, not for ones whose bytes are actually damaged.
 
@@ -1781,8 +1781,8 @@ def _load_corpus(
 
     Args:
         workspace_root: Root workspace.
-        allow_unverifiable_legacy_roots: Opt-in to read artifacts classified
-            ``UNVERIFIABLE_LEGACY_ROOT``. Defaults to False (fail-closed): an
+        allow_unauthenticated_legacy_roots: Opt-in to read artifacts classified
+            ``UNAUTHENTICATED_LEGACY_ROOT``. Defaults to False (fail-closed): an
             unauthenticated root sidecar is refused unless the operator explicitly
             says so.
     """
@@ -1801,25 +1801,25 @@ def _load_corpus(
             shallow_intact = False
         if not shallow_intact:
             logger.warning("evidence store: %s failed digest verification and was not read", artifact.sha256)
-            outcomes[artifact.sha256] = CorpusReadOutcome.FAILED_INTEGRITY
+            outcomes[artifact.sha256] = CorpusReadOutcome.INTEGRITY_FAILED
             continue
         try:
             deep_intact = verify_artifact(workspace_root, artifact.sha256, deep=True)
         except ValueError:
             deep_intact = False
         if deep_intact:
-            outcome = CorpusReadOutcome.VERIFIED_DEEP
+            outcome = CorpusReadOutcome.SELF_CONSISTENT_METADATA
         elif artifact.extracted_sha256 is not None:
-            outcome = CorpusReadOutcome.VERIFIED_SHALLOW
+            outcome = CorpusReadOutcome.SIDECAR_DIGEST_ONLY
         else:
-            outcome = CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT
+            outcome = CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
 
-        if outcome == CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT and not allow_unverifiable_legacy_roots:
+        if outcome == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT and not allow_unauthenticated_legacy_roots:
             logger.warning(
                 "evidence store: %s has no derivation binding AND no extracted_sha256, "
                 "so it cannot be authenticated at all -- was NOT read. Re-extract it into "
                 "an authenticated record, or re-run this pass with the explicit opt-in "
-                "to read unverifiable legacy roots",
+                "to read unauthenticated legacy roots",
                 artifact.sha256,
             )
             outcomes[artifact.sha256] = outcome
@@ -1910,7 +1910,7 @@ def _corpus_loop(
     action_id: str,
     run_id: str,
     already_covered: frozenset[tuple[str, str]] = frozenset(),
-    allow_unverifiable_legacy_roots: bool = False,
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> None:
     """The corpus-only pass: read what is held, propose, ground, verify.
 
@@ -1943,14 +1943,14 @@ def _corpus_loop(
     re-read identical input at full cost.
     """
     corpus, outcomes = _load_corpus(
-        workspace_root, allow_unverifiable_legacy_roots=allow_unverifiable_legacy_roots
+        workspace_root, allow_unauthenticated_legacy_roots=allow_unauthenticated_legacy_roots
     )
     read_shas = {artifact.sha256 for artifact, _, _ in corpus}
     skipped = [sha256 for sha256 in outcomes if sha256 not in read_shas]
     # Grouped by REASON, not merely counted. Flattening every unread class back into
     # one list here would reproduce, one layer up, the exact conflation the typed
     # outcomes exist to remove -- and this is the only version a human ever sees. The
-    # classes call for opposite responses: an unverifiable legacy root wants
+    # classes call for opposite responses: an unauthenticated legacy root wants
     # re-extraction or the explicit opt-in, damaged bytes want the paper re-acquired,
     # and an unreadable meta.json wants the directory itself looked at.
     unread_by_reason: dict[str, list[str]] = {}
@@ -2316,12 +2316,14 @@ def _run_pass(
         # automatic, and a changed prompt or a newer model is a real reason to want it.
         reread_all = _permission_from(action.parameters, "reread_all", state)
         # Opt-in to reading a held artifact whose stored text carries no digest
-        # binding it to anything (`CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT`).
+        # binding it to anything (`CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT`).
         # Meaningless outside the corpus path -- a search pass has no held corpus to
         # gate -- so it is read here but only ever threaded through on that branch
         # below, rather than added to `_research_loop`'s signature where it would
         # silently do nothing.
-        allow_unverifiable_legacy_roots = _permission_from(action.parameters, "allow_unverifiable_legacy_roots", state)
+        allow_unauthenticated_legacy_roots = _permission_from(
+            action.parameters, "allow_unauthenticated_legacy_roots", state
+        )
         already_covered: frozenset[tuple[str, str]] = frozenset()
         if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
             already_covered = frozenset(
@@ -2343,7 +2345,7 @@ def _run_pass(
                     action_id=action.action_id,
                     run_id=run_id,
                     already_covered=already_covered,
-                    allow_unverifiable_legacy_roots=allow_unverifiable_legacy_roots,
+                    allow_unauthenticated_legacy_roots=allow_unauthenticated_legacy_roots,
                 )
             else:
                 _research_loop(

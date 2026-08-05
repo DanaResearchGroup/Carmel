@@ -518,34 +518,40 @@ class CorpusReadOutcome(StrEnum):
     manufacture the more permissive tier at will. Keying on ``extracted_sha256``
     instead is safe in a way that is not, because of its DIRECTION -- deleting
     ``extracted_sha256`` does not promote an artifact, it DEMOTES one, moving it from
-    ``VERIFIED_SHALLOW`` down into ``UNVERIFIABLE_LEGACY_ROOT``, which is refused by
-    default. The same attack that would have laundered a downgrade through
+    ``SIDECAR_DIGEST_ONLY`` down into ``UNAUTHENTICATED_LEGACY_ROOT``, which is
+    refused by default. The same attack that would have laundered a downgrade through
     ``derivation_binding`` therefore buys the attacker only a refusal here, never an
     admission.
     """
 
-    VERIFIED_DEEP = "verified_deep"
-    """``verify_artifact(..., deep=True)`` passed: the sidecar's ``derivation_binding``
-    is intact, so both the raw bytes AND the claim that the text was derived from them
-    are authenticated."""
+    SELF_CONSISTENT_METADATA = "self_consistent_metadata"
+    """``verify_artifact(..., deep=True)`` passed: ``raw.bin`` re-hashes to its own
+    name, the recorded sidecar digest matches ``extracted.json``, and the recorded
+    derivation binding matches one recomputed from ``meta.json``'s own
+    ``extractor_version``/``sha256``/``extracted_sha256``. All three inputs to that
+    recomputation live in the same mutable file, so this is internal consistency of a
+    metadata record, and NOT evidence that the served text came from the stored
+    bytes. What it does buy: it catches the realistic non-adversarial failure, a
+    truncated or interrupted write."""
 
-    VERIFIED_SHALLOW = "verified_shallow"
-    """Deep verification failed, but the default (non-deep) check passed AND
-    ``meta.extracted_sha256`` is not ``None`` -- the sidecar actually read WAS digest-
-    checked at some point, there is simply no ``derivation_binding`` recording that it
-    came from these particular raw bytes."""
+    SIDECAR_DIGEST_ONLY = "sidecar_digest_only"
+    """As :attr:`SELF_CONSISTENT_METADATA`, minus the binding: deep verification
+    failed, but the default (non-deep) check passed AND ``meta.extracted_sha256`` is
+    not ``None`` -- the sidecar that is actually read WAS digest-checked, but nothing
+    ties it to the raw bytes."""
 
-    UNVERIFIABLE_LEGACY_ROOT = "unverifiable_legacy_root"
-    """The default check passed, but ``meta.extracted_sha256`` is ``None``: nothing ever
-    bound ``extracted.json`` to anything, so the text this artifact would serve cannot
-    be authenticated at all. Refused by default; readable only under an explicit
+    UNAUTHENTICATED_LEGACY_ROOT = "unauthenticated_legacy_root"
+    """No sidecar digest was ever recorded: the default check passed, but
+    ``meta.extracted_sha256`` is ``None``, so the text this would serve is checked
+    against nothing at all. Refused by default; readable only under an explicit
     operator opt-in."""
 
-    FAILED_INTEGRITY = "failed_integrity"
-    """The default (non-deep) check itself failed: ``raw.bin`` is absent or no longer
-    hashes to the directory naming it, or a RECORDED sidecar digest no longer matches.
-    Never read, regardless of any opt-in -- an opt-in for unauthenticated-but-intact
-    bytes must not launder bytes that are not even intact."""
+    INTEGRITY_FAILED = "integrity_failed"
+    """The bytes themselves do not match what was recorded: the default (non-deep)
+    check itself failed, because ``raw.bin`` is absent or no longer hashes to the
+    directory naming it, or a RECORDED sidecar digest no longer matches. Never read,
+    regardless of any opt-in -- an opt-in for unauthenticated-but-intact bytes must
+    not launder bytes that are not even intact."""
 
     MISSING_TEXT = "missing_text"
     """Verification (at whichever tier applies) passed, but ``load_artifact_text``
@@ -594,8 +600,8 @@ class CoveredDocument(BaseModel):
     """Either :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex extraction sha256."""
     verification_standard: str = Field(min_length=1)
     """Which :class:`CorpusReadOutcome` this document was actually read under: one of
-    ``VERIFIED_DEEP``, ``VERIFIED_SHALLOW``, ``UNVERIFIABLE_LEGACY_ROOT``, or the
-    literal ``"unrecorded"``.
+    ``SELF_CONSISTENT_METADATA``, ``SIDECAR_DIGEST_ONLY``,
+    ``UNAUTHENTICATED_LEGACY_ROOT``, or the literal ``"unrecorded"``.
 
     REQUIRED, with no default, for the same reason :attr:`EvidenceRef.extraction_id`
     has none. Reports are APPEND-ONLY: if a pass does not record whether a document
@@ -631,9 +637,9 @@ class CoveredDocument(BaseModel):
     @classmethod
     def _validate_verification_standard_shape(cls, value: str) -> str:
         allowed = {
-            CorpusReadOutcome.VERIFIED_DEEP.value,
-            CorpusReadOutcome.VERIFIED_SHALLOW.value,
-            CorpusReadOutcome.UNVERIFIABLE_LEGACY_ROOT.value,
+            CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
+            CorpusReadOutcome.SIDECAR_DIGEST_ONLY.value,
+            CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value,
             "unrecorded",
         }
         if value not in allowed:

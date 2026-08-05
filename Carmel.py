@@ -153,7 +153,7 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     corpus.add_argument(
-        "--allow-unverifiable-legacy-roots",
+        "--allow-unauthenticated-legacy-roots",
         action="store_true",
         help=(
             "Read held artifacts whose stored text cannot be authenticated against "
@@ -476,7 +476,7 @@ def _cmd_corpus_pass(
     dry_run: bool,
     reread_all: bool = False,
     dispatch_queued: bool = False,
-    allow_unverifiable_legacy_roots: bool = False,
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> int:
     """Append a corpus pass to a campaign's plan and run it.
 
@@ -508,9 +508,9 @@ def _cmd_corpus_pass(
                 file=sys.stderr,
             )
             return 1
-        if allow_unverifiable_legacy_roots:
+        if allow_unauthenticated_legacy_roots:
             print(
-                "--allow-unverifiable-legacy-roots cannot be combined with --dispatch-queued: "
+                "--allow-unauthenticated-legacy-roots cannot be combined with --dispatch-queued: "
                 "the queued pass already carries the parameters it was approved under, and "
                 "bolting a fresh permission on at dispatch time would defeat the approval.",
                 file=sys.stderr,
@@ -590,7 +590,7 @@ def _cmd_corpus_pass(
             budget_tokens=budget_tokens,
             model_name=model_name,
             reread_all=reread_all,
-            allow_unverifiable_legacy_roots=allow_unverifiable_legacy_roots,
+            allow_unauthenticated_legacy_roots=allow_unauthenticated_legacy_roots,
         )
     except FileNotFoundError:
         # Distinguished from the generic OSError below because the remedy is
@@ -1077,7 +1077,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             reread_all=args.reread_all,
             dispatch_queued=args.dispatch_queued,
-            allow_unverifiable_legacy_roots=args.allow_unverifiable_legacy_roots,
+            allow_unauthenticated_legacy_roots=args.allow_unauthenticated_legacy_roots,
         )
 
     if args.command == "new-campaign":

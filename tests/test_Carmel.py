@@ -1629,7 +1629,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
         assert code == 1
         assert "--budget-tokens is required" in capsys.readouterr().err
 
-    def test_allow_unverifiable_legacy_roots_is_recorded_on_the_queued_action(
+    def test_allow_unauthenticated_legacy_roots_is_recorded_on_the_queued_action(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """C1. The flag must actually reach the queued action's parameters, not
@@ -1650,7 +1650,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
                 "250000",
                 "--workspaces",
                 str(tmp_path),
-                "--allow-unverifiable-legacy-roots",
+                "--allow-unauthenticated-legacy-roots",
                 "--dry-run",
             ]
         )
@@ -1659,7 +1659,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
         capsys.readouterr()
         actions = load_plan(ws).actions
         corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
-        assert corpus_action.parameters.get("allow_unverifiable_legacy_roots") is True
+        assert corpus_action.parameters.get("allow_unauthenticated_legacy_roots") is True
 
     def test_the_key_is_absent_without_the_flag(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -1681,7 +1681,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
         capsys.readouterr()
         actions = load_plan(ws).actions
         corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
-        assert "allow_unverifiable_legacy_roots" not in corpus_action.parameters
+        assert "allow_unauthenticated_legacy_roots" not in corpus_action.parameters
 
     def test_the_planner_grants_no_permission_a_caller_did_not_ask_for(self, tmp_path: Path) -> None:
         """C7. The DEFAULTS, pinned at the API boundary rather than through the CLI.
@@ -1705,7 +1705,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
             "parameters dict is the only shape that says 'nothing was authorised here'"
         )
 
-    def test_allow_unverifiable_legacy_roots_composes_with_reread_all(
+    def test_allow_unauthenticated_legacy_roots_composes_with_reread_all(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """C3. The composition trap: two independent boolean flags, each recorded
@@ -1725,7 +1725,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
                 "250000",
                 "--workspaces",
                 str(tmp_path),
-                "--allow-unverifiable-legacy-roots",
+                "--allow-unauthenticated-legacy-roots",
                 "--reread-all",
                 "--dry-run",
             ]
@@ -1735,10 +1735,10 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
         capsys.readouterr()
         actions = load_plan(ws).actions
         corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
-        assert corpus_action.parameters.get("allow_unverifiable_legacy_roots") is True
+        assert corpus_action.parameters.get("allow_unauthenticated_legacy_roots") is True
         assert corpus_action.parameters.get("reread_all") is True
 
-    def test_allow_unverifiable_legacy_roots_may_not_be_combined_with_dispatch_queued(
+    def test_allow_unauthenticated_legacy_roots_may_not_be_combined_with_dispatch_queued(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
         """C4. The queued pass already carries the parameters it was approved
@@ -1757,7 +1757,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
                 "--workspaces",
                 str(tmp_path),
                 "--dispatch-queued",
-                "--allow-unverifiable-legacy-roots",
+                "--allow-unauthenticated-legacy-roots",
             ]
         )
 
