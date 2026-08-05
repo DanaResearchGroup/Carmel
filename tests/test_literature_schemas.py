@@ -10,6 +10,7 @@ from carmel.agents.budget import BudgetDimension, BudgetUsage
 from carmel.agents.literature_agent import ProposedFinding, VerifierAssessment
 from carmel.schemas.campaign import ReactorType
 from carmel.schemas.literature import (
+    ROOT_EXTRACTION_ID,
     STOP_REASON_FOR_DIMENSION,
     Citation,
     CredenceVerdict,
@@ -111,7 +112,7 @@ class TestFindingPayloadDiscriminatedUnion:
                 payload=payload,  # type: ignore[arg-type]
                 citation=_citation(doi="10.1/x"),
                 verbatim_quote="quote",
-                evidence=EvidenceRef(artifact_sha256="a" * 64),
+                evidence=EvidenceRef(artifact_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID),
                 grounding=_grounding(),
             )
 
@@ -149,7 +150,7 @@ def _make_finding(payload: object) -> LiteratureFinding:
         payload=payload,  # type: ignore[arg-type]
         citation=_citation(doi="10.1000/abc"),
         verbatim_quote="the ignition delay was 1.2 ms",
-        evidence=EvidenceRef(artifact_sha256="a" * 64),
+        evidence=EvidenceRef(artifact_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID),
         grounding=_grounding(),
     )
 
@@ -316,7 +317,13 @@ class TestLiteratureReportRoundTrip:
             payload=_experimental_payload(),
             citation=_citation(doi="https://doi.org/10.1000/XYZ"),
             verbatim_quote="the ignition delay was 1.2 ms at 1200 K",
-            evidence=EvidenceRef(artifact_sha256="b" * 64, quote_start=10, quote_end=40, page=3),
+            evidence=EvidenceRef(
+                artifact_sha256="b" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                quote_start=10,
+                quote_end=40,
+                page=3,
+            ),
             grounding=_grounding(),
             credence=CredenceVerdict(
                 credence=0.8,

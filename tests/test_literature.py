@@ -50,6 +50,7 @@ from carmel.schemas import (
 from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
+    CURRENT_REPORT_SCHEMA_VERSION,
     ROOT_EXTRACTION_ID,
     ArtifactProvenance,
     CoveredDocument,
@@ -1909,7 +1910,7 @@ class TestReportSchemaVersionGate:
         migrated = migrate_report_payload(payload)
 
         assert isinstance(migrated, dict)
-        assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION == 4
+        assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION == 5
         assert migrated["passes"][0]["covered"] == [
             {"raw_sha256": sha_a, "extraction_id": ROOT_EXTRACTION_ID},
             {"raw_sha256": sha_b, "extraction_id": ROOT_EXTRACTION_ID},
@@ -1964,15 +1965,15 @@ class TestReportSchemaVersionGate:
         assert isinstance(v2_migrated, dict)
         assert v2_migrated["passes"][0]["covered"] == []
 
-    def test_t8_a_v4_payload_passes_through_unchanged(self) -> None:
-        """T8. A payload already at the current version (4) is idempotent -- returned
+    def test_t8_a_payload_already_at_the_current_version_passes_through_unchanged(self) -> None:
+        """T8. A payload already at the current version (5) is idempotent -- returned
         as-is, not re-migrated."""
         from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
         from carmel.services.literature import migrate_report_payload
 
-        assert CURRENT_REPORT_SCHEMA_VERSION == 4
+        assert CURRENT_REPORT_SCHEMA_VERSION == 5
         payload = {
-            "schema_version": 4,
+            "schema_version": 5,
             "passes": [
                 {
                     **self._v3_pass(covered_sha256=[]),
@@ -2901,6 +2902,7 @@ class TestOutcomeReflectsThisPassOnly:
                     "action_id": f"act-{run_id}",
                     "evidence": {
                         "artifact_sha256": "a" * 64,
+                        "extraction_id": ROOT_EXTRACTION_ID,
                         "quote_start": 0,
                         "quote_end": len(QUOTE),
                     },
@@ -3039,3 +3041,300 @@ class TestTheReservationMatchesThePromptSize:
         from carmel.services.literature import estimated_tokens_for
 
         assert estimated_tokens_for("x" * 200_000) > estimated_tokens_for("x" * 100_000)
+
+
+class TestAFindingRecordsWhichExtractionItsOffsetsIndex:
+    """``EvidenceRef`` must name the extraction its offsets were computed against.
+
+    An ``EvidenceRef`` stores ``quote_start``/``quote_end`` as offsets into "the
+    artifact's extracted text". That was unambiguous while an artifact had exactly one
+    text. It stopped being so when the nested extraction-record store landed: one raw
+    sha256 can now carry a root ``extracted.json`` sidecar AND any number of
+    authenticated re-extraction records, each with its own text and therefore its own
+    offsets for the same quote.
+
+    Nothing reads these offsets today -- there is no literature replayer, only the
+    dataset one -- so this is not a live mis-resolution. It is a capture defect, and
+    that is what makes it urgent rather than deferrable: the report is append-only and
+    stored character offsets are NEVER migrated, so a finding accepted without this
+    identity can never afterwards be told which text it indexed. The only moment the
+    information exists to be captured is the moment of acceptance.
+    """
+
+    #: A stand-in for an authenticated re-extraction record's address. The tests below
+    #: patch ``_load_corpus`` rather than mint a real record, because teaching
+    #: ``_load_corpus`` to SELECT a record is the next increment and is deliberately
+    #: out of scope here -- what must be proven now is that whatever it read gets
+    #: recorded on the finding.
+    RECORD_ID = hashlib.sha256(b"a-re-extraction-record").hexdigest()
+
+    #: The same quote, in a text where it sits at a DIFFERENT offset than in ``DOC``.
+    #: The leading matter is what shifts it; without a shift the two texts would agree
+    #: on the offsets and the ambiguity would be invisible.
+    RECORD_DOC = (
+        "A shock tube study of oxygen ignition\n"
+        "J. Smith and A. Jones (2020)\n"
+        f"doi: {DOI}\n\n"
+        "Abstract text here.\n\n"
+        "A paragraph recovered only by the newer extractor, which the root sidecar\n"
+        "dropped entirely, and which therefore shifts everything after it.\n\n"
+        f"{QUOTE}\n"
+        "Further discussion of the measurements follows here.\n"
+    )
+
+    def _patch_corpus_to_read_a_record(
+        self, monkeypatch: pytest.MonkeyPatch, *, extraction_id: str, text: str
+    ) -> None:
+        """Make ``_load_corpus`` report that it read a NON-root extraction.
+
+        It calls the real loader and substitutes the text and identity, so the
+        StoredArtifact, the digest verification and the skipped-sha bookkeeping are
+        all still the production ones.
+        """
+        real = literature_module._load_corpus
+
+        def _patched(workspace_root: Path) -> Any:
+            corpus, skipped = real(workspace_root)
+            return (
+                [(artifact, extract_text(text.encode(), "text/plain"), extraction_id) for artifact, _, _ in corpus],
+                skipped,
+            )
+
+        monkeypatch.setattr(literature_module, "_load_corpus", _patched)
+
+    def test_p1_red_offsets_from_a_non_root_extraction_are_recorded_against_that_extraction(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1, RED. THE ambiguity test.
+
+        A pass reads a non-root extraction and accepts a finding from it. The offsets
+        index the RECORD's text. Nothing on the finding says so, so a later reader
+        holding only ``artifact_sha256`` would resolve them against the root sidecar
+        and slice out the wrong span -- which the final assertion demonstrates is not
+        a hypothetical: the same offsets against the root text do not yield the quote.
+        """
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        self._patch_corpus_to_read_a_record(monkeypatch, extraction_id=self.RECORD_ID, text=self.RECORD_DOC)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        evidence = report.findings[0].evidence
+        assert evidence.artifact_sha256 == sha
+        assert evidence.extraction_id == self.RECORD_ID, (
+            "the finding was mined from a re-extraction record, so its offsets index that "
+            "record's text -- the finding must say so"
+        )
+        start, end = evidence.quote_start, evidence.quote_end
+        assert start is not None and end is not None
+        assert self.RECORD_DOC[start:end] == QUOTE, "the recorded offsets must index the text actually read"
+        assert DOC[start:end] != QUOTE, (
+            "if the same offsets also resolved correctly against the root text there would be "
+            "no ambiguity to close, and this test would prove nothing"
+        )
+
+    def test_p2_a_corpus_finding_from_the_root_sidecar_is_recorded_as_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2. The honest case, and the guard against a fix that stamps every finding
+        with a record id."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        evidence = report.findings[0].evidence
+        assert evidence.extraction_id == ROOT_EXTRACTION_ID
+        start, end = evidence.quote_start, evidence.quote_end
+        assert start is not None and end is not None
+        assert DOC[start:end] == QUOTE
+
+    def test_p3_a_search_pass_finding_is_recorded_as_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P3. The OTHER call site. A search pass fetches and extracts in one breath and
+        stores the result as the root sidecar, so root is a fact about that path, not a
+        default -- but it still has to be stated, because the field has no default."""
+        _patch_chem_success(monkeypatch)
+        deps, _, config = _make_deps(
+            [
+                _proposal(findings=[_finding_dict()], done=True),
+                _assessment(),
+            ],
+            search={"oxygen ignition delay shock tube": [SearchResult(title="t", url=SOURCE_URL, snippet="s")]},
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        assert report.findings[0].evidence.extraction_id == ROOT_EXTRACTION_ID
+
+    def test_p4_an_evidence_ref_cannot_be_built_without_stating_an_extraction(self) -> None:
+        """P4. No default. A default would let a producer that never considered the
+        question silently claim the root -- which is the exact ambiguity being closed.
+        ``CharSpanLocator.text_space`` makes the same argument for the dataset lane."""
+        from pydantic import ValidationError
+
+        from carmel.schemas.literature import EvidenceRef
+
+        with pytest.raises(ValidationError, match="extraction_id"):
+            EvidenceRef(artifact_sha256="a" * 64, quote_start=0, quote_end=5)  # type: ignore[call-arg]
+
+    def test_p5_a_v4_report_migrates_every_evidence_ref_to_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P5. Every ref written before this field existed was necessarily root-derived:
+        ``_ground_and_record``'s only two callers read text via ``_fetch_and_store``
+        (fresh extraction, stored as the root sidecar) and ``_load_corpus`` (root
+        sidecar only). Root here is a fact about what could have been read, not a
+        default standing in for an unstated intent."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        start = DOC.index(QUOTE)
+        legacy = self._legacy_v4_report(campaign, sha=sha, start=start)
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(legacy))
+
+        report = load_literature_report(campaign.workspace_root)
+
+        assert report is not None
+        assert len(report.findings) == 1
+        evidence = report.findings[0].evidence
+        assert evidence.extraction_id == ROOT_EXTRACTION_ID
+        assert evidence.quote_start == start, "a migration must never move a stored character offset"
+        assert evidence.quote_end == start + len(QUOTE)
+
+    @staticmethod
+    def _legacy_v4_report(campaign: Campaign, *, sha: str, start: int) -> dict[str, Any]:
+        """A v4 report holding one grounded finding whose evidence has no
+        ``extraction_id`` -- i.e. exactly what was on disk before this field existed."""
+        return {
+            "schema_version": 4,
+            "report_id": "rep-legacy",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-legacy",
+                    "action_id": "act-legacy",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "rejected": [],
+            "findings": [
+                {
+                    "finding_id": "f-legacy",
+                    "run_id": "run-legacy",
+                    "action_id": "act-legacy",
+                    "payload": {
+                        "category": "experimental_benchmark",
+                        "reactor_type": "shock_tube",
+                        "observable": "ignition_delay_time",
+                        "observable_raw": "ignition delay time",
+                        "species": [{"raw_name": "O2"}],
+                        "measured": [{"value": 1.25, "unit": "ms"}],
+                    },
+                    "citation": {
+                        "title": "A shock tube study of oxygen ignition",
+                        "authors": ["J. Smith"],
+                        "year": 2020,
+                        "doi": DOI,
+                    },
+                    "verbatim_quote": QUOTE,
+                    "evidence": {
+                        "artifact_sha256": sha,
+                        "quote_start": start,
+                        "quote_end": start + len(QUOTE),
+                    },
+                    "grounding": {
+                        "status": GroundingStatus.GROUNDED_EXACT.value,
+                        "grounded": True,
+                        "match_ratio": 1.0,
+                        "identity_ok": True,
+                    },
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "bogus",
+        ["ROOT", "Root", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 64 + "\n", "", "  "],
+    )
+    def test_p7_an_extraction_id_that_is_neither_root_nor_a_sha256_is_refused(self, bogus: str) -> None:
+        """P7. The field's SHAPE, not merely its presence.
+
+        Found by a mutation audit: with the shape check neutered, the whole literature
+        suite still passed, so nothing was certifying that this value even looks like an
+        extraction identity. The trailing-newline case is the specific reason the check
+        uses ``fullmatch`` rather than ``match`` -- Python's ``$`` also matches just
+        BEFORE a trailing newline, so ``"a" * 64 + "\\n"`` would otherwise be accepted
+        and then used as a filesystem path component.
+        """
+        from pydantic import ValidationError
+
+        from carmel.schemas.literature import EvidenceRef
+
+        with pytest.raises(ValidationError, match="extraction_id"):
+            EvidenceRef(artifact_sha256="a" * 64, extraction_id=bogus)
+
+    def test_p8_a_v4_payload_claiming_a_record_is_normalised_to_root_not_honoured(
+        self, campaign: Campaign
+    ) -> None:
+        """P8. The migration OVERWRITES; it does not merely fill in a blank.
+
+        No v4 writer could have had grounds to say "these offsets index record <sha>" --
+        that impossibility IS the argument for stamping root -- and ``EvidenceRef``'s
+        ``extra="forbid"`` meant a payload carrying the key was previously rejected
+        outright. A migration that only defaulted the key would silently promote that
+        impossible claim into an accepted one, attached to offsets nothing can re-check.
+        Also found by a mutation audit: nothing distinguished ``setdefault`` from a
+        plain assignment.
+        """
+        start = DOC.index(QUOTE)
+        payload = self._legacy_v4_report(campaign, sha="c" * 64, start=start)
+        payload["findings"][0]["evidence"]["extraction_id"] = "d" * 64
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(payload))
+
+        report = load_literature_report(campaign.workspace_root)
+
+        assert report is not None
+        assert report.findings[0].evidence.extraction_id == ROOT_EXTRACTION_ID
+
+    def test_p6_a_report_from_a_future_schema_version_still_fails_closed(self, campaign: Campaign) -> None:
+        """P6. The version bump must not cost the fail-closed guard on future reports.
+        A bump that forgets to move the ceiling turns 'refuse a report I cannot
+        understand' into 'accept it and silently drop its unknown fields on the next
+        write'."""
+        from carmel.services.literature import ReportSchemaTooNewError
+
+        future = {
+            "schema_version": CURRENT_REPORT_SCHEMA_VERSION + 1,
+            "report_id": "rep-future",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [],
+            "queries": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(future))
+
+        with pytest.raises(ReportSchemaTooNewError, match="Upgrade Carmel"):
+            load_literature_report(campaign.workspace_root)

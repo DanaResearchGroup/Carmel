@@ -277,6 +277,8 @@ def migrate_report_payload(payload: object) -> object:
         migrated = _migrate_v2_to_v3(migrated)
     if version < 4:
         migrated = _migrate_v3_to_v4(migrated)
+    if version < 5:
+        migrated = _migrate_v4_to_v5(migrated)
     # Not a literal. This produces whatever the CURRENT schema is, so hardcoding the
     # number means the next version bump silently stamps migrated reports with a
     # stale version -- and the `version == CURRENT` early return above then treats
@@ -359,6 +361,46 @@ def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
             ]
             new_passes.append(new_p)
         migrated["passes"] = new_passes
+    return migrated
+
+
+def _migrate_v4_to_v5(payload: dict[str, Any]) -> dict[str, Any]:
+    """Set ``extraction_id`` to :data:`ROOT_EXTRACTION_ID` on every finding's
+    ``evidence`` mapping.
+
+    This is not a guess: `_ground_and_record`'s only two callers obtain the text a
+    finding was grounded against either from `_fetch_and_store` (which extracts
+    freshly and stores the result as the root sidecar) or from `_load_corpus`
+    (which loads text only via `load_artifact_text`, i.e. the root sidecar). So
+    root text is the only thing any pre-v5 finding could possibly have been
+    grounded against. ``quote_start``/``quote_end`` and every other field are left
+    untouched -- this migration only adds the identity that was previously implicit.
+    """
+    migrated = dict(payload)
+    findings = migrated.get("findings")
+    if isinstance(findings, list):
+        new_findings = []
+        for f in findings:
+            if not isinstance(f, dict):
+                new_findings.append(f)
+                continue
+            evidence = f.get("evidence")
+            if isinstance(evidence, dict):
+                new_f = dict(f)
+                new_evidence = dict(evidence)
+                # Assigned unconditionally, NOT via setdefault. By the argument above, a
+                # pre-v5 payload cannot legitimately carry this key at all, and
+                # ``EvidenceRef`` sets ``extra="forbid"``, so one that did used to be
+                # REJECTED outright. Honouring such a value would quietly turn that
+                # refusal into acceptance of a claim -- "these offsets index record
+                # <sha>" -- that no v4 writer could have had grounds to make, and that
+                # nothing downstream can check once the offsets are frozen.
+                new_evidence["extraction_id"] = ROOT_EXTRACTION_ID
+                new_f["evidence"] = new_evidence
+                new_findings.append(new_f)
+            else:
+                new_findings.append(f)
+        migrated["findings"] = new_findings
     return migrated
 
 
@@ -922,6 +964,10 @@ def _process_finding(
         action_id=action_id,
         run_id=run_id,
         queue_acquisition=True,
+        # This path fetches and extracts in one breath (`_fetch_and_store` above) and
+        # stores the result as the root sidecar, so root is a fact about this path,
+        # not a default.
+        extraction_id=ROOT_EXTRACTION_ID,
     )
 
 
@@ -938,6 +984,7 @@ def _ground_and_record(
     action_id: str,
     run_id: str,
     queue_acquisition: bool,
+    extraction_id: str,
 ) -> None:
     """Ground one proposed finding against resolved bytes; verify and record it only
     if it survives.
@@ -950,6 +997,10 @@ def _ground_and_record(
     ``queue_acquisition`` is False for a corpus pass. There, a failed grounding means
     the quote is not in a document Carmel already holds, so asking a human to go and
     obtain that same document would be nonsense.
+
+    ``extraction_id`` is required, not defaulted, for the same reason the
+    ``EvidenceRef`` field it feeds is required: a caller that forgets to state which
+    text ``extracted`` actually is must fail loudly, not silently claim the root.
     """
     finding_id = uuid.uuid4().hex
     if stored is not None and all(a.sha256 != stored.sha256 for a in state.artifacts):
@@ -1029,6 +1080,7 @@ def _ground_and_record(
             verbatim_quote=proposed.verbatim_quote,
             evidence=EvidenceRef(
                 artifact_sha256=stored.sha256,
+                extraction_id=extraction_id,
                 quote_start=match.start if match else None,
                 quote_end=match.end if match else None,
                 page=match.page if match else None,
@@ -1802,7 +1854,7 @@ def _corpus_loop(
         # Only the document actually shown is resolvable. The agent is looking at one
         # paper, so a digest naming any other is a mistake worth surfacing, even when
         # that other paper happens to be in the store.
-        by_sha = {artifact.sha256: (artifact, extracted)}
+        by_sha = {artifact.sha256: (artifact, extracted, extraction_id)}
         corpus_prompt = _corpus_prompt(campaign, artifact, extracted)
         result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
         # Recorded once the call has RETURNED, which is the moment the tokens are
@@ -1846,7 +1898,7 @@ def _process_corpus_proposal(
     *,
     config: AgentConfig,
     state: _RunState,
-    by_sha: dict[str, tuple[StoredArtifact, ExtractedText]],
+    by_sha: dict[str, tuple[StoredArtifact, ExtractedText, str]],
     log_path: Path,
     action_id: str,
     run_id: str,
@@ -1879,7 +1931,7 @@ def _process_corpus_proposal(
             )
             continue
 
-        artifact, extracted = resolved
+        artifact, extracted, extraction_id = resolved
         key = (proposed.artifact_sha256, proposed.verbatim_quote.strip()[:200])
         if key in seen:
             continue
@@ -1902,6 +1954,7 @@ def _process_corpus_proposal(
             action_id=action_id,
             run_id=run_id,
             queue_acquisition=False,
+            extraction_id=extraction_id,
         )
 
 

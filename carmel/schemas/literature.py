@@ -244,11 +244,38 @@ class EvidenceRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     artifact_sha256: str = Field(min_length=1)
+    extraction_id: str = Field(min_length=1)
+    """Which of ``artifact_sha256``'s texts ``quote_start``/``quote_end`` index: either
+    :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex ``extraction_sha256`` naming a nested
+    re-extraction record. Naming the raw sha256 alone used to be unambiguous, back when a
+    stored artifact had exactly one extracted text; it no longer is, now that the same raw
+    sha256 can carry a root ``extracted.json`` sidecar AND any number of authenticated
+    re-extraction records, each with its own text and therefore its own offsets for the
+    same quote.
+
+    REQUIRED, with no default, and that absence is deliberate: a producer that never
+    considered the question would otherwise silently claim the root, which is exactly the
+    ambiguity this field exists to close. Character offsets are also never migrated once
+    stored (this project's standing constraint on ``quote_start``/``quote_end``), so a
+    finding accepted without recording which text it indexed could never afterwards be
+    told. See ``CharSpanLocator.text_space`` in ``carmel/schemas/datasets.py`` for the same
+    argument made about a sibling ambiguity.
+    """
     quote_start: int | None = None
-    """Offset into ExtractedText.text."""
+    """Offset into the text named by ``extraction_id``."""
     quote_end: int | None = None
     page: int | None = None
     section_label: str | None = None
+
+    @field_validator("extraction_id")
+    @classmethod
+    def _validate_extraction_id_shape(cls, value: str) -> str:
+        if value != ROOT_EXTRACTION_ID and not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or "
+                "64 lowercase hex characters)"
+            )
+        return value
 
 
 class GroundingStatus(StrEnum):
@@ -570,7 +597,7 @@ class PassRecord(BaseModel):
 #: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
 #: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
 #: truncate) a report written by a newer one.
-CURRENT_REPORT_SCHEMA_VERSION = 4
+CURRENT_REPORT_SCHEMA_VERSION = 5
 
 
 class LiteratureReport(BaseModel):
