@@ -51,6 +51,7 @@ from carmel.paths import normalize_path
 from carmel.services.numeric import GlyphHealth, SourceContext, Unresolvable, normalize_numeric_span
 
 __all__ = [
+    "CONDITION_SET_STORE_DIR",
     "DATASET_STORE_DIR",
     "StoredDataset",
     "canonical_decimal",
@@ -65,6 +66,31 @@ __all__ = [
 ]
 
 DATASET_STORE_DIR = "evidence/datasets"
+
+# A SECOND store directory under the same root, holding `ConditionSetEnvelope`
+# payloads. Separate from `DATASET_STORE_DIR` because the chosen query model for
+# this store is "scan the files", which makes the directory the type index: a
+# condition set sitting among the datasets would be handed to every dataset
+# consumer that enumerates the store, and each would have to re-derive the type
+# from the payload just to skip it.
+#
+# The directory is NOT part of the content address -- the sha is over the
+# canonical bytes alone, so the same payload stored in either directory lands at
+# the same sha. That is deliberate and safe, because the payload itself carries
+# an `envelope_type` discriminator (see `carmel.schemas.datasets`): two envelope
+# types cannot produce identical bytes, so one type's sha can never collide with
+# the other's. The directory answers "where do I enumerate", not "who am I".
+CONDITION_SET_STORE_DIR = "evidence/condition_sets"
+
+# The complete set of directories this store will address. `store_dir` is checked
+# against it rather than merely being resolved for containment, because
+# containment only catches a path that ESCAPES the workspace -- it happily accepts
+# a wrong path INSIDE it. A typo'd "evidence/condition_sets_typo" would otherwise
+# create a silent third store: the writes succeed, and the records are then
+# invisible to every reader that spells the directory correctly. In an
+# append-only store that is data quietly written where nothing will ever look for
+# it, which is worse than a failed write.
+_KNOWN_STORE_DIRS = frozenset({DATASET_STORE_DIR, CONDITION_SET_STORE_DIR})
 
 # Mirrors `evidence.py`'s `_SHA256_RE`, but is intentionally NOT imported from there:
 # that pattern is a module-private detail of the `evidence/literature/<sha>/` layout,
@@ -518,7 +544,7 @@ class StoredDataset:
     """The resolved on-disk path of the stored ``<sha256>.json`` file."""
 
 
-def dataset_path(root: Path, dataset_sha: str) -> Path:
+def dataset_path(root: Path, dataset_sha: str, *, store_dir: str = DATASET_STORE_DIR) -> Path:
     """Compute the content-addressed path for ``dataset_sha`` under ``root``.
 
     Validates ``dataset_sha`` is exactly 64 lowercase hex characters before ever
@@ -534,9 +560,17 @@ def dataset_path(root: Path, dataset_sha: str) -> Path:
     Args:
         root: Root of the campaign workspace.
         dataset_sha: Hex digest identifying the dataset.
+        store_dir: Which store directory under ``root`` to address, one of
+            :data:`DATASET_STORE_DIR` (the default) or
+            :data:`CONDITION_SET_STORE_DIR`. Keyword-only and defaulted so that
+            every pre-existing caller keeps addressing exactly the path it
+            always did -- adding a second envelope type must not move a single
+            already-stored dataset. This is a directory, never a schema: the
+            store stays schema-blind, and the containment assertion below
+            applies to it exactly as it does to the sha.
 
     Returns:
-        The resolved ``<root>/evidence/datasets/<dataset_sha>.json`` path.
+        The resolved ``<root>/<store_dir>/<dataset_sha>.json`` path.
 
     Raises:
         ValueError: If ``dataset_sha`` is not exactly 64 lowercase hex
@@ -547,8 +581,14 @@ def dataset_path(root: Path, dataset_sha: str) -> Path:
     # trailing newline, so match would let "a" * 64 + "\n" through.
     if not _SHA256_RE.fullmatch(dataset_sha):
         raise ValueError(f"invalid dataset sha256: {dataset_sha!r} (expected 64 lowercase hex characters)")
+    if store_dir not in _KNOWN_STORE_DIRS:
+        raise ValueError(
+            f"unknown store directory: {store_dir!r} (expected one of {sorted(_KNOWN_STORE_DIRS)}) -- "
+            "an unrecognized directory would become a silent third store whose records no correctly "
+            "spelled reader ever finds"
+        )
     resolved_root = normalize_path(root)
-    candidate = resolved_root / DATASET_STORE_DIR / f"{dataset_sha}.json"
+    candidate = resolved_root / store_dir / f"{dataset_sha}.json"
     resolved = candidate.resolve()
     if not resolved.is_relative_to(resolved_root):
         raise ValueError(f"refusing to use path outside workspace root: {resolved} not under {resolved_root}")
@@ -635,7 +675,9 @@ def compute_dataset_sha(identity_payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(_inject_decimal_repr_version(identity_payload))).hexdigest()
 
 
-def store_dataset(root: Path, identity_payload: dict[str, Any]) -> StoredDataset:
+def store_dataset(
+    root: Path, identity_payload: dict[str, Any], *, store_dir: str = DATASET_STORE_DIR
+) -> StoredDataset:
     """Content-address and durably persist ``identity_payload``.
 
     Injects the reserved decimal-repr version marker (see the module-level
@@ -671,6 +713,10 @@ def store_dataset(root: Path, identity_payload: dict[str, Any]) -> StoredDataset
         root: Root of the campaign workspace.
         identity_payload: The plain dict to store. See :func:`compute_dataset_sha`
             for why this must be a plain dict, never a pydantic model.
+        store_dir: Which store directory to publish into; see
+            :func:`dataset_path`. Note this does NOT participate in the content
+            address -- the same payload written to either directory lands at the
+            same sha256.
 
     Returns:
         The :class:`StoredDataset` record (freshly written, or pre-existing and
@@ -686,7 +732,7 @@ def store_dataset(root: Path, identity_payload: dict[str, Any]) -> StoredDataset
     """
     canonical_bytes = canonical_json_bytes(_inject_decimal_repr_version(identity_payload))
     sha256 = hashlib.sha256(canonical_bytes).hexdigest()
-    path = dataset_path(root, sha256)
+    path = dataset_path(root, sha256, store_dir=store_dir)
 
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
@@ -786,7 +832,7 @@ def _raw_bytes_nest_too_deeply(raw_bytes: bytes) -> bool:
     return False
 
 
-def _read_verified_canonical_dict(root: Path, sha256: str) -> dict[str, Any]:
+def _read_verified_canonical_dict(root: Path, sha256: str, *, store_dir: str = DATASET_STORE_DIR) -> dict[str, Any]:
     """Read, hash-verify, and canonicality-verify the dataset stored under ``sha256``.
 
     Shared by :func:`load_dataset` and :func:`dataset_decimal_repr_version` --
@@ -823,7 +869,7 @@ def _read_verified_canonical_dict(root: Path, sha256: str) -> dict[str, Any]:
             their own parsed content.
         FileNotFoundError: If no dataset is stored under ``sha256``.
     """
-    path = dataset_path(root, sha256)
+    path = dataset_path(root, sha256, store_dir=store_dir)
     if not path.exists():
         raise FileNotFoundError(f"dataset not found: {path}")
     raw_bytes = path.read_bytes()
@@ -863,7 +909,7 @@ def _read_verified_canonical_dict(root: Path, sha256: str) -> dict[str, Any]:
     return parsed_any
 
 
-def load_dataset(root: Path, sha256: str) -> dict[str, Any]:
+def load_dataset(root: Path, sha256: str, *, store_dir: str = DATASET_STORE_DIR) -> dict[str, Any]:
     """Load, verify, and parse the dataset stored under ``sha256``.
 
     Recomputes the digest from the on-disk bytes and confirms they both hash to
@@ -916,8 +962,8 @@ def load_dataset(root: Path, sha256: str) -> dict[str, Any]:
             the decimal-repr version marker is missing or unrecognized.
         FileNotFoundError: If no dataset is stored under ``sha256``.
     """
-    path = dataset_path(root, sha256)
-    parsed = _read_verified_canonical_dict(root, sha256)
+    path = dataset_path(root, sha256, store_dir=store_dir)
+    parsed = _read_verified_canonical_dict(root, sha256, store_dir=store_dir)
     version = parsed.pop(_DECIMAL_REPR_VERSION_KEY, None)
     if version not in _RECOGNIZED_DECIMAL_REPR_VERSIONS:
         raise ValueError(
@@ -927,7 +973,7 @@ def load_dataset(root: Path, sha256: str) -> dict[str, Any]:
     return parsed
 
 
-def dataset_decimal_repr_version(root: Path, sha256: str) -> int:
+def dataset_decimal_repr_version(root: Path, sha256: str, *, store_dir: str = DATASET_STORE_DIR) -> int:
     """Return the decimal-repr version marker recorded for the dataset at ``sha256``.
 
     A caller of :func:`load_dataset` never sees this marker -- it is stripped
@@ -959,8 +1005,8 @@ def dataset_decimal_repr_version(root: Path, sha256: str) -> int:
             decimal-repr version marker is missing or unrecognized.
         FileNotFoundError: If no dataset is stored under ``sha256``.
     """
-    path = dataset_path(root, sha256)
-    parsed = _read_verified_canonical_dict(root, sha256)
+    path = dataset_path(root, sha256, store_dir=store_dir)
+    parsed = _read_verified_canonical_dict(root, sha256, store_dir=store_dir)
     version = parsed.get(_DECIMAL_REPR_VERSION_KEY)
     if version not in _RECOGNIZED_DECIMAL_REPR_VERSIONS:
         raise ValueError(
@@ -974,7 +1020,7 @@ def dataset_decimal_repr_version(root: Path, sha256: str) -> int:
     return int(version)
 
 
-def verify_dataset(root: Path, sha256: str) -> bool:
+def verify_dataset(root: Path, sha256: str, *, store_dir: str = DATASET_STORE_DIR) -> bool:
     """Re-read the stored bytes and confirm they are a genuine, canonical dataset.
 
     Verifies BOTH that the on-disk bytes hash to ``sha256`` AND that they are
@@ -999,6 +1045,18 @@ def verify_dataset(root: Path, sha256: str) -> bool:
     produce a file this function returns True for. Callers needing provenance
     beyond "these bytes are self-consistent" need a mechanism this module does
     not provide.
+
+    It also does NOT check the payload's ``envelope_type``, and with two store
+    directories that limit now has teeth: a DATASET payload hand-placed in
+    ``evidence/condition_sets/`` returns True here, and is listed by
+    :func:`list_datasets` for that directory too. Both answers are correct for
+    what this function measures -- raw store integrity, which is schema-blind
+    by design and must stay so (see :func:`compute_dataset_sha`) -- but "this
+    sha verifies" therefore means "these bytes are canonical and correctly
+    named", never "this is a genuine condition set". The typed loaders
+    (:func:`carmel.services.condition_set_bridge.load_condition_set_envelope`
+    and its dataset sibling) are the only thing that refuses a payload of the
+    wrong type, and any caller that needs a TYPE guarantee must go through one.
 
     A hash-correct file can still be adversarially hostile in ways that would
     otherwise crash a naive re-parse rather than fail closed: an oversized
@@ -1027,7 +1085,7 @@ def verify_dataset(root: Path, sha256: str) -> bool:
             hex digest, or if the resolved path would fall outside the resolved
             workspace root.
     """
-    path = dataset_path(root, sha256)
+    path = dataset_path(root, sha256, store_dir=store_dir)
     if not path.exists():
         return False
     raw_bytes = path.read_bytes()
@@ -1049,7 +1107,7 @@ def verify_dataset(root: Path, sha256: str) -> bool:
     return parsed.get(_DECIMAL_REPR_VERSION_KEY) in _RECOGNIZED_DECIMAL_REPR_VERSIONS
 
 
-def list_datasets(root: Path) -> list[str]:
+def list_datasets(root: Path, *, store_dir: str = DATASET_STORE_DIR) -> list[str]:
     """List every dataset sha256 currently held in this workspace's dataset store.
 
     Filenames that don't match the ``<64-hex>.json`` shape are skipped rather
@@ -1072,8 +1130,15 @@ def list_datasets(root: Path) -> list[str]:
         Sorted list of sha256 hex digests for every validly named dataset file
         found. Empty list if the dataset directory does not exist.
     """
+    # Checked here too, not only in `dataset_path`: this is the one entry point
+    # that builds its path without going through it, so a typo'd directory would
+    # otherwise silently enumerate nothing and read as "the store is empty".
+    if store_dir not in _KNOWN_STORE_DIRS:
+        raise ValueError(
+            f"unknown store directory: {store_dir!r} (expected one of {sorted(_KNOWN_STORE_DIRS)})"
+        )
     resolved_root = normalize_path(root)
-    datasets_dir = resolved_root / DATASET_STORE_DIR
+    datasets_dir = resolved_root / store_dir
     try:
         entries = list(datasets_dir.iterdir())
     except OSError:
