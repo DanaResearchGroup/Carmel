@@ -4087,7 +4087,30 @@ def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
 
 
 def _source_graph_identity_payload(graph: SourceGraph) -> dict[str, Any]:
-    return {"nodes": [_source_node_identity_payload(node) for node in graph.nodes]}
+    """Project a :class:`SourceGraph` to its identity-payload shape, with
+    ``nodes`` emitted in ascending ``node_id`` order regardless of the order
+    the model's tuple happens to hold them in.
+
+    The sort is what makes this projection CANONICAL. ``SourceGraph.nodes``
+    is semantically a set -- no validator constrains its order, and no
+    consumer may read meaning into it -- so the same graph is legally
+    constructible with its nodes in any permutation. Projected in tuple
+    order, each of those permutations produced different canonical bytes,
+    i.e. ONE dataset held MANY content addresses: the store's write-once
+    dedup silently stopped deduplicating, and byte-level comparison of two
+    stored payloads could report two "different" datasets that differ in
+    nothing at all. Normalizing here, at the projection, is deliberate --
+    an ordering VALIDATOR on the model field would instead outlaw
+    construction orders that carry no meaning to begin with. The sort key
+    is total and deterministic because ``node_id`` is unique within a graph
+    (enforced by ``SourceGraph``'s own duplicate-id validator).
+    """
+    return {
+        "nodes": [
+            _source_node_identity_payload(node)
+            for node in sorted(graph.nodes, key=lambda node: node.node_id)
+        ]
+    }
 
 
 def _semantic_dependency_use_identity_payload(use: SemanticDependencyUse) -> dict[str, Any]:
@@ -4375,6 +4398,113 @@ escape hatch for a field that is genuinely not addressable (e.g. a derived
 ``@property``), not a shortcut for "forgot to project it". Do not add an
 entry to make the meta-test pass; add the projection instead.
 """
+
+
+_ENVELOPE_TYPE_KEY = "envelope_type"
+"""Top-level identity-payload key naming which envelope class projected the
+payload. Deliberately NOT in the store's reserved ``_carmel_`` namespace:
+the store injects and strips reserved-prefixed keys itself and refuses
+payloads that already carry them, so a discriminator the ENVELOPE must own
+end-to-end (it is part of the addressed bytes) has to live under a plain
+name."""
+
+_IDENTITY_PAYLOAD_VERSION_KEY = "identity_payload_version"
+"""Top-level identity-payload key carrying the projection-schema version.
+Distinct from :attr:`ExtractionBinding.identity_payload_version` (a nested
+FIELD of one projected model); this key versions the ENVELOPE projection
+itself."""
+
+_DATASET_ENVELOPE_TYPE = "dataset"
+"""``envelope_type`` value emitted by :meth:`DatasetEnvelope.identity_payload`."""
+
+_CONDITION_SET_ENVELOPE_TYPE = "condition_set"
+"""``envelope_type`` value emitted by
+:meth:`ConditionSetEnvelope.identity_payload`."""
+
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 1
+"""The one envelope-projection version this module can parse. A payload
+carrying any other version was projected by code this module has never
+seen, so parsing it here could only produce a silently reinterpreted
+envelope."""
+
+
+def _check_identity_payload_discriminator(
+    payload: dict[str, Any], *, expected_envelope_type: str, class_name: str
+) -> None:
+    """Refuse a payload whose self-description does not name
+    ``expected_envelope_type`` at :data:`_SUPPORTED_IDENTITY_PAYLOAD_VERSION`
+    -- the gate both ``from_identity_payload`` classmethods run BEFORE any
+    rehydration or model validation.
+
+    The failure mode this closes: without a discriminator in the stored
+    bytes, nothing says whether a payload is a dataset or a condition set,
+    so a condition-set payload handed to
+    :meth:`DatasetEnvelope.from_identity_payload` (or the reverse) is
+    interpreted purely by field-shape luck -- today the two schemas happen
+    to reject each other, but that is an accident of their current fields,
+    not a guarantee, and the error it produces is an incomprehensible
+    field-level ``ValidationError`` rather than the actual problem ("this
+    is not a dataset at all"). Checking BEFORE model validation is the
+    point: the type mismatch must be reported as a type mismatch, never
+    laundered into (or, worse, silently absorbed by) field validation.
+
+    The version check is the same refusal aimed at time rather than type: a
+    payload projected under a future projection schema must be refused
+    loudly, not parsed by a module that cannot know what its bytes mean.
+    ``bool`` is explicitly excluded even though ``True == 1`` in Python --
+    a payload carrying ``true`` was not written by any version of this
+    projector, and equality alone would wave it through this gate.
+
+    Raises:
+        DatasetEnvelopeParseError: the ``envelope_type`` key is missing or
+            names something other than ``expected_envelope_type``, or the
+            ``identity_payload_version`` key is missing or is not exactly
+            :data:`_SUPPORTED_IDENTITY_PAYLOAD_VERSION`. Every message
+            names both what was expected and what was found.
+    """
+    if _ENVELOPE_TYPE_KEY not in payload:
+        raise DatasetEnvelopeParseError(
+            f"{class_name}.from_identity_payload: payload carries no {_ENVELOPE_TYPE_KEY!r} key -- "
+            f"expected {_ENVELOPE_TYPE_KEY}={expected_envelope_type!r}, found none; a payload that "
+            "does not say what it is cannot be trusted to be this envelope type"
+        )
+    found_type = payload[_ENVELOPE_TYPE_KEY]
+    if found_type != expected_envelope_type:
+        raise DatasetEnvelopeParseError(
+            f"{class_name}.from_identity_payload: payload declares "
+            f"{_ENVELOPE_TYPE_KEY}={found_type!r} but this parser expected "
+            f"{expected_envelope_type!r} -- refusing to reinterpret one envelope type as another"
+        )
+    if _IDENTITY_PAYLOAD_VERSION_KEY not in payload:
+        raise DatasetEnvelopeParseError(
+            f"{class_name}.from_identity_payload: payload carries no "
+            f"{_IDENTITY_PAYLOAD_VERSION_KEY!r} key -- expected version "
+            f"{_SUPPORTED_IDENTITY_PAYLOAD_VERSION!r}, found none"
+        )
+    found_version = payload[_IDENTITY_PAYLOAD_VERSION_KEY]
+    if isinstance(found_version, bool) or found_version != _SUPPORTED_IDENTITY_PAYLOAD_VERSION:
+        raise DatasetEnvelopeParseError(
+            f"{class_name}.from_identity_payload: payload declares "
+            f"{_IDENTITY_PAYLOAD_VERSION_KEY}={found_version!r} but this parser supports exactly "
+            f"version {_SUPPORTED_IDENTITY_PAYLOAD_VERSION!r} -- a payload projected under any "
+            "other version cannot be parsed here without silently reinterpreting it"
+        )
+
+
+def _strip_identity_payload_discriminator(rehydrated: dict[str, Any]) -> dict[str, Any]:
+    """Return ``rehydrated`` without the two discriminator keys, which are
+    projection-only data: they are emitted by ``identity_payload()`` and
+    verified by :func:`_check_identity_payload_discriminator`, but they are
+    not model fields, and both envelope classes are ``extra="forbid"`` --
+    handed through unstripped, ``model_validate`` would reject every
+    well-formed payload. The stage-2 byte comparison still covers them,
+    because the RE-projection puts them back before comparing against the
+    original input."""
+    return {
+        key: value
+        for key, value in rehydrated.items()
+        if key not in (_ENVELOPE_TYPE_KEY, _IDENTITY_PAYLOAD_VERSION_KEY)
+    }
 
 
 class _SourceGraphEnvelope(Protocol):
@@ -4880,8 +5010,20 @@ class DatasetEnvelope(BaseModel):
         Returns a freshly built dict on every call: nothing here is shared
         with ``self`` or with a previous call's return value, so mutating
         the result affects neither this envelope nor a subsequent call.
+
+        The payload is SELF-DESCRIBING: it carries ``envelope_type`` and
+        ``identity_payload_version`` alongside the model fields, so the
+        stored bytes themselves say what they are and under which
+        projection schema they were written. Without those keys, nothing in
+        a stored payload distinguishes a dataset from a condition set --
+        the wrong parser could only be caught by field-shape accident --
+        and no future projection change could ever be told apart from
+        corruption. Both keys are verified (and stripped) by
+        ``from_identity_payload`` before model validation.
         """
         return {
+            _ENVELOPE_TYPE_KEY: _DATASET_ENVELOPE_TYPE,
+            _IDENTITY_PAYLOAD_VERSION_KEY: _SUPPORTED_IDENTITY_PAYLOAD_VERSION,
             "source_graph": _source_graph_identity_payload(self.source_graph),
             "composition": _project_maybe(self.composition, _composition_identity_payload),
             "series": [_series_identity_payload(series) for series in self.series],
@@ -4973,12 +5115,21 @@ class DatasetEnvelope(BaseModel):
             The reconstructed ``DatasetEnvelope``.
 
         Raises:
-            DatasetEnvelopeParseError: the payload contains a malformed
+            DatasetEnvelopeParseError: the payload is missing its
+                discriminator (``envelope_type`` /
+                ``identity_payload_version``), declares another envelope
+                type or an unsupported version, contains a malformed
                 absence marker, fails pydantic validation, or -- after
                 validating -- does not reproduce byte-for-byte under
-                re-projection.
+                re-projection. The discriminator checks run FIRST, before
+                any rehydration or model validation, so a wrong-type
+                payload is refused as a wrong-type payload -- never
+                laundered into a field-level validation error.
         """
-        rehydrated = _rehydrate_identity_payload(payload)
+        _check_identity_payload_discriminator(
+            payload, expected_envelope_type=_DATASET_ENVELOPE_TYPE, class_name=cls.__name__
+        )
+        rehydrated = _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
         try:
             parsed = cls.model_validate(rehydrated)
         except ValidationError as exc:
@@ -5241,8 +5392,16 @@ class ConditionSetEnvelope(BaseModel):
         The one shape unique to this envelope is the subject SUM, which
         projects TAGGED via :func:`_condition_subject_identity_payload` --
         see that helper for why the tag is load-bearing.
+
+        Like its dataset counterpart, the payload is SELF-DESCRIBING:
+        ``envelope_type`` and ``identity_payload_version`` are part of the
+        addressed bytes, so a stored condition set can never be silently
+        parsed as a dataset (or vice versa) -- see
+        :meth:`DatasetEnvelope.identity_payload` for the full rationale.
         """
         return {
+            _ENVELOPE_TYPE_KEY: _CONDITION_SET_ENVELOPE_TYPE,
+            _IDENTITY_PAYLOAD_VERSION_KEY: _SUPPORTED_IDENTITY_PAYLOAD_VERSION,
             "source_graph": _source_graph_identity_payload(self.source_graph),
             "conversion_tables": [
                 _embedded_conversion_table_identity_payload(table) for table in self.conversion_tables
@@ -5283,11 +5442,21 @@ class ConditionSetEnvelope(BaseModel):
         ``ArchiveOrigin.member_display_path`` only).
 
         Raises:
-            DatasetEnvelopeParseError: the payload has a malformed absence
+            DatasetEnvelopeParseError: the payload is missing its
+                discriminator (``envelope_type`` /
+                ``identity_payload_version``), declares another envelope
+                type or an unsupported version, has a malformed absence
                 marker, a missing/unknown subject tag, fails validation, or
-                does not reproduce byte-for-byte under re-projection.
+                does not reproduce byte-for-byte under re-projection. The
+                discriminator checks run FIRST, before any rehydration or
+                model validation -- a dataset payload handed here must be
+                refused as the wrong envelope type, never half-parsed into
+                a subject-tag or field-level error.
         """
-        rehydrated = _rehydrate_identity_payload(payload)
+        _check_identity_payload_discriminator(
+            payload, expected_envelope_type=_CONDITION_SET_ENVELOPE_TYPE, class_name=cls.__name__
+        )
+        rehydrated = _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
         if isinstance(rehydrated, dict) and "subject" in rehydrated:
             rehydrated = {**rehydrated, "subject": _rehydrate_condition_subject(rehydrated["subject"])}
         try:
