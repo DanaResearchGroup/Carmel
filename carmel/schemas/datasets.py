@@ -125,6 +125,7 @@ __all__ = [
     "ExtractedTextVerification",
     "ExtractionBinding",
     "GlyphHealthAssessment",
+    "GroundedCategoricalClaim",
     "GroundedScalarClaim",
     "Maybe",
     "MeasuredValue",
@@ -3241,6 +3242,87 @@ class GroundedScalarClaim(BaseModel):
             where=f"GroundedScalarClaim(claim_id={self.claim_id!r})",
         )
         return self
+
+
+class GroundedCategoricalClaim(BaseModel):
+    """ONE condition a source states as a NAME rather than a number -- "the
+    diluent is CO2", "the bath gas is argon", "the reactor is a heat-flux
+    burner", "the tubing is Teflon".
+
+    Sibling to :class:`GroundedScalarClaim`, not a variant of it: the two
+    share a shape -- a labeled claim with two independently-grounded halves
+    -- because that is the right shape for a labeled claim, not because one
+    specializes the other. No base class joins them, deliberately. Envelope
+    identity here is a hand-written projection naming its keys, so a subclass
+    inheriting one would address two different payloads identically, and in a
+    write-once store that collision is permanent; the seven shared envelope
+    validators above are shared by CALL for the same reason.
+
+    This is not a completeness nicety. A probe of the eight real corpus
+    papers found the diluent IDENTITY -- N2 vs CO2 vs He vs Ar -- is the
+    independent variable in 4 of 8, with the numeric dilution fraction
+    secondary to it. A conditions model that holds only numbers would drop
+    the actual subject of half that corpus, or worse, launder it: record a
+    fraction and silently lose which gas it was a fraction OF.
+
+    ``label_raw``/``label_ref`` and ``token_raw``/``token_ref`` carry
+    INDEPENDENT refs for exactly the reason :class:`MeasuredValue` splits
+    ``value_ref`` from ``unit_ref``: proving the string ``"CO2"`` sits at
+    some located offset can never prove it is the diluent, rather than a
+    product species, a cylinder label printed in the same figure, or another
+    lab's experiment quoted in the discussion. Only an independent ref on
+    the label closes that gap, and even then only as far as "these two spans
+    exist" -- see below for what it still does not prove.
+
+    There is deliberately NO normalized/resolved token field. A
+    :class:`MeasuredValue` may normalize a printed unit because an auditable
+    conversion table with a content hash (``conversion_table_sha256``) backs
+    that normalization end to end. Nothing comparable backs chemical
+    identity: there is no content-addressed table mapping the printed token
+    ``"CO2"`` to a canonical species identity, and inventing one here would
+    fabricate exactly the kind of unearned authority this project exists to
+    refuse. This codebase already has the right home for that problem --
+    :class:`CompositionResolution`, which exists precisely because ``"air"``
+    is an unresolved token in roughly 5 of the 8 corpus papers. Resolving a
+    printed token to a real identity is a separate, auditable step with its
+    own evidence trail; this model is the evidence atom that records only
+    what was PRINTED, and where.
+
+    **What this type does NOT prove, stated plainly rather than implied:**
+    that ``token_raw`` names a real chemical species or apparatus, that
+    ``label_raw`` actually describes ``token_raw``, or that either belongs to
+    THIS experiment rather than one the source merely cites. All three need
+    the extraction gate, which holds the document this model does not; a
+    label and a token located anywhere in a source, in any relation to each
+    other, still construct here.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str
+    label_raw: str = Field(min_length=1)
+    """The name the SOURCE gives this slot, verbatim (e.g. ``"diluent"``,
+    ``"bath gas"``, ``"carrier gas"``, ``"reactor"``) -- never a normalized
+    or invented label."""
+    label_ref: SourceRef
+    """Provenance for the LABEL, independent of the token's. Required and
+    never :class:`Absent`: an ungrounded label is not a weaker claim to
+    record honestly, it is no claim at all."""
+    token_raw: str = Field(min_length=1)
+    """The categorical value as PRINTED in the source (e.g. ``"CO2"``,
+    ``"Ar"``, ``"heat flux method"``, ``"Teflon"``) -- verbatim, never
+    normalized, resolved, or expanded. See class docstring for why no
+    normalized counterpart exists."""
+    token_ref: SourceRef
+    """Provenance for the TOKEN, independent of the label's -- same split,
+    same reason, as ``label_ref``. Required and never :class:`Absent`, for
+    the same reason as ``label_ref``: an ungrounded token is no claim at
+    all."""
+
+    @field_validator("claim_id")
+    @classmethod
+    def _validate_claim_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="claim_id")
 
 
 class EmbeddedConversionTable(BaseModel):
