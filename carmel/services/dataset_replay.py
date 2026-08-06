@@ -239,6 +239,7 @@ __all__ = [
     "ReplayFinding",
     "ReplayOutcome",
     "ReplayReport",
+    "UncheckedClaim",
     "replay_envelope",
     "replay_stored_dataset",
     "verify_measured_value_unit",
@@ -278,6 +279,42 @@ class ReplayFinding:
 
 
 @dataclass(frozen=True)
+class UncheckedClaim:
+    """One carried provenance claim that replay could not check AT ALL.
+
+    Deliberately NOT a :class:`ReplayFinding`, and deliberately not carried in
+    ``ReplayReport.findings`` -- so it can never feed ``ReplayReport.outcome``.
+    That separation is the whole point. "Did the envelope's DATA verify" and
+    "was every provenance claim it carries actually checked" are orthogonal
+    questions, and collapsing them into one field is what made replay silent
+    about an unchecked root-sidecar claim (Codex round 73, P1): an envelope
+    whose ``root_sidecar`` claim was forged and whose root ``meta.json`` was
+    then deleted replayed exactly like one whose claim was checked and held.
+
+    The alternative -- reporting :attr:`ReplayOutcome.UNVERIFIABLE` -- is wrong
+    and was tried and reverted, because it breaks the deliberate contract that
+    a perfect extraction record replays VERIFIED with the root sidecar gone
+    (``TestReplayVerifiesAgainstTheRecordNotTheRootSidecar``). Replay's
+    verification of the data is root-independent by design and must stay so.
+
+    This mirrors the ``checked_char_spans``/``total_char_spans``/
+    ``unchecked_char_spans`` triple below, which exists for exactly this
+    reason: to make a MIXED result legible instead of collapsing it into one
+    outcome that overstates or understates how much was really verified.
+    """
+
+    ref_path: str
+    """Where in the envelope the unchecked claim lives."""
+
+    claim: str
+    """The claim's recorded value, verbatim -- what would have been tested."""
+
+    reason: str
+    """Why the check could not run. Never a disagreement: a disagreement is a
+    FAILED :class:`ReplayFinding`, not an unchecked claim."""
+
+
+@dataclass(frozen=True)
 class ReplayReport:
     """The structured result of replaying one :class:`DatasetEnvelope`.
 
@@ -297,6 +334,13 @@ class ReplayReport:
     total_char_spans: int
     unchecked_char_spans: int
     findings: tuple[ReplayFinding, ...] = ()
+    unchecked_claims: tuple[UncheckedClaim, ...] = ()
+    """Provenance claims replay could not check at all -- see
+    :class:`UncheckedClaim`. Orthogonal to ``outcome`` on purpose: a report may
+    be ``VERIFIED`` and still carry entries here, meaning "the data verified,
+    and this claim about the store was never tested." Reading ``outcome``
+    alone therefore does NOT tell a trust consumer that every carried claim
+    held; it must read this too."""
 
     @property
     def failures(self) -> tuple[ReplayFinding, ...]:
@@ -635,7 +679,23 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
     return NodeVerification(extracted.text, None, False)
 
 
-def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> ReplayFinding | None:
+class RootSidecarClaimCheck(NamedTuple):
+    """The result of putting one node's ``root_sidecar`` claim to the store.
+
+    At most one field is ever non-``None``: the store either contradicted the
+    claim (``finding``), or could not be read to check it (``unchecked``), or
+    agreed with it (both ``None``). They come from ONE function and ONE read of
+    the root tier deliberately -- computing them in two passes would read
+    ``meta.json`` twice, and a root tier that appears between the two reads (or
+    disappears between them) would yield a report claiming both that the check
+    ran and that it could not, or neither.
+    """
+
+    finding: ReplayFinding | None = None
+    unchecked: UncheckedClaim | None = None
+
+
+def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSidecarClaimCheck:
     """Try to REFUTE this node's recorded ``root_sidecar`` claim against the store.
 
     This is the one tier of :class:`~carmel.schemas.datasets.SourceVerification`
@@ -670,7 +730,7 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> Replay
     that the envelope was altered afterwards, hence FAILED.
 
     IT ONLY EVER REFUTES. A root tier that is missing, unreadable or unparseable
-    produces NO finding at all -- not UNVERIFIABLE -- and that is a hard
+    produces NO FINDING at all -- not UNVERIFIABLE -- and that is a hard
     contract rather than a convenience.
     ``TestReplayVerifiesAgainstTheRecordNotTheRootSidecar`` pins it: a perfect
     record must replay VERIFIED with the root sidecar gone, because replay's
@@ -683,44 +743,86 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> Replay
     inability-to-check must never be silently a pass. That reasoning is right in
     general and wrong here, and the existing contract test caught it: failing to
     REFUTE a claim is not the same as failing to VERIFY the evidence. Deleting
-    the root meta buys an attacker nothing either -- the raw bytes and the
-    addressed record still have to authenticate, and those are what the
-    envelope's data actually rests on.
+    the root meta buys an attacker nothing about the DATA either -- the raw
+    bytes and the addressed record still have to authenticate, and those are
+    what the envelope's data actually rests on.
+
+    UNREFUTED IS NOT UNREPORTED, though, and for a while it was. Codex round 73
+    landed the P1: an envelope could claim ``ROOT_SIDECAR_DIGEST_AUTHENTICATED``
+    and then have its root ``meta.json`` deleted or made unreadable, and the
+    resulting report was indistinguishable from one where the claim was checked
+    and held. So an unreadable root tier now yields an :class:`UncheckedClaim`
+    instead of nothing. That is not a finding and does not touch ``outcome`` --
+    the contract above is untouched -- it simply stops the report implying a
+    check that never ran.
 
     Args:
         workspace_root: Root of the campaign workspace holding the store.
         node: The node whose recorded claim is under test.
 
     Returns:
-        A FAILED finding when the store positively contradicts the claim;
-        ``None`` in every other case -- the claim survives, the node carries no
-        verification record, or the root tier could not be read to check.
+        A :class:`RootSidecarClaimCheck` carrying a FAILED finding when the
+        store positively contradicts the claim; an :class:`UncheckedClaim` when
+        the root tier could not be read to check it; and neither when the claim
+        survives or the node carries no verification record at all.
     """
     verification = node.verification
     if isinstance(verification, Absent):
-        return None
+        # Nothing was claimed, so there is nothing to check and nothing left
+        # unchecked. This is NOT an unchecked claim: reporting one here would
+        # mean every pre-``SourceVerification`` envelope grew a permanent
+        # entry naming a claim it never made.
+        return RootSidecarClaimCheck()
     claimed = verification.root_sidecar
     path = f"source_graph.node({node.node_id!r}).verification.root_sidecar"
     try:
         meta = load_artifact_meta(workspace_root, node.sha256)
-    except (OSError, ValueError):
+    except (OSError, ValueError) as exc:
         # NOT a finding. See the contract note in the docstring: a root tier
         # that cannot be read leaves the claim UNREFUTED, which is a fact about
-        # this workspace and not a defect of the envelope.
-        return None
+        # this workspace and not a defect of the envelope. It is reported as
+        # unchecked so that fact is visible rather than silent.
+        return RootSidecarClaimCheck(
+            unchecked=_unchecked_root_claim(
+                path, node, claimed, f"root meta.json could not be read ({type(exc).__name__})"
+            )
+        )
     if meta is None:
-        return None
+        return RootSidecarClaimCheck(
+            unchecked=_unchecked_root_claim(path, node, claimed, "root meta.json is absent")
+        )
     actual = _recompute_root_sidecar_claim(workspace_root, node.sha256, meta)
     if actual is claimed:
-        return None
-    return ReplayFinding(
-        category=ReplayOutcome.FAILED,
+        return RootSidecarClaimCheck()
+    return RootSidecarClaimCheck(
+        finding=ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path,
+            reason=f"node {node.node_id!r} claims root_sidecar={claimed.value}, but recomputing "
+            f"that claim against the store yields {actual.value}. Root sidecars are never "
+            "rewritten, so the claim was false when it was made or the envelope was altered "
+            "afterwards",
+            expected=actual.value,
+            actual=claimed.value,
+        )
+    )
+
+
+def _unchecked_root_claim(
+    path: str, node: SourceNode, claimed: RootSidecarVerification, why: str
+) -> UncheckedClaim:
+    """Build the :class:`UncheckedClaim` for a root tier that could not be read.
+
+    Names the artifact sha256 as well as the node id: a reader holding only the
+    report needs to know WHICH artifact's root tier was unreachable in order to
+    go look, and the node id alone does not say.
+    """
+    return UncheckedClaim(
         ref_path=path,
-        reason=f"node {node.node_id!r} claims root_sidecar={claimed.value}, but recomputing that "
-        f"claim against the store yields {actual.value}. Root sidecars are never rewritten, so "
-        "the claim was false when it was made or the envelope was altered afterwards",
-        expected=actual.value,
-        actual=claimed.value,
+        claim=claimed.value,
+        reason=f"node {node.node_id!r} claims root_sidecar={claimed.value}, but that claim could "
+        f"not be checked: {why} for artifact {node.sha256}. The claim is neither confirmed nor "
+        "refuted -- it was never tested",
     )
 
 
@@ -1329,6 +1431,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     node_problems: dict[str, ReplayFinding] = {}
     node_level_problems: dict[str, ReplayFinding] = {}
     claim_findings: list[ReplayFinding] = []
+    unchecked_claims: list[UncheckedClaim] = []
     for node in envelope.source_graph.nodes:
         text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
         if problem is not None:
@@ -1343,9 +1446,11 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         # provenance claim is most likely to be hiding, and refuting the claim
         # needs nothing the text check produces -- suppressing it on failure
         # would drop the check precisely when it matters most.
-        claim_finding = _refute_root_sidecar_claim(workspace_root, node)
-        if claim_finding is not None:
-            claim_findings.append(claim_finding)
+        claim_check = _refute_root_sidecar_claim(workspace_root, node)
+        if claim_check.finding is not None:
+            claim_findings.append(claim_check.finding)
+        if claim_check.unchecked is not None:
+            unchecked_claims.append(claim_check.unchecked)
 
     checked, total_char_spans, span_findings = check_char_spans(
         envelope, text_by_node_id, node_problems, reveal_text=reveal_text
@@ -1412,6 +1517,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         total_char_spans=total_char_spans,
         unchecked_char_spans=total_char_spans - checked,
         findings=all_findings,
+        unchecked_claims=tuple(unchecked_claims),
     )
 
 

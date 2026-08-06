@@ -1881,6 +1881,49 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         assert not [f for f in report.findings if "root_sidecar" in f.ref_path]
         assert report.outcome is ReplayOutcome.VERIFIED
 
+    def test_an_unreadable_root_meta_is_reported_as_an_unchecked_claim(
+        self, tmp_path: Path
+    ) -> None:
+        """Unrefuted must not mean unreported (Codex round 73, P1).
+
+        The test above pins that a missing root tier does not degrade the
+        OUTCOME, and that is right: replay's verification of the data is
+        root-independent. But it left replay completely SILENT about a claim it
+        never checked, so an envelope whose ``root_sidecar`` claim was forged
+        and whose root ``meta.json`` was then deleted produced a report
+        indistinguishable from one where the claim was checked and held.
+
+        Those are two orthogonal questions -- did the data verify, and was every
+        carried provenance claim actually checked -- and this asserts they are
+        now reported separately. ``unchecked_claims`` is deliberately NOT a
+        :class:`ReplayFinding`, so it cannot feed ``outcome`` and the pinned
+        contract above survives untouched."""
+        stored = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, stored)
+        (artifact_dir(tmp_path, stored.sha256) / "meta.json").unlink()
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert len(report.unchecked_claims) == 1
+        unchecked = report.unchecked_claims[0]
+        assert unchecked.ref_path.endswith(".verification.root_sidecar")
+        assert stored.sha256 in unchecked.reason or "root" in unchecked.reason
+
+    def test_a_readable_root_meta_leaves_no_unchecked_claim(self, tmp_path: Path) -> None:
+        """Counterweight. This one passes by construction on the CURRENT code
+        as well (nothing populates ``unchecked_claims`` yet), so it is not
+        evidence on its own -- it exists to pin that the new reporting fires
+        ONLY when the root tier genuinely could not be read, and it is what
+        kills the "emit for every node" mutation."""
+        stored = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, stored)
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.unchecked_claims == ()
+
 
 class TestProducerNodeKind:
     """P1-C: the root SourceNode's ``kind`` must be derived honestly from the

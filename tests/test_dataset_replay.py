@@ -1943,6 +1943,33 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         # complaint -- only the text-dependent label_ref check may complain.
         assert not any("has no ExtractionBinding" in r for r in reasons), reasons
 
+    def test_a_node_that_claims_nothing_leaves_no_unchecked_claim(
+        self, tmp_path: Path
+    ) -> None:
+        """A node with ``verification=Absent`` made no claim, so there is
+        nothing to check and nothing left unchecked.
+
+        This exists because a mutation audit found the gap: nothing pinned that
+        ``unchecked_claims`` stays empty for a node carrying no
+        ``SourceVerification`` at all. Emitting one there would give every
+        pre-``SourceVerification`` envelope -- and every legitimate
+        `FIGURE_CROP`, which is what this crop node is -- a permanent entry
+        naming a claim it never made. That is noise, and a provenance field
+        readers learn to ignore is the exact decoration failure the whole
+        ``SourceVerification`` design was built to avoid.
+
+        The crop is the ONLY node here without a verification record; the root
+        has one and its root tier is readable, so an empty tuple pins both
+        halves at once."""
+        stored_artifact, loaded = _produce_and_load(tmp_path)
+        envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
+        crop = envelope.source_graph.nodes[1]
+        assert isinstance(crop.verification, Absent), "fixture drift: the crop must claim nothing"
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.unchecked_claims == ()
+
     def test_mixed_text_and_bbox_envelope_rejects_a_fabricated_label(
         self, tmp_path: Path
     ) -> None:

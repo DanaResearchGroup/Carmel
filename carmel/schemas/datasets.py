@@ -816,7 +816,17 @@ class RootSidecarVerification(StrEnum):
     design removed, and would block a dataset whose raw bytes and grounded text
     are both fully authenticated. Surfacing the damage in the envelope is the
     honest handling; deciding what to do about it belongs to whoever reads the
-    envelope, not to the producer."""
+    envelope, not to the producer.
+
+    DO NOT READ THIS AS BENIGN VERSION DRIFT. It is tempting to explain a
+    mismatch away as "a different pypdf wrote that sidecar", and Codex round 73
+    was right to push back: root sidecars are never rewritten, so a mismatch
+    means the recorded digest does not match the bytes sitting there NOW --
+    damage or tampering at the root tier, not a vintage difference. It is
+    recorded rather than raised only because that tier is not the one this
+    envelope's evidence rests on. Any downstream policy that maps a whole
+    :class:`SourceVerification` onto a single "verified" boolean will get this
+    wrong; the tier has to be read on its own."""
 
     NO_RECORDED_DIGEST = "no_recorded_digest"
     """The artifact's root ``meta.json`` records ``extracted_sha256=None``: it
@@ -849,6 +859,18 @@ class SourceVerification(BaseModel):
     be decoration, and this codebase has already carried provenance nobody read
     for long enough to find the same stale "no consumer reads this yet" comment
     in four separate places.
+
+    FALSIFIABLE IS NOT THE SAME AS ALWAYS CHECKED, and this docstring used to
+    blur the two (Codex round 73). ``raw_artifact`` and ``extracted_text`` are
+    re-derived from bytes on every replay, so those are always checked. The
+    ``root_sidecar`` claim is checked only when the root tier can actually be
+    read: replay never treats an unreadable root ``meta.json`` as a failure,
+    because its verification of the DATA is root-independent by design. What it
+    no longer does is stay SILENT about it -- a claim it could not check is
+    reported on the replay report as a
+    :class:`~carmel.services.dataset_replay.UncheckedClaim`, orthogonal to
+    ``outcome``. A reader who wants "every carried claim held" must therefore
+    read both: ``outcome is VERIFIED`` alone does not say that.
 
     Note what is NOT here: any claim that the extracted text was derived from
     the raw bytes. See :class:`ExtractedTextVerification` for why no component
