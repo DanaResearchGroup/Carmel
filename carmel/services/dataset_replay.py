@@ -208,6 +208,7 @@ from carmel.schemas.datasets import (
     CharSpanLocator,
     DatasetEnvelope,
     MeasuredValue,
+    RootSidecarVerification,
     SourceNode,
     iter_measured_values,
     iter_source_refs,
@@ -218,7 +219,7 @@ from carmel.services.dataset_producer import (
     _unit_table_boundary_violation,
     binding_for_known_sha,
 )
-from carmel.services.evidence import artifact_dir
+from carmel.services.evidence import artifact_dir, load_artifact_meta
 from carmel.services.extraction_record import (
     ExtractionRecordError,
     extraction_record_dir,
@@ -327,13 +328,21 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
     """Re-derive ``node``'s extracted text from the evidence store, from
     bytes, independent of anything the envelope itself carries.
 
-    Mirrors the exact re-read/re-verify shape used elsewhere in this
-    codebase (``dataset_producer._load_verified_extracted_text``,
-    the test-local ``_independently_verified_text`` this module replaces):
-    read ``extracted.json`` bytes off disk, verify them against the digest
-    :class:`StoredArtifact` recorded at store time, parse, and only then
-    hash the parsed text and compare against the RECORDED
-    ``extracted_text_sha256``.
+    Reads the ``extracted.json`` bytes belonging to the extraction record the
+    node's own :class:`ExtractionBinding` ADDRESSES, verifies them against the
+    digest that binding carries, parses, and only then hashes the parsed text
+    and compares against the RECORDED ``extracted_text_sha256``.
+
+    This docstring used to say it mirrored
+    ``dataset_producer._load_verified_extracted_text`` and verified bytes
+    "against the digest :class:`StoredArtifact` recorded at store time" -- i.e.
+    the ROOT sidecar and the root ``meta.json``. That was stale: this function
+    has not touched either since it began resolving the addressed record, and
+    the producer helper it named no longer exists. The distinction is the whole
+    security argument below (see the anchor comment before the
+    ``extracted_sha256`` comparison): a sidecar sitting next to the file it
+    would authenticate is trivially rewritten by anyone who can write to the
+    store, so the envelope's own binding is the only acceptable anchor.
 
     The node's bytes are checked FIRST and unconditionally: every node
     admitted into a VERIFIED envelope must have ``raw.bin`` present and
@@ -623,6 +632,88 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
             False,
         )
     return NodeVerification(extracted.text, None, False)
+
+
+def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> ReplayFinding | None:
+    """Try to REFUTE this node's recorded ``root_sidecar`` claim against the store.
+
+    This is the one tier of :class:`~carmel.schemas.datasets.SourceVerification`
+    that replay cannot otherwise see. The other two are already re-derived from
+    bytes by :func:`_independently_verify_node_text`, which re-hashes ``raw.bin``
+    and re-verifies the addressed extraction record -- so an envelope lying about
+    either of them fails there, on evidence, and a carried claim adds nothing.
+    Nothing anywhere else in this module reads the ROOT ``meta.json``, by design:
+    the root sidecar is not evidence and is never an anchor. Which leaves a
+    genuine gap -- a claim about the root tier that no consumer could contradict
+    is decoration, and decoration is exactly how provenance nobody reads gets
+    into a codebase.
+
+    So this function reads root ``meta.json`` for ONE purpose: refutation. It
+    never authenticates anything, and its result never licenses trusting any
+    text.
+
+    Only ``NO_RECORDED_DIGEST`` is refutable, and deliberately so. It is a
+    positive claim ABOUT THE STORE -- "this artifact's root meta records
+    ``extracted_sha256=None``, so its sidecar cannot be authenticated by anyone,
+    ever" -- and that is stable, because root sidecars are never rewritten (see
+    :mod:`carmel.services.reextraction`, which writes only under
+    ``extractions/``). If the artifact does carry a digest, the claim was false
+    when made or the envelope was altered after; either way it is positive
+    evidence of disagreement, hence FAILED.
+
+    ``NOT_CHECKED`` is NOT refutable and is not treated as though it were. It
+    records what the producer chose to do, not a fact about the store, and no
+    later inspection can contradict a choice. Reporting it as verified would be
+    the assertion-for-observation conflation this codebase keeps having to
+    unwind; saying nothing is the honest handling.
+
+    Args:
+        workspace_root: Root of the campaign workspace holding the store.
+        node: The node whose recorded claim is under test.
+
+    Returns:
+        ``None`` when nothing was refuted (including every case where the claim
+        is not the refutable one, or the node carries no verification record at
+        all), a FAILED finding when the store positively contradicts the claim,
+        or an UNVERIFIABLE finding when the root ``meta.json`` could not be read
+        to check -- inability to check is never silently a pass.
+    """
+    verification = node.verification
+    if isinstance(verification, Absent):
+        return None
+    if verification.root_sidecar is not RootSidecarVerification.NO_RECORDED_DIGEST:
+        return None
+    path = f"source_graph.node({node.node_id!r}).verification.root_sidecar"
+    try:
+        meta = load_artifact_meta(workspace_root, node.sha256)
+    except (OSError, ValueError) as exc:
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"node {node.node_id!r} claims root_sidecar=no_recorded_digest, but this "
+            f"artifact's root meta.json could not be read to check it: {exc}",
+        )
+    if meta is None:
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path,
+            reason=f"node {node.node_id!r} claims root_sidecar=no_recorded_digest, but no readable "
+            f"root meta.json exists for sha256={node.sha256!r} in this workspace, so the claim "
+            "can be neither confirmed nor refuted here",
+        )
+    if meta.extracted_sha256 is not None:
+        return ReplayFinding(
+            category=ReplayOutcome.FAILED,
+            ref_path=path,
+            reason=f"node {node.node_id!r} claims root_sidecar=no_recorded_digest -- that its root "
+            "sidecar predates extracted_sha256 and so can never be authenticated -- but the "
+            "artifact's root meta.json DOES record an extracted_sha256. Root sidecars are never "
+            "rewritten, so the claim was false when it was made or the envelope was altered "
+            "afterwards",
+            expected="root meta.json with extracted_sha256=None",
+            actual=f"root meta.json with extracted_sha256={meta.extracted_sha256!r}",
+        )
+    return None
 
 
 def _redacted(text: str, locator: CharSpanLocator | None = None) -> str:
@@ -1206,6 +1297,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     text_by_node_id: dict[str, str] = {}
     node_problems: dict[str, ReplayFinding] = {}
     node_level_problems: dict[str, ReplayFinding] = {}
+    claim_findings: list[ReplayFinding] = []
     for node in envelope.source_graph.nodes:
         text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
         if problem is not None:
@@ -1215,6 +1307,14 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         else:
             assert text is not None
             text_by_node_id[node.node_id] = text
+        # Runs for EVERY node, including one whose text verification just
+        # failed. A node that cannot be re-verified is exactly where a forged
+        # provenance claim is most likely to be hiding, and refuting the claim
+        # needs nothing the text check produces -- suppressing it on failure
+        # would drop the check precisely when it matters most.
+        claim_finding = _refute_root_sidecar_claim(workspace_root, node)
+        if claim_finding is not None:
+            claim_findings.append(claim_finding)
 
     checked, total_char_spans, span_findings = check_char_spans(
         envelope, text_by_node_id, node_problems, reveal_text=reveal_text
@@ -1246,7 +1346,9 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # carries it for that purpose.
     node_level_findings = tuple(node_level_problems.values())
 
-    all_findings = tuple(span_findings) + tuple(unit_findings) + node_level_findings
+    all_findings = (
+        tuple(span_findings) + tuple(unit_findings) + node_level_findings + tuple(claim_findings)
+    )
 
     # A replay that independently re-sliced ZERO character spans must never
     # report VERIFIED: that would launder the "verified" label onto an

@@ -26,6 +26,7 @@ from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.datasets import (
     Absent,
     AxisRole,
+    DatasetEnvelope,
     ExtractedTextVerification,
     ExtractionBinding,
     RawArtifactVerification,
@@ -90,8 +91,17 @@ def _store_synthetic_artifact(
     content_type: str = "application/pdf",
     extractor: str = "pdf:pypdf",
     lossy: bool = False,
+    record_text: str | None = None,
 ) -> StoredArtifact:
-    """Store a synthetic artifact through the REAL evidence.store_artifact API."""
+    """Store a synthetic artifact through the REAL evidence.store_artifact API.
+
+    ``record_text`` lets a test store an extraction record whose text DIFFERS
+    from the root sidecar's. By default the two are identical, which is what a
+    real store looks like -- but identical text also means a test cannot tell
+    which tier the producer actually read, so every assertion about
+    record-grounded behaviour would pass just as well against the root. Any
+    test that claims to pin the tier must diverge them.
+    """
     data = text.encode("utf-8")
     artifact = FetchedArtifact(
         url="https://example.org/synthetic.pdf",
@@ -107,7 +117,17 @@ def _store_synthetic_artifact(
     stored = store_artifact(
         workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
     )
-    _store_genuine_extraction_record(workspace_root, stored.sha256, extracted)
+    if record_text is None:
+        record_extracted = extracted
+    else:
+        record_extracted = ExtractedText(
+            text=record_text,
+            normalized=record_text.casefold(),
+            sections=[],
+            extractor=extractor,
+            lossy=lossy,
+        )
+    _store_genuine_extraction_record(workspace_root, stored.sha256, record_extracted)
     return stored
 
 
@@ -1677,6 +1697,152 @@ class TestProducerFailClosed:
                 value_origin=ValueOrigin.EXPERIMENTAL,
                 measurements=_SPECS,
             )
+
+
+class TestGroundingReadsTheRecordAndNotTheRoot:
+    """Pin WHICH TIER the producer grounds against, by making the two disagree.
+
+    Until this class existed, every fixture stored an extraction record built
+    from the same ``ExtractedText`` as the root sidecar. With identical text on
+    both tiers, an assertion about record-grounded behaviour is satisfied just
+    as well by a producer reading the root -- so the whole record-grounding
+    guarantee was, in test terms, unpinned. Diverging the two texts is the only
+    thing that can tell them apart.
+    """
+
+    _ROOT_ONLY = (
+        "The reactor was held at a temperature of 4444 K while the measured "
+        "mole fraction (-) of the fuel species was 0.4444 at steady state."
+    )
+
+    def test_a_quote_present_only_in_the_record_grounds(self, tmp_path: Path) -> None:
+        """``_TEXT``'s quotes live only in the RECORD here; the root sidecar
+        holds different numbers entirely. Grounding succeeds, so the text came
+        from the record."""
+        stored = _store_synthetic_artifact(tmp_path, self._ROOT_ONLY, record_text=_TEXT)
+
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+
+        assert len(envelope.series) == 1
+
+    def test_a_quote_present_only_in_the_root_does_not_ground(self, tmp_path: Path) -> None:
+        """The counterweight, and the half that actually proves the tier: quote
+        the ROOT's numbers instead. If the producer were reading the root
+        sidecar these would ground cleanly; they must not."""
+        stored = _store_synthetic_artifact(tmp_path, self._ROOT_ONLY, record_text=_TEXT)
+        root_only_specs = (
+            MeasurementSpec(
+                axis_id="temperature",
+                role=AxisRole.COORDINATE,
+                quantity_kind=QuantityKind.TEMPERATURE,
+                label_quote="temperature",
+                value_quote="4444",
+                unit_quote="K",
+            ),
+            MeasurementSpec(
+                axis_id="mole_fraction",
+                role=AxisRole.OBSERVATION,
+                quantity_kind=QuantityKind.MOLE_FRACTION,
+                label_quote="mole fraction",
+                value_quote="0.4444",
+                unit_quote="-",
+            ),
+        )
+
+        with pytest.raises(QuoteGroundingError, match="not found"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=root_only_specs,
+            )
+
+
+class TestReplayRefutesAForgedRootSidecarClaim:
+    """The recorded per-tier claim must be FALSIFIABLE, or it is decoration.
+
+    ``NO_RECORDED_DIGEST`` asserts something about the store -- that the root
+    meta records no ``extracted_sha256``, so nobody can ever authenticate that
+    sidecar. Replay checks it. ``NOT_CHECKED`` asserts what the producer chose
+    to do and is deliberately not checkable; see ``_refute_root_sidecar_claim``.
+    """
+
+    @staticmethod
+    def _legacy_artifact(tmp_path: Path) -> StoredArtifact:
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        legacy = meta.model_copy(
+            update={
+                "extracted_sha256": None,
+                "derivation_binding": None,
+                "extractor_version": None,
+            }
+        )
+        meta_path.write_text(legacy.model_dump_json())
+        return stored
+
+    def _envelope(self, tmp_path: Path, stored: StoredArtifact) -> DatasetEnvelope:
+        return produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+
+    def test_an_honest_claim_replays_clean(self, tmp_path: Path) -> None:
+        """The counterweight. Without it, a check that flagged EVERY envelope
+        would pass the refutation test below and look correct."""
+        stored = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, stored)
+        node = envelope.source_graph.nodes[0]
+        assert not isinstance(node.verification, Absent)
+        assert node.verification.root_sidecar is RootSidecarVerification.NO_RECORDED_DIGEST
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert not [f for f in report.findings if "root_sidecar" in f.ref_path]
+
+    def test_a_claim_the_store_contradicts_is_reported_failed(self, tmp_path: Path) -> None:
+        """Restore the root meta's ``extracted_sha256`` AFTER production. The
+        envelope still claims the sidecar could never be authenticated; the
+        store now says otherwise, and that disagreement is positive evidence,
+        not inability to check -- so FAILED, never UNVERIFIABLE."""
+        stored = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, stored)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        meta_path.write_text(meta.model_copy(update={"extracted_sha256": "a" * 64}).model_dump_json())
+
+        report = replay_envelope(tmp_path, envelope)
+
+        refutations = [f for f in report.findings if "root_sidecar" in f.ref_path]
+        assert len(refutations) == 1
+        assert refutations[0].category is ReplayOutcome.FAILED
+        assert report.outcome is ReplayOutcome.FAILED
+
+    def test_an_unreadable_root_meta_is_unverifiable_not_failed(self, tmp_path: Path) -> None:
+        """Inability to check is never silently a pass, and never a FAILURE
+        either: deleting the root meta destroys the evidence that would settle
+        the claim, which says nothing about whether the claim was true. The two
+        outcomes must not conflate."""
+        stored = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, stored)
+        (artifact_dir(tmp_path, stored.sha256) / "meta.json").unlink()
+
+        report = replay_envelope(tmp_path, envelope)
+
+        refutations = [f for f in report.findings if "root_sidecar" in f.ref_path]
+        assert len(refutations) == 1
+        assert refutations[0].category is ReplayOutcome.UNVERIFIABLE
 
 
 class TestProducerNodeKind:
