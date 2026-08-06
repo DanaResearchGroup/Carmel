@@ -206,15 +206,20 @@ from carmel.agents.tools.extract import ExtractedText
 from carmel.schemas.datasets import (
     Absent,
     CharSpanLocator,
+    ConditionSetEnvelope,
     DatasetEnvelope,
+    DeviceClassDeclaration,
     MeasuredValue,
     RootSidecarVerification,
     SourceNode,
+    SourceRef,
+    UnresolvedSubject,
     iter_measured_values,
     iter_source_refs,
 )
 from carmel.schemas.literature import StoredArtifact
 from carmel.services import units
+from carmel.services.condition_set_bridge import load_condition_set_envelope
 from carmel.services.dataset_bridge import load_dataset_envelope
 from carmel.services.dataset_producer import (
     _unit_table_boundary_violation,
@@ -242,7 +247,9 @@ __all__ = [
     "SemanticGap",
     "UncheckedSemanticClaim",
     "UncheckedStoreClaim",
+    "replay_condition_set",
     "replay_envelope",
+    "replay_stored_condition_set",
     "replay_stored_dataset",
     "verify_measured_value_unit",
     "verify_measured_value_unit_boundary",
@@ -1347,6 +1354,185 @@ def _dataset_text_pairings(envelope: DatasetEnvelope) -> Iterator[_TextPairing]:
             )
 
 
+def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_TextPairing]:
+    """Enumerate, BY HAND, every grounding PAIR a :class:`ConditionSetEnvelope`
+    exposes -- i.e. every ``SourceRef`` beside a recorded verbatim string it
+    is supposed to ground. Deliberately excludes the THREE ref locations that
+    are not pairs at all (``attribution_ref``, ``subject.reason_ref``,
+    ``unextracted[*].statement_ref``) -- see :func:`replay_condition_set`'s
+    own semantic-obligation enumerator for those.
+
+    Hand-written and NOT derived from :func:`iter_source_refs`, for exactly
+    the reason :func:`_dataset_text_pairings` gives: a check is only
+    independent of the thing it checks when the two are written separately.
+
+    ``subject`` is a SUM type (:class:`DeviceClassDeclaration` |
+    :class:`UnresolvedSubject`) and the two arms are MUTUALLY EXCLUSIVE:
+    only the ``DeviceClassDeclaration`` arm contributes a pair here
+    (``subject.label_ref``); the ``UnresolvedSubject`` arm's ``reason_ref``
+    is unpaired and handled by the semantic-obligation enumerator instead.
+    """
+    if isinstance(envelope.subject, DeviceClassDeclaration):
+        yield _TextPairing(
+            "subject.label_ref",
+            envelope.subject.label_ref.node_id,
+            envelope.subject.label_ref.locator,
+            envelope.subject.label_raw,
+            uncompensated_fields=("label_ref", "label_raw"),
+        )
+    yield from _measured_value_text_pairings(envelope)
+    for index, claim in enumerate(envelope.scalar_claims):
+        yield _TextPairing(
+            f"scalar_claims[{index}].label_ref",
+            claim.label_ref.node_id,
+            claim.label_ref.locator,
+            claim.label_raw,
+            uncompensated_fields=("label_ref", "label_raw"),
+        )
+    for index, categorical_claim in enumerate(envelope.categorical_claims):
+        yield _TextPairing(
+            f"categorical_claims[{index}].label_ref",
+            categorical_claim.label_ref.node_id,
+            categorical_claim.label_ref.locator,
+            categorical_claim.label_raw,
+            uncompensated_fields=("label_ref", "label_raw"),
+        )
+        yield _TextPairing(
+            f"categorical_claims[{index}].token_ref",
+            categorical_claim.token_ref.node_id,
+            categorical_claim.token_ref.locator,
+            categorical_claim.token_raw,
+            uncompensated_fields=("token_ref", "token_raw"),
+        )
+    for index, statement in enumerate(envelope.unextracted):
+        yield _TextPairing(
+            f"unextracted[{index}].label_ref",
+            statement.label_ref.node_id,
+            statement.label_ref.locator,
+            statement.label_raw,
+            uncompensated_fields=("label_ref", "label_raw"),
+        )
+
+
+def _semantic_ref_gap(
+    ref: SourceRef,
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding] | None = None,
+) -> SemanticGap:
+    """Classify how much a REF-ONLY obligation (one with no recorded
+    counterpart text to compare against -- see :func:`replay_condition_set`)
+    is actually known to be true, independent of the derived value it is
+    cited as supporting.
+
+    Returns :attr:`SemanticGap.LOCATION_UNRESOLVED` when the span itself
+    could not be independently re-sliced at all: the locator is not even a
+    :class:`CharSpanLocator`, the node it targets has a store-integrity
+    problem, the node's text was never independently verified, or the
+    recorded offsets do not fit inside that re-verified text. Returns
+    :attr:`SemanticGap.SUPPORT_UNRECORDED` only once the span itself is
+    confirmed to re-slice cleanly -- STRICTLY MORE is known there than in
+    the ``LOCATION_UNRESOLVED`` case, but still nothing that says the span
+    MEANS the derived value, because (by construction, for these three ref
+    locations) nothing was ever recorded to compare it against.
+    """
+    node_problems = node_problems or {}
+    if not isinstance(ref.locator, CharSpanLocator):
+        return SemanticGap.LOCATION_UNRESOLVED
+    if ref.node_id in node_problems:
+        return SemanticGap.LOCATION_UNRESOLVED
+    text = text_by_node_id.get(ref.node_id)
+    if text is None:
+        return SemanticGap.LOCATION_UNRESOLVED
+    if not (0 <= ref.locator.start <= ref.locator.end <= len(text)):
+        return SemanticGap.LOCATION_UNRESOLVED
+    return SemanticGap.SUPPORT_UNRECORDED
+
+
+def _condition_set_semantic_claims(
+    envelope: ConditionSetEnvelope,
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding] | None = None,
+) -> tuple[UncheckedSemanticClaim, ...]:
+    """Enumerate, BY HAND, every SEMANTIC obligation a
+    :class:`ConditionSetEnvelope` imposes -- the three ref locations that are
+    NOT grounding pairs (see :func:`_condition_set_text_pairings`'s
+    docstring): a located span exists, but nothing recorded says the span
+    MEANS the derived value it is cited to support.
+
+    ``attribution_ref`` is unconditionally present on every legal envelope,
+    so this always yields at least one claim -- see
+    :func:`replay_condition_set`'s docstring for why ``overall_outcome`` is
+    therefore UNVERIFIABLE for every condition set, by design.
+    """
+    claims: list[UncheckedSemanticClaim] = []
+    claims.append(
+        UncheckedSemanticClaim(
+            claim_path="attribution",
+            claim=envelope.attribution.value,
+            gap=_semantic_ref_gap(envelope.attribution_ref, text_by_node_id, node_problems),
+            reason="attribution_ref locates the span the attribution assertion was read from, "
+            "but no recorded text stands beside it to compare against -- grounding a span proves "
+            "only that the span exists, never that it means the asserted attribution",
+            support_paths=("attribution_ref",),
+        )
+    )
+    if isinstance(envelope.subject, UnresolvedSubject):
+        claims.append(
+            UncheckedSemanticClaim(
+                claim_path="subject",
+                claim=envelope.subject.reason.value,
+                gap=_semantic_ref_gap(envelope.subject.reason_ref, text_by_node_id, node_problems),
+                reason="subject.reason_ref locates the span the refusal reason was read from, but "
+                "no recorded text stands beside it to compare against",
+                support_paths=("subject.reason_ref",),
+            )
+        )
+    for index, statement in enumerate(envelope.unextracted):
+        claims.append(
+            UncheckedSemanticClaim(
+                claim_path=f"unextracted[{index}]",
+                claim=statement.reason.value,
+                gap=_semantic_ref_gap(statement.statement_ref, text_by_node_id, node_problems),
+                reason=f"unextracted[{index}].statement_ref locates the span the statement was "
+                "read from, but by design nothing is ever recorded to compare it against -- the "
+                "statement was deliberately not turned into a claim",
+                support_paths=(f"unextracted[{index}].statement_ref",),
+            )
+        )
+    return tuple(claims)
+
+
+def _reconcile_condition_set_refs(
+    envelope: ConditionSetEnvelope,
+    named_paths: set[str],
+) -> tuple[ReplayFinding, ...]:
+    """Reconcile every path :func:`_condition_set_text_pairings` and the
+    semantic-obligation enumerator TOGETHER claim to have named against a
+    generic, independent walk of the envelope.
+
+    Written as a genuinely SEPARATE step from both enumerators above -- not
+    derived from either -- so this is only an independent check because it
+    is not the same code as the thing it checks (the contract's own framing:
+    "a report cannot police its own producer, so the producer must police
+    itself against an inventory"). Fails loudly, per unnamed path, rather
+    than aggregating into one opaque count.
+    """
+    findings: list[ReplayFinding] = []
+    for path, _ref in iter_source_refs(envelope):
+        if path not in named_paths:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=path,
+                    reason="iter_source_refs reaches this SourceRef but neither the "
+                    "condition-set pairing enumerator nor any UncheckedSemanticClaim's "
+                    "support_paths names it -- an obligation this envelope imposes was never "
+                    "discharged",
+                )
+            )
+    return tuple(findings)
+
+
 def _replay_text_pairings(
     envelope: object,
     pairings: Iterator[_TextPairing],
@@ -1354,6 +1540,7 @@ def _replay_text_pairings(
     node_problems: Mapping[str, ReplayFinding] | None = None,
     *,
     reveal_text: bool = False,
+    audit_against_source_refs: bool = True,
 ) -> tuple[int, int, list[ReplayFinding]]:
     """The evidence kernel: re-slice each pairing and compare, then audit
     the enumeration that produced them against a generic walk of ``envelope``.
@@ -1365,6 +1552,24 @@ def _replay_text_pairings(
     checked. The public surface stays concrete -- :func:`check_char_spans`
     and the ``replay_*`` entry points -- so every report is anchored to a
     named envelope type.
+
+    ``audit_against_source_refs`` (default ``True``, unchanged for every
+    existing dataset call site) gates the internal
+    ``accounted_for == total_char_span_refs`` self-audit below. That audit
+    assumes every ``CharSpanLocator`` reachable via :func:`iter_source_refs`
+    is either checked here or turned into a finding here -- true for a
+    :class:`DatasetEnvelope`, where every char-span ref is paired, but FALSE
+    for a :class:`ConditionSetEnvelope`, which has char-span refs
+    (``attribution_ref``, ``subject.reason_ref``,
+    ``unextracted[*].statement_ref``) that are legitimately UNPAIRED -- no
+    recorded text stands beside them to compare against. Passing ``False``
+    skips that audit and reports ``total_char_span_refs`` as simply
+    ``checked + len(findings)`` (i.e. exactly what THIS pairing set
+    accounted for); the caller is then responsible for its own, separately
+    written reconciliation against the full set of paths -- see
+    :func:`replay_condition_set`. This keeps the reconciliation an
+    independent check rather than folding it into the same audit this
+    function already performs for datasets.
     """
     node_problems = node_problems or {}
     checked = 0
@@ -1431,22 +1636,25 @@ def _replay_text_pairings(
             continue
         checked += 1
 
-    total_char_span_refs = sum(
-        1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
-    )
     accounted_for = checked + len(findings)
-    if accounted_for != total_char_span_refs:
-        findings.append(
-            ReplayFinding(
-                category=ReplayOutcome.FAILED,
-                ref_path="<iter_source_refs walk>",
-                reason=f"replayer accounted for {accounted_for} char-span ref(s) but "
-                f"iter_source_refs finds {total_char_span_refs} reachable in the envelope; some "
-                "CharSpanLocator is reachable that this replayer's field-by-field pairing never "
-                "checked -- a newly added ref-bearing field was likely added without updating "
-                "check_char_spans",
-            )
+    if audit_against_source_refs:
+        total_char_span_refs = sum(
+            1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
         )
+        if accounted_for != total_char_span_refs:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path="<iter_source_refs walk>",
+                    reason=f"replayer accounted for {accounted_for} char-span ref(s) but "
+                    f"iter_source_refs finds {total_char_span_refs} reachable in the envelope; some "
+                    "CharSpanLocator is reachable that this replayer's field-by-field pairing never "
+                    "checked -- a newly added ref-bearing field was likely added without updating "
+                    "check_char_spans",
+                )
+            )
+    else:
+        total_char_span_refs = accounted_for
 
     # Concatenated here, at the very end, and NOT earlier: `findings` alone
     # feeds `accounted_for` above, which is checked against
@@ -2024,3 +2232,112 @@ def replay_stored_dataset(workspace_root: Path, sha256: str, *, reveal_text: boo
     """
     envelope = load_dataset_envelope(workspace_root, sha256)
     return replay_envelope(workspace_root, envelope, reveal_text=reveal_text)
+
+
+def replay_condition_set(
+    workspace_root: Path, envelope: ConditionSetEnvelope, *, reveal_text: bool = False
+) -> ReplayReport:
+    """Independently re-verify a :class:`ConditionSetEnvelope` against evidence.
+
+    Mirrors :func:`replay_envelope`'s single-pass node-verification structure
+    exactly, then diverges where the two envelope types genuinely differ: a
+    condition set has THREE ``SourceRef`` locations that are not grounding
+    pairs at all (``attribution_ref``, ``subject.reason_ref``,
+    ``unextracted[*].statement_ref``) -- a location proves nothing recorded
+    says what it MEANS, so each becomes an :class:`UncheckedSemanticClaim`
+    rather than a pass/fail check.
+
+    Because ``attribution_ref`` is unconditionally present on every legal
+    envelope (see the contract), :attr:`ReplayReport.overall_outcome` is
+    UNVERIFIABLE for every condition set this can ever replay -- that is the
+    honest answer, not a defect: :attr:`ReplayReport.evidence_outcome` still
+    says whether every location claim held.
+    """
+    text_by_node_id: dict[str, str] = {}
+    node_problems: dict[str, ReplayFinding] = {}
+    node_level_problems: dict[str, ReplayFinding] = {}
+    claim_findings: list[ReplayFinding] = []
+    unchecked_store_claims: list[UncheckedStoreClaim] = []
+    for node in envelope.source_graph.nodes:
+        text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
+        if problem is not None:
+            node_problems[node.node_id] = problem
+            if not problem_is_text_only:
+                node_level_problems[node.node_id] = problem
+        else:
+            assert text is not None
+            text_by_node_id[node.node_id] = text
+        claim_check = _refute_root_sidecar_claim(workspace_root, node)
+        if claim_check.finding is not None:
+            claim_findings.append(claim_check.finding)
+        if claim_check.unchecked is not None:
+            unchecked_store_claims.append(claim_check.unchecked)
+
+    checked, paired_total, pair_findings = _replay_text_pairings(
+        envelope,
+        _condition_set_text_pairings(envelope),
+        text_by_node_id,
+        node_problems,
+        reveal_text=reveal_text,
+        audit_against_source_refs=False,
+    )
+
+    semantic_claims = _condition_set_semantic_claims(envelope, text_by_node_id, node_problems)
+    support_only_char_spans = sum(1 for claim in semantic_claims if claim.gap is SemanticGap.SUPPORT_UNRECORDED)
+
+    # Independent reconciliation: every path either the hand-written pairing
+    # enumerator or a semantic claim's support_paths names, checked against a
+    # FRESH, generic walk of the envelope -- written separately from both of
+    # those enumerators, which is the only reason it is an independent check
+    # rather than the same list read twice.
+    named_paths: set[str] = {pairing.path for pairing in _condition_set_text_pairings(envelope)}
+    for claim in semantic_claims:
+        named_paths.update(claim.support_paths)
+    reconciliation_findings = _reconcile_condition_set_refs(envelope, named_paths)
+
+    total_char_spans = sum(1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator))
+
+    node_level_findings = tuple(node_level_problems.values())
+    all_findings = (
+        tuple(pair_findings) + node_level_findings + tuple(claim_findings) + reconciliation_findings
+    )
+
+    # A replay that independently re-sliced ZERO paired character spans must
+    # never report VERIFIED -- same rule as replay_envelope's, for the same
+    # reason: nothing about this envelope's grounding was actually checked.
+    if checked == 0:
+        all_findings = all_findings + (
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path="<_condition_set_text_pairings>",
+                reason="independently re-sliced ZERO paired character spans (total paired "
+                f"refs={paired_total}); a replay cannot report VERIFIED without ever having "
+                "checked a single char-span",
+            ),
+        )
+
+    unchecked_char_spans = total_char_spans - checked - support_only_char_spans
+
+    return ReplayReport(
+        checked_char_spans=checked,
+        total_char_spans=total_char_spans,
+        unchecked_char_spans=unchecked_char_spans,
+        findings=all_findings,
+        unchecked_store_claims=tuple(unchecked_store_claims),
+        unchecked_semantic_claims=semantic_claims,
+        support_only_char_spans=support_only_char_spans,
+    )
+
+
+def replay_stored_condition_set(
+    workspace_root: Path, sha256: str, *, reveal_text: bool = False
+) -> ReplayReport:
+    """Independently re-verify the condition set actually STORED under ``sha256``.
+
+    The condition-set sibling of :func:`replay_stored_dataset`, and separate
+    from it for the same reason the two bridges are separate: they read
+    different store directories, and a construct that let one be mistaken for
+    the other would report on bytes the caller never asked about.
+    """
+    envelope = load_condition_set_envelope(workspace_root, sha256)
+    return replay_condition_set(workspace_root, envelope, reveal_text=reveal_text)
