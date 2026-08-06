@@ -39,7 +39,13 @@ dev = [
 # pricing table in `models.py` was cross-checked against
 # (see `_MODEL_PRICING_USD_PER_1M_TOKENS`'s verified-on comment) is pinned rather
 # than left to whatever pydantic-ai happens to require.
-agents = ["pydantic-ai>=2.0", "genai-prices>=0.0.70", "pypdf>=5.0", "rdkit>=2024.3"]
+#
+# pypdf is upper-bounded on purpose. Its version is part of every PDF extraction record's
+# identity, so a MAJOR upgrade makes every stored record non-current at once and the
+# campaign refuses each affected document until `Carmel.py reextract --apply` has run.
+# That should be a deliberate act with a re-extraction pass attached, not something a
+# fresh `pip install` does to a working store behind the operator's back.
+agents = ["pydantic-ai>=2.0", "genai-prices>=0.0.70", "pypdf>=5.0,<6", "rdkit>=2024.3"]
 
 [project.scripts]
 carmel = "Carmel:cli"

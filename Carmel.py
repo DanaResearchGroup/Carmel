@@ -410,8 +410,11 @@ def _cmd_reextract(
     opts IN to dry mode): here ``--apply`` opts IN to mutation, so an operator who
     forgets the flag gets a safe preview rather than an accidental write.
 
-    No consumer reads extraction records yet -- see :mod:`carmel.services.reextraction`.
-    This command only appends evidence for a future one.
+    Extraction records ARE read -- the fourth site still carrying the obsolete "no
+    consumer reads them yet" claim, which `f5ea5bb` corrected in three other places and
+    missed here. The corpus pass prefers an authenticated current record over the root
+    sidecar, and dataset production requires one, so appending a record here changes what
+    later passes read. See :mod:`carmel.services.reextraction`.
     """
     if sha is not None and all_artifacts:
         print("--sha and --all are mutually exclusive. Use one or the other.", file=sys.stderr)
