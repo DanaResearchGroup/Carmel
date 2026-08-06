@@ -74,7 +74,7 @@ import re
 from collections.abc import Callable, Iterator, Mapping
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
@@ -3864,6 +3864,227 @@ entry to make the meta-test pass; add the projection instead.
 """
 
 
+class _SourceGraphEnvelope(Protocol):
+    """Structural type for the provenance state shared by more than one
+    concrete envelope class.
+
+    Named for the two attributes the seven module-level helpers below
+    actually read (``source_graph``, ``conversion_tables``), not for any
+    particular envelope class: :class:`DatasetEnvelope` is today's only
+    caller, but a second, unrelated envelope class is expected to call
+    these same helpers directly. A nominal base class was deliberately
+    rejected as the sharing mechanism -- a subclass silently inheriting a
+    base ``identity_payload()`` that omits its own distinguishing field
+    would let two different payloads collide on ONE address in a
+    write-once immutable store -- so this Protocol, not inheritance, is
+    what lets both envelope classes satisfy the same helper signatures.
+    The walkers ``iter_source_refs``/``iter_measured_values`` themselves
+    take ``object``, so passing the whole envelope to them is fine either
+    way.
+    """
+
+    @property
+    def source_graph(self) -> SourceGraph: ...
+
+    @property
+    def conversion_tables(self) -> tuple[EmbeddedConversionTable, ...]: ...
+
+
+# SHARED-PROVENANCE-VALIDATORS: the seven helpers below implement provenance logic that reads
+# only `source_graph`, `conversion_tables`, and whatever `iter_source_refs`/`iter_measured_values`
+# reach -- nothing series-specific. They are factored out to module level (rather than left as
+# DatasetEnvelope methods) so a second, unrelated envelope class can call them directly without
+# inheriting from DatasetEnvelope -- see `_SourceGraphEnvelope` above for why inheritance was
+# rejected as the sharing mechanism.
+def _validate_conversion_tables_cover_cited_tables(envelope: _SourceGraphEnvelope) -> None:
+    """T2: ``conversion_tables`` must cover EXACTLY the set of
+    ``conversion_table_sha256`` values cited by every :class:`MeasuredValue`
+    reachable in this envelope (via :func:`iter_measured_values`) -- no
+    fewer, no more.
+
+    A table cited but not embedded (missing) would leave a
+    ``MeasuredValue`` whose conversion a non-Carmel consumer cannot
+    interpret at all -- exactly the payload this field exists to
+    prevent. A table embedded but never cited by anything (decorative)
+    is unearned provenance, the same failure class V2 closes for source
+    graph nodes. These are two distinct, independently measured failure
+    modes, so they get two distinct error messages -- a test must be
+    able to tell which one fired, not merely that "something" was
+    wrong.
+    """
+    cited = {value.conversion_table_sha256 for _, value in iter_measured_values(envelope)}
+    embedded = {table.sha256 for table in envelope.conversion_tables}
+    missing = cited - embedded
+    if missing:
+        raise ValueError(
+            f"DatasetEnvelope.conversion_tables is missing table(s) {sorted(missing)!r} cited by a "
+            "MeasuredValue -- every cited conversion table must be embedded"
+        )
+    decorative = embedded - cited
+    if decorative:
+        raise ValueError(
+            f"DatasetEnvelope.conversion_tables embeds decorative table(s) {sorted(decorative)!r} that "
+            "no MeasuredValue actually cites -- an embedded table nothing needs is unearned provenance"
+        )
+
+
+def _validate_conversion_tables_no_duplicate_sha256(envelope: _SourceGraphEnvelope) -> None:
+    """DUPLICATE-CONVERSION-TABLE-SHA256-GUARD: ``conversion_tables`` must
+    not embed the same ``sha256`` more than once.
+
+    T2 (above) compares SETS of embedded sha256s against the set of
+    cited sha256s, so a tuple like ``(V1, V1)`` has exactly the same
+    embedded set as ``(V1,)`` and passes T2 unchanged; T3's adjacent-pair
+    sort check likewise accepts two equal, already-sorted entries. Left
+    unchecked, two envelopes that differ only in whether a table is
+    embedded once or twice have the SAME logical content but different
+    bytes, and therefore different content addresses -- an
+    address-uniqueness bug. This guard closes that gap directly, by
+    sha256 identity rather than by set arithmetic.
+    """
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for table in envelope.conversion_tables:
+        if table.sha256 in seen:
+            duplicates.add(table.sha256)
+        seen.add(table.sha256)
+    if duplicates:
+        raise ValueError(
+            f"DatasetEnvelope.conversion_tables embeds duplicate sha256(s) {sorted(duplicates)!r} -- "
+            "each cited conversion table must be embedded exactly once"
+        )
+
+
+def _validate_conversion_tables_sorted(envelope: _SourceGraphEnvelope) -> None:
+    """T3: ``conversion_tables`` must be sorted ascending by ``sha256``,
+    so exactly one legal ordering exists -- matching the S2/S7/E1b idiom
+    already in this module (a canonical order pins one, and only one,
+    addressable representation)."""
+    expected = tuple(sorted(envelope.conversion_tables, key=lambda table: table.sha256))
+    if envelope.conversion_tables != expected:
+        raise ValueError("DatasetEnvelope.conversion_tables must be sorted ascending by sha256")
+
+
+def _validate_refs_resolve(envelope: _SourceGraphEnvelope) -> None:
+    """V1: every embedded :class:`SourceRef` must name a node this
+    envelope's ``source_graph`` actually contains.
+
+    Without this, a ``SourceRef`` is just a free-floating claim -- it
+    looks like provenance (it has a ``node_id`` and a locator) but there
+    is no guarantee the node it names was ever validated, or even
+    exists. This is the check that makes a ``SourceRef`` actually mean
+    something.
+    """
+    node_ids = envelope.source_graph.node_ids
+    for path, ref in iter_source_refs(envelope):
+        if ref.node_id not in node_ids:
+            raise ValueError(
+                f"SourceRef at {path!r} names node_id={ref.node_id!r}, which is not present in "
+                f"source_graph (known node ids: {sorted(node_ids)!r})"
+            )
+
+
+def _validate_no_decorative_nodes(envelope: _SourceGraphEnvelope) -> None:
+    """V2: every node in ``source_graph`` must be targeted by some
+    ``SourceRef``, or be an ancestor of a node that is.
+
+    An unreferenced node pads the graph with authoritative-looking
+    provenance that nothing in the payload actually relies on -- an
+    "audit-shaped" artifact rather than a real one: it LOOKS like the
+    dataset is grounded against that artifact, but no extracted fact
+    actually cites it. That is precisely the failure class this
+    milestone exists to close, so a node that nothing (directly or via
+    an ancestor of something) targets is rejected, not merely unused.
+    Ancestors of a targeted node stay legal: an SI member's PAPER_PDF
+    parent is real provenance context for that member even if nothing
+    cites the parent directly.
+    """
+    referenced_ids = {ref.node_id for _, ref in iter_source_refs(envelope)}
+    covered_ids: set[str] = set()
+    for node_id in referenced_ids:
+        covered_ids.add(node_id)
+        covered_ids.update(ancestor.node_id for ancestor in envelope.source_graph.ancestors(node_id))
+    for node in envelope.source_graph.nodes:
+        if node.node_id not in covered_ids:
+            raise ValueError(
+                f"node {node.node_id!r} is not targeted by any SourceRef, nor is it an ancestor of a "
+                "targeted node -- an unreferenced node is decorative provenance that nothing in this "
+                "envelope actually relies on"
+            )
+
+
+def _validate_locator_kind_compatibility(envelope: _SourceGraphEnvelope) -> None:
+    """V3: a :class:`SourceRef`'s locator kind must be compatible with
+    the kind of node it targets, and (for a ``TableCellLocator``) its
+    ``table_key`` kind must ALSO be compatible with that node kind.
+
+    See :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` for the
+    locator/node-kind compatibility table and why it exists. Without
+    this check, e.g. an ``XPathLocator`` could target a ``PAPER_PDF``
+    node -- an XPath into a PDF is not a real locator, it is a claim
+    about a document that was never parsed as XML at all.
+
+    The ``table_key`` check is a second, narrower compatibility axis
+    layered on top: ``LocatorKind.TABLE_CELL`` alone says the target can
+    carry SOME table, but a ``MemberSheetKey`` names a workbook SHEET --
+    a concept meaningless against anything but an ``SI_MEMBER`` -- while
+    a ``CaptionLabelKey`` names a printed caption, meaningless against a
+    node that carries no rendered caption at all. See
+    :data:`_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS` for the compatibility
+    table and its documented remaining gap (``SI_MEMBER`` too broad).
+    """
+    for path, ref in iter_source_refs(envelope):
+        node = envelope.source_graph.node(ref.node_id)
+        locator_kind = ref.locator.kind
+        compatible_kinds = _LOCATOR_KIND_COMPATIBLE_NODE_KINDS[locator_kind]
+        if node.kind not in compatible_kinds:
+            raise ValueError(
+                f"SourceRef at {path!r} uses locator kind={locator_kind.value!r} against node "
+                f"{node.node_id!r} of kind={node.kind.value!r}, but {locator_kind.value!r} may only "
+                f"target nodes of kind {sorted(kind.value for kind in compatible_kinds)!r}"
+            )
+        if isinstance(ref.locator, TableCellLocator):
+            table_key_kind = ref.locator.table_key.kind
+            compatible_table_key_kinds = _TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS[table_key_kind]
+            if node.kind not in compatible_table_key_kinds:
+                raise ValueError(
+                    f"SourceRef at {path!r} uses table_key kind={table_key_kind.value!r} against node "
+                    f"{node.node_id!r} of kind={node.kind.value!r}, but table_key kind="
+                    f"{table_key_kind.value!r} may only target nodes of kind "
+                    f"{sorted(kind.value for kind in compatible_table_key_kinds)!r}"
+                )
+
+
+def _validate_char_span_requires_extraction(envelope: _SourceGraphEnvelope) -> None:
+    """V6: a :class:`CharSpanLocator` addresses a node's EXTRACTED TEXT,
+    so its target node must actually HAVE one -- i.e.
+    ``SourceNode.extraction`` must be present, not :class:`Absent`.
+
+    Runs AFTER V1 (``_validate_refs_resolve``, declaration order), so
+    every ``ref.node_id`` looked up here via ``envelope.source_graph.node``
+    is already known to resolve.
+
+    This rule is scoped to ``CHAR_SPAN`` ONLY -- it is deliberately NOT
+    generalised to the other three locator kinds. A ``BBoxLocator``
+    addresses the node's RENDERED RAW bytes, an ``XPathLocator``
+    addresses its RAW XML, and a ``TableCellLocator`` addresses the
+    document's own table structure; none of those three is a claim
+    about extracted text, so requiring ``extraction`` for them would
+    reject legitimate graphs (e.g. a bounding box against a PDF that was
+    never text-extracted at all is still a real, verifiable locator).
+    """
+    for path, ref in iter_source_refs(envelope):
+        if not isinstance(ref.locator, CharSpanLocator):
+            continue
+        node = envelope.source_graph.node(ref.node_id)
+        if isinstance(node.extraction, Absent):
+            raise ValueError(
+                f"SourceRef at {path!r} uses a CharSpanLocator against node {node.node_id!r}, but "
+                f"that node's extraction is Absent ({node.extraction.reason.value!r}) -- a character "
+                "offset into text that was never extracted addresses nothing"
+            )
+
+
 class DatasetEnvelope(BaseModel):
     """The top-level payload for one literature-extracted dataset: a source
     graph plus the extracted content that cites it.
@@ -3939,94 +4160,26 @@ class DatasetEnvelope(BaseModel):
 
     @model_validator(mode="after")
     def _validate_conversion_tables_cover_cited_tables(self) -> DatasetEnvelope:
-        """T2: ``conversion_tables`` must cover EXACTLY the set of
-        ``conversion_table_sha256`` values cited by every :class:`MeasuredValue`
-        reachable in this envelope (via :func:`iter_measured_values`) -- no
-        fewer, no more.
-
-        A table cited but not embedded (missing) would leave a
-        ``MeasuredValue`` whose conversion a non-Carmel consumer cannot
-        interpret at all -- exactly the payload this field exists to
-        prevent. A table embedded but never cited by anything (decorative)
-        is unearned provenance, the same failure class V2 closes for source
-        graph nodes. These are two distinct, independently measured failure
-        modes, so they get two distinct error messages -- a test must be
-        able to tell which one fired, not merely that "something" was
-        wrong.
-        """
-        cited = {value.conversion_table_sha256 for _, value in iter_measured_values(self)}
-        embedded = {table.sha256 for table in self.conversion_tables}
-        missing = cited - embedded
-        if missing:
-            raise ValueError(
-                f"DatasetEnvelope.conversion_tables is missing table(s) {sorted(missing)!r} cited by a "
-                "MeasuredValue -- every cited conversion table must be embedded"
-            )
-        decorative = embedded - cited
-        if decorative:
-            raise ValueError(
-                f"DatasetEnvelope.conversion_tables embeds decorative table(s) {sorted(decorative)!r} that "
-                "no MeasuredValue actually cites -- an embedded table nothing needs is unearned provenance"
-            )
+        """T2: see :func:`_validate_conversion_tables_cover_cited_tables`."""
+        _validate_conversion_tables_cover_cited_tables(self)
         return self
 
     @model_validator(mode="after")
     def _validate_conversion_tables_no_duplicate_sha256(self) -> DatasetEnvelope:
-        """DUPLICATE-CONVERSION-TABLE-SHA256-GUARD: ``conversion_tables`` must
-        not embed the same ``sha256`` more than once.
-
-        T2 (above) compares SETS of embedded sha256s against the set of
-        cited sha256s, so a tuple like ``(V1, V1)`` has exactly the same
-        embedded set as ``(V1,)`` and passes T2 unchanged; T3's adjacent-pair
-        sort check likewise accepts two equal, already-sorted entries. Left
-        unchecked, two envelopes that differ only in whether a table is
-        embedded once or twice have the SAME logical content but different
-        bytes, and therefore different content addresses -- an
-        address-uniqueness bug. This guard closes that gap directly, by
-        sha256 identity rather than by set arithmetic.
-        """
-        seen: set[str] = set()
-        duplicates: set[str] = set()
-        for table in self.conversion_tables:
-            if table.sha256 in seen:
-                duplicates.add(table.sha256)
-            seen.add(table.sha256)
-        if duplicates:
-            raise ValueError(
-                f"DatasetEnvelope.conversion_tables embeds duplicate sha256(s) {sorted(duplicates)!r} -- "
-                "each cited conversion table must be embedded exactly once"
-            )
+        """See :func:`_validate_conversion_tables_no_duplicate_sha256`."""
+        _validate_conversion_tables_no_duplicate_sha256(self)
         return self
 
     @model_validator(mode="after")
     def _validate_conversion_tables_sorted(self) -> DatasetEnvelope:
-        """T3: ``conversion_tables`` must be sorted ascending by ``sha256``,
-        so exactly one legal ordering exists -- matching the S2/S7/E1b idiom
-        already in this module (a canonical order pins one, and only one,
-        addressable representation)."""
-        expected = tuple(sorted(self.conversion_tables, key=lambda table: table.sha256))
-        if self.conversion_tables != expected:
-            raise ValueError("DatasetEnvelope.conversion_tables must be sorted ascending by sha256")
+        """T3: see :func:`_validate_conversion_tables_sorted`."""
+        _validate_conversion_tables_sorted(self)
         return self
 
     @model_validator(mode="after")
     def _validate_refs_resolve(self) -> DatasetEnvelope:
-        """V1: every embedded :class:`SourceRef` must name a node this
-        envelope's ``source_graph`` actually contains.
-
-        Without this, a ``SourceRef`` is just a free-floating claim -- it
-        looks like provenance (it has a ``node_id`` and a locator) but there
-        is no guarantee the node it names was ever validated, or even
-        exists. This is the check that makes a ``SourceRef`` actually mean
-        something.
-        """
-        node_ids = self.source_graph.node_ids
-        for path, ref in iter_source_refs(self):
-            if ref.node_id not in node_ids:
-                raise ValueError(
-                    f"SourceRef at {path!r} names node_id={ref.node_id!r}, which is not present in "
-                    f"source_graph (known node ids: {sorted(node_ids)!r})"
-                )
+        """V1: see :func:`_validate_refs_resolve`."""
+        _validate_refs_resolve(self)
         return self
 
     @model_validator(mode="after")
@@ -4076,106 +4229,20 @@ class DatasetEnvelope(BaseModel):
 
     @model_validator(mode="after")
     def _validate_no_decorative_nodes(self) -> DatasetEnvelope:
-        """V2: every node in ``source_graph`` must be targeted by some
-        ``SourceRef``, or be an ancestor of a node that is.
-
-        An unreferenced node pads the graph with authoritative-looking
-        provenance that nothing in the payload actually relies on -- an
-        "audit-shaped" artifact rather than a real one: it LOOKS like the
-        dataset is grounded against that artifact, but no extracted fact
-        actually cites it. That is precisely the failure class this
-        milestone exists to close, so a node that nothing (directly or via
-        an ancestor of something) targets is rejected, not merely unused.
-        Ancestors of a targeted node stay legal: an SI member's PAPER_PDF
-        parent is real provenance context for that member even if nothing
-        cites the parent directly.
-        """
-        referenced_ids = {ref.node_id for _, ref in iter_source_refs(self)}
-        covered_ids: set[str] = set()
-        for node_id in referenced_ids:
-            covered_ids.add(node_id)
-            covered_ids.update(ancestor.node_id for ancestor in self.source_graph.ancestors(node_id))
-        for node in self.source_graph.nodes:
-            if node.node_id not in covered_ids:
-                raise ValueError(
-                    f"node {node.node_id!r} is not targeted by any SourceRef, nor is it an ancestor of a "
-                    "targeted node -- an unreferenced node is decorative provenance that nothing in this "
-                    "envelope actually relies on"
-                )
+        """V2: see :func:`_validate_no_decorative_nodes`."""
+        _validate_no_decorative_nodes(self)
         return self
 
     @model_validator(mode="after")
     def _validate_locator_kind_compatibility(self) -> DatasetEnvelope:
-        """V3: a :class:`SourceRef`'s locator kind must be compatible with
-        the kind of node it targets, and (for a ``TableCellLocator``) its
-        ``table_key`` kind must ALSO be compatible with that node kind.
-
-        See :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` for the
-        locator/node-kind compatibility table and why it exists. Without
-        this check, e.g. an ``XPathLocator`` could target a ``PAPER_PDF``
-        node -- an XPath into a PDF is not a real locator, it is a claim
-        about a document that was never parsed as XML at all.
-
-        The ``table_key`` check is a second, narrower compatibility axis
-        layered on top: ``LocatorKind.TABLE_CELL`` alone says the target can
-        carry SOME table, but a ``MemberSheetKey`` names a workbook SHEET --
-        a concept meaningless against anything but an ``SI_MEMBER`` -- while
-        a ``CaptionLabelKey`` names a printed caption, meaningless against a
-        node that carries no rendered caption at all. See
-        :data:`_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS` for the compatibility
-        table and its documented remaining gap (``SI_MEMBER`` too broad).
-        """
-        for path, ref in iter_source_refs(self):
-            node = self.source_graph.node(ref.node_id)
-            locator_kind = ref.locator.kind
-            compatible_kinds = _LOCATOR_KIND_COMPATIBLE_NODE_KINDS[locator_kind]
-            if node.kind not in compatible_kinds:
-                raise ValueError(
-                    f"SourceRef at {path!r} uses locator kind={locator_kind.value!r} against node "
-                    f"{node.node_id!r} of kind={node.kind.value!r}, but {locator_kind.value!r} may only "
-                    f"target nodes of kind {sorted(kind.value for kind in compatible_kinds)!r}"
-                )
-            if isinstance(ref.locator, TableCellLocator):
-                table_key_kind = ref.locator.table_key.kind
-                compatible_table_key_kinds = _TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS[table_key_kind]
-                if node.kind not in compatible_table_key_kinds:
-                    raise ValueError(
-                        f"SourceRef at {path!r} uses table_key kind={table_key_kind.value!r} against node "
-                        f"{node.node_id!r} of kind={node.kind.value!r}, but table_key kind="
-                        f"{table_key_kind.value!r} may only target nodes of kind "
-                        f"{sorted(kind.value for kind in compatible_table_key_kinds)!r}"
-                    )
+        """V3: see :func:`_validate_locator_kind_compatibility`."""
+        _validate_locator_kind_compatibility(self)
         return self
 
     @model_validator(mode="after")
     def _validate_char_span_requires_extraction(self) -> DatasetEnvelope:
-        """V6: a :class:`CharSpanLocator` addresses a node's EXTRACTED TEXT,
-        so its target node must actually HAVE one -- i.e.
-        ``SourceNode.extraction`` must be present, not :class:`Absent`.
-
-        Runs AFTER V1 (``_validate_refs_resolve``, declaration order), so
-        every ``ref.node_id`` looked up here via ``self.source_graph.node``
-        is already known to resolve.
-
-        This rule is scoped to ``CHAR_SPAN`` ONLY -- it is deliberately NOT
-        generalised to the other three locator kinds. A ``BBoxLocator``
-        addresses the node's RENDERED RAW bytes, an ``XPathLocator``
-        addresses its RAW XML, and a ``TableCellLocator`` addresses the
-        document's own table structure; none of those three is a claim
-        about extracted text, so requiring ``extraction`` for them would
-        reject legitimate graphs (e.g. a bounding box against a PDF that was
-        never text-extracted at all is still a real, verifiable locator).
-        """
-        for path, ref in iter_source_refs(self):
-            if not isinstance(ref.locator, CharSpanLocator):
-                continue
-            node = self.source_graph.node(ref.node_id)
-            if isinstance(node.extraction, Absent):
-                raise ValueError(
-                    f"SourceRef at {path!r} uses a CharSpanLocator against node {node.node_id!r}, but "
-                    f"that node's extraction is Absent ({node.extraction.reason.value!r}) -- a character "
-                    "offset into text that was never extracted addresses nothing"
-                )
+        """V6: see :func:`_validate_char_span_requires_extraction`."""
+        _validate_char_span_requires_extraction(self)
         return self
 
     @model_validator(mode="after")
