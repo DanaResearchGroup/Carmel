@@ -26,7 +26,11 @@ from carmel.schemas.datasets import (
     DatasetEnvelope,
     DatasetEnvelopeParseError,
 )
-from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
+from carmel.services.dataset_bridge import (
+    UnstorableDatasetEnvelopeError,
+    load_dataset_envelope,
+    store_dataset_envelope,
+)
 from carmel.services.dataset_store import canonical_json_bytes, compute_dataset_sha
 from tests.test_dataset_identity_payload import (
     _maximal_envelope,
@@ -283,3 +287,111 @@ def test_round_trip_drops_unaddressed_display_only_fields() -> None:
     # would satisfy neither.
     assert canonical_json_bytes(parsed.identity_payload()) == canonical_json_bytes(envelope.identity_payload())
     assert parsed != envelope
+
+
+class TestStoreRefusesAnEnvelopeItsOwnLoaderWouldReject:
+    """The store is WRITE-ONCE and IMMUTABLE, so an unreadable write is forever.
+
+    A typed ``DatasetEnvelope`` in hand is not proof it was ever validated:
+    ``model_construct`` builds one with every validator skipped. Probed before
+    the fix, such an envelope stored happily and ``load_dataset_envelope``
+    then refused it permanently -- an address burned on bytes nothing can
+    read, in a store whose whole contract is that writes are final.
+    """
+
+    @staticmethod
+    def _unvalidated_envelope() -> DatasetEnvelope:
+        """An envelope that skipped validation and violates ``series`` MinLen(1).
+
+        Built from a REAL maximal envelope so that everything except the one
+        broken invariant is genuine -- a hand-rolled stub could fail to store
+        for some unrelated reason and the test would pass while proving
+        nothing about the refusal under test.
+        """
+        valid = _maximal_envelope()
+        return DatasetEnvelope.model_construct(**{**valid.__dict__, "series": ()})
+
+    def test_store_refuses_what_load_could_never_read_back(self, tmp_path: Path) -> None:
+        envelope = self._unvalidated_envelope()
+        assert envelope.series == ()  # the validators really were skipped
+        with pytest.raises(UnstorableDatasetEnvelopeError) as excinfo:
+            store_dataset_envelope(tmp_path, envelope)
+        # The refusal must say what the reader would have choked on, not just
+        # "invalid" -- the caller cannot fix what the message does not name.
+        assert "at least 1 item" in str(excinfo.value)
+
+    def test_the_refusal_writes_nothing_at_all(self, tmp_path: Path) -> None:
+        """Fail CLOSED, not fail-halfway.
+
+        A refusal that had already written bytes would be worse than no check:
+        it would burn the address AND raise, leaving a caller that retries
+        unable to ever succeed at that sha.
+        """
+        before = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+        with pytest.raises(UnstorableDatasetEnvelopeError):
+            store_dataset_envelope(tmp_path, self._unvalidated_envelope())
+        after = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
+        assert after == before
+
+    def test_a_valid_envelope_still_stores_at_its_unchanged_address(
+        self, tmp_path: Path
+    ) -> None:
+        """The counterweight, and it is doing real work.
+
+        Without it, a `raise` on EVERY store would satisfy both tests above.
+        It also pins that adding the check did not disturb the canonical bytes:
+        the address must still be exactly ``compute_dataset_sha(payload)``, the
+        value the schema-blind store computes with no knowledge of this module.
+        """
+        envelope = _maximal_envelope()
+        payload = envelope.identity_payload()
+        stored = store_dataset_envelope(tmp_path, envelope)
+        assert stored.sha256 == compute_dataset_sha(payload)
+        # Compared as canonical bytes, not with ``==``: identity in this store
+        # IS the canonical rendering, and model equality answers a different
+        # question (it is not structural over every nested field here).
+        loaded = load_dataset_envelope(tmp_path, stored.sha256)
+        assert canonical_json_bytes(loaded.identity_payload()) == canonical_json_bytes(payload)
+
+    def test_a_refused_write_is_not_reported_as_a_corrupt_read(self) -> None:
+        """``UnstorableDatasetEnvelopeError`` must NOT be a
+        ``DatasetEnvelopeParseError``.
+
+        The two say opposite things about the store: a parse error means bytes
+        on disk are bad (a fact about its past); this means bytes were never
+        written (a fact about a refused future). If the refusal subclassed the
+        parse error, a caller with an ``except DatasetEnvelopeParseError``
+        around a read-repair path would silently swallow a rejected write and
+        believe the store had a corruption problem rather than that its own
+        envelope was invalid.
+        """
+        assert not issubclass(UnstorableDatasetEnvelopeError, DatasetEnvelopeParseError)
+        assert not issubclass(DatasetEnvelopeParseError, UnstorableDatasetEnvelopeError)
+
+    def test_the_check_examines_the_payload_it_will_write_not_the_object(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Validating the OBJECT would be a different, weaker check.
+
+        ``identity_payload()`` -> ``from_identity_payload()`` is a projection
+        and a rehydration, not an identity function. An envelope whose object
+        validates but whose PAYLOAD will not rehydrate is precisely the case
+        that burns an address, and object-validation cannot see it. No such
+        asymmetry exists in the schema today, so the two are separated here by
+        patching the projection -- the only way to tell which artifact the
+        check actually looks at.
+
+        This test was written because a mutation audit found that replacing
+        the payload round-trip with ``model_validate(envelope.model_dump())``
+        passed every other test in this class.
+        """
+        envelope = _maximal_envelope()
+        good_payload = envelope.identity_payload()
+        monkeypatch.setattr(
+            DatasetEnvelope,
+            "identity_payload",
+            lambda self: {k: v for k, v in good_payload.items() if k != "series"},
+        )
+        with pytest.raises(UnstorableDatasetEnvelopeError):
+            store_dataset_envelope(tmp_path, envelope)
+        assert sorted(tmp_path.rglob("*")) == []
