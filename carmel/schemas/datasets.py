@@ -125,6 +125,7 @@ __all__ = [
     "ExtractedTextVerification",
     "ExtractionBinding",
     "GlyphHealthAssessment",
+    "GroundedScalarClaim",
     "Maybe",
     "MeasuredValue",
     "MemberSheetKey",
@@ -3154,6 +3155,91 @@ class Series(BaseModel):
                     obs.value,
                     f"Series(series_id={self.series_id!r}) point {point.point_id!r} observation",
                 )
+        return self
+
+
+class GroundedScalarClaim(BaseModel):
+    """ONE scalar fact a source states about an experiment, label and all --
+    "the initial pressure was 1 atm", "the shock-tube bore is 5.0 cm".
+
+    Deliberately NOT a series element. It has no axis, no point, and no
+    siblings; it is a standalone claim, and it exists because conditions have
+    no legal home in this schema otherwise. A :class:`Series` requires at
+    least one ``COORDINATE`` axis (S3), at least one ``OBSERVATION`` axis
+    (S4), and at least one point (S7), and :attr:`DatasetEnvelope.series`
+    carries ``MinLen(1)`` -- so a constants-only series and a series-free
+    envelope are BOTH unrepresentable, and routing a standalone condition
+    into :attr:`Series.constants` is impossible without weakening three
+    invariants that are CORRECT for real series. Those invariants stay; this
+    type is the home instead.
+
+    ``label_raw``/``label_ref`` are the load-bearing fields, not decoration.
+    Proving a number is an exact located substring of the source can never
+    prove what that number MEANS, and for a standalone scalar the meaning
+    lives entirely in the surrounding prose: ``"1 atm"`` is a pressure only
+    because a sentence nearby called it one. So the label carries its own
+    :class:`SourceRef`, independent of the value's -- exactly the split
+    :class:`MeasuredValue` makes between ``value_ref`` and ``unit_ref``, for
+    exactly the same reason (a single ref can "verify" the number while the
+    label silently came from somewhere else entirely).
+
+    There is deliberately NO ``quantity_kind`` field of its own, unlike
+    :class:`AxisDeclaration`. An axis declares a quantity separately from the
+    per-point values that must match it (S14), because one axis governs many
+    points; a scalar claim's declaration and value co-locate, so a second copy
+    would be one fact stored twice in a content-addressed payload, and every
+    way the two could disagree would be an error class the duplication itself
+    created. Read it from ``value.quantity_kind``.
+
+    Also deliberately absent: ``value_origin`` and ``source_form``. Both are
+    facts about a whole extracted set (was this an experiment or a
+    simulation; was it read from a table, a figure, or prose), not about an
+    individual scalar, and stamping them per claim would let two claims from
+    the same reported run disagree with no way to arbitrate -- the same
+    reasoning that puts ``glyph_health`` on :class:`SourceNode` rather than on
+    every :class:`MeasuredValue`.
+
+    **What this type does NOT prove, stated plainly rather than implied:** it
+    proves a label and a number were each LOCATED in a source. It does not
+    prove the label describes the number. That is a semantic relation between
+    two spans, and no element model -- holding no document, and no text --
+    can check it. A claim whose label reads "laminar burning velocity" over a
+    value in atm is constructible here and must be caught by the prose-local
+    scalar rule in the extraction gate, which has the text this model does
+    not.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str
+    label_raw: str = Field(min_length=1)
+    """The name the SOURCE gives this quantity, verbatim (e.g. ``"initial
+    pressure"``, ``"P1"``, ``"bore"``) -- never a normalized or invented
+    label."""
+    label_ref: SourceRef
+    """Provenance for the LABEL, independent of the value's refs. Required and
+    never :class:`Absent`: an ungrounded label is not a weaker claim to record
+    honestly, it is no claim at all."""
+    value: MeasuredValue
+    """The number and its unit. Plain, never ``Maybe`` -- mirroring
+    :class:`Coordinate` rather than :class:`Observation`. An observation may
+    honestly be absent (a paper plotted a point it never tabulated), but a
+    condition the source never stated is not a condition with a missing
+    number; it is simply not a claim, and must not occupy a ``claim_id``."""
+    uncertainty: Maybe[Uncertainty]
+
+    @field_validator("claim_id")
+    @classmethod
+    def _validate_claim_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="claim_id")
+
+    @model_validator(mode="after")
+    def _validate_uncertainty_bound_quantity(self) -> GroundedScalarClaim:
+        _validate_uncertainty_bound_quantity_kind(
+            uncertainty=self.uncertainty,
+            value=self.value,
+            where=f"GroundedScalarClaim(claim_id={self.claim_id!r})",
+        )
         return self
 
 
