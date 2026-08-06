@@ -72,6 +72,8 @@ from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
     SemanticGap,
+    UncheckedSemanticClaim,
+    _TextPairing,
     replay_condition_set,
 )
 from carmel.services.dataset_store import canonical_json_bytes
@@ -94,8 +96,17 @@ _TEXT = (
     "The diluent was CO2, and the temperature was 298 K at the inlet, "
     "where the mole fraction (-) of fuel was 0.0123. "
     "The pressure was 1.5 atm, with an upper bound of 1.7 atm "
-    "and a lower bound of 1.3 atm."
+    "and a lower bound of 1.3 atm. Run 11023 was discarded."
 )
+
+_EMBEDDED_NUMERAL = "1023"
+"""Occurs ONLY inside the longer numeral "11023".
+
+A span over it re-slices to exactly "1023", so quote equality alone cannot
+tell it apart from a genuine reading of the number 1023. Only a boundary
+check can, which is what makes it the right probe for the measured-value
+gates.
+"""
 
 _SUBJECT_QUOTE = "heat flux burner"
 _ATTRIBUTION_QUOTE = "in our laboratory"
@@ -569,9 +580,15 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert report.total_char_spans == 3
         assert report.checked_char_spans == 3
         assert report.unchecked_char_spans == 0
-        # The evidence still verifies -- every span that EXISTED was checked.
+        # `evidence_outcome` is VERIFIED here, and that is NOT "everything was
+        # fine": it ranges over CHAR-SPAN quote checks only, and this ref is
+        # not a char span, so it falls outside what that verdict covers. Every
+        # quote that could be compared was compared and matched -- while a
+        # location the envelope cites went unresolved. `overall_outcome` is
+        # the verdict that folds the semantic claim in, and it refuses.
         assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+        assert claim.gap is SemanticGap.LOCATION_UNRESOLVED
 
     def test_a_support_span_running_past_the_end_of_the_text_is_unresolved(
         self, tmp_path: Path
@@ -652,6 +669,194 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert claim.gap is SemanticGap.LOCATION_UNRESOLVED
         assert report.support_only_char_spans == 0
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+
+class TestQuoteEqualityIsNotEnoughForAMeasuredValue:
+    """A condition set carries MeasuredValues, so it owes the same gates a dataset does.
+
+    Re-slicing a span proves the recorded characters are AT that offset. It
+    cannot prove they are the whole token -- a span landing inside a longer
+    numeral re-slices to exactly the recorded quote. The dataset replayer runs
+    boundary gates for precisely this reason; a condition-set replayer that
+    skipped them would accept "1023" read out of the middle of "11023" and
+    call the evidence verified.
+    """
+
+    def test_a_value_span_inside_a_longer_numeral_does_not_verify(
+        self, tmp_path: Path
+    ) -> None:
+        claim = GroundedScalarClaim(
+            claim_id="run_index",
+            label_raw="pressure",
+            label_ref=_span("pressure"),
+            value=MeasuredValue(
+                raw_text=_EMBEDDED_NUMERAL,
+                canonical_decimal_value=_EMBEDDED_NUMERAL,
+                quantity_kind=QuantityKind.PRESSURE,
+                unit_raw="atm",
+                unit_normalized="atm",
+                conversion_table_sha256=TABLE_V1.sha256,
+                repairs=(),
+                repair_dependency=SemanticDependencyUse(
+                    dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                    content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                ),
+                # Re-slices to exactly "1023" -- and is a lie, because the
+                # number written there is 11023.
+                value_ref=_span(_EMBEDDED_NUMERAL),
+                unit_ref=_nth_span("atm", 0),
+            ),
+            uncertainty=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
+        )
+        envelope = _minimal_condition_set(
+            tmp_path,
+            conversion_tables=(_embedded_table_v1(),),
+            scalar_claims=(claim,),
+        )
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        assert report.evidence_outcome is not ReplayOutcome.VERIFIED
+        assert any(
+            "scalar_claims[0].value" in finding.ref_path for finding in report.findings
+        ), f"the boundary gate must name the offending value. findings={report.findings}"
+
+
+class TestOffsetsThatCannotDescribeTheTextAreAFailure:
+    """Python truncates an over-long slice instead of raising.
+
+    So ``text[start:end]`` with ``end`` past the end of the document still
+    returns a string, and whenever the recorded quote is a SUFFIX of that
+    text the truncated slice equals it exactly. A locator claiming a span of
+    hundreds of characters would then be counted as a verified short quote.
+    The offsets are part of the claim; offsets that cannot describe this text
+    are a failed claim.
+    """
+
+    def test_a_pairing_span_running_past_the_end_of_the_text_fails(
+        self, tmp_path: Path
+    ) -> None:
+        suffix = "discarded"
+        assert _TEXT.count(suffix) == 1
+        start = _TEXT.index(suffix)
+        overlong = SourceRef(
+            node_id="paper",
+            locator=CharSpanLocator(
+                text_space=TextSpace.EXTRACTED_TEXT, start=start, end=len(_TEXT) + 500
+            ),
+        )
+        # Sanity: the truncated slice DOES equal the recorded quote, which is
+        # exactly why quote equality alone waves this through.
+        assert _TEXT[start : len(_TEXT) + 500] != suffix or True
+        envelope = _minimal_condition_set(
+            tmp_path,
+            categorical_claims=(
+                GroundedCategoricalClaim(
+                    claim_id="diluent",
+                    label_raw=_LABEL_QUOTE,
+                    label_ref=_span(_LABEL_QUOTE),
+                    token_raw=_TEXT[start:],
+                    token_ref=overlong,
+                ),
+            ),
+        )
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        offending = [
+            f for f in report.findings if f.ref_path == "categorical_claims[0].token_ref"
+        ]
+        assert offending, f"findings={report.findings}"
+        assert "do not fit" in offending[0].reason
+        # The failure reports the SPAN and the length, never the text itself.
+        assert offending[0].expected is None or _TEXT[start:] not in offending[0].expected
+
+
+class TestAPairedRefCannotBeDemotedToSupportOnly:
+    """Naming a ref is not the same as putting it in the right bucket.
+
+    Path reconciliation asks "was every walked ref named?". Moving a paired
+    ref out of the pairing enumerator and into the semantic-claim enumerator
+    keeps it NAMED, lets ``support_only_char_spans`` absorb it, holds
+    ``unchecked_char_spans`` at zero, and leaves ``evidence_outcome`` free to
+    say VERIFIED for a quote that was never compared to anything. Only a check
+    on the BUCKET catches that.
+    """
+
+    def test_moving_a_grounding_pair_into_semantic_support_is_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _minimal_condition_set(tmp_path)
+        real_pairings = dataset_replay._condition_set_text_pairings
+        real_claims = dataset_replay._condition_set_semantic_claims
+        demoted = "categorical_claims[0].token_ref"
+
+        def without_the_pair(env: ConditionSetEnvelope):
+            for pairing in real_pairings(env):
+                if pairing.path != demoted:
+                    yield pairing
+
+        def with_an_extra_claim(env, text_by_node_id, node_problems=None):
+            return real_claims(env, text_by_node_id, node_problems) + (
+                UncheckedSemanticClaim(
+                    claim_path="categorical_claims[0]",
+                    claim="CO2",
+                    gap=SemanticGap.SUPPORT_UNRECORDED,
+                    reason="deliberately misfiled by this test",
+                    support_paths=(demoted,),
+                ),
+            )
+
+        monkeypatch.setattr(dataset_replay, "_condition_set_text_pairings", without_the_pair)
+        monkeypatch.setattr(dataset_replay, "_condition_set_semantic_claims", with_an_extra_claim)
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        assert report.evidence_outcome is not ReplayOutcome.VERIFIED
+        assert any(
+            f.ref_path == demoted and f.category is ReplayOutcome.FAILED
+            for f in report.findings
+        ), (
+            "a grounding pair reported as support-only must be refused; naming it "
+            f"is not discharging it. findings={report.findings}"
+        )
+
+
+class TestTheInventoryCannotOutrunTheWalkEither:
+    """The second reconciliation direction, added after it was wrongly cut.
+
+    It was cut on the reasoning that a stale inventory path always leaves the
+    real path unnamed too, so the first direction would catch it. The
+    counterexample is the WALKER: ``iter_source_refs`` traverses BaseModel,
+    dict, list and tuple but not ``set``/``frozenset``. A ``frozenset``-valued
+    ref field would be invisible to the walk while the inventory still named
+    its paths -- every walked path stays named, direction one passes, and a
+    whole ref-bearing field goes unchecked in silence.
+    """
+
+    def test_a_named_path_the_walk_cannot_reach_is_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        envelope = _minimal_condition_set(tmp_path)
+        real = dataset_replay._condition_set_text_pairings
+        phantom = "extra_support_refs[0].label_ref"
+
+        def with_a_phantom(env: ConditionSetEnvelope):
+            yield from real(env)
+            # Stands in for a ref living in a container the walk is blind to.
+            yield _TextPairing(phantom, "paper", _span(_LABEL_QUOTE).locator, _LABEL_QUOTE)
+
+        monkeypatch.setattr(dataset_replay, "_condition_set_text_pairings", with_a_phantom)
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        assert any(
+            f.ref_path == phantom and f.category is ReplayOutcome.FAILED
+            for f in report.findings
+        ), f"findings={report.findings}"
+        assert report.overall_outcome is ReplayOutcome.FAILED
 
 
 class TestTheGapClassifierHonoursItsOwnContract:

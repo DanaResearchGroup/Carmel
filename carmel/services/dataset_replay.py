@@ -197,6 +197,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Iterator, Mapping
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -679,9 +680,21 @@ class ReplayReport:
         """What the checks over the envelope's DATA concluded.
 
         Scoped to the raw bytes, the addressed extraction record and the
-        grounded char spans. It says nothing about whether every claim the
-        envelope makes ABOUT THE STORE was checkable -- that is
-        :attr:`overall_outcome`'s job.
+        grounded CHAR SPANS -- and that last word is a real limit, not a
+        loose synonym for "locations". A ref whose locator is not a
+        :class:`CharSpanLocator` is not something this replayer can re-slice
+        at all, so it is outside what this verdict ranges over: ``VERIFIED``
+        here means every char-span quote that could be compared was compared
+        and matched, NOT that every location the envelope cites was resolved.
+        A condition set can therefore read ``VERIFIED`` here while carrying an
+        ``UncheckedSemanticClaim`` whose gap is
+        :attr:`SemanticGap.LOCATION_UNRESOLVED`.
+
+        It also says nothing about whether every claim the envelope makes
+        ABOUT THE STORE was checkable, nor about the semantic claims. Both of
+        those fold into :attr:`overall_outcome`, which is the verdict to read
+        when the question is "is this envelope trustworthy?" rather than "did
+        the quote checks pass?".
         """
         if any(f.category is ReplayOutcome.FAILED for f in self.findings):
             return ReplayOutcome.FAILED
@@ -1502,9 +1515,31 @@ def _condition_set_semantic_claims(
     return tuple(claims)
 
 
+_UNPAIRED_REF_FIELDS = frozenset({"attribution_ref", "reason_ref", "statement_ref"})
+"""The ONLY ref fields in the condition-set graph with no recorded counterpart.
+
+``attribution_ref`` supports a ``ConditionAttribution``, ``reason_ref`` a
+``SubjectRefusalReason``, and ``statement_ref`` nothing stored at all. Every
+OTHER ref field in that graph sits beside a sibling holding the verbatim text
+read at the span (``label_raw``, ``token_raw``, ``raw_text``, ``unit_raw``),
+which makes it a grounding pair that MUST be quote-checked rather than merely
+located.
+
+Written as a frozen literal, independently of both enumerators, ON PURPOSE.
+It is what stops a paired ref from being quietly reclassified as
+support-only: a path moved out of the pairing enumerator and into the
+semantic-claim enumerator is still NAMED, so path reconciliation alone
+accepts it, ``support_only_char_spans`` absorbs it, and the report can then
+say VERIFIED without that quote ever having been compared. Deriving this set
+from the enumerators would make the check a tautology that passes no matter
+which bucket a ref was put in.
+"""
+
+
 def _reconcile_condition_set_refs(
     envelope: ConditionSetEnvelope,
     named_paths: set[str],
+    support_paths: AbstractSet[str],
 ) -> tuple[ReplayFinding, ...]:
     """Reconcile every path :func:`_condition_set_text_pairings` and the
     semantic-obligation enumerator TOGETHER claim to have named against a
@@ -1528,6 +1563,49 @@ def _reconcile_condition_set_refs(
                     "condition-set pairing enumerator nor any UncheckedSemanticClaim's "
                     "support_paths names it -- an obligation this envelope imposes was never "
                     "discharged",
+                )
+            )
+
+    # The OTHER direction. Cut once on the reasoning that it can never fire
+    # alone -- a mistyped inventory path also leaves the real path unnamed, so
+    # the check above would catch it. That reasoning was wrong, and the
+    # counterexample is the WALKER: `iter_source_refs` traverses BaseModel,
+    # dict, list and tuple, but not `set`/`frozenset`. A `frozenset[SourceRef]`
+    # field would be invisible to the walk while the inventory still named its
+    # paths, so every walked path stays named, the check above passes, and an
+    # entire ref-bearing field goes unchecked in silence. A path the inventory
+    # names that the walk cannot reach therefore means one of two things, and
+    # both are defects: the inventory is stale, or the walker cannot see that
+    # field's container shape.
+    walked_paths = {path for path, _ref in iter_source_refs(envelope)}
+    for path in sorted(named_paths - walked_paths):
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason="the replayer claims to have accounted for this ref path, but "
+                "iter_source_refs cannot reach it -- either the hand-written inventory "
+                "is stale, or the generic walk is blind to the container shape holding "
+                "it, in which case other refs are going unchecked in silence",
+            )
+        )
+
+    # A ref may be discharged as SUPPORT-ONLY only if it is one of the three
+    # fields that genuinely has nothing recorded beside it. Everything else is
+    # a grounding pair and owes a quote comparison. Without this, moving a
+    # paired ref into the semantic-claim enumerator keeps it NAMED, lets
+    # `support_only_char_spans` absorb it, and leaves `evidence_outcome` free
+    # to say VERIFIED for a quote that was never compared to anything.
+    for path in sorted(support_paths):
+        if path.rsplit(".", 1)[-1] not in _UNPAIRED_REF_FIELDS:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=path,
+                    reason="reported as unverifiable SUPPORT for a derived value, but this "
+                    "ref field sits beside a recorded string saying what was read at the "
+                    "span -- it is a grounding pair and owes a quote comparison, so "
+                    "recording it as support-only overstates what was checked",
                 )
             )
     return tuple(findings)
@@ -1620,6 +1698,29 @@ def _replay_text_pairings(
             )
             continue
         expected = pairing.expected
+        if not (0 <= locator.start <= locator.end <= len(text)):
+            # Python TRUNCATES an over-long slice instead of raising, so
+            # `text[start:end]` with `end` past the end of the document still
+            # returns a string -- and whenever the recorded quote happens to
+            # be a suffix of that text, the truncated slice EQUALS it. Without
+            # this check a locator claiming a 983-character span is counted as
+            # a verified 3-character quote. The offsets are part of the claim,
+            # so offsets that cannot describe this text are a FAILED claim
+            # rather than a near miss. Mirrors `_semantic_ref_gap`'s bounds
+            # test on purpose, so the paired and support-only paths agree on
+            # what "re-sliceable" means.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=path,
+                    reason=(
+                        "char-span offsets do not fit the independently re-verified "
+                        f"evidence text: recorded span [{locator.start}, {locator.end}) "
+                        f"against text of length {len(text)}"
+                    ),
+                )
+            )
+            continue
         actual = text[locator.start : locator.end]
         if actual != expected:
             literal = pairing.always_literal or reveal_text
@@ -2282,6 +2383,30 @@ def replay_condition_set(
         audit_against_source_refs=False,
     )
 
+    # The SAME measured-value gates the dataset replayer runs. A condition set
+    # carries MeasuredValues through scalar_claims[i].value and through both
+    # uncertainty bounds, so without these a claim recording raw_text="1023"
+    # whose span points INSIDE the longer numeral "11023" replays clean: the
+    # substring matches, and matching a substring is exactly what re-slicing a
+    # span cannot distinguish from matching the number. Quote equality proves
+    # the characters are there; only the boundary gates prove they are the
+    # whole token.
+    unit_findings: list[ReplayFinding] = []
+    for path, value in iter_measured_values(envelope):
+        finding = verify_measured_value_unit(path, value)
+        if finding is not None:
+            unit_findings.append(finding)
+        boundary_finding = verify_measured_value_unit_boundary(
+            path, value, text_by_node_id, node_problems
+        )
+        if boundary_finding is not None:
+            unit_findings.append(boundary_finding)
+        value_boundary_finding = verify_measured_value_value_boundary(
+            path, value, text_by_node_id, node_problems
+        )
+        if value_boundary_finding is not None:
+            unit_findings.append(value_boundary_finding)
+
     semantic_claims = _condition_set_semantic_claims(envelope, text_by_node_id, node_problems)
     support_only_char_spans = sum(1 for claim in semantic_claims if claim.gap is SemanticGap.SUPPORT_UNRECORDED)
 
@@ -2291,15 +2416,44 @@ def replay_condition_set(
     # those enumerators, which is the only reason it is an independent check
     # rather than the same list read twice.
     named_paths: set[str] = {pairing.path for pairing in _condition_set_text_pairings(envelope)}
+    support_paths: set[str] = set()
     for claim in semantic_claims:
         named_paths.update(claim.support_paths)
-    reconciliation_findings = _reconcile_condition_set_refs(envelope, named_paths)
+        support_paths.update(claim.support_paths)
+    reconciliation_findings = _reconcile_condition_set_refs(envelope, named_paths, support_paths)
 
-    total_char_spans = sum(1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator))
+    # Every char-span ref the replayer knows about from EITHER source: the
+    # generic walk, or the hand-written inventory. Normally these agree
+    # exactly and the union is just the walk. They disagree only when the
+    # reconciliation above has already reported a defect -- and in that case
+    # counting the walk alone would make `checked` exceed the total and raise
+    # out of `ReplayReport.__post_init__`, turning a reportable finding into
+    # a traceback. A replayer owes a verdict about broken input, not a crash,
+    # so the total spans what either side saw and the finding carries the
+    # disagreement.
+    walked_char_span_paths = {
+        path
+        for path, ref in iter_source_refs(envelope)
+        if isinstance(ref.locator, CharSpanLocator)
+    }
+    inventory_char_span_paths = {
+        pairing.path
+        for pairing in _condition_set_text_pairings(envelope)
+        if isinstance(pairing.locator, CharSpanLocator)
+    } | {
+        claim.support_paths[0]
+        for claim in semantic_claims
+        if claim.gap is SemanticGap.SUPPORT_UNRECORDED
+    }
+    total_char_spans = len(walked_char_span_paths | inventory_char_span_paths)
 
     node_level_findings = tuple(node_level_problems.values())
     all_findings = (
-        tuple(pair_findings) + node_level_findings + tuple(claim_findings) + reconciliation_findings
+        tuple(pair_findings)
+        + tuple(unit_findings)
+        + node_level_findings
+        + tuple(claim_findings)
+        + reconciliation_findings
     )
 
     # A replay that independently re-sliced ZERO paired character spans must
