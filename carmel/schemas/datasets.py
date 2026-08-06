@@ -116,11 +116,14 @@ __all__ = [
     "CompositionBasis",
     "CompositionComponent",
     "CompositionResolution",
+    "ConditionAttribution",
+    "ConditionSetEnvelope",
     "Coordinate",
     "CoordinateFrame",
     "DataPoint",
     "DatasetEnvelope",
     "DatasetEnvelopeParseError",
+    "DeviceClassDeclaration",
     "EmbeddedConversionTable",
     "ExtractedTextVerification",
     "ExtractionBinding",
@@ -143,6 +146,7 @@ __all__ = [
     "SourceNodeKind",
     "SourceRef",
     "SourceVerification",
+    "SubjectRefusalReason",
     "TableCellLocator",
     "TableKey",
     "TableKeyKind",
@@ -152,6 +156,7 @@ __all__ = [
     "UncertaintyScale",
     "UnextractedConditionStatement",
     "UnextractedReason",
+    "UnresolvedSubject",
     "ValueOrigin",
     "XPathLocator",
     "iter_measured_values",
@@ -3452,6 +3457,154 @@ class UnextractedConditionStatement(BaseModel):
         return _require_identifier(value, field_name="statement_id")
 
 
+class SubjectRefusalReason(StrEnum):
+    """Why a condition set's SUBJECT could not be resolved to a device-class
+    declaration -- the refusal half of the subject sum on
+    :class:`ConditionSetEnvelope`.
+
+    A FOURTH vocabulary, sibling to :class:`UnextractedReason` and, like it,
+    never to be conflated with the project's two failure vocabularies
+    (``FAILED``: a check ran and the artifact was lost; ``UNVERIFIABLE``: the
+    check could not run). A member here means the extractor read the source
+    successfully and is reporting, with a located span as evidence, that the
+    source itself does not support naming a subject. A scope boundary of the
+    SOURCE, not a defect of the extraction.
+
+    :class:`UnextractedReason` was deliberately not reused, even though both
+    enums describe extraction refusals: that enum classifies why one located
+    CONDITION STATEMENT did not become a claim; this one classifies why the
+    envelope-level SUBJECT -- a fact about the whole condition set, not
+    about any one statement -- could not be declared. Overloading one enum
+    to answer both would blur a per-statement fact into a per-envelope one,
+    exactly the vocabulary conflation ``AbsenceReason``'s own docstring
+    warns against.
+    """
+
+    MULTIPLE_INDISTINGUISHABLE_DEVICES = "multiple_indistinguishable_devices"
+    """Two or more physical devices that the source never names apart. The
+    motivating case, found in a survey of eight real combustion-kinetics
+    papers: one paper's "bomb" is two physically different vessels the text
+    calls only "The first vessel" and "The other vessel", with one
+    conditions table covering both under one caption -- and one of the two
+    vessels physically cannot reach the highest temperature in that table.
+    A required device NAME there would produce a record that LOOKS grounded
+    and is wrong; this member is the honest alternative."""
+
+    ASSIGNMENT_DEPENDS_ON_RESULT = "assignment_depends_on_result"
+    """Which device was used is decided by the MEASURED value (e.g. "runs
+    above 5 atm used the second vessel"): the subject of a condition row
+    cannot be resolved without already knowing the measurement outcome, so
+    any fixed declaration would be a guess wearing a name."""
+
+    DEVICE_UNNAMED = "device_unnamed"
+    """The source never names a device class at all -- conditions are stated
+    with no apparatus noun anywhere to ground a declaration against."""
+
+    ATTRIBUTION_UNCLEAR = "attribution_unclear"
+    """It cannot be established WHOSE device the conditions describe -- this
+    paper's own, a cited third party's, or a simulated one. Deliberately the
+    same spelling as :attr:`UnextractedReason.ATTRIBUTION_UNCLEAR`, and
+    deliberately a distinct member of a distinct enum: the parallel naming
+    marks the same epistemic situation recurring at two different scopes
+    (one statement there, the whole subject here), while keeping the two
+    vocabularies un-mixable in typed code."""
+
+
+class DeviceClassDeclaration(BaseModel):
+    """The grounded declaration half of the subject sum on
+    :class:`ConditionSetEnvelope`: the source names a device CLASS, and this
+    record carries that name verbatim with the span it was read from.
+
+    The field is named ``label_raw`` -- a CLASS label, never a unique
+    physical apparatus -- and the class name says "class" out loud for the
+    same reason: class-level granularity is the STRONGEST subject identity
+    this schema is willing to assert. In a survey of eight real
+    combustion-kinetics papers, one paper's single "bomb" was two physically
+    different vessels the text never names apart ("The first vessel" / "The
+    other vessel"), with one conditions table covering both; an
+    extractor-assigned per-vessel identifier there would be a fabricated
+    identity wearing an identifier, and a "required apparatus name" would
+    make the record look grounded while attributing conditions to a vessel
+    that physically cannot produce them. A field name that carried
+    apparatus-identity semantics would invite downstream code to launder the
+    class label into a device id; these names are chosen so that misreading
+    requires ignoring the words, not just skipping a docstring.
+
+    **What this type does NOT prove, stated plainly rather than implied:**
+    that the labeled class is the device that produced any claim in the
+    envelope, or that only one physical instance of the class exists. It
+    proves one thing: this class NAME was located at this span.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    label_raw: str = Field(min_length=1)
+    """The device-class name as the SOURCE prints it (e.g. ``"heat flux
+    burner"``, ``"spherical combustion vessel"``, ``"shock tube"``) --
+    verbatim, never normalized, resolved, or invented."""
+    label_ref: SourceRef
+    """Provenance for the class label. Plain, never :class:`Maybe`: an
+    ungrounded subject declaration is not a weaker declaration to record
+    honestly, it is no declaration at all -- that case must be an
+    :class:`UnresolvedSubject` instead."""
+
+
+class UnresolvedSubject(BaseModel):
+    """The refusal half of the subject sum on :class:`ConditionSetEnvelope`:
+    an explicit, grounded statement that the subject cannot be resolved even
+    at device-class granularity, and why.
+
+    This is a first-class record, not a missing field: a ``Maybe`` subject
+    (or an optional one) would make "nobody resolved the subject yet" and
+    "the source makes the subject unresolvable" byte-identical, and the
+    second is a fact about the SOURCE that downstream consumers must be able
+    to see and audit. ``reason_ref`` is required for the same reason
+    ``statement_ref`` is on :class:`UnextractedConditionStatement`: a
+    refusal that does not say WHERE the evidence for refusing lives is
+    indistinguishable from a guess.
+
+    **What this type does NOT prove, stated plainly rather than implied:**
+    that ``reason`` is the CORRECT classification, or that the span behind
+    ``reason_ref`` really shows what the reason claims. This model records a
+    decision the extractor already made; checking it needs the document, and
+    an element model holds no document.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    reason: SubjectRefusalReason
+    reason_ref: SourceRef
+    """The located span that SHOWS why the subject is unresolvable (e.g. the
+    sentence introducing "The other vessel"). Plain, never
+    :class:`Maybe`."""
+
+
+class ConditionAttribution(StrEnum):
+    """Whose conditions a :class:`ConditionSetEnvelope` asserts these are.
+
+    An extractor ASSERTION with an auditable span
+    (:attr:`ConditionSetEnvelope.attribution_ref`), never a verified fact:
+    nothing in this schema checks it, and nothing can -- the probe of eight
+    real corpus papers found simulation conditions, cited third-party
+    conditions, and own-experiment conditions are not separable by wording
+    alone (one paper writes "the initial temperature was set to 298 K and
+    initial pressure was fixed at 1 atm" about a CHEMKIN run, with numbers
+    that coincide with its real experimental values stated pages earlier).
+    """
+
+    OWN_EXPERIMENT = "own_experiment"
+    """Asserted to describe an experiment the source's authors ran
+    themselves."""
+
+    CITED_THIRD_PARTY = "cited_third_party"
+    """Asserted to describe a cited, third-party experiment reproduced in
+    this source's text or tables."""
+
+    SIMULATION = "simulation"
+    """Asserted to describe a simulation (e.g. a CHEMKIN run), not a
+    physical measurement."""
+
+
 class EmbeddedConversionTable(BaseModel):
     """A :class:`~carmel.services.units.ConversionTable`'s own canonical
     identity-payload JSON, embedded VERBATIM in a :class:`DatasetEnvelope` so
@@ -4036,6 +4189,157 @@ def _series_identity_payload(series: Series) -> dict[str, Any]:
 
 def _embedded_conversion_table_identity_payload(table: EmbeddedConversionTable) -> dict[str, Any]:
     return {"sha256": table.sha256, "canonical_json": table.canonical_json}
+
+
+def _grounded_scalar_claim_identity_payload(claim: GroundedScalarClaim) -> dict[str, Any]:
+    return {
+        "claim_id": claim.claim_id,
+        "label_raw": claim.label_raw,
+        "label_ref": _source_ref_identity_payload(claim.label_ref),
+        "value": _measured_value_identity_payload(claim.value),
+        "uncertainty": _project_maybe(claim.uncertainty, _uncertainty_identity_payload),
+    }
+
+
+def _grounded_categorical_claim_identity_payload(claim: GroundedCategoricalClaim) -> dict[str, Any]:
+    return {
+        "claim_id": claim.claim_id,
+        "label_raw": claim.label_raw,
+        "label_ref": _source_ref_identity_payload(claim.label_ref),
+        "token_raw": claim.token_raw,
+        "token_ref": _source_ref_identity_payload(claim.token_ref),
+    }
+
+
+def _unextracted_condition_statement_identity_payload(
+    statement: UnextractedConditionStatement,
+) -> dict[str, Any]:
+    return {
+        "statement_id": statement.statement_id,
+        "label_raw": statement.label_raw,
+        "label_ref": _source_ref_identity_payload(statement.label_ref),
+        "statement_ref": _source_ref_identity_payload(statement.statement_ref),
+        "reason": statement.reason.value,
+        "quantity_kind": _project_maybe(statement.quantity_kind, lambda kind: kind.value),
+    }
+
+
+_SUBJECT_KIND_KEY = "subject_kind"
+"""The tag key under which :func:`_condition_subject_identity_payload`
+records WHICH variant of the subject sum a payload projects.
+
+``"subject_kind"`` rather than the ``"kind"`` used by the locator/table-key
+projections: those unions tag with ``"kind"`` because their models carry a
+literal ``kind`` FIELD whose projection doubles as the tag. Neither subject
+variant has (or should grow) such a field, so this tag is projection-only
+data -- naming it after the sum itself (the subject) keeps it from ever
+colliding with a real field name of either variant, today or after a future
+field addition, and makes a raw payload self-describing to a reader who has
+never seen this module."""
+
+_SUBJECT_KIND_DEVICE_CLASS = "device_class"
+_SUBJECT_KIND_UNRESOLVED = "unresolved"
+
+
+def _device_class_declaration_identity_payload(subject: DeviceClassDeclaration) -> dict[str, Any]:
+    return {
+        "label_raw": subject.label_raw,
+        "label_ref": _source_ref_identity_payload(subject.label_ref),
+    }
+
+
+def _unresolved_subject_identity_payload(subject: UnresolvedSubject) -> dict[str, Any]:
+    return {
+        "reason": subject.reason.value,
+        "reason_ref": _source_ref_identity_payload(subject.reason_ref),
+    }
+
+
+def _condition_subject_identity_payload(
+    subject: DeviceClassDeclaration | UnresolvedSubject,
+) -> dict[str, Any]:
+    """Project the subject SUM of a :class:`ConditionSetEnvelope`, TAGGED
+    with :data:`_SUBJECT_KIND_KEY` so the two variants can never produce the
+    same payload.
+
+    The tag is load-bearing, not decorative. Today the two variants happen
+    to have disjoint field names, so their untagged projections could not
+    collide -- but "happen to" is exactly the wrong thing to hang a
+    content address on: one future field addition (say, a ``label_raw`` on
+    a refusal recording what the source ALMOST named) could make an
+    untagged :class:`UnresolvedSubject` payload a legal
+    :class:`DeviceClassDeclaration` payload, and in a write-once
+    content-addressed store two different subjects addressing identically is
+    a permanent collision, not a bug that can be fixed after the fact.
+    :meth:`ConditionSetEnvelope.from_identity_payload` dispatches on this
+    tag (see :func:`_rehydrate_condition_subject`) rather than sniffing
+    field shapes, for the same reason.
+
+    The tag is applied LAST -- ``{**variant_payload, _SUBJECT_KIND_KEY: ...}``
+    -- never merged in first, so a future variant field literally named
+    ``"subject_kind"`` cannot silently overwrite the tag by dict-merge
+    order: the correct tag always wins the address, structurally, not by
+    convention. The guard below backs that structural guarantee with a
+    loud failure: it raises, before the merge, if a variant payload already
+    carries the tag key, rather than silently drop that field's real value
+    under the tag -- a colliding variant field is a bug in the variant
+    projector, and this function is the one place positioned to catch it
+    before it can ever reach the content address.
+    """
+    if isinstance(subject, DeviceClassDeclaration):
+        variant_payload = _device_class_declaration_identity_payload(subject)
+        tag = _SUBJECT_KIND_DEVICE_CLASS
+    elif isinstance(subject, UnresolvedSubject):
+        variant_payload = _unresolved_subject_identity_payload(subject)
+        tag = _SUBJECT_KIND_UNRESOLVED
+    else:
+        raise TypeError(f"_condition_subject_identity_payload: unhandled subject variant {subject!r}")
+    if _SUBJECT_KIND_KEY in variant_payload:
+        raise AssertionError(
+            f"_condition_subject_identity_payload: {type(subject).__name__}'s projected payload already "
+            f"contains the {_SUBJECT_KIND_KEY!r} tag key -- a variant field must never be named after the "
+            "sum's own tag, or the tag and that field's value could collide in the content address"
+        )
+    return {**variant_payload, _SUBJECT_KIND_KEY: tag}
+
+
+def _rehydrate_condition_subject(subject: Any) -> DeviceClassDeclaration | UnresolvedSubject:
+    """Inverse of :func:`_condition_subject_identity_payload`: dispatch on
+    the :data:`_SUBJECT_KIND_KEY` tag, strip it, and reconstruct the tagged
+    variant -- never guess a variant from field shapes.
+
+    A missing or unknown tag is a hard :class:`DatasetEnvelopeParseError`,
+    not a fall-through to pydantic's union matching: the tag is what makes
+    the two variants un-collidable in the store, so a payload without a
+    usable tag has no trustworthy identity to reconstruct. The tag key is
+    stripped before validation because both variants are ``extra="forbid"``
+    -- the same reason :func:`_rehydrate_absence_marker` strips
+    ``"__absent__"`` -- but only after the tag has been proven to name a
+    known variant.
+    """
+    if not isinstance(subject, dict):
+        raise DatasetEnvelopeParseError(
+            f"condition-set subject payload is {type(subject).__name__}, expected a dict carrying the "
+            f"{_SUBJECT_KIND_KEY!r} tag"
+        )
+    tag = subject.get(_SUBJECT_KIND_KEY)
+    if tag == _SUBJECT_KIND_DEVICE_CLASS:
+        variant: type[DeviceClassDeclaration | UnresolvedSubject] = DeviceClassDeclaration
+    elif tag == _SUBJECT_KIND_UNRESOLVED:
+        variant = UnresolvedSubject
+    else:
+        raise DatasetEnvelopeParseError(
+            f"condition-set subject payload has {_SUBJECT_KIND_KEY}={tag!r}, expected "
+            f"{_SUBJECT_KIND_DEVICE_CLASS!r} or {_SUBJECT_KIND_UNRESOLVED!r} -- a subject without a "
+            "known tag has no trustworthy identity to reconstruct"
+        )
+    untagged = {key: value for key, value in subject.items() if key != _SUBJECT_KIND_KEY}
+    try:
+        return variant.model_validate(untagged)
+    except ValidationError as exc:
+        raise DatasetEnvelopeParseError(
+            f"condition-set subject payload tagged {tag!r} failed validation as {variant.__name__}: {exc}"
+        ) from exc
 
 
 _UNADDRESSED_FIELDS: Mapping[tuple[str, str], str] = {
@@ -4687,6 +4991,317 @@ class DatasetEnvelope(BaseModel):
                 "DatasetEnvelope.from_identity_payload: the parsed envelope's re-projected "
                 "identity_payload() does not byte-match the input payload -- this is a "
                 "parser/projector disagreement (the parse silently changed what dataset this "
+                "payload addresses), not a claim that the input payload itself is corrupt"
+            )
+        return parsed
+
+
+class ConditionSetEnvelope(BaseModel):
+    """The top-level payload for one source's extracted experimental
+    CONDITIONS: a source graph, a SUBJECT, an attribution assertion, and the
+    condition atoms (:class:`GroundedScalarClaim`,
+    :class:`GroundedCategoricalClaim`,
+    :class:`UnextractedConditionStatement`) that cite that graph.
+
+    A SEPARATE class from :class:`DatasetEnvelope`, deliberately not a
+    subclass and not sharing a base: both envelopes are content-addressed
+    through hand-written ``identity_payload()`` projections, and a subclass
+    silently inheriting the parent's projection would let two DIFFERENT
+    payloads address identically in a write-once store -- see
+    :class:`_SourceGraphEnvelope` for why the seven shared provenance
+    validators are reused by CALL, never by inheritance.
+
+    **The subject is the hard problem this container solves, and it is a
+    required SUM.** A set of condition claims with no subject silently
+    merges a bomb and a shock tube from one paper into one record with
+    every validator green. A required apparatus NAME does not fix that
+    either: in a survey of eight real combustion-kinetics papers, one
+    paper's "bomb" is two physically different vessels the text never names
+    apart ("The first vessel" / "The other vessel"), whose conditions table
+    covers both under one caption, and one of the two vessels physically
+    cannot reach the highest temperature in that table -- a required name
+    there produces a record that LOOKS grounded and is wrong. So
+    :attr:`subject` is either a :class:`DeviceClassDeclaration` (grounded,
+    and named as a CLASS -- never a unique physical apparatus) or an
+    :class:`UnresolvedSubject` (an explicit, grounded refusal to resolve
+    the subject at all). There is no third state and no escape into
+    ``Maybe``; the field names carry the class-not-instance semantics so
+    that downstream laundering has to ignore the words, not just a
+    docstring.
+
+    Validators: the seven shared provenance helpers (T2, the duplicate-sha
+    guard, T3, V1, V2, V3, V6 -- called as module-level functions), plus
+    four container-specific invariants C1--C4, each with its own docstring
+    below. As on :class:`DatasetEnvelope`, ``mode="after"`` validators run
+    in declaration order, and C4/V2/V3/V6 rely on V1 having already proven
+    every ref resolves.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_graph: SourceGraph
+    conversion_tables: tuple[EmbeddedConversionTable, ...]
+    """Every :class:`~carmel.services.units.ConversionTable` cited (by
+    ``conversion_table_sha256``) by any :class:`MeasuredValue` reachable in
+    this envelope, embedded verbatim -- same contract, same T2/T3
+    validators, and same self-containment rationale as
+    :attr:`DatasetEnvelope.conversion_tables`. Empty exactly when the
+    envelope holds no :class:`MeasuredValue` at all (e.g. a refusals-only
+    condition set), because an embedded table nothing cites is unearned
+    provenance (T2)."""
+    subject: DeviceClassDeclaration | UnresolvedSubject
+    """The required subject SUM -- see the class docstring for why this is
+    a sum and why the declaration arm is class-level. Projected TAGGED (see
+    :func:`_condition_subject_identity_payload`), so the two arms can never
+    collide in the content-addressed store."""
+    attribution: ConditionAttribution
+    """Whose conditions these are asserted to be. An extractor ASSERTION
+    with an auditable span, never a verified fact -- see
+    :class:`ConditionAttribution` and what the counterweight below does not
+    prove."""
+    attribution_ref: SourceRef
+    """The located span the attribution assertion was read from. EVIDENCE
+    for the assertion, never an admission gate: a real, resolving ref can
+    be paired with a false ``OWN_EXPERIMENT`` (the corpus probe found
+    CHEMKIN-run conditions worded exactly like experimental ones), and
+    nothing here can tell. Required anyway, because an attribution with no
+    span at all is not even auditable by a human."""
+    scalar_claims: tuple[GroundedScalarClaim, ...]
+    """Grounded single-valued numeric conditions. May be empty -- see C1:
+    emptiness is judged across all three collections jointly."""
+    categorical_claims: tuple[GroundedCategoricalClaim, ...]
+    """Grounded name-valued conditions (diluent identity, reactor type,
+    ...). May be empty -- see C1."""
+    unextracted: tuple[UnextractedConditionStatement, ...]
+    """Located condition statements deliberately NOT turned into claims --
+    the coverage-honesty records. May be empty -- see C1 -- but a refusal
+    COUNTS as a record there: refusals are first-class content, not
+    padding."""
+
+    @model_validator(mode="after")
+    def _validate_conversion_tables_cover_cited_tables(self) -> ConditionSetEnvelope:
+        """T2: see :func:`_validate_conversion_tables_cover_cited_tables`."""
+        _validate_conversion_tables_cover_cited_tables(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_conversion_tables_no_duplicate_sha256(self) -> ConditionSetEnvelope:
+        """See :func:`_validate_conversion_tables_no_duplicate_sha256`."""
+        _validate_conversion_tables_no_duplicate_sha256(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_conversion_tables_sorted(self) -> ConditionSetEnvelope:
+        """T3: see :func:`_validate_conversion_tables_sorted`."""
+        _validate_conversion_tables_sorted(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_refs_resolve(self) -> ConditionSetEnvelope:
+        """V1: see :func:`_validate_refs_resolve`."""
+        _validate_refs_resolve(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_single_root_artifact(self) -> ConditionSetEnvelope:
+        """C4: every :class:`SourceRef` in the WHOLE envelope must resolve
+        under ONE parentless root artifact.
+
+        Deliberately STRONGER than :class:`DatasetEnvelope`'s per-series V5:
+        a dataset envelope may legitimately aggregate series from one paper
+        and its JATS rendition side by side, but a condition set is one
+        subject's conditions from one source -- a subject label span
+        grounded in paper A with a claim value span grounded in paper B is
+        two papers silently stitched into one record, exactly the
+        fabrication shape this module exists to make unconstructible.
+        Checked at the ROOT level, not the node level: a label in the main
+        PDF and a value in that paper's SI member share a root and stay
+        legal.
+
+        Runs AFTER V1 (declaration order), so every ``ref.node_id`` here is
+        already known to resolve. A node's root is itself if its
+        ``ancestors()`` chain is empty, otherwise the LAST entry of that
+        chain -- ``SourceGraph.ancestors`` returns immediate parent first,
+        root last.
+        """
+        roots: dict[str, str] = {}
+        for path, ref in iter_source_refs(self):
+            ancestor_chain = self.source_graph.ancestors(ref.node_id)
+            root_id = ancestor_chain[-1].node_id if ancestor_chain else ref.node_id
+            roots[root_id] = path
+        if len(roots) > 1:
+            raise ValueError(
+                f"ConditionSetEnvelope spans multiple root artifacts: refs resolve to nodes under root "
+                f"artifacts {sorted(roots)!r} (e.g. {', '.join(sorted(roots[r] for r in roots))}) -- a "
+                "condition set must be grounded under a single root artifact"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_no_decorative_nodes(self) -> ConditionSetEnvelope:
+        """V2: see :func:`_validate_no_decorative_nodes`."""
+        _validate_no_decorative_nodes(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_locator_kind_compatibility(self) -> ConditionSetEnvelope:
+        """V3: see :func:`_validate_locator_kind_compatibility`."""
+        _validate_locator_kind_compatibility(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_char_span_requires_extraction(self) -> ConditionSetEnvelope:
+        """V6: see :func:`_validate_char_span_requires_extraction`."""
+        _validate_char_span_requires_extraction(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_holds_at_least_one_record(self) -> ConditionSetEnvelope:
+        """C1: at least one entry across ``scalar_claims`` +
+        ``categorical_claims`` + ``unextracted`` COMBINED -- refusals COUNT.
+
+        A paper stating only "pressures from 1 to 10 atm" yields zero
+        claims and one ``VALUE_RANGE`` refusal, and that envelope MUST stay
+        legal: it is exactly the coverage honesty the ``unextracted``
+        collection exists for. What is refused is the ALL-empty envelope --
+        a validated source graph, a grounded subject, an attribution, and
+        no condition content whatsoever: an audit-shaped artifact that
+        LOOKS like grounded extraction while containing nothing any
+        consumer could ever read a condition from. This cannot be a
+        ``Field(min_length=1)`` because the requirement spans three fields
+        jointly; a per-field minimum would wrongly outlaw the
+        refusals-only and claims-only shapes that are each individually
+        legitimate.
+        """
+        if not (self.scalar_claims or self.categorical_claims or self.unextracted):
+            raise ValueError(
+                "ConditionSetEnvelope holds no scalar_claims, no categorical_claims and no unextracted "
+                "statements -- an all-empty condition set is an audit-shaped artifact, not a record; a "
+                "set with nothing extractable must still carry its refusals (unextracted), which count"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_one_id_namespace(self) -> ConditionSetEnvelope:
+        """C2: ONE id namespace across the whole envelope -- no id may
+        repeat across ``scalar_claims``, ``categorical_claims`` and
+        ``unextracted`` JOINTLY, not merely within each collection.
+
+        The concrete failure a per-collection check would miss: a coverage
+        map keyed by logical condition id, where
+        ``scalar_claims["pressure"]`` and ``unextracted["pressure"]``
+        coexist and one silently overwrites the other -- turning "refused a
+        range" into "extracted a scalar" (or the reverse) with no
+        validator anywhere in the path. One namespace makes the collision
+        unconstructible instead of merely unlikely.
+        """
+        owners: dict[str, str] = {}
+        for collection_name, entry_id in (
+            *(("scalar_claims", claim.claim_id) for claim in self.scalar_claims),
+            *(("categorical_claims", claim.claim_id) for claim in self.categorical_claims),
+            *(("unextracted", statement.statement_id) for statement in self.unextracted),
+        ):
+            if entry_id in owners:
+                raise ValueError(
+                    f"ConditionSetEnvelope: duplicate id {entry_id!r} appears in both "
+                    f"{owners[entry_id]} and {collection_name} -- claim_ids and statement_ids share "
+                    "ONE namespace across all three collections"
+                )
+            owners[entry_id] = collection_name
+        return self
+
+    @model_validator(mode="after")
+    def _validate_collections_sorted(self) -> ConditionSetEnvelope:
+        """C3: each of the three collections must be sorted ascending by its
+        own id, so exactly one legal ordering -- and therefore exactly one
+        content address -- exists per logical condition set; the same
+        S2/S7/E1b/T3 idiom used throughout this module."""
+        for collection_name, actual_ids in (
+            ("scalar_claims", [claim.claim_id for claim in self.scalar_claims]),
+            ("categorical_claims", [claim.claim_id for claim in self.categorical_claims]),
+            ("unextracted", [statement.statement_id for statement in self.unextracted]),
+        ):
+            if actual_ids != sorted(actual_ids):
+                raise ValueError(
+                    f"ConditionSetEnvelope: {collection_name} must be sorted ascending by id, got "
+                    f"{actual_ids!r}"
+                )
+        return self
+
+    def identity_payload(self) -> dict[str, Any]:
+        """Project this envelope to its canonical-JSON identity payload --
+        the condition-set counterpart of
+        :meth:`DatasetEnvelope.identity_payload`, with the same contract:
+        hand-written field-by-field projection, never ``model_dump`` (see
+        that method's docstring for why pydantic's dump shape must not
+        define a content address), plain JSON-able output only, enums
+        unwrapped to ``.value``, ``Maybe`` fields through
+        :func:`_project_maybe`, and a freshly built dict on every call.
+
+        The one shape unique to this envelope is the subject SUM, which
+        projects TAGGED via :func:`_condition_subject_identity_payload` --
+        see that helper for why the tag is load-bearing.
+        """
+        return {
+            "source_graph": _source_graph_identity_payload(self.source_graph),
+            "conversion_tables": [
+                _embedded_conversion_table_identity_payload(table) for table in self.conversion_tables
+            ],
+            "subject": _condition_subject_identity_payload(self.subject),
+            "attribution": self.attribution.value,
+            "attribution_ref": _source_ref_identity_payload(self.attribution_ref),
+            "scalar_claims": [_grounded_scalar_claim_identity_payload(claim) for claim in self.scalar_claims],
+            "categorical_claims": [
+                _grounded_categorical_claim_identity_payload(claim) for claim in self.categorical_claims
+            ],
+            "unextracted": [
+                _unextracted_condition_statement_identity_payload(statement) for statement in self.unextracted
+            ],
+        }
+
+    @classmethod
+    def from_identity_payload(cls, payload: dict[str, Any]) -> ConditionSetEnvelope:
+        """Reconstruct a :class:`ConditionSetEnvelope` from its own
+        :meth:`identity_payload` projection -- the exact inverse of that
+        method, with the same two-stage parse as
+        :meth:`DatasetEnvelope.from_identity_payload` (see that docstring
+        for the full rationale of each stage) plus one condition-set-only
+        step: the subject sum is dispatched on its
+        :data:`_SUBJECT_KIND_KEY` tag via
+        :func:`_rehydrate_condition_subject` BEFORE ``model_validate``,
+        because both variants are ``extra="forbid"`` and the tag is
+        projection-only data that must be stripped -- and because variant
+        choice must follow the tag, never pydantic's field-shape sniffing.
+
+        Stage 2's byte-for-byte re-projection comparison is what proves the
+        parse preserved identity; a mismatch is raised as a
+        parser/projector DISAGREEMENT, never as a claim that the input
+        payload is corrupt -- nothing here has evidence of that.
+
+        Like its ``DatasetEnvelope`` counterpart, this inverse is exact on
+        IDENTITY and lossy on ``_UNADDRESSED_FIELDS`` (today:
+        ``ArchiveOrigin.member_display_path`` only).
+
+        Raises:
+            DatasetEnvelopeParseError: the payload has a malformed absence
+                marker, a missing/unknown subject tag, fails validation, or
+                does not reproduce byte-for-byte under re-projection.
+        """
+        rehydrated = _rehydrate_identity_payload(payload)
+        if isinstance(rehydrated, dict) and "subject" in rehydrated:
+            rehydrated = {**rehydrated, "subject": _rehydrate_condition_subject(rehydrated["subject"])}
+        try:
+            parsed = cls.model_validate(rehydrated)
+        except ValidationError as exc:
+            raise DatasetEnvelopeParseError(
+                f"ConditionSetEnvelope payload failed validation after rehydration: {exc}"
+            ) from exc
+        reprojected = parsed.identity_payload()
+        if canonical_json_bytes(reprojected) != canonical_json_bytes(payload):
+            raise DatasetEnvelopeParseError(
+                "ConditionSetEnvelope.from_identity_payload: the parsed envelope's re-projected "
+                "identity_payload() does not byte-match the input payload -- this is a "
+                "parser/projector disagreement (the parse silently changed what condition set this "
                 "payload addresses), not a claim that the input payload itself is corrupt"
             )
         return parsed
