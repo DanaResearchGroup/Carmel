@@ -1961,7 +1961,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         nothing to check and nothing left unchecked.
 
         This exists because a mutation audit found the gap: nothing pinned that
-        ``unchecked_claims`` stays empty for a node carrying no
+        ``unchecked_store_claims`` stays empty for a node carrying no
         ``SourceVerification`` at all. Emitting one there would give every
         pre-``SourceVerification`` envelope -- and every legitimate
         `FIGURE_CROP`, which is what this crop node is -- a permanent entry
@@ -1979,7 +1979,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.unchecked_claims == ()
+        assert report.unchecked_store_claims == ()
 
     def test_mixed_text_and_bbox_envelope_rejects_a_fabricated_label(
         self, tmp_path: Path

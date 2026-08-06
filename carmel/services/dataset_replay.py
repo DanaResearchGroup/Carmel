@@ -239,7 +239,8 @@ __all__ = [
     "ReplayFinding",
     "ReplayOutcome",
     "ReplayReport",
-    "UncheckedClaim",
+    "UncheckedSemanticClaim",
+    "UncheckedStoreClaim",
     "replay_envelope",
     "replay_stored_dataset",
     "verify_measured_value_unit",
@@ -319,8 +320,20 @@ class ReplayFinding:
 
 
 @dataclass(frozen=True)
-class UncheckedClaim:
-    """One carried provenance claim that replay could not check AT ALL.
+class UncheckedStoreClaim:
+    """One carried claim ABOUT THE STORE that replay could not check AT ALL.
+
+    The store axis: claims of the form "this node's bytes are recorded in the
+    content-addressed store under this digest, and its root sidecar was
+    authenticated." When the root tier cannot be read, that claim is neither
+    confirmed nor refuted -- it was never tested.
+
+    The sibling axis is :class:`UncheckedSemanticClaim`, and the two are
+    deliberately distinct TYPES rather than one type in two lists. The
+    distinction is not decorative: the report's account of WHICH axis was left
+    untested is the whole reason both lists exist, and one shared type would let
+    a store claim be filed as a semantic one without anything noticing, because
+    both downgrade the overall verdict identically (Codex round 85, P1).
 
     Deliberately NOT a :class:`ReplayFinding`, and deliberately not carried in
     ``ReplayReport.findings`` -- so it can never feed
@@ -352,6 +365,54 @@ class UncheckedClaim:
 
     claim: str
     """The claim's recorded value, verbatim -- what would have been tested."""
+
+    reason: str
+    """Why the check could not run. Never a disagreement: a disagreement is a
+    FAILED :class:`ReplayFinding`, not an unchecked claim."""
+
+
+@dataclass(frozen=True)
+class UncheckedSemanticClaim:
+    """One carried claim about MEANING that replay could not check AT ALL.
+
+    The semantic axis: claims of the form "the span this ref locates SUPPORTS
+    the value recorded here", which replay cannot test even when every
+    location-level check passes.
+
+    The concrete case this exists for is the condition-set envelope.
+    ``attribution_ref`` is an ordinary :class:`SourceRef` -- it carries a
+    locator like any other, and its span re-slices like any other. What is
+    missing is the other half of a grounding pair: the value it supports is
+    ``ConditionAttribution.OWN_EXPERIMENT`` (an enum), and no recorded text says
+    that span means that enum. ``statement_ref`` is the same shape. Contrast
+    ``label_ref``, which IS paired with a recorded ``label_raw`` and therefore
+    IS checkable in the ordinary way -- the axis is a property of the PAIRING,
+    not of the ref.
+
+    This is the load-bearing rule stated as a data type: grounding proves
+    LOCATION, never MEANING. A semantic claim is never something replay could
+    have caught if it tried harder, and never a defect in the envelope; it is
+    the boundary of what re-slicing can establish at all, recorded so the report
+    stays honest about it.
+
+    Distinct from :class:`UncheckedStoreClaim` by TYPE, not merely by which list
+    it sits in -- see that class for why. Both are refused by the other's list.
+    """
+
+    ref_path: str
+    """Where in the envelope the unchecked claim lives."""
+
+    claim: str
+    """The DERIVED value whose support went unchecked -- the enum member, unit or
+    label the envelope recorded, never the source text the ref points at.
+
+    That restriction is not stylistic. The rest of this module routes every
+    quotation of paper text through a redaction gate, because the corpus is
+    closed-access and non-redistributable and these reports reach logs and CI.
+    This field has no such gate, so it must never be handed a slice of the
+    source: what went unchecked is whether the span supports the derived VALUE,
+    and naming that value says everything a reader needs without reproducing a
+    single word of the paper."""
 
     reason: str
     """Why the check could not run. Never a disagreement: a disagreement is a
@@ -394,14 +455,27 @@ class ReplayReport:
     total_char_spans: int
     unchecked_char_spans: int
     findings: tuple[ReplayFinding, ...] = ()
-    unchecked_claims: tuple[UncheckedClaim, ...] = ()
-    """Provenance claims replay could not check at all -- see
-    :class:`UncheckedClaim`. Orthogonal to :attr:`evidence_outcome` on purpose:
-    the evidence may be VERIFIED while entries sit here, meaning "the data
-    verified, and this claim about the store was never tested." That
+    unchecked_store_claims: tuple[UncheckedStoreClaim, ...] = ()
+    """Claims about the STORE that replay could not check at all -- see
+    :class:`UncheckedStoreClaim`. Orthogonal to :attr:`evidence_outcome` on
+    purpose: the evidence may be VERIFIED while entries sit here, meaning "the
+    data verified, and this claim about the store was never tested." That
     combination is real and worth reporting -- what it must not do is escape as
     a bare "verified", which is exactly why it is what downgrades
     :attr:`overall_outcome`."""
+
+    unchecked_semantic_claims: tuple[UncheckedSemanticClaim, ...] = ()
+    """Claims about MEANING that replay could not check at all -- see
+    :class:`UncheckedSemanticClaim`. A separate axis from the store claims
+    above, and deliberately NOT one list of one shared type: both downgrade
+    :attr:`overall_outcome` identically, so nothing else in the system would
+    ever notice one filed as the other, and the report's account of WHICH axis
+    was left untested is the reason both exist.
+
+    **There is deliberately no field named ``unchecked_claims``.** Keeping the
+    unqualified name for either axis would re-file the other one under it at
+    every call site that was never revisited -- the same defect as the bare
+    ``outcome`` this report already removed, one level down."""
 
     def __post_init__(self) -> None:
         # `frozen=True` stops the FIELD being rebound; it does nothing about the
@@ -413,7 +487,8 @@ class ReplayReport:
         # the contents, and costs nothing on the producer path, which already
         # passes tuples.
         object.__setattr__(self, "findings", tuple(self.findings))
-        object.__setattr__(self, "unchecked_claims", tuple(self.unchecked_claims))
+        object.__setattr__(self, "unchecked_store_claims", tuple(self.unchecked_store_claims))
+        object.__setattr__(self, "unchecked_semantic_claims", tuple(self.unchecked_semantic_claims))
 
         # Normalising the CONTAINER says nothing about what is in it. Both
         # derivations read `.category` off each finding and match it on
@@ -431,13 +506,24 @@ class ReplayReport:
                     "identity, so a look-alike would take part in the verdict without being "
                     "bound by any of the rules ReplayFinding enforces"
                 )
-        for index, claim in enumerate(self.unchecked_claims):
-            if type(claim) is not UncheckedClaim:
-                raise ValueError(
-                    f"unchecked_claims[{index}] is a {type(claim).__name__}, not an "
-                    "UncheckedClaim -- its mere presence downgrades overall_outcome, so an "
-                    "arbitrary object here silently decides a verdict"
-                )
+        # Per AXIS, by exact type. A store claim sitting in the semantic list
+        # changes no verdict -- both downgrade overall_outcome identically --
+        # which is precisely why nothing else in the system would ever catch
+        # it. What it corrupts is the report's account of WHICH axis was left
+        # untested, and that account is the only reason there are two lists
+        # (Codex round 85, P1).
+        for field_name, expected in (
+            ("unchecked_store_claims", UncheckedStoreClaim),
+            ("unchecked_semantic_claims", UncheckedSemanticClaim),
+        ):
+            for index, claim in enumerate(getattr(self, field_name)):
+                if type(claim) is not expected:
+                    raise ValueError(
+                        f"{field_name}[{index}] is a {type(claim).__name__}, not an "
+                        f"{expected.__name__} -- its mere presence downgrades overall_outcome, "
+                        "so an arbitrary object here silently decides a verdict, and a claim "
+                        "from the other axis would misreport which axis was left untested"
+                    )
 
         # `bool` subclasses `int`, so `True` satisfies every bound below and
         # reads as a count of 1; a float satisfies them too and can make the
@@ -522,7 +608,11 @@ class ReplayReport:
         # two are never conflated, in EITHER direction.
         if evidence is ReplayOutcome.FAILED:
             return ReplayOutcome.FAILED
-        if self.unchecked_claims:
+        # BOTH axes, and every future one. A list that widens "what was left
+        # untested" and is not wired in here recreates the original overclaim
+        # one level up: this property's entire promise is that a consumer need
+        # not also read a side list to know what the report earned.
+        if self.unchecked_store_claims or self.unchecked_semantic_claims:
             return ReplayOutcome.UNVERIFIABLE
         return evidence
 
@@ -882,7 +972,7 @@ class RootSidecarClaimCheck(NamedTuple):
     """
 
     finding: ReplayFinding | None = None
-    unchecked: UncheckedClaim | None = None
+    unchecked: UncheckedStoreClaim | None = None
 
 
 def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSidecarClaimCheck:
@@ -941,7 +1031,7 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSi
     landed the P1: an envelope could claim ``ROOT_SIDECAR_DIGEST_AUTHENTICATED``
     and then have its root ``meta.json`` deleted or made unreadable, and the
     resulting report was indistinguishable from one where the claim was checked
-    and held. So an unreadable root tier now yields an :class:`UncheckedClaim`
+    and held. So an unreadable root tier now yields an :class:`UncheckedStoreClaim`
     instead of nothing. That is not a finding and does not touch ``evidence_outcome`` --
     the contract above is untouched -- it simply stops the report implying a
     check that never ran.
@@ -952,7 +1042,7 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSi
 
     Returns:
         A :class:`RootSidecarClaimCheck` carrying a FAILED finding when the
-        store positively contradicts the claim; an :class:`UncheckedClaim` when
+        store positively contradicts the claim; an :class:`UncheckedStoreClaim` when
         the root tier could not be read to check it; and neither when the claim
         survives or the node carries no verification record at all.
     """
@@ -1017,14 +1107,14 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSi
 
 def _unchecked_root_claim(
     path: str, node: SourceNode, claimed: RootSidecarVerification, why: str
-) -> UncheckedClaim:
-    """Build the :class:`UncheckedClaim` for a root tier that could not be read.
+) -> UncheckedStoreClaim:
+    """Build the :class:`UncheckedStoreClaim` for a root tier that could not be read.
 
     Names the artifact sha256 as well as the node id: a reader holding only the
     report needs to know WHICH artifact's root tier was unreachable in order to
     go look, and the node id alone does not say.
     """
-    return UncheckedClaim(
+    return UncheckedStoreClaim(
         ref_path=path,
         claim=claimed.value,
         reason=f"node {node.node_id!r} claims root_sidecar={claimed.value}, but that claim could "
@@ -1638,7 +1728,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     node_problems: dict[str, ReplayFinding] = {}
     node_level_problems: dict[str, ReplayFinding] = {}
     claim_findings: list[ReplayFinding] = []
-    unchecked_claims: list[UncheckedClaim] = []
+    unchecked_store_claims: list[UncheckedStoreClaim] = []
     for node in envelope.source_graph.nodes:
         text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
         if problem is not None:
@@ -1657,7 +1747,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         if claim_check.finding is not None:
             claim_findings.append(claim_check.finding)
         if claim_check.unchecked is not None:
-            unchecked_claims.append(claim_check.unchecked)
+            unchecked_store_claims.append(claim_check.unchecked)
 
     checked, total_char_spans, span_findings = check_char_spans(
         envelope, text_by_node_id, node_problems, reveal_text=reveal_text
@@ -1720,7 +1810,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         total_char_spans=total_char_spans,
         unchecked_char_spans=total_char_spans - checked,
         findings=all_findings,
-        unchecked_claims=tuple(unchecked_claims),
+        unchecked_store_claims=tuple(unchecked_store_claims),
     )
 
 

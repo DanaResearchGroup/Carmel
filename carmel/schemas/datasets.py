@@ -877,7 +877,7 @@ class SourceVerification(BaseModel):
     because its verification of the DATA is root-independent by design. What it
     no longer does is stay SILENT about it -- a claim it could not check is
     reported on the replay report as a
-    :class:`~carmel.services.dataset_replay.UncheckedClaim`, orthogonal to
+    :class:`~carmel.services.dataset_replay.UncheckedStoreClaim`, orthogonal to
     ``evidence_outcome`` and folded into ``overall_outcome``. A reader who wants
     "every carried claim held" reads ``overall_outcome``, which is exactly that
     question; it no longer has to be paired with a side list, because an

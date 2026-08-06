@@ -27,7 +27,7 @@ from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
     ReplayReport,
-    UncheckedClaim,
+    UncheckedStoreClaim,
 )
 
 
@@ -42,7 +42,7 @@ def _clean_report(**overrides: object) -> ReplayReport:
     return ReplayReport(**kwargs)  # type: ignore[arg-type]
 
 
-_AN_UNCHECKED_CLAIM = UncheckedClaim(
+_AN_UNCHECKED_STORE_CLAIM = UncheckedStoreClaim(
     ref_path="source_graph.node('paper').verification.root_sidecar",
     claim="no_recorded_digest",
     reason="the root meta.json could not be read, so the claim was never tested",
@@ -101,11 +101,11 @@ class TestAnUncheckedClaimCannotLeaveTheReportClaimingVerified:
     """
 
     def test_clean_evidence_plus_an_unchecked_claim_splits_the_verdict(self) -> None:
-        report = _clean_report(unchecked_claims=(_AN_UNCHECKED_CLAIM,))
+        report = _clean_report(unchecked_store_claims=(_AN_UNCHECKED_STORE_CLAIM,))
 
         # The evidence really did verify. That is worth saying, and saying
         # separately -- collapsing it away would lose the distinction round 74
-        # built `UncheckedClaim` to preserve.
+        # built `UncheckedStoreClaim` to preserve.
         assert report.evidence_outcome is ReplayOutcome.VERIFIED
         # But the report as a whole cannot claim it.
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
@@ -126,7 +126,7 @@ class TestAnUncheckedClaimCannotLeaveTheReportClaimingVerified:
         """
         report = _clean_report(
             findings=(_A_FAILURE,),
-            unchecked_claims=(_AN_UNCHECKED_CLAIM,),
+            unchecked_store_claims=(_AN_UNCHECKED_STORE_CLAIM,),
         )
 
         assert report.evidence_outcome is ReplayOutcome.FAILED
@@ -137,7 +137,7 @@ class TestAnUncheckedClaimCannotLeaveTheReportClaimingVerified:
     ) -> None:
         report = _clean_report(
             findings=(_AN_UNVERIFIABLE,),
-            unchecked_claims=(_AN_UNCHECKED_CLAIM,),
+            unchecked_store_claims=(_AN_UNCHECKED_STORE_CLAIM,),
         )
 
         assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
@@ -166,7 +166,7 @@ class TestTheEvidenceScopedListsSayEvidenceInTheirNames:
         self,
     ) -> None:
         """The exact shape that made the old property names misleading."""
-        report = _clean_report(unchecked_claims=(_AN_UNCHECKED_CLAIM,))
+        report = _clean_report(unchecked_store_claims=(_AN_UNCHECKED_STORE_CLAIM,))
 
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert report.evidence_unverifiable == ()
@@ -359,12 +359,12 @@ class TestTheReportValidatesWhatItIsMadeOf:
         object here silently decides a verdict."""
         look_alike = SimpleNamespace(ref_path="x", claim="y", reason="z")
 
-        with pytest.raises(ValueError, match="UncheckedClaim"):
+        with pytest.raises(ValueError, match="UncheckedStoreClaim"):
             ReplayReport(
                 checked_char_spans=1,
                 total_char_spans=1,
                 unchecked_char_spans=0,
-                unchecked_claims=(look_alike,),  # type: ignore[arg-type]
+                unchecked_store_claims=(look_alike,),  # type: ignore[arg-type]
             )
 
     @pytest.mark.parametrize(
@@ -416,16 +416,16 @@ class TestTheFreezeReachesTheContents:
         assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
 
     def test_a_list_of_unchecked_claims_cannot_be_mutated_after_the_fact(self) -> None:
-        claims = [_AN_UNCHECKED_CLAIM]
+        claims = [_AN_UNCHECKED_STORE_CLAIM]
         report = ReplayReport(
             checked_char_spans=3,
             total_char_spans=3,
             unchecked_char_spans=0,
-            unchecked_claims=claims,  # type: ignore[arg-type]
+            unchecked_store_claims=claims,  # type: ignore[arg-type]
         )
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
 
         claims.clear()
 
-        assert report.unchecked_claims == (_AN_UNCHECKED_CLAIM,)
+        assert report.unchecked_store_claims == (_AN_UNCHECKED_STORE_CLAIM,)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE

@@ -1899,7 +1899,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         Those are two orthogonal questions -- did the data verify, and was every
         carried provenance claim actually checked -- and this asserts they are
-        now reported separately. ``unchecked_claims`` is deliberately NOT a
+        now reported separately. ``unchecked_store_claims`` is deliberately NOT a
         :class:`ReplayFinding`, so it cannot feed ``outcome`` and the pinned
         contract above survives untouched."""
         stored = self._legacy_artifact(tmp_path)
@@ -1910,8 +1910,8 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
-        assert len(report.unchecked_claims) == 1
-        unchecked = report.unchecked_claims[0]
+        assert len(report.unchecked_store_claims) == 1
+        unchecked = report.unchecked_store_claims[0]
         assert unchecked.ref_path == "source_graph.node('paper').verification.root_sidecar"
         # An `or` here would let either half rot silently. A reader holding only
         # the report needs BOTH: which artifact's root tier to go look at, and
@@ -1945,8 +1945,8 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
-        assert len(report.unchecked_claims) == 1
-        reason = report.unchecked_claims[0].reason
+        assert len(report.unchecked_store_claims) == 1
+        reason = report.unchecked_store_claims[0].reason
         assert "missing, unreadable or invalid" in reason
         assert "is absent" not in reason
 
@@ -1974,14 +1974,14 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert {c.ref_path for c in report.unchecked_claims} == {
+        assert {c.ref_path for c in report.unchecked_store_claims} == {
             "source_graph.node('paper').verification.root_sidecar",
             "source_graph.node('paper_2').verification.root_sidecar",
         }
 
     def test_a_readable_root_meta_leaves_no_unchecked_claim(self, tmp_path: Path) -> None:
         """Counterweight. This one passes by construction on the CURRENT code
-        as well (nothing populates ``unchecked_claims`` yet), so it is not
+        as well (nothing populates ``unchecked_store_claims`` yet), so it is not
         evidence on its own -- it exists to pin that the new reporting fires
         ONLY when the root tier genuinely could not be read, and it is what
         kills the "emit for every node" mutation."""
@@ -1991,7 +1991,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         report = replay_envelope(tmp_path, envelope)
 
         assert report.overall_outcome is ReplayOutcome.VERIFIED
-        assert report.unchecked_claims == ()
+        assert report.unchecked_store_claims == ()
 
 
 class TestProducerNodeKind:
@@ -2359,7 +2359,7 @@ class TestFigureFurnitureFabricatesAVerifiedEnvelope:
 
         assert report.overall_outcome is ReplayOutcome.VERIFIED
         assert report.findings == ()
-        assert report.unchecked_claims == ()
+        assert report.unchecked_store_claims == ()
         # Not vacuous: spans were actually checked, and all of them were.
         assert report.total_char_spans > 0
         assert report.checked_char_spans == report.total_char_spans
