@@ -1907,8 +1907,71 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         assert report.outcome is ReplayOutcome.VERIFIED
         assert len(report.unchecked_claims) == 1
         unchecked = report.unchecked_claims[0]
-        assert unchecked.ref_path.endswith(".verification.root_sidecar")
-        assert stored.sha256 in unchecked.reason or "root" in unchecked.reason
+        assert unchecked.ref_path == "source_graph.node('paper').verification.root_sidecar"
+        # An `or` here would let either half rot silently. A reader holding only
+        # the report needs BOTH: which artifact's root tier to go look at, and
+        # what the untested claim actually said.
+        assert stored.sha256 in unchecked.reason
+        assert unchecked.claim == RootSidecarVerification.NO_RECORDED_DIGEST.value
+
+    def test_an_unparseable_root_meta_is_not_reported_as_an_absent_one(
+        self, tmp_path: Path
+    ) -> None:
+        """A corrupt root tier must not be described as a missing one.
+
+        Written (following Codex round 74, P2) expecting the two to report
+        DIFFERENTLY, on the reasoning that "not there" and "there and garbage"
+        are different facts an operator acts on differently. It failed, and the
+        failure was the useful part: ``load_artifact_meta`` collapses missing,
+        unreadable and invalid into a single ``None``, so the branch cannot
+        tell them apart -- and the reason string was nonetheless asserting
+        "root meta.json is absent", a fact nothing had established.
+
+        Distinguishing them for real would need a second stat of the same file,
+        reintroducing the TOCTOU ``RootSidecarClaimCheck`` exists to avoid. So
+        the fix went the other way: say only what is known. This pins that the
+        honest disjunction is what is reported, and that no branch claims a
+        specific cause it did not establish."""
+        stored = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, stored)
+        (artifact_dir(tmp_path, stored.sha256) / "meta.json").write_text("{not json")
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert len(report.unchecked_claims) == 1
+        reason = report.unchecked_claims[0].reason
+        assert "missing, unreadable or invalid" in reason
+        assert "is absent" not in reason
+
+    def test_every_node_with_an_uncheckable_claim_gets_its_own_entry(
+        self, tmp_path: Path
+    ) -> None:
+        """Two uncheckable nodes must produce TWO entries, not one.
+
+        Codex round 74 named the collapsing mutation directly: nothing pinned
+        cardinality, so an implementation that recorded only the first
+        unchecked claim (or de-duplicated by tier) would pass every other test
+        here while hiding every node after the first."""
+        first = self._legacy_artifact(tmp_path)
+        envelope = self._envelope(tmp_path, first)
+        root = envelope.source_graph.nodes[0]
+        sibling = root.model_copy(update={"node_id": "paper_2", "parent_node_id": root.node_id})
+        envelope = envelope.model_copy(
+            update={
+                "source_graph": envelope.source_graph.model_copy(
+                    update={"nodes": (root, sibling)}
+                )
+            }
+        )
+        (artifact_dir(tmp_path, first.sha256) / "meta.json").unlink()
+
+        report = replay_envelope(tmp_path, envelope)
+
+        assert {c.ref_path for c in report.unchecked_claims} == {
+            "source_graph.node('paper').verification.root_sidecar",
+            "source_graph.node('paper_2').verification.root_sidecar",
+        }
 
     def test_a_readable_root_meta_leaves_no_unchecked_claim(self, tmp_path: Path) -> None:
         """Counterweight. This one passes by construction on the CURRENT code

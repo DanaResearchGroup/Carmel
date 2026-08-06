@@ -252,7 +252,17 @@ class ReplayOutcome(StrEnum):
     """The three (never two) outcomes a replay check can produce."""
 
     VERIFIED = "verified"
-    """Every applicable check ran, and every one of them passed."""
+    """Every applicable EVIDENCE check ran, and every one of them passed.
+
+    This read "every applicable check ran", full stop, and that became false the
+    moment :class:`UncheckedClaim` existed: a VERIFIED report may carry
+    provenance claims that were never tested at all. The scope word is
+    load-bearing. VERIFIED is a statement about the envelope's DATA -- its raw
+    bytes, its addressed extraction record, its grounded spans -- and says
+    nothing about whether every claim the envelope carries ABOUT THE STORE was
+    checkable. A consumer that reads ``outcome`` alone and concludes the
+    provenance is trustworthy is reading more than this member asserts; it must
+    read ``ReplayReport.unchecked_claims`` as well (Codex round 74, P1)."""
 
     FAILED = "failed"
     """At least one check ran and produced a definite disagreement."""
@@ -782,14 +792,31 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSi
         # that cannot be read leaves the claim UNREFUTED, which is a fact about
         # this workspace and not a defect of the envelope. It is reported as
         # unchecked so that fact is visible rather than silent.
+        #
+        # ``ValueError`` here does NOT mean "the file was corrupt" --
+        # ``load_artifact_meta`` raises it only for a malformed sha256 or a
+        # directory that would escape the workspace root, and swallows every
+        # parse failure into ``None`` instead. So the reason names the
+        # exception type rather than asserting a cause.
         return RootSidecarClaimCheck(
             unchecked=_unchecked_root_claim(
-                path, node, claimed, f"root meta.json could not be read ({type(exc).__name__})"
+                path, node, claimed, f"resolving the root artifact raised {type(exc).__name__}"
             )
         )
     if meta is None:
+        # DELIBERATELY does not say "absent". ``load_artifact_meta`` returns
+        # ``None`` for missing, unreadable AND invalid alike, so this branch
+        # cannot tell them apart, and a reason string that picked one would
+        # assert a fact nothing here established -- the precise over-claim this
+        # module keeps having to unwind elsewhere. Distinguishing them would
+        # need a second stat/read of the same file, reintroducing exactly the
+        # TOCTOU that :class:`RootSidecarClaimCheck` exists to avoid. Naming
+        # all three is the honest option, and the operator has the artifact
+        # sha256 below to go look.
         return RootSidecarClaimCheck(
-            unchecked=_unchecked_root_claim(path, node, claimed, "root meta.json is absent")
+            unchecked=_unchecked_root_claim(
+                path, node, claimed, "root meta.json is missing, unreadable or invalid"
+            )
         )
     actual = _recompute_root_sidecar_claim(workspace_root, node.sha256, meta)
     if actual is claimed:
