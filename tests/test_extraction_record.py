@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,8 +16,10 @@ from carmel.schemas.literature import ROOT_EXTRACTION_ID, ArtifactProvenance
 from carmel.services import semantic_deps
 from carmel.services.evidence import store_artifact
 from carmel.services.extraction_record import (
+    CurrentSelectionKind,
     ExtractionPreference,
     ExtractionRecordError,
+    ExtractionRecordMeta,
     ExtractionSelectionError,
     SelectedExtraction,
     UnknownPypdfVersionError,
@@ -25,6 +28,7 @@ from carmel.services.extraction_record import (
     extraction_record_dir,
     list_extraction_records,
     load_extraction_record,
+    select_current_extraction,
     select_extraction,
     store_extraction_record,
     stored_extraction_sha256,
@@ -124,6 +128,31 @@ def _store_root_artifact(tmp_path: Path, *, data: bytes = b"%PDF-1.4\nsynthetic\
         max_bytes=MAX_BYTES,
     )
     return stored.sha256
+
+
+def _store_artifact_with_record(tmp_path: Path, text: str = "authenticated body text") -> tuple[str, str]:
+    """A root artifact PLUS one genuinely current extraction record for it.
+
+    Stamped with the REAL `extraction_identity()` rather than the hardcoded fixture
+    identity used elsewhere in this file, because these tests turn on the record
+    actually being CURRENT -- a hardcoded code sha would make it stale and the selector
+    would refuse for the wrong reason, passing the assertion while testing nothing.
+
+    Returns:
+        ``(raw_sha256, extraction_sha256)``.
+    """
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    raw_sha = _store_root_artifact(tmp_path, text=text)
+    extraction_sha = _store(
+        tmp_path,
+        raw_sha256=raw_sha,
+        extractor_code_sha256=identity.code_sha256,
+        pypdf_version=identity.pypdf_version,
+        text=text,
+    )
+    return raw_sha, extraction_sha
 
 
 class TestComputeExtractionSha:
@@ -1077,3 +1106,96 @@ class TestSelectExtraction:
 
         assert result.extraction_id == extraction_sha
         assert result.extracted.text == "honest record text h2"
+
+
+class TestTheSelectorRefusesRatherThanCrashesOrGuesses:
+    """Coverage the mutation audit proved was missing, not extra assertions on old ground.
+
+    Each of these pins a branch that stayed green when it was deliberately broken: the
+    suite could not tell the difference between the guard being present and absent.
+    """
+
+    def test_a_pypdf_record_is_not_current_when_the_running_pypdf_is_unidentifiable(self) -> None:
+        """``"unknown"`` must never satisfy a version comparison by matching itself.
+
+        A stored record claiming ``pypdf_version="unknown"`` cannot be minted through
+        `store_extraction_record` (it refuses), but it can exist on disk from tampering
+        or a hand-edited store. Without the identifiability check, ``"unknown" ==
+        "unknown"`` makes such a record CURRENT, and a record nobody can attribute to a
+        real pypdf would then be served as authenticated text.
+        """
+        from carmel.services.extraction_record import _is_current
+        from carmel.services.semantic_deps import ExtractionIdentity
+
+        identity = ExtractionIdentity(code_sha256="a" * 64, pypdf_version="unknown")
+        record = ExtractionRecordMeta(
+            parent_raw_sha256="b" * 64,
+            extraction_sha256="c" * 64,
+            extracted_sha256="d" * 64,
+            extracted_text_sha256="e" * 64,
+            extractor="pdf:pypdf",
+            extractor_code_sha256="a" * 64,
+            pypdf_version="unknown",
+            identity_payload_version="2",
+            stored_at=datetime.now(UTC),
+        )
+
+        assert not _is_current(record, identity), (
+            "two unknowns are not a match -- an unidentifiable extractor cannot certify "
+            "that a record it cannot attribute is current"
+        )
+
+    def test_an_unreadable_extracted_json_refuses_instead_of_escaping_as_an_oserror(
+        self, tmp_path: Path
+    ) -> None:
+        """A record whose body cannot be READ is as unusable as one that is absent.
+
+        The narrow ``FileNotFoundError`` catch let a permissions/EIO failure escape as an
+        unhandled exception, which aborts the caller's entire pass over every OTHER
+        artifact -- turning one unreadable file into a campaign-wide crash.
+        """
+        if os.geteuid() == 0:
+            pytest.skip("root can read a chmod-000 file")
+        raw_sha, extraction_sha = _store_artifact_with_record(tmp_path)
+        body = (
+            tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha / "extracted.json"
+        )
+        body.chmod(0o000)
+        try:
+            selection = select_current_extraction(tmp_path, raw_sha)
+        finally:
+            body.chmod(0o600)
+
+        assert selection.kind is CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED
+        assert selection.selected is None
+
+
+class TestAnUnreadableEvidenceStoreIsNotAnEmptyOne:
+    def test_listing_an_unlistable_store_raises_rather_than_reporting_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        """"I could not look" must not present as "there is nothing there".
+
+        A caller handed an empty list reports full coverage of nothing, and a barren pass
+        that looks conclusive is worse than a failing one -- nobody re-runs a pass that
+        said it was done.
+        """
+        if os.geteuid() == 0:
+            pytest.skip("root can read a chmod-000 directory")
+        from carmel.services.evidence import EvidenceStoreUnreadableError, list_artifacts_with_unreadable
+
+        _store_artifact_with_record(tmp_path)
+        root = tmp_path / "evidence" / "literature"
+        root.chmod(0o000)
+        try:
+            with pytest.raises(EvidenceStoreUnreadableError, match="could not be listed"):
+                list_artifacts_with_unreadable(tmp_path)
+        finally:
+            root.chmod(0o700)
+
+    def test_a_workspace_that_never_held_an_artifact_is_honestly_empty(self, tmp_path: Path) -> None:
+        """The counterweight: the one route that MAY report an empty store."""
+        from carmel.services.evidence import list_artifacts_with_unreadable
+
+        assert not (tmp_path / "evidence" / "literature").exists()
+        assert list_artifacts_with_unreadable(tmp_path) == ([], [])

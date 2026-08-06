@@ -100,7 +100,44 @@ def _store_synthetic_artifact(
     extracted = ExtractedText(
         text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=lossy
     )
-    return store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+    stored = store_artifact(
+        workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
+    )
+    _store_genuine_extraction_record(workspace_root, stored.sha256, extracted)
+    return stored
+
+
+def _store_genuine_extraction_record(
+    workspace_root: Path, raw_sha256: str, extracted: ExtractedText
+) -> str:
+    """Give the artifact the extraction record a real re-extraction would have left.
+
+    The producer no longer MINTS a record by mirroring the root sidecar's text -- doing
+    so laundered unauthenticated root text into an address the corpus gate reads as
+    authenticated. It now requires a record to already exist, which in production is
+    what ``Carmel.py reextract`` produces. These fixtures therefore set up that world
+    explicitly rather than relying on the producer to conjure it, which is the honest
+    shape: a stored extraction is a PRECONDITION of dataset production, not a side
+    effect of it.
+    """
+    from carmel.services.extraction_record import store_extraction_record
+    from carmel.services.reextraction import _canonical_extracted_json_bytes
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    # The PRODUCTION serializer, not a hand-rolled one: a fixture that serialized
+    # differently would mint a record whose content address no genuine re-extraction
+    # could ever reproduce, and every digest assertion downstream would then be
+    # measuring the fixture rather than the code.
+    payload = _canonical_extracted_json_bytes(extracted)
+    return store_extraction_record(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        extractor=extracted.extractor,
+        extractor_code_sha256=identity.code_sha256,
+        pypdf_version=identity.pypdf_version,
+        extracted_json_bytes=payload,
+    )
 
 
 
@@ -1190,6 +1227,57 @@ class TestGroundQuoteUnitAcceptanceMatrix:
             quantity=QuantityKind.TEMPERATURE,
         )
         assert text[locator.start : locator.end] == "K"
+
+
+class TestTheProducerNeverMintsARecordFromTheRootSidecar:
+    """A dataset must be grounded in an extraction the producer FOUND, never one it made.
+
+    This producer used to call ``store_extraction_record`` on the root sidecar's
+    already-stored ``extracted.json`` bytes, stamped with today's extractor identity,
+    purely so its ``ExtractionBinding`` had a resolvable address to name. Nothing read
+    extraction records at the time, so it was inert -- until the corpus gate began
+    preferring an authenticated current record over the root sidecar. From that moment
+    the mirrored record WAS such a record, so producing a dataset from a legacy artifact
+    would have promoted unauthenticated root text to text the corpus reads as
+    digest-authenticated, bypassing the legacy-root opt-in entirely.
+    """
+
+    def test_an_artifact_with_no_extraction_record_is_refused(self, tmp_path: Path) -> None:
+        """No record, no envelope -- and above all, no record invented to fill the gap."""
+        data = _TEXT.encode("utf-8")
+        artifact = FetchedArtifact(
+            url="https://example.invalid/legacy.pdf",
+            final_url="https://example.invalid/legacy.pdf",
+            sha256=hashlib.sha256(data).hexdigest(),
+            content_type="application/pdf",
+            n_bytes=len(data),
+            fetched_at=datetime.now(UTC),
+        )
+        extracted = ExtractedText(
+            text=_TEXT, normalized=_TEXT.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
+        )
+        # Deliberately NOT via _store_synthetic_artifact: that helper now stores the
+        # record a real re-extraction would have left, which is exactly what must be
+        # absent here.
+        stored = store_artifact(
+            tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
+        )
+        records_dir = tmp_path / "evidence" / "literature" / stored.sha256 / "extractions"
+        assert not records_dir.exists()
+
+        with pytest.raises(DatasetProducerError, match="no usable current extraction record"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="s1",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
+
+        assert not records_dir.exists(), (
+            "refusing must not leave a record behind: minting one here is the laundering "
+            "this refusal exists to prevent"
+        )
 
 
 class TestProducerEndToEnd:

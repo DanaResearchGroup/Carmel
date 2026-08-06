@@ -119,7 +119,44 @@ def _store_synthetic_artifact(
         fetched_at=datetime.now(UTC),
     )
     extracted = ExtractedText(text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=False)
-    return store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
+    stored = store_artifact(
+        workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
+    )
+    _store_genuine_extraction_record(workspace_root, stored.sha256, extracted)
+    return stored
+
+
+def _store_genuine_extraction_record(
+    workspace_root: Path, raw_sha256: str, extracted: ExtractedText
+) -> str:
+    """Give the artifact the extraction record a real re-extraction would have left.
+
+    The producer no longer MINTS a record by mirroring the root sidecar's text -- doing
+    so laundered unauthenticated root text into an address the corpus gate reads as
+    authenticated. It now requires a record to already exist, which in production is
+    what ``Carmel.py reextract`` produces. These fixtures therefore set up that world
+    explicitly rather than relying on the producer to conjure it, which is the honest
+    shape: a stored extraction is a PRECONDITION of dataset production, not a side
+    effect of it.
+    """
+    from carmel.services.extraction_record import store_extraction_record
+    from carmel.services.reextraction import _canonical_extracted_json_bytes
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    # The PRODUCTION serializer, not a hand-rolled one: a fixture that serialized
+    # differently would mint a record whose content address no genuine re-extraction
+    # could ever reproduce, and every digest assertion downstream would then be
+    # measuring the fixture rather than the code.
+    payload = _canonical_extracted_json_bytes(extracted)
+    return store_extraction_record(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        extractor=extracted.extractor,
+        extractor_code_sha256=identity.code_sha256,
+        pypdf_version=identity.pypdf_version,
+        extracted_json_bytes=payload,
+    )
 
 
 def _produce_and_load(tmp_path: Path, text: str = _TEXT):

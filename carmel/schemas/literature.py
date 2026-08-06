@@ -587,6 +587,47 @@ class CorpusReadOutcome(StrEnum):
     authorised: break the record, and the unauthenticated root text gets served in its
     place. A broken record is a refusal, not a reason to trust something else."""
 
+    NO_CURRENT_EXTRACTION_RECORD = "no_current_extraction_record"
+    """Extraction records exist for this artifact, but none matches today's extractor
+    identity. Never read, and deliberately NOT downgraded to the root sidecar.
+
+    Kept distinct from having no records at all, which is the one situation that DOES
+    reach the root tiers. "Nothing was ever stored" and "something was stored and it is
+    stale" are different facts, and only the first can honestly be said to leave the
+    root as the best available evidence: here a better answer existed and has expired,
+    so the fix is re-extraction (``Carmel.py reextract``), not a downgrade."""
+
+    EXTRACTOR_IDENTITY_UNAVAILABLE = "extractor_identity_unavailable"
+    """Today's extractor identity could not be determined, so currentness is unknowable.
+
+    In practice: ``pypdf`` could not be introspected, and
+    :func:`~carmel.services.semantic_deps._pypdf_version` collapses every such failure
+    to ``"unknown"``, which matches no stored version. That silently un-currents EVERY
+    pypdf-extracted record in the campaign at once, so without this member a broken
+    pypdf install would revert an entire corpus to unauthenticated root text with
+    nothing said about it.
+
+    Distinct from :attr:`NO_CURRENT_EXTRACTION_RECORD` because it is a fact about the
+    ENVIRONMENT, not the documents. Reporting staleness here would send the operator to
+    re-extract every paper when what is actually broken is their pypdf install."""
+
+    UNUSABLE_EXTRACTION_RECORD_PRESENT = "unusable_extraction_record_present"
+    """At least one sha-shaped entry under ``extractions/`` could not be read at all.
+
+    Never read, because a candidate record that cannot be examined cannot be counted,
+    and the count is load-bearing. Skipping it instead -- which is what a plain list of
+    readable records does -- lets corrupting ONE ``meta.json`` turn two current records
+    (ambiguous, refuses) into one (selected, served). That is a tamper-to-PROMOTE: the
+    attacker gains a read by destroying evidence, the opposite direction from the
+    downgrade :attr:`EXTRACTION_RECORD_AUTHENTICATION_FAILED` guards."""
+
+    EXTRACTION_RECORD_STORE_UNREADABLE = "extraction_record_store_unreadable"
+    """The ``extractions/`` directory exists but could not be enumerated (permissions,
+    EIO, ...). Never read.
+
+    "The store could not answer" is not "the store answered that there is nothing
+    here", and only the latter may fall through to the root tiers."""
+
     INTEGRITY_FAILED = "integrity_failed"
     """The bytes themselves do not match what was recorded: the default (non-deep)
     check itself failed, because ``raw.bin`` is absent or no longer hashes to the

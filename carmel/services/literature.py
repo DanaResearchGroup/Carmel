@@ -117,11 +117,8 @@ from carmel.services.evidence import (
     verify_artifact,
 )
 from carmel.services.extraction_record import (
-    ExtractionPreference,
-    ExtractionRecordError,
-    ExtractionSelectionError,
-    current_extraction_records,
-    select_extraction,
+    CurrentSelectionKind,
+    select_current_extraction,
 )
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
@@ -134,6 +131,33 @@ from carmel.services.plan_progress import (
 from carmel.services.provenance import record_agent_provenance
 
 logger = get_logger("services.literature")
+
+#: How each refusing :class:`CurrentSelectionKind` is reported to the operator.
+#:
+#: Exhaustive over every kind EXCEPT the two that are not refusals:
+#: :attr:`~CurrentSelectionKind.SELECTED` (the document was read) and
+#: :attr:`~CurrentSelectionKind.NO_RECORDS_STORED` (the one route that legitimately
+#: falls through to the root tiers). A mapping rather than a chain of ``if``s so that
+#: adding a kind without deciding how to report it fails with a ``KeyError`` at the
+#: point of use, instead of silently taking some default branch -- which, in a function
+#: whose default branch serves unauthenticated text, is precisely the failure mode this
+#: whole selector exists to remove.
+_RECORD_REFUSAL_OUTCOMES: dict[CurrentSelectionKind, CorpusReadOutcome] = {
+    CurrentSelectionKind.NO_CURRENT_RECORD: CorpusReadOutcome.NO_CURRENT_EXTRACTION_RECORD,
+    CurrentSelectionKind.MULTIPLE_CURRENT_RECORDS: (
+        CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS
+    ),
+    CurrentSelectionKind.UNUSABLE_RECORD_PRESENT: (
+        CorpusReadOutcome.UNUSABLE_EXTRACTION_RECORD_PRESENT
+    ),
+    CurrentSelectionKind.STORE_UNREADABLE: CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE,
+    CurrentSelectionKind.EXTRACTOR_IDENTITY_UNAVAILABLE: (
+        CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE
+    ),
+    CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED: (
+        CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED
+    ),
+}
 
 LITERATURE_REPORT_NAME = "literature_report.json"
 RUN_LOCK_DIR_NAME = ".run.lock"
@@ -1849,53 +1873,34 @@ def _load_corpus(
         # longer hashes to its own name is not evidence, whatever records point at it.
         # A record must never launder a corrupt artifact.
         #
-        # "Exactly one current record" is decided HERE rather than read off the
-        # exception, because `select_extraction` raises the same
-        # `ExtractionSelectionError` for "not exactly one current record" (ordinary --
-        # fall through to the root) and for "the record failed to authenticate" (a
-        # refusal that must NOT fall through). Telling those apart by matching the
-        # message text would be reading a decision out of prose.
-        try:
-            n_current_records = len(current_extraction_records(workspace_root, artifact.sha256))
-        except ExtractionRecordError:
-            # The store cannot say what is current right now (e.g. the running pypdf
-            # version is unrecognised). That is not a fact about THIS artifact, so it
-            # must not condemn it: fall through and let the root tiers judge it.
-            n_current_records = 0
-        if n_current_records > 1:
-            # Several records claim to be current at once. Every one of them may be
-            # intact -- the STORE is ambiguous, which is a different fact from a broken
-            # record and gets its own outcome so the operator is not sent hunting for a
-            # corrupt file. Falling through to the root here would be the same downgrade
-            # a failed record must not buy: ambiguity among records is not a licence to
-            # serve text checked against nothing.
-            logger.warning(
-                "evidence store: %s has %d extraction records current at once, so which one "
-                "speaks for this document is ambiguous and it was NOT read. The root sidecar is "
-                "deliberately NOT served instead",
-                artifact.sha256,
-                n_current_records,
-            )
-            outcomes[artifact.sha256] = CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS
-            continue
-        if n_current_records == 1:
-            try:
-                selected = select_extraction(
-                    workspace_root, artifact.sha256, prefer=ExtractionPreference.CURRENT
-                )
-            except ExtractionSelectionError as exc:
-                logger.warning(
-                    "evidence store: %s has one current extraction record and it failed to "
-                    "authenticate, so the artifact was NOT read (%s). The root sidecar is "
-                    "deliberately NOT served instead -- a broken record must not buy a read of "
-                    "text that is checked against nothing",
-                    artifact.sha256,
-                    exc,
-                )
-                outcomes[artifact.sha256] = CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED
-                continue
+        # ONE scan decides this, and it returns a typed result rather than a count or an
+        # exception. Both of those shapes previously hid a decision: a count could be
+        # WRONG (a corrupt meta.json made a candidate record vanish, turning an ambiguous
+        # store into an apparently unambiguous one and PROMOTING a read), and a single
+        # exception type meant "not exactly one current record" and "the record failed to
+        # authenticate" -- which license opposite decisions -- were distinguishable only
+        # by matching message prose.
+        #
+        # Of everything this scan can establish, exactly ONE (no record was ever stored)
+        # may fall through to the root tiers below. Every other route to "nothing to
+        # prefer here" is a downgrade wearing a different face, and refuses.
+        selection = select_current_extraction(workspace_root, artifact.sha256)
+        if selection.kind is CurrentSelectionKind.SELECTED:
+            selected = selection.selected
+            if selected is None:  # pragma: no cover - CurrentSelection's own invariant
+                raise AssertionError("SELECTED selection carried no extraction")
             outcomes[artifact.sha256] = CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
             corpus.append((artifact, selected.extracted, selected.extraction_id))
+            continue
+        if selection.kind is not CurrentSelectionKind.NO_RECORDS_STORED:
+            logger.warning(
+                "evidence store: %s was NOT read from an extraction record (%s). The root sidecar "
+                "is deliberately NOT served instead -- every route to 'no usable record' except a "
+                "store that never held one is a downgrade, not a licence",
+                artifact.sha256,
+                selection.detail,
+            )
+            outcomes[artifact.sha256] = _RECORD_REFUSAL_OUTCOMES[selection.kind]
             continue
 
         try:

@@ -3924,6 +3924,44 @@ def _store_current_record(workspace_root: Path, raw_sha256: str, *, text: str) -
     )
 
 
+def _store_record(
+    workspace_root: Path,
+    raw_sha256: str,
+    *,
+    text: str,
+    extractor: str = "pdf:pypdf",
+    code_sha256: str | None = None,
+    pypdf_version: str | None = None,
+) -> str:
+    """Append ONE extraction record with the identity fields spelled out.
+
+    The generalisation of :func:`_store_current_record` for tests that need a record
+    which is deliberately NOT current, or not a ``pdf:pypdf`` one. Defaults still come
+    from the real `extraction_identity()` for the same reason that helper does it.
+    """
+    from carmel.agents.tools.extract import ExtractedText, normalize_for_match
+    from carmel.services.extraction_record import store_extraction_record
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    extracted = ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=[], extractor=extractor, lossy=False
+    )
+    payload = json.dumps(extracted.model_dump(mode="json"), indent=2, sort_keys=True).encode("utf-8")
+    return store_extraction_record(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        extractor=extractor,
+        extractor_code_sha256=code_sha256 if code_sha256 is not None else identity.code_sha256,
+        pypdf_version=pypdf_version if pypdf_version is not None else identity.pypdf_version,
+        extracted_json_bytes=payload,
+    )
+
+
+def _records_dir(workspace_root: Path, raw_sha256: str) -> Path:
+    return workspace_root / "evidence" / "literature" / raw_sha256 / "extractions"
+
+
 RECORD_TEXT = "Text served from the authenticated extraction record, not the root sidecar."
 
 
@@ -4088,4 +4126,147 @@ class TestTheCorpusPrefersAnAuthenticatedExtractionRecord:
         )
         assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
             "and it must not quietly fall through to the root sidecar"
+        )
+
+
+class TestEveryRouteToNoUsableRecordRefuses:
+    """Only a genuinely absent ``extractions/`` may fall through to the root tiers.
+
+    `4c0aa23` guarded exactly one route -- a record that is FOUND and fails to
+    authenticate. Every other way of arriving at "zero current records" still served
+    unauthenticated root text, and two of those routes are worse than the downgrade that
+    commit fixed: one of them SELECTS rather than falls through, and one is reachable by
+    tampering with a single file.
+    """
+
+    def test_corrupting_one_meta_json_must_not_turn_a_refusal_into_a_read(
+        self, campaign: Campaign
+    ) -> None:
+        """Tamper-to-PROMOTE: the attacker gains a read rather than losing one.
+
+        Two current records are ambiguous and refuse. Corrupting ONE record's meta.json
+        makes `list_extraction_records` skip it, so the count falls to one and the
+        survivor is served as authenticated corpus text. That is strictly worse than the
+        downgrade the record-preference was introduced to prevent, because deleting
+        evidence must never be able to unlock a read.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        doomed = _store_record(
+            campaign.workspace_root, legacy_sha, text="a second, differently-worded extraction"
+        )
+        (_records_dir(campaign.workspace_root, legacy_sha) / doomed / "meta.json").write_text(
+            "{ this is not json", encoding="utf-8"
+        )
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], (
+            "a sha-shaped record that cannot be read is a candidate, not noise -- it must "
+            "block the read, not silently reduce the count to one"
+        )
+        assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED, (
+            "corrupting one file must never PROMOTE the survivor to an authenticated read"
+        )
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_a_pdf_unavailable_record_is_not_current_once_pypdf_is_installed(
+        self, campaign: Campaign
+    ) -> None:
+        """False currentness: today's extractor would never produce this record.
+
+        ``pdf:unavailable`` is the degraded placeholder written when pypdf could not be
+        imported. It is deliberately excluded from the pypdf-version comparison -- which
+        is right at STORE time, where demanding a version there provably is none would be
+        wrong, but wrong at QUERY time: with pypdf installed, today's extraction would
+        produce ``pdf:pypdf``, so the placeholder is stale and must not be served.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_record(
+            campaign.workspace_root,
+            legacy_sha,
+            text="degraded placeholder written when pypdf was missing",
+            extractor="pdf:unavailable",
+            pypdf_version="unknown",
+        )
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "a degraded placeholder must not be served as a current record"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_records_that_no_longer_match_todays_code_identity_refuse(
+        self, campaign: Campaign
+    ) -> None:
+        """Records exist but none is current: a refusal, not a fall-through.
+
+        "No record was ever stored" and "records exist, none matches today's extractor"
+        are different facts about the document, and only the first one licenses reading
+        text that is checked against nothing.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_record(
+            campaign.workspace_root, legacy_sha, text=RECORD_TEXT, code_sha256="0" * 64
+        )
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "a stale record is not a licence to serve the root sidecar"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_an_undiscoverable_pypdf_version_refuses_and_says_so(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken pypdf install must not silently revert the whole campaign to root text.
+
+        `_pypdf_version()` collapses every failure to ``"unknown"``, which matches no
+        stored version, so EVERY pypdf-extracted record in the campaign stops being
+        current at once. The operator must be told their environment cannot identify the
+        extractor dependency -- not that their documents are stale.
+        """
+        from carmel.services import semantic_deps
+
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        monkeypatch.setattr(semantic_deps, "_pypdf_version", lambda: "unknown")
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "an unidentifiable extractor dependency must refuse, not downgrade"
+        assert outcomes[legacy_sha] == CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a chmod-000 directory")
+    def test_an_unlistable_extractions_directory_refuses(self, campaign: Campaign) -> None:
+        """"The store cannot be read" must not present as "the store is empty"."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        records_dir = _records_dir(campaign.workspace_root, legacy_sha)
+        records_dir.chmod(0o000)
+        try:
+            corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+        finally:
+            records_dir.chmod(0o700)
+
+        assert corpus == [], "an unreadable record store is not an absent one"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_a_genuinely_absent_extractions_directory_is_the_only_fall_through(
+        self, campaign: Campaign
+    ) -> None:
+        """The one route that legitimately reaches the root tiers.
+
+        This is the counterweight to every refusal above: if the refusals swallowed this
+        case too, the legacy corpus would be unreadable rather than opt-in, and the
+        refusals would be indistinguishable from a blanket ban.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        assert not _records_dir(campaign.workspace_root, legacy_sha).exists()
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "still gated behind the legacy-root opt-in"
+        assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "an artifact that never had a record must still reach the root tiers"
         )

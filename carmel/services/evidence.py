@@ -84,6 +84,7 @@ from carmel.services.artifacts import read_bytes, read_json, write_bytes, write_
 
 __all__ = [
     "EVIDENCE_LITERATURE_DIR",
+    "EvidenceStoreUnreadableError",
     "artifact_dir",
     "list_artifacts",
     "list_artifacts_with_unreadable",
@@ -96,6 +97,21 @@ __all__ = [
 logger = get_logger("services.evidence")
 
 EVIDENCE_LITERATURE_DIR = "evidence/literature"
+
+
+class EvidenceStoreUnreadableError(OSError):
+    """The evidence store exists but could not be enumerated.
+
+    Deliberately an exception rather than an empty result. Every other "I could not read
+    this" in this module degrades to skipping ONE artifact, which the caller folds into
+    its reported coverage; there is no equivalent move for the store as a whole, because
+    a caller handed an empty list cannot tell "nothing is stored" from "I could not
+    look", and reports full coverage of nothing either way.
+
+    A subclass of ``OSError`` so a caller that already handles I/O failure around store
+    access keeps working, while one that wants to name this case specifically can.
+    """
+
 
 _RAW_NAME = "raw.bin"
 _TEXT_NAME = "text.txt"
@@ -478,10 +494,23 @@ def list_artifacts_with_unreadable(workspace_root: Path) -> tuple[list[StoredArt
     names lets the caller fold them into the coverage it reports (F11).
     """
     root = Path(workspace_root) / EVIDENCE_LITERATURE_DIR
+    if not root.exists():
+        # A workspace that has never held an artifact. Genuinely empty, and saying so is
+        # honest -- this is the ONLY route by which this function reports an empty store.
+        return [], []
     try:
         entries = sorted(root.iterdir())
-    except OSError:
-        return [], []
+    except OSError as exc:
+        # NOT `return [], []`. That is the very failure this function's docstring argues
+        # against, applied to the whole store rather than to one artifact: "the store
+        # cannot be read" would present as "the store is empty", and a pass over an empty
+        # store reports full coverage of nothing. A barren pass would look conclusive,
+        # which is strictly worse than failing -- nobody re-runs a pass that said it was
+        # done.
+        raise EvidenceStoreUnreadableError(
+            f"the evidence store at {root} exists but could not be listed: {exc}. Refusing to "
+            "report it as empty -- an unreadable store establishes nothing about what it holds"
+        ) from exc
 
     artifacts: list[StoredArtifact] = []
     unreadable: list[str] = []

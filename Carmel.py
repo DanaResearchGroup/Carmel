@@ -184,10 +184,11 @@ def create_parser() -> argparse.ArgumentParser:
         description=(
             "Re-parse a stored artifact's raw.bin with today's extractor and append a new, "
             "separately-addressed extraction record under evidence/literature/<raw_sha256>/"
-            "extractions/. NOTE: no consumer reads extraction records yet -- this command "
-            "only appends evidence for a future one. Dry run (the default) does the real "
-            "read/parse/cleanliness check and reports what it would do without writing "
-            "anything; pass --apply to actually write."
+            "extractions/. The corpus pass PREFERS such a record over the root sidecar, so "
+            "re-extracting is how a legacy artifact becomes readable without the "
+            "unauthenticated-legacy-root opt-in, and dataset production now requires one. "
+            "Dry run (the default) does the real read/parse/cleanliness check and reports "
+            "what it would do without writing anything; pass --apply to actually write."
         ),
     )
     reextract.add_argument("--campaign", help="Campaign ID")
@@ -339,9 +340,10 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     return 0
 
 
-_NO_CONSUMER_NOTICE = (
-    "NOTE: no consumer reads extraction records yet -- this command only appends "
-    "evidence for a future one."
+_CONSUMER_NOTICE = (
+    "NOTE: extraction records ARE read. The corpus pass prefers an authenticated current "
+    "record over the root sidecar, and dataset production requires one, so appending a "
+    "record here changes what later passes read."
 )
 
 
@@ -442,7 +444,7 @@ def _cmd_reextract(
         print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
         return 1
 
-    print(_NO_CONSUMER_NOTICE)
+    print(_CONSUMER_NOTICE)
 
     if sha is not None:
         return _reextract_one(ws, raw_sha256=sha, max_bytes=max_bytes, apply=apply)

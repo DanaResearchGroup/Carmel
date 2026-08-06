@@ -2025,13 +2025,13 @@ class TestReextractCommand:
 
         assert code == 0
         out = capsys.readouterr().out
-        assert "no consumer reads extraction records yet" in out.lower()
+        assert "extraction records are read" in out.lower()
 
-    def test_no_consumer_notice_appears_in_help_text(self, capsys: pytest.CaptureFixture[str]) -> None:
+    def test_consumer_notice_appears_in_help_text(self, capsys: pytest.CaptureFixture[str]) -> None:
         with pytest.raises(SystemExit):
             main(["reextract", "--help"])
         out = capsys.readouterr().out
         # argparse line-wraps the description to the terminal width, so compare on
         # whitespace-normalized text rather than requiring the phrase on one line.
         normalized = " ".join(out.lower().split())
-        assert "no consumer reads extraction records yet" in normalized
+        assert "the corpus pass prefers such a record over the root sidecar" in normalized

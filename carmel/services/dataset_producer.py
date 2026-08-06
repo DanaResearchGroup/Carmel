@@ -99,10 +99,9 @@ from carmel.services.dataset_store import (
 from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_artifact
 from carmel.services.extraction_record import (
     _PYPDF_DEPENDENT_EXTRACTORS,
-    ExtractionRecordError,
-    UnknownPypdfVersionError,
+    CurrentSelectionKind,
     load_extraction_record,
-    store_extraction_record,
+    select_current_extraction,
 )
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
@@ -121,7 +120,6 @@ from carmel.services.numeric import (
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     current_sha_for,
-    extraction_identity,
 )
 from carmel.services.units import QuantityKind
 
@@ -1376,9 +1374,37 @@ def produce_envelope_from_artifact(
                 "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
             )
 
-    extracted, extracted_sha256, content_type, extracted_json_bytes = (
+    _root_extracted, extracted_sha256, content_type, _extracted_json_bytes = (
         _load_verified_extracted_text(workspace_root, sha256)
     )
+    # The text this envelope grounds against must come from a genuinely stored
+    # extraction record, never from the root sidecar.
+    #
+    # This function used to MIRROR the root's already-stored extracted.json into a new
+    # record stamped with today's extraction_identity(), purely so the binding below had
+    # a resolvable address to name. No re-extraction happened: raw.bin was never
+    # re-parsed. While nothing consumed extraction records that was inert. It stopped
+    # being inert the moment the corpus gate began PREFERRING an authenticated current
+    # record over the root -- because the mirrored record is, by construction, exactly
+    # such a record. Running dataset production on a legacy artifact would then have
+    # laundered unauthenticated root text into text the corpus reads as
+    # EXTRACTION_RECORD_DIGEST_AUTHENTICATED, silently bypassing the legacy-root opt-in
+    # that exists precisely to stop that text being read without the operator saying so.
+    #
+    # A record must therefore be something this producer FINDS, never something it
+    # mints. If none exists, the honest answer is that no envelope can be produced until
+    # the artifact is genuinely re-extracted (`Carmel.py reextract`).
+    selection = select_current_extraction(workspace_root, sha256)
+    if selection.kind is not CurrentSelectionKind.SELECTED or selection.selected is None:
+        raise DatasetProducerError(
+            f"artifact {sha256!r} has no usable current extraction record ({selection.detail}); "
+            "refusing to produce a dataset envelope. A dataset must be grounded in a genuinely "
+            "stored extraction, and this producer will not mint a record from the root sidecar's "
+            "text to satisfy its own binding -- that would launder unauthenticated text into an "
+            "address the corpus gate treats as authenticated. Re-extract the artifact first"
+        )
+    extraction_sha256 = selection.selected.extraction_id
+    extracted = selection.selected.extracted
     if extracted.lossy:
         # `ground_quote` below is a simple substring search, not the full
         # carmel.services.grounding gate -- it has no equivalent of that gate's
@@ -1414,62 +1440,26 @@ def produce_envelope_from_artifact(
     # this closes.
     document_source_context = _source_context_for(extracted)
     document_glyph_health = assess_glyph_health(text)
-    # ExtractionBinding.parent_raw_sha256/extraction_sha256 must name a
-    # genuinely RESOLVABLE extraction record, not merely a computed address
-    # that resolves to nothing on disk -- a replayer handed an address with
-    # no backing record can never do better than report it UNVERIFIABLE
-    # forever, which is worse than no replayer at all. So this producer does
-    # not compute the address in isolation; it calls store_extraction_record(),
-    # which parses+content-addresses+durably MIRRORS the ALREADY-STORED root
-    # extracted.json bytes read above (via extracted_json_bytes) into
-    # evidence/literature/<sha256>/extractions/<extraction_sha256>/ (a no-op
-    # if that exact record is already stored -- idempotent on re-run), and
-    # returns the address that record now durably occupies. This is NOT a
-    # fresh extraction: no re-parsing of raw.bin happens here, and a genuine
-    # re-extraction path (re-running the extractor against raw.bin to
-    # produce new bytes) does not exist yet. The extractor code identity
-    # stamped onto the record IS today's, from
-    # semantic_deps.extraction_identity() -- the old store never recorded a
-    # separate extractor_code_sha256, so this producer cannot honestly claim
-    # to know what code identity produced a legacy artifact's extraction; it
-    # only claims what identity is stamping this mirrored record's metadata,
-    # now.
-    identity = extraction_identity()
-    try:
-        extraction_sha256 = store_extraction_record(
-            workspace_root,
-            raw_sha256=sha256,
-            extractor=extracted.extractor,
-            extractor_code_sha256=identity.code_sha256,
-            pypdf_version=identity.pypdf_version,
-            extracted_json_bytes=extracted_json_bytes,
-        )
-    except UnknownPypdfVersionError as exc:
-        raise DatasetProducerError(
-            f"artifact {sha256!r} was extracted with extractor={extracted.extractor!r}, which is "
-            "pypdf-version-dependent, but the installed pypdf version could not be determined; "
-            "refusing to mint an extraction address that cannot honestly claim which pypdf produced "
-            f"it: {exc}"
-        ) from exc
-    except ExtractionRecordError as exc:
-        raise DatasetProducerError(
-            f"artifact {sha256!r}: could not durably store a resolvable extraction record for its "
-            f"extracted.json: {exc}"
-        ) from exc
-    # The binding's identity fields are populated from what the store
-    # ACTUALLY stored -- the record is loaded back (which self-authenticates
-    # its meta.json against the address store_extraction_record just
-    # returned), never re-asserted from this function's local variables. An
-    # ExtractionBinding recomputes its own extraction_sha256 from these
-    # fields at construction, so building it from the authenticated record
-    # guarantees the binding recomputes to the address the store returned;
-    # inventing any value here would make the binding schema-invalid, loudly.
+    # The binding's identity fields are populated from what the store ACTUALLY holds --
+    # the record is loaded back (which self-authenticates its meta.json against the
+    # address selected above), never re-asserted from this function's local variables.
+    # An ExtractionBinding recomputes its own extraction_sha256 from these fields at
+    # construction, so building it from the authenticated record guarantees the binding
+    # recomputes to the address on disk; inventing any value here would make the binding
+    # schema-invalid, loudly.
+    #
+    # ExtractionBinding.parent_raw_sha256/extraction_sha256 must name a genuinely
+    # RESOLVABLE record, not merely a computed address that resolves to nothing -- a
+    # replayer handed an address with no backing record can never do better than report
+    # it UNVERIFIABLE forever, which is worse than no replayer at all. That requirement
+    # is now met by SELECTING an existing record rather than by minting one, so the only
+    # way this lookup can fail is a store that changed underneath the selection.
     record_meta = load_extraction_record(workspace_root, sha256, extraction_sha256)
     if record_meta is None:
         raise DatasetProducerError(
-            f"artifact {sha256!r}: store_extraction_record returned extraction address "
-            f"{extraction_sha256!r}, but no self-authenticating record resolves at that address; "
-            "the extraction record store is inconsistent and no binding can honestly be produced"
+            f"artifact {sha256!r}: extraction record {extraction_sha256!r} authenticated during "
+            "selection but no longer resolves; the extraction record store changed underneath this "
+            "producer and no binding can honestly be produced"
         )
     binding = ExtractionBinding(
         parent_raw_sha256=record_meta.parent_raw_sha256,

@@ -34,13 +34,22 @@ recorded identity fields and require it to equal the directory the record was
 loaded from, so a ``meta.json`` that was forged, corrupted, or moved to a
 different address's directory does not silently authenticate under that address.
 
-This increment adds ONLY the store: nothing in this codebase reads from it yet.
-The root ``evidence/literature/<raw_sha>/extracted.json`` layout, and every
-existing reader of it (grounding, the CLI, dataset production/replay), are
-UNCHANGED and UNTOUCHED by this module -- they are not migrated, and they are not
-cut off; they keep working exactly as before. Wiring a caller to actually consult
-this store, and to decide what happens when the "current" extraction record
-diverges from the root layout's, is deliberately out of scope here.
+This store is READ, by two consumers, and what each does when a record is missing
+differs on purpose:
+
+- The corpus pass (:func:`carmel.services.literature._load_corpus`) PREFERS a
+  digest-authenticated current record over the root sidecar, uniformly. Only an
+  artifact for which no record was ever stored reaches the root tiers at all; every
+  other route to "no usable record" refuses. See :func:`select_current_extraction`.
+- Dataset production (:func:`carmel.services.dataset_producer.produce_envelope_from_artifact`)
+  REQUIRES one, and refuses outright without it. It used to mirror the root sidecar's
+  bytes into a record to satisfy its own binding; that became a laundering path the
+  moment the corpus pass started preferring records, because a mirrored record is
+  indistinguishable on disk from a genuinely re-extracted one.
+
+The root ``evidence/literature/<raw_sha>/extracted.json`` layout is UNCHANGED and is
+never rewritten or migrated by this module. Other readers of it (grounding, the CLI)
+keep working exactly as before.
 
 Multiple records may accumulate under the same ``<raw_sha>/extractions/`` for one
 raw artifact over time (a ``pypdf`` upgrade, an extraction code change). Nothing on
@@ -97,7 +106,11 @@ from carmel.schemas.literature import ROOT_EXTRACTION_ID
 from carmel.services.artifacts import read_bytes, read_json, write_bytes, write_json, write_text
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.evidence import artifact_dir, load_artifact_text
-from carmel.services.semantic_deps import _PYPDF_VERSION_UNKNOWN, extraction_identity
+from carmel.services.semantic_deps import (
+    _PYPDF_VERSION_UNKNOWN,
+    ExtractionIdentity,
+    extraction_identity,
+)
 
 __all__ = [
     "EXTRACTIONS_SUBDIR",
@@ -156,6 +169,13 @@ _IDENTITY_PAYLOAD_VERSION = "2"
 #: exactly where there provably is none. Only ``"pdf:pypdf"`` -- the extractor string
 #: that means "pypdf actually ran" -- belongs in this set.
 _PYPDF_DEPENDENT_EXTRACTORS: frozenset[str] = frozenset({"pdf:pypdf"})
+
+#: The extractor string emitted precisely when ``pypdf`` was NOT importable. It is
+#: deliberately absent from :data:`_PYPDF_DEPENDENT_EXTRACTORS` above -- demanding a
+#: known pypdf version to STORE it would be wrong, since there provably is none -- but
+#: it is still pypdf-dependent for the purpose of deciding whether a stored record is
+#: CURRENT: see :func:`_is_current`.
+_PYPDF_UNAVAILABLE_EXTRACTOR = "pdf:unavailable"
 
 #: The base identity fields every payload must carry, regardless of extractor.
 _BASE_IDENTITY_FIELDS: frozenset[str] = frozenset(
@@ -938,6 +958,147 @@ def verify_extraction_record(workspace_root: Path, raw_sha256: str, extraction_s
     return hashlib.sha256(data).hexdigest() == meta.extracted_sha256
 
 
+class RecordsDirState(StrEnum):
+    """What the ``extractions/`` directory itself turned out to be.
+
+    The distinction this exists to draw is ABSENT vs UNLISTABLE. Both used to present
+    to a caller as an empty record list, and they license opposite decisions: an
+    artifact that never had a record may legitimately be judged by its root sidecar,
+    while a store that cannot be read says nothing about the artifact at all and must
+    never be read as though it had answered.
+    """
+
+    ABSENT = "absent"
+    """No ``extractions/`` directory exists. The artifact predates the record store."""
+
+    LISTED = "listed"
+    """The directory was read successfully. It may still have contained nothing."""
+
+    UNLISTABLE = "unlistable"
+    """The directory exists but could not be enumerated (permissions, EIO, ...)."""
+
+
+@dataclass(frozen=True)
+class RecordScanProblem:
+    """One sha-shaped entry that could not be turned into a usable record.
+
+    Deliberately reported rather than only logged. A ``logger.warning`` is invisible to
+    the decision the caller is about to make, and the caller's decision -- whether to
+    serve text -- depends on whether anything was skipped: a skipped entry is a
+    CANDIDATE record, not noise, so its absence from the list silently changes a count
+    the caller treats as meaningful.
+    """
+
+    entry_name: str
+    """The ``extractions/`` entry name, i.e. the claimed extraction sha256."""
+
+    reason: str
+    """Operator-facing phrase naming what was wrong with this entry."""
+
+
+@dataclass(frozen=True)
+class ExtractionRecordScan:
+    """Everything one pass over ``extractions/`` observed, including what it could not use.
+
+    Returned instead of a bare list because a bare list cannot distinguish "there is
+    nothing here" from "there is something here I could not read", and those two facts
+    license opposite decisions at every call site that matters.
+    """
+
+    records: tuple[ExtractionRecordMeta, ...]
+    """Readable, authenticated records, sorted by (``stored_at``, ``extraction_sha256``)."""
+
+    problems: tuple[RecordScanProblem, ...]
+    """Sha-shaped entries that could NOT be turned into a record. Empty is the good case."""
+
+    dir_state: RecordsDirState
+    """What the directory itself was; see :class:`RecordsDirState`."""
+
+    unlistable_reason: str | None = None
+    """Why enumeration failed, when ``dir_state`` is :attr:`RecordsDirState.UNLISTABLE`."""
+
+
+def scan_extraction_records(workspace_root: Path, raw_sha256: str) -> ExtractionRecordScan:
+    """One pass over ``extractions/``, reporting what was unusable as well as what was not.
+
+    The richer sibling of :func:`list_extraction_records`, and the one any caller that
+    is about to DECIDE something on the strength of the result should use. See
+    :class:`ExtractionRecordScan` for why a bare list is not enough.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        raw_sha256: sha256 of the parent raw artifact.
+
+    Returns:
+        An :class:`ExtractionRecordScan`. Never raises for a store-content problem;
+        those are reported in ``problems``/``dir_state`` instead.
+
+    Raises:
+        ValueError: If ``raw_sha256`` is not a well-formed 64-character lowercase
+            hex digest, or if the resolved directory would fall outside the
+            resolved workspace root.
+    """
+    records_dir = _validated_records_dir(workspace_root, raw_sha256)
+    if not records_dir.exists():
+        return ExtractionRecordScan(records=(), problems=(), dir_state=RecordsDirState.ABSENT)
+    try:
+        entries = sorted(records_dir.iterdir())
+    except OSError as exc:
+        logger.warning(
+            "extraction record store: %s/extractions could not be listed (%s); the store has NOT "
+            "reported that this artifact has no records -- it has reported nothing at all",
+            raw_sha256,
+            exc,
+        )
+        return ExtractionRecordScan(
+            records=(),
+            problems=(),
+            dir_state=RecordsDirState.UNLISTABLE,
+            unlistable_reason=str(exc),
+        )
+
+    records: list[ExtractionRecordMeta] = []
+    problems: list[RecordScanProblem] = []
+
+    def _problem(entry_name: str, reason: str) -> None:
+        logger.warning(
+            "extraction record store: skipping %s/extractions/%s (%s)", raw_sha256, entry_name, reason
+        )
+        problems.append(RecordScanProblem(entry_name=entry_name, reason=reason))
+
+    for entry in entries:
+        if not _SHA256_RE.fullmatch(entry.name):
+            # Not sha-shaped: never a record this store minted, so not a candidate.
+            # Editor swap files and the like are genuine noise and stay noise.
+            continue
+        try:
+            resolved_entry = entry.resolve()
+        except OSError as exc:
+            _problem(entry.name, f"could not be resolved: {exc}")
+            continue
+        if not resolved_entry.is_relative_to(records_dir):
+            _problem(entry.name, "resolves outside the extractions root")
+            continue
+        if not resolved_entry.is_dir():
+            _problem(entry.name, "is sha-named but not a directory")
+            continue
+        try:
+            meta = _load_meta(
+                resolved_entry / _META_NAME, expected_raw_sha256=raw_sha256, expected_extraction_sha256=entry.name
+            )
+        except ExtractionRecordError:
+            _problem(entry.name, "unreadable or malformed meta.json")
+            continue
+        if meta is None:
+            _problem(entry.name, "no authenticating meta.json")
+            continue
+        records.append(meta)
+    records.sort(key=lambda m: (m.stored_at, m.extraction_sha256))
+    return ExtractionRecordScan(
+        records=tuple(records), problems=tuple(problems), dir_state=RecordsDirState.LISTED
+    )
+
+
 def list_extraction_records(workspace_root: Path, raw_sha256: str) -> list[ExtractionRecordMeta]:
     """Every extraction record currently held for one raw artifact.
 
@@ -970,51 +1131,15 @@ def list_extraction_records(workspace_root: Path, raw_sha256: str) -> list[Extra
         ValueError: If ``raw_sha256`` is not a well-formed 64-character lowercase
             hex digest, or if the resolved directory would fall outside the
             resolved workspace root.
-    """
-    records_dir = _validated_records_dir(workspace_root, raw_sha256)
-    try:
-        entries = sorted(records_dir.iterdir())
-    except OSError:
-        return []
 
-    records: list[ExtractionRecordMeta] = []
-    for entry in entries:
-        if not _SHA256_RE.fullmatch(entry.name):
-            continue
-        try:
-            resolved_entry = entry.resolve()
-        except OSError:
-            continue
-        if not resolved_entry.is_relative_to(records_dir):
-            logger.warning(
-                "extraction record store: skipping %s/extractions/%s (resolves outside the extractions root)",
-                raw_sha256,
-                entry.name,
-            )
-            continue
-        if not resolved_entry.is_dir():
-            continue
-        try:
-            meta = _load_meta(
-                resolved_entry / _META_NAME, expected_raw_sha256=raw_sha256, expected_extraction_sha256=entry.name
-            )
-        except ExtractionRecordError:
-            logger.warning(
-                "extraction record store: skipping %s/extractions/%s (unreadable or malformed meta.json)",
-                raw_sha256,
-                entry.name,
-            )
-            continue
-        if meta is None:
-            logger.warning(
-                "extraction record store: skipping %s/extractions/%s (no authenticating meta.json)",
-                raw_sha256,
-                entry.name,
-            )
-            continue
-        records.append(meta)
-    records.sort(key=lambda m: (m.stored_at, m.extraction_sha256))
-    return records
+    Warning:
+        This LOSES the distinction between "nothing is stored", "something is stored
+        that I could not read", and "the directory could not be listed at all" -- all
+        three return an empty list. Any caller deciding whether to trust or serve
+        something must call :func:`scan_extraction_records` instead; this remains for
+        callers that genuinely only want the readable records (inventory, display).
+    """
+    return list(scan_extraction_records(workspace_root, raw_sha256).records)
 
 
 def stored_extraction_sha256(
@@ -1129,14 +1254,32 @@ def current_extraction_records(workspace_root: Path, raw_sha256: str) -> list[Ex
             resolved workspace root.
     """
     identity = extraction_identity()
-    current: list[ExtractionRecordMeta] = []
-    for record in list_extraction_records(workspace_root, raw_sha256):
-        if record.extractor_code_sha256 != identity.code_sha256:
-            continue
-        if record.extractor in _PYPDF_DEPENDENT_EXTRACTORS and record.pypdf_version != identity.pypdf_version:
-            continue
-        current.append(record)
-    return current
+    return [r for r in list_extraction_records(workspace_root, raw_sha256) if _is_current(r, identity)]
+
+
+def _is_current(record: ExtractionRecordMeta, identity: ExtractionIdentity) -> bool:
+    """Would today's extractor still produce a record with this one's identity?
+
+    Three cases, not two. The version comparison alone is not sufficient, because it is
+    conditional on the record's OWN extractor being pypdf-dependent, which leaves
+    ``pdf:unavailable`` -- the degraded placeholder written when pypdf could not be
+    imported -- matching unconditionally. That placeholder then stays "current" after
+    pypdf is installed, and would be selected and served as authenticated text even
+    though today's extraction would produce ``pdf:pypdf`` instead. Currentness is a
+    claim about what today would produce, so the availability of pypdf has to be
+    compared in BOTH directions.
+    """
+    if record.extractor_code_sha256 != identity.code_sha256:
+        return False
+    pypdf_is_identifiable = identity.pypdf_version != _PYPDF_VERSION_UNKNOWN
+    if record.extractor in _PYPDF_DEPENDENT_EXTRACTORS:
+        # "pypdf actually ran." Current only if pypdf still runs, at the same version.
+        return pypdf_is_identifiable and record.pypdf_version == identity.pypdf_version
+    if record.extractor == _PYPDF_UNAVAILABLE_EXTRACTOR:
+        # "pypdf could not be imported." Current only while that is still true.
+        return not pypdf_is_identifiable
+    # html/xml/text: nothing about them depends on pypdf either way.
+    return True
 
 
 class ExtractionSelectionError(ExtractionRecordError):
@@ -1212,7 +1355,12 @@ def _load_authenticated_record_text(
     dest_dir = extraction_record_dir(workspace_root, raw_sha256, extraction_sha256)
     try:
         raw_bytes = read_bytes(dest_dir / _EXTRACTED_NAME)
-    except FileNotFoundError as exc:
+    except OSError as exc:
+        # OSError, not FileNotFoundError: a record whose extracted.json exists but
+        # cannot be read (permissions, EIO, a dangling symlink) is exactly as unusable
+        # as one that is absent, and the narrow catch let that case escape as an
+        # unhandled exception which aborts the caller's entire pass over every OTHER
+        # artifact -- turning one unreadable file into a campaign-wide crash.
         raise ExtractionSelectionError(
             f"extraction record raw_sha256={raw_sha256!r} extraction_sha256={extraction_sha256!r} "
             f"has a meta.json but no readable extracted.json: {exc}"
@@ -1350,3 +1498,170 @@ def select_extraction(
         return SelectedExtraction(extraction_id=winner.extraction_sha256, extracted=extracted)
 
     raise ExtractionSelectionError(f"unknown ExtractionPreference: {prefer!r}")
+
+
+class CurrentSelectionKind(StrEnum):
+    """Which of the mutually exclusive facts one selector scan established.
+
+    The point of naming them is that exactly ONE of them --
+    :attr:`NO_RECORDS_STORED` -- licenses a caller to go on and judge the artifact by
+    its root sidecar. Every other member is a refusal. Collapsing them (to a count, to
+    an empty list, to a caught exception) is what let five different situations all
+    present as "nothing to prefer here" and quietly serve unauthenticated text.
+    """
+
+    SELECTED = "selected"
+    """Exactly one authenticated current record, whose body also authenticated."""
+
+    NO_RECORDS_STORED = "no_records_stored"
+    """No ``extractions/`` directory at all. The ONLY member that may fall through."""
+
+    NO_CURRENT_RECORD = "no_current_record"
+    """Records exist; none matches today's extractor identity. Re-extraction is the fix."""
+
+    MULTIPLE_CURRENT_RECORDS = "multiple_current_records"
+    """Several records are current at once: the store is ambiguous, not broken."""
+
+    UNUSABLE_RECORD_PRESENT = "unusable_record_present"
+    """At least one sha-shaped entry could not be read. See the warning below."""
+
+    STORE_UNREADABLE = "store_unreadable"
+    """``extractions/`` exists but could not be enumerated at all."""
+
+    EXTRACTOR_IDENTITY_UNAVAILABLE = "extractor_identity_unavailable"
+    """Today's extractor identity is unknowable, so currentness cannot be decided."""
+
+    RECORD_AUTHENTICATION_FAILED = "record_authentication_failed"
+    """One current record was found and it failed to authenticate."""
+
+
+@dataclass(frozen=True)
+class CurrentSelection:
+    """The typed outcome of :func:`select_current_extraction`.
+
+    Carries the decision AND the evidence for it, so a caller never has to re-derive
+    one from a count or an exception message. ``selected`` is populated if and only if
+    ``kind`` is :attr:`CurrentSelectionKind.SELECTED`.
+    """
+
+    kind: CurrentSelectionKind
+    detail: str
+    """Operator-facing phrase saying what was observed and what would change it."""
+
+    selected: SelectedExtraction | None = None
+
+
+def select_current_extraction(workspace_root: Path, raw_sha256: str) -> CurrentSelection:
+    """Decide, in ONE scan, whether this artifact has a usable current extraction record.
+
+    Replaces the count-then-select pair a caller previously had to write by hand. That
+    shape had two defects beyond the obvious TOCTOU window between the two scans:
+
+    - It read a decision out of an exception. ``ExtractionSelectionError`` means both
+      "not exactly one current record" (ordinary) and "the record failed to
+      authenticate" (a refusal), so telling them apart meant matching message prose.
+    - It could reach a WRONG count. A sha-shaped entry whose ``meta.json`` is corrupt
+      was skipped silently, so two current records became one, and an ambiguity that
+      must refuse instead SELECTED the survivor. Corrupting a single file therefore
+      PROMOTED a read -- the opposite direction from the downgrade the caller was
+      guarding, and reachable by anyone who can delete a byte.
+
+    Hence: any unusable sha-shaped candidate blocks selection outright, rather than
+    merely not counting. The result reflects the store as observed during this one
+    scan; a record appearing afterwards is not excluded (see the module docstring on
+    why full closure needs lock discipline this store does not have).
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        raw_sha256: sha256 of the parent raw artifact.
+
+    Returns:
+        A :class:`CurrentSelection`. Never raises for a store-content problem.
+
+    Raises:
+        ValueError: If ``raw_sha256`` is not a well-formed 64-character lowercase hex
+            digest, or if the resolved directory would fall outside the workspace root.
+    """
+    scan = scan_extraction_records(workspace_root, raw_sha256)
+
+    if scan.dir_state is RecordsDirState.UNLISTABLE:
+        return CurrentSelection(
+            kind=CurrentSelectionKind.STORE_UNREADABLE,
+            detail=(
+                f"the extractions directory for {raw_sha256} exists but could not be listed "
+                f"({scan.unlistable_reason}); the store has reported nothing about this artifact, "
+                "which is not the same as reporting that it has no records"
+            ),
+        )
+    if scan.problems:
+        described = ", ".join(f"{p.entry_name[:12]} ({p.reason})" for p in scan.problems)
+        return CurrentSelection(
+            kind=CurrentSelectionKind.UNUSABLE_RECORD_PRESENT,
+            detail=(
+                f"{len(scan.problems)} extraction record(s) for {raw_sha256} could not be read: "
+                f"{described}. Each is a CANDIDATE record, so none of them may be silently "
+                "dropped from the count -- doing so could turn an ambiguous store into an "
+                "apparently unambiguous one and unlock a read"
+            ),
+        )
+    if scan.dir_state is RecordsDirState.ABSENT or not scan.records:
+        return CurrentSelection(
+            kind=CurrentSelectionKind.NO_RECORDS_STORED,
+            detail=f"no extraction record has ever been stored for {raw_sha256}",
+        )
+
+    identity = extraction_identity()
+    if identity.pypdf_version == _PYPDF_VERSION_UNKNOWN and any(
+        record.extractor in _PYPDF_DEPENDENT_EXTRACTORS for record in scan.records
+    ):
+        # Distinguished from NO_CURRENT_RECORD deliberately. Both present as "nothing is
+        # current", but this one is a fact about the ENVIRONMENT, not the documents:
+        # every pypdf-extracted record in the campaign stops being current at once, and
+        # telling the operator their documents are stale would send them to re-extract
+        # when what they need is to fix their pypdf install.
+        return CurrentSelection(
+            kind=CurrentSelectionKind.EXTRACTOR_IDENTITY_UNAVAILABLE,
+            detail=(
+                f"{raw_sha256} has pypdf-extracted records, but the installed pypdf version could "
+                "not be determined, so whether any of them is current is unknowable. This is an "
+                "environment problem, not a stale-document problem: fix the pypdf install"
+            ),
+        )
+
+    current = [record for record in scan.records if _is_current(record, identity)]
+    if not current:
+        return CurrentSelection(
+            kind=CurrentSelectionKind.NO_CURRENT_RECORD,
+            detail=(
+                f"{raw_sha256} has {len(scan.records)} extraction record(s), none matching today's "
+                "extractor identity; re-extract it to produce one that does"
+            ),
+        )
+    if len(current) > 1:
+        addresses = ", ".join(sorted(record.extraction_sha256[:12] for record in current))
+        return CurrentSelection(
+            kind=CurrentSelectionKind.MULTIPLE_CURRENT_RECORDS,
+            detail=(
+                f"{raw_sha256} has {len(current)} records current at once ({addresses}); which one "
+                "speaks for this document is ambiguous, and ambiguity is never resolved by ranking"
+            ),
+        )
+
+    (winner,) = current
+    try:
+        extracted = _load_authenticated_record_text(
+            workspace_root, raw_sha256, winner.extraction_sha256, winner
+        )
+    except ExtractionSelectionError as exc:
+        return CurrentSelection(
+            kind=CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED,
+            detail=(
+                f"{raw_sha256}'s one current record ({winner.extraction_sha256[:12]}) failed to "
+                f"authenticate: {exc}"
+            ),
+        )
+    return CurrentSelection(
+        kind=CurrentSelectionKind.SELECTED,
+        detail=f"{raw_sha256} was read from record {winner.extraction_sha256[:12]}",
+        selected=SelectedExtraction(extraction_id=winner.extraction_sha256, extracted=extracted),
+    )
