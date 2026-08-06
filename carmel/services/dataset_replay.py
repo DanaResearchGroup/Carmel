@@ -196,7 +196,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -1163,6 +1163,190 @@ def _redacted(text: str, locator: CharSpanLocator | None = None) -> str:
     return descriptor + ">"
 
 
+class _TextPairing(NamedTuple):
+    """One (ref -> recorded text) GROUNDING PAIR an envelope exposes.
+
+    The pair is the unit the evidence kernel can actually test: a locator
+    saying WHERE, beside a recorded string saying WHAT was read there. A ref
+    with no recorded counterpart is NOT a pairing and must never be
+    expressed as one -- re-slicing it would compare the span against
+    nothing, and reporting it as checked would claim a grounding that was
+    never established.
+
+    ``uncompensated_fields`` carries the non-``CharSpanLocator`` POLICY,
+    which differs per field and is a property of the surrounding module, not
+    of the locator: ``None`` means some other gate in this module already
+    reports UNVERIFIABLE for a non-char-span locator on this field (as
+    :func:`verify_measured_value_value_boundary` and
+    :func:`verify_measured_value_unit_boundary` do for ``value_ref`` and
+    ``unit_ref``), so the kernel stays silent and leaves it to that gate. A
+    ``(ref_field, text_field)`` pair means there is NO compensating gate, so
+    the kernel must report it here or it goes unreported entirely.
+    """
+
+    path: str
+    node_id: str
+    locator: object
+    expected: str
+    always_literal: bool = False
+    uncompensated_fields: tuple[str, str] | None = None
+
+
+def _measured_value_text_pairings(envelope: object) -> Iterator[_TextPairing]:
+    """Yield the pairings every :class:`MeasuredValue` in ANY envelope exposes.
+
+    Generic on purpose: :func:`iter_measured_values` walks an arbitrary
+    pydantic tree, so this is the one enumerator that is correct for every
+    envelope type without being told that type's shape.
+    """
+    for path, value in iter_measured_values(envelope):
+        yield _TextPairing(
+            f"{path}.value_ref", value.value_ref.node_id, value.value_ref.locator, value.raw_text
+        )
+        # unit_raw is short, controlled-vocabulary text (unit symbols and
+        # aliases) -- never excerpted prose -- so it is always left literal
+        # regardless of reveal_text; see check_char_spans's own docstring.
+        yield _TextPairing(
+            f"{path}.unit_ref",
+            value.unit_ref.node_id,
+            value.unit_ref.locator,
+            value.unit_raw,
+            always_literal=True,
+        )
+
+
+def _dataset_text_pairings(envelope: DatasetEnvelope) -> Iterator[_TextPairing]:
+    """Enumerate, BY HAND, every grounding pair a :class:`DatasetEnvelope` exposes.
+
+    Hand-written and NOT derived from :func:`iter_source_refs` -- that is the
+    entire point. The self-audit in :func:`_replay_text_pairings` cross-checks
+    this enumeration against the generic walk, and a check is only independent
+    of the thing it checks when the two are written separately. Deriving this
+    list from the same walk would turn that audit into a tautology that passes
+    by construction.
+    """
+    yield from _measured_value_text_pairings(envelope)
+    for series in envelope.series:
+        for axis in series.axes:
+            yield _TextPairing(
+                f"series[{series.series_id!r}].axes[{axis.axis_id!r}].label_ref",
+                axis.label_ref.node_id,
+                axis.label_ref.locator,
+                axis.label_raw,
+                uncompensated_fields=("label_ref", "label_raw"),
+            )
+
+
+def _replay_text_pairings(
+    envelope: object,
+    pairings: Iterator[_TextPairing],
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding] | None = None,
+    *,
+    reveal_text: bool = False,
+) -> tuple[int, int, list[ReplayFinding]]:
+    """The evidence kernel: re-slice each pairing and compare, then audit
+    the enumeration that produced them against a generic walk of ``envelope``.
+
+    PRIVATE, and to stay private. Its ``envelope: object`` parameter is what
+    makes it reusable across envelope types, and is also exactly why it must
+    not be public: handed an arbitrary object it will happily produce a
+    report whose ``ref_path`` strings name fields of something nobody
+    checked. The public surface stays concrete -- :func:`check_char_spans`
+    and the ``replay_*`` entry points -- so every report is anchored to a
+    named envelope type.
+    """
+    node_problems = node_problems or {}
+    checked = 0
+    findings: list[ReplayFinding] = []
+    # Findings for pairings whose locator is not a CharSpanLocator and which
+    # have no compensating gate (see _TextPairing): these do NOT correspond
+    # to any CharSpanLocator reachable via iter_source_refs, so they must
+    # stay OUT of `findings` -- the `accounted_for == total_char_span_refs`
+    # self-audit below would falsely trip if they inflated `len(findings)`
+    # against a `total_char_span_refs` count that never counted them in the
+    # first place. Concatenated into the returned list only at the very end.
+    non_char_span_findings: list[ReplayFinding] = []
+
+    for pairing in pairings:
+        path = pairing.path
+        locator = pairing.locator
+        if not isinstance(locator, CharSpanLocator):
+            if pairing.uncompensated_fields is not None:
+                ref_field, text_field = pairing.uncompensated_fields
+                non_char_span_findings.append(
+                    ReplayFinding(
+                        category=ReplayOutcome.UNVERIFIABLE,
+                        ref_path=path,
+                        reason=f"{ref_field}.locator is a {type(locator).__name__}, not a "
+                        f"CharSpanLocator -- {text_field} is text, and this replayer (there is no "
+                        "renderer in this codebase) can only independently verify text through a "
+                        "CharSpanLocator's re-sliced character span, so it cannot re-derive or "
+                        f"confirm the text recorded in {text_field} from this locator kind",
+                    )
+                )
+            continue
+        node_id = pairing.node_id
+        if node_id in node_problems:
+            problem = node_problems[node_id]
+            findings.append(
+                ReplayFinding(category=problem.category, ref_path=path, reason=problem.reason)
+            )
+            continue
+        text = text_by_node_id.get(node_id)
+        if text is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=path,
+                    reason=f"references node_id={node_id!r}, which is not present in "
+                    "envelope.source_graph and was never independently checked",
+                )
+            )
+            continue
+        expected = pairing.expected
+        actual = text[locator.start : locator.end]
+        if actual != expected:
+            literal = pairing.always_literal or reveal_text
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=path,
+                    reason="char-span re-slice mismatch: the independently re-verified evidence "
+                    "text no longer contains the recorded quote at the recorded offsets",
+                    expected=expected if literal else _redacted(expected),
+                    actual=actual if literal else _redacted(actual, locator),
+                )
+            )
+            continue
+        checked += 1
+
+    total_char_span_refs = sum(
+        1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
+    )
+    accounted_for = checked + len(findings)
+    if accounted_for != total_char_span_refs:
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path="<iter_source_refs walk>",
+                reason=f"replayer accounted for {accounted_for} char-span ref(s) but "
+                f"iter_source_refs finds {total_char_span_refs} reachable in the envelope; some "
+                "CharSpanLocator is reachable that this replayer's field-by-field pairing never "
+                "checked -- a newly added ref-bearing field was likely added without updating "
+                "check_char_spans",
+            )
+        )
+
+    # Concatenated here, at the very end, and NOT earlier: `findings` alone
+    # feeds `accounted_for` above, which is checked against
+    # `total_char_span_refs` (a CharSpanLocator-only count). Merging
+    # non_char_span_findings into `findings` before that check would inflate
+    # accounted_for with findings that have no matching char-span ref and
+    # falsely trip the self-audit -- keep the two lists separate up to here.
+    return checked, total_char_span_refs, findings + non_char_span_findings
+
+
 def check_char_spans(
     envelope: DatasetEnvelope,
     text_by_node_id: Mapping[str, str],
@@ -1217,113 +1401,13 @@ def check_char_spans(
     ``CharSpanLocator`` refs, so those non-char-span findings are excluded
     from that count on purpose.
     """
-    node_problems = node_problems or {}
-    checked = 0
-    findings: list[ReplayFinding] = []
-    # Findings for non-char-span label_ref locators (see the docstring
-    # above): these do NOT correspond to any CharSpanLocator reachable via
-    # iter_source_refs, so they must stay OUT of `findings` -- the
-    # `accounted_for == total_char_span_refs` self-audit below would
-    # falsely trip if they inflated `len(findings)` against a
-    # `total_char_span_refs` count that never counted them in the first
-    # place. Concatenated into the returned list only at the very end.
-    non_char_span_findings: list[ReplayFinding] = []
-
-    def _check(
-        path: str, node_id: str, locator: object, expected: str, *, always_literal: bool = False
-    ) -> None:
-        nonlocal checked
-        if not isinstance(locator, CharSpanLocator):
-            return
-        if node_id in node_problems:
-            problem = node_problems[node_id]
-            findings.append(
-                ReplayFinding(category=problem.category, ref_path=path, reason=problem.reason)
-            )
-            return
-        text = text_by_node_id.get(node_id)
-        if text is None:
-            findings.append(
-                ReplayFinding(
-                    category=ReplayOutcome.UNVERIFIABLE,
-                    ref_path=path,
-                    reason=f"references node_id={node_id!r}, which is not present in "
-                    "envelope.source_graph and was never independently checked",
-                )
-            )
-            return
-        actual = text[locator.start : locator.end]
-        if actual != expected:
-            literal = always_literal or reveal_text
-            findings.append(
-                ReplayFinding(
-                    category=ReplayOutcome.FAILED,
-                    ref_path=path,
-                    reason="char-span re-slice mismatch: the independently re-verified evidence "
-                    "text no longer contains the recorded quote at the recorded offsets",
-                    expected=expected if literal else _redacted(expected),
-                    actual=actual if literal else _redacted(actual, locator),
-                )
-            )
-            return
-        checked += 1
-
-    for path, value in iter_measured_values(envelope):
-        _check(f"{path}.value_ref", value.value_ref.node_id, value.value_ref.locator, value.raw_text)
-        # unit_raw is short, controlled-vocabulary text (unit symbols and
-        # aliases) -- never excerpted prose -- so it is always left literal
-        # regardless of reveal_text; see this function's own docstring.
-        _check(
-            f"{path}.unit_ref",
-            value.unit_ref.node_id,
-            value.unit_ref.locator,
-            value.unit_raw,
-            always_literal=True,
-        )
-
-    for series in envelope.series:
-        for axis in series.axes:
-            axis_path = f"series[{series.series_id!r}].axes[{axis.axis_id!r}].label_ref"
-            label_locator = axis.label_ref.locator
-            if not isinstance(label_locator, CharSpanLocator):
-                non_char_span_findings.append(
-                    ReplayFinding(
-                        category=ReplayOutcome.UNVERIFIABLE,
-                        ref_path=axis_path,
-                        reason=f"label_ref.locator is a {type(label_locator).__name__}, not a "
-                        "CharSpanLocator -- label_raw is text, and this replayer (there is no "
-                        "renderer in this codebase) can only independently verify text through a "
-                        "CharSpanLocator's re-sliced character span, so it cannot re-derive or "
-                        "confirm the text recorded in label_raw from this locator kind",
-                    )
-                )
-                continue
-            _check(axis_path, axis.label_ref.node_id, axis.label_ref.locator, axis.label_raw)
-
-    total_char_span_refs = sum(
-        1 for _, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
+    return _replay_text_pairings(
+        envelope,
+        _dataset_text_pairings(envelope),
+        text_by_node_id,
+        node_problems,
+        reveal_text=reveal_text,
     )
-    accounted_for = checked + len(findings)
-    if accounted_for != total_char_span_refs:
-        findings.append(
-            ReplayFinding(
-                category=ReplayOutcome.FAILED,
-                ref_path="<iter_source_refs walk>",
-                reason=f"replayer accounted for {accounted_for} char-span ref(s) but "
-                f"iter_source_refs finds {total_char_span_refs} reachable in the envelope; some "
-                "CharSpanLocator is reachable that this replayer's field-by-field pairing never "
-                "checked -- a newly added ref-bearing field was likely added without updating "
-                "check_char_spans",
-            )
-        )
-
-    # Concatenated here, at the very end, and NOT earlier: `findings` alone
-    # feeds `accounted_for` above, which is checked against
-    # `total_char_span_refs` (a CharSpanLocator-only count). Merging
-    # non_char_span_findings into `findings` before that check would inflate
-    # accounted_for with findings that have no matching char-span ref and
-    # falsely trip the self-audit -- keep the two lists separate up to here.
-    return checked, total_char_span_refs, findings + non_char_span_findings
 
 
 def verify_measured_value_unit(path: str, value: MeasuredValue) -> ReplayFinding | None:
