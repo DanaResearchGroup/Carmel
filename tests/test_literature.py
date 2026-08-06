@@ -1214,6 +1214,34 @@ class TestSchemas:
                 verification_standard="verified_deep",
             )
 
+    def test_t10c_covered_document_refuses_a_standard_naming_a_document_never_read(self) -> None:
+        """Every ``CorpusReadOutcome`` that names a REFUSAL must be rejected here.
+
+        A coverage entry asserts a document WAS read; a standard like
+        ``extraction_record_authentication_failed`` or
+        ``multiple_current_extraction_records`` says it was not. Accepting one would let
+        a report permanently claim coverage of text nobody ever served -- and coverage
+        drives what a later pass treats as already done, so the document would never be
+        looked at again.
+
+        Loops over the refusal members rather than spot-checking one, so a member added
+        later is caught here instead of discovered in a report years on.
+        """
+        refusals = [
+            CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED,
+            CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS,
+            CorpusReadOutcome.INTEGRITY_FAILED,
+            CorpusReadOutcome.MISSING_TEXT,
+            CorpusReadOutcome.UNREADABLE_META,
+        ]
+        for refusal in refusals:
+            with pytest.raises(ValueError, match="invalid verification_standard"):
+                CoveredDocument(
+                    raw_sha256="a" * 64,
+                    extraction_id=ROOT_EXTRACTION_ID,
+                    verification_standard=refusal.value,
+                )
+
     def test_t11_pass_record_rejects_the_old_covered_sha256_key(self) -> None:
         """T11. ``PassRecord`` sets ``extra="forbid"``, so a payload still carrying
         the retired ``covered_sha256`` key proves the rename is real, not merely
@@ -3867,3 +3895,197 @@ class TestAPermissionIsReadStrictlyFromThePlan:
         report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
 
         assert report.passes[0].covered == [], "a string must never grant the permission to read unauthenticated text"
+
+
+def _store_current_record(workspace_root: Path, raw_sha256: str, *, text: str) -> str:
+    """Append ONE extraction record that is current for today's extractor identity.
+
+    Stamped with the real `extraction_identity()` rather than a fixed string, because
+    `current_extraction_records` compares against what today's code reports: a
+    hardcoded sha would make the record permanently non-current and the test would
+    pass for the wrong reason -- silently exercising the root path it exists to avoid.
+    """
+    from carmel.agents.tools.extract import ExtractedText, normalize_for_match
+    from carmel.services.extraction_record import store_extraction_record
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    extracted = ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=[], extractor="pdf:pypdf", lossy=False
+    )
+    payload = json.dumps(extracted.model_dump(mode="json"), indent=2, sort_keys=True).encode("utf-8")
+    return store_extraction_record(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        extractor="pdf:pypdf",
+        extractor_code_sha256=identity.code_sha256,
+        pypdf_version=identity.pypdf_version,
+        extracted_json_bytes=payload,
+    )
+
+
+RECORD_TEXT = "Text served from the authenticated extraction record, not the root sidecar."
+
+
+class TestTheCorpusPrefersAnAuthenticatedExtractionRecord:
+    """A record that authenticates is read in preference to the root sidecar.
+
+    The root `extracted.json` of an older artifact is checked against nothing at all,
+    so the gate refuses it. Re-extraction was supposed to be the way out, but it writes
+    only under `extractions/` while the gate read only root fields -- so re-extracting
+    changed nothing about whether a document could be read.
+
+    The preference is UNIFORM, not a fallback triggered by the root failing to
+    authenticate. A fallback keyed on root failure would mean deleting
+    `extracted_sha256` from a modern root silently switches which text is served, and
+    the store cannot tell "old legacy root" from "field just deleted" -- deletion would
+    PROMOTE. A uniform rule makes deletion incapable of changing which path is taken.
+    """
+
+    def test_a_legacy_root_with_one_authenticated_record_is_read_with_no_opt_in_flag(
+        self, campaign: Campaign
+    ) -> None:
+        """The operator's 8 papers, after re-extraction, without the opt-in flag.
+
+        The record's text is deliberately DIFFERENT from the root's, so serving the
+        root would fail this test rather than passing by coincidence -- the difference
+        is the whole point. Using the record's mere existence to bless the ROOT text
+        would authenticate one artifact by pointing at a different one.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == [legacy_sha], (
+            "a legacy root with one authenticated current record must be READ without the opt-in"
+        )
+        _, extracted, extraction_id = corpus[0]
+        assert extracted.text == RECORD_TEXT, "the RECORD's text must be served, never the root sidecar's"
+        assert extracted.text != DOC
+        assert extraction_id == record_sha, "coverage must name the record that was actually read"
+        assert extraction_id != ROOT_EXTRACTION_ID
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_a_record_whose_text_fails_its_digest_is_not_read_and_not_downgraded_to_the_root(
+        self, campaign: Campaign
+    ) -> None:
+        """A tampered record must not buy a read of the unauthenticated root text.
+
+        Falling back here would hand an attacker exactly the downgrade the operator
+        never authorised: break the record, get the root served instead.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        record_json = (
+            campaign.workspace_root
+            / "evidence"
+            / "literature"
+            / legacy_sha
+            / "extractions"
+            / record_sha
+            / "extracted.json"
+        )
+        tampered = json.loads(record_json.read_text(encoding="utf-8"))
+        tampered["text"] = "swapped after the digest was recorded"
+        record_json.write_text(json.dumps(tampered, indent=2, sort_keys=True), encoding="utf-8")
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "a record that fails its own digest must not be read"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "and must NOT silently downgrade to the root path"
+        )
+
+    def test_a_corrupt_raw_bin_is_not_read_even_with_a_valid_current_record(self, campaign: Campaign) -> None:
+        """A record must never launder a corrupt artifact.
+
+        The shallow integrity check is absolute and runs first: whatever records exist,
+        bytes that no longer hash to their own directory name are not evidence.
+        """
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, sha, text=RECORD_TEXT)
+        _corrupt_raw_bytes(campaign.workspace_root, sha)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == []
+        assert outcomes[sha] == CorpusReadOutcome.INTEGRITY_FAILED
+
+    def test_deleting_extracted_sha256_from_a_modern_root_does_not_change_the_served_text(
+        self, campaign: Campaign
+    ) -> None:
+        """Deletion cannot promote -- asserted directly rather than argued.
+
+        If the record path were a FALLBACK for a root that fails to authenticate, then
+        deleting one root field would flip which text is served. Because the preference
+        is uniform, deletion changes nothing: the record already won.
+        """
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, sha, text=RECORD_TEXT)
+
+        before, _ = literature_module._load_corpus(campaign.workspace_root)
+
+        meta_path = campaign.workspace_root / "evidence" / "literature" / sha / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        del meta["extracted_sha256"]
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        after, _ = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [(a.sha256, e.text, x) for a, e, x in before] == [(sha, RECORD_TEXT, record_sha)]
+        assert [(a.sha256, e.text, x) for a, e, x in after] == [(sha, RECORD_TEXT, record_sha)], (
+            "deleting a root field must not change which text is served, in either direction"
+        )
+
+    def test_the_operator_is_told_when_a_document_was_read_from_a_record(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Which text was served is not a detail the operator should have to dig for.
+
+        A document read from a record is a different document from the same raw bytes
+        read through the root sidecar, and it is quoted under a different extraction id.
+        Pinned here because the previous round's audit showed that a fix nothing asserts
+        on is free to regress silently.
+        """
+        _patch_chem_success(monkeypatch)
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        deps, _, config = _make_deps([_corpus_proposal([]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        warnings = "\n".join(report.passes[0].warnings)
+        assert "authenticated extraction record" in warnings
+        assert legacy_sha[:12] in warnings and record_sha[:12] in warnings
+        covered = report.passes[0].covered
+        assert [c.extraction_id for c in covered] == [record_sha]
+        assert [c.verification_standard for c in covered] == [
+            CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED.value
+        ], "the permanent record must name the standard the document was ACTUALLY read under"
+
+    def test_two_records_current_at_once_is_ambiguous_and_does_not_fall_back_to_the_root(
+        self, campaign: Campaign
+    ) -> None:
+        """Ambiguity among records is not a licence to serve unchecked text.
+
+        Every record here may be perfectly intact -- it is the STORE that cannot say
+        which one speaks for this document. That is a different fact from a broken
+        record, so it gets its own outcome rather than sending the operator hunting for
+        a corrupt file that does not exist.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        _store_current_record(campaign.workspace_root, legacy_sha, text="a second, differently-worded extraction")
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "with two current records the document must not be read at all"
+        assert outcomes[legacy_sha] == CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS
+        assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED, (
+            "nothing failed to authenticate -- saying so would send the operator after a "
+            "corrupt file that does not exist"
+        )
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "and it must not quietly fall through to the root sidecar"
+        )

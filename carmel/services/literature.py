@@ -116,6 +116,13 @@ from carmel.services.evidence import (
     store_artifact,
     verify_artifact,
 )
+from carmel.services.extraction_record import (
+    ExtractionPreference,
+    ExtractionRecordError,
+    ExtractionSelectionError,
+    current_extraction_records,
+    select_extraction,
+)
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
     DEFAULT_LOCK_GRACE_S,
@@ -240,9 +247,12 @@ def migrate_report_payload(payload: object) -> object:
     (the root sidecar, plus whatever re-extraction has since produced) and coverage
     of one must not be read as coverage of another. The v3->v4 step maps each raw
     sha in ``covered_sha256`` to a pair with ``extraction_id`` set to
-    :data:`ROOT_EXTRACTION_ID`. That mapping is not a guess: `_load_corpus` in this
-    module has only ever loaded text via `load_artifact_text`, which reads the ROOT
-    sidecar, so root text is the only thing any v3 pass could possibly have mined.
+    :data:`ROOT_EXTRACTION_ID`. That mapping is not a guess: for as long as v3 was the
+    current schema, `_load_corpus` loaded text solely via `load_artifact_text`, which
+    reads the ROOT sidecar, so root text is the only thing any v3 pass could possibly
+    have mined. It can now also serve an authenticated extraction record, which is
+    exactly why this mapping is stated as a fact about PAST passes and must never be
+    re-derived from what the loader does today.
 
     This is a CHAIN, applied step by step from the payload's own version. It used to
     be a single branch that ran the v1 lift for ANY version below current, which was
@@ -345,9 +355,11 @@ def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
     extraction identity) pairs.
 
     Every raw sha in the old list is mapped to ``ROOT_EXTRACTION_ID``. This is not a
-    guess: `_load_corpus` in this module has only ever loaded document text via
+    guess: while v3 was current, `_load_corpus` loaded document text solely via
     `load_artifact_text`, which reads the ROOT `extracted.json` sidecar, so root text
-    is the only thing any v3 pass could possibly have mined. The old
+    is the only thing any v3 pass could possibly have mined. The loader can now also
+    serve an authenticated extraction record; this mapping describes what OLD passes
+    did and is not affected by that. The old
     ``covered_sha256`` key is removed, not left alongside the new one -- `PassRecord`
     sets ``extra="forbid"``, so a payload still carrying it would be rejected.
     """
@@ -373,12 +385,15 @@ def _migrate_v4_to_v5(payload: dict[str, Any]) -> dict[str, Any]:
     """Set ``extraction_id`` to :data:`ROOT_EXTRACTION_ID` on every finding's
     ``evidence`` mapping.
 
-    This is not a guess: `_ground_and_record`'s only two callers obtain the text a
-    finding was grounded against either from `_fetch_and_store` (which extracts
-    freshly and stores the result as the root sidecar) or from `_load_corpus`
-    (which loads text only via `load_artifact_text`, i.e. the root sidecar). So
-    root text is the only thing any pre-v5 finding could possibly have been
-    grounded against. ``quote_start``/``quote_end`` and every other field are left
+    This is not a guess: at the time pre-v5 findings were written,
+    `_ground_and_record`'s only two callers obtained the text a finding was grounded
+    against either from `_fetch_and_store` (which extracts freshly and stores the
+    result as the root sidecar) or from `_load_corpus` (which then loaded text solely
+    via `load_artifact_text`, i.e. the root sidecar). So root text is the only thing
+    any pre-v5 finding could possibly have been grounded against. `_load_corpus` can
+    now also serve an authenticated extraction record, which changes nothing about
+    findings already on disk -- and is why this reasoning is pinned to when those
+    findings were written rather than to today's loader. ``quote_start``/``quote_end`` and every other field are left
     untouched -- this migration only adds the identity that was previously implicit.
     """
     migrated = dict(payload)
@@ -1744,11 +1759,19 @@ def _load_corpus(
     read from, plus the typed outcome EVERY held artifact was actually classified
     under -- read or not.
 
-    The extraction identity is always :data:`ROOT_EXTRACTION_ID` today, because this
-    function loads text only via :func:`load_artifact_text`, which reads the root
-    ``extracted.json`` sidecar. Choosing between the root and a nested re-extraction
-    record is a separate, later increment -- this function reports what it actually
-    read, not what it could have read.
+    The extraction identity is the address of whatever was actually served: a nested
+    extraction record's ``extraction_sha256`` when one was read, and
+    :data:`ROOT_EXTRACTION_ID` when the root ``extracted.json`` sidecar was. A record is
+    preferred whenever exactly one is current for today's extractor identity and it
+    authenticates.
+
+    That preference is UNIFORM, not a fallback for a root that fails to authenticate.
+    Were it a fallback, deleting ``extracted_sha256`` from a modern root would silently
+    switch which text is served, and nothing on disk distinguishes "legacy root" from
+    "field just deleted" -- so the deletion would PROMOTE. Preferring the record
+    unconditionally makes deletion incapable of changing which path is taken.
+
+    This function reports what it actually read, not what it could have read.
 
     The outcomes mapping is RETURNED rather than a bare skipped-shas list dropped
     (spar round 7, P2, now generalised). A pass that silently reads 6 of 8 held
@@ -1813,6 +1836,68 @@ def _load_corpus(
             logger.warning("evidence store: %s failed digest verification and was not read", artifact.sha256)
             outcomes[artifact.sha256] = CorpusReadOutcome.INTEGRITY_FAILED
             continue
+
+        # Prefer a digest-authenticated extraction record over the root sidecar, for
+        # EVERY artifact -- deliberately not as a fallback for a root that fails to
+        # authenticate. A fallback keyed on root failure would mean deleting
+        # `extracted_sha256` from a modern root silently switches which text is served,
+        # and nothing on disk distinguishes "legacy root" from "field just deleted", so
+        # the deletion would PROMOTE. Preferring the record unconditionally makes
+        # deletion incapable of changing which path is taken.
+        #
+        # This sits AFTER the shallow check on purpose: an artifact whose raw.bin no
+        # longer hashes to its own name is not evidence, whatever records point at it.
+        # A record must never launder a corrupt artifact.
+        #
+        # "Exactly one current record" is decided HERE rather than read off the
+        # exception, because `select_extraction` raises the same
+        # `ExtractionSelectionError` for "not exactly one current record" (ordinary --
+        # fall through to the root) and for "the record failed to authenticate" (a
+        # refusal that must NOT fall through). Telling those apart by matching the
+        # message text would be reading a decision out of prose.
+        try:
+            n_current_records = len(current_extraction_records(workspace_root, artifact.sha256))
+        except ExtractionRecordError:
+            # The store cannot say what is current right now (e.g. the running pypdf
+            # version is unrecognised). That is not a fact about THIS artifact, so it
+            # must not condemn it: fall through and let the root tiers judge it.
+            n_current_records = 0
+        if n_current_records > 1:
+            # Several records claim to be current at once. Every one of them may be
+            # intact -- the STORE is ambiguous, which is a different fact from a broken
+            # record and gets its own outcome so the operator is not sent hunting for a
+            # corrupt file. Falling through to the root here would be the same downgrade
+            # a failed record must not buy: ambiguity among records is not a licence to
+            # serve text checked against nothing.
+            logger.warning(
+                "evidence store: %s has %d extraction records current at once, so which one "
+                "speaks for this document is ambiguous and it was NOT read. The root sidecar is "
+                "deliberately NOT served instead",
+                artifact.sha256,
+                n_current_records,
+            )
+            outcomes[artifact.sha256] = CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS
+            continue
+        if n_current_records == 1:
+            try:
+                selected = select_extraction(
+                    workspace_root, artifact.sha256, prefer=ExtractionPreference.CURRENT
+                )
+            except ExtractionSelectionError as exc:
+                logger.warning(
+                    "evidence store: %s has one current extraction record and it failed to "
+                    "authenticate, so the artifact was NOT read (%s). The root sidecar is "
+                    "deliberately NOT served instead -- a broken record must not buy a read of "
+                    "text that is checked against nothing",
+                    artifact.sha256,
+                    exc,
+                )
+                outcomes[artifact.sha256] = CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED
+                continue
+            outcomes[artifact.sha256] = CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
+            corpus.append((artifact, selected.extracted, selected.extraction_id))
+            continue
+
         try:
             deep_intact = verify_artifact(workspace_root, artifact.sha256, deep=True)
         except ValueError:
@@ -1998,6 +2083,33 @@ def _corpus_loop(
             # `sha256` is kept as it was so nothing reading this event breaks, and the
             # per-reason grouping is ADDED beside it rather than replacing it.
             payload={"sha256": skipped, "n_skipped": len(skipped), "unread_by_reason": unread_by_reason},
+        )
+    # Which text was served is not a detail: a document read from a record is a
+    # DIFFERENT document from the same raw bytes read through the root sidecar, and it
+    # is quoted under a different extraction id. Saying so here means the operator sees
+    # it while the pass runs, instead of only by reading the stored report afterwards.
+    from_records = sorted(
+        (artifact.sha256, extraction_id)
+        for artifact, _, extraction_id in corpus
+        if extraction_id != ROOT_EXTRACTION_ID
+    )
+    if from_records:
+        state.warnings.append(
+            f"{len(from_records)} document(s) were read from an authenticated extraction record "
+            "rather than the root sidecar -- "
+            + ", ".join(f"{sha[:12]} via {extraction_id[:12]}" for sha, extraction_id in from_records)
+        )
+        append_typed_event(
+            log_path,
+            event="literature.corpus_read_from_extraction_record",
+            action_id=action_id,
+            run_id=run_id,
+            payload={
+                "n_from_records": len(from_records),
+                "read_from_records": [
+                    {"sha256": sha, "extraction_id": extraction_id} for sha, extraction_id in from_records
+                ],
+            },
         )
     if not corpus:
         state.stop_reason = StopReason.NO_NEW_INFORMATION

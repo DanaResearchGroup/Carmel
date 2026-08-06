@@ -546,6 +546,47 @@ class CorpusReadOutcome(StrEnum):
     against nothing at all. Refused by default; readable only under an explicit
     operator opt-in."""
 
+    EXTRACTION_RECORD_DIGEST_AUTHENTICATED = "extraction_record_digest_authenticated"
+    """Read from a nested extraction record rather than from the root sidecar: exactly
+    one record was current for today's extractor identity, it self-authenticated to its
+    own content address, and its stored text matched its recorded
+    ``extracted_text_sha256``.
+
+    This does NOT establish that the text was derived from ``raw.bin`` -- no check here
+    re-runs the extractor -- and it does not inherit any standard from the root, which
+    is not consulted at all on this path. It is strictly a statement about the record
+    that was actually served.
+
+    Preferred over every root tier whenever it applies, INCLUDING over
+    :attr:`SELF_CONSISTENT_METADATA`. That uniformity is the point: were the record path
+    a fallback for a root that fails to authenticate, deleting ``extracted_sha256`` from
+    a modern root would silently switch which text is served, and nothing on disk
+    distinguishes "legacy root" from "field just deleted" -- so deletion would PROMOTE.
+    Preferring the record unconditionally makes deletion incapable of changing which
+    path is taken."""
+
+    MULTIPLE_CURRENT_EXTRACTION_RECORDS = "multiple_current_extraction_records"
+    """More than one record is current for today's extractor identity at once. Never
+    read, and deliberately NOT resolved by picking one.
+
+    Kept distinct from :attr:`EXTRACTION_RECORD_AUTHENTICATION_FAILED` because the two
+    say opposite things about the store: there, one record was found and it was broken;
+    here, every record may be perfectly intact and the STORE is ambiguous about which
+    one speaks for this document. Collapsing them would send the operator hunting for a
+    corrupt file that does not exist.
+
+    Falling through to the root sidecar instead would be the same downgrade a failed
+    record must not buy: ambiguity among records is not a licence to serve text checked
+    against nothing."""
+
+    EXTRACTION_RECORD_AUTHENTICATION_FAILED = "extraction_record_authentication_failed"
+    """Exactly one record was current, and it failed to authenticate. Never read -- and
+    deliberately NOT downgraded to the root sidecar either.
+
+    Falling back here would hand an attacker precisely the downgrade no operator
+    authorised: break the record, and the unauthenticated root text gets served in its
+    place. A broken record is a refusal, not a reason to trust something else."""
+
     INTEGRITY_FAILED = "integrity_failed"
     """The bytes themselves do not match what was recorded: the default (non-deep)
     check itself failed, because ``raw.bin`` is absent or no longer hashes to the
@@ -600,8 +641,9 @@ class CoveredDocument(BaseModel):
     """Either :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex extraction sha256."""
     verification_standard: str = Field(min_length=1)
     """Which :class:`CorpusReadOutcome` this document was actually read under: one of
-    ``SELF_CONSISTENT_METADATA``, ``SIDECAR_DIGEST_ONLY``,
-    ``UNAUTHENTICATED_LEGACY_ROOT``, or the literal ``"unrecorded"``.
+    ``EXTRACTION_RECORD_DIGEST_AUTHENTICATED``, ``SELF_CONSISTENT_METADATA``,
+    ``SIDECAR_DIGEST_ONLY``, ``UNAUTHENTICATED_LEGACY_ROOT``, or the literal
+    ``"unrecorded"``.
 
     REQUIRED, with no default, for the same reason :attr:`EvidenceRef.extraction_id`
     has none. Reports are APPEND-ONLY: if a pass does not record whether a document
@@ -637,6 +679,7 @@ class CoveredDocument(BaseModel):
     @classmethod
     def _validate_verification_standard_shape(cls, value: str) -> str:
         allowed = {
+            CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED.value,
             CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
             CorpusReadOutcome.SIDECAR_DIGEST_ONLY.value,
             CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value,
