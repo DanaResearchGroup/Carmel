@@ -522,6 +522,32 @@ def list_artifacts_with_unreadable(workspace_root: Path) -> tuple[list[StoredArt
             logger.warning("evidence store: skipping %s (no readable meta.json)", entry.name)
             unreadable.append(entry.name)
             continue
+        if meta.sha256 != entry.name:
+            # The DIRECTORY NAME is the content address; `meta.sha256` is a field
+            # inside a mutable file that happens to sit in it. Every caller of this
+            # function then works from `artifact.sha256` -- verifying, selecting
+            # extraction records, and recording coverage BY THAT VALUE -- so a
+            # meta.json whose sha256 field names some OTHER directory silently
+            # redirects all of it: the corpus pass would verify one artifact and
+            # record coverage for another, both of which exist and both of which
+            # pass their own checks.
+            #
+            # Reported UNREADABLE, not skipped silently and not raised. It is the
+            # same class as an unparseable meta.json -- this directory cannot be
+            # turned into a trustworthy StoredArtifact -- and this function's whole
+            # contract is that anything it could not read is surfaced to the caller
+            # rather than quietly reducing the store's apparent size. The producer
+            # has enforced this cross-check for some time
+            # (`_authenticate_raw_bytes_and_read_source_metadata`); enumeration had
+            # not, so the corpus path was the one that could still be redirected.
+            logger.warning(
+                "evidence store: skipping %s (meta.json records sha256=%s, which names a different "
+                "artifact directory)",
+                entry.name,
+                meta.sha256,
+            )
+            unreadable.append(entry.name)
+            continue
         artifacts.append(meta)
     artifacts.sort(key=lambda a: (a.stored_at, a.sha256))
     return artifacts, sorted(unreadable)

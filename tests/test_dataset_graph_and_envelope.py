@@ -99,7 +99,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
     return SourceVerification(
         raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
         extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
-        root_sidecar=RootSidecarVerification.NOT_CHECKED,
+        root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
 
 SHA_A = "a" * 64
@@ -2451,3 +2451,57 @@ class TestModelsAreFrozen:
         envelope = _fully_populated_envelope()
         with pytest.raises(ValidationError, match="frozen"):
             envelope.composition = Absent(reason=AbsenceReason.NOT_APPLICABLE)  # type: ignore[misc]
+
+
+class TestSourceGraphConflictingVerification:
+    """I5e: two nodes naming the SAME extraction address must agree on what was
+    VERIFIED about it.
+
+    Same shape as the glyph-health and extraction-binding conflicts one class
+    up, on the field those checks did not cover. An artifact and the extracted
+    text at a given address have exactly one true verification story, so an
+    envelope carrying two different ones contradicts itself -- and without this
+    check it would validate, leaving a reader to pick whichever node they
+    happened to look at.
+    """
+
+    @staticmethod
+    def _verification(root_sidecar: RootSidecarVerification) -> SourceVerification:
+        return SourceVerification(
+            raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
+            extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
+            root_sidecar=root_sidecar,
+        )
+
+    def _pair(
+        self, first: RootSidecarVerification, second: RootSidecarVerification
+    ) -> tuple[SourceNode, SourceNode]:
+        binding = _extraction_binding(extracted_text_sha256=SHA_B)
+        paper = _node(
+            "paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None, extraction=binding
+        ).model_copy(update={"verification": self._verification(first)})
+        si = _sha_sharing_node_with_extraction(
+            "si", SHA_A, "paper", extraction=binding
+        ).model_copy(update={"verification": self._verification(second)})
+        return paper, si
+
+    def test_same_address_disagreeing_on_verification_is_rejected(self) -> None:
+        paper, si = self._pair(
+            RootSidecarVerification.NO_RECORDED_DIGEST,
+            RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
+        )
+
+        with pytest.raises(ValidationError, match="recorded SourceVerifications disagree"):
+            SourceGraph(nodes=(paper, si))
+
+    def test_same_address_agreeing_on_verification_is_allowed(self) -> None:
+        """The counterweight: a check that rejected every same-address pair
+        would pass the test above while forbidding a legitimate graph."""
+        paper, si = self._pair(
+            RootSidecarVerification.NO_RECORDED_DIGEST,
+            RootSidecarVerification.NO_RECORDED_DIGEST,
+        )
+
+        graph = SourceGraph(nodes=(paper, si))
+
+        assert graph.node("si").sha256 == graph.node("paper").sha256

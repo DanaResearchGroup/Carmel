@@ -93,6 +93,7 @@ from carmel.schemas.datasets import (
     TextSpace,
     ValueOrigin,
 )
+from carmel.schemas.literature import StoredArtifact
 from carmel.services import units
 from carmel.services.dataset_store import (
     CanonicalDecimalError,
@@ -138,13 +139,16 @@ _RAW_NAME = "raw.bin"
 """Filename of the stored raw bytes inside an artifact's content-addressed
 directory. This is the evidence store's PUBLIC on-disk contract --
 ``carmel.services.evidence``'s module docstring documents the layout as exact
-("Layout, exactly::") -- not private knowledge duplicated here.
+("Layout, exactly::") -- not private knowledge duplicated here."""
 
-An ``_EXTRACTED_NAME = "extracted.json"`` constant used to sit alongside this
-one, naming the ROOT sidecar. It was deleted with its only reader: this module
-no longer opens the root sidecar at any point (see
-:func:`_authenticate_raw_bytes_and_read_source_metadata`), and a constant
-naming a file nothing here reads is an invitation to start reading it again."""
+_ROOT_EXTRACTED_NAME = "extracted.json"
+"""Filename of the ROOT ``ExtractedText`` sidecar, the legacy tier.
+
+Read at exactly one place, :func:`_root_sidecar_claim`, and for exactly one
+purpose: to compute a claim a reader can refute. It is NEVER grounding input --
+text read from it is precisely what the corpus gate refuses without an explicit
+operator opt-in, and routing it into an envelope would launder unauthenticated
+text into an address the corpus treats as authenticated."""
 
 _ROOT_NODE_ID = "paper"
 """The single :class:`SourceNode`'s id in every produced graph. One artifact
@@ -1191,11 +1195,12 @@ def _authenticate_raw_bytes_and_read_source_metadata(
        construction, and it would silently become false for a non-legacy
        artifact.)
 
-    ``meta.json`` is read here ONLY for ``content_type``. It is source
-    metadata, not evidence, and nothing derived from it is authenticated by
-    anything -- which is precisely why the returned claim says the root sidecar
-    was ``NOT_CHECKED`` rather than letting a reader infer that loading
-    ``meta.json`` verified something about it.
+    ``meta.json`` is read here ONLY for ``content_type``, which is source
+    metadata rather than evidence and is not treated as such. The separate
+    question of what can honestly be SAID about the root sidecar is decided by
+    :func:`_root_sidecar_claim`, which looks -- so that the recorded claim is
+    one a reader can refute rather than an assertion about what this producer
+    chose to do.
 
     Args:
         workspace_root: Root of the campaign workspace.
@@ -1203,11 +1208,8 @@ def _authenticate_raw_bytes_and_read_source_metadata(
 
     Returns:
         The artifact's ``content_type``, and the
-        :class:`RootSidecarVerification` claim that honestly describes what
-        this function established about the root sidecar --
-        ``NO_RECORDED_DIGEST`` when the artifact predates ``extracted_sha256``
-        (so its sidecar can never be authenticated by anyone), ``NOT_CHECKED``
-        when a digest exists but this producer deliberately did not check it.
+        :class:`RootSidecarVerification` claim -- see
+        :func:`_root_sidecar_claim`, which decides it by looking.
 
     Raises:
         DatasetProducerError: The artifact is absent, its ``meta.json``
@@ -1238,16 +1240,51 @@ def _authenticate_raw_bytes_and_read_source_metadata(
             f"sha256 they are stored under; the evidence store's raw bytes have been tampered with "
             "or corrupted, and no envelope may name them"
         )
-    root_sidecar_claim = (
-        # "Nobody can ever authenticate this sidecar" and "this producer chose
-        # not to look" are different facts and must not collapse into one
-        # value -- the same inability-vs-choice conflation this codebase has
-        # already fixed twice on the acquisition side.
-        RootSidecarVerification.NO_RECORDED_DIGEST
-        if meta.extracted_sha256 is None
-        else RootSidecarVerification.NOT_CHECKED
-    )
+    root_sidecar_claim = _root_sidecar_claim(workspace_root, sha256, meta)
     return meta.content_type, root_sidecar_claim
+
+
+def _root_sidecar_claim(
+    workspace_root: Path, sha256: str, meta: StoredArtifact
+) -> RootSidecarVerification:
+    """Decide, by looking, what can honestly be said about the root sidecar.
+
+    Every value this returns is one a reader can put to the test against the
+    store, and that is the entire reason the check runs. The sidecar is NOT an
+    input to production, and an earlier revision therefore just recorded
+    ``NOT_CHECKED`` for the non-legacy case on the grounds that nothing had read
+    it. But ``NOT_CHECKED`` describes a producer CHOICE, not a fact about the
+    store, so no consumer could ever contradict it -- and an unfalsifiable claim
+    in persisted evidence is indistinguishable from no claim at all while still
+    reading like provenance. One hash buys a value replay can refute.
+
+    A mismatch is RECORDED, never raised. Refusing here would re-erect exactly
+    the gate this design removed, blocking a dataset whose raw bytes and grounded
+    text are both authenticated, over a tier that fed neither.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        sha256: Raw-bytes sha256 of the artifact (and its store directory).
+        meta: The artifact's already-loaded root metadata.
+
+    Returns:
+        ``NO_RECORDED_DIGEST`` when the artifact predates ``extracted_sha256``;
+        otherwise ``ROOT_SIDECAR_DIGEST_AUTHENTICATED`` or
+        ``ROOT_SIDECAR_DIGEST_MISMATCH`` according to what the bytes hash to. An
+        unreadable sidecar counts as a mismatch: a recorded digest with nothing
+        on disk to match it is a damaged legacy tier, which is what that value
+        reports.
+    """
+    if meta.extracted_sha256 is None:
+        return RootSidecarVerification.NO_RECORDED_DIGEST
+    sidecar = artifact_dir(workspace_root, sha256) / _ROOT_EXTRACTED_NAME
+    try:
+        sidecar_bytes = sidecar.read_bytes()
+    except OSError:
+        return RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
+    if hashlib.sha256(sidecar_bytes).hexdigest() == meta.extracted_sha256:
+        return RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
+    return RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
 
 
 def produce_envelope_from_artifact(

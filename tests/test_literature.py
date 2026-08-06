@@ -60,6 +60,7 @@ from carmel.schemas.literature import (
     LiteratureReport,
     PassRecord,
     StopReason,
+    StoredArtifact,
 )
 from carmel.services import chem
 from carmel.services import literature as literature_module
@@ -73,7 +74,12 @@ from carmel.services.acquisition import (
 )
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
-from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
+from carmel.services.evidence import (
+    EVIDENCE_LITERATURE_DIR,
+    artifact_dir,
+    list_artifacts_with_unreadable,
+    store_artifact,
+)
 from carmel.services.literature import (
     LITERATURE_REPORT_NAME,
     LOCK_GRACE_S,
@@ -4388,3 +4394,47 @@ class TestAnIncompleteRecordStoreRefusesInTheCorpusPass:
         assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
             "planting one broken symlink must not forge the store's most permissive answer"
         )
+
+
+class TestCorpusEnumerationDoesNotTrustMetaJsonsOwnSha256:
+    """The DIRECTORY NAME is the content address. `meta.sha256` is a field in a
+    mutable file that happens to sit inside it, and every consumer of
+    `list_artifacts_with_unreadable` works from that field -- verifying,
+    selecting extraction records, and recording coverage BY IT.
+
+    So a `meta.json` whose `sha256` names a DIFFERENT (also real, also valid)
+    artifact directory silently redirects the whole pass: it would verify one
+    artifact and record coverage for another, with both passing their own
+    checks. The dataset producer has cross-checked field against directory for
+    some time; enumeration had not, which left the corpus path as the one that
+    could still be redirected.
+    """
+
+    def test_a_meta_naming_another_directory_is_reported_unreadable(self, tmp_path: Path) -> None:
+        first = _store(tmp_path, text="first document text", url="https://example.org/a")
+        second = _store(tmp_path, text="second document text", url="https://example.org/b")
+        assert first != second
+        meta_path = artifact_dir(tmp_path, first) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text(encoding="utf-8"))
+        meta_path.write_text(
+            meta.model_copy(update={"sha256": second}).model_dump_json(), encoding="utf-8"
+        )
+
+        artifacts, unreadable = list_artifacts_with_unreadable(tmp_path)
+
+        # Reported, not silently dropped: this function's contract is that
+        # anything it could not turn into a trustworthy StoredArtifact is
+        # surfaced, never quietly shrinking the store's apparent size.
+        assert first in unreadable
+        assert [a.sha256 for a in artifacts] == [second]
+
+    def test_an_untampered_store_still_enumerates_completely(self, tmp_path: Path) -> None:
+        """The counterweight. A check that rejected every artifact would satisfy
+        the test above and look correct."""
+        first = _store(tmp_path, text="first document text", url="https://example.org/a")
+        second = _store(tmp_path, text="second document text", url="https://example.org/b")
+
+        artifacts, unreadable = list_artifacts_with_unreadable(tmp_path)
+
+        assert unreadable == []
+        assert {a.sha256 for a in artifacts} == {first, second}

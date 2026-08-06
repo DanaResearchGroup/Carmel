@@ -1441,8 +1441,9 @@ class TestProducerFailClosed:
         corruption can actually do harm.
 
         What the produced envelope must NOT do is imply the root was verified.
-        It records ``root_sidecar=NOT_CHECKED`` -- the honest answer for a file
-        nothing opened."""
+        It records ``root_sidecar=ROOT_SIDECAR_DIGEST_MISMATCH`` -- the damage is
+        surfaced in the envelope's own bytes rather than blocking a dataset whose
+        raw bytes and grounded text are both authenticated."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
         corrupt = ExtractedText(
@@ -1459,7 +1460,10 @@ class TestProducerFailClosed:
         )
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
-        assert node.verification.root_sidecar is RootSidecarVerification.NOT_CHECKED
+        assert (
+            node.verification.root_sidecar
+            is RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
+        )
 
     def test_refuses_a_corrupt_extraction_record_sidecar(self, tmp_path: Path) -> None:
         """The counterweight to the test above, and where the real guarantee
@@ -1618,7 +1622,7 @@ class TestProducerFailClosed:
         )
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
-        assert node.verification.root_sidecar is RootSidecarVerification.NOT_CHECKED
+        assert node.verification.root_sidecar is RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
 
     def test_a_legacy_artifact_now_produces_and_says_so(self, tmp_path: Path) -> None:
         """THE test this whole increment exists for.
@@ -1798,6 +1802,33 @@ class TestReplayRefutesAForgedRootSidecarClaim:
             measurements=_SPECS,
         )
 
+    def test_the_legacy_claim_keys_on_extracted_sha256_not_derivation_binding(
+        self, tmp_path: Path
+    ) -> None:
+        """``NO_RECORDED_DIGEST`` must key on ``extracted_sha256`` -- the field
+        that decides whether the sidecar CAN be authenticated at all.
+
+        ``derivation_binding`` is a strictly later and strictly stronger field,
+        so an artifact can legitimately carry ``extracted_sha256`` with no
+        binding; keying on the binding would call that artifact legacy when its
+        sidecar is perfectly authenticable. Every other fixture clears the two
+        fields together, which is precisely why that mutation would otherwise
+        survive the audit -- this is the one case that pulls them apart."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text())
+        assert meta.extracted_sha256 is not None
+        meta_path.write_text(meta.model_copy(update={"derivation_binding": None}).model_dump_json())
+
+        envelope = self._envelope(tmp_path, stored)
+
+        node = envelope.source_graph.nodes[0]
+        assert not isinstance(node.verification, Absent)
+        assert (
+            node.verification.root_sidecar
+            is RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
+        )
+
     def test_an_honest_claim_replays_clean(self, tmp_path: Path) -> None:
         """The counterweight. Without it, a check that flagged EVERY envelope
         would pass the refutation test below and look correct."""
@@ -1829,20 +1860,26 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         assert refutations[0].category is ReplayOutcome.FAILED
         assert report.outcome is ReplayOutcome.FAILED
 
-    def test_an_unreadable_root_meta_is_unverifiable_not_failed(self, tmp_path: Path) -> None:
-        """Inability to check is never silently a pass, and never a FAILURE
-        either: deleting the root meta destroys the evidence that would settle
-        the claim, which says nothing about whether the claim was true. The two
-        outcomes must not conflate."""
+    def test_an_unreadable_root_meta_leaves_the_claim_unrefuted(self, tmp_path: Path) -> None:
+        """A missing root tier must NOT degrade the outcome -- the check only
+        ever refutes.
+
+        This asserted UNVERIFIABLE in its first draft, on the general principle
+        that inability-to-check is never silently a pass.
+        ``TestReplayVerifiesAgainstTheRecordNotTheRootSidecar`` in
+        tests/test_dataset_replay.py caught it: that class pins, as a deliberate
+        architectural contract, that a perfect record replays VERIFIED with the
+        root sidecar gone. Failing to refute a claim is not failing to verify
+        the evidence, and replay's verification of the data is root-independent
+        by design."""
         stored = self._legacy_artifact(tmp_path)
         envelope = self._envelope(tmp_path, stored)
         (artifact_dir(tmp_path, stored.sha256) / "meta.json").unlink()
 
         report = replay_envelope(tmp_path, envelope)
 
-        refutations = [f for f in report.findings if "root_sidecar" in f.ref_path]
-        assert len(refutations) == 1
-        assert refutations[0].category is ReplayOutcome.UNVERIFIABLE
+        assert not [f for f in report.findings if "root_sidecar" in f.ref_path]
+        assert report.outcome is ReplayOutcome.VERIFIED
 
 
 class TestProducerNodeKind:

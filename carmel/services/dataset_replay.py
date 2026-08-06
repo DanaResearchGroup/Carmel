@@ -213,6 +213,7 @@ from carmel.schemas.datasets import (
     iter_measured_values,
     iter_source_refs,
 )
+from carmel.schemas.literature import StoredArtifact
 from carmel.services import units
 from carmel.services.dataset_bridge import load_dataset_envelope
 from carmel.services.dataset_producer import (
@@ -648,72 +649,102 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> Replay
     is decoration, and decoration is exactly how provenance nobody reads gets
     into a codebase.
 
-    So this function reads root ``meta.json`` for ONE purpose: refutation. It
-    never authenticates anything, and its result never licenses trusting any
-    text.
+    So this function reads the root tier for ONE purpose: refutation. It never
+    authenticates anything, and its result never licenses trusting any text.
 
-    Only ``NO_RECORDED_DIGEST`` is refutable, and deliberately so. It is a
-    positive claim ABOUT THE STORE -- "this artifact's root meta records
-    ``extracted_sha256=None``, so its sidecar cannot be authenticated by anyone,
-    ever" -- and that is stable, because root sidecars are never rewritten (see
-    :mod:`carmel.services.reextraction`, which writes only under
-    ``extractions/``). If the artifact does carry a digest, the claim was false
-    when made or the envelope was altered after; either way it is positive
-    evidence of disagreement, hence FAILED.
+    EVERY member of :class:`RootSidecarVerification` is refutable, which is why
+    that enum has no "not checked" value. Each member asserts something ABOUT
+    THE STORE, and each is stable, because root sidecars are never rewritten
+    (see :mod:`carmel.services.reextraction`, which writes only under
+    ``extractions/``). So this recomputes the claim exactly as the producer did
+    and compares:
 
-    ``NOT_CHECKED`` is NOT refutable and is not treated as though it were. It
-    records what the producer chose to do, not a fact about the store, and no
-    later inspection can contradict a choice. Reporting it as verified would be
-    the assertion-for-observation conflation this codebase keeps having to
-    unwind; saying nothing is the honest handling.
+    - ``NO_RECORDED_DIGEST`` is contradicted by a root meta that DOES record an
+      ``extracted_sha256``;
+    - ``ROOT_SIDECAR_DIGEST_AUTHENTICATED`` is contradicted by a sidecar whose
+      bytes do not hash to the recorded digest, or by no recorded digest at all;
+    - ``ROOT_SIDECAR_DIGEST_MISMATCH`` is contradicted by a sidecar that hashes
+      correctly.
+
+    Each disagreement is positive evidence that the claim was false when made or
+    that the envelope was altered afterwards, hence FAILED.
+
+    IT ONLY EVER REFUTES. A root tier that is missing, unreadable or unparseable
+    produces NO finding at all -- not UNVERIFIABLE -- and that is a hard
+    contract rather than a convenience.
+    ``TestReplayVerifiesAgainstTheRecordNotTheRootSidecar`` pins it: a perfect
+    record must replay VERIFIED with the root sidecar gone, because replay's
+    verification of the DATA is root-independent by design and has to stay that
+    way. A workspace that garbage-collects root sidecars, or a dataset replayed
+    somewhere holding only records, would otherwise degrade for a reason having
+    nothing to do with its data.
+
+    An earlier revision reported UNVERIFIABLE there, reasoning that
+    inability-to-check must never be silently a pass. That reasoning is right in
+    general and wrong here, and the existing contract test caught it: failing to
+    REFUTE a claim is not the same as failing to VERIFY the evidence. Deleting
+    the root meta buys an attacker nothing either -- the raw bytes and the
+    addressed record still have to authenticate, and those are what the
+    envelope's data actually rests on.
 
     Args:
         workspace_root: Root of the campaign workspace holding the store.
         node: The node whose recorded claim is under test.
 
     Returns:
-        ``None`` when nothing was refuted (including every case where the claim
-        is not the refutable one, or the node carries no verification record at
-        all), a FAILED finding when the store positively contradicts the claim,
-        or an UNVERIFIABLE finding when the root ``meta.json`` could not be read
-        to check -- inability to check is never silently a pass.
+        A FAILED finding when the store positively contradicts the claim;
+        ``None`` in every other case -- the claim survives, the node carries no
+        verification record, or the root tier could not be read to check.
     """
     verification = node.verification
     if isinstance(verification, Absent):
         return None
-    if verification.root_sidecar is not RootSidecarVerification.NO_RECORDED_DIGEST:
-        return None
+    claimed = verification.root_sidecar
     path = f"source_graph.node({node.node_id!r}).verification.root_sidecar"
     try:
         meta = load_artifact_meta(workspace_root, node.sha256)
-    except (OSError, ValueError) as exc:
-        return ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"node {node.node_id!r} claims root_sidecar=no_recorded_digest, but this "
-            f"artifact's root meta.json could not be read to check it: {exc}",
-        )
+    except (OSError, ValueError):
+        # NOT a finding. See the contract note in the docstring: a root tier
+        # that cannot be read leaves the claim UNREFUTED, which is a fact about
+        # this workspace and not a defect of the envelope.
+        return None
     if meta is None:
-        return ReplayFinding(
-            category=ReplayOutcome.UNVERIFIABLE,
-            ref_path=path,
-            reason=f"node {node.node_id!r} claims root_sidecar=no_recorded_digest, but no readable "
-            f"root meta.json exists for sha256={node.sha256!r} in this workspace, so the claim "
-            "can be neither confirmed nor refuted here",
-        )
-    if meta.extracted_sha256 is not None:
-        return ReplayFinding(
-            category=ReplayOutcome.FAILED,
-            ref_path=path,
-            reason=f"node {node.node_id!r} claims root_sidecar=no_recorded_digest -- that its root "
-            "sidecar predates extracted_sha256 and so can never be authenticated -- but the "
-            "artifact's root meta.json DOES record an extracted_sha256. Root sidecars are never "
-            "rewritten, so the claim was false when it was made or the envelope was altered "
-            "afterwards",
-            expected="root meta.json with extracted_sha256=None",
-            actual=f"root meta.json with extracted_sha256={meta.extracted_sha256!r}",
-        )
-    return None
+        return None
+    actual = _recompute_root_sidecar_claim(workspace_root, node.sha256, meta)
+    if actual is claimed:
+        return None
+    return ReplayFinding(
+        category=ReplayOutcome.FAILED,
+        ref_path=path,
+        reason=f"node {node.node_id!r} claims root_sidecar={claimed.value}, but recomputing that "
+        f"claim against the store yields {actual.value}. Root sidecars are never rewritten, so "
+        "the claim was false when it was made or the envelope was altered afterwards",
+        expected=actual.value,
+        actual=claimed.value,
+    )
+
+
+def _recompute_root_sidecar_claim(
+    workspace_root: Path, sha256: str, meta: StoredArtifact
+) -> RootSidecarVerification:
+    """Recompute a node's root-sidecar claim from the store, independently.
+
+    Deliberately NOT a call into ``dataset_producer._root_sidecar_claim``.
+    Replay's entire value is being an INDEPENDENT re-derivation: sharing the
+    producer's implementation would mean a bug in it produces a wrong claim and
+    then agrees with itself, and this check would confirm rather than refute.
+    The duplication is the point, the same way the char-span re-slice does not
+    reuse the grounding gate's own span arithmetic.
+    """
+    if meta.extracted_sha256 is None:
+        return RootSidecarVerification.NO_RECORDED_DIGEST
+    try:
+        sidecar_bytes = (artifact_dir(workspace_root, sha256) / "extracted.json").read_bytes()
+    except OSError:
+        return RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
+    if hashlib.sha256(sidecar_bytes).hexdigest() == meta.extracted_sha256:
+        return RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
+    return RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
 
 
 def _redacted(text: str, locator: CharSpanLocator | None = None) -> str:

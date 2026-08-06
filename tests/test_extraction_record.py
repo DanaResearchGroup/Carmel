@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1394,3 +1396,66 @@ class TestAnIncompleteStoreIsNotAnAbsentOne:
         selection = select_current_extraction(tmp_path, raw_sha)
 
         assert selection.kind is CurrentSelectionKind.NO_RECORDS_STORED
+
+
+class TestOnlyReextractionMayWriteToTheRecordStore:
+    """`store_extraction_record()` cannot verify that the bytes handed to it were
+    derived from `raw.bin` -- nothing in this system can, and the codebase says
+    so plainly (see `ExtractedTextVerification`). Its safety therefore rests
+    entirely on WHO CALLS IT, and that is a fact about the call graph, not about
+    the function. So it is pinned here.
+
+    The stake is concrete. A caller that read the ROOT `extracted.json` and
+    stored those bytes as a current record would launder text the corpus gate
+    refuses without an operator opt-in into an address the gate treats as
+    EXTRACTION_RECORD_DIGEST_AUTHENTICATED -- and, since the dataset producer
+    stopped gating on the root sidecar, straight into a produced envelope. The
+    dataset producer used to mint exactly such a record and no longer does; the
+    root precondition that removal took with it was, incidentally, a second lock
+    on the same door.
+
+    `reextract_artifact` is the one legitimate writer: it re-parses `raw.bin`,
+    checks that those bytes hash to the address, refuses an empty extraction,
+    and never opens a root file at all. If a second caller appears, that
+    reasoning has to be redone rather than assumed -- which is what this test is
+    for.
+    """
+
+    def test_store_extraction_record_has_exactly_one_call_site(self) -> None:
+        package_root = Path(__file__).resolve().parent.parent / "carmel"
+        call = re.compile(r"(?<![\w.])store_extraction_record\s*\(")
+        callers: list[str] = []
+        for path in sorted(package_root.rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for node in ast.walk(ast.parse(source)):
+                if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                    continue
+                if node.func.id == "store_extraction_record":
+                    callers.append(f"{path.relative_to(package_root)}:{node.lineno}")
+        assert call.search("store_extraction_record(")  # the pattern itself is sane
+        assert [c.split(":")[0] for c in callers] == ["services/reextraction.py"], (
+            "store_extraction_record() gained a call site. It cannot verify that the bytes it is "
+            "given were derived from raw.bin, so its safety rests entirely on every caller "
+            f"deriving them honestly. Call sites now: {callers}. Re-establish that for the new "
+            "one -- does it re-parse raw.bin, or is it passing along text it read from somewhere "
+            "else (the root sidecar above all)? -- and only then update this test."
+        )
+
+    def test_reextraction_never_reads_a_root_sidecar(self) -> None:
+        """The other half: the one permitted caller must not open the root tier.
+
+        A call-site count alone would be satisfied by a `reextract_artifact`
+        that quietly started reading `extracted.json`, which is the exact
+        laundering this pins against."""
+        source = (
+            Path(__file__).resolve().parent.parent / "carmel" / "services" / "reextraction.py"
+        ).read_text(encoding="utf-8")
+        code = "\n".join(
+            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        )
+        for forbidden in ('"extracted.json"', "'extracted.json'", '"text.txt"', "'text.txt'"):
+            assert forbidden not in code, (
+                f"carmel/services/reextraction.py now names {forbidden} in code. It must derive "
+                "every extraction from raw.bin alone -- reading a root sidecar here would launder "
+                "unauthenticated text into a digest-authenticated record address"
+            )

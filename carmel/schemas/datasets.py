@@ -794,20 +794,40 @@ class RootSidecarVerification(StrEnum):
     production at all.
     """
 
-    NOT_CHECKED = "not_checked"
-    """The root sidecar was never read. Its ``meta.json`` was consulted only
-    for source metadata (``content_type``), which is not evidence and is not
-    treated as such."""
+    ROOT_SIDECAR_DIGEST_AUTHENTICATED = "root_sidecar_digest_authenticated"
+    """The root ``meta.json`` records an ``extracted_sha256``, and the sidecar's
+    bytes on disk hashed to it at production time.
+
+    This says nothing about the text this envelope grounds against -- that came
+    from the extraction record either way. It is recorded because the
+    alternative was a ``NOT_CHECKED`` member, and an unfalsifiable claim has no
+    business in persisted evidence: ``NOT_CHECKED`` would have described a
+    producer CHOICE rather than a fact about the store, so no consumer could
+    ever contradict it, and a claim nobody can refute is indistinguishable from
+    a claim nobody made. Checking costs one hash and buys a value replay can
+    put to the test."""
+
+    ROOT_SIDECAR_DIGEST_MISMATCH = "root_sidecar_digest_mismatch"
+    """The root ``meta.json`` records an ``extracted_sha256`` and the sidecar's
+    bytes did NOT hash to it: the legacy tier of this artifact is damaged.
+
+    Recorded, deliberately, rather than refused. The root sidecar is not an
+    input to production -- refusing over it would re-erect exactly the gate this
+    design removed, and would block a dataset whose raw bytes and grounded text
+    are both fully authenticated. Surfacing the damage in the envelope is the
+    honest handling; deciding what to do about it belongs to whoever reads the
+    envelope, not to the producer."""
 
     NO_RECORDED_DIGEST = "no_recorded_digest"
     """The artifact's root ``meta.json`` records ``extracted_sha256=None``: it
     was stored before that field existed, so its sidecar carries no digest and
-    CANNOT be authenticated by anyone, now or later. Distinct from
-    ``NOT_CHECKED``, which says only that this producer did not look --
-    "could not be checked by anyone" and "was not checked here" are different
-    facts, and conflating inability-to-check with a choice not to check is the
-    exact conflation this codebase has already fixed three times on the
-    acquisition side."""
+    CANNOT be authenticated by anyone, now or later.
+
+    Distinct from ``ROOT_SIDECAR_DIGEST_MISMATCH``, which reports a check that
+    RAN and disagreed. Inability-to-check and demonstrated-disagreement are
+    different facts, and this codebase has already had to unwind that
+    conflation three times on the acquisition side (PAYWALLED vs
+    NO_OPEN_ACCESS_COPY, then NO_OPEN_ACCESS_COPY vs OA_LOOKUP_INCOMPLETE)."""
 
 
 class SourceVerification(BaseModel):
@@ -1643,6 +1663,39 @@ class SourceGraph(BaseModel):
                     )
                 continue
             health_by_address[address] = (node.node_id, health)
+
+        # I5e: two nodes naming the SAME extraction address must also agree on
+        # what was VERIFIED about it. Same reasoning as I5b one block up, on a
+        # different field: a SourceVerification describes the artifact and the
+        # extracted text that address names, and those have exactly one true
+        # verification story. Left unchecked, a graph could carry one node
+        # claiming its root sidecar authenticated and a second node on the very
+        # same record claiming it has no recorded digest -- a contradiction
+        # replay would then report twice, once per node, without either
+        # finding naming the fact that the ENVELOPE disagrees with itself.
+        #
+        # Placed after I5b for the same ordering reason I5c is placed before
+        # it: an extraction-binding conflict is the root cause and a
+        # verification disagreement is downstream of it, so the more specific
+        # diagnosis has already had its chance to fire.
+        verification_by_address: dict[tuple[str, str], tuple[str, SourceVerification]] = {}
+        for node in self.nodes:
+            if isinstance(node.verification, Absent):
+                continue
+            assert not isinstance(node.extraction, Absent)  # SourceNode's iff-rule guarantees this
+            address = (node.extraction.parent_raw_sha256, node.extraction.extraction_sha256)
+            if address in verification_by_address:
+                other_node_id, other_verification = verification_by_address[address]
+                if other_verification != node.verification:
+                    raise ValueError(
+                        f"node {node.node_id!r} and node {other_node_id!r} both name extraction address "
+                        f"(parent_raw_sha256={address[0]!r}, extraction_sha256={address[1]!r}) but their "
+                        "recorded SourceVerifications disagree; the same artifact and extracted text can "
+                        "only have one true verification story, so this envelope contradicts itself and "
+                        "must be reconciled before this graph can validate"
+                    )
+                continue
+            verification_by_address[address] = (node.node_id, node.verification)
 
         seen_triples: set[tuple[SourceNodeKind, str, str | None]] = set()
         for node in self.nodes:

@@ -75,7 +75,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
     return SourceVerification(
         raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
         extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
-        root_sidecar=RootSidecarVerification.NOT_CHECKED,
+        root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
 
 SHA_A = "a" * 64
