@@ -2254,3 +2254,142 @@ class TestActiveTableBindingTracksItsArgument:
         assert active_other.embedded.sha256 == other_table.sha256
         assert active_other.embedded.sha256 != active_default.embedded.sha256
         assert active_default.embedded.sha256 == units.TABLE_V1.sha256
+
+
+_FIGURE_FURNITURE_TEXT = (
+    "Figure 3 compares the measured and predicted burning velocities.\n"
+    "0 4 8 12 16 20 24 28\n"
+    "0.3 0.5 0.7 0.9 1.1 1.3 1.5\n"
+    "Model Comparison, Tu=310 K\n"
+    "Equivalence Ratio (-)\n"
+    "Laminar Burning Velocity (cm/s)\n"
+)
+"""SYNTHETIC figure furniture -- invented numbers and labels, never real paper text.
+
+It reproduces the SHAPE that ``pdf:pypdf`` produces for a plot: the two axis tick
+runs, a plot annotation, and the two axis labels with their units, all flattened
+into running text as one short contiguous block. Nothing in this block is a
+measurement. No point (phi, S_L) is stated anywhere; the tick runs are the ruler,
+not the data.
+
+Every quote used below occurs exactly once, so ``ground_quote``'s uniqueness
+default applies and no ``*_occurrence`` disambiguation is needed.
+"""
+
+_FURNITURE_SPECS = (
+    MeasurementSpec(
+        axis_id="equivalence_ratio",
+        role=AxisRole.COORDINATE,
+        quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+        label_quote="Equivalence Ratio",
+        value_quote="0.7",  # an x-axis TICK, not a measured condition
+        unit_quote="-",
+    ),
+    MeasurementSpec(
+        axis_id="burning_velocity",
+        role=AxisRole.OBSERVATION,
+        quantity_kind=QuantityKind.VELOCITY,
+        label_quote="Laminar Burning Velocity",
+        value_quote="24",  # a y-axis TICK, not a measured value
+        unit_quote="cm/s",
+    ),
+)
+
+
+class TestFigureFurnitureFabricatesAVerifiedEnvelope:
+    """CHARACTERIZATION of a live defect: axis furniture produces VERIFIED data.
+
+    This class asserts what the code does TODAY, and today's behaviour is wrong.
+    It is the standing, suite-defended form of a probe that was run against a
+    real paper in the closed corpus: an envelope built entirely from a figure's
+    axis tick runs and axis labels is produced without objection and replays
+    ``VERIFIED`` with zero findings. Every quote grounds, because grounding
+    proves a string is an exact located substring of the verified document and
+    says NOTHING about whether that string is a datum or a ruler mark.
+
+    Read the assertions as a description of the hole, not as a specification.
+    When the real defense lands -- textual series requiring table/row structure
+    or a prose-local scalar statement, with figure-resident data routed through
+    explicit digitization -- production must REFUSE these specs and this class
+    must be rewritten to assert the refusal. A green run here means the hole is
+    still open.
+
+    It is deliberately built so that a BOUNDED MEASUREMENT CONTEXT fix would
+    NOT flip it: label, value and unit for both axes fall inside one ~110-char
+    span. Co-location is satisfied and the data is still fabricated. That is
+    the point -- this class is the reason bounded context cannot be sold as the
+    fix for this route, and ``test_every_quote_lands_inside_one_short_span``
+    below is what would fail if anyone tried.
+    """
+
+    def _envelope(self, tmp_path: Path) -> DatasetEnvelope:
+        stored = _store_synthetic_artifact(tmp_path, _FIGURE_FURNITURE_TEXT)
+        return produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="fabricated_from_axis_ticks",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_FURNITURE_SPECS,
+        )
+
+    def test_the_producer_accepts_quotes_taken_from_axis_furniture(
+        self, tmp_path: Path
+    ) -> None:
+        """Production does not object. It has no basis on which to object: each
+        quote IS in the document, exactly where the locator says it is."""
+        envelope = self._envelope(tmp_path)
+        point = envelope.series[0].points[0]
+        assert {c.axis_id for c in point.coordinates} == {"equivalence_ratio"}
+        assert {o.axis_id for o in point.observations} == {"burning_velocity"}
+
+    def test_replay_verifies_an_envelope_whose_every_number_is_a_tick(
+        self, tmp_path: Path
+    ) -> None:
+        """The full round trip -- store, re-read, re-slice every span -- reports
+        ``VERIFIED`` with nothing to say. This is the defect in one assertion:
+        the strongest verdict the system can issue, over fabricated data."""
+        envelope = self._envelope(tmp_path)
+        report = replay_envelope(tmp_path, envelope)
+
+        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.findings == ()
+        assert report.unchecked_claims == ()
+        # Not vacuous: spans were actually checked, and all of them were.
+        assert report.total_char_spans > 0
+        assert report.checked_char_spans == report.total_char_spans
+
+    def test_the_fabricated_point_is_physically_plausible(self, tmp_path: Path) -> None:
+        """phi = 0.7 with a laminar burning velocity of 24 cm/s is an entirely
+        ordinary-looking lean-flame datum -- which is why a downstream range or
+        sanity check would not catch it either. The defense cannot be
+        plausibility; it has to be provenance."""
+        envelope = self._envelope(tmp_path)
+        point = envelope.series[0].points[0]
+        phi = next(c for c in point.coordinates if c.axis_id == "equivalence_ratio")
+        s_l = next(o for o in point.observations if o.axis_id == "burning_velocity")
+        assert float(phi.value.canonical_decimal_value) == pytest.approx(0.7)
+        assert float(s_l.value.canonical_decimal_value) == pytest.approx(24.0)
+        assert s_l.value.unit_normalized == "cm/s"
+
+    def test_every_quote_lands_inside_one_short_span(self, tmp_path: Path) -> None:
+        """The co-location counterweight, and the reason it is stated here.
+
+        A bounded-measurement-context check requires an axis's label, value and
+        unit to fall within one caller-supplied window. This asserts that ALL
+        SIX quotes -- both axes -- already do, inside a single short span. Such
+        a check would therefore accept this envelope unchanged.
+
+        This test passes by construction rather than by discovering anything,
+        and is worth having only because it is what a future bounded-context
+        implementation would have to break in order to claim it closed this
+        route."""
+        envelope = self._envelope(tmp_path)
+        series = envelope.series[0]
+        point = series.points[0]
+        refs = [axis.label_ref for axis in series.axes]
+        for cell in (*point.coordinates, *point.observations):
+            refs.extend((cell.value.value_ref, cell.value.unit_ref))
+        offsets = [(ref.locator.start, ref.locator.end) for ref in refs if ref is not None]
+        assert len(offsets) == 6, "two labels, two values, two units -- all six must ground"
+        span = max(end for _, end in offsets) - min(start for start, _ in offsets)
+        assert span < 130, f"quotes span {span} chars; the axis block is no longer compact"
