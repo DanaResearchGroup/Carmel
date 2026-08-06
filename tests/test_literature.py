@@ -4270,3 +4270,82 @@ class TestEveryRouteToNoUsableRecordRefuses:
         assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
             "an artifact that never had a record must still reach the root tiers"
         )
+
+
+class TestOnePoisonedEntryDoesNotKillTheWholePass:
+    """A containment failure must cost ONE document, not the whole corpus.
+
+    `f5ea5bb` made every route to "no usable extraction record" refuse rather than serve
+    unauthenticated root text. It left one route that does not refuse -- it CRASHES.
+    ``_validated_records_dir`` raises ``ValueError`` when an artifact's ``extractions/``
+    resolves outside the workspace, and nothing between it and the per-artifact loop in
+    ``_load_corpus`` catches it, so a single poisoned entry aborts the pass for every
+    OTHER document too.
+
+    The root tier immediately below already degrades on its own ``ValueError`` rather
+    than propagating it, so the record tier is the odd one out -- and it is the tier
+    where the blast radius is the whole campaign instead of one artifact.
+    """
+
+    def test_a_symlinked_extractions_dir_refuses_only_its_own_document(
+        self, campaign: Campaign
+    ) -> None:
+        """Two healthy documents must survive a third one's escaping symlink.
+
+        The failure this pins is availability, not authenticity: before the fix the
+        assertion below could not even be reached, because the call raised out of the
+        loop and the two healthy artifacts were never classified at all.
+        """
+        healthy = [
+            _store_legacy(
+                campaign.workspace_root,
+                text=f"Healthy synthetic document {index}. Measured 1.{index} ms.\n",
+                url=f"https://example.invalid/healthy-{index}",
+            )
+            for index in range(2)
+        ]
+        for sha in healthy:
+            _store_current_record(campaign.workspace_root, sha, text=RECORD_TEXT)
+        poisoned = _store_legacy(
+            campaign.workspace_root,
+            text="Poisoned synthetic document. Measured 9.9 ms.\n",
+            url="https://example.invalid/poisoned",
+        )
+        outside = campaign.workspace_root.parent / "outside-the-workspace"
+        outside.mkdir(parents=True, exist_ok=True)
+        _records_dir(campaign.workspace_root, poisoned).symlink_to(outside, target_is_directory=True)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert sorted(artifact.sha256 for artifact, _, _ in corpus) == sorted(healthy), (
+            "one artifact whose record store escapes the workspace must not take the "
+            "healthy documents down with it"
+        )
+        assert outcomes[poisoned] == CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE
+        assert outcomes[poisoned] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "escaping the workspace is never a licence to fall through to the root sidecar"
+        )
+
+    def test_the_escape_is_not_reported_as_a_merely_unreadable_store(
+        self, campaign: Campaign
+    ) -> None:
+        """"Points outside the workspace" and "could not be listed" are different facts.
+
+        The first is a containment breach -- the store is being asked to follow a path
+        out of the workspace it is supposed to be sealed inside. The second is an IO
+        error. Folding them into one outcome is the exact collapse this whole arc exists
+        to undo, and it would tell an operator to check permissions when what they have
+        is a planted or restored symlink.
+        """
+        poisoned = _store_legacy(
+            campaign.workspace_root, text=DOC, url="https://example.invalid/escapes"
+        )
+        outside = campaign.workspace_root.parent / "outside-for-distinctness"
+        outside.mkdir(parents=True, exist_ok=True)
+        _records_dir(campaign.workspace_root, poisoned).symlink_to(outside, target_is_directory=True)
+
+        _, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert outcomes[poisoned] != CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE, (
+            "a containment breach must not be reported as a permissions problem"
+        )

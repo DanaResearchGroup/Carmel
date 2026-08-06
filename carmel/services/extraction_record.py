@@ -112,12 +112,23 @@ from carmel.services.semantic_deps import (
     extraction_identity,
 )
 
+#: Exports the DECISION-grade API alongside the lossy one. ``list_extraction_records``
+#: and ``current_extraction_records`` drop the distinction between "no records exist" and
+#: "records exist but could not be read" -- exactly the collapse that let unauthenticated
+#: root text be served in place of a record. Exporting only those two advertised the trap
+#: and hid the safe path, so ``scan_extraction_records`` (which reports what it could not
+#: read) and ``select_current_extraction`` (which returns a typed decision) are listed too.
 __all__ = [
     "EXTRACTIONS_SUBDIR",
+    "CurrentSelection",
+    "CurrentSelectionKind",
     "ExtractionPreference",
     "ExtractionRecordError",
     "ExtractionRecordMeta",
+    "ExtractionRecordScan",
     "ExtractionSelectionError",
+    "RecordScanProblem",
+    "RecordsDirState",
     "SelectedExtraction",
     "UnknownPypdfVersionError",
     "compute_extraction_sha",
@@ -125,6 +136,8 @@ __all__ = [
     "extraction_record_dir",
     "list_extraction_records",
     "load_extraction_record",
+    "scan_extraction_records",
+    "select_current_extraction",
     "select_extraction",
     "store_extraction_record",
     "stored_extraction_sha256",
@@ -348,6 +361,31 @@ def _validated_records_dir(workspace_root: Path, raw_sha256: str) -> Path:
     _validate_sha(raw_sha256, label="raw_sha256")
     root = normalize_path(workspace_root)
     return _assert_contained(root, artifact_dir(root, raw_sha256) / EXTRACTIONS_SUBDIR)
+
+
+def _records_dir_escape_reason(workspace_root: Path, raw_sha256: str) -> str | None:
+    """``None`` if ``extractions/`` is contained, else why it is not.
+
+    The predicate form of :func:`_validated_records_dir`, for the one caller that must
+    NOT let a containment failure propagate: :func:`select_current_extraction` speaks for
+    a single artifact inside a loop over the whole corpus, so an exception there costs
+    every OTHER document too, while a typed refusal costs one.
+
+    ``raw_sha256`` is validated FIRST and deliberately still raises. A digest that is not
+    64 lowercase hex characters is a fact about the CALLER, not about the store: there is
+    no artifact to refuse on behalf of, and turning a typo into a per-document refusal
+    would let it read as a merely unreadable paper forever. Only after that check does
+    a remaining :exc:`ValueError` mean containment -- :func:`_assert_contained` raises it
+    for exactly one reason -- so this is a narrow conversion at a single-meaning boundary,
+    not a decision recovered from exception prose.
+    """
+    _validate_sha(raw_sha256, label="raw_sha256")
+    root = normalize_path(workspace_root)
+    try:
+        _assert_contained(root, artifact_dir(root, raw_sha256) / EXTRACTIONS_SUBDIR)
+    except ValueError as exc:
+        return str(exc)
+    return None
 
 
 def _validated_record_dir(workspace_root: Path, raw_sha256: str, extraction_sha256: str) -> Path:
@@ -1231,12 +1269,25 @@ def current_extraction_records(workspace_root: Path, raw_sha256: str) -> list[Ex
     Every record NOT returned here is "superseded" purely by virtue of not
     matching; nothing on disk ever annotates it as such.
 
-    A raw artifact may have zero, one, or several current records at once: e.g.
-    one stored as ``"pdf:unavailable"`` before ``pypdf`` was installed and one
-    later stored as ``"pdf:pypdf"`` after, both produced by the same (unchanged)
-    Carmel extraction code, are BOTH current -- ``pypdf_version`` only
-    disqualifies a record when the record's own extractor is one of
-    :data:`_PYPDF_DEPENDENT_EXTRACTORS`.
+    A raw artifact may have zero, one, or several current records at once: two
+    records written by different version-independent extractors (say ``"html"``
+    and ``"text"`` over the same bytes) under unchanged Carmel extraction code
+    are BOTH current, because ``pypdf_version`` only disqualifies a record whose
+    own extractor is in :data:`_PYPDF_DEPENDENT_EXTRACTORS`.
+
+    A ``"pdf:unavailable"`` record is NOT such a case, though it was described as
+    one here until the currentness rule became three-way. That extractor is the
+    degraded placeholder written when ``pypdf`` could not be imported, and it is
+    current only while ``pypdf`` is STILL unidentifiable; once the install is
+    fixed, today's extraction would produce ``"pdf:pypdf"``, so the placeholder is
+    stale rather than a co-equal second reading. See :func:`_is_current`.
+
+    "Version-independent" is a claim about ``pypdf`` specifically, not about the
+    world: ``html``/``xml``/``text`` still ride on stdlib behaviour
+    (:mod:`html.parser`, :func:`unicodedata.normalize`, ``str.casefold``) that no
+    field in the identity payload pins. A Python upgrade can therefore change what
+    those extractors produce while their records go on reporting as current. Only
+    Carmel's own source is pinned, via ``extractor_code_sha256``.
 
     Args:
         workspace_root: Root of the campaign workspace.
@@ -1528,6 +1579,16 @@ class CurrentSelectionKind(StrEnum):
     STORE_UNREADABLE = "store_unreadable"
     """``extractions/`` exists but could not be enumerated at all."""
 
+    RECORD_STORE_ESCAPES_WORKSPACE = "record_store_escapes_workspace"
+    """``extractions/`` resolves OUTSIDE the workspace root.
+
+    Kept distinct from :attr:`STORE_UNREADABLE` on purpose. That one is an IO error --
+    check the permissions. This one is a containment breach: the store is being asked to
+    follow a path out of the directory it is supposed to be sealed inside, which is what
+    a planted symlink, a restored backup, or a stray bind mount looks like. Reporting a
+    breach as a permissions problem would send the operator to `chmod` a symlink.
+    """
+
     EXTRACTOR_IDENTITY_UNAVAILABLE = "extractor_identity_unavailable"
     """Today's extractor identity is unknowable, so currentness cannot be decided."""
 
@@ -1549,6 +1610,24 @@ class CurrentSelection:
     """Operator-facing phrase saying what was observed and what would change it."""
 
     selected: SelectedExtraction | None = None
+
+    def __post_init__(self) -> None:
+        """Hold the if-and-only-if the docstring claims, rather than asserting it.
+
+        Unenforced, the dangerous direction is a REFUSAL that still carries readable
+        text: a caller that reaches for ``selected`` before checking ``kind`` would then
+        serve text the selector had just declined to vouch for. The mirror case (SELECTED
+        with nothing to show) is merely broken rather than unsafe, but the two are one
+        invariant and are checked as one.
+        """
+        has_extraction = self.selected is not None
+        if has_extraction != (self.kind is CurrentSelectionKind.SELECTED):
+            raise ValueError(
+                f"CurrentSelection invariant violated: kind={self.kind.value!r} with "
+                f"selected={'set' if has_extraction else 'None'}. An extraction is carried "
+                "if and only if the kind is SELECTED; every other kind is a refusal and a "
+                "refusal must not hand back text it declined to vouch for"
+            )
 
 
 def select_current_extraction(workspace_root: Path, raw_sha256: str) -> CurrentSelection:
@@ -1580,8 +1659,23 @@ def select_current_extraction(workspace_root: Path, raw_sha256: str) -> CurrentS
 
     Raises:
         ValueError: If ``raw_sha256`` is not a well-formed 64-character lowercase hex
-            digest, or if the resolved directory would fall outside the workspace root.
+            digest. A caller-side bug, and the ONLY thing this function still raises: a
+            records directory that resolves outside the workspace is a fact about the
+            STORE and comes back as :attr:`CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE`,
+            because this function is called once per artifact inside a loop over the whole
+            corpus and an exception there loses every other document as well.
     """
+    escape_reason = _records_dir_escape_reason(workspace_root, raw_sha256)
+    if escape_reason is not None:
+        return CurrentSelection(
+            kind=CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE,
+            detail=(
+                f"the extractions directory for {raw_sha256} resolves outside the workspace "
+                f"root ({escape_reason}); nothing under it is treated as a record of this "
+                "campaign, because a store that can be pointed out of the workspace could be "
+                "pointed at anything"
+            ),
+        )
     scan = scan_extraction_records(workspace_root, raw_sha256)
 
     if scan.dir_state is RecordsDirState.UNLISTABLE:

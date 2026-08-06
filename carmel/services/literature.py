@@ -151,6 +151,9 @@ _RECORD_REFUSAL_OUTCOMES: dict[CurrentSelectionKind, CorpusReadOutcome] = {
         CorpusReadOutcome.UNUSABLE_EXTRACTION_RECORD_PRESENT
     ),
     CurrentSelectionKind.STORE_UNREADABLE: CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE,
+    CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE: (
+        CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE
+    ),
     CurrentSelectionKind.EXTRACTOR_IDENTITY_UNAVAILABLE: (
         CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE
     ),

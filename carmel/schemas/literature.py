@@ -628,6 +628,18 @@ class CorpusReadOutcome(StrEnum):
     "The store could not answer" is not "the store answered that there is nothing
     here", and only the latter may fall through to the root tiers."""
 
+    EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE = "extraction_record_store_escapes_workspace"
+    """The ``extractions/`` directory resolves OUTSIDE the workspace root. Never read.
+
+    Distinct from :attr:`EXTRACTION_RECORD_STORE_UNREADABLE`, which is an IO error the
+    operator fixes with permissions. This is a containment breach -- a planted symlink, a
+    restored backup, a stray bind mount -- and the honest report is that the store was
+    pointed somewhere it may not go, not that it was hard to read.
+
+    Before this outcome existed the condition raised out of the per-artifact loop, so ONE
+    such artifact aborted the corpus pass for every other document. Refusing costs one
+    paper; raising cost the campaign."""
+
     INTEGRITY_FAILED = "integrity_failed"
     """The bytes themselves do not match what was recorded: the default (non-deep)
     check itself failed, because ``raw.bin`` is absent or no longer hashes to the

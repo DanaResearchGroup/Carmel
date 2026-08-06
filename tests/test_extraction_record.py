@@ -1199,3 +1199,126 @@ class TestAnUnreadableEvidenceStoreIsNotAnEmptyOne:
 
         assert not (tmp_path / "evidence" / "literature").exists()
         assert list_artifacts_with_unreadable(tmp_path) == ([], [])
+
+
+class TestAContainmentBreachRefusesRatherThanCrashingThePass:
+    """The selector's last un-typed exit: ``ValueError`` straight out to the caller.
+
+    Every other store condition became a typed :class:`CurrentSelection` in `f5ea5bb`.
+    A records directory that resolves outside the workspace stayed an exception, and
+    because the corpus loop does not wrap this call, that one artifact aborts the pass
+    for all the others. A refusal costs one document; an exception costs the campaign.
+    """
+
+    def test_an_escaping_records_dir_is_a_typed_refusal(self, tmp_path: Path) -> None:
+        raw_sha, _ = _store_artifact_with_record(tmp_path)
+        records_dir = tmp_path / "evidence" / "literature" / raw_sha / "extractions"
+        outside = tmp_path.parent / f"outside-{tmp_path.name}"
+        outside.mkdir(parents=True, exist_ok=True)
+        for child in sorted(records_dir.iterdir()):
+            child.rename(outside / child.name)
+        records_dir.rmdir()
+        records_dir.symlink_to(outside, target_is_directory=True)
+
+        selection = select_current_extraction(tmp_path, raw_sha)
+
+        assert selection.kind is CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE
+        assert selection.selected is None, "a breach never yields text"
+        assert "outside" in selection.detail.lower(), (
+            "the operator must be told the store escaped, not merely that it failed"
+        )
+
+    def test_a_malformed_raw_sha_still_raises_because_that_is_a_caller_bug(
+        self, tmp_path: Path
+    ) -> None:
+        """The distinction the typed refusal must NOT swallow.
+
+        A store that points outside the workspace is a fact about the store, and the
+        pass should carry on with the other documents. A malformed digest is a fact
+        about the CALLER -- there is no document to carry on with, and converting it to
+        a refusal would let a typo present as a merely unreadable artifact forever.
+        """
+        with pytest.raises(ValueError, match="raw_sha256"):
+            select_current_extraction(tmp_path, "not-a-sha256")
+
+
+class TestCurrentSelectionEnforcesItsOwnInvariant:
+    """``selected`` is populated if and only if ``kind`` is SELECTED.
+
+    The docstring asserted this; nothing enforced it. Both callers therefore carry a
+    hand-written ``selected is None`` re-check whose only purpose is to survive an
+    invariant the type itself could hold.
+    """
+
+    def test_a_selected_outcome_without_an_extraction_is_rejected(self) -> None:
+        from carmel.services.extraction_record import CurrentSelection
+
+        with pytest.raises(ValueError, match="SELECTED"):
+            CurrentSelection(kind=CurrentSelectionKind.SELECTED, detail="claims a read it cannot show")
+
+    def test_a_refusal_carrying_an_extraction_is_rejected(self, tmp_path: Path) -> None:
+        """The dangerous direction: a refusal that smuggles readable text alongside it."""
+        from carmel.services.extraction_record import CurrentSelection
+
+        raw_sha, _ = _store_artifact_with_record(tmp_path)
+        smuggled = select_current_extraction(tmp_path, raw_sha).selected
+        assert smuggled is not None, "fixture must supply a real SelectedExtraction"
+
+        with pytest.raises(ValueError, match="SELECTED"):
+            CurrentSelection(
+                kind=CurrentSelectionKind.NO_CURRENT_RECORD, detail="refuses", selected=smuggled
+            )
+
+
+class TestTheDecisionGradeApiIsTheExportedOne:
+    def test_scan_and_select_are_exported_alongside_the_lossy_helpers(self) -> None:
+        """An importer reading ``__all__`` must not find only the unsafe half.
+
+        ``list_extraction_records``/``current_extraction_records`` drop the distinction
+        between "no records" and "records that could not be read", which is precisely the
+        collapse that let unauthenticated text be served. They are exported; the two
+        functions that preserve the distinction were not, so the public surface
+        recommended the trap and hid the safe path.
+        """
+        from carmel.services import extraction_record
+
+        decision_grade = (
+            "scan_extraction_records",
+            "select_current_extraction",
+            "CurrentSelection",
+            "CurrentSelectionKind",
+        )
+        for name in decision_grade:
+            assert name in extraction_record.__all__, f"{name} decides things; it must be exported"
+
+
+class TestTheIdentityPayloadKeySetIsPinned:
+    """A guard, not a migration: changing either constant orphans every stored record.
+
+    ``_build_identity_payload`` applies TODAY's key-set rule regardless of a record's own
+    ``identity_payload_version``, so bumping the version or moving an extractor in or out
+    of the pypdf-dependent set makes every existing record fail to authenticate. Before
+    `f5ea5bb` that merely SKIPPED those records; now it reports
+    ``UNUSABLE_RECORD_PRESENT``, which BRICKS the document -- and records are append-only,
+    so nothing can self-heal.
+
+    No v1 record can exist today (the version was born at "2" and the key set has never
+    moved), so this is a prospective hazard and gets a tripwire rather than a version-keyed
+    rebuild that nothing could exercise.
+    """
+
+    def test_changing_the_key_set_rule_must_ship_a_migration_story(self) -> None:
+        from carmel.services.extraction_record import (
+            _IDENTITY_PAYLOAD_VERSION,
+            _PYPDF_DEPENDENT_EXTRACTORS,
+        )
+
+        pinned = (_IDENTITY_PAYLOAD_VERSION, set(_PYPDF_DEPENDENT_EXTRACTORS))
+        assert pinned == ("2", {"pdf:pypdf"}), (
+            "you changed the identity-payload shape or the pypdf-dependent key set. Every "
+            "record already in every store was addressed under the OLD rule and will now "
+            "fail to authenticate -- reported as UNUSABLE_RECORD_PRESENT, which refuses the "
+            "document outright. Records are append-only, so they cannot be rewritten in "
+            "place. Ship a version-keyed rebuild in _build_identity_payload before changing "
+            "this, or accept that every stored record must be re-extracted."
+        )
