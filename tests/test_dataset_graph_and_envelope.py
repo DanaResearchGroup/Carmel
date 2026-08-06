@@ -43,6 +43,7 @@ from carmel.schemas.datasets import (
     DataPoint,
     DatasetEnvelope,
     EmbeddedConversionTable,
+    ExtractedTextVerification,
     ExtractionBinding,
     GlyphHealthAssessment,
     Maybe,
@@ -50,6 +51,8 @@ from carmel.schemas.datasets import (
     MemberSheetKey,
     Observation,
     QuantityKind,
+    RawArtifactVerification,
+    RootSidecarVerification,
     SemanticDependencyUse,
     Series,
     SourceForm,
@@ -57,6 +60,7 @@ from carmel.schemas.datasets import (
     SourceNode,
     SourceNodeKind,
     SourceRef,
+    SourceVerification,
     TableCellLocator,
     TableKeyKind,
     TextSpace,
@@ -79,6 +83,24 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1, ConversionTable, IdentityRule
+
+
+def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
+    """Mirror ``SourceNode``'s iff-rule: a node carries a verification record
+    exactly when it carries an extraction to have verified, and an absent one
+    keeps the SAME ``AbsenceReason`` (so a FIGURE_CROP's NOT_APPLICABLE stays
+    NOT_APPLICABLE). Deriving it here rather than restating a literal at every
+    construction site keeps these fixtures from drifting out of step with the
+    validator they are meant to exercise -- a fixture that has to be hand-kept
+    consistent with an invariant is a fixture that will eventually contradict
+    it silently."""
+    if isinstance(extraction, Absent):
+        return Absent(reason=extraction.reason)
+    return SourceVerification(
+        raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
+        extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
+        root_sidecar=RootSidecarVerification.NOT_CHECKED,
+    )
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -259,6 +281,7 @@ def _node(
         origin=origin,
         extraction=extraction,
         glyph_health=glyph_health,
+        verification=_verification_for(extraction),
     )
 
 
@@ -297,7 +320,20 @@ def _sha_sharing_node_with_extraction(
     run, because `SourceGraph(nodes=(...))` itself is a fresh constructor
     call, not a `model_copy`."""
     node = _node(node_id, SourceNodeKind.SI_MEMBER, sha256, parent_node_id=parent_node_id)
-    return node.model_copy(update={"extraction": extraction, "glyph_health": glyph_health})
+    # `verification` rides along with `extraction` because SourceNode's iff-rule
+    # binds the two. `model_copy` skips validators by design here (that is this
+    # helper's whole purpose), so injecting an extraction WITHOUT its
+    # verification would build a node no direct construction could ever produce
+    # -- and the failure would then surface later, at SourceGraph validation,
+    # naming the missing verification instead of the graph-level conflict these
+    # fixtures exist to exercise.
+    return node.model_copy(
+        update={
+            "extraction": extraction,
+            "glyph_health": glyph_health,
+            "verification": _verification_for(extraction),
+        }
+    )
 
 
 def _bbox_ref(node_id: str) -> SourceRef:

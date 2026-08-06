@@ -24,8 +24,12 @@ import pytest
 from carmel.agents.tools.extract import ExtractedText
 from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.datasets import (
+    Absent,
     AxisRole,
+    ExtractedTextVerification,
     ExtractionBinding,
+    RawArtifactVerification,
+    RootSidecarVerification,
     SourceNodeKind,
     ValueOrigin,
 )
@@ -41,7 +45,7 @@ from carmel.services.dataset_producer import (
 from carmel.services.dataset_replay import ReplayOutcome, replay_envelope
 from carmel.services.dataset_store import compute_dataset_sha
 from carmel.services.evidence import artifact_dir, store_artifact
-from carmel.services.extraction_record import extraction_record_dir
+from carmel.services.extraction_record import extraction_record_dir, select_current_extraction
 from carmel.services.numeric import QuoteRole
 from carmel.services.units import QuantityKind
 
@@ -1402,21 +1406,23 @@ class TestProducerEndToEnd:
 
 
 class TestProducerFailClosed:
-    def test_refuses_corrupted_extracted_json(self, tmp_path: Path) -> None:
-        """Bytes on disk that no longer match StoredArtifact.extracted_sha256
-        are refused BEFORE parsing -- the corrupt replacement here is valid
-        JSON and would parse fine, so only the digest check can be what
-        refuses it. P1-B added ``verify_artifact`` as an earlier gate that
-        also checks this same extracted.json digest (among other things), so
-        it is now the one that fires first; the still-later, by-hand digest
-        check below it (with the older "refusing to parse unverified bytes"
-        message) is reached only if verify_artifact's own check is somehow
-        bypassed, e.g. by a future refactor -- both are exercised by other
-        tests in ``TestProducerFailClosed``. round-36: the shallow
-        ``verify_artifact(deep=False)`` integrity check now runs before
-        BOTH the legacy carve-outs and the deep=True call, so this is the
-        gate that actually fires now -- its "failed integrity verification"
-        message, not the deep-check's "failed verify_artifact" message."""
+    def test_a_corrupt_root_sidecar_no_longer_blocks_production(self, tmp_path: Path) -> None:
+        """INVERTED, deliberately. This test used to assert that corrupting the
+        ROOT ``extracted.json`` refused production. It now asserts the
+        opposite, because the producer no longer opens that file at all.
+
+        The change is not a weakening. The root sidecar stopped being an input
+        the moment production began grounding against a stored extraction
+        record, so refusing on its digest was a check on a file whose contents
+        could not reach the envelope. The same check applied to the tier that
+        DOES feed the envelope is
+        ``test_refuses_a_corrupt_extraction_record_sidecar`` below, and that
+        pair is the whole point: corruption still refuses, at the tier where
+        corruption can actually do harm.
+
+        What the produced envelope must NOT do is imply the root was verified.
+        It records ``root_sidecar=NOT_CHECKED`` -- the honest answer for a file
+        nothing opened."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
         corrupt = ExtractedText(
@@ -1424,7 +1430,35 @@ class TestProducerFailClosed:
         )
         extracted_path.write_bytes(corrupt.model_dump_json().encode("utf-8"))
 
-        with pytest.raises(DatasetProducerError, match="failed integrity verification"):
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        node = envelope.source_graph.nodes[0]
+        assert not isinstance(node.verification, Absent)
+        assert node.verification.root_sidecar is RootSidecarVerification.NOT_CHECKED
+
+    def test_refuses_a_corrupt_extraction_record_sidecar(self, tmp_path: Path) -> None:
+        """The counterweight to the test above, and where the real guarantee
+        now lives: corrupt the ``extracted.json`` INSIDE the extraction record
+        -- the tier production actually grounds against -- and it must refuse.
+
+        Without this pair, removing the root-sidecar check would read as
+        removing corruption detection. It is not; it is moving it onto the file
+        that can actually reach the envelope."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        selection = select_current_extraction(tmp_path, stored.sha256)
+        assert selection.selected is not None
+        record_sidecar = (
+            extraction_record_dir(tmp_path, stored.sha256, selection.selected.extraction_id)
+            / "extracted.json"
+        )
+        record_sidecar.write_bytes(b'{"not":"an ExtractedText"}')
+
+        with pytest.raises(DatasetProducerError, match="no usable current extraction record"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
@@ -1486,16 +1520,20 @@ class TestProducerFailClosed:
     def test_refuses_corrupted_raw_bin(self, tmp_path: Path) -> None:
         """P1-B: raw.bin was never verified before this fix -- only
         extracted.json was. Corrupt raw.bin (leave extracted.json/meta.json
-        untouched) and confirm production now refuses. round-36: the
-        shallow ``verify_artifact(deep=False)`` integrity check now runs
-        before the deep=True call, so it is the one that catches raw.bin
-        corruption and its "failed integrity verification" message is what
-        fires, not the deep-check's "failed verify_artifact" message."""
+        untouched) and confirm production refuses.
+
+        The guarantee is unchanged by the move to record-grounded production;
+        only the message is, and it got MORE specific. It used to come from
+        ``verify_artifact``, which returns a bare ``bool`` and so could not say
+        which of its several checks failed -- the refusal had to hedge across
+        "raw.bin missing, its bytes not hashing, meta.json unreadable, or
+        extracted.json not matching". The raw-only check that replaced it can
+        only fail one way, so it names it and prints both digests."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         raw_path = artifact_dir(tmp_path, stored.sha256) / "raw.bin"
         raw_path.write_bytes(b"not the original bytes at all")
 
-        with pytest.raises(DatasetProducerError, match="failed integrity verification"):
+        with pytest.raises(DatasetProducerError, match="raw.bin bytes on disk hash to"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
@@ -1526,14 +1564,23 @@ class TestProducerFailClosed:
                 measurements=_SPECS,
             )
 
-    def test_refuses_stale_derivation_binding(self, tmp_path: Path) -> None:
-        """Hand-edit ``derivation_binding`` so it no longer recomputes from
-        meta.json's own extractor_version/sha256/extracted_sha256, leaving
-        extracted_sha256 (and everything on disk) untouched -- raw.bin and
-        extracted.json both still verify fine, so only the deep
-        derivation_binding re-check (``verify_artifact(deep=True)``) can
-        catch this. This is the entire point of the deep=True flip: this
-        test MUST fail if that flip is reverted to deep=False."""
+    def test_a_stale_root_derivation_binding_no_longer_blocks_production(
+        self, tmp_path: Path
+    ) -> None:
+        """INVERTED, deliberately, and for the same reason as the corrupt-root
+        -sidecar test above: ``derivation_binding`` binds the ROOT sidecar's
+        digest to the root extractor identity, and neither is carried into the
+        envelope. The binding the envelope DOES carry is rebuilt from the
+        extraction record (see ``ExtractionBinding`` in
+        ``produce_envelope_from_artifact``), which this tampering does not
+        touch.
+
+        Read what the old check actually bought before mourning it, quoting
+        ``StoredArtifact.derivation_binding``'s own caveat: it proved INTERNAL
+        CONSISTENCY of the meta.json record, never that ``extracted.json`` was
+        re-derived from ``raw.bin``, and it was no defence at all against a
+        forger who updates digest and binding together. Applied to a file the
+        producer no longer reads, it bought nothing."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
         meta = StoredArtifact.model_validate_json(meta_path.read_text())
@@ -1542,49 +1589,77 @@ class TestProducerFailClosed:
         assert tampered.derivation_binding != meta.derivation_binding
         meta_path.write_text(tampered.model_dump_json())
 
-        with pytest.raises(DatasetProducerError, match="failed verify_artifact"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        node = envelope.source_graph.nodes[0]
+        assert not isinstance(node.verification, Absent)
+        assert node.verification.root_sidecar is RootSidecarVerification.NOT_CHECKED
 
-    def test_refuses_legacy_artifact_missing_derivation_binding(self, tmp_path: Path) -> None:
-        """A legacy artifact stored after extracted_sha256 existed but before
-        derivation_binding did has extracted_sha256 set and
-        derivation_binding=None -- refused with a message naming that
-        specific legacy cause, distinguishable both from the
-        extracted_sha256-is-None legacy message and from a stale-binding
-        refusal."""
+    def test_a_legacy_artifact_now_produces_and_says_so(self, tmp_path: Path) -> None:
+        """THE test this whole increment exists for.
+
+        An artifact stored before ``extracted_sha256``/``derivation_binding``
+        existed used to be refused outright -- permanently, because
+        ``reextract`` writes only under ``extractions/`` and NEVER rewrites a
+        root sidecar, so no amount of re-extraction could ever satisfy the
+        precondition. That described the ENTIRE real corpus: all 8 papers
+        predate both fields, and none of them could be turned into a dataset.
+
+        Now it produces, and the envelope states the reduced standard in its
+        own bytes rather than leaving a reader to assume a stronger one:
+        ``NO_RECORDED_DIGEST`` says the root sidecar cannot be authenticated by
+        ANYONE, which is a different fact from ``NOT_CHECKED`` ("this producer
+        did not look"). The raw bytes and the grounded text are still
+        authenticated -- what changed is that the envelope no longer pretends
+        the root tier was, and no longer refuses over a tier it does not use."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
         meta = StoredArtifact.model_validate_json(meta_path.read_text())
         assert meta.extracted_sha256 is not None
-        tampered = meta.model_copy(update={"derivation_binding": None, "extractor_version": None})
-        meta_path.write_text(tampered.model_dump_json())
+        legacy = meta.model_copy(
+            update={
+                "extracted_sha256": None,
+                "derivation_binding": None,
+                "extractor_version": None,
+            }
+        )
+        meta_path.write_text(legacy.model_dump_json())
 
-        with pytest.raises(DatasetProducerError, match="predates derivation_binding"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+        envelope = produce_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            measurements=_SPECS,
+        )
+        node = envelope.source_graph.nodes[0]
+        assert not isinstance(node.verification, Absent)
+        assert node.verification.raw_artifact is RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED
+        assert (
+            node.verification.extracted_text
+            is ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
+        )
+        assert node.verification.root_sidecar is RootSidecarVerification.NO_RECORDED_DIGEST
 
     def test_refuses_a_legacy_artifact_that_is_also_corrupt_by_naming_the_integrity_failure(
         self, tmp_path: Path
     ) -> None:
-        """round-36: an artifact that is BOTH legacy (predates extracted_sha256,
-        so it would also hit the legacy carve-out) AND corrupt (raw.bin no
-        longer hashes to sha256) must be refused as CORRUPT -- the shallow
-        verify_artifact(deep=False) integrity check now runs BEFORE the
-        legacy carve-outs, precisely so this case is never misreported as
-        routine legacy handling. Before this fix, the legacy carve-out ran
-        first and this same scenario raised "predates extracted_sha256"
-        instead, hiding the real integrity failure."""
+        """round-36: an artifact that is BOTH legacy (predates extracted_sha256)
+        AND corrupt (raw.bin no longer hashes to sha256) must be refused as
+        CORRUPT, never waved through or misreported as routine legacy handling.
+
+        The guarantee SURVIVES the move to record-grounded production, and this
+        test is the one that proves it. Legacy status is now no reason to
+        refuse at all (see ``test_a_legacy_artifact_now_produces_and_says_so``),
+        so the danger inverted: the risk is no longer that a corrupt artifact
+        gets the wrong message, but that it slips through entirely on the
+        strength of being legacy. It does not -- raw-byte authentication runs
+        for every artifact regardless of vintage, and it is what fires here."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         meta_path = artifact_dir(tmp_path, stored.sha256) / "meta.json"
         meta = StoredArtifact.model_validate_json(meta_path.read_text())
@@ -1594,7 +1669,7 @@ class TestProducerFailClosed:
         raw_path = artifact_dir(tmp_path, stored.sha256) / "raw.bin"
         raw_path.write_bytes(b"not the original bytes at all")
 
-        with pytest.raises(DatasetProducerError, match="failed integrity verification"):
+        with pytest.raises(DatasetProducerError, match="raw.bin bytes on disk hash to"):
             produce_envelope_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,

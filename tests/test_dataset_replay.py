@@ -35,13 +35,17 @@ from carmel.schemas.datasets import (
     CharSpanLocator,
     CoordinateFrame,
     DatasetEnvelope,
+    ExtractedTextVerification,
     ExtractionBinding,
     LocatorKind,
     MeasuredValue,
+    RawArtifactVerification,
+    RootSidecarVerification,
     SemanticDependencyUse,
     SourceNode,
     SourceNodeKind,
     SourceRef,
+    SourceVerification,
     TextSpace,
     ValueOrigin,
     XPathLocator,
@@ -68,6 +72,24 @@ from carmel.services.extraction_record import (
 )
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1, QuantityKind
+
+
+def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
+    """Mirror ``SourceNode``'s iff-rule: a node carries a verification record
+    exactly when it carries an extraction to have verified, and an absent one
+    keeps the SAME ``AbsenceReason`` (so a FIGURE_CROP's NOT_APPLICABLE stays
+    NOT_APPLICABLE). Deriving it here rather than restating a literal at every
+    construction site keeps these fixtures from drifting out of step with the
+    validator they are meant to exercise -- a fixture that has to be hand-kept
+    consistent with an invariant is a fixture that will eventually contradict
+    it silently."""
+    if isinstance(extraction, Absent):
+        return Absent(reason=extraction.reason)
+    return SourceVerification(
+        raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
+        extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
+        root_sidecar=RootSidecarVerification.NOT_CHECKED,
+    )
 
 MAX_BYTES = 10_000_000
 
@@ -1413,6 +1435,7 @@ class TestIndependentNodeVerificationOutcomeCategories:
             origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            verification=_verification_for(Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)),
         )
         text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
         assert text is None
@@ -1867,6 +1890,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
             origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             extraction=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             glyph_health=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            verification=_verification_for(Absent(reason=AbsenceReason.NOT_APPLICABLE)),
         )
         graph = loaded.source_graph.model_copy(update={"nodes": (*loaded.source_graph.nodes, crop)})
         frame = CoordinateFrame(

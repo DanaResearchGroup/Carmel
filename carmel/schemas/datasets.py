@@ -122,6 +122,7 @@ __all__ = [
     "DatasetEnvelope",
     "DatasetEnvelopeParseError",
     "EmbeddedConversionTable",
+    "ExtractedTextVerification",
     "ExtractionBinding",
     "GlyphHealthAssessment",
     "Maybe",
@@ -129,6 +130,8 @@ __all__ = [
     "MemberSheetKey",
     "Observation",
     "QuantityKind",
+    "RawArtifactVerification",
+    "RootSidecarVerification",
     "SemanticDependencyUse",
     "Series",
     "SourceForm",
@@ -137,6 +140,7 @@ __all__ = [
     "SourceNode",
     "SourceNodeKind",
     "SourceRef",
+    "SourceVerification",
     "TableCellLocator",
     "TableKey",
     "TableKeyKind",
@@ -736,6 +740,108 @@ class GlyphHealthAssessment(BaseModel):
         return self
 
 
+class RawArtifactVerification(StrEnum):
+    """What was checked about a node's ``raw.bin`` when its envelope was produced.
+
+    One member only, deliberately. The producer refuses outright when the raw
+    bytes do not re-hash to the node's ``sha256``, so no envelope can exist
+    carrying any weaker claim -- and this module DELETES unreachable guards
+    rather than shipping them (see :class:`DatasetEnvelope`'s note on the
+    removed V0 validator). An unreachable enum member is the data equivalent.
+    The enum exists rather than a bare ``bool`` so that a future producer path
+    which checks something different must add a member and say so, instead of
+    silently reusing a field that already reads as "the bytes were
+    authenticated".
+    """
+
+    RAW_SHA256_DIGEST_AUTHENTICATED = "raw_sha256_digest_authenticated"
+    """``raw.bin`` was re-read from the store and re-hashed, and its digest
+    equalled the node's own ``sha256``."""
+
+
+class ExtractedTextVerification(StrEnum):
+    """Which tier of the evidence store the grounded text was authenticated against.
+
+    Read the member names EXACTLY: every one of them is a claim about DIGEST
+    AUTHENTICATION, never about derivation. Nothing in this codebase proves
+    that any stored extracted text was genuinely re-derived from ``raw.bin`` --
+    not the extraction record, not the replayer, not this field. An extraction
+    record is bytes plus a self-consistent identity payload, and a caller that
+    can write to the store can mint one from text of its choosing. What these
+    members do assert is that the bytes grounding this envelope hashed to the
+    digest recorded for them, at the tier named.
+    """
+
+    EXTRACTION_RECORD_DIGEST_AUTHENTICATED = "extraction_record_digest_authenticated"
+    """The grounded text came from an extraction record under
+    ``extractions/<extraction_sha256>/`` whose stored bytes hashed to the
+    digest its own address folds in. This is the only tier the producer will
+    ground against: the root sidecar is never used as grounding input, because
+    text read from it is exactly what the corpus gate refuses without an
+    explicit operator opt-in."""
+
+
+class RootSidecarVerification(StrEnum):
+    """What, if anything, was established about the ROOT ``extracted.json``
+    sidecar -- the legacy, unauthenticated tier that predates the extraction
+    -record store.
+
+    This is the one tier whose answer genuinely varies with the artifact, and
+    it is mostly a NEGATIVE claim: its job is to stop a reader inferring that
+    a record-grounded envelope also carries root-level verification. It never
+    describes the text this envelope grounds against (that is
+    :class:`ExtractedTextVerification`); the root sidecar is not an input to
+    production at all.
+    """
+
+    NOT_CHECKED = "not_checked"
+    """The root sidecar was never read. Its ``meta.json`` was consulted only
+    for source metadata (``content_type``), which is not evidence and is not
+    treated as such."""
+
+    NO_RECORDED_DIGEST = "no_recorded_digest"
+    """The artifact's root ``meta.json`` records ``extracted_sha256=None``: it
+    was stored before that field existed, so its sidecar carries no digest and
+    CANNOT be authenticated by anyone, now or later. Distinct from
+    ``NOT_CHECKED``, which says only that this producer did not look --
+    "could not be checked by anyone" and "was not checked here" are different
+    facts, and conflating inability-to-check with a choice not to check is the
+    exact conflation this codebase has already fixed three times on the
+    acquisition side."""
+
+
+class SourceVerification(BaseModel):
+    """What was ACTUALLY verified about one source node, tier by tier.
+
+    Three orthogonal claims, because "verified" without a tier is the field
+    that quietly changes meaning between envelope vintages. A dataset produced
+    against a legacy artifact -- raw bytes authenticated, text authenticated
+    against a genuinely stored extraction record, root sidecar never
+    authenticable at all -- is not the same evidence as one produced against
+    an artifact verified at every tier, and an envelope that says only
+    "verified" cannot tell the two apart.
+
+    NONE of this is self-asserted trust. Every claim here is independently
+    FALSIFIABLE by :mod:`carmel.services.dataset_replay` against the store, and
+    the replayer does exactly that: a claim that disagrees with what the store
+    can support is positive evidence the envelope was altered outside validated
+    construction, and is reported FAILED. A claim no consumer can refute would
+    be decoration, and this codebase has already carried provenance nobody read
+    for long enough to find the same stale "no consumer reads this yet" comment
+    in four separate places.
+
+    Note what is NOT here: any claim that the extracted text was derived from
+    the raw bytes. See :class:`ExtractedTextVerification` for why no component
+    in this system can honestly make that claim.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw_artifact: RawArtifactVerification
+    extracted_text: ExtractedTextVerification
+    root_sidecar: RootSidecarVerification
+
+
 class SourceNode(BaseModel):
     """One artifact in a dataset's source graph.
 
@@ -778,6 +884,47 @@ class SourceNode(BaseModel):
     """This node's stored glyph-health assessment, if any has been recorded.
     ``Maybe``-typed, with no default, for the same reason as ``extraction``
     above -- and for the same reason, NOT inferred from ``kind`` either."""
+    verification: Maybe[SourceVerification]
+    """Tier-by-tier record of what was ACTUALLY verified about this node when
+    the envelope was produced -- see :class:`SourceVerification`.
+
+    ``Maybe``-typed, with no default, for the same "no unreasoned absence"
+    reasoning as the three fields above, and bound to ``extraction`` by the
+    validator below: present exactly when this node carries an extraction,
+    absent otherwise. A node with no extracted text has no verification story
+    this system can honestly state, and inventing one would be exactly the
+    unearned provenance the surrounding validators exist to prevent."""
+
+    @model_validator(mode="after")
+    def _validate_verification_binds_to_extraction(self) -> SourceNode:
+        """``verification`` must be present exactly when ``extraction`` is.
+
+        The two directions fail differently, so they are reported differently.
+        A node carrying a :class:`SourceVerification` but no extraction is
+        claiming an ``extracted_text`` tier for text it does not have -- the
+        same unearned-provenance failure as a ``glyph_health`` assessment with
+        nothing to attribute it to. A node carrying an extraction but no
+        verification is the more dangerous direction: it is the envelope that
+        grounds against real text while declining to say what was checked
+        about it, which is precisely the "verified means whatever the reader
+        assumes" ambiguity this field was added to remove.
+        """
+        has_extraction = not isinstance(self.extraction, Absent)
+        has_verification = not isinstance(self.verification, Absent)
+        if has_verification and not has_extraction:
+            raise ValueError(
+                f"node {self.node_id!r} carries a SourceVerification but no extraction binding "
+                "(extraction is Absent); a verification record states what was checked about this "
+                "node's extracted text, and there is no extracted text here to have checked"
+            )
+        if has_extraction and not has_verification:
+            raise ValueError(
+                f"node {self.node_id!r} carries an extraction binding but no SourceVerification "
+                "(verification is Absent); an envelope that grounds against extracted text must state "
+                "tier by tier what was actually verified about it, or 'verified' means only whatever "
+                "the reader assumes"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_origin_only_for_si_member(self) -> SourceNode:
@@ -897,6 +1044,19 @@ class SourceNode(BaseModel):
                 f"node {self.node_id!r} has kind={self.kind.value!r}, which has no extracted text for a "
                 "glyph-health assessment to describe -- glyph_health must be "
                 f"Absent(reason=AbsenceReason.NOT_APPLICABLE), not {self.glyph_health!r}"
+            )
+        if not isinstance(self.verification, Absent) or self.verification.reason != AbsenceReason.NOT_APPLICABLE:
+            # Folded in for the same reason as glyph_health above, and it pins the
+            # same distinction: the iff-rule in
+            # `_validate_verification_binds_to_extraction` already forces a crop's
+            # `verification` to be SOME Absent (because its extraction is), so all
+            # this validator decides is WHICH AbsenceReason -- and for an image
+            # region NOT_EXTRACTED_YET would be a false promise that a verification
+            # story could arrive later. It never can; there is no text to verify.
+            raise ValueError(
+                f"node {self.node_id!r} has kind={self.kind.value!r}, which has no extracted text for a "
+                "verification record to describe -- verification must be "
+                f"Absent(reason=AbsenceReason.NOT_APPLICABLE), not {self.verification!r}"
             )
         return self
 
@@ -3377,6 +3537,14 @@ def _glyph_health_assessment_identity_payload(assessment: GlyphHealthAssessment)
     }
 
 
+def _source_verification_identity_payload(verification: SourceVerification) -> dict[str, Any]:
+    return {
+        "raw_artifact": verification.raw_artifact.value,
+        "extracted_text": verification.extracted_text.value,
+        "root_sidecar": verification.root_sidecar.value,
+    }
+
+
 def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
     return {
         "node_id": node.node_id,
@@ -3386,6 +3554,12 @@ def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
         "origin": _project_maybe(node.origin, _archive_origin_identity_payload),
         "extraction": _project_maybe(node.extraction, _extraction_binding_identity_payload),
         "glyph_health": _project_maybe(node.glyph_health, _glyph_health_assessment_identity_payload),
+        # Folded into the address on purpose: an envelope's content address must
+        # COMMIT to the verification standard it claims. Left out, a record-only
+        # envelope and a fully root-verified one would address identically, and the
+        # claim could be swapped for free without breaking the address that is
+        # supposed to authenticate it.
+        "verification": _project_maybe(node.verification, _source_verification_identity_payload),
     }
 
 

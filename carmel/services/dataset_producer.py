@@ -59,7 +59,6 @@ something this vertical slice attempts.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -77,9 +76,12 @@ from carmel.schemas.datasets import (
     DataPoint,
     DatasetEnvelope,
     EmbeddedConversionTable,
+    ExtractedTextVerification,
     ExtractionBinding,
     MeasuredValue,
     Observation,
+    RawArtifactVerification,
+    RootSidecarVerification,
     SemanticDependencyUse,
     Series,
     SourceForm,
@@ -87,6 +89,7 @@ from carmel.schemas.datasets import (
     SourceNode,
     SourceNodeKind,
     SourceRef,
+    SourceVerification,
     TextSpace,
     ValueOrigin,
 )
@@ -96,7 +99,7 @@ from carmel.services.dataset_store import (
     canonical_decimal,
     canonical_json_bytes,
 )
-from carmel.services.evidence import artifact_dir, load_artifact_meta, verify_artifact
+from carmel.services.evidence import artifact_dir, load_artifact_meta
 from carmel.services.extraction_record import (
     _PYPDF_DEPENDENT_EXTRACTORS,
     CurrentSelectionKind,
@@ -131,12 +134,17 @@ __all__ = [
     "produce_envelope_from_artifact",
 ]
 
-_EXTRACTED_NAME = "extracted.json"
-"""Filename of the full ``ExtractedText`` sidecar inside an artifact's
-content-addressed directory. This is the evidence store's PUBLIC on-disk
-contract -- ``carmel.services.evidence``'s module docstring documents the
-layout as exact ("Layout, exactly::") -- not private knowledge duplicated
-here."""
+_RAW_NAME = "raw.bin"
+"""Filename of the stored raw bytes inside an artifact's content-addressed
+directory. This is the evidence store's PUBLIC on-disk contract --
+``carmel.services.evidence``'s module docstring documents the layout as exact
+("Layout, exactly::") -- not private knowledge duplicated here.
+
+An ``_EXTRACTED_NAME = "extracted.json"`` constant used to sit alongside this
+one, naming the ROOT sidecar. It was deleted with its only reader: this module
+no longer opens the root sidecar at any point (see
+:func:`_authenticate_raw_bytes_and_read_source_metadata`), and a constant
+naming a file nothing here reads is an invitation to start reading it again."""
 
 _ROOT_NODE_ID = "paper"
 """The single :class:`SourceNode`'s id in every produced graph. One artifact
@@ -1137,96 +1145,74 @@ _CONTENT_TYPE_TO_NODE_KIND: dict[str, SourceNodeKind] = {
 }
 
 
-def _load_verified_extracted_text(
+def _authenticate_raw_bytes_and_read_source_metadata(
     workspace_root: Path, sha256: str
-) -> tuple[ExtractedText, str, str, bytes]:
-    """Resolve, verify, and parse the stored extraction for ``sha256``.
+) -> tuple[str, RootSidecarVerification]:
+    """Authenticate ``raw.bin`` and read the source metadata this producer needs.
 
-    Returns ``(extracted, extracted_sha256, content_type,
-    raw_bytes)``, where ``raw_bytes`` is the exact, already-verified
-    ``extracted.json`` bytes read from disk -- returned so a caller that needs
-    to re-address this same extraction (e.g. via
-    :func:`carmel.services.extraction_record.store_extraction_record`) can do
-    so without a second, redundant read-and-reverify of the same file.
-    The bytes of ``extracted.json`` are read directly from disk and their digest is
-    compared against ``StoredArtifact.extracted_sha256`` BEFORE any parsing
-    -- unverified bytes are never parsed. (``extracted_sha256`` really is the
-    digest of those file bytes: ``evidence._write_all`` computes it as
-    ``hashlib.sha256(extracted_path.read_bytes()).hexdigest()`` AFTER writing
-    the file, precisely so the recorded digest describes the bytes on disk.)
+    Returns ``(content_type, root_sidecar_claim)``: the artifact's declared
+    content type, and the honest :class:`RootSidecarVerification` claim to
+    record on the produced node.
 
-    Artifact resolution goes through :func:`carmel.services.evidence.load_artifact_meta`
-    (added alongside this module): a direct by-sha lookup with the read
-    path's sha-shape/containment validation. The alternative --
-    ``list_artifacts()`` and filter -- is O(store size) per call, silently
-    skips artifacts whose ``meta.json`` is unreadable (so "absent" and
-    "present but corrupt" become indistinguishable), and validates nothing
-    about the caller-supplied sha string.
+    This REPLACED ``_load_verified_extracted_text``, which loaded, verified and
+    parsed the ROOT ``extracted.json`` sidecar. That helper's three legacy
+    carve-outs -- refusing an artifact whose ``meta.extracted_sha256`` or
+    ``derivation_binding`` is ``None`` -- were preconditions on evidence this
+    producer no longer uses for anything. Since the producer began grounding
+    against a genuinely stored extraction record (see
+    :func:`produce_envelope_from_artifact`), the root sidecar has not been an
+    input to production at all: the grounded text, the ``ExtractionBinding``,
+    and every digest carried into the envelope come from the record. What the
+    root refusals actually did was block dataset production entirely for every
+    artifact stored before those fields existed -- permanently, since
+    ``reextract`` writes only under ``extractions/`` and NEVER rewrites a root
+    sidecar. That is the whole real corpus: all 8 papers predate both fields.
 
-    P1-B: before this function existed, the producer verified ONLY
-    ``extracted.json`` (below) -- ``raw.bin`` and ``meta.json`` were never
-    checked at all. Several checks close that gap, each refusing with a
-    message naming exactly which one failed:
+    So the checks below are exactly the ones whose results this producer can
+    honestly assert, and no others:
 
-    1. ``meta.sha256 == sha256``: ``load_artifact_meta`` resolves the store
-       directory purely from the ``sha256`` PARAMETER (via its own
-       sha-shape/containment validation) and does NOT cross-check that
-       parameter against the ``sha256`` FIELD recorded inside the loaded
-       ``meta.json`` -- so a ``meta.json`` whose ``sha256`` field disagrees
-       with the directory it lives in (e.g. hand-edited or copied from
-       elsewhere) would otherwise go undetected.
-    2. round-36: :func:`~carmel.services.evidence.verify_artifact` with
-       ``deep=False`` -- runs BEFORE the legacy carve-outs in step 3, on
-       purpose. An artifact that is both legacy (predates
-       ``extracted_sha256``/``derivation_binding``) AND corrupt (``raw.bin``
-       no longer hashes to ``sha256``, or its sidecar no longer matches its
-       recorded digest) must be refused as CORRUPT, not waved through to a
-       legacy carve-out whose message reads as routine and names the wrong
-       problem. Checking shallow integrity first, before either carve-out
-       runs, is what makes that ordering guarantee hold.
-    3. Two legacy carve-outs, each refused with its own named cause rather
-       than falling through to the generic ``verify_artifact`` failure above
-       (which would otherwise report the same message for both, and for
-       every other kind of corruption besides): an artifact that predates
-       ``extracted_sha256`` (its sidecar can never be verified at all), and
-       one that predates ``derivation_binding`` but does carry
-       ``extracted_sha256``. round-36: this carve-out's raise means
-       :func:`produce_envelope_from_artifact` is never even reached for such
-       an artifact -- every path that would otherwise let a legacy artifact
-       through raises first, right here.
-    4. :func:`carmel.services.evidence.verify_artifact` with ``deep=True``:
-       confirms ``raw.bin`` exists and hashes to ``sha256`` (the parameter),
-       that ``extracted.json`` matches its recorded digest (the same check
-       performed by hand below, but this call also covers ``raw.bin``, which
-       nothing here otherwise touches), and -- because every artifact reaching
-       this call already carries a non-``None`` ``extracted_sha256`` and
-       ``derivation_binding`` (checks 2 above ran first) -- that the recorded
-       ``derivation_binding`` is internally consistent: recomputed from
-       ``meta.json``'s own ``extractor_version``/``sha256``/``extracted_sha256``
-       fields, it still matches the recorded value. ``derivation_binding`` is
-       NOT carried into the produced envelope (the envelope's
-       ``ExtractionBinding`` authenticates the extraction-record store's own
-       identity fields instead -- see ``produce_envelope_from_artifact``
-       below); this deep check remains purely as an integrity gate on the
-       legacy evidence store this producer reads its input from.
+    1. ``load_artifact_meta`` resolves the store directory from the ``sha256``
+       PARAMETER, and does not cross-check it against the ``sha256`` FIELD
+       inside the loaded ``meta.json``. That field is cross-checked here, as a
+       METADATA sanity check rather than as verification: a ``meta.json``
+       disagreeing with the directory it lives in is not a trustworthy source
+       of ``content_type`` either, whatever else may be wrong with it.
+    2. ``raw.bin`` is re-read and re-hashed against ``sha256``. This is a
+       RAW-ONLY check, deliberately not
+       :func:`~carmel.services.evidence.verify_artifact` even at
+       ``deep=False``: that function ALSO requires ``meta.json`` to load and
+       the root sidecar to match its recorded digest when one exists, so its
+       ``bool`` result would fold a root-tier fact into a claim this node
+       records as raw-tier. (For the legacy corpus specifically, ``deep=False``
+       happens to reduce to almost this same check, because
+       ``_extracted_sidecar_intact`` returns True unconditionally when
+       ``extracted_sha256`` is ``None`` -- but relying on that coincidence would
+       make the recorded claim accidentally true rather than true by
+       construction, and it would silently become false for a non-legacy
+       artifact.)
 
-       Read exactly what this buys, and no more -- quoting
-       :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding`'s
-       own caveat: it proves only INTERNAL CONSISTENCY of the ``meta.json``
-       record -- that ``extracted_sha256`` was not changed independently of
-       ``derivation_binding`` after the two were bound together at store
-       time. It is NOT proof that ``extracted.json`` was actually re-derived
-       from ``raw.bin``, and it is no defence against a forger who swaps the
-       sidecar AND updates ``extracted_sha256`` AND recomputes
-       ``derivation_binding`` to match, all together, consistently -- that
-       forgery passes every check here undetected.
+    ``meta.json`` is read here ONLY for ``content_type``. It is source
+    metadata, not evidence, and nothing derived from it is authenticated by
+    anything -- which is precisely why the returned claim says the root sidecar
+    was ``NOT_CHECKED`` rather than letting a reader infer that loading
+    ``meta.json`` verified something about it.
 
-       Because :func:`verify_artifact` returns a plain ``bool`` with no record
-       of which of its internal checks failed, a ``False`` here cannot be
-       narrated as one specific cause: it might be ``raw.bin`` missing or not
-       hashing to ``sha256``, ``extracted.json`` not matching its recorded
-       digest, or a stale/inconsistent ``derivation_binding`` -- the refusal
-       message below says so honestly rather than guessing.
+    Args:
+        workspace_root: Root of the campaign workspace.
+        sha256: Raw-bytes sha256 of the stored artifact.
+
+    Returns:
+        The artifact's ``content_type``, and the
+        :class:`RootSidecarVerification` claim that honestly describes what
+        this function established about the root sidecar --
+        ``NO_RECORDED_DIGEST`` when the artifact predates ``extracted_sha256``
+        (so its sidecar can never be authenticated by anyone), ``NOT_CHECKED``
+        when a digest exists but this producer deliberately did not check it.
+
+    Raises:
+        DatasetProducerError: The artifact is absent, its ``meta.json``
+            disagrees with the directory it lives in, or ``raw.bin`` is
+            missing/unreadable or no longer hashes to ``sha256``.
     """
     meta = load_artifact_meta(workspace_root, sha256)
     if meta is None:
@@ -1238,68 +1224,30 @@ def _load_verified_extracted_text(
             f"artifact meta.json at sha256 {sha256!r} records sha256={meta.sha256!r} internally -- "
             "the two disagree, so this evidence directory is not trustworthy; refusing to use it"
         )
-    if not verify_artifact(workspace_root, sha256, deep=False):
-        # round-36: this shallow integrity check MUST run before the legacy
-        # carve-outs below. An artifact that is BOTH legacy (predates
-        # extracted_sha256/derivation_binding) AND corrupt (raw.bin no longer
-        # hashes to sha256, or its sidecar no longer matches its recorded
-        # digest) used to reach a legacy carve-out first and be refused with a
-        # "predates ..." message that named the wrong problem -- masking a
-        # real integrity failure behind a message that reads as routine
-        # legacy handling. Checking integrity first ensures corruption is
-        # always named as corruption, on legacy artifacts included.
-        raise DatasetProducerError(
-            f"artifact {sha256!r} failed integrity verification (raw.bin missing, its bytes not "
-            "hashing to sha256, meta.json unreadable, or extracted.json not matching its recorded "
-            "digest -- verify_artifact reports only a plain bool, not which check failed); refusing "
-            "to use unverified bytes"
-        )
-    if meta.extracted_sha256 is None:
-        # A legacy artifact stored before extracted_sha256 existed carries no
-        # digest for its sidecar, so its extracted.json cannot be verified at
-        # all -- and this producer never parses unverified bytes. Checked
-        # before verify_artifact(deep=True) below: that call fails closed for
-        # this same artifact too, but with no way to say why.
-        raise DatasetProducerError(
-            f"artifact {sha256!r} predates extracted_sha256 and its extracted.json cannot be "
-            "verified; refusing to parse unverified bytes"
-        )
-    if meta.derivation_binding is None:
-        # A legacy artifact stored before derivation_binding existed (but
-        # after extracted_sha256 did) has a verifiable sidecar yet nothing to
-        # deep-verify -- also checked before verify_artifact(deep=True),
-        # which would otherwise fail this artifact for the same underlying
-        # reason as a genuinely stale binding, indistinguishably.
-        raise DatasetProducerError(
-            f"artifact {sha256!r} predates derivation_binding and its extractor identity cannot be "
-            "bound to its extracted bytes; refusing to carry an unverifiable binding forward"
-        )
-    if not verify_artifact(workspace_root, sha256, deep=True):
-        raise DatasetProducerError(
-            f"artifact {sha256!r} failed verify_artifact (raw.bin digest, meta.json, extracted.json "
-            "digest, or derivation_binding consistency -- verify_artifact reports only a plain bool, "
-            "not which check failed); refusing to use unverified bytes"
-        )
-    extracted_path = artifact_dir(workspace_root, sha256) / _EXTRACTED_NAME
+    raw_path = artifact_dir(workspace_root, sha256) / _RAW_NAME
     try:
-        raw_bytes = extracted_path.read_bytes()
+        raw_artifact_bytes = raw_path.read_bytes()
     except OSError as exc:  # FileNotFoundError is an OSError subclass
         raise DatasetProducerError(
-            f"artifact {sha256!r} has no readable {_EXTRACTED_NAME}: {exc}"
+            f"artifact {sha256!r} has no readable {_RAW_NAME}: {exc}"
         ) from exc
-    actual_digest = hashlib.sha256(raw_bytes).hexdigest()
-    if actual_digest != meta.extracted_sha256:
+    actual_raw_sha256 = hashlib.sha256(raw_artifact_bytes).hexdigest()
+    if actual_raw_sha256 != sha256:
         raise DatasetProducerError(
-            f"artifact {sha256!r}: {_EXTRACTED_NAME} bytes on disk hash to {actual_digest!r}, not the "
-            f"recorded extracted_sha256 {meta.extracted_sha256!r}; refusing to parse unverified bytes"
+            f"artifact {sha256!r}: {_RAW_NAME} bytes on disk hash to {actual_raw_sha256!r}, not the "
+            f"sha256 they are stored under; the evidence store's raw bytes have been tampered with "
+            "or corrupted, and no envelope may name them"
         )
-    try:
-        extracted = ExtractedText.model_validate(json.loads(raw_bytes))
-    except ValueError as exc:
-        raise DatasetProducerError(
-            f"artifact {sha256!r}: verified {_EXTRACTED_NAME} bytes do not parse as an ExtractedText: {exc}"
-        ) from exc
-    return extracted, meta.extracted_sha256, meta.content_type, raw_bytes
+    root_sidecar_claim = (
+        # "Nobody can ever authenticate this sidecar" and "this producer chose
+        # not to look" are different facts and must not collapse into one
+        # value -- the same inability-vs-choice conflation this codebase has
+        # already fixed twice on the acquisition side.
+        RootSidecarVerification.NO_RECORDED_DIGEST
+        if meta.extracted_sha256 is None
+        else RootSidecarVerification.NOT_CHECKED
+    )
+    return meta.content_type, root_sidecar_claim
 
 
 def produce_envelope_from_artifact(
@@ -1312,10 +1260,11 @@ def produce_envelope_from_artifact(
 ) -> DatasetEnvelope:
     """Build a fully validated :class:`DatasetEnvelope` from ONE stored artifact.
 
-    The vertical slice, end to end: resolve the artifact's metadata by its
-    raw-bytes sha256, verify ``raw.bin``/``meta.json``/``extracted.json``
-    (see :func:`_load_verified_extracted_text`), parse the verified
-    extraction, ground every caller-stated quote in the extracted text via
+    The vertical slice, end to end: authenticate ``raw.bin`` against the
+    artifact's own sha256 and read its ``content_type`` (see
+    :func:`_authenticate_raw_bytes_and_read_source_metadata`), select the one
+    CURRENT extraction record and take the grounded text from it, ground every
+    caller-stated quote in that text via
     :func:`ground_quote`, and assemble one root node -- ``PAPER_PDF`` or
     ``JATS_XML``, derived honestly from the artifact's own ``content_type``
     (never hardcoded; an unrecognised ``content_type`` is refused, not
@@ -1374,8 +1323,8 @@ def produce_envelope_from_artifact(
                 "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
             )
 
-    _root_extracted, extracted_sha256, content_type, _extracted_json_bytes = (
-        _load_verified_extracted_text(workspace_root, sha256)
+    content_type, root_sidecar_claim = _authenticate_raw_bytes_and_read_source_metadata(
+        workspace_root, sha256
     )
     # The text this envelope grounds against must come from a genuinely stored
     # extraction record, never from the root sidecar.
@@ -1488,6 +1437,19 @@ def produce_envelope_from_artifact(
         origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         extraction=binding,
         glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        # Each tier states what this function ACTUALLY established, and nothing
+        # more. The first two are constants here because the alternative to
+        # either one is a refusal several lines above, not a weaker envelope:
+        # unauthenticated raw bytes and a non-current record both abort
+        # production outright. Only the root-sidecar tier varies, and it is the
+        # one a reader would otherwise get wrong -- see
+        # `_authenticate_raw_bytes_and_read_source_metadata` for why the root
+        # sidecar is not an input to production at all.
+        verification=SourceVerification(
+            raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
+            extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
+            root_sidecar=root_sidecar_claim,
+        ),
     )
     graph = SourceGraph(nodes=(root_node,))
 

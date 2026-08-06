@@ -28,11 +28,15 @@ from carmel.schemas.datasets import (
     DataPoint,
     DatasetEnvelope,
     EmbeddedConversionTable,
+    ExtractedTextVerification,
+    ExtractionBinding,
     Maybe,
     MeasuredValue,
     MemberSheetKey,
     Observation,
     QuantityKind,
+    RawArtifactVerification,
+    RootSidecarVerification,
     SemanticDependencyUse,
     Series,
     SourceForm,
@@ -40,6 +44,7 @@ from carmel.schemas.datasets import (
     SourceNode,
     SourceNodeKind,
     SourceRef,
+    SourceVerification,
     TableCellLocator,
     TableKeyKind,
     Uncertainty,
@@ -53,6 +58,24 @@ from carmel.schemas.datasets import (
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1
+
+
+def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
+    """Mirror ``SourceNode``'s iff-rule: a node carries a verification record
+    exactly when it carries an extraction to have verified, and an absent one
+    keeps the SAME ``AbsenceReason`` (so a FIGURE_CROP's NOT_APPLICABLE stays
+    NOT_APPLICABLE). Deriving it here rather than restating a literal at every
+    construction site keeps these fixtures from drifting out of step with the
+    validator they are meant to exercise -- a fixture that has to be hand-kept
+    consistent with an invariant is a fixture that will eventually contradict
+    it silently."""
+    if isinstance(extraction, Absent):
+        return Absent(reason=extraction.reason)
+    return SourceVerification(
+        raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
+        extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
+        root_sidecar=RootSidecarVerification.NOT_CHECKED,
+    )
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -117,6 +140,7 @@ def _node(
         origin=_NO_ORIGIN,
         extraction=_NO_EXTRACTION_CROP if is_crop else _NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH_CROP if is_crop else _NO_GLYPH_HEALTH,
+        verification=_verification_for(_NO_EXTRACTION_CROP if is_crop else _NO_EXTRACTION),
     )
 
 

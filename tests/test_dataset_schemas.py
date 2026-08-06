@@ -26,15 +26,19 @@ from carmel.schemas.datasets import (
     CompositionResolution,
     CoordinateFrame,
     EmbeddedConversionTable,
+    ExtractedTextVerification,
     ExtractionBinding,
     GlyphHealthAssessment,
     Maybe,
     MeasuredValue,
     QuantityKind,
+    RawArtifactVerification,
+    RootSidecarVerification,
     SemanticDependencyUse,
     SourceNode,
     SourceNodeKind,
     SourceRef,
+    SourceVerification,
     TableCellLocator,
     TextSpace,
     Uncertainty,
@@ -55,6 +59,24 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1
+
+
+def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
+    """Mirror ``SourceNode``'s iff-rule: a node carries a verification record
+    exactly when it carries an extraction to have verified, and an absent one
+    keeps the SAME ``AbsenceReason`` (so a FIGURE_CROP's NOT_APPLICABLE stays
+    NOT_APPLICABLE). Deriving it here rather than restating a literal at every
+    construction site keeps these fixtures from drifting out of step with the
+    validator they are meant to exercise -- a fixture that has to be hand-kept
+    consistent with an invariant is a fixture that will eventually contradict
+    it silently."""
+    if isinstance(extraction, Absent):
+        return Absent(reason=extraction.reason)
+    return SourceVerification(
+        raw_artifact=RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED,
+        extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
+        root_sidecar=RootSidecarVerification.NOT_CHECKED,
+    )
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -179,6 +201,7 @@ def _node(
         origin=origin,
         extraction=extraction,
         glyph_health=glyph_health,
+        verification=_verification_for(extraction),
     )
 
 
@@ -484,6 +507,7 @@ class TestSourceGraph:
                 origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
                 extraction=_NO_EXTRACTION,
                 glyph_health=_NO_GLYPH_HEALTH,
+                verification=_verification_for(_NO_EXTRACTION),
             )
 
     def test_source_node_rejects_trailing_newline_in_sha256(self) -> None:
@@ -511,6 +535,7 @@ class TestSourceGraph:
             origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
+            verification=_verification_for(_NO_EXTRACTION),
         )
         assert member.parent_node_id == "paper"
 
@@ -527,6 +552,7 @@ class TestSourceGraph:
             origin=ArchiveOrigin(archive_sha256=SHA_A, member_display_path="data/table1.csv"),
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
+            verification=_verification_for(_NO_EXTRACTION),
         )
         assert isinstance(member.origin, ArchiveOrigin)
         assert member.origin.archive_sha256 == SHA_A
@@ -544,6 +570,7 @@ class TestSourceGraph:
                 origin=ArchiveOrigin(archive_sha256=SHA_B),
                 extraction=_NO_EXTRACTION,
                 glyph_health=_NO_GLYPH_HEALTH,
+                verification=_verification_for(_NO_EXTRACTION),
             )
 
     def test_extraction_binding_rejects_bad_hex(self) -> None:
@@ -682,6 +709,7 @@ class TestSourceGraph:
                 origin=_NO_ORIGIN,
                 extraction=_extraction_binding(parent_raw_sha256=SHA_B),
                 glyph_health=_NO_GLYPH_HEALTH,
+                verification=_verification_for(_extraction_binding(parent_raw_sha256=SHA_B)),
             )
 
     def test_glyph_health_assessment_rejects_wrong_dependency_id(self) -> None:
