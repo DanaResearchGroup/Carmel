@@ -150,6 +150,8 @@ __all__ = [
     "UncertaintyBasis",
     "UncertaintyKind",
     "UncertaintyScale",
+    "UnextractedConditionStatement",
+    "UnextractedReason",
     "ValueOrigin",
     "XPathLocator",
     "iter_measured_values",
@@ -3323,6 +3325,131 @@ class GroundedCategoricalClaim(BaseModel):
     @classmethod
     def _validate_claim_id(cls, value: str) -> str:
         return _require_identifier(value, field_name="claim_id")
+
+
+class UnextractedReason(StrEnum):
+    """Why a located condition statement did NOT become a
+    :class:`GroundedScalarClaim` or :class:`GroundedCategoricalClaim`.
+
+    This is a THIRD vocabulary, distinct from and never to be conflated with
+    this project's two existing failure vocabularies. ``FAILED`` means a
+    check RAN and the artifact was lost. ``UNVERIFIABLE`` means the check
+    could NOT run at all. Neither applies here: a member of this enum means
+    the statement was located SUCCESSFULLY -- the extractor found it, and can
+    say exactly where -- and is simply outside what the claim models can
+    currently represent. A scope boundary, not a defect.
+
+    ``AbsenceReason`` was deliberately NOT reused for this. ``AbsenceReason``
+    answers "why is this FIELD missing" -- a fact about a field on an
+    already-existing record. This enum answers "why did a LOCATED STATEMENT
+    not become a claim" -- a fact about an extraction decision made before
+    any record with fields even existed. Overloading one enum to answer both
+    questions would blur two different kinds of fact into one vocabulary,
+    exactly the conflation ``AbsenceReason``'s own docstring warns against
+    for its own members.
+    """
+
+    MULTI_VALUED_SWEEP = "multi_valued_sweep"
+    """The statement gives several discrete values for one quantity (a list,
+    e.g. "0.6, 1.2 and 2.0")."""
+
+    VALUE_RANGE = "value_range"
+    """The statement gives an interval rather than a value (e.g. "0.4 to
+    5.0")."""
+
+    ONE_SIDED_BOUND = "one_sided_bound"
+    """The statement constrains the quantity with an inequality rather than
+    stating it (e.g. "Re < 2000")."""
+
+    QUALITATIVE_ONLY = "qualitative_only"
+    """The statement names a condition with no number at all (e.g.
+    "atmospheric pressure", "ambient temperature")."""
+
+    COMPOSITE_VALUE = "composite_value"
+    """The statement gives a tuple/ratio that loses meaning if split into
+    scalars (e.g. a three-component blend ratio)."""
+
+    ATTRIBUTION_UNCLEAR = "attribution_unclear"
+    """A single value, located, but it could not be established that it
+    belongs to THIS experiment rather than to a simulation or to a cited
+    third party.
+
+    The odd member out: the other five are shape facts about the statement
+    itself (is it a list, a range, a bound, ...); this one is instead a fact
+    about the EXTRACTOR'S CONFIDENCE in attribution. Included because the
+    probe found simulation conditions, cited third-party conditions, and
+    own-experiment conditions are not separable by wording alone -- one paper
+    in the corpus writes "the initial temperature was set to 298 K and
+    initial pressure was fixed at 1 atm" about a CHEMKIN run, with numbers
+    that coincide with its real experimental values stated pages earlier."""
+
+
+class UnextractedConditionStatement(BaseModel):
+    """A record that a condition statement WAS found and located in a source,
+    and was deliberately NOT turned into a claim.
+
+    Exists for coverage honesty. A probe of the eight real corpus papers
+    found that ~70-80% of stated conditions are not single-valued: the
+    equivalence ratio is a range or a list in 8 of 8 papers ("0.4 to 5.0";
+    "0.6, 1.2 and 2.0"), pressure is in 7 of 8 ("1, 5 and 10 atm"),
+    composition is in 8 of 8 -- and some conditions carry no number at all
+    ("atmospheric pressure", "ambient temperature", in 8 of 8 papers, and in
+    one paper that qualitative statement is the ONLY mention of temperature
+    anywhere). Carmel extracts only genuinely single-valued conditions today.
+    Without this type, a dataset that holds three apparatus dimensions and no
+    pressure claim is indistinguishable from one where a pressure sweep was
+    seen and deliberately skipped -- the two look byte-identical, and any
+    coverage number computed from claims alone silently overstates itself in
+    exactly the cases where real coverage is worst.
+
+    ``statement_ref`` is required and never :class:`Maybe`, for the same
+    reason ``label_ref``/``value_ref`` are required on
+    :class:`GroundedScalarClaim`: a refusal that does not say WHERE the
+    refused statement lives is indistinguishable from a guess. This is what
+    makes the record auditable -- a human, or a later extraction pass, can go
+    look at the exact span this type declined to turn into a claim.
+
+    Deliberately holds NO parsed contents of the statement -- no range
+    endpoints, no list members, no inequality operator. Parsing a sweep into
+    its endpoints is most of the actual work of SUPPORTING sweeps as claims,
+    which is exactly what this narrow slice defers; a half-parsed record here
+    would be scope creep wearing a refusal's clothes. This type holds the
+    span, not the contents.
+
+    **What this type does NOT prove, stated plainly rather than implied:**
+    that ``reason`` is the CORRECT classification of the statement. This
+    model records a decision the extractor already made; it cannot check
+    that decision itself, because checking would require the document, and
+    an element model holds no document. A record whose ``reason`` is
+    ``VALUE_RANGE`` but whose statement is actually a single value still
+    constructs here -- the real check for that lives upstream, in whatever
+    process assigned the reason in the first place.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    statement_id: str
+    label_raw: str = Field(min_length=1)
+    """The name the SOURCE gives the quantity, verbatim -- never a normalized
+    or invented label."""
+    label_ref: SourceRef
+    """Provenance for the LABEL. Plain, never :class:`Maybe`: an ungrounded
+    label is not a weaker record to keep honestly, it is no record at all."""
+    statement_ref: SourceRef
+    """Provenance for the LOCATED STATEMENT itself. Plain, never
+    :class:`Maybe`: this is what makes the record auditable -- a refusal
+    that doesn't say WHERE is indistinguishable from a guess."""
+    reason: UnextractedReason
+    quantity_kind: Maybe[QuantityKind]
+    """What quantity the statement appears to concern, where the extractor
+    could tell. Honestly ``Absent`` when it could not -- a statement whose
+    quantity is itself unclear must still be recordable, not silently
+    dropped."""
+
+    @field_validator("statement_id")
+    @classmethod
+    def _validate_statement_id(cls, value: str) -> str:
+        return _require_identifier(value, field_name="statement_id")
 
 
 class EmbeddedConversionTable(BaseModel):
