@@ -36,6 +36,7 @@ from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
     ReplayReport,
+    SemanticGap,
     UncheckedSemanticClaim,
     UncheckedStoreClaim,
 )
@@ -61,10 +62,12 @@ _A_STORE_CLAIM = UncheckedStoreClaim(
 _A_SEMANTIC_CLAIM = UncheckedSemanticClaim(
     # The DERIVED value, never a slice of the paper: this field has no redaction
     # gate and these reports reach logs.
-    ref_path="attribution_ref",
+    claim_path="attribution",
     claim="ConditionAttribution.OWN_EXPERIMENT",
+    gap=SemanticGap.SUPPORT_UNRECORDED,
     reason="the ref locates a span and that span re-slices, but no recorded text says the "
     "span supports this enum -- grounding proves LOCATION, never MEANING",
+    support_paths=("attribution_ref",),
 )
 
 _A_FAILURE = ReplayFinding(
@@ -277,9 +280,11 @@ class TestEachAxisRefusesTheOtherAxisType:
             reason=_A_STORE_CLAIM.reason,
         )
         embellished_semantic = EmbellishedSemanticClaim(
-            ref_path=_A_SEMANTIC_CLAIM.ref_path,
+            claim_path=_A_SEMANTIC_CLAIM.claim_path,
             claim=_A_SEMANTIC_CLAIM.claim,
+            gap=_A_SEMANTIC_CLAIM.gap,
             reason=_A_SEMANTIC_CLAIM.reason,
+            support_paths=_A_SEMANTIC_CLAIM.support_paths,
         )
 
         with pytest.raises(ValueError, match=r"unchecked_store_claims\[0\]"):
@@ -319,3 +324,132 @@ class TestTheFreezeReachesBothLists:
         # already went out the door would have changed underneath its reader.
         assert report.overall_outcome is ReplayOutcome.VERIFIED
         assert report.unchecked_semantic_claims == ()
+
+
+class TestUncheckedSemanticClaimRefusesAnIncoherentClaim:
+    """``__post_init__`` guards the fields this type's whole story rests on.
+
+    A claim with a blank path, a gap that is not really a ``SemanticGap``, or
+    ``support_paths`` that disagree with what the gap says was offered would
+    still satisfy every OTHER check in this module -- the axis guards above
+    only ask "is this the right type", never "does this instance make sense".
+    Nothing but this constructor stands between a caller and a claim that
+    contradicts itself.
+    """
+
+    def test_an_empty_claim_path_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="claim_path"):
+            UncheckedSemanticClaim(
+                claim_path="",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=("attribution_ref",),
+            )
+
+    def test_a_whitespace_only_claim_path_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="claim_path"):
+            UncheckedSemanticClaim(
+                claim_path="   ",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=("attribution_ref",),
+            )
+
+    def test_an_empty_claim_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="claim"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=("attribution_ref",),
+            )
+
+    def test_a_whitespace_only_claim_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="claim"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="   ",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=("attribution_ref",),
+            )
+
+    def test_a_plain_string_gap_is_refused(self) -> None:
+        """``SemanticGap`` has members, so Python forbids subclassing it --
+        the dangerous look-alike here is not a subclass but a plain string
+        that happens to equal one of its values."""
+        with pytest.raises(ValueError, match="gap must be exactly a SemanticGap"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap="support_unrecorded",  # type: ignore[arg-type]
+                reason="test",
+                support_paths=("attribution_ref",),
+            )
+
+    def test_a_list_of_support_paths_is_normalised_to_a_tuple(self) -> None:
+        """``frozen=True`` stops the field being rebound, not the object it
+        names -- the same normalisation ``ReplayReport`` applies to its own
+        list fields, here for the same reason."""
+        claim = UncheckedSemanticClaim(
+            claim_path="attribution",
+            claim="ConditionAttribution.OWN_EXPERIMENT",
+            gap=SemanticGap.SUPPORT_UNRECORDED,
+            reason="test",
+            support_paths=["attribution_ref"],  # type: ignore[arg-type]
+        )
+
+        assert claim.support_paths == ("attribution_ref",)
+        assert isinstance(claim.support_paths, tuple)
+
+    def test_a_non_string_support_path_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="support_paths"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=(123,),  # type: ignore[arg-type]
+            )
+
+    def test_a_blank_support_path_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="support_paths"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=("   ",),
+            )
+
+    def test_no_support_offered_with_nonempty_support_paths_is_refused(self) -> None:
+        """The gap says nothing was offered, but a ref is listed anyway --
+        a consumer reading only ``gap`` and a consumer reading only
+        ``support_paths`` would disagree about what happened, and nothing
+        would ever notice which one to believe."""
+        with pytest.raises(ValueError, match="NO_SUPPORT_OFFERED"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap=SemanticGap.NO_SUPPORT_OFFERED,
+                reason="test",
+                support_paths=("attribution_ref",),
+            )
+
+    def test_a_gap_that_implies_support_was_offered_with_empty_support_paths_is_refused(
+        self,
+    ) -> None:
+        """The mirror image: the gap says something WAS offered, but no ref
+        is named at all -- equally self-contradictory, and refused for the
+        same reason."""
+        with pytest.raises(ValueError, match="non-empty support_paths"):
+            UncheckedSemanticClaim(
+                claim_path="attribution",
+                claim="ConditionAttribution.OWN_EXPERIMENT",
+                gap=SemanticGap.SUPPORT_UNRECORDED,
+                reason="test",
+                support_paths=(),
+            )

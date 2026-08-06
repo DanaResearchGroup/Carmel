@@ -239,6 +239,7 @@ __all__ = [
     "ReplayFinding",
     "ReplayOutcome",
     "ReplayReport",
+    "SemanticGap",
     "UncheckedSemanticClaim",
     "UncheckedStoreClaim",
     "replay_envelope",
@@ -247,6 +248,32 @@ __all__ = [
     "verify_measured_value_unit_boundary",
     "verify_measured_value_value_boundary",
 ]
+
+
+class SemanticGap(StrEnum):
+    """Which of three states left a semantic claim's support unchecked.
+
+    Not a boolean, on purpose: a consumer must be able to tell "reachable but
+    unexplained" from "not even reachable" from "nothing was ever offered"
+    without parsing prose.
+    """
+
+    SUPPORT_UNRECORDED = "support_unrecorded"
+    """A support ref was resolved and its span re-sliced cleanly, but nothing
+    recorded anywhere says that span MEANS the derived value. This is the
+    ordinary case for a value whose support is a location without a recorded
+    quote beside it."""
+
+    LOCATION_UNRESOLVED = "location_unresolved"
+    """The support ref's span could not be re-sliced at all -- its locator is
+    not a :class:`~carmel.schemas.datasets.CharSpanLocator`, or its node is
+    missing, or that node carries a store-level problem. STRICTLY LESS is
+    known than :attr:`SUPPORT_UNRECORDED`: there, the span was confirmed to
+    exist and only its meaning was untested; here, not even that."""
+
+    NO_SUPPORT_OFFERED = "no_support_offered"
+    """The derived value carries no support ref at all, so there is nothing to
+    resolve and nothing to re-slice."""
 
 
 class ReplayOutcome(StrEnum):
@@ -399,8 +426,10 @@ class UncheckedSemanticClaim:
     it sits in -- see that class for why. Both are refused by the other's list.
     """
 
-    ref_path: str
-    """Where in the envelope the unchecked claim lives."""
+    claim_path: str
+    """Where in the envelope the DERIVED VALUE lives -- never the path of a
+    ref. A derived value may be supported by several refs or by none, so
+    naming this field after one ref was a category error."""
 
     claim: str
     """The DERIVED value whose support went unchecked -- the enum member, unit or
@@ -414,9 +443,68 @@ class UncheckedSemanticClaim:
     and naming that value says everything a reader needs without reproducing a
     single word of the paper."""
 
+    gap: SemanticGap
+    """Which of the three :class:`SemanticGap` states applies."""
+
     reason: str
     """Why the check could not run. Never a disagreement: a disagreement is a
     FAILED :class:`ReplayFinding`, not an unchecked claim."""
+
+    support_paths: tuple[str, ...] = ()
+    """The ref paths OFFERED as support for this claim, in the order the
+    enumeration named them. Empty is meaningful -- it is exactly what
+    :attr:`SemanticGap.NO_SUPPORT_OFFERED` describes. A tuple rather than a
+    single path because a derived value can rest on more than one ref."""
+
+    def __post_init__(self) -> None:
+        if not self.claim_path.strip():
+            raise ValueError(
+                "UncheckedSemanticClaim.claim_path must be non-empty and "
+                "non-blank: it names where the derived value whose support "
+                "went unchecked lives, and a blank path cannot be traced "
+                "back to that value."
+            )
+        if not self.claim.strip():
+            raise ValueError(
+                "UncheckedSemanticClaim.claim must be non-empty and "
+                "non-blank: it names the derived value whose support went "
+                "unchecked, and a blank claim says nothing was even "
+                "attempted to be verified."
+            )
+        if type(self.gap) is not SemanticGap:
+            raise ValueError(
+                "UncheckedSemanticClaim.gap must be exactly a SemanticGap "
+                f"member, got {type(self.gap)!r}: an exact-type check (not "
+                "isinstance) is used because a subclass could carry "
+                "arbitrary added behaviour, and this value decides how a "
+                "consumer reads the claim."
+            )
+        object.__setattr__(self, "support_paths", tuple(self.support_paths))
+        for path in self.support_paths:
+            if type(path) is not str or not path.strip():
+                raise ValueError(
+                    "UncheckedSemanticClaim.support_paths must contain only "
+                    f"non-empty, non-blank str elements, got {path!r}: a "
+                    "bool is a subclass of int and similar look-alikes "
+                    "exist for str, which is why the check is on the exact "
+                    "type."
+                )
+        if self.gap is SemanticGap.NO_SUPPORT_OFFERED:
+            if self.support_paths != ():
+                raise ValueError(
+                    "UncheckedSemanticClaim with gap=NO_SUPPORT_OFFERED "
+                    f"must have empty support_paths, got {self.support_paths!r}: "
+                    "a claim where the gap says nothing was offered but "
+                    "support_paths lists refs anyway is self-contradictory."
+                )
+        else:
+            if self.support_paths == ():
+                raise ValueError(
+                    f"UncheckedSemanticClaim with gap={self.gap!r} must have "
+                    "non-empty support_paths: a claim where the gap says "
+                    "something WAS offered as support but support_paths is "
+                    "empty is self-contradictory."
+                )
 
 
 @dataclass(frozen=True)
@@ -476,6 +564,13 @@ class ReplayReport:
     unqualified name for either axis would re-file the other one under it at
     every call site that was never revisited -- the same defect as the bare
     ``outcome`` this report already removed, one level down."""
+
+    support_only_char_spans: int = 0
+    """Char-span refs that were resolved and re-sliced to confirm the span
+    EXISTS, but which carry no recorded text to compare against, so no quote
+    was matched. Neither "checked" (nothing was verified about content) nor
+    "unchecked" (the location genuinely was resolved) -- collapsing them into
+    either one misreports coverage."""
 
     def __post_init__(self) -> None:
         # `frozen=True` stops the FIELD being rebound; it does nothing about the
@@ -548,13 +643,28 @@ class ReplayReport:
                 f"({self.total_char_spans}) -- a replay cannot check more spans than the "
                 "envelope reaches"
             )
-        expected_unchecked = self.total_char_spans - self.checked_char_spans
+        if self.support_only_char_spans < 0:
+            raise ValueError(
+                f"support_only_char_spans ({self.support_only_char_spans}) cannot be negative "
+                "-- it counts refs that were resolved and re-sliced, so a negative value "
+                "misreports coverage"
+            )
+        if self.checked_char_spans + self.support_only_char_spans > self.total_char_spans:
+            raise ValueError(
+                f"checked_char_spans ({self.checked_char_spans}) + support_only_char_spans "
+                f"({self.support_only_char_spans}) exceeds total_char_spans "
+                f"({self.total_char_spans}) -- a replay cannot have resolved more spans than "
+                "the envelope reaches"
+            )
+        expected_unchecked = (
+            self.total_char_spans - self.checked_char_spans - self.support_only_char_spans
+        )
         if self.unchecked_char_spans != expected_unchecked:
             raise ValueError(
                 f"unchecked_char_spans ({self.unchecked_char_spans}) must be "
-                f"total_char_spans - checked_char_spans ({expected_unchecked}) -- the three "
-                "counts are what make a MIXED result legible, so a set that does not add up "
-                "misreports coverage"
+                f"total_char_spans - checked_char_spans - support_only_char_spans "
+                f"({expected_unchecked}) -- these counts are what make a MIXED result legible, "
+                "so a set that does not add up misreports coverage"
             )
 
     @property

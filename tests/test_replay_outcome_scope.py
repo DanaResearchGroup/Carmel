@@ -27,6 +27,8 @@ from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
     ReplayReport,
+    SemanticGap,
+    UncheckedSemanticClaim,
     UncheckedStoreClaim,
 )
 
@@ -58,6 +60,15 @@ _AN_UNVERIFIABLE = ReplayFinding(
     category=ReplayOutcome.UNVERIFIABLE,
     ref_path="claims[0].value.source_ref",
     reason="the evidence file could not be read",
+)
+
+_A_SEMANTIC_CLAIM = UncheckedSemanticClaim(
+    claim_path="attribution",
+    claim="ConditionAttribution.OWN_EXPERIMENT",
+    gap=SemanticGap.SUPPORT_UNRECORDED,
+    reason="the ref locates a span and that span re-slices, but no recorded text says the "
+    "span supports this enum -- grounding proves LOCATION, never MEANING",
+    support_paths=("attribution_ref",),
 )
 
 
@@ -428,4 +439,121 @@ class TestTheFreezeReachesTheContents:
         claims.clear()
 
         assert report.unchecked_store_claims == (_AN_UNCHECKED_STORE_CLAIM,)
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+
+class TestTheSupportOnlyCounterMustAddUpToo:
+    """``support_only_char_spans`` joins the arithmetic the triple above
+    already enforced, not a separate rule beside it.
+
+    A span that was resolved and re-sliced to confirm it EXISTS but carries no
+    recorded text to compare against is neither "checked" (nothing about its
+    content was verified) nor "unchecked" (the location genuinely was
+    resolved) -- so it gets its own count, and that count has to reconcile
+    with the other two exactly the way they already reconcile with each
+    other.
+    """
+
+    def test_a_negative_support_only_count_is_refused(self) -> None:
+        # unchecked_char_spans is set to what the (broken) arithmetic would
+        # actually demand here -- 3 - 1 - (-1) = 3 -- so this raises ONLY if
+        # the negative-count guard itself fires, not as a side effect of the
+        # arithmetic check catching a mismatch it was never aimed at.
+        with pytest.raises(ValueError, match="cannot be negative"):
+            ReplayReport(
+                checked_char_spans=1,
+                total_char_spans=3,
+                unchecked_char_spans=3,
+                support_only_char_spans=-1,
+            )
+
+    def test_checked_plus_support_only_exceeding_total_is_refused(self) -> None:
+        # 2 checked + 2 support-only = 4, but only 3 spans are reachable at
+        # all -- a replay cannot have resolved more spans than the envelope
+        # reaches, however they were resolved. The match phrase is the one
+        # unique to THIS check: the sibling "checked_char_spans exceeds
+        # total_char_spans" check phrases it as "cannot CHECK more spans",
+        # and the arithmetic-invariant check below also happens to mention
+        # "support_only_char_spans" in its own message, so a looser match
+        # would pass even with this guard disabled.
+        with pytest.raises(ValueError, match="resolved more spans than"):
+            ReplayReport(
+                checked_char_spans=2,
+                total_char_spans=3,
+                unchecked_char_spans=0,
+                support_only_char_spans=2,
+            )
+
+    def test_unchecked_char_spans_must_account_for_support_only_too(self) -> None:
+        # total=5, checked=1, support_only=2 -> unchecked must be 2, not 1.
+        with pytest.raises(ValueError, match="unchecked_char_spans"):
+            ReplayReport(
+                checked_char_spans=1,
+                total_char_spans=5,
+                unchecked_char_spans=1,
+                support_only_char_spans=2,
+            )
+
+    def test_a_report_that_partitions_correctly_with_support_only_spans_is_accepted(
+        self,
+    ) -> None:
+        report = ReplayReport(
+            checked_char_spans=2,
+            total_char_spans=5,
+            unchecked_char_spans=2,
+            support_only_char_spans=1,
+        )
+
+        assert report.support_only_char_spans == 1
+
+
+class TestSupportOnlySpansDoNotForceTheEvidenceVerdictUnverifiable:
+    """The behaviour the third counter exists for.
+
+    Before this counter existed, a support-only span had nowhere to live but
+    ``unchecked_char_spans``, and ``evidence_outcome`` reads that count with no
+    way to tell "resolved but nothing to compare" from "never checked at
+    all" -- so a report where every quote-checkable span matched could still
+    never say VERIFIED about the evidence, because a span outside the
+    grounding-pair story dragged the verdict down with it.
+    """
+
+    def test_support_only_spans_do_not_stop_the_evidence_verdict_from_verifying(
+        self,
+    ) -> None:
+        report = _clean_report(
+            checked_char_spans=2,
+            total_char_spans=3,
+            unchecked_char_spans=0,
+            support_only_char_spans=1,
+            unchecked_semantic_claims=(_A_SEMANTIC_CLAIM,),
+        )
+
+        # Every quote-checkable span matched, so the evidence really did
+        # verify -- the support-only span and the semantic claim are both
+        # real gaps, but neither one is a disagreement in the DATA.
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        # The report as a whole still cannot claim it: a semantic claim
+        # about MEANING was left unchecked, and that is exactly what
+        # overall_outcome exists to surface.
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+    def test_all_support_only_spans_with_nothing_quote_checked_stays_unverifiable(
+        self,
+    ) -> None:
+        """The zero-span rule survives the new counter, deliberately.
+
+        Every reachable span here was resolved, but NONE of them was ever
+        compared against a recorded quote -- ``checked_char_spans`` is 0, so
+        nothing was established about content and the evidence verdict must
+        say so, however many spans were merely confirmed to exist.
+        """
+        report = ReplayReport(
+            checked_char_spans=0,
+            total_char_spans=2,
+            unchecked_char_spans=0,
+            support_only_char_spans=2,
+        )
+
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
