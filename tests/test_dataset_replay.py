@@ -200,10 +200,10 @@ class TestReplayEnvelopeCleanRoundTrip:
     def test_replay_verifies_clean_round_trip(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         report = replay_envelope(tmp_path, loaded)
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.VERIFIED
         assert report.checked_char_spans == 6
-        assert report.failures == ()
-        assert report.unverifiable == ()
+        assert report.evidence_failures == ()
+        assert report.evidence_unverifiable == ()
 
 
 class TestReplayEnvelopeCatchesMutation:
@@ -225,7 +225,7 @@ class TestReplayEnvelopeCatchesMutation:
         loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
 
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.outcome is ReplayOutcome.VERIFIED
+        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
 
         # Corrupt the stored evidence *underneath the same sha256 node the
         # envelope already points at* is not representable (the store is
@@ -259,8 +259,11 @@ class TestReplayEnvelopeCatchesMutation:
         extracted_path.write_text(json.dumps(mutated_extracted.model_dump(mode="json")), encoding="utf-8")
 
         mutated_report = replay_envelope(tmp_path, loaded)
-        assert mutated_report.outcome is not ReplayOutcome.VERIFIED
-        assert any("extracted.json" in f.reason for f in (mutated_report.failures + mutated_report.unverifiable))
+        assert mutated_report.evidence_outcome is not ReplayOutcome.VERIFIED
+        assert any(
+            "extracted.json" in f.reason
+            for f in (mutated_report.evidence_failures + mutated_report.evidence_unverifiable)
+        )
 
 
 class TestReplayEnvelopeMissingEvidence:
@@ -274,9 +277,9 @@ class TestReplayEnvelopeMissingEvidence:
         shutil.rmtree(artifact_dir(tmp_path, stored_artifact.sha256))
 
         report = replay_envelope(tmp_path, loaded)
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert report.failures == ()
-        assert report.unverifiable != ()
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.evidence_failures == ()
+        assert report.evidence_unverifiable != ()
 
     def test_absent_extraction_record_is_unverifiable_naming_the_missing_record(self, tmp_path: Path) -> None:
         """The missing-record branch must report WHY, not merely UNVERIFIABLE.
@@ -308,9 +311,9 @@ class TestReplayEnvelopeMissingEvidence:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert report.failures == ()
-        reasons = " ".join(finding.reason for finding in report.unverifiable)
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.evidence_failures == ()
+        reasons = " ".join(finding.reason for finding in report.evidence_unverifiable)
         assert "no extraction record" in reasons.lower()
         assert node.extraction.extraction_sha256 in reasons
 
@@ -352,8 +355,8 @@ class TestReplayEnvelopeExtractedTextShaMismatch:
         tampered = loaded.model_copy(update={"source_graph": patched_graph})
 
         report = replay_envelope(tmp_path, tampered)
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("extracted_text_sha256" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("extracted_text_sha256" in f.reason for f in report.evidence_failures)
 
 
 class TestVerifyMeasuredValueUnit:
@@ -453,7 +456,7 @@ class TestReplayEnvelopeCatchesSpanResliceMismatchIndependentOfEvidence:
     def test_shifted_locator_offsets_fail_replay_even_with_untouched_evidence(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.outcome is ReplayOutcome.VERIFIED
+        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
 
         series = loaded.series[0]
         point = series.points[0]
@@ -481,8 +484,8 @@ class TestReplayEnvelopeCatchesSpanResliceMismatchIndependentOfEvidence:
         tampered = loaded.model_copy(update={"series": shifted_series})
 
         report = replay_envelope(tmp_path, tampered)
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("char-span re-slice mismatch" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("char-span re-slice mismatch" in f.reason for f in report.evidence_failures)
 
 
 class TestReplayEnvelopeGenericWalkExhaustiveness:
@@ -517,7 +520,7 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
     def test_meta_json_sidecar_rewrite_does_not_launder_a_verified_result(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.outcome is ReplayOutcome.VERIFIED
+        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
 
         # Tamper with the files replay actually reads: the ADDRESSED
         # extraction record's extracted.json and the meta.json sidecar
@@ -556,8 +559,8 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
         # ExtractionBinding.extracted_sha256 anchor must catch the rewrite
         # as a definite FAILED, naming the anchor.
         report = replay_envelope(tmp_path, loaded)
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("ExtractionBinding.extracted_sha256" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("ExtractionBinding.extracted_sha256" in f.reason for f in report.evidence_failures)
 
         # Then patch the record's meta.json extracted_sha256 to match the
         # forged bytes, so a replayer that (wrongly) anchored on the
@@ -572,14 +575,14 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
         meta_path.write_text(json.dumps(meta), encoding="utf-8")
 
         report = replay_envelope(tmp_path, loaded)
-        assert report.outcome is not ReplayOutcome.VERIFIED, (
+        assert report.evidence_outcome is not ReplayOutcome.VERIFIED, (
             "replay must not launder a rewritten extracted.json just because meta.json was "
             "patched to match it -- the envelope's own ExtractionBinding.extracted_sha256 is "
             "the only acceptable anchor"
         )
         assert any(
             "does not authenticate" in f.reason or "extracted_sha256" in f.reason or "extracted.json" in f.reason
-            for f in (report.failures + report.unverifiable)
+            for f in (report.evidence_failures + report.evidence_unverifiable)
         )
 
 
@@ -600,12 +603,12 @@ class TestReplayEnvelopeZeroCheckedSpansCannotVerify:
 
         report = replay_envelope(tmp_path, empty_envelope)
         assert report.checked_char_spans == 0
-        assert report.outcome is not ReplayOutcome.VERIFIED, (
+        assert report.evidence_outcome is not ReplayOutcome.VERIFIED, (
             "a replay that independently checked zero character spans must never report "
             "VERIFIED -- there is nothing behind that label"
         )
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert any("0" in f.reason or "zero" in f.reason.lower() for f in report.unverifiable)
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("0" in f.reason or "zero" in f.reason.lower() for f in report.evidence_unverifiable)
 
 
 class TestVerifyMeasuredValueUnitBoundary:
@@ -938,7 +941,7 @@ class TestReplayEnvelopeCatchesUnitBoundaryViolation:
         text_with_glued_bar = _TEXT + " The pressure was 1 bar(a) at closure."
         _stored_artifact, loaded = _produce_and_load(tmp_path, text=text_with_glued_bar)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.outcome is ReplayOutcome.VERIFIED
+        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
 
         series = loaded.series[0]
         point = series.points[0]
@@ -968,8 +971,8 @@ class TestReplayEnvelopeCatchesUnitBoundaryViolation:
         tampered = loaded.model_copy(update={"series": tampered_series})
 
         report = replay_envelope(tmp_path, tampered)
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("unit_trailing_unclassified_char" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("unit_trailing_unclassified_char" in f.reason for f in report.evidence_failures)
 
 
 class TestReplayEnvelopeContainsParserExceptions:
@@ -1079,9 +1082,9 @@ class TestReplayEnvelopeContainsParserExceptions:
         tampered = loaded.model_copy(update={"source_graph": forged_graph})
 
         report = replay_envelope(tmp_path, tampered)  # must not raise
-        assert report.outcome is not ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is not ReplayOutcome.VERIFIED
         assert any(
-            "parse" in f.reason.lower() or "RecursionError" in f.reason for f in report.unverifiable
+            "parse" in f.reason.lower() or "RecursionError" in f.reason for f in report.evidence_unverifiable
         )
 
 
@@ -1110,8 +1113,8 @@ class TestReplayEnvelopeSurfacesUnreferencedNodeProblems:
         tampered = loaded.model_copy(update={"source_graph": extra_graph})
 
         report = replay_envelope(tmp_path, tampered)
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert any("orphan" in f.reason for f in report.unverifiable)
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("orphan" in f.reason for f in report.evidence_unverifiable)
 
 
 class TestReplayEnvelopeVerifiesRawBinIntegrity:
@@ -1131,8 +1134,8 @@ class TestReplayEnvelopeVerifiesRawBinIntegrity:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert any("raw.bin" in f.reason for f in report.unverifiable)
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("raw.bin" in f.reason for f in report.evidence_unverifiable)
 
     def test_replay_fails_when_raw_bin_does_not_hash_to_node_sha256(self, tmp_path: Path) -> None:
         stored_artifact, loaded = _produce_and_load(tmp_path)
@@ -1141,8 +1144,8 @@ class TestReplayEnvelopeVerifiesRawBinIntegrity:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("raw.bin" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("raw.bin" in f.reason for f in report.evidence_failures)
 
 
 class TestReplayEnvelopeChecksLossyExtraction:
@@ -1220,8 +1223,8 @@ class TestReplayEnvelopeChecksLossyExtraction:
 
         report = replay_envelope(tmp_path, tampered)
 
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert any("lossy" in f.reason and "1 page" in f.reason for f in report.unverifiable)
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert any("lossy" in f.reason and "1 page" in f.reason for f in report.evidence_unverifiable)
 
 
 class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
@@ -1237,15 +1240,18 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
     (contract d).
     """
 
-    def test_replay_verifies_when_root_meta_json_is_missing(self, tmp_path: Path) -> None:
+    def test_the_evidence_verifies_when_root_meta_json_is_missing(self, tmp_path: Path) -> None:
         """Contract (a): the nested record is present, self-authenticating,
         and agrees with the envelope on every digest -- deleting the ROOT
-        sidecar removes nothing replay legitimately needs, so the outcome
-        must be VERIFIED with no findings at all (not UNVERIFIABLE: nothing
-        replay checks is missing). raw.bin stays in place, so the only thing
-        that could turn this input non-VERIFIED is a replay-side dependence
-        on the root sidecar itself -- the exact dependence this test exists
-        to keep out.
+        sidecar removes nothing replay legitimately needs, so the EVIDENCE
+        outcome must be VERIFIED with no findings at all (not UNVERIFIABLE:
+        nothing replay checks is missing). raw.bin stays in place, so the only
+        thing that could turn ``evidence_outcome`` non-VERIFIED is a
+        replay-side dependence on the root sidecar itself -- the exact
+        dependence this test exists to keep out. The overall outcome is a
+        separate question: the now-unreadable root sidecar leaves its own
+        claim unchecked, which correctly downgrades ``overall_outcome`` to
+        UNVERIFIABLE.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
@@ -1253,10 +1259,11 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert report.findings == ()
 
-    def test_replay_outcome_is_unmoved_by_a_tampered_root_meta_json(self, tmp_path: Path) -> None:
+    def test_the_evidence_outcome_is_unmoved_by_a_tampered_root_meta_json(self, tmp_path: Path) -> None:
         """Contract (d), tamper flavour: rewrite the root sidecar's own
         identity claims (extractor_version, derivation_binding) to garbage
         that would have FAILED the old root-derived cross-check. The
@@ -1265,7 +1272,7 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
         what an envelope asserts about itself.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
-        assert replay_envelope(tmp_path, loaded).outcome is ReplayOutcome.VERIFIED
+        assert replay_envelope(tmp_path, loaded).overall_outcome is ReplayOutcome.VERIFIED
 
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         raw_meta = json.loads(root_meta_path.read_text(encoding="utf-8"))
@@ -1275,24 +1282,28 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.VERIFIED
         assert report.findings == ()
 
-    def test_replay_outcome_is_unmoved_by_an_unparseable_root_meta_json(self, tmp_path: Path) -> None:
+    def test_the_evidence_outcome_is_unmoved_by_an_unparseable_root_meta_json(self, tmp_path: Path) -> None:
         """Contract (d), corruption flavour: the root sidecar is not even
         JSON any more. A replayer that still consulted it would crash or
         report UNVERIFIABLE; one that honestly ignores it must still return
-        VERIFIED with no findings.
+        an evidence outcome of VERIFIED with no findings. The overall outcome
+        does move, though: an unparseable root sidecar leaves its own claim
+        unchecked, which is exactly what downgrades ``overall_outcome`` to
+        UNVERIFIABLE -- that is not the dependence this test guards against.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
-        assert replay_envelope(tmp_path, loaded).outcome is ReplayOutcome.VERIFIED
+        assert replay_envelope(tmp_path, loaded).overall_outcome is ReplayOutcome.VERIFIED
 
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         root_meta_path.write_bytes(b"\x00not json at all")
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert report.findings == ()
 
 
@@ -1332,11 +1343,11 @@ class TestReplayCrossChecksRecordIdentityAgainstTheBinding:
 
         report = replay_envelope(tmp_path, tampered)
 
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("extractor_code_sha256" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("extractor_code_sha256" in f.reason for f in report.evidence_failures)
         # The record was present and readable throughout -- nothing about
         # this input is inability-to-check.
-        assert not any("extractor_code_sha256" in f.reason for f in report.unverifiable)
+        assert not any("extractor_code_sha256" in f.reason for f in report.evidence_unverifiable)
 
     def test_replay_fails_when_binding_pypdf_version_disagrees_with_the_record(self, tmp_path: Path) -> None:
         """Same contract, for the pypdf-dependent identity half: the
@@ -1356,8 +1367,8 @@ class TestReplayCrossChecksRecordIdentityAgainstTheBinding:
 
         report = replay_envelope(tmp_path, tampered)
 
-        assert report.outcome is ReplayOutcome.FAILED
-        assert any("pypdf_version" in f.reason for f in report.failures)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        assert any("pypdf_version" in f.reason for f in report.evidence_failures)
 
 
 def _char_span_ref(node_id: str, start: int, end: int) -> SourceRef:
@@ -1930,11 +1941,11 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert report.failures == ()
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.evidence_failures == ()
         # One char-span label_ref became a BBox ref, so 5 of the original 6 remain.
         assert report.checked_char_spans == 5
-        reasons = [f.reason for f in report.unverifiable]
+        reasons = [f.reason for f in report.evidence_unverifiable]
         assert any(
             "label_ref" in r and "BBoxLocator" in r for r in reasons
         ), reasons
@@ -1996,7 +2007,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
 
         report = replay_envelope(tmp_path, fabricated_envelope)
 
-        assert report.outcome is not ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is not ReplayOutcome.VERIFIED
 
     def test_bbox_only_node_with_missing_raw_bytes_is_still_unverifiable(self, tmp_path: Path) -> None:
         """The over-correction guard: waiving the TEXT requirement must not
@@ -2008,11 +2019,11 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.UNVERIFIABLE
-        assert report.failures == ()
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.evidence_failures == ()
         # Pin the REASON, not merely the outcome. Before the text/bytes split
         # this test passed vacuously -- the envelope was UNVERIFIABLE because
         # the crop had no extraction, and the missing raw.bin was never even
         # reached. Asserting the byte-level reason is what makes it a real test.
-        reasons = [f.reason for f in report.unverifiable]
+        reasons = [f.reason for f in report.evidence_unverifiable]
         assert any("no readable raw.bin" in r and "'crop'" in r for r in reasons), reasons

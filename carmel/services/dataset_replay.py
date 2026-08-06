@@ -252,17 +252,20 @@ class ReplayOutcome(StrEnum):
     """The three (never two) outcomes a replay check can produce."""
 
     VERIFIED = "verified"
-    """Every applicable EVIDENCE check ran, and every one of them passed.
+    """Every applicable check ran, and every one of them passed.
 
-    This read "every applicable check ran", full stop, and that became false the
-    moment :class:`UncheckedClaim` existed: a VERIFIED report may carry
-    provenance claims that were never tested at all. The scope word is
-    load-bearing. VERIFIED is a statement about the envelope's DATA -- its raw
-    bytes, its addressed extraction record, its grounded spans -- and says
-    nothing about whether every claim the envelope carries ABOUT THE STORE was
-    checkable. A consumer that reads ``outcome`` alone and concludes the
-    provenance is trustworthy is reading more than this member asserts; it must
-    read ``ReplayReport.unchecked_claims`` as well (Codex round 74, P1)."""
+    Scope-neutral on purpose: this member no longer carries the caveat, because
+    the FIELD now carries the scope. It used to say "every applicable EVIDENCE
+    check", with a paragraph explaining that a VERIFIED report might still hold
+    provenance claims nothing ever tested -- a caveat attached to the vocabulary
+    because the field it was read through, ``ReplayReport.outcome``, did not
+    distinguish the two scopes (Codex round 74, P1).
+
+    That is now structural: :attr:`ReplayReport.evidence_outcome` asks the
+    narrow question and :attr:`ReplayReport.overall_outcome` asks the total one,
+    so VERIFIED means exactly "the question you asked came back clean" and a
+    reader learns the scope from the name they read it through. Leaving the old
+    caveat here would now UNDERSTATE ``overall_outcome`` (Codex round 83)."""
 
     FAILED = "failed"
     """At least one check ran and produced a definite disagreement."""
@@ -287,14 +290,45 @@ class ReplayFinding:
     expected: str | None = None
     actual: str | None = None
 
+    def __post_init__(self) -> None:
+        # `ReplayOutcome` is a StrEnum, so a plain `"failed"` compares EQUAL to
+        # `ReplayOutcome.FAILED` while failing every `is` test -- and the
+        # outcome derivation is written with `is`, deliberately, because
+        # identity is what an enum is for. A string category would therefore be
+        # invisible to it in exactly the way a VERIFIED finding is: the report
+        # would read VERIFIED while carrying a finding that says otherwise.
+        # Nothing but this check stands between a caller and that (Codex 84).
+        if not isinstance(self.category, ReplayOutcome):
+            raise ValueError(
+                f"category must be a ReplayOutcome, not {type(self.category).__name__} "
+                f"({self.category!r}) -- a string compares equal to a StrEnum member but is "
+                "not identical to it, and the outcome derivation matches on identity, so a "
+                "string category would be silently invisible to the verdict"
+            )
+        # The docstring above said this; nothing enforced it. A VERIFIED
+        # finding is not merely odd, it is INVISIBLE to the outcome
+        # derivation: it matches neither the "any FAILED" nor the "any
+        # UNVERIFIABLE" test, so a report carrying one would derive VERIFIED
+        # while holding a finding that says otherwise.
+        if self.category is ReplayOutcome.VERIFIED:
+            raise ValueError(
+                "a ReplayFinding is never categorised VERIFIED -- a clean check produces no "
+                f"finding at all, so a VERIFIED finding at {self.ref_path!r} would be a verdict "
+                "no check produced"
+            )
+
 
 @dataclass(frozen=True)
 class UncheckedClaim:
     """One carried provenance claim that replay could not check AT ALL.
 
     Deliberately NOT a :class:`ReplayFinding`, and deliberately not carried in
-    ``ReplayReport.findings`` -- so it can never feed ``ReplayReport.outcome``.
-    That separation is the whole point. "Did the envelope's DATA verify" and
+    ``ReplayReport.findings`` -- so it can never feed
+    :attr:`~ReplayReport.evidence_outcome`. It IS what downgrades
+    :attr:`~ReplayReport.overall_outcome`, which is the distinction:
+    an unchecked claim must not make the evidence verdict look worse than the
+    evidence was, and must not let the total verdict look better than the whole
+    report earned. That separation is the whole point. "Did the envelope's DATA verify" and
     "was every provenance claim it carries actually checked" are orthogonal
     questions, and collapsing them into one field is what made replay silent
     about an unchecked root-sidecar claim (Codex round 73, P1): an envelope
@@ -337,27 +371,173 @@ class ReplayReport:
     rather than a clean check. These three numbers make a MIXED result
     (some spans checked, some not) legible instead of collapsing to one
     outcome that overstates or understates how much was actually verified.
+
+    **There is deliberately no field named ``outcome``.** There was, it was
+    scoped to the EVIDENCE checks, and it carried the shortest and most
+    prominent name on the report -- so a consumer who read it and stopped was
+    told "verified" about a report that might carry provenance claims nothing
+    ever tested. That was first patched with a docstring on the enum member
+    confessing the gap (Codex round 74); prose does not constrain a caller
+    (round 82). Both scopes are now named, and neither name is the bare one, so
+    every read has to state which question it is asking:
+
+    * :attr:`evidence_outcome` -- what the checks over the DATA concluded.
+    * :attr:`overall_outcome` -- what this report can honestly claim in total.
+
+    Both are DERIVED, not stored. A stored verdict can disagree with the
+    findings underneath it, and a frozen dataclass would then serve that
+    disagreement to a caller as though a real replay had produced it:
+    ``frozen=True`` constrains identity, not consistency (Codex round 83).
     """
 
-    outcome: ReplayOutcome
     checked_char_spans: int
     total_char_spans: int
     unchecked_char_spans: int
     findings: tuple[ReplayFinding, ...] = ()
     unchecked_claims: tuple[UncheckedClaim, ...] = ()
     """Provenance claims replay could not check at all -- see
-    :class:`UncheckedClaim`. Orthogonal to ``outcome`` on purpose: a report may
-    be ``VERIFIED`` and still carry entries here, meaning "the data verified,
-    and this claim about the store was never tested." Reading ``outcome``
-    alone therefore does NOT tell a trust consumer that every carried claim
-    held; it must read this too."""
+    :class:`UncheckedClaim`. Orthogonal to :attr:`evidence_outcome` on purpose:
+    the evidence may be VERIFIED while entries sit here, meaning "the data
+    verified, and this claim about the store was never tested." That
+    combination is real and worth reporting -- what it must not do is escape as
+    a bare "verified", which is exactly why it is what downgrades
+    :attr:`overall_outcome`."""
+
+    def __post_init__(self) -> None:
+        # `frozen=True` stops the FIELD being rebound; it does nothing about the
+        # object the field points at. Handed a list, the report would keep the
+        # caller's live list, and appending to it afterwards would silently
+        # change a verdict that has already been read -- both outcomes are
+        # derived on every access, so there is no snapshot to protect them
+        # (Codex round 84). Normalising to a tuple here makes the freeze reach
+        # the contents, and costs nothing on the producer path, which already
+        # passes tuples.
+        object.__setattr__(self, "findings", tuple(self.findings))
+        object.__setattr__(self, "unchecked_claims", tuple(self.unchecked_claims))
+
+        # Normalising the CONTAINER says nothing about what is in it. Both
+        # derivations read `.category` off each finding and match it on
+        # identity, so any object carrying that attribute takes part in the
+        # verdict -- and one whose `.category` is the string "failed" matches
+        # no branch, leaving a report that reads VERIFIED while holding
+        # something that calls itself a failure. Exact type rather than
+        # `isinstance`: a subclass could carry state the derivation does not
+        # know to consult, and this is a fail-closed path (Codex round 85).
+        for index, finding in enumerate(self.findings):
+            if type(finding) is not ReplayFinding:
+                raise ValueError(
+                    f"findings[{index}] is a {type(finding).__name__}, not a ReplayFinding -- "
+                    "the outcome derivation reads .category off each entry and matches it on "
+                    "identity, so a look-alike would take part in the verdict without being "
+                    "bound by any of the rules ReplayFinding enforces"
+                )
+        for index, claim in enumerate(self.unchecked_claims):
+            if type(claim) is not UncheckedClaim:
+                raise ValueError(
+                    f"unchecked_claims[{index}] is a {type(claim).__name__}, not an "
+                    "UncheckedClaim -- its mere presence downgrades overall_outcome, so an "
+                    "arbitrary object here silently decides a verdict"
+                )
+
+        # `bool` subclasses `int`, so `True` satisfies every bound below and
+        # reads as a count of 1; a float satisfies them too and can make the
+        # arithmetic agree by coincidence. Exact type only.
+        for name in ("checked_char_spans", "total_char_spans", "unchecked_char_spans"):
+            count = getattr(self, name)
+            if type(count) is not int:
+                raise ValueError(
+                    f"{name} must be an int, not {type(count).__name__} ({count!r}) -- bools "
+                    "and floats compare cleanly against these bounds, and would let a report "
+                    "derive a verdict from a coverage count that was never really counted"
+                )
+
+        if self.checked_char_spans < 0 or self.total_char_spans < 0:
+            raise ValueError(
+                "a replay cannot have checked a negative number of char spans "
+                f"(checked={self.checked_char_spans}, total={self.total_char_spans})"
+            )
+        if self.checked_char_spans > self.total_char_spans:
+            raise ValueError(
+                f"checked_char_spans ({self.checked_char_spans}) exceeds total_char_spans "
+                f"({self.total_char_spans}) -- a replay cannot check more spans than the "
+                "envelope reaches"
+            )
+        expected_unchecked = self.total_char_spans - self.checked_char_spans
+        if self.unchecked_char_spans != expected_unchecked:
+            raise ValueError(
+                f"unchecked_char_spans ({self.unchecked_char_spans}) must be "
+                f"total_char_spans - checked_char_spans ({expected_unchecked}) -- the three "
+                "counts are what make a MIXED result legible, so a set that does not add up "
+                "misreports coverage"
+            )
 
     @property
-    def failures(self) -> tuple[ReplayFinding, ...]:
+    def evidence_outcome(self) -> ReplayOutcome:
+        """What the checks over the envelope's DATA concluded.
+
+        Scoped to the raw bytes, the addressed extraction record and the
+        grounded char spans. It says nothing about whether every claim the
+        envelope makes ABOUT THE STORE was checkable -- that is
+        :attr:`overall_outcome`'s job.
+        """
+        if any(f.category is ReplayOutcome.FAILED for f in self.findings):
+            return ReplayOutcome.FAILED
+        if any(f.category is ReplayOutcome.UNVERIFIABLE for f in self.findings):
+            return ReplayOutcome.UNVERIFIABLE
+        if self.unchecked_char_spans > 0:
+            # The report states in as many words that some reachable spans were
+            # never checked. A verdict that ignored its own coverage count would
+            # be the original overclaim moved up one level -- the count is not
+            # decoration, it is what makes a MIXED result legible (Codex 84).
+            #
+            # Today's producer always records a finding alongside an unchecked
+            # span, so this changes no real replay result -- probed by applying
+            # it and running the replay + producer suites unchanged. It is here
+            # for the same reason as the zero-span rule below: the derivation
+            # has to hold for every report, not only the ones this module
+            # happens to build.
+            return ReplayOutcome.UNVERIFIABLE
+        if self.checked_char_spans == 0:
+            # A replay that re-sliced nothing has established nothing. The
+            # producer also records a finding saying so, carrying the reason a
+            # caller needs -- but a rule enforced only by the one caller that
+            # remembers it is not an invariant, and this report type is public
+            # and constructible by anyone.
+            return ReplayOutcome.UNVERIFIABLE
+        return ReplayOutcome.VERIFIED
+
+    @property
+    def overall_outcome(self) -> ReplayOutcome:
+        """What this report can honestly claim, across every axis it covers.
+
+        ``VERIFIED`` here means: every applicable check ran, every one passed,
+        and nothing was left untested. It is the verdict a consumer may act on
+        WITHOUT also inspecting a side list -- which is the whole reason it
+        exists, so nothing that widens "what was left untested" may be added to
+        this report without also being wired in here.
+        """
+        evidence = self.evidence_outcome
+        # A demonstrated disagreement outranks an untested claim: FAILED must
+        # never soften to UNVERIFIABLE on its way through this property. The
+        # two are never conflated, in EITHER direction.
+        if evidence is ReplayOutcome.FAILED:
+            return ReplayOutcome.FAILED
+        if self.unchecked_claims:
+            return ReplayOutcome.UNVERIFIABLE
+        return evidence
+
+    @property
+    def evidence_failures(self) -> tuple[ReplayFinding, ...]:
+        """Findings that are definite disagreements. EVIDENCE-scoped: an
+        unchecked claim never appears here, because it is not a disagreement."""
         return tuple(f for f in self.findings if f.category is ReplayOutcome.FAILED)
 
     @property
-    def unverifiable(self) -> tuple[ReplayFinding, ...]:
+    def evidence_unverifiable(self) -> tuple[ReplayFinding, ...]:
+        """Findings whose check could not run. EVIDENCE-scoped, and the scope is
+        load-bearing in the name: a report whose OVERALL verdict is
+        ``UNVERIFIABLE`` because of an unchecked claim returns ``()`` here, and a
+        caller reading a shorter name would have concluded the opposite."""
         return tuple(f for f in self.findings if f.category is ReplayOutcome.UNVERIFIABLE)
 
 
@@ -762,7 +942,7 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSi
     and then have its root ``meta.json`` deleted or made unreadable, and the
     resulting report was indistinguishable from one where the claim was checked
     and held. So an unreadable root tier now yields an :class:`UncheckedClaim`
-    instead of nothing. That is not a finding and does not touch ``outcome`` --
+    instead of nothing. That is not a finding and does not touch ``evidence_outcome`` --
     the contract above is untouched -- it simply stops the report implying a
     check that never ran.
 
@@ -1531,15 +1711,11 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
             ),
         )
 
-    if any(f.category is ReplayOutcome.FAILED for f in all_findings):
-        outcome = ReplayOutcome.FAILED
-    elif any(f.category is ReplayOutcome.UNVERIFIABLE for f in all_findings):
-        outcome = ReplayOutcome.UNVERIFIABLE
-    else:
-        outcome = ReplayOutcome.VERIFIED
-
+    # The verdict is NOT computed here. `ReplayReport` derives both of its
+    # outcomes from the findings and claims it is handed, so there is no way
+    # for a verdict to disagree with the material underneath it -- and no
+    # second implementation of the rule to drift from this one.
     return ReplayReport(
-        outcome=outcome,
         checked_char_spans=checked,
         total_char_spans=total_char_spans,
         unchecked_char_spans=total_char_spans - checked,

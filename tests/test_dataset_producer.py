@@ -1328,9 +1328,9 @@ class TestProducerEndToEnd:
         # re-verifies extracted.json from disk and re-slices every span in
         # the LOADED envelope against it.
         report = replay_envelope(tmp_path, loaded)
-        assert report.outcome is ReplayOutcome.VERIFIED, report.findings
-        assert report.failures == ()
-        assert report.unverifiable == ()
+        assert report.overall_outcome is ReplayOutcome.VERIFIED, report.findings
+        assert report.evidence_failures == ()
+        assert report.evidence_unverifiable == ()
         # 2 axes x (value_ref + unit_ref + label_ref) = 6 char-span refs.
         assert report.checked_char_spans == 6
 
@@ -1389,7 +1389,7 @@ class TestProducerEndToEnd:
 
         # Sanity: replay passes clean against the untouched evidence...
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.outcome is ReplayOutcome.VERIFIED
+        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
         assert clean_report.checked_char_spans == 6
 
         # ...then tamper with the SAME extraction record's extracted.json on
@@ -1418,10 +1418,10 @@ class TestProducerEndToEnd:
         extracted_path.write_text(json.dumps(mutated_extracted.model_dump(mode="json")), encoding="utf-8")
 
         mutated_report = replay_envelope(tmp_path, loaded)
-        assert mutated_report.outcome is not ReplayOutcome.VERIFIED
+        assert mutated_report.evidence_outcome is not ReplayOutcome.VERIFIED
         assert any(
             "extracted.json" in finding.reason or "extracted_text_sha256" in finding.reason
-            for finding in (mutated_report.failures + mutated_report.unverifiable)
+            for finding in (mutated_report.evidence_failures + mutated_report.evidence_unverifiable)
         )
 
 
@@ -1858,11 +1858,11 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         refutations = [f for f in report.findings if "root_sidecar" in f.ref_path]
         assert len(refutations) == 1
         assert refutations[0].category is ReplayOutcome.FAILED
-        assert report.outcome is ReplayOutcome.FAILED
+        assert report.evidence_outcome is ReplayOutcome.FAILED
 
     def test_an_unreadable_root_meta_leaves_the_claim_unrefuted(self, tmp_path: Path) -> None:
-        """A missing root tier must NOT degrade the outcome -- the check only
-        ever refutes.
+        """A missing root tier must NOT degrade the EVIDENCE outcome -- the
+        check only ever refutes.
 
         This asserted UNVERIFIABLE in its first draft, on the general principle
         that inability-to-check is never silently a pass.
@@ -1871,7 +1871,10 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         architectural contract, that a perfect record replays VERIFIED with the
         root sidecar gone. Failing to refute a claim is not failing to verify
         the evidence, and replay's verification of the data is root-independent
-        by design."""
+        by design -- so ``evidence_outcome`` stays VERIFIED. But the unreadable
+        root sidecar also leaves its own claim unchecked, which is exactly what
+        downgrades ``overall_outcome`` to UNVERIFIABLE; that is the split this
+        vocabulary exists to express, not a regression of this test's contract."""
         stored = self._legacy_artifact(tmp_path)
         envelope = self._envelope(tmp_path, stored)
         (artifact_dir(tmp_path, stored.sha256) / "meta.json").unlink()
@@ -1879,7 +1882,8 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         report = replay_envelope(tmp_path, envelope)
 
         assert not [f for f in report.findings if "root_sidecar" in f.ref_path]
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
 
     def test_an_unreadable_root_meta_is_reported_as_an_unchecked_claim(
         self, tmp_path: Path
@@ -1904,7 +1908,8 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert len(report.unchecked_claims) == 1
         unchecked = report.unchecked_claims[0]
         assert unchecked.ref_path == "source_graph.node('paper').verification.root_sidecar"
@@ -1938,7 +1943,8 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert len(report.unchecked_claims) == 1
         reason = report.unchecked_claims[0].reason
         assert "missing, unreadable or invalid" in reason
@@ -1984,7 +1990,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.VERIFIED
         assert report.unchecked_claims == ()
 
 
@@ -2351,7 +2357,7 @@ class TestFigureFurnitureFabricatesAVerifiedEnvelope:
         envelope = self._envelope(tmp_path)
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.VERIFIED
         assert report.findings == ()
         assert report.unchecked_claims == ()
         # Not vacuous: spans were actually checked, and all of them were.
