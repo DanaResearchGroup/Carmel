@@ -4349,3 +4349,42 @@ class TestOnePoisonedEntryDoesNotKillTheWholePass:
         assert outcomes[poisoned] != CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE, (
             "a containment breach must not be reported as a permissions problem"
         )
+
+
+class TestAnIncompleteRecordStoreRefusesInTheCorpusPass:
+    """The two forged/accidental routes to the root fall-through, end to end.
+
+    Asserts the OUTCOME, not merely that the read refused: an operator facing an
+    interrupted write is told to re-extract, and one facing a broken link is told their
+    store has a pointer to nothing. Collapsing them would send the first person hunting
+    for a symlink that does not exist.
+    """
+
+    def test_an_interrupted_write_is_reported_as_an_empty_store_not_an_absent_one(
+        self, campaign: Campaign
+    ) -> None:
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _records_dir(campaign.workspace_root, legacy_sha).mkdir(parents=True)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == []
+        assert outcomes[legacy_sha] == CorpusReadOutcome.EMPTY_EXTRACTION_RECORD_STORE_PRESENT
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "a write that was begun and did not finish must not license the root sidecar"
+        )
+
+    def test_a_dangling_store_link_is_reported_as_such(self, campaign: Campaign) -> None:
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        artifact_root = campaign.workspace_root / "evidence" / "literature" / legacy_sha
+        (artifact_root / "extractions").symlink_to(
+            artifact_root / "never-created", target_is_directory=True
+        )
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == []
+        assert outcomes[legacy_sha] == CorpusReadOutcome.EXTRACTION_RECORD_STORE_LINK_DANGLING
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "planting one broken symlink must not forge the store's most permissive answer"
+        )

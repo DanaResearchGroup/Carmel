@@ -628,6 +628,23 @@ class CorpusReadOutcome(StrEnum):
     "The store could not answer" is not "the store answered that there is nothing
     here", and only the latter may fall through to the root tiers."""
 
+    EMPTY_EXTRACTION_RECORD_STORE_PRESENT = "empty_extraction_record_store_present"
+    """The ``extractions/`` directory exists and holds no record. Never read.
+
+    ``store_extraction_record`` creates the directory before it creates the record, so an
+    interrupted write -- a crash, a full disk, a SIGKILL -- leaves exactly this state. It
+    is NOT "this artifact predates the record store": a write was begun. Reading the root
+    sidecar here would let a crash mid-write silently downgrade the document, and because
+    records are append-only nothing afterwards repairs it. Re-extraction is the fix."""
+
+    EXTRACTION_RECORD_STORE_LINK_DANGLING = "extraction_record_store_link_dangling"
+    """Something is at the ``extractions/`` path but it cannot be entered. Never read.
+
+    A symlink whose target does not exist is the reachable case. Detected with ``lexists``
+    rather than ``exists``, which follows symlinks and so reported a broken link as an
+    ABSENT store -- making the single most permissive outcome forgeable by planting one
+    link."""
+
     EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE = "extraction_record_store_escapes_workspace"
     """The ``extractions/`` directory resolves OUTSIDE the workspace root. Never read.
 

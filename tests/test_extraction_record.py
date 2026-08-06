@@ -1315,10 +1315,82 @@ class TestTheIdentityPayloadKeySetIsPinned:
 
         pinned = (_IDENTITY_PAYLOAD_VERSION, set(_PYPDF_DEPENDENT_EXTRACTORS))
         assert pinned == ("2", {"pdf:pypdf"}), (
-            "you changed the identity-payload shape or the pypdf-dependent key set. Every "
-            "record already in every store was addressed under the OLD rule and will now "
-            "fail to authenticate -- reported as UNUSABLE_RECORD_PRESENT, which refuses the "
-            "document outright. Records are append-only, so they cannot be rewritten in "
-            "place. Ship a version-keyed rebuild in _build_identity_payload before changing "
-            "this, or accept that every stored record must be re-extracted."
+            "you changed the identity-payload version or the pypdf-dependent KEY SET. Only "
+            "the second orphans stored records, and it is the one to worry about: "
+            "_identity_payload_from_meta rebuilds using meta.identity_payload_version -- the "
+            "record's OWN value -- so a version bump alone still recomputes each stored "
+            "record's address correctly. The KEY SET is different: _build_identity_payload "
+            "decides which fields to include using TODAY's rule regardless of the record's "
+            "version, so moving an extractor into or out of the set re-addresses every "
+            "record already stored. Those records then fail to authenticate and are reported "
+            "as UNUSABLE_RECORD_PRESENT, which refuses the document outright, and they are "
+            "append-only so they cannot be rewritten in place. Add version dispatch to the "
+            "key-set rule before changing it, or accept that every stored record must be "
+            "re-extracted."
         )
+
+
+class TestAnIncompleteStoreIsNotAnAbsentOne:
+    """Only "no record was ever stored" may license the root fall-through.
+
+    ``NO_RECORDS_STORED`` is the single kind a caller may treat as permission to judge an
+    artifact by its unauthenticated root sidecar. Deriving it from
+    :meth:`~pathlib.Path.exists` collapsed three different store states into it: never
+    created, created and left empty by an interrupted write, and a symlink pointing at
+    nothing. The last two are forgeable or accidental, and both resolve toward serving
+    text that is checked against nothing.
+    """
+
+    def test_an_empty_extractions_dir_is_an_unfinished_write_not_an_absent_store(
+        self, tmp_path: Path
+    ) -> None:
+        """``store_extraction_record`` makes the directory BEFORE the record.
+
+        So a crash, a full disk, or a SIGKILL between those two steps leaves exactly this
+        state. Reporting it as "this artifact predates the record store" would let an
+        interrupted write silently downgrade the document to root text -- and because
+        records are append-only, nothing later repairs it.
+        """
+        raw_sha = _store_root_artifact(tmp_path, text="synthetic text for an unfinished write")
+        (tmp_path / "evidence" / "literature" / raw_sha / "extractions").mkdir(parents=True)
+
+        selection = select_current_extraction(tmp_path, raw_sha)
+
+        assert selection.kind is not CurrentSelectionKind.NO_RECORDS_STORED, (
+            "an attempted-but-unfinished write must not read as a write never attempted"
+        )
+        assert selection.selected is None
+
+    def test_a_dangling_extractions_symlink_does_not_forge_an_absent_store(
+        self, tmp_path: Path
+    ) -> None:
+        """``exists()`` follows symlinks, so a dangling one reports False.
+
+        The target is chosen INSIDE the workspace on purpose: an outside target is already
+        caught by the containment check, so only an inside-pointing dangling link isolates
+        this defect. Otherwise planting one link forges the store's single most permissive
+        answer.
+        """
+        raw_sha = _store_root_artifact(tmp_path, text="synthetic text behind a dangling link")
+        artifact_root = tmp_path / "evidence" / "literature" / raw_sha
+        (artifact_root / "extractions").symlink_to(
+            artifact_root / "never-created", target_is_directory=True
+        )
+
+        selection = select_current_extraction(tmp_path, raw_sha)
+
+        assert selection.kind is not CurrentSelectionKind.NO_RECORDS_STORED, (
+            "a symlink to nothing is not the same fact as no symlink at all"
+        )
+        assert selection.selected is None
+
+    def test_a_genuinely_absent_extractions_dir_is_still_the_one_fall_through(
+        self, tmp_path: Path
+    ) -> None:
+        """The counterweight: without this, the fix would just ban the legacy corpus."""
+        raw_sha = _store_root_artifact(tmp_path, text="synthetic text that never had a record")
+        assert not (tmp_path / "evidence" / "literature" / raw_sha / "extractions").exists()
+
+        selection = select_current_extraction(tmp_path, raw_sha)
+
+        assert selection.kind is CurrentSelectionKind.NO_RECORDS_STORED

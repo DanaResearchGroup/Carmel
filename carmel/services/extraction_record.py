@@ -1007,10 +1007,24 @@ class RecordsDirState(StrEnum):
     """
 
     ABSENT = "absent"
-    """No ``extractions/`` directory exists. The artifact predates the record store."""
+    """Nothing exists at the ``extractions/`` path -- not even a broken symlink.
+
+    Established with :func:`os.path.lexists`, NOT :meth:`~pathlib.Path.exists`, which
+    follows symlinks and so reports a DANGLING link as absent. That made the store's most
+    permissive answer forgeable by planting one link.
+    """
 
     LISTED = "listed"
     """The directory was read successfully. It may still have contained nothing."""
+
+    DANGLING = "dangling"
+    """Something is at the path, but it is not a directory that can be entered.
+
+    A symlink whose target does not exist is the reachable case: an interrupted restore,
+    a half-finished move, or a deliberately planted link. Distinct from ABSENT because a
+    broken pointer to a record store is not the same fact as never having had one, and
+    distinct from UNLISTABLE because there is nothing here to gain permission to read.
+    """
 
     UNLISTABLE = "unlistable"
     """The directory exists but could not be enumerated (permissions, EIO, ...)."""
@@ -1077,8 +1091,26 @@ def scan_extraction_records(workspace_root: Path, raw_sha256: str) -> Extraction
             resolved workspace root.
     """
     records_dir = _validated_records_dir(workspace_root, raw_sha256)
-    if not records_dir.exists():
+    # Both of these must be asked of the LITERAL path, not the containment-checked one:
+    # `_validated_records_dir` returns the RESOLVED path, so by the time it hands one back
+    # a symlink has already been followed and the link itself is invisible.
+    #
+    # lexists, not exists: the latter follows symlinks too, so a link pointing at nothing
+    # reports False and forges ABSENT -- the one state that licenses reading the
+    # unauthenticated root sidecar. Planting a broken symlink must not buy that.
+    literal_dir = artifact_dir(normalize_path(workspace_root), raw_sha256) / EXTRACTIONS_SUBDIR
+    if not os.path.lexists(literal_dir):
         return ExtractionRecordScan(records=(), problems=(), dir_state=RecordsDirState.ABSENT)
+    if not literal_dir.is_dir():
+        return ExtractionRecordScan(
+            records=(),
+            problems=(),
+            dir_state=RecordsDirState.DANGLING,
+            unlistable_reason=(
+                "the path exists but is not a directory that can be entered (a symlink whose "
+                "target is missing, or a plain file where the record store should be)"
+            ),
+        )
     try:
         entries = sorted(records_dir.iterdir())
     except OSError as exc:
@@ -1565,7 +1597,18 @@ class CurrentSelectionKind(StrEnum):
     """Exactly one authenticated current record, whose body also authenticated."""
 
     NO_RECORDS_STORED = "no_records_stored"
-    """No ``extractions/`` directory at all. The ONLY member that may fall through."""
+    """No ``extractions/`` entry at all. The ONLY member that may fall through.
+
+    Narrowed deliberately: "the directory exists but is empty" and "the path is a broken
+    symlink" used to arrive here too, and both are forgeable or accidental routes to the
+    store's most permissive answer. They now have their own kinds.
+    """
+
+    EMPTY_RECORD_STORE_PRESENT = "empty_record_store_present"
+    """``extractions/`` exists and holds no record: a write begun and not finished."""
+
+    RECORD_STORE_LINK_DANGLING = "record_store_link_dangling"
+    """Something is at the ``extractions/`` path but it cannot be entered."""
 
     NO_CURRENT_RECORD = "no_current_record"
     """Records exist; none matches today's extractor identity. Re-extraction is the fix."""
@@ -1698,10 +1741,34 @@ def select_current_extraction(workspace_root: Path, raw_sha256: str) -> CurrentS
                 "apparently unambiguous one and unlock a read"
             ),
         )
-    if scan.dir_state is RecordsDirState.ABSENT or not scan.records:
+    if scan.dir_state is RecordsDirState.DANGLING:
+        return CurrentSelection(
+            kind=CurrentSelectionKind.RECORD_STORE_LINK_DANGLING,
+            detail=(
+                f"the extractions path for {raw_sha256} exists but cannot be entered "
+                f"({scan.unlistable_reason}); a broken pointer to a record store is not the "
+                "same fact as never having had one, and only the latter licenses reading the "
+                "root sidecar"
+            ),
+        )
+    if scan.dir_state is RecordsDirState.ABSENT:
         return CurrentSelection(
             kind=CurrentSelectionKind.NO_RECORDS_STORED,
             detail=f"no extraction record has ever been stored for {raw_sha256}",
+        )
+    if not scan.records:
+        # LISTED, no problems, and still nothing: the directory was created but holds no
+        # record. `store_extraction_record` makes it BEFORE the temp dir, so an interrupted
+        # write leaves exactly this. Treating it as ABSENT would let a crash mid-write
+        # silently downgrade the document to root text, with nothing able to repair it
+        # afterwards, because records are append-only.
+        return CurrentSelection(
+            kind=CurrentSelectionKind.EMPTY_RECORD_STORE_PRESENT,
+            detail=(
+                f"the extractions directory for {raw_sha256} exists but holds no record; a "
+                "write was begun and did not finish (or its output was removed). Re-extract "
+                "the artifact to complete it"
+            ),
         )
 
     identity = extraction_identity()
