@@ -70,22 +70,16 @@ from carmel.agents.tools.extract import ExtractedText
 from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
-    AxisDeclaration,
     AxisRole,
     CharSpanLocator,
-    Coordinate,
-    DataPoint,
     DatasetEnvelope,
     EmbeddedConversionTable,
     ExtractedTextVerification,
     ExtractionBinding,
     MeasuredValue,
-    Observation,
     RawArtifactVerification,
     RootSidecarVerification,
     SemanticDependencyUse,
-    Series,
-    SourceForm,
     SourceGraph,
     SourceNode,
     SourceNodeKind,
@@ -1354,17 +1348,24 @@ def _prepare_grounding(
     workspace_root: Path,
     sha256: str,
     *,
-    envelope_noun: str = "dataset envelope",
-    envelope_subject: str = "A dataset",
+    envelope_noun: str,
+    envelope_subject: str,
 ) -> _GroundingContext:
     """Authenticate ``sha256`` and build the grounding context for a producer.
 
     ``envelope_noun``/``envelope_subject`` appear ONLY in refusal messages, so a
-    condition-set refusal does not misname itself a dataset refusal. Both default
-    to the dataset path's original wording, so that path's diagnostics are
-    byte-identical to the inline block this was extracted from -- a refactor that
-    quietly reworded a refusal would be a behaviour change hiding inside a
-    "pure" extraction, and no test asserts those strings to catch it.
+    condition-set refusal does not misname itself a dataset refusal. Both are
+    REQUIRED. They used to default to the dataset path's wording, which was
+    right while dataset production existed to be byte-identical to the inline
+    block this was extracted from -- but the only caller that took those
+    defaults was ``produce_envelope_from_artifact``, which now refuses
+    unconditionally (P0-c). The condition-set producer passed
+    ``envelope_noun`` and NOT ``envelope_subject``, so its no-current-record
+    refusal read "refusing to produce a condition set. A dataset must be
+    grounded in ..." -- a refusal naming the wrong artifact, unnoticed because
+    no test asserted that message on the live path. A default no live caller
+    wants is not a convenience; it is a wrong answer waiting for the caller
+    that forgets to override it.
 
     Raises:
         DatasetProducerError: The artifact is missing/legacy/corrupt, has no
@@ -1509,6 +1510,15 @@ def _prepare_grounding(
     )
 
 
+def _describe_count(measurements: object) -> str:
+    """Render the spec count for the refusal message without trusting the
+    caller to have passed something sized."""
+    try:
+        return f"{len(measurements)} spec(s)"  # type: ignore[arg-type]
+    except TypeError:
+        return "an unsized measurements argument"
+
+
 def produce_envelope_from_artifact(
     workspace_root: Path,
     *,
@@ -1517,134 +1527,79 @@ def produce_envelope_from_artifact(
     value_origin: ValueOrigin,
     measurements: tuple[MeasurementSpec, ...],
 ) -> DatasetEnvelope:
-    """Build a fully validated :class:`DatasetEnvelope` from ONE stored artifact.
+    """REFUSED: this runtime cannot honestly produce a dataset envelope.
 
-    The vertical slice, end to end: authenticate ``raw.bin`` against the
-    artifact's own sha256 and read its ``content_type`` (see
-    :func:`_authenticate_raw_bytes_and_read_source_metadata`), select the one
-    CURRENT extraction record and take the grounded text from it, ground every
-    caller-stated quote in that text via
-    :func:`ground_quote`, and assemble one root node -- ``PAPER_PDF`` or
-    ``JATS_XML``, derived honestly from the artifact's own ``content_type``
-    (never hardcoded; an unrecognised ``content_type`` is refused, not
-    guessed) -- one ``TEXTUAL`` series, and one data point into an envelope
-    that passes every schema validator (construction runs pydantic's full
-    validation -- nothing here uses ``model_construct``).
+    P0-c. This function used to build a fully validated
+    :class:`DatasetEnvelope` -- authenticate ``raw.bin``, select the one
+    CURRENT extraction, ground every caller-stated quote in its text, and
+    assemble one root node, one ``TEXTUAL`` series and one data point. It now
+    refuses unconditionally, and the assembly code is deleted rather than
+    parked behind the refusal.
 
-    ``source_form`` is fixed at ``TEXTUAL``: a :class:`CharSpanLocator` into
-    extracted running text is the only locator kind this runtime can actually
-    produce (the round-33 ruling that added it), and it is what every span
-    here is. ``value_origin`` is the caller's assertion, passed through --
-    see :class:`ValueOrigin` for why the schema records it unverified.
+    WHY IT REFUSES. A :class:`CharSpanLocator` into extracted running text is
+    the only locator kind this runtime can produce (the round-33 ruling), so
+    every series this function could emit is ``source_form=TEXTUAL`` -- and
+    :meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`
+    (V7) now rejects a char span as the source of a series VALUE, and a char
+    span is the only thing this producer can emit. Note V7 refuses the
+    LOCATOR, not ``source_form``: ``TEXTUAL`` itself remains legal for a
+    series whose values are located some other way. A series asserts a structured pairing of coordinates to
+    observations, and running text carries no row structure from which that
+    pairing can be proven. This was a live fabrication, not a theoretical one:
+    pypdf renders a figure's axis furniture into ``text.txt`` as ordinary body
+    prose, so grounding a coordinate at the tick ``0.7`` and an observation at
+    the tick ``24`` produced a schema-valid envelope that replayed
+    ``VERIFIED`` with zero findings. Grounding proves LOCATION, never MEANING.
 
-    WHAT GROUNDING DOES AND DOES NOT PROVE (P1-F, restated at the call site
-    that matters most): every ``value_ref``/``unit_ref``/``label_ref`` this
-    function emits is independently verified to be an exact, located
-    substring of the one verified document -- that is the entire guarantee.
-    It is NOT verified that the value, unit, and label for a given axis were
-    stated TOGETHER, in the same sentence, table row, or even the same
-    paragraph. A caller can supply ``value_quote="1023"`` from one part of
-    the paper and ``unit_quote="K"`` from an unrelated part, and this
-    function will happily ground both and produce a fully schema-valid
-    envelope asserting they belong together. Closing that gap needs a bounded
-    measurement-context notion (e.g. requiring value/unit/label quotes to
-    fall within one caller-supplied span) that does not exist yet -- it is
-    intentionally out of scope for this vertical slice and is its own future
-    milestone. See ``TestGroundingIsIndependentPerQuote`` in the test suite
-    for a pinning test of this exact gap: if it starts failing, this
-    paragraph is stale and must be updated (or removed) alongside the fix.
+    WHAT THIS IS NOT. It is not a claim that prose never states a series --
+    "At 300, 400 and 500 K the rates were 1.2, 2.4 and 4.8 s-1, respectively"
+    is a real one. It is a statement about what THIS RUNTIME can prove. Nor is
+    the refusal a furniture detector: it does not inspect the quotes and judge
+    them tick-like, which would be a probabilistic guess about meaning inside
+    the deterministic S1 lane. It closes the ROUTE.
+
+    WHY THE BODY IS DELETED RATHER THAN KEPT. An unreachable envelope
+    assembler reads as an available capability, which is the same trap as
+    :class:`~carmel.agents.tools.extract.TextSection`'s documented-but-never-
+    emitted ``caption``/``table`` labels. Git holds the previous
+    implementation; a future ``TABULAR``/``DIGITIZED`` producer will not want
+    its char-span assembly anyway.
+
+    HOW TO RESTORE DATASET PRODUCTION. Something must first be able to emit a
+    ``TABLE_CELL`` locator (a table parser) or a ``FIGURE_CROP`` node (a figure
+    digitizer). Until then no producer can construct any
+    :class:`DatasetEnvelope`, and the dataset slice is schema + replay +
+    storage only. For a prose-local SCALAR statement -- the honest thing
+    running text CAN support -- use
+    :func:`~carmel.services.condition_set_producer.produce_condition_set_from_artifact`.
+    Note that a :class:`ConditionSetEnvelope` holds CONDITIONS, not
+    observables, so a genuinely prose-stated observable has no home today; a
+    survey of the eight-paper corpus found no honest instance of one (every
+    observable-shaped prose sentence was a figure caption, axis furniture, a
+    method threshold, or an explicit narration of a figure).
 
     Args:
-        workspace_root: Root of the campaign workspace holding the evidence
-            store.
-        sha256: Raw-bytes sha256 of the stored artifact to ground against.
-        series_id: Id for the single produced series.
-        value_origin: How the numbers were produced, as asserted by the
-            caller.
-        measurements: One :class:`MeasurementSpec` per axis; at least one
-            ``COORDINATE`` and one ``OBSERVATION`` role are required (by the
-            schema's own S3/S4 validators). ``CONSTANT`` is not supported by
-            this producer.
-
-    Returns:
-        The validated envelope.
+        workspace_root: Unused; kept so the refusal is reachable from every
+            existing call site with a real diagnosis rather than a
+            ``TypeError``.
+        sha256: Unused, as above.
+        series_id: Reported back in the message so a caller with several
+            pending series can tell which one was refused.
+        value_origin: Reported back, as above.
+        measurements: Reported back by count, as above.
 
     Raises:
-        DatasetProducerError: Artifact missing/legacy/corrupt, a value quote
-            not derivable into a numeral, an unknown unit, or a ``CONSTANT``
-            role spec.
-        QuoteGroundingError: A quote that cannot be grounded unambiguously.
+        DatasetProducerError: Always.
     """
-    for spec in measurements:
-        if spec.role is AxisRole.CONSTANT:
-            raise DatasetProducerError(
-                f"MeasurementSpec for axis {spec.axis_id!r} has role=CONSTANT, which this producer "
-                "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
-            )
-
-    grounding = _prepare_grounding(workspace_root, sha256)
-    text = grounding.text
-    graph = grounding.graph
-    document_source_context = grounding.document_source_context
-    document_glyph_health = grounding.document_glyph_health
-
-    axes: list[AxisDeclaration] = []
-    coordinates: list[Coordinate] = []
-    observations: list[Observation] = []
-    for spec in sorted(measurements, key=lambda spec: spec.axis_id):
-        label_locator = ground_quote(
-            text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
-        )
-        axes.append(
-            AxisDeclaration(
-                axis_id=spec.axis_id,
-                role=spec.role,
-                quantity_kind=spec.quantity_kind,
-                label_raw=spec.label_quote,
-                label_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=label_locator),
-            )
-        )
-        value = _measured_value(
-            text,
-            spec,
-            where=f"axis {spec.axis_id!r}",
-            document_source_context=document_source_context,
-            document_glyph_health=document_glyph_health,
-        )
-        if spec.role is AxisRole.COORDINATE:
-            coordinates.append(
-                Coordinate(
-                    axis_id=spec.axis_id,
-                    value=value,
-                    uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
-                )
-            )
-        else:
-            observations.append(
-                Observation(
-                    axis_id=spec.axis_id,
-                    value=value,
-                    uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
-                )
-            )
-
-    point = DataPoint(
-        point_id=_POINT_ID,
-        coordinates=tuple(coordinates),
-        observations=tuple(observations),
-        composition=Absent(reason=AbsenceReason.SAME_AS_DATASET),
-    )
-    series = Series(
-        series_id=series_id,
-        source_form=SourceForm.TEXTUAL,
-        value_origin=value_origin,
-        axes=tuple(axes),
-        constants=(),
-        points=(point,),
-    )
-    return DatasetEnvelope(
-        source_graph=graph,
-        composition=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
-        series=(series,),
-        conversion_tables=(_ACTIVE.embedded,),
+    raise DatasetProducerError(
+        "this producer can only locate values as CHAR_SPAN offsets into running text, which "
+        "would make every series it emits source_form=TEXTUAL -- and a char span in running "
+        "text cannot ground a series data point (DatasetEnvelope V7). A series asserts a "
+        "coordinate/observation pairing that running text carries no structure to prove: a "
+        "figure's axis ticks extract as ordinary body prose and ground perfectly (series_id="
+        f"{series_id!r}, {len(measurements)} spec(s), value_origin={value_origin.value!r}). "
+        "This is a limit of what this runtime can prove, not a claim that prose never states a "
+        "series. Series data needs TABULAR (a table parser) or DIGITIZED (a figure digitizer), "
+        "neither of which exists yet; a prose-local scalar statement belongs in a "
+        "ConditionSetEnvelope via produce_condition_set_from_artifact"
     )

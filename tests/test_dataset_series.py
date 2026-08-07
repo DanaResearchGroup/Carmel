@@ -22,6 +22,7 @@ from carmel.schemas.datasets import (
     BBox,
     BBoxLocator,
     CaptionLabelKey,
+    CharSpanLocator,
     Composition,
     Coordinate,
     CoordinateFrame,
@@ -47,6 +48,7 @@ from carmel.schemas.datasets import (
     SourceVerification,
     TableCellLocator,
     TableKeyKind,
+    TextSpace,
     Uncertainty,
     UncertaintyBasis,
     UncertaintyKind,
@@ -58,6 +60,7 @@ from carmel.schemas.datasets import (
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1
+from tests.test_dataset_graph_and_envelope import _extraction_binding, _glyph_health_assessment
 
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
@@ -201,6 +204,43 @@ def _bbox_ref(node_id: str) -> SourceRef:
 
 def _xpath_ref(node_id: str, xpath: str = "//table/row[1]/cell[1]") -> SourceRef:
     return SourceRef(node_id=node_id, locator=XPathLocator(xpath=xpath))
+
+
+def _extracted_paper_graph(node_id: str = "paper") -> SourceGraph:
+    """A PAPER_PDF node that actually carries an extraction binding, which V2
+    requires before any ``CharSpanLocator`` may target it. Built by reusing
+    test_dataset_graph_and_envelope's self-authenticating binding/assessment
+    helpers rather than restating them: a hand-copied binding whose
+    ``extraction_sha256`` stops recomputing from its own fields is
+    schema-invalid, so duplicating that machinery here would be a second thing
+    to keep in step with the validator."""
+    return SourceGraph(
+        nodes=(
+            SourceNode(
+                node_id=node_id,
+                kind=SourceNodeKind.PAPER_PDF,
+                sha256=SHA_A,
+                parent_node_id=None,
+                origin=_NO_ORIGIN,
+                extraction=_extraction_binding(parent_raw_sha256=SHA_A, extracted_text_sha256=SHA_B),
+                glyph_health=_glyph_health_assessment(input_sha256=SHA_B),
+                verification=_verification_for(
+                    _extraction_binding(parent_raw_sha256=SHA_A, extracted_text_sha256=SHA_B)
+                ),
+            ),
+        )
+    )
+
+
+def _char_span_ref(node_id: str, start: int = 0, end: int = 3) -> SourceRef:
+    """The locator V7 refuses as the source of a series VALUE -- see
+    ``TestACharSpanCannotGroundASeriesValue``. Still legitimate for a unit or
+    an axis label, which is why it is a general helper and not a fixture
+    private to the refusal tests."""
+    return SourceRef(
+        node_id=node_id,
+        locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=start, end=end),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -882,57 +922,6 @@ class TestSourceFormConstrainsValueRef:
         envelope = _envelope_with_series((series,), graph=graph)
         assert envelope.series[0].source_form is SourceForm.DIGITIZED
 
-    def test_textual_rejects_table_cell_locator(self) -> None:
-        point = _point(
-            "p1",
-            coordinates=(_coordinate("equivalence_ratio", _equivalence_ratio_amount()),),
-            observations=(_observation("burning_velocity", _velocity_amount()),),
-        )
-        series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL)
-        with pytest.raises(ValidationError, match="source_form"):
-            _envelope_with_series((series,))
-
-    def test_textual_rejects_figure_crop_node(self) -> None:
-        graph = _paper_and_figure_crop_graph()
-        point = _point(
-            "p1",
-            coordinates=(
-                _coordinate(
-                    "equivalence_ratio",
-                    _equivalence_ratio_amount(value_ref=_bbox_ref("fig"), unit_ref=_table_ref("paper")),
-                ),
-            ),
-            observations=(
-                _observation(
-                    "burning_velocity",
-                    _velocity_amount(value_ref=_bbox_ref("fig"), unit_ref=_table_ref("paper")),
-                ),
-            ),
-        )
-        series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL)
-        with pytest.raises(ValidationError, match="source_form"):
-            _envelope_with_series((series,), graph=graph)
-
-    def test_textual_value_ref_via_bbox_on_paper_pdf_accepted(self) -> None:
-        point = _point(
-            "p1",
-            coordinates=(
-                _coordinate(
-                    "equivalence_ratio",
-                    _equivalence_ratio_amount(value_ref=_bbox_ref("paper"), unit_ref=_table_ref("paper")),
-                ),
-            ),
-            observations=(
-                _observation(
-                    "burning_velocity",
-                    _velocity_amount(value_ref=_bbox_ref("paper"), unit_ref=_table_ref("paper")),
-                ),
-            ),
-        )
-        series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL)
-        envelope = _envelope_with_series((series,))
-        assert envelope.series[0].source_form is SourceForm.TEXTUAL
-
     def test_source_form_does_not_constrain_unit_ref_or_label_ref(self) -> None:
         """A digitized series may legitimately take its unit and axis label
         from the caption (a table cell), not the crop itself -- only
@@ -980,6 +969,235 @@ class TestSourceFormConstrainsValueRef:
                 ref=_bbox_ref("paper"),
                 node_kind=SourceNodeKind.PAPER_PDF,
                 where="test",
+            )
+
+
+# ===========================================================================
+# P0-c: a char span cannot ground a series value (V7)
+# ===========================================================================
+
+
+class TestACharSpanCannotGroundASeriesValue:
+    """V7: a series data point's VALUE may not be located by a char span.
+
+    A char span in running text can support a prose-local SCALAR statement --
+    that is what :class:`ConditionSetEnvelope` is for -- but it cannot support
+    a series DATA POINT, because a series is a structured pairing of
+    coordinates to observations and running text carries no row structure to
+    prove that pairing from. This is the normative boundary: the producer
+    mirrors it with a friendlier message (see
+    ``TestFigureFurnitureIsRefused``), but the boundary itself lives here, so
+    a hand-built envelope, a future producer, or any other caller is bound by
+    it too.
+
+    Deliberately a check on ``source_form`` ITSELF rather than a tightening of
+    V4's per-ref TEXTUAL branch: V4 only ever runs on refs it finds, so a
+    rejection expressed there would be conditional on a point existing to
+    check, whereas the claim being refused is a property of the series.
+    """
+
+    def test_a_char_span_value_is_rejected_on_a_coordinate_and_on_an_observation(self) -> None:
+        """Both cell kinds are refused -- half a rule would let a fabricated
+        pairing through on whichever side went unchecked."""
+        for coord_ref, obs_ref in (
+            (_char_span_ref("paper"), _table_ref("paper")),
+            (_table_ref("paper"), _char_span_ref("paper")),
+            (_char_span_ref("paper"), _char_span_ref("paper")),
+        ):
+            point = _point(
+                "p1",
+                coordinates=(
+                    _coordinate(
+                        "equivalence_ratio",
+                        _equivalence_ratio_amount(value_ref=coord_ref, unit_ref=_table_ref("paper")),
+                    ),
+                ),
+                observations=(
+                    _observation(
+                        "burning_velocity",
+                        _velocity_amount(value_ref=obs_ref, unit_ref=_table_ref("paper")),
+                    ),
+                ),
+            )
+            series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL)
+            with pytest.raises(ValidationError, match="cannot ground a series data point"):
+                _envelope_with_series((series,), graph=_extracted_paper_graph())
+
+    def test_a_char_span_unit_or_label_is_still_allowed(self) -> None:
+        """V7 constrains where the NUMBER came from, nothing else. A series
+        legitimately takes its unit spelling and axis label from running prose,
+        and a rule that swept those up would forbid honest provenance."""
+        point = _point(
+            "p1",
+            coordinates=(
+                _coordinate(
+                    "equivalence_ratio",
+                    _equivalence_ratio_amount(value_ref=_table_ref("paper"), unit_ref=_char_span_ref("paper")),
+                ),
+            ),
+            observations=(
+                _observation(
+                    "burning_velocity",
+                    _velocity_amount(value_ref=_table_ref("paper"), unit_ref=_char_span_ref("paper")),
+                ),
+            ),
+        )
+        series = _valid_series(points=(point,), source_form=SourceForm.TABULAR)
+        envelope = _envelope_with_series((series,), graph=_extracted_paper_graph())
+        assert envelope.series[0].points[0].coordinates[0].value.unit_ref is not None
+
+    def test_an_xpath_value_under_textual_survives(self) -> None:
+        """The over-reach this rule was corrected away from. Banning
+        ``source_form=TEXTUAL`` outright also banned XPATH value refs, and an
+        XPath into a JATS ``<td>`` is exactly the structured pairing evidence a
+        char span lacks. TEXTUAL is not the defect; the char span is."""
+        point = _point(
+            "p1",
+            coordinates=(
+                _coordinate(
+                    "equivalence_ratio",
+                    _equivalence_ratio_amount(
+                        node_id="jats", value_ref=_xpath_ref("jats"), unit_ref=_xpath_ref("jats")
+                    ),
+                ),
+            ),
+            observations=(
+                _observation(
+                    "burning_velocity",
+                    _velocity_amount(
+                        node_id="jats", value_ref=_xpath_ref("jats"), unit_ref=_xpath_ref("jats")
+                    ),
+                ),
+            ),
+        )
+        series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL, node_id="jats")
+        envelope = _envelope_with_series((series,), graph=_jats_graph())
+        assert envelope.series[0].source_form is SourceForm.TEXTUAL
+
+    def test_the_refusal_names_runtime_incapacity_not_impossibility(self) -> None:
+        """Prose CAN carry a real series -- "At 300, 400 and 500 K the rates
+        were 1.2, 2.4 and 4.8 s-1, respectively" is one. What this runtime
+        cannot do is PROVE the pairing from a char span. The message must say
+        that, so a later reader does not "discover" the counterexample and
+        conclude the rule was simply wrong.
+        """
+        point = _point(
+            "p1",
+            coordinates=(
+                _coordinate(
+                    "equivalence_ratio",
+                    _equivalence_ratio_amount(value_ref=_char_span_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+            observations=(
+                _observation(
+                    "burning_velocity",
+                    _velocity_amount(value_ref=_table_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+        )
+        series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL)
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_series((series,), graph=_extracted_paper_graph())
+        message = str(excinfo.value)
+        assert "this runtime" in message
+        assert "ConditionSetEnvelope" in message, "the honest destination must be named"
+
+    def test_tabular_and_digitized_series_are_untouched(self) -> None:
+        """The refusal is specific to TEXTUAL -- V7 must not become a blanket
+        ban that would make the whole envelope unconstructible."""
+        point = _point(
+            "p1",
+            coordinates=(
+                _coordinate(
+                    "equivalence_ratio",
+                    _equivalence_ratio_amount(value_ref=_table_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+            observations=(
+                _observation(
+                    "burning_velocity",
+                    _velocity_amount(value_ref=_table_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+        )
+        series = _valid_series(points=(point,), source_form=SourceForm.TABULAR)
+        assert _envelope_with_series((series,)).series[0].source_form is SourceForm.TABULAR
+
+    def test_the_refusal_names_the_offending_cell(self) -> None:
+        """A maximal envelope has many values; a refusal that does not say
+        WHICH one is a refusal the caller has to bisect by hand."""
+        point = _point(
+            "p1",
+            coordinates=(
+                _coordinate(
+                    "equivalence_ratio",
+                    _equivalence_ratio_amount(value_ref=_char_span_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+            observations=(
+                _observation(
+                    "burning_velocity",
+                    _velocity_amount(value_ref=_table_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+        )
+        series = _valid_series(points=(point,), source_form=SourceForm.TEXTUAL)
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_series((series,), graph=_extracted_paper_graph())
+        message = str(excinfo.value)
+        assert "'p1'" in message and "coordinate" in message and "'equivalence_ratio'" in message
+
+    def test_a_char_span_constant_is_deliberately_still_allowed(self) -> None:
+        """The scope boundary, pinned so it stays a decision.
+
+        A whole-series CONSTANT is a prose-local scalar statement -- "the
+        pressure was held at 1 atm throughout" -- and that is exactly what a
+        char span CAN support. It asserts no coordinate/observation pairing,
+        so V7's argument does not reach it. Spar r94 flagged that this was
+        unstated; if a later change decides constants must be covered too,
+        this test is what has to be confronted rather than quietly broken.
+        """
+        point = _point(
+            "p1",
+            coordinates=(
+                _coordinate(
+                    "equivalence_ratio",
+                    _equivalence_ratio_amount(value_ref=_table_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+            observations=(
+                _observation(
+                    "burning_velocity",
+                    _velocity_amount(value_ref=_table_ref("paper"), unit_ref=_table_ref("paper")),
+                ),
+            ),
+        )
+        constant = _coordinate(
+            "pressure",
+            _pressure_amount(value_ref=_char_span_ref("paper"), unit_ref=_table_ref("paper")),
+        )
+        series = _valid_series(
+            points=(point,), source_form=SourceForm.TABULAR, constants=(constant,)
+        )
+        envelope = _envelope_with_series((series,), graph=_extracted_paper_graph())
+        stored_constant = envelope.series[0].constants[0]
+        assert stored_constant.axis_id == "pressure"
+        # Not vacuous: the constant really did keep a CHAR_SPAN value locator,
+        # the exact thing V7 refuses one field over.
+        assert isinstance(stored_constant.value.value_ref.locator, CharSpanLocator)
+
+    def test_v4s_textual_branch_still_discriminates_when_called_directly(self) -> None:
+        """V7 runs before V4, so V4's TEXTUAL branch is now unreachable THROUGH
+        an envelope. The helper is still a standalone contract, so it is pinned
+        here directly rather than left as untested dead code."""
+        ref = _table_ref("paper")
+        with pytest.raises(ValueError, match="source_form=TEXTUAL requires"):
+            _check_source_form_for_ref(
+                source_form=SourceForm.TEXTUAL,
+                ref=ref,
+                node_kind=SourceNodeKind.PAPER_PDF,
+                where="direct call",
             )
 
 

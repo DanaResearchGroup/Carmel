@@ -309,15 +309,27 @@ class TestTheDatasetPathCarriesTheSameObligations:
 
     def test_replay_envelope_reports_a_ref_less_quantity_kind(self, tmp_path: Path) -> None:
         from carmel.services.dataset_replay import replay_envelope
-        from tests.test_dataset_replay import _produce_and_load
+        from tests.test_dataset_replay import (
+            _assert_unverifiable_only_for_the_value_locators,
+            _produce_and_load,
+        )
 
         _stored, loaded = _produce_and_load(tmp_path)
         report = replay_envelope(tmp_path, loaded)
         assert [claim.claim_path for claim in report.unchecked_semantic_claims] == [
             "series[0].points[0].observations[0].value.quantity_kind"
         ]
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+        # This used to read `evidence_outcome is VERIFIED`, which made the point
+        # sharply: a ref-less SEMANTIC claim moves the overall verdict without
+        # touching the EVIDENCE verdict. After P0-c the dataset path can never
+        # reach an evidence outcome of VERIFIED (its values are located by
+        # things this runtime cannot re-read), so that exact contrast is no
+        # longer available here. What is still checkable, and is the real
+        # subject, is that the semantic claim did not LEAK into the evidence
+        # axis: the evidence findings are the two value locators and nothing
+        # else, with the quantity_kind claim confined to its own axis.
+        _assert_unverifiable_only_for_the_value_locators(report)
 
 
 class TestABrokenObjectGetsAVerdictNotATraceback:

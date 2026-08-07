@@ -67,7 +67,7 @@ from carmel.schemas.datasets import (
     iter_source_refs,
 )
 from carmel.services import dataset_replay
-from carmel.services.dataset_producer import MeasurementSpec, produce_envelope_from_artifact
+from carmel.services.dataset_producer import MeasurementSpec
 from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
@@ -86,6 +86,7 @@ from carmel.services.units import TABLE_V1, QuantityKind
 from tests.test_dataset_replay import (
     MAX_BYTES,
     _store_genuine_extraction_record,
+    _tabular_envelope_from_artifact,
 )
 
 # Synthetic prose. Each grounded quote below appears EXACTLY ONCE, so an
@@ -208,7 +209,7 @@ def _verifying_graph(tmp_path: Path) -> SourceGraph:
         tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
     )
     _store_genuine_extraction_record(tmp_path, stored.sha256, extracted)
-    dataset = produce_envelope_from_artifact(
+    dataset = _tabular_envelope_from_artifact(
         tmp_path,
         sha256=stored.sha256,
         series_id="s1",

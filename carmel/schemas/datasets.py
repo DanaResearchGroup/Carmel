@@ -4967,6 +4967,88 @@ class DatasetEnvelope(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_no_char_span_grounds_a_series_value(self) -> DatasetEnvelope:
+        """V7 (P0-c): a series data point's VALUE may not be located by a
+        :class:`CharSpanLocator`.
+
+        A char span in running text CAN support a prose-local scalar
+        statement -- that is what :class:`ConditionSetEnvelope` exists for --
+        but it cannot support a series DATA POINT. A series asserts a
+        structured pairing of coordinates to observations, and running text
+        carries no row structure from which that pairing can be proven. What
+        made this a live fabrication rather than a theoretical one: pypdf
+        renders a figure's axis furniture (tick labels, axis titles) into
+        ``text.txt`` as ordinary body prose, so grounding a coordinate at the
+        tick ``0.7`` and an observation at the tick ``24`` succeeded, produced
+        a schema-valid envelope, and replayed ``VERIFIED`` with zero findings.
+        Every quote really was an exact, located substring of a verified
+        document; grounding proves LOCATION and never MEANING, and nothing in
+        that datum was a datum.
+
+        **The rule is about the LOCATOR, not about ``source_form``.** Banning
+        ``source_form=TEXTUAL`` outright was the first attempt and it
+        over-reached: ``TEXTUAL`` is also the only form compatible with an
+        ``XPATH`` value ref, and an XPath into a JATS ``<td>`` is exactly the
+        structured pairing evidence a char span lacks. Refusing the char span
+        refuses the thing that cannot prove a pairing, and leaves every
+        locator that can (``TABLE_CELL``, ``XPATH``, ``BBOX``,
+        ``FIGURE_CROP``) alone.
+
+        **This is a statement about THIS RUNTIME, not about prose.** Prose can
+        carry a real series -- "At 300, 400 and 500 K the rates were 1.2, 2.4
+        and 4.8 s-1, respectively" is one. What cannot be done here is PROVE
+        the pairing from a char span, so the refusal is worded as incapacity;
+        a later reader who finds the counterexample should conclude the
+        runtime is limited, not that the rule was wrong.
+
+        Constrains only a POINT's ``Coordinate.value`` and a present
+        ``Observation.value`` -- the same scope as V4, and for the same
+        reason: this is about where a DATA POINT's number was read from.
+        ``unit_ref``, ``label_ref`` and every uncertainty ref may still be
+        char spans, because a series legitimately takes its unit spelling and
+        axis label from running prose.
+
+        ``Series.constants`` is deliberately NOT covered, and this is a
+        decision rather than an oversight (it was originally an oversight;
+        spar r94 caught it). A whole-series constant -- "the pressure was held
+        at 1 atm throughout" -- is precisely a prose-local SCALAR statement,
+        which is the thing a char span CAN support; it makes no
+        coordinate/observation pairing claim, so the argument above does not
+        reach it. Composition refs are excluded for the same reason. If that
+        ever changes, ``test_a_char_span_constant_is_deliberately_still_allowed``
+        is the test that must be confronted first.
+
+        Deliberately form-agnostic rather than an extra clause on V4's
+        ``TEXTUAL`` branch: today only ``TEXTUAL`` can carry a ``CHAR_SPAN``
+        value (``TABULAR`` demands ``TABLE_CELL``, and ``CHAR_SPAN`` is not
+        compatible with the ``FIGURE_CROP`` node ``DIGITIZED`` demands), but a
+        rule buried in one branch is a rule a newly added ``SourceForm`` can
+        forget.
+        """
+        for series in self.series:
+            for point in series.points:
+                values = [(coord.axis_id, "coordinate", coord.value) for coord in point.coordinates]
+                values += [
+                    (obs.axis_id, "observation", obs.value)
+                    for obs in point.observations
+                    if not isinstance(obs.value, Absent)
+                ]
+                for axis_id, cell_kind, value in values:
+                    if value.value_ref.locator.kind is LocatorKind.CHAR_SPAN:
+                        raise ValueError(
+                            f"DatasetEnvelope: Series(series_id={series.series_id!r}) point "
+                            f"{point.point_id!r} {cell_kind} axis_id={axis_id!r} grounds its value "
+                            "in a CHAR_SPAN, but a char span in running text cannot ground a series "
+                            "data point -- a series asserts a coordinate/observation pairing that "
+                            "running text carries no structure to prove (a figure's axis ticks "
+                            "extract as ordinary body prose and would ground perfectly). This is a "
+                            "limit of what this runtime can prove, not a claim that prose never "
+                            "states a series: locate series values by TABLE_CELL, XPATH or BBOX, "
+                            "and put a prose-local scalar statement in a ConditionSetEnvelope"
+                        )
+        return self
+
+    @model_validator(mode="after")
     def _validate_source_form_constrains_value_refs(self) -> DatasetEnvelope:
         """V4: a series' ``source_form`` constrains where its points' values
         may be grounded -- see :func:`_check_source_form_for_ref` for the

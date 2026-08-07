@@ -12,6 +12,7 @@ repository.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -228,6 +229,39 @@ class TestTheProducerRefusesRatherThanFabricates:
         )
         with pytest.raises(QuoteGroundingError):
             _produce(tmp_path, scalars=(absent,))
+
+    def test_a_missing_current_record_refusal_never_calls_itself_a_dataset(
+        self, tmp_path: Path
+    ) -> None:
+        """The preamble's OTHER refusal, and the one that was actually wrong.
+
+        ``_prepare_grounding`` took its refusal wording from two keyword
+        arguments that both defaulted to the DATASET path's phrasing. This
+        producer overrode only one of them, so this message read "refusing to
+        produce a condition set. A dataset must be grounded in a genuinely
+        stored extraction" -- a refusal that names the wrong artifact in its
+        own second sentence. Nothing caught it because the only test covering
+        the shared preamble from this side matched on the noun that WAS
+        overridden. Both arguments are now required.
+        """
+        stored = _store_synthetic_artifact(tmp_path, _METHODS_TEXT)
+        # Delete the stored extraction record, then call the producer DIRECTLY:
+        # the shared `_produce` helper re-stores the artifact (and so re-creates
+        # the record) on its way in, which would undo the setup.
+        for record in (tmp_path / "evidence" / "literature" / stored.sha256 / "extractions").glob("*"):
+            shutil.rmtree(record)
+        with pytest.raises(DatasetProducerError) as excinfo:
+            produce_condition_set_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                attribution=ConditionAttribution.OWN_EXPERIMENT,
+                attribution_quote="Measurements were carried out",
+                subject=_subject(),
+                scalars=(_temperature(),),
+            )
+        message = str(excinfo.value)
+        assert "condition set" in message
+        assert "A dataset" not in message, message
 
     def test_a_lossy_extraction_is_refused_and_names_a_condition_set(
         self, tmp_path: Path

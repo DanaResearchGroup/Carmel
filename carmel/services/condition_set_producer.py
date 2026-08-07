@@ -367,7 +367,9 @@ def produce_condition_set_from_artifact(
         "produce_condition_set_from_artifact", attribution_occurrence=attribution_occurrence
     )
 
-    grounding = _prepare_grounding(workspace_root, sha256, envelope_noun="condition set")
+    grounding = _prepare_grounding(
+        workspace_root, sha256, envelope_noun="condition set", envelope_subject="A condition set"
+    )
     text = grounding.text
 
     resolved_subject: DeviceClassDeclaration | UnresolvedSubject

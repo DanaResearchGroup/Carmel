@@ -26,6 +26,7 @@ from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.datasets import (
     Absent,
     AxisRole,
+    ConditionAttribution,
     DatasetEnvelope,
     ExtractedTextVerification,
     ExtractionBinding,
@@ -35,6 +36,11 @@ from carmel.schemas.datasets import (
     ValueOrigin,
 )
 from carmel.schemas.literature import StoredArtifact
+from carmel.services.condition_set_producer import (
+    DeviceClassSpec,
+    ScalarConditionSpec,
+    produce_condition_set_from_artifact,
+)
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
 from carmel.services.dataset_producer import (
     DatasetProducerError,
@@ -82,6 +88,46 @@ _SPECS = (
         unit_quote="-",
     ),
 )
+
+
+from tests.test_dataset_replay import (  # noqa: E402
+    _assert_unverifiable_only_for_the_value_locators,
+    _tabular_envelope_from_artifact,
+)
+
+
+def _produce_through_the_preamble(workspace_root: Path, *, sha256: str) -> object:
+    """Reach the SHARED grounding preamble (``_prepare_grounding``) the way the
+    runtime now reaches it: through the condition-set producer.
+
+    Every refusal below -- unknown sha, legacy artifact, corrupt raw.bin, a
+    forged root sidecar, a lossy or unhealthy extraction, an unrecognised
+    content type -- is a property of that preamble, not of dataset production.
+    They were written against ``produce_envelope_from_artifact``, which now
+    refuses unconditionally (P0-c), so testing them there would only ever
+    re-prove the unconditional refusal. Re-pointing keeps the coverage pointed
+    at live code instead of deleting it.
+
+    The specs are the minimum the condition-set producer accepts against
+    ``_TEXT``; none of these tests care what is produced on the happy path,
+    only which refusal fires first.
+    """
+    return produce_condition_set_from_artifact(
+        workspace_root,
+        sha256=sha256,
+        attribution=ConditionAttribution.OWN_EXPERIMENT,
+        attribution_quote="The reactor was held",
+        subject=DeviceClassSpec(label_quote="reactor"),
+        scalars=(
+            ScalarConditionSpec(
+                claim_id="temperature",
+                label_quote="temperature",
+                quantity_kind=QuantityKind.TEMPERATURE,
+                value_quote="1023",
+                unit_quote="K",
+            ),
+        ),
+    )
 
 
 def _store_synthetic_artifact(
@@ -1290,13 +1336,7 @@ class TestTheProducerNeverMintsARecordFromTheRootSidecar:
         assert not records_dir.exists()
 
         with pytest.raises(DatasetProducerError, match="no usable current extraction record"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _tabular_envelope_from_artifact(tmp_path, sha256=stored.sha256)
 
         assert not records_dir.exists(), (
             "refusing must not leave a record behind: minting one here is the laundering "
@@ -1312,13 +1352,7 @@ class TestProducerEndToEnd:
         stored_artifact = _store_synthetic_artifact(tmp_path, _TEXT)
         datasets_root = tmp_path / "datasets"
 
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored_artifact.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _tabular_envelope_from_artifact(tmp_path, sha256=stored_artifact.sha256)
         stored_dataset = store_dataset_envelope(datasets_root, envelope)
         loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
 
@@ -1328,11 +1362,10 @@ class TestProducerEndToEnd:
         # re-verifies extracted.json from disk and re-slices every span in
         # the LOADED envelope against it.
         report = replay_envelope(tmp_path, loaded)
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED, report.findings
-        assert report.evidence_failures == ()
-        assert report.evidence_unverifiable == ()
-        # 2 axes x (value_ref + unit_ref + label_ref) = 6 char-span refs.
-        assert report.checked_char_spans == 6
+        # 2 axes x (unit_ref + label_ref) = 4 char-span refs. The two value_refs
+        # are TABLE_CELLs, which no component here can re-read -- see the
+        # helper for why the outcome is unverifiable rather than verified.
+        _assert_unverifiable_only_for_the_value_locators(report)
 
         # The loaded binding's extracted_text_sha256 must equal a digest
         # recomputed here from an independently re-read extracted.json --
@@ -1377,20 +1410,13 @@ class TestProducerEndToEnd:
         original = _store_synthetic_artifact(tmp_path, _TEXT)
         datasets_root = tmp_path / "datasets"
 
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=original.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _tabular_envelope_from_artifact(tmp_path, sha256=original.sha256)
         stored_dataset = store_dataset_envelope(datasets_root, envelope)
         loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
 
         # Sanity: replay passes clean against the untouched evidence...
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
-        assert clean_report.checked_char_spans == 6
+        _assert_unverifiable_only_for_the_value_locators(clean_report)
 
         # ...then tamper with the SAME extraction record's extracted.json on
         # disk, in place, so the envelope still names the same
@@ -1451,13 +1477,7 @@ class TestProducerFailClosed:
         )
         extracted_path.write_bytes(corrupt.model_dump_json().encode("utf-8"))
 
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
         assert (
@@ -1483,42 +1503,11 @@ class TestProducerFailClosed:
         record_sidecar.write_bytes(b'{"not":"an ExtractedText"}')
 
         with pytest.raises(DatasetProducerError, match="no usable current extraction record"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
     def test_refuses_unknown_sha256(self, tmp_path: Path) -> None:
         with pytest.raises(DatasetProducerError, match="no stored artifact"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256="0" * 64,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
-
-    def test_refuses_constant_role_spec(self, tmp_path: Path) -> None:
-        stored = _store_synthetic_artifact(tmp_path, _TEXT)
-        constant_spec = MeasurementSpec(
-            axis_id="temperature",
-            role=AxisRole.CONSTANT,
-            quantity_kind=QuantityKind.TEMPERATURE,
-            label_quote="temperature",
-            value_quote="1023",
-            unit_quote="K",
-        )
-        with pytest.raises(DatasetProducerError, match="role=CONSTANT"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=(constant_spec,),
-            )
+            _produce_through_the_preamble(tmp_path, sha256="0" * 64)
 
     def test_ungroundable_quote_propagates(self, tmp_path: Path) -> None:
         """A spec whose quote is not in the text fails the whole production --
@@ -1533,12 +1522,8 @@ class TestProducerFailClosed:
             unit_quote="Pa",
         )
         with pytest.raises(QuoteGroundingError, match="not found"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=(bad_spec, *_SPECS),
+            _tabular_envelope_from_artifact(
+                tmp_path, sha256=stored.sha256, measurements=(bad_spec, *_SPECS)
             )
 
     def test_refuses_corrupted_raw_bin(self, tmp_path: Path) -> None:
@@ -1558,13 +1543,7 @@ class TestProducerFailClosed:
         raw_path.write_bytes(b"not the original bytes at all")
 
         with pytest.raises(DatasetProducerError, match="raw.bin bytes on disk hash to"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
     def test_refuses_meta_sha256_field_disagreeing_with_directory(self, tmp_path: Path) -> None:
         """P1-B: ``load_artifact_meta`` resolves the directory purely from the
@@ -1580,13 +1559,7 @@ class TestProducerFailClosed:
         meta_path.write_text(tampered.model_dump_json())
 
         with pytest.raises(DatasetProducerError, match="disagree"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
     def test_a_stale_root_derivation_binding_no_longer_blocks_production(
         self, tmp_path: Path
@@ -1613,13 +1586,7 @@ class TestProducerFailClosed:
         assert tampered.derivation_binding != meta.derivation_binding
         meta_path.write_text(tampered.model_dump_json())
 
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
         assert node.verification.root_sidecar is RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
@@ -1654,13 +1621,7 @@ class TestProducerFailClosed:
         )
         meta_path.write_text(legacy.model_dump_json())
 
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
         assert node.verification.raw_artifact is RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED
@@ -1694,13 +1655,7 @@ class TestProducerFailClosed:
         raw_path.write_bytes(b"not the original bytes at all")
 
         with pytest.raises(DatasetProducerError, match="raw.bin bytes on disk hash to"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
 
 class TestGroundingReadsTheRecordAndNotTheRoot:
@@ -1725,13 +1680,7 @@ class TestGroundingReadsTheRecordAndNotTheRoot:
         from the record."""
         stored = _store_synthetic_artifact(tmp_path, self._ROOT_ONLY, record_text=_TEXT)
 
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _tabular_envelope_from_artifact(tmp_path, sha256=stored.sha256)
 
         assert len(envelope.series) == 1
 
@@ -1740,32 +1689,24 @@ class TestGroundingReadsTheRecordAndNotTheRoot:
         the ROOT's numbers instead. If the producer were reading the root
         sidecar these would ground cleanly; they must not."""
         stored = _store_synthetic_artifact(tmp_path, self._ROOT_ONLY, record_text=_TEXT)
-        root_only_specs = (
-            MeasurementSpec(
-                axis_id="temperature",
-                role=AxisRole.COORDINATE,
-                quantity_kind=QuantityKind.TEMPERATURE,
-                label_quote="temperature",
-                value_quote="4444",
-                unit_quote="K",
-            ),
-            MeasurementSpec(
-                axis_id="mole_fraction",
-                role=AxisRole.OBSERVATION,
-                quantity_kind=QuantityKind.MOLE_FRACTION,
-                label_quote="mole fraction",
-                value_quote="0.4444",
-                unit_quote="-",
-            ),
-        )
-
+        # Through the condition-set producer: the claim under test is about a
+        # VALUE quote, and the dataset fixture grounds only labels and units.
         with pytest.raises(QuoteGroundingError, match="not found"):
-            produce_envelope_from_artifact(
+            produce_condition_set_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=root_only_specs,
+                attribution=ConditionAttribution.OWN_EXPERIMENT,
+                attribution_quote="temperature",
+                subject=DeviceClassSpec(label_quote="temperature"),
+                scalars=(
+                    ScalarConditionSpec(
+                        claim_id="temperature",
+                        label_quote="temperature",
+                        quantity_kind=QuantityKind.TEMPERATURE,
+                        value_quote="4444",  # lives ONLY in the root sidecar's text
+                        unit_quote="K",
+                    ),
+                ),
             )
 
 
@@ -1794,13 +1735,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         return stored
 
     def _envelope(self, tmp_path: Path, stored: StoredArtifact) -> DatasetEnvelope:
-        return produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        return _tabular_envelope_from_artifact(tmp_path, sha256=stored.sha256)
 
     def test_the_legacy_claim_keys_on_extracted_sha256_not_derivation_binding(
         self, tmp_path: Path
@@ -1882,7 +1817,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         report = replay_envelope(tmp_path, envelope)
 
         assert not [f for f in report.findings if "root_sidecar" in f.ref_path]
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(report)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
 
     def test_an_unreadable_root_meta_is_reported_as_an_unchecked_claim(
@@ -1908,7 +1843,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(report)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert len(report.unchecked_store_claims) == 1
         unchecked = report.unchecked_store_claims[0]
@@ -1943,7 +1878,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(report)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert len(report.unchecked_store_claims) == 1
         reason = report.unchecked_store_claims[0].reason
@@ -1990,7 +1925,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(report)
         assert report.unchecked_store_claims == ()
 
 
@@ -2001,26 +1936,14 @@ class TestProducerNodeKind:
 
     def test_pdf_artifact_yields_paper_pdf_node(self, tmp_path: Path) -> None:
         stored = _store_synthetic_artifact(tmp_path, _TEXT, content_type="application/pdf")
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         assert envelope.source_graph.nodes[0].kind == SourceNodeKind.PAPER_PDF
 
     def test_xml_artifact_yields_jats_xml_node(self, tmp_path: Path) -> None:
         stored = _store_synthetic_artifact(
             tmp_path, _TEXT, content_type="application/xml", extractor="xml"
         )
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         assert envelope.source_graph.nodes[0].kind == SourceNodeKind.JATS_XML
 
     def test_unrecognised_content_type_is_refused(self, tmp_path: Path) -> None:
@@ -2028,13 +1951,7 @@ class TestProducerNodeKind:
             tmp_path, _TEXT, content_type="text/html", extractor="html"
         )
         with pytest.raises(DatasetProducerError, match="does not map to any SourceNodeKind"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
 
 class TestProducerRefusesLossyExtraction:
@@ -2048,25 +1965,13 @@ class TestProducerRefusesLossyExtraction:
     def test_lossy_extraction_is_refused(self, tmp_path: Path) -> None:
         stored = _store_synthetic_artifact(tmp_path, _TEXT, lossy=True)
         with pytest.raises(DatasetProducerError, match="extracted lossily"):
-            produce_envelope_from_artifact(
-                tmp_path,
-                sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=_SPECS,
-            )
+            _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
     def test_non_lossy_extraction_still_succeeds(self, tmp_path: Path) -> None:
         """Regression guard: the new refusal must not fire on ordinary, fully
         successful extractions -- the vast majority of stored artifacts."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT, lossy=False)
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         assert envelope.source_graph.nodes[0].kind == SourceNodeKind.PAPER_PDF
 
 
@@ -2095,29 +2000,25 @@ class TestProducerGlyphHealthQuarantine:
 
     def test_bare_exponent_value_refused_in_suspect_pdf_document(self, tmp_path: Path) -> None:
         stored = _store_synthetic_artifact(tmp_path, self._SUSPECT_TEXT)
-        coordinate_spec = MeasurementSpec(
-            axis_id="temperature",
-            role=AxisRole.COORDINATE,
-            quantity_kind=QuantityKind.TEMPERATURE,
-            label_quote="temperature",
-            value_quote="300",
-            unit_quote="K",
-        )
-        spec = MeasurementSpec(
-            axis_id="rate_constant",
-            role=AxisRole.OBSERVATION,
-            quantity_kind=QuantityKind.STRAIN_RATE,
-            label_quote="rate constant",
-            value_quote="1023e5",
-            unit_quote="1/s",
-        )
+        # Reached through the condition-set producer: the quarantine is a
+        # property of value grounding in a glyph-suspect document, and that is
+        # the only producer that still grounds a value.
         with pytest.raises(DatasetProducerError, match="1023e5"):
-            produce_envelope_from_artifact(
+            produce_condition_set_from_artifact(
                 tmp_path,
                 sha256=stored.sha256,
-                series_id="s1",
-                value_origin=ValueOrigin.EXPERIMENTAL,
-                measurements=(coordinate_spec, spec),
+                attribution=ConditionAttribution.OWN_EXPERIMENT,
+                attribution_quote="rate constant",
+                subject=DeviceClassSpec(label_quote="rate constant"),
+                scalars=(
+                    ScalarConditionSpec(
+                        claim_id="rate_constant",
+                        label_quote="rate constant",
+                        quantity_kind=QuantityKind.STRAIN_RATE,
+                        value_quote="1023e5",
+                        unit_quote="1/s",
+                    ),
+                ),
             )
 
 
@@ -2142,31 +2043,30 @@ class TestGroundingIsIndependentPerQuote:
         # "1023" comes from the temperature sentence; "Pa" comes from the
         # unrelated SI-units sentence. Nothing binds them to the same
         # physical statement -- yet this spec grounds and validates cleanly.
-        coordinate_spec = MeasurementSpec(
-            axis_id="temperature",
-            role=AxisRole.COORDINATE,
-            quantity_kind=QuantityKind.TEMPERATURE,
-            label_quote="temperature",
-            value_quote="1023",
-            unit_quote="K",
-        )
-        spec = MeasurementSpec(
-            axis_id="pressure",
-            role=AxisRole.OBSERVATION,
-            quantity_kind=QuantityKind.PRESSURE,
-            label_quote="static gauge reading",
-            value_quote="1023",
-            unit_quote="Pa",
-        )
-        envelope = produce_envelope_from_artifact(
+        # Reached through the condition-set producer, which is now the only
+        # path that grounds a value at all. The gap is unchanged by that move:
+        # it was never about datasets, it is about grounding being independent
+        # per quote. Its sharpest live form is
+        # TestSpanStitchingFabricatesAVerifiedCondition in
+        # tests/test_condition_set_producer.py.
+        envelope = produce_condition_set_from_artifact(
             tmp_path,
             sha256=stored.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=(coordinate_spec, spec),
+            attribution=ConditionAttribution.OWN_EXPERIMENT,
+            attribution_quote="temperature",
+            subject=DeviceClassSpec(label_quote="temperature"),
+            scalars=(
+                ScalarConditionSpec(
+                    claim_id="pressure",
+                    label_quote="static gauge reading",
+                    quantity_kind=QuantityKind.PRESSURE,
+                    value_quote="1023",
+                    unit_quote="Pa",
+                ),
+            ),
         )
         # Reachable and schema-valid today: this IS the gap P1-F describes.
-        assert envelope.series[0].points[0].observations[0].axis_id == "pressure"
+        assert envelope.scalar_claims[0].claim_id == "pressure"
 
 
 class TestActiveTableBindingTracksItsArgument:
@@ -2302,33 +2202,38 @@ _FURNITURE_SPECS = (
 )
 
 
-class TestFigureFurnitureFabricatesAVerifiedEnvelope:
-    """CHARACTERIZATION of a live defect: axis furniture produces VERIFIED data.
 
-    This class asserts what the code does TODAY, and today's behaviour is wrong.
-    It is the standing, suite-defended form of a probe that was run against a
-    real paper in the closed corpus: an envelope built entirely from a figure's
-    axis tick runs and axis labels is produced without objection and replays
-    ``VERIFIED`` with zero findings. Every quote grounds, because grounding
-    proves a string is an exact located substring of the verified document and
-    says NOTHING about whether that string is a datum or a ruler mark.
 
-    Read the assertions as a description of the hole, not as a specification.
-    When the real defense lands -- textual series requiring table/row structure
-    or a prose-local scalar statement, with figure-resident data routed through
-    explicit digitization -- production must REFUSE these specs and this class
-    must be rewritten to assert the refusal. A green run here means the hole is
-    still open.
+class TestFigureFurnitureIsRefused:
+    """P0-c CLOSED: axis furniture can no longer become a dataset.
 
-    It is deliberately built so that a BOUNDED MEASUREMENT CONTEXT fix would
-    NOT flip it: label, value and unit for both axes fall inside one ~110-char
-    span. Co-location is satisfied and the data is still fabricated. That is
-    the point -- this class is the reason bounded context cannot be sold as the
-    fix for this route, and ``test_every_quote_lands_inside_one_short_span``
-    below is what would fail if anyone tried.
+    This class used to be a CHARACTERIZATION of a live defect. The probe behind
+    it was run against a real paper in the closed corpus: an envelope built
+    entirely from a figure's axis tick runs and axis labels was produced
+    without objection and replayed ``VERIFIED`` with zero findings. Every quote
+    grounded, because grounding proves a string is an exact located substring
+    of the verified document and says NOTHING about whether that string is a
+    datum or a ruler mark. phi = 0.7 with a laminar burning velocity of
+    24 cm/s is an ordinary-looking lean-flame datum, so no plausibility or
+    range check downstream would have caught it either.
+
+    What closed it is V7 (``DatasetEnvelope._validate_no_char_span_grounds_a_series_value``):
+    a series data point's VALUE may not be located by a char span, because
+    running text carries no structure from which a coordinate/observation
+    PAIRING can be proven. The producer mirrors that boundary with a specific
+    error rather than letting the envelope constructor raise a generic
+    ``ValidationError`` after all the grounding work is already done.
+
+    **The refusal is unconditional, and is not a furniture detector.** It does
+    not inspect the quotes and decide they look like tick marks -- that would
+    be a probabilistic guess about MEANING inside the deterministic S1 lane,
+    which was considered and rejected (the corpus has axis runs in two
+    different layouts, and equally-spaced values are also how real experiments
+    are designed). It refuses the whole ROUTE. See
+    ``test_the_refusal_is_not_a_judgement_about_these_quotes``.
     """
 
-    def _envelope(self, tmp_path: Path) -> DatasetEnvelope:
+    def _produce(self, tmp_path: Path) -> DatasetEnvelope:
         stored = _store_synthetic_artifact(tmp_path, _FIGURE_FURNITURE_TEXT)
         return produce_envelope_from_artifact(
             tmp_path,
@@ -2338,84 +2243,90 @@ class TestFigureFurnitureFabricatesAVerifiedEnvelope:
             measurements=_FURNITURE_SPECS,
         )
 
-    def test_the_producer_accepts_quotes_taken_from_axis_furniture(
+    def test_the_producer_refuses_quotes_taken_from_axis_furniture(
         self, tmp_path: Path
     ) -> None:
-        """Production does not object. It has no basis on which to object: each
-        quote IS in the document, exactly where the locator says it is."""
-        envelope = self._envelope(tmp_path)
-        point = envelope.series[0].points[0]
-        assert {c.axis_id for c in point.coordinates} == {"equivalence_ratio"}
-        assert {o.axis_id for o in point.observations} == {"burning_velocity"}
+        """The exact call that used to yield a VERIFIED envelope now raises."""
+        with pytest.raises(DatasetProducerError, match="cannot ground a series data point"):
+            self._produce(tmp_path)
 
-    def test_replay_verifies_an_envelope_whose_every_number_is_a_tick(
+    def test_the_refusal_names_runtime_incapacity_not_prose_impossibility(
         self, tmp_path: Path
     ) -> None:
-        """The full round trip -- store, re-read, re-slice every span -- still
-        reports ``VERIFIED`` on the EVIDENCE axis with nothing to say. This is
-        the defect in one assertion: the strongest verdict the evidence scope
-        can issue, over fabricated data.
+        """Prose CAN state a real series -- "At 300, 400 and 500 K the rates
+        were 1.2, 2.4 and 4.8 s-1, respectively" is one. What this runtime
+        cannot do is PROVE the pairing from a char span. The wording has to
+        carry that distinction, or a later reader who meets the counterexample
+        concludes the rule was simply wrong and reopens the route."""
+        with pytest.raises(DatasetProducerError) as excinfo:
+            self._produce(tmp_path)
+        message = str(excinfo.value)
+        assert "this runtime" in message
+        assert "ConditionSetEnvelope" in message, "the honest destination must be named"
 
-        ``overall_outcome`` no longer says ``VERIFIED`` here, and it is worth
-        being exact about why, because it would be easy to read this as the
-        defect having been fixed. It has not. The ref-less obligations added
-        for ``quantity_kind`` downgrade the OVERALL verdict for a reason that
-        has nothing to do with fabrication -- the fabricated figure furniture
-        happens to carry a dimensionless unit whose quantity kind no ref
-        supports. Every number here is still a chart tick, every span still
-        re-slices clean, and nothing in the report says so. The evidence axis
-        is where the defect lives, and this asserts on the evidence axis so
-        that a future fix has to move THAT verdict, not a neighbouring one.
-        """
-        envelope = self._envelope(tmp_path)
-        report = replay_envelope(tmp_path, envelope)
+    def test_the_refusal_is_not_a_judgement_about_these_quotes(
+        self, tmp_path: Path
+    ) -> None:
+        """Specs quoting an ordinary prose sentence -- nothing furniture-like
+        about them -- are refused identically. The route is closed, not the
+        quotes judged. This is what stops the fix being read as a heuristic
+        that a cleverer caller could dress around."""
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        with pytest.raises(DatasetProducerError, match="cannot ground a series data point"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                series_id="honest_looking",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_SPECS,
+            )
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
-        assert report.findings == ()
-        assert report.unchecked_store_claims == ()
-        # The overall verdict moved, but only via the unrelated quantity-kind
-        # obligation -- pinned so that "P0-c is fixed" cannot be concluded from
-        # a green suite alone.
-        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
-        assert {claim.claim_path.rsplit(".", 1)[-1] for claim in report.unchecked_semantic_claims} == {
-            "quantity_kind"
-        }
-        # Not vacuous: spans were actually checked, and all of them were.
-        assert report.total_char_spans > 0
-        assert report.checked_char_spans == report.total_char_spans
+    def test_the_refusal_precedes_any_grounding_work(self, tmp_path: Path) -> None:
+        """Refusing first means a caller gets the real diagnosis. If the check
+        ran after grounding, an unrelated failure (a missing artifact, an
+        unknown unit) would mask it, and the route would look like it failed
+        for a fixable reason."""
+        with pytest.raises(DatasetProducerError, match="cannot ground a series data point"):
+            produce_envelope_from_artifact(
+                tmp_path,
+                sha256="0" * 64,  # nothing is stored: artifact loading would fail first
+                series_id="never_grounded",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                measurements=_FURNITURE_SPECS,
+            )
 
-    def test_the_fabricated_point_is_physically_plausible(self, tmp_path: Path) -> None:
-        """phi = 0.7 with a laminar burning velocity of 24 cm/s is an entirely
-        ordinary-looking lean-flame datum -- which is why a downstream range or
-        sanity check would not catch it either. The defense cannot be
-        plausibility; it has to be provenance."""
-        envelope = self._envelope(tmp_path)
-        point = envelope.series[0].points[0]
-        phi = next(c for c in point.coordinates if c.axis_id == "equivalence_ratio")
-        s_l = next(o for o in point.observations if o.axis_id == "burning_velocity")
-        assert float(phi.value.canonical_decimal_value) == pytest.approx(0.7)
-        assert float(s_l.value.canonical_decimal_value) == pytest.approx(24.0)
-        assert s_l.value.unit_normalized == "cm/s"
-
-    def test_every_quote_lands_inside_one_short_span(self, tmp_path: Path) -> None:
-        """The co-location counterweight, and the reason it is stated here.
+    def test_co_location_would_not_have_closed_this_route(self) -> None:
+        """The counterweight that survives the fix, and the reason it is kept.
 
         A bounded-measurement-context check requires an axis's label, value and
-        unit to fall within one caller-supplied window. This asserts that ALL
-        SIX quotes -- both axes -- already do, inside a single short span. Such
-        a check would therefore accept this envelope unchanged.
+        unit to fall within one caller-supplied window. All SIX quotes here --
+        two labels, two values, two units -- fall inside a single short span,
+        so such a check would have accepted the fabricated envelope unchanged.
+        That is why V7 refuses the route rather than tightening co-location,
+        and it is the same reason co-location cannot close the span-stitching
+        hole pinned in ``TestSpanStitchingFabricatesAVerifiedCondition``.
 
-        This test passes by construction rather than by discovering anything,
-        and is worth having only because it is what a future bounded-context
-        implementation would have to break in order to claim it closed this
-        route."""
-        envelope = self._envelope(tmp_path)
-        series = envelope.series[0]
-        point = series.points[0]
-        refs = [axis.label_ref for axis in series.axes]
-        for cell in (*point.coordinates, *point.observations):
-            refs.extend((cell.value.value_ref, cell.value.unit_ref))
-        offsets = [(ref.locator.start, ref.locator.end) for ref in refs if ref is not None]
+        Measured directly against the text now that no envelope can be built
+        from it -- the point is a property of the SOURCE, not of the envelope
+        that used to be produced from it.
+        """
+        offsets = []
+        for spec in _FURNITURE_SPECS:
+            for quote, role, occurrence in (
+                (spec.label_quote, QuoteRole.LABEL, spec.label_occurrence),
+                (spec.value_quote, QuoteRole.VALUE, spec.value_occurrence),
+                (spec.unit_quote, QuoteRole.UNIT, spec.unit_occurrence),
+            ):
+                locator = ground_quote(
+                    _FIGURE_FURNITURE_TEXT,
+                    quote,
+                    role=role,
+                    occurrence=occurrence,
+                    # UNIT grounding checks the quote against the vocabulary of
+                    # the quantity it claims to measure, so it needs the kind.
+                    quantity=spec.quantity_kind if role is QuoteRole.UNIT else None,
+                )
+                offsets.append((locator.start, locator.end))
         assert len(offsets) == 6, "two labels, two values, two units -- all six must ground"
         span = max(end for _, end in offsets) - min(start for start, _ in offsets)
         assert span < 130, f"quotes span {span} chars; the axis block is no longer compact"

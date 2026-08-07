@@ -29,30 +29,46 @@ from carmel.agents.tools.fetch import FetchedArtifact
 from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
+    AxisDeclaration,
     AxisRole,
     BBox,
     BBoxLocator,
+    CaptionLabelKey,
     CharSpanLocator,
+    Coordinate,
     CoordinateFrame,
+    DataPoint,
     DatasetEnvelope,
     ExtractedTextVerification,
     ExtractionBinding,
     LocatorKind,
     MeasuredValue,
+    Observation,
     RawArtifactVerification,
     RootSidecarVerification,
     SemanticDependencyUse,
+    Series,
+    SourceForm,
     SourceNode,
     SourceNodeKind,
     SourceRef,
     SourceVerification,
+    TableCellLocator,
+    TableKeyKind,
     TextSpace,
     ValueOrigin,
     XPathLocator,
 )
 from carmel.schemas.literature import StoredArtifact
+from carmel.services import units
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
-from carmel.services.dataset_producer import MeasurementSpec, produce_envelope_from_artifact
+from carmel.services.dataset_producer import (
+    _ACTIVE,
+    _ROOT_NODE_ID,
+    MeasurementSpec,
+    _prepare_grounding,
+    ground_quote,
+)
 from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
@@ -70,7 +86,11 @@ from carmel.services.extraction_record import (
     load_extraction_record,
     store_extraction_record,
 )
-from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
+from carmel.services.numeric import QuoteRole
+from carmel.services.semantic_deps import (
+    CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    current_sha_for,
+)
 from carmel.services.units import TABLE_V1, QuantityKind
 
 
@@ -181,16 +201,144 @@ def _store_genuine_extraction_record(
     )
 
 
+_VALUE_REF_PATHS = frozenset(
+    {
+        "series[0].points[0].coordinates[0].value.value_ref",
+        "series[0].points[0].observations[0].value.value_ref",
+    }
+)
+"""The two refs no runtime component can re-read: after P0-c a series VALUE may
+not be a char span, and every locator that IS allowed (TABLE_CELL, XPATH, BBOX)
+names something this runtime has no parser or renderer for."""
+
+
+def _assert_unverifiable_only_for_the_value_locators(report, *, checked_spans: int = 4) -> None:
+    """The post-P0-c replacement for ``evidence_outcome is VERIFIED``.
+
+    The dataset lane can no longer reach VERIFIED at all -- not because
+    anything is broken, but because its values are now located by things this
+    runtime cannot re-read. Asserting the bare UNVERIFIABLE would be a test a
+    genuine regression also satisfies, so this pins the REASON: the two value
+    refs and nothing else are unverifiable, there are no failures, and every
+    char span that does exist (the units and axis labels) was checked and
+    re-sliced clean.
+    """
+    assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+    assert report.evidence_failures == ()
+    assert {finding.ref_path for finding in report.evidence_unverifiable} == _VALUE_REF_PATHS
+    # Nothing ELSE is wrong: the only findings are those same two.
+    assert {finding.ref_path for finding in report.findings} == _VALUE_REF_PATHS
+    assert report.checked_char_spans == checked_spans
+    assert report.checked_char_spans == report.total_char_spans
+
+
+def _tabular_envelope_from_artifact(
+    workspace_root: Path,
+    *,
+    sha256: str,
+    series_id: str = "s1",
+    value_origin: ValueOrigin = ValueOrigin.EXPERIMENTAL,
+    measurements: tuple[MeasurementSpec, ...] = _SPECS,
+) -> DatasetEnvelope:
+    """Build the envelope this module's replay tests need, now that
+    ``produce_envelope_from_artifact`` refuses (P0-c: a CHAR_SPAN cannot ground
+    a series VALUE -- see ``DatasetEnvelope._validate_no_char_span_grounds_a_series_value``).
+
+    Deliberately a TEST fixture and not a resurrected producer. It emits what
+    the runtime cannot: ``TABULAR`` series whose values cite a ``TABLE_CELL``
+    that no table parser exists to find. That is exactly why it may not live in
+    ``carmel/`` -- shipping it would re-open the route V7 closed, one import
+    away.
+
+    Units and axis labels ARE still grounded as real char spans against the
+    real stored text, via the same ``ground_quote`` the live condition-set
+    producer uses. So these tests keep exercising genuine span re-slicing,
+    digest checking and store bookkeeping end to end; what they no longer
+    exercise is a char span standing behind a VALUE, which is the thing that
+    is now forbidden. Value-span replay is covered on the live path by
+    tests/test_condition_set_replay.py.
+    """
+    grounding = _prepare_grounding(
+        workspace_root, sha256, envelope_noun="dataset envelope", envelope_subject="A dataset"
+    )
+    axes: list[AxisDeclaration] = []
+    coordinates: list[Coordinate] = []
+    observations: list[Observation] = []
+    for index, spec in enumerate(sorted(measurements, key=lambda spec: spec.axis_id)):
+        label_locator = ground_quote(
+            grounding.text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
+        )
+        axes.append(
+            AxisDeclaration(
+                axis_id=spec.axis_id,
+                role=spec.role,
+                quantity_kind=spec.quantity_kind,
+                label_raw=spec.label_quote,
+                label_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=label_locator),
+            )
+        )
+        unit_locator = ground_quote(
+            grounding.text,
+            spec.unit_quote,
+            role=QuoteRole.UNIT,
+            occurrence=spec.unit_occurrence,
+            quantity=spec.quantity_kind,
+        )
+        value = MeasuredValue(
+            raw_text=spec.value_quote,
+            canonical_decimal_value=spec.value_quote,
+            repairs=(),
+            repair_dependency=SemanticDependencyUse(
+                dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            ),
+            quantity_kind=spec.quantity_kind,
+            unit_raw=spec.unit_quote,
+            unit_normalized=units.normalize_unit(spec.quantity_kind, spec.unit_quote, table=_ACTIVE.table),
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=SourceRef(
+                node_id=_ROOT_NODE_ID,
+                locator=TableCellLocator(
+                    row=index,
+                    col=1,
+                    table_key=CaptionLabelKey(kind=TableKeyKind.CAPTION_LABEL, label="Table 1"),
+                ),
+            ),
+            unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=unit_locator),
+        )
+        cell_uncertainty = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+        if spec.role is AxisRole.COORDINATE:
+            coordinates.append(Coordinate(axis_id=spec.axis_id, value=value, uncertainty=cell_uncertainty))
+        else:
+            observations.append(Observation(axis_id=spec.axis_id, value=value, uncertainty=cell_uncertainty))
+
+    point = DataPoint(
+        point_id="pt1",
+        coordinates=tuple(coordinates),
+        observations=tuple(observations),
+        composition=Absent(reason=AbsenceReason.SAME_AS_DATASET),
+    )
+    series = Series(
+        series_id=series_id,
+        source_form=SourceForm.TABULAR,
+        value_origin=value_origin,
+        axes=tuple(axes),
+        constants=(),
+        points=(point,),
+    )
+    return DatasetEnvelope(
+        source_graph=grounding.graph,
+        composition=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        series=(series,),
+        conversion_tables=(_ACTIVE.embedded,),
+    )
+
+
 def _produce_and_load(tmp_path: Path, text: str = _TEXT):
     stored_artifact = _store_synthetic_artifact(tmp_path, text)
     datasets_root = tmp_path / "datasets"
-    envelope = produce_envelope_from_artifact(
-        tmp_path,
-        sha256=stored_artifact.sha256,
-        series_id="s1",
-        value_origin=ValueOrigin.EXPERIMENTAL,
-        measurements=_SPECS,
-    )
+    envelope = _tabular_envelope_from_artifact(tmp_path, sha256=stored_artifact.sha256)
     stored_dataset = store_dataset_envelope(datasets_root, envelope)
     loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
     return stored_artifact, loaded
@@ -200,10 +348,7 @@ class TestReplayEnvelopeCleanRoundTrip:
     def test_replay_verifies_clean_round_trip(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         report = replay_envelope(tmp_path, loaded)
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
-        assert report.checked_char_spans == 6
-        assert report.evidence_failures == ()
-        assert report.evidence_unverifiable == ()
+        _assert_unverifiable_only_for_the_value_locators(report)
 
 
 class TestReplayEnvelopeCatchesMutation:
@@ -214,18 +359,12 @@ class TestReplayEnvelopeCatchesMutation:
         assert len(_TEXT) == len(_MUTATED_TEXT)
 
         datasets_root = tmp_path / "datasets"
-        envelope = produce_envelope_from_artifact(
-            tmp_path,
-            sha256=original.sha256,
-            series_id="s1",
-            value_origin=ValueOrigin.EXPERIMENTAL,
-            measurements=_SPECS,
-        )
+        envelope = _tabular_envelope_from_artifact(tmp_path, sha256=original.sha256)
         stored_dataset = store_dataset_envelope(datasets_root, envelope)
         loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
 
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(clean_report)
 
         # Corrupt the stored evidence *underneath the same sha256 node the
         # envelope already points at* is not representable (the store is
@@ -456,23 +595,28 @@ class TestReplayEnvelopeCatchesSpanResliceMismatchIndependentOfEvidence:
     def test_shifted_locator_offsets_fail_replay_even_with_untouched_evidence(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(clean_report)
 
         series = loaded.series[0]
         point = series.points[0]
         coordinate = point.coordinates[0]
         value = coordinate.value
-        locator = value.value_ref.locator
+        # The UNIT ref, not the value ref: after P0-c a series VALUE may not be
+        # grounded in a char span at all, so the unit is where a shiftable span
+        # now lives. The check under test is the re-slice comparison itself,
+        # which does not care which field the span hangs off.
+        assert value.unit_ref is not None
+        locator = value.unit_ref.locator
         assert isinstance(locator, CharSpanLocator)
 
         # Shift the span by one character in the SAME (untouched) evidence
         # text, so it now slices to something other than the recorded
-        # raw_text -- a structurally valid envelope (frozen models copied
+        # unit_raw -- a structurally valid envelope (frozen models copied
         # without re-validation) whose claim about the evidence is simply
         # wrong, exactly the kind of defect this check exists to catch.
         shifted_locator = locator.model_copy(update={"start": locator.start + 1, "end": locator.end + 1})
-        shifted_ref = value.value_ref.model_copy(update={"locator": shifted_locator})
-        shifted_value = value.model_copy(update={"value_ref": shifted_ref})
+        shifted_ref = value.unit_ref.model_copy(update={"locator": shifted_locator})
+        shifted_value = value.model_copy(update={"unit_ref": shifted_ref})
         shifted_coordinate = coordinate.model_copy(update={"value": shifted_value})
         shifted_coordinates = tuple(
             shifted_coordinate if c is coordinate else c for c in point.coordinates
@@ -520,7 +664,7 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
     def test_meta_json_sidecar_rewrite_does_not_launder_a_verified_result(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(clean_report)
 
         # Tamper with the files replay actually reads: the ADDRESSED
         # extraction record's extracted.json and the meta.json sidecar
@@ -941,7 +1085,7 @@ class TestReplayEnvelopeCatchesUnitBoundaryViolation:
         text_with_glued_bar = _TEXT + " The pressure was 1 bar(a) at closure."
         _stored_artifact, loaded = _produce_and_load(tmp_path, text=text_with_glued_bar)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(clean_report)
 
         series = loaded.series[0]
         point = series.points[0]
@@ -1259,20 +1403,20 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(report)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
-        assert report.findings == ()
 
     def test_the_evidence_outcome_is_unmoved_by_a_tampered_root_meta_json(self, tmp_path: Path) -> None:
         """Contract (d), tamper flavour: rewrite the root sidecar's own
         identity claims (extractor_version, derivation_binding) to garbage
         that would have FAILED the old root-derived cross-check. The
-        addressed record and the envelope are untouched, so the outcome must
-        remain VERIFIED with no findings -- the root sidecar is not part of
-        what an envelope asserts about itself.
+        addressed record and the envelope are untouched, so the evidence outcome
+        must be unmoved -- still unverifiable for the two value locators and
+        nothing else. The root sidecar is not part of what an envelope asserts
+        about itself.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
-        assert replay_envelope(tmp_path, loaded).evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(replay_envelope(tmp_path, loaded))
 
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         raw_meta = json.loads(root_meta_path.read_text(encoding="utf-8"))
@@ -1282,29 +1426,27 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
-        assert report.findings == ()
+        _assert_unverifiable_only_for_the_value_locators(report)
 
     def test_the_evidence_outcome_is_unmoved_by_an_unparseable_root_meta_json(self, tmp_path: Path) -> None:
         """Contract (d), corruption flavour: the root sidecar is not even
         JSON any more. A replayer that still consulted it would crash or
-        report UNVERIFIABLE; one that honestly ignores it must still return
-        an evidence outcome of VERIFIED with no findings. The overall outcome
+        report a NEW problem; one that honestly ignores it must leave the
+        evidence outcome exactly where it was. The overall outcome
         does move, though: an unparseable root sidecar leaves its own claim
         unchecked, which is exactly what downgrades ``overall_outcome`` to
         UNVERIFIABLE -- that is not the dependence this test guards against.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
-        assert replay_envelope(tmp_path, loaded).evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(replay_envelope(tmp_path, loaded))
 
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         root_meta_path.write_bytes(b"\x00not json at all")
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        _assert_unverifiable_only_for_the_value_locators(report)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
-        assert report.findings == ()
 
 
 class TestReplayCrossChecksRecordIdentityAgainstTheBinding:
@@ -1943,8 +2085,10 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
 
         assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
         assert report.evidence_failures == ()
-        # One char-span label_ref became a BBox ref, so 5 of the original 6 remain.
-        assert report.checked_char_spans == 5
+        # One char-span label_ref became a BBox ref, so 3 of the 4 char spans
+        # this envelope still has (two units, two labels) remain -- the two
+        # VALUE refs are TABLE_CELLs and were never char spans to begin with.
+        assert report.checked_char_spans == 3
         reasons = [f.reason for f in report.evidence_unverifiable]
         assert any(
             "label_ref" in r and "BBoxLocator" in r for r in reasons
