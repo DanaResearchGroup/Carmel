@@ -64,6 +64,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
+from typing import Protocol
 
 from carmel.agents.tools.extract import ExtractedText
 from carmel.schemas.datasets import (
@@ -1041,10 +1042,43 @@ def _current_repair_dependency() -> SemanticDependencyUse:
     )
 
 
+class _ValueQuoteSpec(Protocol):
+    """The quote fields :func:`_measured_value` actually reads off a spec.
+
+    Deliberately NARROWER than :class:`MeasurementSpec`: a condition-set scalar
+    claim carries no ``axis_id`` and no :class:`AxisRole`, because it is not a
+    point on a series -- it is one stated condition. Typing the helper against
+    what it READS rather than against one caller's concrete class is what lets
+    both producers share it without either borrowing the other's vocabulary.
+    The identifying string for refusal messages is passed separately as
+    ``where``, so neither producer has to invent a field the other's domain
+    has no word for.
+    """
+
+    # Declared as read-only properties, not bare attributes: every spec that
+    # satisfies this Protocol is a FROZEN dataclass, and a mutable Protocol
+    # member cannot be satisfied by a read-only attribute.
+    @property
+    def quantity_kind(self) -> QuantityKind: ...
+
+    @property
+    def value_quote(self) -> str: ...
+
+    @property
+    def unit_quote(self) -> str: ...
+
+    @property
+    def value_occurrence(self) -> int | None: ...
+
+    @property
+    def unit_occurrence(self) -> int | None: ...
+
+
 def _measured_value(
     text: str,
-    spec: MeasurementSpec,
+    spec: _ValueQuoteSpec,
     *,
+    where: str,
     document_source_context: SourceContext,
     document_glyph_health: GlyphHealth,
 ) -> MeasuredValue:
@@ -1088,7 +1122,7 @@ def _measured_value(
     )
     if isinstance(canary, Unresolvable):
         raise DatasetProducerError(
-            f"value quote {spec.value_quote!r} for axis {spec.axis_id!r} is refused under the "
+            f"value quote {spec.value_quote!r} for {where} is refused under the "
             f"document's REAL source context ({document_source_context!r}) and glyph health "
             f"({document_glyph_health!r}): {canary.reason} -- this is the P1-D quarantine canary; "
             "the value may be genuinely corrupt in this document even though it would parse fine "
@@ -1101,21 +1135,21 @@ def _measured_value(
     )
     if isinstance(normalized, Unresolvable):
         raise DatasetProducerError(
-            f"value quote {spec.value_quote!r} for axis {spec.axis_id!r} is not derivable into a "
+            f"value quote {spec.value_quote!r} for {where} is not derivable into a "
             f"numeral: {normalized.reason}"
         )
     try:
         canonical = canonical_decimal(normalized.text)
     except CanonicalDecimalError as exc:
         raise DatasetProducerError(
-            f"value quote {spec.value_quote!r} for axis {spec.axis_id!r} repaired to "
+            f"value quote {spec.value_quote!r} for {where} repaired to "
             f"{normalized.text!r}, which is not a valid canonical decimal string: {exc}"
         ) from exc
     try:
         unit_normalized = units.normalize_unit(spec.quantity_kind, spec.unit_quote, table=_ACTIVE.table)
     except units.UnknownUnitError as exc:
         raise DatasetProducerError(
-            f"unit quote {spec.unit_quote!r} for axis {spec.axis_id!r} is not a known unit or alias "
+            f"unit quote {spec.unit_quote!r} for {where} is not a known unit or alias "
             f"of quantity_kind={spec.quantity_kind.value!r} in TABLE_V1: {exc}"
         ) from exc
     return MeasuredValue(
@@ -1287,79 +1321,57 @@ def _root_sidecar_claim(
     return RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
 
 
-def produce_envelope_from_artifact(
+@dataclass(frozen=True, slots=True)
+class _GroundingContext:
+    """Everything a producer needs from ONE authenticated stored artifact.
+
+    Built ONLY by :func:`_prepare_grounding`. This is the shared, fail-closed
+    preamble every envelope producer must run before it may grond a single
+    quote -- raw-bytes authentication, current-extraction selection, the
+    lossy-extraction refusal, and the honest content_type -> node kind
+    derivation. It is factored out rather than copied because a SECOND copy of
+    a security preamble is a second thing that can drift: a fix applied to one
+    producer's authentication path and not the other's is exactly the failure
+    this codebase's content-addressed store exists to make impossible.
+
+    Attributes:
+        text: The grounded text of the selected CURRENT extraction record.
+            Every char offset any producer emits indexes into THIS string.
+        graph: The one-node :class:`SourceGraph` whose root honestly states
+            what kind of document the artifact is and what was authenticated.
+        document_source_context: P1-D canary -- the artifact's REAL source
+            context, derived the way ``carmel.services.grounding`` derives it.
+        document_glyph_health: P1-D canary -- the artifact's REAL glyph health.
+    """
+
+    text: str
+    graph: SourceGraph
+    document_source_context: SourceContext
+    document_glyph_health: GlyphHealth
+
+
+def _prepare_grounding(
     workspace_root: Path,
-    *,
     sha256: str,
-    series_id: str,
-    value_origin: ValueOrigin,
-    measurements: tuple[MeasurementSpec, ...],
-) -> DatasetEnvelope:
-    """Build a fully validated :class:`DatasetEnvelope` from ONE stored artifact.
+    *,
+    envelope_noun: str = "dataset envelope",
+    envelope_subject: str = "A dataset",
+) -> _GroundingContext:
+    """Authenticate ``sha256`` and build the grounding context for a producer.
 
-    The vertical slice, end to end: authenticate ``raw.bin`` against the
-    artifact's own sha256 and read its ``content_type`` (see
-    :func:`_authenticate_raw_bytes_and_read_source_metadata`), select the one
-    CURRENT extraction record and take the grounded text from it, ground every
-    caller-stated quote in that text via
-    :func:`ground_quote`, and assemble one root node -- ``PAPER_PDF`` or
-    ``JATS_XML``, derived honestly from the artifact's own ``content_type``
-    (never hardcoded; an unrecognised ``content_type`` is refused, not
-    guessed) -- one ``TEXTUAL`` series, and one data point into an envelope
-    that passes every schema validator (construction runs pydantic's full
-    validation -- nothing here uses ``model_construct``).
-
-    ``source_form`` is fixed at ``TEXTUAL``: a :class:`CharSpanLocator` into
-    extracted running text is the only locator kind this runtime can actually
-    produce (the round-33 ruling that added it), and it is what every span
-    here is. ``value_origin`` is the caller's assertion, passed through --
-    see :class:`ValueOrigin` for why the schema records it unverified.
-
-    WHAT GROUNDING DOES AND DOES NOT PROVE (P1-F, restated at the call site
-    that matters most): every ``value_ref``/``unit_ref``/``label_ref`` this
-    function emits is independently verified to be an exact, located
-    substring of the one verified document -- that is the entire guarantee.
-    It is NOT verified that the value, unit, and label for a given axis were
-    stated TOGETHER, in the same sentence, table row, or even the same
-    paragraph. A caller can supply ``value_quote="1023"`` from one part of
-    the paper and ``unit_quote="K"`` from an unrelated part, and this
-    function will happily ground both and produce a fully schema-valid
-    envelope asserting they belong together. Closing that gap needs a bounded
-    measurement-context notion (e.g. requiring value/unit/label quotes to
-    fall within one caller-supplied span) that does not exist yet -- it is
-    intentionally out of scope for this vertical slice and is its own future
-    milestone. See ``TestGroundingIsIndependentPerQuote`` in the test suite
-    for a pinning test of this exact gap: if it starts failing, this
-    paragraph is stale and must be updated (or removed) alongside the fix.
-
-    Args:
-        workspace_root: Root of the campaign workspace holding the evidence
-            store.
-        sha256: Raw-bytes sha256 of the stored artifact to ground against.
-        series_id: Id for the single produced series.
-        value_origin: How the numbers were produced, as asserted by the
-            caller.
-        measurements: One :class:`MeasurementSpec` per axis; at least one
-            ``COORDINATE`` and one ``OBSERVATION`` role are required (by the
-            schema's own S3/S4 validators). ``CONSTANT`` is not supported by
-            this producer.
-
-    Returns:
-        The validated envelope.
+    ``envelope_noun``/``envelope_subject`` appear ONLY in refusal messages, so a
+    condition-set refusal does not misname itself a dataset refusal. Both default
+    to the dataset path's original wording, so that path's diagnostics are
+    byte-identical to the inline block this was extracted from -- a refactor that
+    quietly reworded a refusal would be a behaviour change hiding inside a
+    "pure" extraction, and no test asserts those strings to catch it.
 
     Raises:
-        DatasetProducerError: Artifact missing/legacy/corrupt, a value quote
-            not derivable into a numeral, an unknown unit, or a ``CONSTANT``
-            role spec.
-        QuoteGroundingError: A quote that cannot be grounded unambiguously.
+        DatasetProducerError: The artifact is missing/legacy/corrupt, has no
+            usable current extraction record, was extracted lossily, or has a
+            ``content_type`` that maps to no ``SourceNodeKind`` this producer
+            may honestly assert.
     """
-    for spec in measurements:
-        if spec.role is AxisRole.CONSTANT:
-            raise DatasetProducerError(
-                f"MeasurementSpec for axis {spec.axis_id!r} has role=CONSTANT, which this producer "
-                "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
-            )
-
     content_type, root_sidecar_claim = _authenticate_raw_bytes_and_read_source_metadata(
         workspace_root, sha256
     )
@@ -1384,7 +1396,7 @@ def produce_envelope_from_artifact(
     if selection.kind is not CurrentSelectionKind.SELECTED or selection.selected is None:
         raise DatasetProducerError(
             f"artifact {sha256!r} has no usable current extraction record ({selection.detail}); "
-            "refusing to produce a dataset envelope. A dataset must be grounded in a genuinely "
+            f"refusing to produce a {envelope_noun}. {envelope_subject} must be grounded in a genuinely "
             "stored extraction, and this producer will not mint a record from the root sidecar's "
             "text to satisfy its own binding -- that would launder unauthenticated text into an "
             "address the corpus gate treats as authenticated. Re-extract the artifact first"
@@ -1405,7 +1417,7 @@ def produce_envelope_from_artifact(
         )
         raise DatasetProducerError(
             f"artifact {sha256!r} was extracted lossily (extractor={extracted.extractor!r}){page_note}; "
-            "refusing to produce a dataset envelope from a knowingly-partial extraction"
+            f"refusing to produce a {envelope_noun} from a knowingly-partial extraction"
         )
     node_kind = _CONTENT_TYPE_TO_NODE_KIND.get(content_type)
     if node_kind is None:
@@ -1489,6 +1501,92 @@ def produce_envelope_from_artifact(
         ),
     )
     graph = SourceGraph(nodes=(root_node,))
+    return _GroundingContext(
+        text=text,
+        graph=graph,
+        document_source_context=document_source_context,
+        document_glyph_health=document_glyph_health,
+    )
+
+
+def produce_envelope_from_artifact(
+    workspace_root: Path,
+    *,
+    sha256: str,
+    series_id: str,
+    value_origin: ValueOrigin,
+    measurements: tuple[MeasurementSpec, ...],
+) -> DatasetEnvelope:
+    """Build a fully validated :class:`DatasetEnvelope` from ONE stored artifact.
+
+    The vertical slice, end to end: authenticate ``raw.bin`` against the
+    artifact's own sha256 and read its ``content_type`` (see
+    :func:`_authenticate_raw_bytes_and_read_source_metadata`), select the one
+    CURRENT extraction record and take the grounded text from it, ground every
+    caller-stated quote in that text via
+    :func:`ground_quote`, and assemble one root node -- ``PAPER_PDF`` or
+    ``JATS_XML``, derived honestly from the artifact's own ``content_type``
+    (never hardcoded; an unrecognised ``content_type`` is refused, not
+    guessed) -- one ``TEXTUAL`` series, and one data point into an envelope
+    that passes every schema validator (construction runs pydantic's full
+    validation -- nothing here uses ``model_construct``).
+
+    ``source_form`` is fixed at ``TEXTUAL``: a :class:`CharSpanLocator` into
+    extracted running text is the only locator kind this runtime can actually
+    produce (the round-33 ruling that added it), and it is what every span
+    here is. ``value_origin`` is the caller's assertion, passed through --
+    see :class:`ValueOrigin` for why the schema records it unverified.
+
+    WHAT GROUNDING DOES AND DOES NOT PROVE (P1-F, restated at the call site
+    that matters most): every ``value_ref``/``unit_ref``/``label_ref`` this
+    function emits is independently verified to be an exact, located
+    substring of the one verified document -- that is the entire guarantee.
+    It is NOT verified that the value, unit, and label for a given axis were
+    stated TOGETHER, in the same sentence, table row, or even the same
+    paragraph. A caller can supply ``value_quote="1023"`` from one part of
+    the paper and ``unit_quote="K"`` from an unrelated part, and this
+    function will happily ground both and produce a fully schema-valid
+    envelope asserting they belong together. Closing that gap needs a bounded
+    measurement-context notion (e.g. requiring value/unit/label quotes to
+    fall within one caller-supplied span) that does not exist yet -- it is
+    intentionally out of scope for this vertical slice and is its own future
+    milestone. See ``TestGroundingIsIndependentPerQuote`` in the test suite
+    for a pinning test of this exact gap: if it starts failing, this
+    paragraph is stale and must be updated (or removed) alongside the fix.
+
+    Args:
+        workspace_root: Root of the campaign workspace holding the evidence
+            store.
+        sha256: Raw-bytes sha256 of the stored artifact to ground against.
+        series_id: Id for the single produced series.
+        value_origin: How the numbers were produced, as asserted by the
+            caller.
+        measurements: One :class:`MeasurementSpec` per axis; at least one
+            ``COORDINATE`` and one ``OBSERVATION`` role are required (by the
+            schema's own S3/S4 validators). ``CONSTANT`` is not supported by
+            this producer.
+
+    Returns:
+        The validated envelope.
+
+    Raises:
+        DatasetProducerError: Artifact missing/legacy/corrupt, a value quote
+            not derivable into a numeral, an unknown unit, or a ``CONSTANT``
+            role spec.
+        QuoteGroundingError: A quote that cannot be grounded unambiguously.
+    """
+    for spec in measurements:
+        if spec.role is AxisRole.CONSTANT:
+            raise DatasetProducerError(
+                f"MeasurementSpec for axis {spec.axis_id!r} has role=CONSTANT, which this producer "
+                "does not support -- every spec must be a per-point COORDINATE or OBSERVATION"
+            )
+
+    grounding = _prepare_grounding(workspace_root, sha256)
+    text = grounding.text
+    graph = grounding.graph
+    document_source_context = grounding.document_source_context
+    document_glyph_health = grounding.document_glyph_health
 
     axes: list[AxisDeclaration] = []
     coordinates: list[Coordinate] = []
@@ -1509,6 +1607,7 @@ def produce_envelope_from_artifact(
         value = _measured_value(
             text,
             spec,
+            where=f"axis {spec.axis_id!r}",
             document_source_context=document_source_context,
             document_glyph_health=document_glyph_health,
         )
