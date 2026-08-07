@@ -160,6 +160,7 @@ __all__ = [
     "ValueOrigin",
     "XPathLocator",
     "iter_measured_values",
+    "iter_uncertainties",
     "iter_source_refs",
 ]
 
@@ -1395,6 +1396,47 @@ def iter_measured_values(obj: object, _path: str = "") -> Iterator[tuple[str, Me
     if isinstance(obj, (list, tuple)):
         for index, value in enumerate(obj):
             yield from iter_measured_values(value, f"{_path}[{index}]")
+        return
+    return
+
+
+def iter_uncertainties(obj: object, _path: str = "") -> Iterator[tuple[str, Uncertainty]]:
+    """Recursively walk ``obj``, yielding ``(dotted_path, uncertainty)`` for every
+    :class:`Uncertainty` reachable from it.
+
+    Mirrors :func:`iter_measured_values` exactly, and exists for the same
+    reason a second walk exists anywhere in this module: it is the INDEPENDENT
+    side of a duplication check. ``carmel.services.dataset_replay`` enumerates
+    the uncertainty sites an envelope carries BY HAND, because deciding which
+    fields are assertions about the paper (``kind``, ``basis``, ``scale``) and
+    which are self-describing machinery is a semantic judgment no generic walk
+    can make. Reconciling that hand-written inventory against this walk is what
+    stops the inventory silently going stale when a new ``Uncertainty``-bearing
+    field is added -- and the reconciliation is only meaningful because the two
+    are written separately. Deriving either from the other would make it a
+    tautology that always passes.
+
+    Unlike :func:`iter_measured_values`, this walk DOES recurse into the yielded
+    object: an ``Uncertainty``'s ``upper``/``lower`` are :class:`MeasuredValue`
+    bounds and are not uncertainties themselves, so there is no risk of yielding
+    a nested ``Uncertainty`` twice, and stopping here would be an arbitrary
+    difference from the sibling walk rather than a considered one.
+    """
+    if isinstance(obj, Uncertainty):
+        yield _path, obj
+    if isinstance(obj, BaseModel):
+        for name in type(obj).model_fields:
+            value = getattr(obj, name)
+            child_path = f"{_path}.{name}" if _path else name
+            yield from iter_uncertainties(value, child_path)
+        return
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            yield from iter_uncertainties(value, f"{_path}[{key}]")
+        return
+    if isinstance(obj, (list, tuple)):
+        for index, value in enumerate(obj):
+            yield from iter_uncertainties(value, f"{_path}[{index}]")
         return
     return
 

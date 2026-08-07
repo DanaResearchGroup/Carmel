@@ -1328,7 +1328,7 @@ class TestProducerEndToEnd:
         # re-verifies extracted.json from disk and re-slices every span in
         # the LOADED envelope against it.
         report = replay_envelope(tmp_path, loaded)
-        assert report.overall_outcome is ReplayOutcome.VERIFIED, report.findings
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED, report.findings
         assert report.evidence_failures == ()
         assert report.evidence_unverifiable == ()
         # 2 axes x (value_ref + unit_ref + label_ref) = 6 char-span refs.
@@ -1389,7 +1389,7 @@ class TestProducerEndToEnd:
 
         # Sanity: replay passes clean against the untouched evidence...
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
+        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
         assert clean_report.checked_char_spans == 6
 
         # ...then tamper with the SAME extraction record's extracted.json on
@@ -1990,7 +1990,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.overall_outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.unchecked_store_claims == ()
 
 
@@ -2351,15 +2351,35 @@ class TestFigureFurnitureFabricatesAVerifiedEnvelope:
     def test_replay_verifies_an_envelope_whose_every_number_is_a_tick(
         self, tmp_path: Path
     ) -> None:
-        """The full round trip -- store, re-read, re-slice every span -- reports
-        ``VERIFIED`` with nothing to say. This is the defect in one assertion:
-        the strongest verdict the system can issue, over fabricated data."""
+        """The full round trip -- store, re-read, re-slice every span -- still
+        reports ``VERIFIED`` on the EVIDENCE axis with nothing to say. This is
+        the defect in one assertion: the strongest verdict the evidence scope
+        can issue, over fabricated data.
+
+        ``overall_outcome`` no longer says ``VERIFIED`` here, and it is worth
+        being exact about why, because it would be easy to read this as the
+        defect having been fixed. It has not. The ref-less obligations added
+        for ``quantity_kind`` downgrade the OVERALL verdict for a reason that
+        has nothing to do with fabrication -- the fabricated figure furniture
+        happens to carry a dimensionless unit whose quantity kind no ref
+        supports. Every number here is still a chart tick, every span still
+        re-slices clean, and nothing in the report says so. The evidence axis
+        is where the defect lives, and this asserts on the evidence axis so
+        that a future fix has to move THAT verdict, not a neighbouring one.
+        """
         envelope = self._envelope(tmp_path)
         report = replay_envelope(tmp_path, envelope)
 
-        assert report.overall_outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.findings == ()
         assert report.unchecked_store_claims == ()
+        # The overall verdict moved, but only via the unrelated quantity-kind
+        # obligation -- pinned so that "P0-c is fixed" cannot be concluded from
+        # a green suite alone.
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+        assert {claim.claim_path.rsplit(".", 1)[-1] for claim in report.unchecked_semantic_claims} == {
+            "quantity_kind"
+        }
         # Not vacuous: spans were actually checked, and all of them were.
         assert report.total_char_spans > 0
         assert report.checked_char_spans == report.total_char_spans

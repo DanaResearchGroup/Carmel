@@ -214,9 +214,12 @@ from carmel.schemas.datasets import (
     RootSidecarVerification,
     SourceNode,
     SourceRef,
+    Uncertainty,
+    UncertaintyKind,
     UnresolvedSubject,
     iter_measured_values,
     iter_source_refs,
+    iter_uncertainties,
 )
 from carmel.schemas.literature import StoredArtifact
 from carmel.services import units
@@ -1461,6 +1464,273 @@ def _semantic_ref_gap(
     return SemanticGap.SUPPORT_UNRECORDED
 
 
+def _claim_text(value: object) -> str:
+    """Render a derived value for an :class:`UncheckedSemanticClaim`'s ``claim``
+    field without trusting it to be a well-formed enum.
+
+    Every caller here reads a field the schema types as an enum, and on a
+    VALIDATED envelope it always is one. The public replay entry points accept
+    an already-constructed object, though, so ``model_construct`` can hand this
+    module a ``None`` or a string look-alike where an enum belongs. Reaching
+    straight for ``.value`` would then raise ``AttributeError`` out of the
+    middle of a replay -- and a replayer owes a verdict about broken input, not
+    a traceback (the same rule that made the report's span arithmetic report
+    rather than raise). Falling back to ``repr`` keeps the claim honest about
+    what it actually found.
+    """
+    inner = getattr(value, "value", None)
+    return inner if isinstance(inner, str) else repr(value)
+
+
+def _kinds_admitting_unit(table: units.ConversionTable, unit_raw: str) -> tuple[QuantityKind, ...]:
+    """Which :class:`~carmel.services.units.QuantityKind`\\ s the RECORDED table
+    accepts ``unit_raw`` for, in declaration order, EXCLUDING
+    :attr:`~carmel.services.units.QuantityKind.OTHER`.
+
+    This is deliberately the INVERSE of the predicate
+    :func:`verify_measured_value_unit` already enforces ("``unit_raw`` is a
+    known unit or alias of THIS kind in the recorded table"). Asking it of
+    every kind at once is what says whether that predicate discriminates at
+    all: one admitting kind means the unit pins the quantity and the existing
+    validator already closed the question; several means the unit is
+    consistent with any of them and nothing in the envelope says which the
+    paper meant.
+
+    ``OTHER`` is excluded, and the exclusion is load-bearing rather than
+    tidy-minded. ``OTHER`` is a wildcard for a quantity this codebase does not
+    model, so it accepts ANY unit string -- measured, it admits ``'atm'``,
+    ``'wibble'`` and ``'furlongs per fortnight'`` alike. Counting it would
+    therefore put every value in the corpus at two-or-more admitting kinds and
+    make this predicate fire everywhere, which is precisely the blanket rule
+    this enumerator exists to avoid. ``OTHER`` needs no claim of its own
+    either: :func:`verify_measured_value_unit_boundary` already reports it
+    ``UNVERIFIABLE`` as an unmodelled quantity, so it is never silently clean.
+    """
+    admitting: list[QuantityKind] = []
+    for kind in QuantityKind:
+        if kind is QuantityKind.OTHER:
+            continue
+        try:
+            units.normalize_unit(kind, unit_raw, table=table)
+        except units.UnknownUnitError:
+            continue
+        admitting.append(kind)
+    return tuple(admitting)
+
+
+def _quantity_kind_claim(path: str, value: MeasuredValue) -> UncheckedSemanticClaim | None:
+    """The obligation ``value.quantity_kind`` imposes, or ``None`` if the
+    recorded table already pins it.
+
+    ``quantity_kind`` is not merely descriptive: it decides which conversion
+    the value admits and what ``"%"``, ``"1"`` and ``"ppm"` MEAN. Nothing in
+    the envelope grounds the choice -- ``MeasuredValue`` carries a
+    ``value_ref`` for the number and a ``unit_ref`` for the unit, and no ref
+    at all for the quantity. What stands in for grounding is the table
+    lookup, and it works only as far as the unit spelling discriminates.
+    Where several kinds accept the same spelling it establishes nothing, and
+    the report must say so rather than let a table lookup that could not
+    fail read as a check that passed.
+    """
+    try:
+        table = units.table_for_sha(value.conversion_table_sha256)
+    except units.UnknownConversionTableError:
+        # Fail closed. verify_measured_value_unit already reports the
+        # unresolvable sha as UNVERIFIABLE; what is added here is that the
+        # AMBIGUITY question cannot be decided either, so the kind cannot be
+        # called pinned. Staying silent would let an unresolvable table read
+        # as an unambiguous one.
+        return UncheckedSemanticClaim(
+            claim_path=f"{path}.quantity_kind",
+            claim=_claim_text(value.quantity_kind),
+            gap=SemanticGap.NO_SUPPORT_OFFERED,
+            reason=f"conversion_table_sha256={value.conversion_table_sha256!r} names no known "
+            "conversion table, so whether the recorded unit spelling pins this quantity kind "
+            "cannot be decided at all; no ref supports the choice independently",
+        )
+    admitting = _kinds_admitting_unit(table, value.unit_raw)
+    if len(admitting) < 2:
+        return None
+    candidates = ", ".join(kind.value for kind in admitting)
+    return UncheckedSemanticClaim(
+        claim_path=f"{path}.quantity_kind",
+        claim=_claim_text(value.quantity_kind),
+        gap=SemanticGap.NO_SUPPORT_OFFERED,
+        reason=f"unit_raw={value.unit_raw!r} is admitted by {len(admitting)} quantity kinds in the "
+        f"recorded conversion table {value.conversion_table_sha256!r} ({candidates}), so the unit "
+        "does not pin the quantity, and no ref supports the recorded choice: MeasuredValue grounds "
+        "its number and its unit, never its quantity kind",
+    )
+
+
+def _uncertainty_claims(path: str, uncertainty: Uncertainty) -> tuple[UncheckedSemanticClaim, ...]:
+    """The obligations an :class:`~carmel.schemas.datasets.Uncertainty`'s own
+    fields impose. Its bounds are :class:`MeasuredValue`\\ s and are handled
+    with every other measured value; these three fields are not.
+
+    ``kind``, ``basis`` and ``scale`` decide how a downstream consumer may
+    combine this figure with any other, and :class:`Uncertainty` carries no
+    :class:`SourceRef` on any field -- measured, all three construct freely in
+    every combination of bounds present and absent. This is
+    :attr:`SemanticGap.NO_SUPPORT_OFFERED` in its purest form: not a location
+    recorded without a meaning, but no location at all.
+
+    Only CONCRETE assertions are reported. An :class:`Absent` ``basis`` or
+    ``scale``, and the :attr:`UncertaintyKind.UNKNOWN` /
+    :attr:`UncertaintyKind.UNSPECIFIED_PERCENTAGE` sentinels, are recorded
+    REFUSALS -- the envelope declining to state what the paper never stated.
+    Reporting those as unsupported claims would invert the narrow honest
+    slice, treating the honest answer as the defect.
+    """
+    claims: list[UncheckedSemanticClaim] = []
+    if uncertainty.kind not in (UncertaintyKind.UNKNOWN, UncertaintyKind.UNSPECIFIED_PERCENTAGE):
+        claims.append(
+            UncheckedSemanticClaim(
+                claim_path=f"{path}.kind",
+                claim=_claim_text(uncertainty.kind),
+                gap=SemanticGap.NO_SUPPORT_OFFERED,
+                reason="Uncertainty carries no SourceRef on any field, so nothing locates where "
+                "the paper stated this statistical kind; it decides whether the figure may be "
+                "combined as a standard deviation or a confidence interval",
+            )
+        )
+    for field_name, field_value in (("basis", uncertainty.basis), ("scale", uncertainty.scale)):
+        if isinstance(field_value, Absent):
+            continue
+        claims.append(
+            UncheckedSemanticClaim(
+                claim_path=f"{path}.{field_name}",
+                claim=_claim_text(field_value),
+                gap=SemanticGap.NO_SUPPORT_OFFERED,
+                reason=f"Uncertainty carries no SourceRef on any field, so nothing locates where "
+                f"the paper stated this {field_name}; it changes how the recorded magnitude is "
+                "interpreted",
+            )
+        )
+    return tuple(claims)
+
+
+def _condition_set_uncertainty_sites(
+    envelope: ConditionSetEnvelope,
+) -> tuple[tuple[str, Uncertainty], ...]:
+    """Every place a :class:`ConditionSetEnvelope` can hold an
+    :class:`Uncertainty`, named BY HAND.
+
+    Deliberately not derived from :func:`iter_uncertainties`, for the reason
+    :func:`_condition_set_text_pairings` is not derived from
+    :func:`iter_source_refs`: the two are reconciled against each other, and a
+    check whose two sides come from one source is a tautology. Paths use the
+    same index form the walk produces, so the comparison is exact rather than
+    approximate.
+    """
+    sites: list[tuple[str, Uncertainty]] = []
+    for index, claim in enumerate(envelope.scalar_claims):
+        if isinstance(claim.uncertainty, Uncertainty):
+            sites.append((f"scalar_claims[{index}].uncertainty", claim.uncertainty))
+    return tuple(sites)
+
+
+def _dataset_uncertainty_sites(envelope: DatasetEnvelope) -> tuple[tuple[str, Uncertainty], ...]:
+    """Every place a :class:`DatasetEnvelope` can hold an :class:`Uncertainty`,
+    named BY HAND. See :func:`_condition_set_uncertainty_sites` for why this is
+    not derived from the walk.
+    """
+    sites: list[tuple[str, Uncertainty]] = []
+    for series_index, series in enumerate(envelope.series):
+        base = f"series[{series_index}]"
+        for constant_index, constant in enumerate(series.constants):
+            if isinstance(constant.uncertainty, Uncertainty):
+                sites.append((f"{base}.constants[{constant_index}].uncertainty", constant.uncertainty))
+        for point_index, point in enumerate(series.points):
+            point_path = f"{base}.points[{point_index}]"
+            for coord_index, coordinate in enumerate(point.coordinates):
+                if isinstance(coordinate.uncertainty, Uncertainty):
+                    sites.append(
+                        (f"{point_path}.coordinates[{coord_index}].uncertainty", coordinate.uncertainty)
+                    )
+            for obs_index, observation in enumerate(point.observations):
+                if isinstance(observation.uncertainty, Uncertainty):
+                    sites.append(
+                        (f"{point_path}.observations[{obs_index}].uncertainty", observation.uncertainty)
+                    )
+    return tuple(sites)
+
+
+def _reconcile_uncertainty_sites(
+    envelope: ConditionSetEnvelope | DatasetEnvelope,
+    named_paths: AbstractSet[str],
+) -> tuple[ReplayFinding, ...]:
+    """Reconcile a hand-written uncertainty inventory against a fresh, generic
+    walk of the envelope, in BOTH directions.
+
+    A path the walk finds but the inventory never named is an obligation that
+    would go unreported -- the failure mode a hand-written list has and a walk
+    does not, and the whole reason this check exists. A path the inventory
+    named but the walk cannot reach is the opposite failure: a stale or
+    mistyped entry claiming coverage of something that is not there. Neither is
+    softened into a count; each names its own path, because a bare "2 != 3"
+    cannot be acted on.
+    """
+    findings: list[ReplayFinding] = []
+    walked_paths = {path for path, _ in iter_uncertainties(envelope)}
+    for path in sorted(walked_paths - set(named_paths)):
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason="the generic uncertainty walk reaches this path but the hand-written "
+                "obligation inventory never named it, so its kind/basis/scale would go "
+                "unreported: the inventory has gone stale against the schema",
+            )
+        )
+    for path in sorted(set(named_paths) - walked_paths):
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason="the hand-written obligation inventory names this path but the generic "
+                "walk cannot reach it, so the inventory claims coverage of an uncertainty that "
+                "is not in this envelope",
+            )
+        )
+    return tuple(findings)
+
+
+def _derived_value_claims(
+    envelope: ConditionSetEnvelope | DatasetEnvelope,
+    uncertainty_sites: tuple[tuple[str, Uncertainty], ...],
+) -> tuple[UncheckedSemanticClaim, ...]:
+    """Every :attr:`SemanticGap.NO_SUPPORT_OFFERED` obligation this envelope
+    imposes: a derived value that decides interpretation and that no ref
+    supports.
+
+    The hand-written judgment here is over FIELDS, not paths -- which fields
+    are assertions about the source document (``quantity_kind``,
+    ``Uncertainty.kind``/``basis``/``scale``) versus self-describing machinery
+    (``conversion_table_sha256``, ``SourceRef.node_id``, every content
+    address). That distinction is semantic and no walk can make it, which is
+    why enumerating it by hand is the point rather than an inconvenience.
+    Measured on a small envelope, treating EVERY ref-less field as an
+    obligation instead would emit 122 claims to carry the 3 that decide
+    anything.
+
+    Measured-value paths come from :func:`iter_measured_values` on purpose: the
+    per-field judgment is already hand-written in :func:`_quantity_kind_claim`,
+    so a second hand-written path list would add brittleness without adding a
+    check. Uncertainty sites are the reverse -- there is no per-field predicate
+    to gate them, so the inventory IS the judgment and is reconciled against
+    its own walk by :func:`_reconcile_uncertainty_sites`.
+    """
+    claims: list[UncheckedSemanticClaim] = []
+    for path, value in iter_measured_values(envelope):
+        claim = _quantity_kind_claim(path, value)
+        if claim is not None:
+            claims.append(claim)
+    for path, uncertainty in uncertainty_sites:
+        claims.extend(_uncertainty_claims(path, uncertainty))
+    return tuple(claims)
+
+
 def _condition_set_semantic_claims(
     envelope: ConditionSetEnvelope,
     text_by_node_id: Mapping[str, str],
@@ -2282,8 +2552,24 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # carries it for that purpose.
     node_level_findings = tuple(node_level_problems.values())
 
+    # The dataset path carries the SAME ref-less obligations as the condition-set
+    # path, and for the same reason: `MeasuredValue` and `Uncertainty` occur in
+    # both envelope types. Emitting them on only one side would leave
+    # `overall_outcome`'s promise ("every check ran, and nothing is left
+    # untested") overclaimed here while it was honest there -- a difference no
+    # consumer could see and none would expect (Codex round 89).
+    uncertainty_sites = _dataset_uncertainty_sites(envelope)
+    uncertainty_reconciliation = _reconcile_uncertainty_sites(
+        envelope, {path for path, _ in uncertainty_sites}
+    )
+    semantic_claims = _derived_value_claims(envelope, uncertainty_sites)
+
     all_findings = (
-        tuple(span_findings) + tuple(unit_findings) + node_level_findings + tuple(claim_findings)
+        tuple(span_findings)
+        + tuple(unit_findings)
+        + node_level_findings
+        + tuple(claim_findings)
+        + uncertainty_reconciliation
     )
 
     # A replay that independently re-sliced ZERO character spans must never
@@ -2314,6 +2600,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         unchecked_char_spans=total_char_spans - checked,
         findings=all_findings,
         unchecked_store_claims=tuple(unchecked_store_claims),
+        unchecked_semantic_claims=semantic_claims,
     )
 
 
@@ -2407,7 +2694,17 @@ def replay_condition_set(
         if value_boundary_finding is not None:
             unit_findings.append(value_boundary_finding)
 
-    semantic_claims = _condition_set_semantic_claims(envelope, text_by_node_id, node_problems)
+    # Obligations from LOCATED-BUT-UNEXPLAINED support, then obligations from
+    # values nothing locates at all. Both live in one list because a consumer
+    # asks one question ("what did this replay not check?"), and they are told
+    # apart by `gap` -- which is exactly what SemanticGap is for.
+    uncertainty_sites = _condition_set_uncertainty_sites(envelope)
+    uncertainty_reconciliation = _reconcile_uncertainty_sites(
+        envelope, {path for path, _ in uncertainty_sites}
+    )
+    semantic_claims = _condition_set_semantic_claims(
+        envelope, text_by_node_id, node_problems
+    ) + _derived_value_claims(envelope, uncertainty_sites)
     support_only_char_spans = sum(1 for claim in semantic_claims if claim.gap is SemanticGap.SUPPORT_UNRECORDED)
 
     # Independent reconciliation: every path either the hand-written pairing
@@ -2454,6 +2751,7 @@ def replay_condition_set(
         + node_level_findings
         + tuple(claim_findings)
         + reconciliation_findings
+        + uncertainty_reconciliation
     )
 
     # A replay that independently re-sliced ZERO paired character spans must

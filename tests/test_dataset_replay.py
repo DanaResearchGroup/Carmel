@@ -200,7 +200,7 @@ class TestReplayEnvelopeCleanRoundTrip:
     def test_replay_verifies_clean_round_trip(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         report = replay_envelope(tmp_path, loaded)
-        assert report.overall_outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.checked_char_spans == 6
         assert report.evidence_failures == ()
         assert report.evidence_unverifiable == ()
@@ -225,7 +225,7 @@ class TestReplayEnvelopeCatchesMutation:
         loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
 
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
+        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
 
         # Corrupt the stored evidence *underneath the same sha256 node the
         # envelope already points at* is not representable (the store is
@@ -456,7 +456,7 @@ class TestReplayEnvelopeCatchesSpanResliceMismatchIndependentOfEvidence:
     def test_shifted_locator_offsets_fail_replay_even_with_untouched_evidence(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
+        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
 
         series = loaded.series[0]
         point = series.points[0]
@@ -520,7 +520,7 @@ class TestReplayEnvelopeRejectsMutableSidecarAsAnchor:
     def test_meta_json_sidecar_rewrite_does_not_launder_a_verified_result(self, tmp_path: Path) -> None:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
+        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
 
         # Tamper with the files replay actually reads: the ADDRESSED
         # extraction record's extracted.json and the meta.json sidecar
@@ -941,7 +941,7 @@ class TestReplayEnvelopeCatchesUnitBoundaryViolation:
         text_with_glued_bar = _TEXT + " The pressure was 1 bar(a) at closure."
         _stored_artifact, loaded = _produce_and_load(tmp_path, text=text_with_glued_bar)
         clean_report = replay_envelope(tmp_path, loaded)
-        assert clean_report.overall_outcome is ReplayOutcome.VERIFIED
+        assert clean_report.evidence_outcome is ReplayOutcome.VERIFIED
 
         series = loaded.series[0]
         point = series.points[0]
@@ -1272,7 +1272,7 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
         what an envelope asserts about itself.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
-        assert replay_envelope(tmp_path, loaded).overall_outcome is ReplayOutcome.VERIFIED
+        assert replay_envelope(tmp_path, loaded).evidence_outcome is ReplayOutcome.VERIFIED
 
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         raw_meta = json.loads(root_meta_path.read_text(encoding="utf-8"))
@@ -1282,7 +1282,7 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
 
         report = replay_envelope(tmp_path, loaded)
 
-        assert report.overall_outcome is ReplayOutcome.VERIFIED
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.findings == ()
 
     def test_the_evidence_outcome_is_unmoved_by_an_unparseable_root_meta_json(self, tmp_path: Path) -> None:
@@ -1295,7 +1295,7 @@ class TestReplayVerifiesAgainstTheRecordNotTheRootSidecar:
         UNVERIFIABLE -- that is not the dependence this test guards against.
         """
         stored_artifact, loaded = _produce_and_load(tmp_path)
-        assert replay_envelope(tmp_path, loaded).overall_outcome is ReplayOutcome.VERIFIED
+        assert replay_envelope(tmp_path, loaded).evidence_outcome is ReplayOutcome.VERIFIED
 
         root_meta_path = artifact_dir(tmp_path, stored_artifact.sha256) / "meta.json"
         root_meta_path.write_bytes(b"\x00not json at all")
