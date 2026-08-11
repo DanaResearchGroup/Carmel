@@ -279,8 +279,7 @@ class EvidenceRef(BaseModel):
     def _validate_extraction_id_shape(cls, value: str) -> str:
         if value != ROOT_EXTRACTION_ID and not _SHA256_RE.fullmatch(value):
             raise ValueError(
-                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or "
-                "64 lowercase hex characters)"
+                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or 64 lowercase hex characters)"
             )
         return value
 
@@ -740,8 +739,7 @@ class CoveredDocument(BaseModel):
     def _validate_extraction_id_shape(cls, value: str) -> str:
         if value != ROOT_EXTRACTION_ID and not _SHA256_RE.fullmatch(value):
             raise ValueError(
-                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or "
-                "64 lowercase hex characters)"
+                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or 64 lowercase hex characters)"
             )
         return value
 

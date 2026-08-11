@@ -62,23 +62,17 @@ from carmel.services.semantic_deps import (
 # "carmel.numeric.context_free_span_repair". That row documents a real piece of
 # history (what code produced which stored MeasuredValue.repairs) and mutating it
 # in place would silently invalidate that history's meaning.
-_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256 = (
-    "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
-)
+_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256 = "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
 
 # Pinned for carmel.numeric.glyph_health on exactly the same terms as the literal
 # above: hardcoded, never recomputed from the live module, never edited in place.
 # Entry point: assess_glyph_health.
-_PINNED_GLYPH_HEALTH_SHA256 = (
-    "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a"
-)
+_PINNED_GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a"
 
 # The set of sha256 digests this registry has ever shipped, as of this test's writing.
 # Used only to assert DEPENDENCIES_BY_SHA never drops a previously-shipped entry (see
 # test_registry_is_append_only_and_never_drops_a_previously_shipped_sha below).
-_HISTORICALLY_SHIPPED_SHAS = frozenset(
-    {_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256, _PINNED_GLYPH_HEALTH_SHA256}
-)
+_HISTORICALLY_SHIPPED_SHAS = frozenset({_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256, _PINNED_GLYPH_HEALTH_SHA256})
 
 
 def _real_numeric_source() -> str:
@@ -86,9 +80,7 @@ def _real_numeric_source() -> str:
 
 
 def test_seeded_dependency_sha_matches_a_hardcoded_pin() -> None:
-    computed = compute_dependency_sha(
-        _real_numeric_source(), ["normalize_numeric_span", "REPAIR_NAMES"]
-    )
+    computed = compute_dependency_sha(_real_numeric_source(), ["normalize_numeric_span", "REPAIR_NAMES"])
     assert computed == _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256, (
         "carmel/services/numeric.py's repair heuristic (or this toolchain's ast.dump "
         "rendering) has changed since carmel.numeric.context_free_span_repair was "
@@ -336,8 +328,7 @@ def test_reformatting_whitespace_does_not_change_the_sha() -> None:
 def test_changing_only_a_module_level_docstring_does_not_change_the_sha() -> None:
     source = _real_numeric_source()
     perturbed = source.replace(
-        "def _find_range_separator(text: str) -> int | None:\n"
-        '    """Return the index of the hyphen/en-dash',
+        'def _find_range_separator(text: str) -> int | None:\n    """Return the index of the hyphen/en-dash',
         "def _find_range_separator(text: str) -> int | None:\n"
         '    """COMPLETELY DIFFERENT DOCSTRING TEXT. Return the index of the hyphen/en-dash',
         1,
@@ -827,12 +818,7 @@ def test_changing_a_module_level_import_binding_changes_the_sha() -> None:
     changes no closure-reachable *name*, only what that name resolves to at
     runtime -- so the sha must still change, or such a swap would be
     invisible to a consumer trusting the sha as an identity."""
-    source = (
-        "import re\n"
-        "\n"
-        "def normalize_numeric_span(text):\n"
-        "    return re.sub('a', 'b', text)\n"
-    )
+    source = "import re\n\ndef normalize_numeric_span(text):\n    return re.sub('a', 'b', text)\n"
     perturbed = source.replace("import re\n", "import regex as re\n", 1)
     assert perturbed != source, "the string replacement did not match anything in the synthetic source"
     original_sha = compute_dependency_sha(source, ["normalize_numeric_span"])
@@ -847,10 +833,7 @@ def test_changing_an_unrelated_import_still_changes_the_sha() -> None:
     """Every module-level Import/ImportFrom is hashed unconditionally, not
     only ones an entry point's closure happens to reference -- adding a
     wholly unused import must still move the sha."""
-    source = (
-        "def normalize_numeric_span(text):\n"
-        "    return text\n"
-    )
+    source = "def normalize_numeric_span(text):\n    return text\n"
     perturbed = "import os\n" + source
     assert perturbed != source
     original_sha = compute_dependency_sha(source, ["normalize_numeric_span"])
@@ -862,13 +845,7 @@ def test_changing_an_if_bound_module_level_name_changes_the_sha() -> None:
     """A module-level name bound inside an `if` block (not a plain top-level
     Assign) must still be visible to the closure -- and to the sha -- rather
     than silently invisible."""
-    source = (
-        "if True:\n"
-        "    _THRESHOLD = 6\n"
-        "\n"
-        "def normalize_numeric_span(text):\n"
-        "    return _THRESHOLD\n"
-    )
+    source = "if True:\n    _THRESHOLD = 6\n\ndef normalize_numeric_span(text):\n    return _THRESHOLD\n"
     perturbed = source.replace("_THRESHOLD = 6", "_THRESHOLD = 9", 1)
     assert perturbed != source
     original_sha = compute_dependency_sha(source, ["normalize_numeric_span"])
@@ -882,13 +859,7 @@ def test_changing_an_if_bound_module_level_name_changes_the_sha() -> None:
 def test_changing_a_for_bound_module_level_name_changes_the_sha() -> None:
     """Same guarantee as the 'if' case above, for a module-level `for` loop's
     target binding."""
-    source = (
-        "for _CODE in (6,):\n"
-        "    pass\n"
-        "\n"
-        "def normalize_numeric_span(text):\n"
-        "    return _CODE\n"
-    )
+    source = "for _CODE in (6,):\n    pass\n\ndef normalize_numeric_span(text):\n    return _CODE\n"
     perturbed = source.replace("for _CODE in (6,):", "for _CODE in (9,):", 1)
     assert perturbed != source
     original_sha = compute_dependency_sha(source, ["normalize_numeric_span"])
@@ -900,14 +871,7 @@ def test_module_level_match_statement_raises_invariant_error() -> None:
     """`ast.Match`'s capture-pattern binding shapes are too open-ended to
     resolve confidently -- compute_dependency_sha must fail loudly rather
     than silently miss a module-level binding hidden inside a `match` case."""
-    source = (
-        "match 1:\n"
-        "    case _THRESHOLD:\n"
-        "        pass\n"
-        "\n"
-        "def normalize_numeric_span(text):\n"
-        "    return text\n"
-    )
+    source = "match 1:\n    case _THRESHOLD:\n        pass\n\ndef normalize_numeric_span(text):\n    return text\n"
     with pytest.raises(SemanticDependencyInvariantError) as excinfo:
         compute_dependency_sha(source, ["normalize_numeric_span"])
     assert "match" in str(excinfo.value)

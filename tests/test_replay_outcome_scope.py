@@ -313,9 +313,7 @@ class TestTheReportValidatesWhatItIsMadeOf:
     """
 
     def test_a_look_alike_finding_is_refused(self) -> None:
-        look_alike = SimpleNamespace(
-            category="failed", ref_path="claims[0]", reason="not a real finding"
-        )
+        look_alike = SimpleNamespace(category="failed", ref_path="claims[0]", reason="not a real finding")
 
         with pytest.raises(ValueError, match="ReplayFinding"):
             ReplayReport(
@@ -385,9 +383,7 @@ class TestTheReportValidatesWhatItIsMadeOf:
             pytest.param((1.0, 1.0, 0.0), id="floats"),
         ],
     )
-    def test_counts_that_are_not_really_ints_are_refused(
-        self, counts: tuple[object, object, object]
-    ) -> None:
+    def test_counts_that_are_not_really_ints_are_refused(self, counts: tuple[object, object, object]) -> None:
         """``bool`` subclasses ``int``, so ``True`` satisfies every bound and
         reads as a count of 1; a float satisfies them too and can make the
         arithmetic agree by coincidence. Both derived VERIFIED before this."""

@@ -267,9 +267,9 @@ def test_round_trip_drops_unaddressed_display_only_fields() -> None:
 
     origins = [node.origin for node in envelope.source_graph.nodes if not isinstance(node.origin, Absent)]
     assert origins, "fixture regression: the maximal envelope no longer has any ArchiveOrigin to test"
-    assert any(
-        origin.member_display_path is not None for origin in origins
-    ), "fixture regression: no ArchiveOrigin carries a member_display_path, so this test proves nothing"
+    assert any(origin.member_display_path is not None for origin in origins), (
+        "fixture regression: no ArchiveOrigin carries a member_display_path, so this test proves nothing"
+    )
 
     parsed = DatasetEnvelope.from_identity_payload(envelope.identity_payload())
 
@@ -333,9 +333,7 @@ class TestStoreRefusesAnEnvelopeItsOwnLoaderWouldReject:
         after = sorted(p.relative_to(tmp_path) for p in tmp_path.rglob("*"))
         assert after == before
 
-    def test_a_valid_envelope_still_stores_at_its_unchanged_address(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_valid_envelope_still_stores_at_its_unchanged_address(self, tmp_path: Path) -> None:
         """The counterweight, and it is doing real work.
 
         Without it, a `raise` on EVERY store would satisfy both tests above.

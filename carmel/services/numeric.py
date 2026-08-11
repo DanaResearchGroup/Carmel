@@ -642,9 +642,7 @@ def unit_boundary_violation(
         elif _is_unit_token_char(lead_prev):
             return "unit_leading_not_maximal"
         elif not (
-            lead_prev.isspace()
-            or lead_prev in _UNIT_DELIMITER_CHARS
-            or lead_prev == _UNIT_LEADING_ONLY_DELIMITER
+            lead_prev.isspace() or lead_prev in _UNIT_DELIMITER_CHARS or lead_prev == _UNIT_LEADING_ONLY_DELIMITER
         ):
             return "unit_leading_unclassified_char"
 
@@ -660,11 +658,7 @@ def unit_boundary_violation(
                 return "unit_trailing_exponent_or_footnote_ambiguous"
             if _is_unit_token_char(nxt):
                 return "unit_trailing_not_maximal"
-            if not (
-                nxt.isspace()
-                or nxt in _UNIT_DELIMITER_CHARS
-                or nxt == _UNIT_TRAILING_ONLY_DELIMITER
-            ):
+            if not (nxt.isspace() or nxt in _UNIT_DELIMITER_CHARS or nxt == _UNIT_TRAILING_ONLY_DELIMITER):
                 return "unit_trailing_unclassified_char"
 
     return None

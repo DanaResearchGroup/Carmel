@@ -78,6 +78,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
         root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
 
+
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
@@ -290,9 +291,7 @@ def _registered_extra_dependency(
     never carmel/'s source, and is restored before the block exits."""
     original_by_sha = semantic_deps.DEPENDENCIES_BY_SHA
     original_current = semantic_deps.CURRENT_SHA_BY_DEPENDENCY_ID
-    semantic_deps.DEPENDENCIES_BY_SHA = MappingProxyType(
-        {**original_by_sha, definition.content_sha256: definition}
-    )
+    semantic_deps.DEPENDENCIES_BY_SHA = MappingProxyType({**original_by_sha, definition.content_sha256: definition})
     if make_current:
         semantic_deps.CURRENT_SHA_BY_DEPENDENCY_ID = MappingProxyType(
             {**original_current, definition.dependency_id: definition.content_sha256}
@@ -789,9 +788,7 @@ class TestSourceGraph:
         assert isinstance(ref.locator, XPathLocator)
 
     def test_char_span_locator_ref_round_trips(self) -> None:
-        ref = SourceRef(
-            node_id="n1", locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=10, end=20)
-        )
+        ref = SourceRef(node_id="n1", locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=10, end=20))
         assert isinstance(ref.locator, CharSpanLocator)
         assert ref.locator.text_space is TextSpace.EXTRACTED_TEXT
         assert ref.locator.start == 10

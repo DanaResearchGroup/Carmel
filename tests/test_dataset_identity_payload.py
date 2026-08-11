@@ -98,6 +98,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
         root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
 
+
 # --------------------------------------------------------------------------
 # Shared constants
 # --------------------------------------------------------------------------
@@ -541,15 +542,15 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
         from carmel.schemas.datasets import _UNADDRESSED_FIELDS  # type: ignore[attr-defined]
 
         model_name = type(value).__name__
-        assert isinstance(
-            projected, dict
-        ), f"{path}: expected a dict projection of {model_name}, got {type(projected)!r}"
+        assert isinstance(projected, dict), (
+            f"{path}: expected a dict projection of {model_name}, got {type(projected)!r}"
+        )
         for name in type(value).model_fields:
             key = (model_name, name)
             if key in _UNADDRESSED_FIELDS:
-                assert _UNADDRESSED_FIELDS[
-                    key
-                ], f"{path}.{name}: registered in _UNADDRESSED_FIELDS with an empty reason"
+                assert _UNADDRESSED_FIELDS[key], (
+                    f"{path}.{name}: registered in _UNADDRESSED_FIELDS with an empty reason"
+                )
                 continue
             assert name in projected, (
                 f"{path}.{name}: field {name!r} of {model_name} is missing from identity_payload()'s output "
@@ -557,9 +558,9 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
             )
             _walk_completeness(getattr(value, name), projected[name], f"{path}.{name}")
     elif isinstance(value, Absent):
-        assert isinstance(
-            projected, dict
-        ), f"{path}: an Absent value must project to a dict shape, got {type(projected)!r}"
+        assert isinstance(projected, dict), (
+            f"{path}: an Absent value must project to a dict shape, got {type(projected)!r}"
+        )
     elif dataclasses.is_dataclass(value) and not isinstance(value, type):
         # Same rule as for BaseModel above, applied to a stdlib dataclass field --
         # otherwise a dataclass-valued field could silently drop its own sub-fields
@@ -567,16 +568,16 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
         from carmel.schemas.datasets import _UNADDRESSED_FIELDS  # type: ignore[attr-defined]
 
         dataclass_name = type(value).__name__
-        assert isinstance(
-            projected, dict
-        ), f"{path}: expected a dict projection of {dataclass_name}, got {type(projected)!r}"
+        assert isinstance(projected, dict), (
+            f"{path}: expected a dict projection of {dataclass_name}, got {type(projected)!r}"
+        )
         for field in dataclasses.fields(type(value)):
             name = field.name
             key = (dataclass_name, name)
             if key in _UNADDRESSED_FIELDS:
-                assert _UNADDRESSED_FIELDS[
-                    key
-                ], f"{path}.{name}: registered in _UNADDRESSED_FIELDS with an empty reason"
+                assert _UNADDRESSED_FIELDS[key], (
+                    f"{path}.{name}: registered in _UNADDRESSED_FIELDS with an empty reason"
+                )
                 continue
             assert name in projected, (
                 f"{path}.{name}: field {name!r} of {dataclass_name} is missing from identity_payload()'s output "
@@ -598,9 +599,9 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
             assert k in projected, f"{path}.{k}: missing from projected dict"
             _walk_completeness(v, projected[k], f"{path}.{k}")
     elif isinstance(value, Enum):
-        assert (
-            projected == value.value
-        ), f"{path}: enum {value!r} must project as its .value ({value.value!r}), got {projected!r}"
+        assert projected == value.value, (
+            f"{path}: enum {value!r} must project as its .value ({value.value!r}), got {projected!r}"
+        )
     # else: a primitive (str/int/bool/None) -- nothing further to walk.
 
 
@@ -677,9 +678,7 @@ class TestCompletenessWalkerIsNotVacuous:
 
             payload: _ProbeDataclassForWalkerTest
 
-        instance = _ScratchModelWithDataclassField(
-            payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b")
-        )
+        instance = _ScratchModelWithDataclassField(payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b"))
         # deliberately omit "field_b" from the dataclass's sub-projection, and no
         # registry entry covers it
         projected = {"payload": {"field_a": "a"}}
@@ -700,9 +699,7 @@ class TestCompletenessWalkerIsNotVacuous:
 
             payload: _ProbeDataclassForWalkerTest
 
-        instance = _ScratchModelWithDataclassField(
-            payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b")
-        )
+        instance = _ScratchModelWithDataclassField(payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b"))
         projected = {"payload": {"field_a": "a"}}
 
         original = dict(datasets_module._UNADDRESSED_FIELDS)  # type: ignore[attr-defined]
@@ -730,9 +727,7 @@ class TestCompletenessWalkerIsNotVacuous:
 
             payload: _ProbeDataclassForWalkerTest
 
-        instance = _ScratchModelWithDataclassField(
-            payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b")
-        )
+        instance = _ScratchModelWithDataclassField(payload=_ProbeDataclassForWalkerTest(field_a="a", field_b="b"))
         projected = {"payload": {"field_a": "a"}}
 
         original = dict(datasets_module._UNADDRESSED_FIELDS)  # type: ignore[attr-defined]
@@ -951,7 +946,9 @@ class TestGlyphHealthAssessmentIsIdentityBearing:
         env = _maximal_envelope()
         payload = env.identity_payload()
         paper_payload = next(
-            node for node in payload["source_graph"]["nodes"] if node["node_id"] == "paper"  # type: ignore[index]
+            node
+            for node in payload["source_graph"]["nodes"]
+            if node["node_id"] == "paper"  # type: ignore[index]
         )
         glyph_health_payload = paper_payload["glyph_health"]
         health_payload = glyph_health_payload["health"]
@@ -1097,9 +1094,7 @@ class TestExtractionIdentityFieldsAreIdentityBearing:
 
         other_env = _minimal_envelope_with_extraction(_computed_binding(extractor_code_sha256=SHA_B))
         other_sha = compute_dataset_sha(other_env.identity_payload())
-        assert other_sha != changed_sha, (
-            "two different extractor_code_sha256 values produced the same content address"
-        )
+        assert other_sha != changed_sha, "two different extractor_code_sha256 values produced the same content address"
 
     def test_absent_pypdf_version_round_trips_and_validates(self) -> None:
         """A non-pypdf extractor's binding carries an explicit
@@ -1115,7 +1110,9 @@ class TestExtractionIdentityFieldsAreIdentityBearing:
 
         payload = env.identity_payload()
         paper_payload = next(
-            node for node in payload["source_graph"]["nodes"] if node["node_id"] == "paper"  # type: ignore[index]
+            node
+            for node in payload["source_graph"]["nodes"]
+            if node["node_id"] == "paper"  # type: ignore[index]
         )
         assert paper_payload["extraction"]["pypdf_version"] == {
             "__absent__": True,
@@ -1515,9 +1512,9 @@ class TestModelDumpTripwire:
         dumped = env.model_dump()
 
         assert isinstance(dumped["series"], tuple), "expected model_dump() to keep a tuple-typed field as a tuple"
-        assert isinstance(
-            dumped["series"][0]["source_form"], SourceForm
-        ), "expected model_dump() to keep an enum field as an Enum instance, not its .value"
+        assert isinstance(dumped["series"][0]["source_form"], SourceForm), (
+            "expected model_dump() to keep an enum field as an Enum instance, not its .value"
+        )
 
         payload = env.identity_payload()
         assert isinstance(payload["series"], list), "identity_payload() must project tuples as lists"

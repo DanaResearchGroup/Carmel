@@ -170,7 +170,7 @@ def _prepare_reextraction(
     # read, closes that: every later step operates on the resolved, contained path.
     try:
         resolved_raw_path = raw_path.resolve(strict=True)
-    except (FileNotFoundError, NotADirectoryError, OSError):
+    except FileNotFoundError, NotADirectoryError, OSError:
         raise ReextractionError(f"raw.bin does not exist for {raw_sha256}: {raw_path}") from None
     if not resolved_raw_path.is_relative_to(resolved_dest_dir):
         raise ReextractionError(
@@ -179,9 +179,7 @@ def _prepare_reextraction(
             f"which is not under {resolved_dest_dir}"
         )
     if not resolved_raw_path.is_file():
-        raise ReextractionError(
-            f"raw.bin for {raw_sha256} does not resolve to a regular file: {resolved_raw_path}"
-        )
+        raise ReextractionError(f"raw.bin for {raw_sha256} does not resolve to a regular file: {resolved_raw_path}")
 
     # Step 4: refuse an oversized artifact via stat() BEFORE reading it into memory.
     # stat() and the read below both go through the RESOLVED path, never raw_path.

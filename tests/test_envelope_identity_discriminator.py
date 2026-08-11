@@ -192,9 +192,9 @@ class TestDatasetNodeOrderDoesNotAffectIdentity:
     def test_two_node_tuple_orders_produce_identical_canonical_bytes(self) -> None:
         baseline = _maximal_envelope()
         permuted_nodes = tuple(reversed(baseline.source_graph.nodes))
-        assert [node.node_id for node in permuted_nodes] != [
-            node.node_id for node in baseline.source_graph.nodes
-        ], "fixture drift: the permutation must actually change the tuple order"
+        assert [node.node_id for node in permuted_nodes] != [node.node_id for node in baseline.source_graph.nodes], (
+            "fixture drift: the permutation must actually change the tuple order"
+        )
         permuted = DatasetEnvelope(
             source_graph=SourceGraph(nodes=permuted_nodes),
             composition=baseline.composition,
@@ -202,9 +202,7 @@ class TestDatasetNodeOrderDoesNotAffectIdentity:
             conversion_tables=baseline.conversion_tables,
         )
 
-        assert canonical_json_bytes(permuted.identity_payload()) == canonical_json_bytes(
-            baseline.identity_payload()
-        ), (
+        assert canonical_json_bytes(permuted.identity_payload()) == canonical_json_bytes(baseline.identity_payload()), (
             "two DatasetEnvelopes differing ONLY in node tuple order produced different "
             "canonical bytes -- one dataset holds many content addresses"
         )

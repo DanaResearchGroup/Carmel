@@ -364,9 +364,7 @@ def _referenced_names(node: ast.AST) -> set[str]:
     return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
 
 
-def _transitive_closure(
-    entry_points: Sequence[str], definitions: Mapping[str, ast.stmt]
-) -> dict[str, ast.stmt]:
+def _transitive_closure(entry_points: Sequence[str], definitions: Mapping[str, ast.stmt]) -> dict[str, ast.stmt]:
     """Walk the transitive closure of module-level names reachable from ``entry_points``.
 
     Starting from ``entry_points``, repeatedly walks each already-included
@@ -620,8 +618,10 @@ def _assert_no_carmel_imports(module_source: str, module_name: str) -> None:
                         "within-module only and can no longer be assumed to capture this "
                         "module's full behavior -- see the semantic_deps module docstring"
                     )
-        elif isinstance(node, ast.ImportFrom) and node.module is not None and (
-            node.module == "carmel" or node.module.startswith("carmel.")
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and (node.module == "carmel" or node.module.startswith("carmel."))
         ):
             raise SemanticDependencyInvariantError(
                 f"{module_name} now imports from carmel.* "
@@ -843,8 +843,7 @@ def dependency_for_sha(sha256: str) -> SemanticDependencyDefinition:
         return DEPENDENCIES_BY_SHA[sha256]
     except KeyError:
         raise UnknownSemanticDependencyError(
-            f"no semantic dependency known for content_sha256 {sha256!r}; known: "
-            f"{sorted(DEPENDENCIES_BY_SHA)!r}"
+            f"no semantic dependency known for content_sha256 {sha256!r}; known: {sorted(DEPENDENCIES_BY_SHA)!r}"
         ) from None
 
 

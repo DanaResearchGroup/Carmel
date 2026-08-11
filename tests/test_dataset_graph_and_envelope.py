@@ -102,6 +102,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
         root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
 
+
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
@@ -1294,9 +1295,7 @@ class TestSourceGraphConflictingGlyphHealth:
             SHA_A,
             parent_node_id=None,
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
-            glyph_health=_glyph_health_assessment(
-                input_sha256=SHA_B, health=_UNHEALTHY_GLYPH_HEALTH
-            ),
+            glyph_health=_glyph_health_assessment(input_sha256=SHA_B, health=_UNHEALTHY_GLYPH_HEALTH),
         )
         with pytest.raises(ValidationError, match="CONFLICT") as excinfo:
             SourceGraph(nodes=(a, b))
@@ -2162,11 +2161,11 @@ class TestFunctionalRealisticEnvelope:
             components=[h2, n2, o2],
         )
         return DatasetEnvelope(
-        source_graph=graph,
-        composition=composition,
-        series=(_fully_populated_series("paper"),),
-        conversion_tables=(_embedded_table_v1(),),
-    )
+            source_graph=graph,
+            composition=composition,
+            series=(_fully_populated_series("paper"),),
+            conversion_tables=(_embedded_table_v1(),),
+        )
 
     def test_constructs(self) -> None:
         envelope = self._build()
@@ -2473,16 +2472,14 @@ class TestSourceGraphConflictingVerification:
             root_sidecar=root_sidecar,
         )
 
-    def _pair(
-        self, first: RootSidecarVerification, second: RootSidecarVerification
-    ) -> tuple[SourceNode, SourceNode]:
+    def _pair(self, first: RootSidecarVerification, second: RootSidecarVerification) -> tuple[SourceNode, SourceNode]:
         binding = _extraction_binding(extracted_text_sha256=SHA_B)
-        paper = _node(
-            "paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None, extraction=binding
-        ).model_copy(update={"verification": self._verification(first)})
-        si = _sha_sharing_node_with_extraction(
-            "si", SHA_A, "paper", extraction=binding
-        ).model_copy(update={"verification": self._verification(second)})
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None, extraction=binding).model_copy(
+            update={"verification": self._verification(first)}
+        )
+        si = _sha_sharing_node_with_extraction("si", SHA_A, "paper", extraction=binding).model_copy(
+            update={"verification": self._verification(second)}
+        )
         return paper, si
 
     def test_same_address_disagreeing_on_verification_is_rejected(self) -> None:

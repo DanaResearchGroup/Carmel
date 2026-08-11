@@ -202,9 +202,7 @@ class UnextractedConditionSpec:
                 f"UnextractedConditionSpec.reason={self.reason!r} must be a genuine "
                 f"UnextractedReason member, not {type(self.reason).__name__}"
             )
-        if self.quantity_kind is not None and not isinstance(
-            self.quantity_kind, units.QuantityKind
-        ):
+        if self.quantity_kind is not None and not isinstance(self.quantity_kind, units.QuantityKind):
             # The same StrEnum trap the other spec fields close. Left open here,
             # a bare "temperature" would be coerced downstream by pydantic and
             # the refusal would surface as a schema ValidationError from deep
@@ -250,9 +248,7 @@ class UnresolvedSubjectSpec:
                 f"UnresolvedSubjectSpec.reason={self.reason!r} must be a genuine "
                 f"SubjectRefusalReason member, not {type(self.reason).__name__}"
             )
-        _require_int_occurrences(
-            "UnresolvedSubjectSpec", reason_occurrence=self.reason_occurrence
-        )
+        _require_int_occurrences("UnresolvedSubjectSpec", reason_occurrence=self.reason_occurrence)
 
 
 def _ref(text: str, quote: str, *, role: QuoteRole, occurrence: int | None) -> SourceRef:
@@ -352,9 +348,7 @@ def produce_condition_set_from_artifact(
     # ValidationError from inside construction -- a late, badly-located refusal
     # for a caller error this producer can name precisely.
     _duplicate_ids(
-        [s.claim_id for s in scalars]
-        + [c.claim_id for c in categoricals]
-        + [u.statement_id for u in unextracted],
+        [s.claim_id for s in scalars] + [c.claim_id for c in categoricals] + [u.statement_id for u in unextracted],
         owner="id",
     )
     if not isinstance(attribution, ConditionAttribution):
@@ -363,9 +357,7 @@ def produce_condition_set_from_artifact(
             f"{type(attribution).__name__} -- ConditionAttribution is a StrEnum, so a plain "
             "string equal to a member's value would compare `==` equal without being that member"
         )
-    _require_int_occurrences(
-        "produce_condition_set_from_artifact", attribution_occurrence=attribution_occurrence
-    )
+    _require_int_occurrences("produce_condition_set_from_artifact", attribution_occurrence=attribution_occurrence)
 
     grounding = _prepare_grounding(
         workspace_root, sha256, envelope_noun="condition set", envelope_subject="A condition set"
@@ -398,9 +390,7 @@ def produce_condition_set_from_artifact(
         GroundedScalarClaim(
             claim_id=spec.claim_id,
             label_raw=spec.label_quote,
-            label_ref=_ref(
-                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
-            ),
+            label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
             value=_measured_value(
                 text,
                 spec,
@@ -419,13 +409,9 @@ def produce_condition_set_from_artifact(
         GroundedCategoricalClaim(
             claim_id=spec.claim_id,
             label_raw=spec.label_quote,
-            label_ref=_ref(
-                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
-            ),
+            label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
             token_raw=spec.token_quote,
-            token_ref=_ref(
-                text, spec.token_quote, role=QuoteRole.VALUE, occurrence=spec.token_occurrence
-            ),
+            token_ref=_ref(text, spec.token_quote, role=QuoteRole.VALUE, occurrence=spec.token_occurrence),
         )
         for spec in categoricals
     )
@@ -433,9 +419,7 @@ def produce_condition_set_from_artifact(
         UnextractedConditionStatement(
             statement_id=spec.statement_id,
             label_raw=spec.label_quote,
-            label_ref=_ref(
-                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
-            ),
+            label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
             statement_ref=_ref(
                 text,
                 spec.statement_quote,
@@ -444,9 +428,7 @@ def produce_condition_set_from_artifact(
             ),
             reason=spec.reason,
             quantity_kind=(
-                spec.quantity_kind
-                if spec.quantity_kind is not None
-                else Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+                spec.quantity_kind if spec.quantity_kind is not None else Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
             ),
         )
         for spec in unextracted
@@ -462,9 +444,7 @@ def produce_condition_set_from_artifact(
         conversion_tables=(_ACTIVE.embedded,) if scalar_claims else (),
         subject=resolved_subject,
         attribution=attribution,
-        attribution_ref=_ref(
-            text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence
-        ),
+        attribution_ref=_ref(text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence),
         scalar_claims=scalar_claims,
         categorical_claims=categorical_claims,
         unextracted=unextracted_statements,

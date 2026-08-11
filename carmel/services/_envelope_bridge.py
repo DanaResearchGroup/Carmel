@@ -103,9 +103,7 @@ class TypedEnvelopeSpec[E: AddressableEnvelope]:
     caller who reached the wrong door is told which one is right."""
 
 
-def store_typed_envelope[E: AddressableEnvelope](
-    spec: TypedEnvelopeSpec[E], root: Path, envelope: E
-) -> StoredDataset:
+def store_typed_envelope[E: AddressableEnvelope](spec: TypedEnvelopeSpec[E], root: Path, envelope: E) -> StoredDataset:
     """Project, refuse if unreadable, then persist through the schema-blind store.
 
     Two refusals run here, in this order, and they are NOT redundant:
@@ -174,9 +172,7 @@ def store_typed_envelope[E: AddressableEnvelope](
     return store_dataset(root, payload, store_dir=spec.store_dir)
 
 
-def load_typed_envelope[E: AddressableEnvelope](
-    spec: TypedEnvelopeSpec[E], root: Path, sha256: str
-) -> E:
+def load_typed_envelope[E: AddressableEnvelope](spec: TypedEnvelopeSpec[E], root: Path, sha256: str) -> E:
     """Load from this spec's directory and rehydrate through this spec's class.
 
     ``load_dataset`` verifies the bytes against the address; the class's own

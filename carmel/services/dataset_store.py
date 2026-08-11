@@ -675,9 +675,7 @@ def compute_dataset_sha(identity_payload: dict[str, Any]) -> str:
     return hashlib.sha256(canonical_json_bytes(_inject_decimal_repr_version(identity_payload))).hexdigest()
 
 
-def store_dataset(
-    root: Path, identity_payload: dict[str, Any], *, store_dir: str = DATASET_STORE_DIR
-) -> StoredDataset:
+def store_dataset(root: Path, identity_payload: dict[str, Any], *, store_dir: str = DATASET_STORE_DIR) -> StoredDataset:
     """Content-address and durably persist ``identity_payload``.
 
     Injects the reserved decimal-repr version marker (see the module-level
@@ -1134,9 +1132,7 @@ def list_datasets(root: Path, *, store_dir: str = DATASET_STORE_DIR) -> list[str
     # that builds its path without going through it, so a typo'd directory would
     # otherwise silently enumerate nothing and read as "the store is empty".
     if store_dir not in _KNOWN_STORE_DIRS:
-        raise ValueError(
-            f"unknown store directory: {store_dir!r} (expected one of {sorted(_KNOWN_STORE_DIRS)})"
-        )
+        raise ValueError(f"unknown store directory: {store_dir!r} (expected one of {sorted(_KNOWN_STORE_DIRS)})")
     resolved_root = normalize_path(root)
     datasets_dir = resolved_root / store_dir
     try:

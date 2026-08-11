@@ -123,9 +123,7 @@ class TestAProducedConditionSetSurvivesItsOwnReplay:
     once real extraction runs.
     """
 
-    def test_produce_store_load_replay_reports_verified_evidence(
-        self, tmp_path: Path
-    ) -> None:
+    def test_produce_store_load_replay_reports_verified_evidence(self, tmp_path: Path) -> None:
         """The full loop, with the envelope re-read from the store rather than
         replayed from the in-memory object the producer returned."""
         envelope = _produce(tmp_path)
@@ -144,14 +142,10 @@ class TestAProducedConditionSetSurvivesItsOwnReplay:
         # must never be conflated: `unchecked_char_spans` must still be zero.
         assert report.total_char_spans > 0
         assert report.unchecked_char_spans == 0
-        assert report.checked_char_spans + report.support_only_char_spans == (
-            report.total_char_spans
-        )
+        assert report.checked_char_spans + report.support_only_char_spans == (report.total_char_spans)
         assert report.support_only_char_spans > 0
 
-    def test_the_replay_is_not_silently_skipping_the_produced_claims(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_replay_is_not_silently_skipping_the_produced_claims(self, tmp_path: Path) -> None:
         """Guards the way this test could rot into a tautology: if the producer
         emitted an envelope the replayer walked no part of, the assertions above
         would still pass. Pin that every produced claim is reached."""
@@ -186,14 +180,10 @@ class TestTheProducerRefusesRatherThanFabricates:
         with pytest.raises(ConditionSetProducerError, match="duplicate id"):
             _produce(tmp_path, scalars=(_temperature(), _temperature()))
 
-    def test_a_claim_id_may_not_collide_across_the_two_claim_kinds(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_claim_id_may_not_collide_across_the_two_claim_kinds(self, tmp_path: Path) -> None:
         """Scalar and categorical claims share one id namespace, because a
         report path names a claim without naming its kind."""
-        clashing = CategoricalConditionSpec(
-            claim_id="pressure", label_quote="fuel", token_quote="methane"
-        )
+        clashing = CategoricalConditionSpec(claim_id="pressure", label_quote="fuel", token_quote="methane")
         with pytest.raises(ConditionSetProducerError, match="duplicate id"):
             _produce(tmp_path, categoricals=(clashing,))
 
@@ -216,9 +206,7 @@ class TestTheProducerRefusesRatherThanFabricates:
         with pytest.raises(ConditionSetProducerError, match="duplicate id"):
             _produce(tmp_path, unextracted=(colliding,))
 
-    def test_a_quote_absent_from_the_document_cannot_be_grounded(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_quote_absent_from_the_document_cannot_be_grounded(self, tmp_path: Path) -> None:
         """The producer never invents a location for a quote it cannot find."""
         absent = ScalarConditionSpec(
             claim_id="t",
@@ -230,9 +218,7 @@ class TestTheProducerRefusesRatherThanFabricates:
         with pytest.raises(QuoteGroundingError):
             _produce(tmp_path, scalars=(absent,))
 
-    def test_a_missing_current_record_refusal_never_calls_itself_a_dataset(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_missing_current_record_refusal_never_calls_itself_a_dataset(self, tmp_path: Path) -> None:
         """The preamble's OTHER refusal, and the one that was actually wrong.
 
         ``_prepare_grounding`` took its refusal wording from two keyword
@@ -263,9 +249,7 @@ class TestTheProducerRefusesRatherThanFabricates:
         assert "condition set" in message
         assert "A dataset" not in message, message
 
-    def test_a_lossy_extraction_is_refused_and_names_a_condition_set(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_lossy_extraction_is_refused_and_names_a_condition_set(self, tmp_path: Path) -> None:
         """The shared preamble's refusal, reached through this producer. The
         message must name a CONDITION SET -- a refusal that misnames what it
         refused sends a reader to the wrong producer."""
@@ -368,9 +352,7 @@ class TestTheSubjectIsEitherNamedOrExplicitlyRefused:
 
 
 class TestARefusedConditionKeepsItsReasonAndItsSpan:
-    def test_the_sweep_is_recorded_as_a_refusal_not_as_a_number(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_sweep_is_recorded_as_a_refusal_not_as_a_number(self, tmp_path: Path) -> None:
         """'varied from 0.6 to 1.4' must never become the scalar 0.6. A sweep
         squeezed into one number is a fabricated condition."""
         envelope = _produce(tmp_path)
@@ -393,19 +375,13 @@ class TestARefusedConditionKeepsItsReasonAndItsSpan:
 
 
 class TestTheProducedValuesAreDerivedNotAsserted:
-    def test_the_scalar_carries_its_raw_quote_and_normalized_unit(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_scalar_carries_its_raw_quote_and_normalized_unit(self, tmp_path: Path) -> None:
         envelope = _produce(tmp_path)
-        temperature = next(
-            c for c in envelope.scalar_claims if c.claim_id == "initial_temperature"
-        )
+        temperature = next(c for c in envelope.scalar_claims if c.claim_id == "initial_temperature")
         assert temperature.value.raw_text == "823"
         assert temperature.value.unit_raw == "K"
 
-    def test_an_unknown_unit_for_the_quantity_kind_is_refused(
-        self, tmp_path: Path
-    ) -> None:
+    def test_an_unknown_unit_for_the_quantity_kind_is_refused(self, tmp_path: Path) -> None:
         """A unit that is not a known unit or alias of the stated quantity kind
         cannot be normalized, so no value may be produced from it."""
         wrong = ScalarConditionSpec(
@@ -444,17 +420,13 @@ class TestAbsenceReasonsAreNotInterchangeable:
     a mutation swapping the two survived the whole suite until this test existed.
     """
 
-    def test_a_produced_scalar_records_not_extracted_yet_not_not_reported(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_produced_scalar_records_not_extracted_yet_not_not_reported(self, tmp_path: Path) -> None:
         envelope = _produce(tmp_path)
         for claim in envelope.scalar_claims:
             assert isinstance(claim.uncertainty, Absent)
             assert claim.uncertainty.reason is AbsenceReason.NOT_EXTRACTED_YET
 
-    def test_a_refused_statement_of_unknown_kind_says_not_extracted_yet(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_refused_statement_of_unknown_kind_says_not_extracted_yet(self, tmp_path: Path) -> None:
         """Same rule on the refusal path: an unknown quantity kind is one we did
         not extract, not one the paper declined to state."""
         spec = UnextractedConditionSpec(
@@ -505,38 +477,26 @@ class TestSpanStitchingFabricatesAVerifiedCondition:
             unit_quote="atm",
         )
 
-    def test_the_producer_accepts_a_value_stolen_from_another_quantity(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_producer_accepts_a_value_stolen_from_another_quantity(self, tmp_path: Path) -> None:
         """Production does not object. It has no basis on which to object: every
         quote IS in the document, exactly where the locator says it is."""
-        envelope = _produce(
-            tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=()
-        )
+        envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
         claim = envelope.scalar_claims[0]
         assert claim.label_raw == "pressure"
         assert claim.value.raw_text == "823"
         assert claim.value.unit_raw == "atm"
 
-    def test_replay_verifies_a_condition_the_paper_never_states(
-        self, tmp_path: Path
-    ) -> None:
+    def test_replay_verifies_a_condition_the_paper_never_states(self, tmp_path: Path) -> None:
         """The hole in one assertion: the strongest verdict the evidence scope
         can issue, over a fabricated association."""
-        envelope = _produce(
-            tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=()
-        )
+        envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
         report = replay_condition_set(tmp_path, envelope)
         assert report.evidence_outcome is ReplayOutcome.VERIFIED
         assert report.findings == ()
 
-    def test_the_fabricated_condition_is_not_even_physically_absurd(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_fabricated_condition_is_not_even_physically_absurd(self, tmp_path: Path) -> None:
         """823 atm is a perfectly ordinary shock-tube pressure, which is why a
         downstream range or plausibility check would not catch this either. The
         defense cannot be plausibility; it has to be provenance."""
-        envelope = _produce(
-            tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=()
-        )
+        envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
         assert envelope.scalar_claims[0].value.raw_text == "823"

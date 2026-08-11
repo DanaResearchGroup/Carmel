@@ -134,9 +134,7 @@ def _nth_span(quote: str, occurrence: int, node_id: str = "paper") -> SourceRef:
         start = _TEXT.index(quote, start + 1)
     return SourceRef(
         node_id=node_id,
-        locator=CharSpanLocator(
-            text_space=TextSpace.EXTRACTED_TEXT, start=start, end=start + len(quote)
-        ),
+        locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=start, end=start + len(quote)),
     )
 
 
@@ -202,12 +200,8 @@ def _verifying_graph(tmp_path: Path) -> SourceGraph:
         n_bytes=len(data),
         fetched_at=datetime.now(UTC),
     )
-    extracted = ExtractedText(
-        text=_TEXT, normalized=_TEXT.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
-    )
-    stored = store_artifact(
-        tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
-    )
+    extracted = ExtractedText(text=_TEXT, normalized=_TEXT.casefold(), sections=[], extractor="pdf:pypdf", lossy=False)
+    stored = store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
     _store_genuine_extraction_record(tmp_path, stored.sha256, extracted)
     dataset = _tabular_envelope_from_artifact(
         tmp_path,
@@ -257,9 +251,7 @@ def _minimal_condition_set(tmp_path: Path, **kwargs: object) -> ConditionSetEnve
     defaults: dict[str, object] = {
         "source_graph": _verifying_graph(tmp_path),
         "conversion_tables": (),
-        "subject": DeviceClassDeclaration(
-            label_raw=_SUBJECT_QUOTE, label_ref=_span(_SUBJECT_QUOTE)
-        ),
+        "subject": DeviceClassDeclaration(label_raw=_SUBJECT_QUOTE, label_ref=_span(_SUBJECT_QUOTE)),
         "attribution": ConditionAttribution.OWN_EXPERIMENT,
         "attribution_ref": _span(_ATTRIBUTION_QUOTE),
         "scalar_claims": (),
@@ -288,9 +280,7 @@ class TestAConditionSetIsNeverFullyVerifiable:
     replayer can pass every span check and still be wrong here.
     """
 
-    def test_clean_spans_verify_the_evidence_but_not_the_condition_set(
-        self, tmp_path: Path
-    ) -> None:
+    def test_clean_spans_verify_the_evidence_but_not_the_condition_set(self, tmp_path: Path) -> None:
         envelope = _minimal_condition_set(tmp_path)
 
         report = replay_condition_set(tmp_path, envelope)
@@ -305,9 +295,7 @@ class TestAConditionSetIsNeverFullyVerifiable:
         # verdicts disagreeing is the POINT of the split, not a defect in it.
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
 
-    def test_the_unexplained_attribution_is_recorded_as_an_explicit_claim(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_unexplained_attribution_is_recorded_as_an_explicit_claim(self, tmp_path: Path) -> None:
         """UNVERIFIABLE must be justified in the report, not merely asserted.
 
         A verdict a consumer cannot trace to a named cause is indistinguishable
@@ -327,9 +315,7 @@ class TestAConditionSetIsNeverFullyVerifiable:
         assert _ATTRIBUTION_QUOTE not in claim.claim
         assert _ATTRIBUTION_QUOTE not in claim.reason
 
-    def test_the_three_span_counters_partition_every_reachable_ref(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_three_span_counters_partition_every_reachable_ref(self, tmp_path: Path) -> None:
         """Support-only spans are neither checked nor unchecked.
 
         Collapsing them into ``unchecked`` would force ``evidence_outcome`` to
@@ -372,17 +358,11 @@ class TestTheObligationInventoryCannotBeOutgrown:
 
         # Each walked ref is accounted for exactly once: as a span that was
         # quote-checked, or as a support ref named by a semantic claim.
-        named = {
-            path
-            for claim in report.unchecked_semantic_claims
-            for path in claim.support_paths
-        }
+        named = {path for claim in report.unchecked_semantic_claims for path in claim.support_paths}
         assert named == {"attribution_ref"}
         assert report.checked_char_spans + len(named) == len(walked)
 
-    def test_a_ref_the_inventory_never_named_is_a_failure_not_an_omission(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_ref_the_inventory_never_named_is_a_failure_not_an_omission(self, tmp_path: Path) -> None:
         """The single highest-value behaviour in this phase.
 
         Four commits were unable to CONTRADICT the claim that the enumeration
@@ -415,9 +395,7 @@ class TestTheSubjectIsASumAndBothArmsMustReplay:
     graph; this test is what makes the next mis-statement fail loudly.
     """
 
-    def test_the_device_class_arm_grounds_its_label_as_an_ordinary_pair(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_device_class_arm_grounds_its_label_as_an_ordinary_pair(self, tmp_path: Path) -> None:
         envelope = _minimal_condition_set(tmp_path)
 
         report = replay_condition_set(tmp_path, envelope)
@@ -432,23 +410,19 @@ class TestReplayRefusesToInventEvidence:
     """A drifted span must FAIL, not quietly re-anchor onto matching text."""
 
     @pytest.mark.parametrize("quote", [_SUBJECT_QUOTE, _LABEL_QUOTE, _TOKEN_QUOTE])
-    def test_a_paired_span_that_no_longer_matches_fails_replay(
-        self, tmp_path: Path, quote: str
-    ) -> None:
+    def test_a_paired_span_that_no_longer_matches_fails_replay(self, tmp_path: Path, quote: str) -> None:
         envelope = _minimal_condition_set(tmp_path)
         walked = dict(iter_source_refs(envelope))
-        assert any(
-            isinstance(ref.locator, CharSpanLocator) for ref in walked.values()
-        ), "fixture must ground every ref in a char span for this test to mean anything"
+        assert any(isinstance(ref.locator, CharSpanLocator) for ref in walked.values()), (
+            "fixture must ground every ref in a char span for this test to mean anything"
+        )
 
         # Shift the recorded text out from under the locator by one character.
         start = _TEXT.index(quote)
         drifted = _span(quote)
         drifted = SourceRef(
             node_id=drifted.node_id,
-            locator=CharSpanLocator(
-                text_space=TextSpace.EXTRACTED_TEXT, start=start + 1, end=start + 1 + len(quote)
-            ),
+            locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=start + 1, end=start + 1 + len(quote)),
         )
         if quote == _SUBJECT_QUOTE:
             envelope = _minimal_condition_set(
@@ -557,9 +531,7 @@ class TestSupportThatCouldNotEvenBeLocated:
     would report coverage the replayer never achieved.
     """
 
-    def test_a_non_char_span_support_ref_is_unresolved_and_uncounted(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_non_char_span_support_ref_is_unresolved_and_uncounted(self, tmp_path: Path) -> None:
         envelope = _minimal_condition_set(
             tmp_path,
             # A table cell, not a char span. Legal against a PDF node -- an
@@ -591,9 +563,7 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert claim.gap is SemanticGap.LOCATION_UNRESOLVED
 
-    def test_a_support_span_running_past_the_end_of_the_text_is_unresolved(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_support_span_running_past_the_end_of_the_text_is_unresolved(self, tmp_path: Path) -> None:
         """An offset that does not fit the re-verified text proves nothing.
 
         Python slicing silently truncates out-of-range slices, so without an
@@ -624,9 +594,7 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert report.unchecked_char_spans == 1
         assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
 
-    def test_support_on_a_node_with_a_store_problem_is_unresolved(
-        self, tmp_path: Path
-    ) -> None:
+    def test_support_on_a_node_with_a_store_problem_is_unresolved(self, tmp_path: Path) -> None:
         """A span in a node that failed verification proves nothing either.
 
         The offsets would re-slice arithmetically, so a gap classifier that
@@ -649,9 +617,7 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert report.support_only_char_spans == 0
         assert report.evidence_outcome is ReplayOutcome.FAILED
 
-    def test_a_support_ref_naming_a_node_outside_the_graph_does_not_raise(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_support_ref_naming_a_node_outside_the_graph_does_not_raise(self, tmp_path: Path) -> None:
         """Survive an envelope whose validators were bypassed.
 
         ``model_construct`` skips validation, which is exactly how a corrupt
@@ -683,9 +649,7 @@ class TestQuoteEqualityIsNotEnoughForAMeasuredValue:
     call the evidence verified.
     """
 
-    def test_a_value_span_inside_a_longer_numeral_does_not_verify(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_value_span_inside_a_longer_numeral_does_not_verify(self, tmp_path: Path) -> None:
         claim = GroundedScalarClaim(
             claim_id="run_index",
             label_raw="pressure",
@@ -719,9 +683,9 @@ class TestQuoteEqualityIsNotEnoughForAMeasuredValue:
         report = replay_condition_set(tmp_path, envelope)
 
         assert report.evidence_outcome is not ReplayOutcome.VERIFIED
-        assert any(
-            "scalar_claims[0].value" in finding.ref_path for finding in report.findings
-        ), f"the boundary gate must name the offending value. findings={report.findings}"
+        assert any("scalar_claims[0].value" in finding.ref_path for finding in report.findings), (
+            f"the boundary gate must name the offending value. findings={report.findings}"
+        )
 
 
 class TestOffsetsThatCannotDescribeTheTextAreAFailure:
@@ -735,17 +699,13 @@ class TestOffsetsThatCannotDescribeTheTextAreAFailure:
     are a failed claim.
     """
 
-    def test_a_pairing_span_running_past_the_end_of_the_text_fails(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_pairing_span_running_past_the_end_of_the_text_fails(self, tmp_path: Path) -> None:
         suffix = "discarded"
         assert _TEXT.count(suffix) == 1
         start = _TEXT.index(suffix)
         overlong = SourceRef(
             node_id="paper",
-            locator=CharSpanLocator(
-                text_space=TextSpace.EXTRACTED_TEXT, start=start, end=len(_TEXT) + 500
-            ),
+            locator=CharSpanLocator(text_space=TextSpace.EXTRACTED_TEXT, start=start, end=len(_TEXT) + 500),
         )
         # Sanity: the truncated slice DOES equal the recorded quote, which is
         # exactly why quote equality alone waves this through.
@@ -766,9 +726,7 @@ class TestOffsetsThatCannotDescribeTheTextAreAFailure:
         report = replay_condition_set(tmp_path, envelope)
 
         assert report.evidence_outcome is ReplayOutcome.FAILED
-        offending = [
-            f for f in report.findings if f.ref_path == "categorical_claims[0].token_ref"
-        ]
+        offending = [f for f in report.findings if f.ref_path == "categorical_claims[0].token_ref"]
         assert offending, f"findings={report.findings}"
         assert "do not fit" in offending[0].reason
         # The failure reports the SPAN and the length, never the text itself.
@@ -816,10 +774,7 @@ class TestAPairedRefCannotBeDemotedToSupportOnly:
         report = replay_condition_set(tmp_path, envelope)
 
         assert report.evidence_outcome is not ReplayOutcome.VERIFIED
-        assert any(
-            f.ref_path == demoted and f.category is ReplayOutcome.FAILED
-            for f in report.findings
-        ), (
+        assert any(f.ref_path == demoted and f.category is ReplayOutcome.FAILED for f in report.findings), (
             "a grounding pair reported as support-only must be refused; naming it "
             f"is not discharging it. findings={report.findings}"
         )
@@ -853,10 +808,9 @@ class TestTheInventoryCannotOutrunTheWalkEither:
 
         report = replay_condition_set(tmp_path, envelope)
 
-        assert any(
-            f.ref_path == phantom and f.category is ReplayOutcome.FAILED
-            for f in report.findings
-        ), f"findings={report.findings}"
+        assert any(f.ref_path == phantom and f.category is ReplayOutcome.FAILED for f in report.findings), (
+            f"findings={report.findings}"
+        )
         assert report.overall_outcome is ReplayOutcome.FAILED
 
 
@@ -915,9 +869,7 @@ class TestNothingCheckedIsNeverQuietlyClean:
             tmp_path,
             # The unresolved arm carries no label pair at all, and both
             # categorical refs are table cells, so NOTHING is re-sliceable.
-            subject=UnresolvedSubject(
-                reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=table
-            ),
+            subject=UnresolvedSubject(reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=table),
             categorical_claims=(
                 GroundedCategoricalClaim(
                     claim_id="diluent",
@@ -933,8 +885,7 @@ class TestNothingCheckedIsNeverQuietlyClean:
 
         assert report.checked_char_spans == 0
         assert any(
-            finding.ref_path == "<_condition_set_text_pairings>"
-            and finding.category is ReplayOutcome.UNVERIFIABLE
+            finding.ref_path == "<_condition_set_text_pairings>" and finding.category is ReplayOutcome.UNVERIFIABLE
             for finding in report.findings
         ), f"a replay that re-sliced nothing must say so. findings={report.findings}"
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
@@ -1010,9 +961,7 @@ class TestTheReconciliationActuallyFires:
         )
         assert any(f.category is ReplayOutcome.FAILED for f in offending)
 
-    def test_an_intact_inventory_produces_no_reconciliation_failure(
-        self, tmp_path: Path
-    ) -> None:
+    def test_an_intact_inventory_produces_no_reconciliation_failure(self, tmp_path: Path) -> None:
         """The guard above must not be firing for some unrelated reason."""
         report = replay_condition_set(tmp_path, _minimal_condition_set(tmp_path))
         assert report.findings == ()

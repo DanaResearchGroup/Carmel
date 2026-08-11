@@ -541,8 +541,7 @@ def list_artifacts_with_unreadable(workspace_root: Path) -> tuple[list[StoredArt
             # (`_authenticate_raw_bytes_and_read_source_metadata`); enumeration had
             # not, so the corpus path was the one that could still be redirected.
             logger.warning(
-                "evidence store: skipping %s (meta.json records sha256=%s, which names a different "
-                "artifact directory)",
+                "evidence store: skipping %s (meta.json records sha256=%s, which names a different artifact directory)",
                 entry.name,
                 meta.sha256,
             )

@@ -684,7 +684,7 @@ def _load_meta(
         return None
     try:
         recomputed = compute_extraction_sha(_identity_payload_from_meta(meta))
-    except (ExtractionRecordError, ValueError):
+    except ExtractionRecordError, ValueError:
         return None
     if recomputed != expected_extraction_sha256:
         return None
@@ -728,7 +728,7 @@ def _records_identical(candidate_dir: Path, existing_dir: Path) -> bool:
     try:
         candidate_meta = read_json(candidate_dir / _META_NAME)
         existing_meta = read_json(existing_dir / _META_NAME)
-    except (FileNotFoundError, ValueError):
+    except FileNotFoundError, ValueError:
         return False
     ignored = {"stored_at", "pypdf_version"}
     candidate_identity = {k: v for k, v in candidate_meta.items() if k not in ignored}
@@ -1131,9 +1131,7 @@ def scan_extraction_records(workspace_root: Path, raw_sha256: str) -> Extraction
     problems: list[RecordScanProblem] = []
 
     def _problem(entry_name: str, reason: str) -> None:
-        logger.warning(
-            "extraction record store: skipping %s/extractions/%s (%s)", raw_sha256, entry_name, reason
-        )
+        logger.warning("extraction record store: skipping %s/extractions/%s (%s)", raw_sha256, entry_name, reason)
         problems.append(RecordScanProblem(entry_name=entry_name, reason=reason))
 
     for entry in entries:
@@ -1164,9 +1162,7 @@ def scan_extraction_records(workspace_root: Path, raw_sha256: str) -> Extraction
             continue
         records.append(meta)
     records.sort(key=lambda m: (m.stored_at, m.extraction_sha256))
-    return ExtractionRecordScan(
-        records=tuple(records), problems=tuple(problems), dir_state=RecordsDirState.LISTED
-    )
+    return ExtractionRecordScan(records=tuple(records), problems=tuple(problems), dir_state=RecordsDirState.LISTED)
 
 
 def list_extraction_records(workspace_root: Path, raw_sha256: str) -> list[ExtractionRecordMeta]:
@@ -1540,8 +1536,7 @@ def select_extraction(
     if prefer is ExtractionPreference.EXACT:
         if extraction_sha256 is None:
             raise ExtractionSelectionError(
-                f"prefer=EXACT for raw_sha256={raw_sha256!r} requires an extraction_sha256, but None "
-                "was given"
+                f"prefer=EXACT for raw_sha256={raw_sha256!r} requires an extraction_sha256, but None was given"
             )
         _validate_sha(extraction_sha256, label="extraction_sha256")
         meta = load_extraction_record(workspace_root, raw_sha256, extraction_sha256)
@@ -1575,9 +1570,7 @@ def select_extraction(
                 "this is a refusal, not a ranking problem"
             )
         (winner,) = candidates
-        extracted = _load_authenticated_record_text(
-            workspace_root, raw_sha256, winner.extraction_sha256, winner
-        )
+        extracted = _load_authenticated_record_text(workspace_root, raw_sha256, winner.extraction_sha256, winner)
         return SelectedExtraction(extraction_id=winner.extraction_sha256, extracted=extracted)
 
     raise ExtractionSelectionError(f"unknown ExtractionPreference: {prefer!r}")
@@ -1810,15 +1803,12 @@ def select_current_extraction(workspace_root: Path, raw_sha256: str) -> CurrentS
 
     (winner,) = current
     try:
-        extracted = _load_authenticated_record_text(
-            workspace_root, raw_sha256, winner.extraction_sha256, winner
-        )
+        extracted = _load_authenticated_record_text(workspace_root, raw_sha256, winner.extraction_sha256, winner)
     except ExtractionSelectionError as exc:
         return CurrentSelection(
             kind=CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED,
             detail=(
-                f"{raw_sha256}'s one current record ({winner.extraction_sha256[:12]}) failed to "
-                f"authenticate: {exc}"
+                f"{raw_sha256}'s one current record ({winner.extraction_sha256[:12]}) failed to authenticate: {exc}"
             ),
         )
     return CurrentSelection(

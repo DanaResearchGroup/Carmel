@@ -150,9 +150,7 @@ class TestUncertaintyReportsAssertionsAndNotRefusals:
         assert {claim.claim_path for claim in claims} == {"u.kind", "u.basis", "u.scale"}
         assert {claim.gap for claim in claims} == {SemanticGap.NO_SUPPORT_OFFERED}
 
-    @pytest.mark.parametrize(
-        "kind", [UncertaintyKind.UNKNOWN, UncertaintyKind.UNSPECIFIED_PERCENTAGE]
-    )
+    @pytest.mark.parametrize("kind", [UncertaintyKind.UNKNOWN, UncertaintyKind.UNSPECIFIED_PERCENTAGE])
     def test_the_not_stated_sentinels_are_not_reported(self, kind: UncertaintyKind) -> None:
         claims = _uncertainty_claims(
             "u", Uncertainty(kind=kind, basis=_ABSENT, scale=_ABSENT, upper=_ABSENT, lower=_ABSENT)
@@ -162,9 +160,7 @@ class TestUncertaintyReportsAssertionsAndNotRefusals:
     def test_an_absent_basis_and_scale_are_not_reported(self) -> None:
         claims = _uncertainty_claims(
             "u",
-            Uncertainty(
-                kind=UncertaintyKind.STD_DEV, basis=_ABSENT, scale=_ABSENT, upper=_ABSENT, lower=_ABSENT
-            ),
+            Uncertainty(kind=UncertaintyKind.STD_DEV, basis=_ABSENT, scale=_ABSENT, upper=_ABSENT, lower=_ABSENT),
         )
         assert {claim.claim_path for claim in claims} == {"u.kind"}
 
@@ -223,6 +219,7 @@ class TestTheDatasetInventoryReachesEveryUncertaintyBearingSite:
             upper=_ABSENT,
             lower=_ABSENT,
         )
+
         def build(model: type[BaseModel], **fields: object) -> BaseModel:
             """`model_construct` with every OTHER field explicitly ``None``.
 
@@ -268,9 +265,7 @@ class TestTheDatasetInventoryReachesEveryUncertaintyBearingSite:
 
 
 class TestTheClaimsReachTheReportWithoutDisturbingItsArithmetic:
-    def test_a_condition_set_carrying_an_uncertainty_reports_its_obligations(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_condition_set_carrying_an_uncertainty_reports_its_obligations(self, tmp_path: Path) -> None:
         envelope = _minimal_condition_set(
             tmp_path,
             scalar_claims=(_scalar_claim_with_uncertainty(),),
@@ -284,13 +279,9 @@ class TestTheClaimsReachTheReportWithoutDisturbingItsArithmetic:
         # The report still adds up: a NO_SUPPORT_OFFERED claim owns no span, so
         # it can never push checked + support_only past the total. Constructing
         # the report at all is the assertion -- __post_init__ raises otherwise.
-        assert (
-            report.checked_char_spans + report.support_only_char_spans <= report.total_char_spans
-        )
+        assert report.checked_char_spans + report.support_only_char_spans <= report.total_char_spans
 
-    def test_the_overall_verdict_is_downgraded_but_the_evidence_verdict_is_not(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_overall_verdict_is_downgraded_but_the_evidence_verdict_is_not(self, tmp_path: Path) -> None:
         """The whole point of the two scopes. The spans still re-slice clean;
         what is unverifiable is the MEANING no ref supports."""
         envelope = _minimal_condition_set(
@@ -359,9 +350,7 @@ class TestACleanDatasetStillReportsVerifiedOverall:
     semantic claim would leave every private test green and every public report
     permanently unverifiable."""
 
-    def test_single_kind_units_and_no_concrete_uncertainty_verify_overall(
-        self, tmp_path: Path
-    ) -> None:
+    def test_single_kind_units_and_no_concrete_uncertainty_verify_overall(self, tmp_path: Path) -> None:
         envelope = _minimal_condition_set(tmp_path)
         report = replay_condition_set(tmp_path, envelope)
         assert [

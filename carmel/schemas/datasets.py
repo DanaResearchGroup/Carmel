@@ -696,8 +696,7 @@ class ExtractionBinding(BaseModel):
             # authenticate and is refused an existence, mirroring
             # store_extraction_record's own refusal to mint such an address.
             raise ValueError(
-                f"ExtractionBinding's identity fields do not form an addressable extraction "
-                f"identity payload: {exc}"
+                f"ExtractionBinding's identity fields do not form an addressable extraction identity payload: {exc}"
             ) from exc
         if recomputed != self.extraction_sha256:
             raise ValueError(
@@ -2981,9 +2980,7 @@ class Series(BaseModel):
         seen: set[str] = set()
         for axis in self.axes:
             if axis.axis_id in seen:
-                raise ValueError(
-                    f"Series(series_id={self.series_id!r}): duplicate axis_id {axis.axis_id!r} in axes"
-                )
+                raise ValueError(f"Series(series_id={self.series_id!r}): duplicate axis_id {axis.axis_id!r} in axes")
             seen.add(axis.axis_id)
         return self
 
@@ -3017,9 +3014,7 @@ class Series(BaseModel):
         ``COORDINATE`` axis serves.
         """
         if not any(axis.role == AxisRole.COORDINATE for axis in self.axes):
-            raise ValueError(
-                f"Series(series_id={self.series_id!r}) must declare at least one coordinate axis"
-            )
+            raise ValueError(f"Series(series_id={self.series_id!r}) must declare at least one coordinate axis")
         return self
 
     @model_validator(mode="after")
@@ -3031,9 +3026,7 @@ class Series(BaseModel):
         data, not a dataset.
         """
         if not any(axis.role == AxisRole.OBSERVATION for axis in self.axes):
-            raise ValueError(
-                f"Series(series_id={self.series_id!r}) must declare at least one observation axis"
-            )
+            raise ValueError(f"Series(series_id={self.series_id!r}) must declare at least one observation axis")
         return self
 
     @model_validator(mode="after")
@@ -3065,8 +3058,7 @@ class Series(BaseModel):
         for point in self.points:
             if point.point_id in seen:
                 raise ValueError(
-                    f"Series(series_id={self.series_id!r}): duplicate point_id {point.point_id!r} in "
-                    "points"
+                    f"Series(series_id={self.series_id!r}): duplicate point_id {point.point_id!r} in points"
                 )
             seen.add(point.point_id)
         return self
@@ -3707,9 +3699,7 @@ class EmbeddedConversionTable(BaseModel):
         # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
         # trailing newline, so match would let "a" * 64 + "\n" through.
         if not _SHA256_RE.fullmatch(value):
-            raise ValueError(
-                f"EmbeddedConversionTable.sha256 {value!r} is not 64 lowercase hex characters"
-            )
+            raise ValueError(f"EmbeddedConversionTable.sha256 {value!r} is not 64 lowercase hex characters")
         return value
 
     @model_validator(mode="after")
@@ -3757,8 +3747,7 @@ class EmbeddedConversionTable(BaseModel):
             # backstop for the exceedingly deep-but-short payload the length bound alone would
             # not catch.
             raise ValueError(
-                f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json does not parse as JSON: "
-                f"{exc}"
+                f"EmbeddedConversionTable(sha256={self.sha256!r}): canonical_json does not parse as JSON: {exc}"
             ) from exc
         try:
             reconstructed = units.ConversionTable.from_identity_payload(parsed)
@@ -3798,8 +3787,7 @@ def _check_source_form_for_ref(
     if source_form == SourceForm.TABULAR:
         if ref.locator.kind is not LocatorKind.TABLE_CELL:
             raise ValueError(
-                f"{where}: source_form=TABULAR requires value_ref.locator.kind=TABLE_CELL, got "
-                f"{ref.locator.kind!r}"
+                f"{where}: source_form=TABULAR requires value_ref.locator.kind=TABLE_CELL, got {ref.locator.kind!r}"
             )
     elif source_form == SourceForm.DIGITIZED:
         if node_kind is not SourceNodeKind.FIGURE_CROP:
@@ -3822,9 +3810,7 @@ _LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]
     LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
     LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
     LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML}),
-    LocatorKind.CHAR_SPAN: frozenset(
-        {SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}
-    ),
+    LocatorKind.CHAR_SPAN: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
 }
 """Which :class:`SourceNodeKind`\\ s a given :class:`LocatorKind` may target.
 
@@ -4150,10 +4136,7 @@ def _source_graph_identity_payload(graph: SourceGraph) -> dict[str, Any]:
     (enforced by ``SourceGraph``'s own duplicate-id validator).
     """
     return {
-        "nodes": [
-            _source_node_identity_payload(node)
-            for node in sorted(graph.nodes, key=lambda node: node.node_id)
-        ]
+        "nodes": [_source_node_identity_payload(node) for node in sorted(graph.nodes, key=lambda node: node.node_id)]
     }
 
 
@@ -5500,8 +5483,7 @@ class ConditionSetEnvelope(BaseModel):
         ):
             if actual_ids != sorted(actual_ids):
                 raise ValueError(
-                    f"ConditionSetEnvelope: {collection_name} must be sorted ascending by id, got "
-                    f"{actual_ids!r}"
+                    f"ConditionSetEnvelope: {collection_name} must be sorted ascending by id, got {actual_ids!r}"
                 )
         return self
 

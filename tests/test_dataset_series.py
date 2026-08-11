@@ -80,6 +80,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
         root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
 
+
 SHA_A = "a" * 64
 SHA_B = "b" * 64
 SHA_C = "c" * 64
@@ -109,6 +110,8 @@ def _embedded_table_v1() -> EmbeddedConversionTable:
         sha256=TABLE_V1.sha256,
         canonical_json=canonical_json_bytes(TABLE_V1.identity_payload()).decode("utf-8"),
     )
+
+
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 _NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
@@ -1064,9 +1067,7 @@ class TestACharSpanCannotGroundASeriesValue:
             observations=(
                 _observation(
                     "burning_velocity",
-                    _velocity_amount(
-                        node_id="jats", value_ref=_xpath_ref("jats"), unit_ref=_xpath_ref("jats")
-                    ),
+                    _velocity_amount(node_id="jats", value_ref=_xpath_ref("jats"), unit_ref=_xpath_ref("jats")),
                 ),
             ),
         )
@@ -1177,9 +1178,7 @@ class TestACharSpanCannotGroundASeriesValue:
             "pressure",
             _pressure_amount(value_ref=_char_span_ref("paper"), unit_ref=_table_ref("paper")),
         )
-        series = _valid_series(
-            points=(point,), source_form=SourceForm.TABULAR, constants=(constant,)
-        )
+        series = _valid_series(points=(point,), source_form=SourceForm.TABULAR, constants=(constant,))
         envelope = _envelope_with_series((series,), graph=_extracted_paper_graph())
         stored_constant = envelope.series[0].constants[0]
         assert stored_constant.axis_id == "pressure"

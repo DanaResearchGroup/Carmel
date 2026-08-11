@@ -351,8 +351,7 @@ def _base_units_from_identity_payload(payload: Any) -> tuple[tuple[QuantityKind,
         where = f"base_units[{index}]"
         if not isinstance(entry, list) or len(entry) != 2:
             raise ConversionTableInvariantError(
-                f"conversion table payload: {where} must be a 2-element JSON array of [quantity, unit], "
-                f"got {entry!r}"
+                f"conversion table payload: {where} must be a 2-element JSON array of [quantity, unit], got {entry!r}"
             )
         quantity_value, unit = entry
         quantity = _quantity_kind_from_identity_payload(quantity_value, where=where)
@@ -389,8 +388,7 @@ def _aliases_from_identity_payload(payload: Any) -> tuple[UnitAlias, ...]:
         for field_name, field_value in (("raw", raw), ("normalized", normalized)):
             if not isinstance(field_value, str):
                 raise ConversionTableInvariantError(
-                    f"conversion table payload: {where} {field_name!r} must be a str, got "
-                    f"{type(field_value).__name__}"
+                    f"conversion table payload: {where} {field_name!r} must be a str, got {type(field_value).__name__}"
                 )
         result.append(UnitAlias(quantity=quantity, raw=raw, normalized=normalized))
     return tuple(result)
@@ -439,8 +437,7 @@ def _rule_from_identity_payload(payload: Any, *, index: int) -> ConversionRule:
         for field_name, field_value in (("from_unit", from_unit), ("to_unit", to_unit), ("scale", scale)):
             if not isinstance(field_value, str):
                 raise ConversionTableInvariantError(
-                    f"conversion table payload: {where} {field_name!r} must be a str, got "
-                    f"{type(field_value).__name__}"
+                    f"conversion table payload: {where} {field_name!r} must be a str, got {type(field_value).__name__}"
                 )
         return ScaleRule(kind="scale", quantity=quantity, from_unit=from_unit, to_unit=to_unit, scale=scale)
     if kind == "affine":
@@ -466,8 +463,7 @@ def _rule_from_identity_payload(payload: Any, *, index: int) -> ConversionRule:
         ):
             if not isinstance(field_value, str):
                 raise ConversionTableInvariantError(
-                    f"conversion table payload: {where} {field_name!r} must be a str, got "
-                    f"{type(field_value).__name__}"
+                    f"conversion table payload: {where} {field_name!r} must be a str, got {type(field_value).__name__}"
                 )
         return AffineRule(
             kind="affine", quantity=quantity, from_unit=from_unit, to_unit=to_unit, scale=scale, offset=offset
@@ -712,8 +708,7 @@ class ConversionTable:
         actual_keys = set(payload)
         if actual_keys != expected_keys:
             raise ConversionTableInvariantError(
-                f"conversion table payload keys must be exactly {sorted(expected_keys)!r}, got "
-                f"{sorted(actual_keys)!r}"
+                f"conversion table payload keys must be exactly {sorted(expected_keys)!r}, got {sorted(actual_keys)!r}"
             )
         table_id = payload["table_id"]
         if not isinstance(table_id, str):

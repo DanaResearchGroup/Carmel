@@ -1693,9 +1693,7 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
         corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
         assert corpus_action.parameters.get("allow_unauthenticated_legacy_roots") is True
 
-    def test_the_key_is_absent_without_the_flag(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_the_key_is_absent_without_the_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         """C2. Absent, not present-and-False -- matching ``reread_all``'s own
         convention, so a downstream ``.get(..., False)`` reads the fail-closed
         default rather than an explicit but redundant False."""
@@ -1966,7 +1964,7 @@ class TestReextractCommand:
     def test_apply_refuses_a_bogus_record_directory_instead_of_reporting_already_present(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        """"Already present" must mean an AUTHENTICATED record, never merely a
+        """ "Already present" must mean an AUTHENTICATED record, never merely a
         directory existing at the computed address. A directory occupying that
         address without authenticating to it (here: empty) is a distinct, fatal
         collision -- ``--apply`` must neither report it as ALREADY-PRESENT (a

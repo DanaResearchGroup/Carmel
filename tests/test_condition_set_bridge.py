@@ -114,9 +114,7 @@ class TestOneTypeCannotBeWrittenThroughTheOtherTypesDoor:
             store_condition_set_envelope(tmp_path, _maximal_envelope())  # type: ignore[arg-type]
         assert sorted(tmp_path.rglob("*")) == []
 
-    def test_a_condition_set_hand_planted_in_the_dataset_dir_is_refused_on_read(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_condition_set_hand_planted_in_the_dataset_dir_is_refused_on_read(self, tmp_path: Path) -> None:
         """The read-side mirror, and it is not hypothetical.
 
         The bridges cannot stop a payload reaching the dataset directory by
@@ -130,9 +128,7 @@ class TestOneTypeCannotBeWrittenThroughTheOtherTypesDoor:
         with pytest.raises(DatasetEnvelopeParseError):
             load_dataset_envelope(tmp_path, stored.sha256)
 
-    def test_a_dataset_hand_planted_in_the_condition_set_dir_is_refused_on_read(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_dataset_hand_planted_in_the_condition_set_dir_is_refused_on_read(self, tmp_path: Path) -> None:
         payload = _maximal_envelope().identity_payload()
         stored = store_dataset(tmp_path, payload, store_dir=CONDITION_SET_STORE_DIR)
         with pytest.raises(DatasetEnvelopeParseError):
@@ -171,9 +167,7 @@ class TestTheRoundTripThatMakesTheRefusalsMeanSomething:
             stored = store_condition_set_envelope(tmp_path, envelope)
             loaded = load_condition_set_envelope(tmp_path, stored.sha256)
             assert type(loaded.subject) is type(envelope.subject)
-            assert canonical_json_bytes(loaded.identity_payload()) == canonical_json_bytes(
-                envelope.identity_payload()
-            )
+            assert canonical_json_bytes(loaded.identity_payload()) == canonical_json_bytes(envelope.identity_payload())
 
     def test_storing_twice_is_idempotent(self, tmp_path: Path) -> None:
         envelope = _maximal_condition_set_envelope()
@@ -192,9 +186,7 @@ class TestConditionSetsLiveInTheirOwnDirectory:
     payload to skip it.
     """
 
-    def test_a_stored_condition_set_lands_under_the_condition_set_dir(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_stored_condition_set_lands_under_the_condition_set_dir(self, tmp_path: Path) -> None:
         stored = store_condition_set_envelope(tmp_path, _maximal_condition_set_envelope())
         assert stored.path.is_relative_to(tmp_path / CONDITION_SET_STORE_DIR)
         assert not stored.path.is_relative_to(tmp_path / DATASET_STORE_DIR)
@@ -203,9 +195,7 @@ class TestConditionSetsLiveInTheirOwnDirectory:
         store_condition_set_envelope(tmp_path, _maximal_condition_set_envelope())
         assert list_datasets(tmp_path) == []
 
-    def test_a_dataset_and_a_condition_set_coexist_without_shadowing(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_dataset_and_a_condition_set_coexist_without_shadowing(self, tmp_path: Path) -> None:
         """Both still load as themselves once both are present."""
         dataset = _maximal_envelope()
         condition_set = _maximal_condition_set_envelope()
@@ -239,9 +229,7 @@ class TestTheStoresOwnIntegrityToolsReachTheSecondDirectory:
         stored = store_condition_set_envelope(tmp_path, _maximal_condition_set_envelope())
         assert verify_dataset(tmp_path, stored.sha256) is False
 
-    def test_verification_is_type_blind_and_that_limit_is_pinned_here(
-        self, tmp_path: Path
-    ) -> None:
+    def test_verification_is_type_blind_and_that_limit_is_pinned_here(self, tmp_path: Path) -> None:
         """``verify_dataset`` answers "are these bytes canonical and correctly
         named", NOT "is this a genuine condition set".
 
@@ -288,10 +276,7 @@ class TestTheStoresOwnIntegrityToolsReachTheSecondDirectory:
         migration instead of a silent re-addressing. A directory where it
         cannot be read back is a directory that loses that guarantee."""
         stored = store_condition_set_envelope(tmp_path, _maximal_condition_set_envelope())
-        assert (
-            dataset_decimal_repr_version(tmp_path, stored.sha256, store_dir=CONDITION_SET_STORE_DIR)
-            == 1
-        )
+        assert dataset_decimal_repr_version(tmp_path, stored.sha256, store_dir=CONDITION_SET_STORE_DIR) == 1
 
 
 class TestStoreRefusesAnEnvelopeItsOwnLoaderWouldReject:

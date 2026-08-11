@@ -469,9 +469,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
                 categorical_claims=(
                     _categorical_claim(label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)),
                 ),
-                unextracted=(
-                    _refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_a")),
-                ),
+                unextracted=(_refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_a")),),
             )
 
     def test_a_refusal_reaching_into_a_second_paper_is_refused(self) -> None:
@@ -513,13 +511,9 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
                     ),
                 ),
                 categorical_claims=(
-                    _categorical_claim(
-                        label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)
-                    ),
+                    _categorical_claim(label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)),
                 ),
-                unextracted=(
-                    _refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_b")),
-                ),
+                unextracted=(_refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_b")),),
             )
 
     def test_a_subject_label_reaching_into_a_second_paper_is_refused(self) -> None:
@@ -561,13 +555,9 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
                     ),
                 ),
                 categorical_claims=(
-                    _categorical_claim(
-                        label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)
-                    ),
+                    _categorical_claim(label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)),
                 ),
-                unextracted=(
-                    _refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_a")),
-                ),
+                unextracted=(_refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_a")),),
             )
 
     def test_an_attribution_ref_reaching_into_a_second_paper_is_refused(self) -> None:
@@ -607,13 +597,9 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
                     ),
                 ),
                 categorical_claims=(
-                    _categorical_claim(
-                        label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)
-                    ),
+                    _categorical_claim(label_ref=_table_ref("paper_a"), token_ref=_table_ref("paper_a", col=3)),
                 ),
-                unextracted=(
-                    _refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_a")),
-                ),
+                unextracted=(_refusal(label_ref=_table_ref("paper_a"), statement_ref=_bbox_ref("paper_a")),),
             )
 
     def test_refs_to_two_nodes_under_one_root_are_accepted(self) -> None:

@@ -434,8 +434,7 @@ def _cmd_reextract(
         return 1
     if agent_config is None:
         print(
-            "No agent config available: pass --config FILE whose 'agents' section "
-            "sets budget.max_artifact_bytes.",
+            "No agent config available: pass --config FILE whose 'agents' section sets budget.max_artifact_bytes.",
             file=sys.stderr,
         )
         return 1

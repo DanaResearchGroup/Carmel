@@ -186,16 +186,10 @@ class TestTheEvidenceVerdictIsDeafToBothAxes:
     """
 
     def test_a_store_claim_does_not_move_the_evidence_verdict(self) -> None:
-        assert (
-            _clean_report(unchecked_store_claims=(_A_STORE_CLAIM,)).evidence_outcome
-            is ReplayOutcome.VERIFIED
-        )
+        assert _clean_report(unchecked_store_claims=(_A_STORE_CLAIM,)).evidence_outcome is ReplayOutcome.VERIFIED
 
     def test_a_semantic_claim_does_not_move_the_evidence_verdict(self) -> None:
-        assert (
-            _clean_report(unchecked_semantic_claims=(_A_SEMANTIC_CLAIM,)).evidence_outcome
-            is ReplayOutcome.VERIFIED
-        )
+        assert _clean_report(unchecked_semantic_claims=(_A_SEMANTIC_CLAIM,)).evidence_outcome is ReplayOutcome.VERIFIED
 
     def test_neither_axis_appears_in_the_evidence_scoped_lists(self) -> None:
         report = _clean_report(

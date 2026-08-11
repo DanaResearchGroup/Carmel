@@ -144,28 +144,14 @@ logger = get_logger("services.literature")
 #: whole selector exists to remove.
 _RECORD_REFUSAL_OUTCOMES: dict[CurrentSelectionKind, CorpusReadOutcome] = {
     CurrentSelectionKind.NO_CURRENT_RECORD: CorpusReadOutcome.NO_CURRENT_EXTRACTION_RECORD,
-    CurrentSelectionKind.MULTIPLE_CURRENT_RECORDS: (
-        CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS
-    ),
-    CurrentSelectionKind.UNUSABLE_RECORD_PRESENT: (
-        CorpusReadOutcome.UNUSABLE_EXTRACTION_RECORD_PRESENT
-    ),
+    CurrentSelectionKind.MULTIPLE_CURRENT_RECORDS: (CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS),
+    CurrentSelectionKind.UNUSABLE_RECORD_PRESENT: (CorpusReadOutcome.UNUSABLE_EXTRACTION_RECORD_PRESENT),
     CurrentSelectionKind.STORE_UNREADABLE: CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE,
-    CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE: (
-        CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE
-    ),
-    CurrentSelectionKind.EMPTY_RECORD_STORE_PRESENT: (
-        CorpusReadOutcome.EMPTY_EXTRACTION_RECORD_STORE_PRESENT
-    ),
-    CurrentSelectionKind.RECORD_STORE_LINK_DANGLING: (
-        CorpusReadOutcome.EXTRACTION_RECORD_STORE_LINK_DANGLING
-    ),
-    CurrentSelectionKind.EXTRACTOR_IDENTITY_UNAVAILABLE: (
-        CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE
-    ),
-    CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED: (
-        CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED
-    ),
+    CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE: (CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE),
+    CurrentSelectionKind.EMPTY_RECORD_STORE_PRESENT: (CorpusReadOutcome.EMPTY_EXTRACTION_RECORD_STORE_PRESENT),
+    CurrentSelectionKind.RECORD_STORE_LINK_DANGLING: (CorpusReadOutcome.EXTRACTION_RECORD_STORE_LINK_DANGLING),
+    CurrentSelectionKind.EXTRACTOR_IDENTITY_UNAVAILABLE: (CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE),
+    CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED: (CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED),
 }
 
 LITERATURE_REPORT_NAME = "literature_report.json"
@@ -406,9 +392,7 @@ def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
                 continue
             new_p = dict(p)
             old_covered = new_p.pop("covered_sha256", [])
-            new_p["covered"] = [
-                {"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID} for sha in old_covered
-            ]
+            new_p["covered"] = [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID} for sha in old_covered]
             new_passes.append(new_p)
         migrated["passes"] = new_passes
     return migrated
@@ -2085,8 +2069,7 @@ def _corpus_loop(
         state.warnings.append(
             f"{len(skipped)} held artifact(s) were NOT covered by this pass -- "
             + "; ".join(
-                f"{reason}: " + ", ".join(sha[:12] for sha in shas)
-                for reason, shas in sorted(unread_by_reason.items())
+                f"{reason}: " + ", ".join(sha[:12] for sha in shas) for reason, shas in sorted(unread_by_reason.items())
             )
         )
         append_typed_event(
@@ -2103,9 +2086,7 @@ def _corpus_loop(
     # is quoted under a different extraction id. Saying so here means the operator sees
     # it while the pass runs, instead of only by reading the stored report afterwards.
     from_records = sorted(
-        (artifact.sha256, extraction_id)
-        for artifact, _, extraction_id in corpus
-        if extraction_id != ROOT_EXTRACTION_ID
+        (artifact.sha256, extraction_id) for artifact, _, extraction_id in corpus if extraction_id != ROOT_EXTRACTION_ID
     )
     if from_records:
         state.warnings.append(

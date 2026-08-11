@@ -150,9 +150,7 @@ def _bbox_ref() -> SourceRef:
 
 
 def _caption_ref() -> SourceRef:
-    return SourceRef(
-        node_id="si", locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=1)
-    )
+    return SourceRef(node_id="si", locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=1))
 
 
 def _sheet_ref() -> SourceRef:
@@ -549,9 +547,7 @@ class TestTheSubjectTagCannotBeClobberedByAVariantField:
     ``DeviceClassDeclaration`` sub-projector emit a colliding key, without
     inventing a fake field on a real pydantic model to do it."""
 
-    def test_a_variant_field_named_after_the_tag_key_is_refused_loudly(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_a_variant_field_named_after_the_tag_key_is_refused_loudly(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import carmel.schemas.datasets as datasets_module
 
         monkeypatch.setattr(
@@ -585,14 +581,12 @@ class TestNodeOrderDoesNotAffectIdentity:
     def test_two_node_tuple_orders_produce_identical_canonical_bytes(self) -> None:
         baseline = _maximal_condition_set_envelope()
         permuted_nodes = tuple(reversed(baseline.source_graph.nodes))
-        assert [node.node_id for node in permuted_nodes] != [
-            node.node_id for node in baseline.source_graph.nodes
-        ], "fixture drift: the permutation must actually change the tuple order"
+        assert [node.node_id for node in permuted_nodes] != [node.node_id for node in baseline.source_graph.nodes], (
+            "fixture drift: the permutation must actually change the tuple order"
+        )
         permuted = _maximal_condition_set_envelope(source_graph=SourceGraph(nodes=permuted_nodes))
 
-        assert canonical_json_bytes(permuted.identity_payload()) == canonical_json_bytes(
-            baseline.identity_payload()
-        ), (
+        assert canonical_json_bytes(permuted.identity_payload()) == canonical_json_bytes(baseline.identity_payload()), (
             "two ConditionSetEnvelopes differing ONLY in node tuple order produced different "
             "canonical bytes -- one condition set holds many content addresses"
         )

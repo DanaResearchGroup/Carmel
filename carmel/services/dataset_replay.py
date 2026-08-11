@@ -667,9 +667,7 @@ class ReplayReport:
                 f"({self.total_char_spans}) -- a replay cannot have resolved more spans than "
                 "the envelope reaches"
             )
-        expected_unchecked = (
-            self.total_char_spans - self.checked_char_spans - self.support_only_char_spans
-        )
+        expected_unchecked = self.total_char_spans - self.checked_char_spans - self.support_only_char_spans
         if self.unchecked_char_spans != expected_unchecked:
             raise ValueError(
                 f"unchecked_char_spans ({self.unchecked_char_spans}) must be "
@@ -873,9 +871,7 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
     # node's own ExtractionBinding is the only honest anchor for which one
     # this node claims.
     try:
-        record_meta = load_extraction_record(
-            workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
-        )
+        record_meta = load_extraction_record(workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256)
     except ExtractionRecordError as exc:
         return NodeVerification(
             None,
@@ -949,9 +945,10 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
             ),
             False,
         )
-    extracted_path = extraction_record_dir(
-        workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256
-    ) / "extracted.json"
+    extracted_path = (
+        extraction_record_dir(workspace_root, extraction.parent_raw_sha256, extraction.extraction_sha256)
+        / "extracted.json"
+    )
     try:
         raw_bytes = extracted_path.read_bytes()
     except (FileNotFoundError, OSError) as exc:
@@ -1029,8 +1026,7 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
             ReplayFinding(
                 category=ReplayOutcome.UNVERIFIABLE,
                 ref_path=path,
-                reason=f"verified extracted.json for node {node.node_id!r} does not parse as "
-                f"ExtractedText: {exc!r}",
+                reason=f"verified extracted.json for node {node.node_id!r} does not parse as ExtractedText: {exc!r}",
             ),
             False,
         )
@@ -1044,9 +1040,7 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
         # its digests line up. Report UNVERIFIABLE rather than silently
         # replaying partial text as though it were a faithful, complete
         # re-derivation.
-        page_note = (
-            f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
-        )
+        page_note = f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
         return NodeVerification(
             None,
             ReplayFinding(
@@ -1217,9 +1211,7 @@ def _refute_root_sidecar_claim(workspace_root: Path, node: SourceNode) -> RootSi
         # all three is the honest option, and the operator has the artifact
         # sha256 below to go look.
         return RootSidecarClaimCheck(
-            unchecked=_unchecked_root_claim(
-                path, node, claimed, "root meta.json is missing, unreadable or invalid"
-            )
+            unchecked=_unchecked_root_claim(path, node, claimed, "root meta.json is missing, unreadable or invalid")
         )
     actual = _recompute_root_sidecar_claim(workspace_root, node.sha256, meta)
     if actual is claimed:
@@ -1256,9 +1248,7 @@ def _unchecked_root_claim(
     )
 
 
-def _recompute_root_sidecar_claim(
-    workspace_root: Path, sha256: str, meta: StoredArtifact
-) -> RootSidecarVerification:
+def _recompute_root_sidecar_claim(workspace_root: Path, sha256: str, meta: StoredArtifact) -> RootSidecarVerification:
     """Recompute a node's root-sidecar claim from the store, independently.
 
     Deliberately NOT a call into ``dataset_producer._root_sidecar_claim``.
@@ -1333,9 +1323,7 @@ def _measured_value_text_pairings(envelope: object) -> Iterator[_TextPairing]:
     envelope type without being told that type's shape.
     """
     for path, value in iter_measured_values(envelope):
-        yield _TextPairing(
-            f"{path}.value_ref", value.value_ref.node_id, value.value_ref.locator, value.raw_text
-        )
+        yield _TextPairing(f"{path}.value_ref", value.value_ref.node_id, value.value_ref.locator, value.raw_text)
         # unit_raw is short, controlled-vocabulary text (unit symbols and
         # aliases) -- never excerpted prose -- so it is always left literal
         # regardless of reveal_text; see check_char_spans's own docstring.
@@ -1645,14 +1633,10 @@ def _dataset_uncertainty_sites(envelope: DatasetEnvelope) -> tuple[tuple[str, Un
             point_path = f"{base}.points[{point_index}]"
             for coord_index, coordinate in enumerate(point.coordinates):
                 if isinstance(coordinate.uncertainty, Uncertainty):
-                    sites.append(
-                        (f"{point_path}.coordinates[{coord_index}].uncertainty", coordinate.uncertainty)
-                    )
+                    sites.append((f"{point_path}.coordinates[{coord_index}].uncertainty", coordinate.uncertainty))
             for obs_index, observation in enumerate(point.observations):
                 if isinstance(observation.uncertainty, Uncertainty):
-                    sites.append(
-                        (f"{point_path}.observations[{obs_index}].uncertainty", observation.uncertainty)
-                    )
+                    sites.append((f"{point_path}.observations[{obs_index}].uncertainty", observation.uncertainty))
     return tuple(sites)
 
 
@@ -1952,9 +1936,7 @@ def _replay_text_pairings(
         node_id = pairing.node_id
         if node_id in node_problems:
             problem = node_problems[node_id]
-            findings.append(
-                ReplayFinding(category=problem.category, ref_path=path, reason=problem.reason)
-            )
+            findings.append(ReplayFinding(category=problem.category, ref_path=path, reason=problem.reason))
             continue
         text = text_by_node_id.get(node_id)
         if text is None:
@@ -2559,9 +2541,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # untested") overclaimed here while it was honest there -- a difference no
     # consumer could see and none would expect (Codex round 89).
     uncertainty_sites = _dataset_uncertainty_sites(envelope)
-    uncertainty_reconciliation = _reconcile_uncertainty_sites(
-        envelope, {path for path, _ in uncertainty_sites}
-    )
+    uncertainty_reconciliation = _reconcile_uncertainty_sites(envelope, {path for path, _ in uncertainty_sites})
     semantic_claims = _derived_value_claims(envelope, uncertainty_sites)
 
     all_findings = (
@@ -2683,14 +2663,10 @@ def replay_condition_set(
         finding = verify_measured_value_unit(path, value)
         if finding is not None:
             unit_findings.append(finding)
-        boundary_finding = verify_measured_value_unit_boundary(
-            path, value, text_by_node_id, node_problems
-        )
+        boundary_finding = verify_measured_value_unit_boundary(path, value, text_by_node_id, node_problems)
         if boundary_finding is not None:
             unit_findings.append(boundary_finding)
-        value_boundary_finding = verify_measured_value_value_boundary(
-            path, value, text_by_node_id, node_problems
-        )
+        value_boundary_finding = verify_measured_value_value_boundary(path, value, text_by_node_id, node_problems)
         if value_boundary_finding is not None:
             unit_findings.append(value_boundary_finding)
 
@@ -2699,12 +2675,10 @@ def replay_condition_set(
     # asks one question ("what did this replay not check?"), and they are told
     # apart by `gap` -- which is exactly what SemanticGap is for.
     uncertainty_sites = _condition_set_uncertainty_sites(envelope)
-    uncertainty_reconciliation = _reconcile_uncertainty_sites(
-        envelope, {path for path, _ in uncertainty_sites}
+    uncertainty_reconciliation = _reconcile_uncertainty_sites(envelope, {path for path, _ in uncertainty_sites})
+    semantic_claims = _condition_set_semantic_claims(envelope, text_by_node_id, node_problems) + _derived_value_claims(
+        envelope, uncertainty_sites
     )
-    semantic_claims = _condition_set_semantic_claims(
-        envelope, text_by_node_id, node_problems
-    ) + _derived_value_claims(envelope, uncertainty_sites)
     support_only_char_spans = sum(1 for claim in semantic_claims if claim.gap is SemanticGap.SUPPORT_UNRECORDED)
 
     # Independent reconciliation: every path either the hand-written pairing
@@ -2729,19 +2703,13 @@ def replay_condition_set(
     # so the total spans what either side saw and the finding carries the
     # disagreement.
     walked_char_span_paths = {
-        path
-        for path, ref in iter_source_refs(envelope)
-        if isinstance(ref.locator, CharSpanLocator)
+        path for path, ref in iter_source_refs(envelope) if isinstance(ref.locator, CharSpanLocator)
     }
     inventory_char_span_paths = {
         pairing.path
         for pairing in _condition_set_text_pairings(envelope)
         if isinstance(pairing.locator, CharSpanLocator)
-    } | {
-        claim.support_paths[0]
-        for claim in semantic_claims
-        if claim.gap is SemanticGap.SUPPORT_UNRECORDED
-    }
+    } | {claim.support_paths[0] for claim in semantic_claims if claim.gap is SemanticGap.SUPPORT_UNRECORDED}
     total_char_spans = len(walked_char_span_paths | inventory_char_span_paths)
 
     node_level_findings = tuple(node_level_problems.values())
@@ -2781,9 +2749,7 @@ def replay_condition_set(
     )
 
 
-def replay_stored_condition_set(
-    workspace_root: Path, sha256: str, *, reveal_text: bool = False
-) -> ReplayReport:
+def replay_stored_condition_set(workspace_root: Path, sha256: str, *, reveal_text: bool = False) -> ReplayReport:
     """Independently re-verify the condition set actually STORED under ``sha256``.
 
     The condition-set sibling of :func:`replay_stored_dataset`, and separate

@@ -698,7 +698,7 @@ def ground_quote(
             if extent != (start, end):
                 raise QuoteGroundingError(
                     f"ground_quote: quote {display!r} is an interior fragment of the larger "
-                    f"numeral {text[extent[0]:extent[1]]!r} (span "
+                    f"numeral {text[extent[0] : extent[1]]!r} (span "
                     f"[{extent[0]}:{extent[1]}]) in the supplied text -- a grounded "
                     "numeral span must be the MAXIMAL numeral candidate, never a slice of a "
                     "bigger one; quote the full numeral if that is what is meant"
@@ -1093,9 +1093,7 @@ def _measured_value(
     stored, because ``MeasuredValue``'s own validator requires the
     context-free ``repairs`` exactly.
     """
-    value_locator = ground_quote(
-        text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence
-    )
+    value_locator = ground_quote(text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence)
     # P1: pass the VALUE locator's own span so UNIT's leading-edge digit-glue
     # exception (see carmel.services.numeric.unit_boundary_violation) can
     # require the glued digit run to be THIS measurement's own value, not
@@ -1129,8 +1127,7 @@ def _measured_value(
     )
     if isinstance(normalized, Unresolvable):
         raise DatasetProducerError(
-            f"value quote {spec.value_quote!r} for {where} is not derivable into a "
-            f"numeral: {normalized.reason}"
+            f"value quote {spec.value_quote!r} for {where} is not derivable into a numeral: {normalized.reason}"
         )
     try:
         canonical = canonical_decimal(normalized.text)
@@ -1258,9 +1255,7 @@ def _authenticate_raw_bytes_and_read_source_metadata(
     try:
         raw_artifact_bytes = raw_path.read_bytes()
     except OSError as exc:  # FileNotFoundError is an OSError subclass
-        raise DatasetProducerError(
-            f"artifact {sha256!r} has no readable {_RAW_NAME}: {exc}"
-        ) from exc
+        raise DatasetProducerError(f"artifact {sha256!r} has no readable {_RAW_NAME}: {exc}") from exc
     actual_raw_sha256 = hashlib.sha256(raw_artifact_bytes).hexdigest()
     if actual_raw_sha256 != sha256:
         raise DatasetProducerError(
@@ -1272,9 +1267,7 @@ def _authenticate_raw_bytes_and_read_source_metadata(
     return meta.content_type, root_sidecar_claim
 
 
-def _root_sidecar_claim(
-    workspace_root: Path, sha256: str, meta: StoredArtifact
-) -> RootSidecarVerification:
+def _root_sidecar_claim(workspace_root: Path, sha256: str, meta: StoredArtifact) -> RootSidecarVerification:
     """Decide, by looking, what can honestly be said about the root sidecar.
 
     Every value this returns is one a reader can put to the test against the
@@ -1373,9 +1366,7 @@ def _prepare_grounding(
             ``content_type`` that maps to no ``SourceNodeKind`` this producer
             may honestly assert.
     """
-    content_type, root_sidecar_claim = _authenticate_raw_bytes_and_read_source_metadata(
-        workspace_root, sha256
-    )
+    content_type, root_sidecar_claim = _authenticate_raw_bytes_and_read_source_metadata(workspace_root, sha256)
     # The text this envelope grounds against must come from a genuinely stored
     # extraction record, never from the root sidecar.
     #
@@ -1413,9 +1404,7 @@ def _prepare_grounding(
         # empty one that happens to substring-match nothing and fail for the
         # wrong reason. Refuse up front instead of letting a knowingly-partial
         # extraction feed a dataset envelope at all.
-        page_note = (
-            f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
-        )
+        page_note = f" ({len(extracted.page_failures)} page(s) failed to extract)" if extracted.page_failures else ""
         raise DatasetProducerError(
             f"artifact {sha256!r} was extracted lossily (extractor={extracted.extractor!r}){page_note}; "
             f"refusing to produce a {envelope_noun} from a knowingly-partial extraction"
