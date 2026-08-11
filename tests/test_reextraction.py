@@ -25,6 +25,7 @@ from carmel.schemas.literature import ArtifactProvenance
 from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.extraction_record import extraction_record_dir, list_extraction_records
 from carmel.services.reextraction import ReextractionError, preview_reextraction, reextract_artifact
+from tests.pypdf_gate import require_pypdf
 
 MAX_BYTES = 10_000_000
 
@@ -120,6 +121,7 @@ def _store_synthetic_artifact(
     says, independent of ``data`` -- this is how the divergence tests force root and
     raw bytes to disagree without touching ``reextraction.py``'s own write path.
     """
+    require_pypdf()
     artifact = _fetched_artifact(data, content_type=content_type)
     extracted = root_extracted if root_extracted is not None else _stale_extracted()
     stored = store_artifact(
@@ -257,7 +259,7 @@ class TestPreview:
 
 
 class TestBogusRecordDirectoryIsNotAlreadyPresent:
-    """"Already present" must mean an AUTHENTICATED record
+    """ "Already present" must mean an AUTHENTICATED record
     (:func:`~carmel.services.extraction_record.verify_extraction_record`), never
     merely a directory existing at the computed address. A directory occupying
     that address without authenticating to it (empty, half-written, or holding
@@ -268,17 +270,13 @@ class TestBogusRecordDirectoryIsNotAlreadyPresent:
     def test_preview_refuses_a_bogus_record_directory_as_already_present(self, tmp_path: Path) -> None:
         pdf_bytes = _build_tiny_pdf(b"Bogus Record Dir Preview")
         raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
-        extraction_sha256, already_present = preview_reextraction(
-            tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES
-        )
+        extraction_sha256, already_present = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
         assert already_present is False
 
         bogus_dir = extraction_record_dir(tmp_path, raw_sha256, extraction_sha256)
         bogus_dir.mkdir(parents=True)  # exists, but authenticates to nothing: empty.
 
-        with pytest.raises(
-            ReextractionError, match=r"exists but does not authenticate as a stored extraction record"
-        ):
+        with pytest.raises(ReextractionError, match=r"exists but does not authenticate as a stored extraction record"):
             preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
     def test_preview_of_a_bogus_record_directory_holding_junk_leaves_it_untouched(self, tmp_path: Path) -> None:
@@ -290,9 +288,7 @@ class TestBogusRecordDirectoryIsNotAlreadyPresent:
         bogus_dir.mkdir(parents=True)
         (bogus_dir / "junk.txt").write_text("not a record", encoding="utf-8")
 
-        with pytest.raises(
-            ReextractionError, match=r"exists but does not authenticate as a stored extraction record"
-        ):
+        with pytest.raises(ReextractionError, match=r"exists but does not authenticate as a stored extraction record"):
             preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
         # Preview never writes: the junk contents are untouched, and no real
@@ -312,9 +308,7 @@ class TestBogusRecordDirectoryIsNotAlreadyPresent:
         bogus_dir.mkdir(parents=True)
         (bogus_dir / "meta.json").write_text("not valid json{{{", encoding="utf-8")
 
-        with pytest.raises(
-            ReextractionError, match=r"exists but its meta\.json does not authenticate"
-        ):
+        with pytest.raises(ReextractionError, match=r"exists but its meta\.json does not authenticate"):
             preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
     def test_h3_preview_refuses_a_dangling_symlink_at_the_record_directory(self, tmp_path: Path) -> None:
@@ -328,9 +322,7 @@ class TestBogusRecordDirectoryIsNotAlreadyPresent:
         """
         pdf_bytes = _build_tiny_pdf(b"Dangling Symlink Record Dir Preview")
         raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
-        extraction_sha256, already_present = preview_reextraction(
-            tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES
-        )
+        extraction_sha256, already_present = preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
         assert already_present is False
 
         dangling_target = tmp_path / "does-not-exist-h3"
@@ -339,9 +331,7 @@ class TestBogusRecordDirectoryIsNotAlreadyPresent:
         record_dir.parent.mkdir(parents=True, exist_ok=True)
         record_dir.symlink_to(dangling_target)
 
-        with pytest.raises(
-            ReextractionError, match=r"exists but does not authenticate as a stored extraction record"
-        ):
+        with pytest.raises(ReextractionError, match=r"exists but does not authenticate as a stored extraction record"):
             preview_reextraction(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
 
@@ -556,9 +546,7 @@ class TestRefusals:
         with pytest.raises(ReextractionError, match=r"refusing to read outside workspace root"):
             reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
-    def test_step9_refuses_an_unexpected_extractor_value(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_step9_refuses_an_unexpected_extractor_value(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Reachable for real: when pypdf is not importable, extract.py's
         _extract_pdf returns extractor="pdf:unavailable" instead of raising.
         Forces that branch the same way pypdf-unavailable is forced in production
@@ -572,9 +560,7 @@ class TestRefusals:
         pdf_bytes = _build_tiny_pdf(b"Hello Unavailable")
         raw_sha256 = _store_synthetic_artifact(tmp_path, pdf_bytes)
 
-        with pytest.raises(
-            ReextractionError, match=r"extractor 'pdf:unavailable', not the expected 'pdf:pypdf'"
-        ):
+        with pytest.raises(ReextractionError, match=r"extractor 'pdf:unavailable', not the expected 'pdf:pypdf'"):
             reextract_artifact(tmp_path, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
 
     def test_step9_refuses_a_fresh_extraction_with_page_failures(

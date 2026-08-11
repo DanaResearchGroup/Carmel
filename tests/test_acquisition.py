@@ -55,6 +55,7 @@ from carmel.services.acquisition import (
     slug_for,
 )
 from carmel.services.evidence import artifact_dir
+from tests.pypdf_gate import require_pypdf
 
 TITLE = "Shock tube study of ignition delay times in methane oxygen argon mixtures"
 DOI = "10.1016/0010-2180(76)90042-0"
@@ -422,6 +423,7 @@ def _genuine_pdf_bytes(text: str) -> bytes:
     Paginates onto as many 612x792 pages as needed (~50 lines each) so this also
     covers text far longer than one page, e.g. clearing ``_ARTICLE_MIN_CHARS``.
     """
+    require_pypdf()
     import pypdf
     from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 

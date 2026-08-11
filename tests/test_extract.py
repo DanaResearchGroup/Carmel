@@ -904,6 +904,7 @@ class TestExtractPdfPhantomKidsEntries:
         assert result.lossy is False
 
     def test_phantom_kids_do_not_consume_the_max_pdf_pages_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        pytest.importorskip("pypdf")
         # A phantom /Kids entry must not count against MAX_PDF_PAGES: with the cap
         # lowered to exactly the REAL page count, and phantom entries spliced in
         # both before and after those real pages, the true (real) page total must

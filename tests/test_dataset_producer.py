@@ -55,6 +55,7 @@ from carmel.services.evidence import artifact_dir, store_artifact
 from carmel.services.extraction_record import extraction_record_dir, select_current_extraction
 from carmel.services.numeric import QuoteRole
 from carmel.services.units import QuantityKind
+from tests.pypdf_gate import require_pypdf
 
 MAX_BYTES = 10_000_000
 
@@ -148,6 +149,7 @@ def _store_synthetic_artifact(
     record-grounded behaviour would pass just as well against the root. Any
     test that claims to pin the tier must diverge them.
     """
+    require_pypdf()
     data = text.encode("utf-8")
     artifact = FetchedArtifact(
         url="https://example.org/synthetic.pdf",
@@ -157,12 +159,8 @@ def _store_synthetic_artifact(
         n_bytes=len(data),
         fetched_at=datetime.now(UTC),
     )
-    extracted = ExtractedText(
-        text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=lossy
-    )
-    stored = store_artifact(
-        workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
-    )
+    extracted = ExtractedText(text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=lossy)
+    stored = store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
     if record_text is None:
         record_extracted = extracted
     else:
@@ -177,9 +175,7 @@ def _store_synthetic_artifact(
     return stored
 
 
-def _store_genuine_extraction_record(
-    workspace_root: Path, raw_sha256: str, extracted: ExtractedText
-) -> str:
+def _store_genuine_extraction_record(workspace_root: Path, raw_sha256: str, extracted: ExtractedText) -> str:
     """Give the artifact the extraction record a real re-extraction would have left.
 
     The producer no longer MINTS a record by mirroring the root sidecar's text -- doing
@@ -190,6 +186,7 @@ def _store_genuine_extraction_record(
     shape: a stored extraction is a PRECONDITION of dataset production, not a side
     effect of it.
     """
+    require_pypdf()
     from carmel.services.extraction_record import store_extraction_record
     from carmel.services.reextraction import _canonical_extracted_json_bytes
     from carmel.services.semantic_deps import extraction_identity
@@ -208,8 +205,6 @@ def _store_genuine_extraction_record(
         pypdf_version=identity.pypdf_version,
         extracted_json_bytes=payload,
     )
-
-
 
 
 class TestMeasurementSpecOccurrence:
@@ -564,21 +559,15 @@ class TestGroundQuoteRoleDispatchIsExhaustive:
     accept it."""
 
     def test_rejects_a_plain_string_role_that_equals_a_member_value(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ):
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"):
             ground_quote("Kinetics pressure 1023", "K", role="value")  # type: ignore[arg-type]
 
     def test_rejects_a_none_role(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ):
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"):
             ground_quote("Kinetics pressure 1023", "K", role=None)  # type: ignore[arg-type]
 
     def test_rejects_an_arbitrary_object_role(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ):
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"):
             ground_quote("Kinetics pressure 1023", "K", role=object())  # type: ignore[arg-type]
 
     # -- Round 41: the guard must run FIRST, before any later check gets a
@@ -595,30 +584,22 @@ class TestGroundQuoteRoleDispatchIsExhaustive:
         # "300" appears twice with occurrence=None (the default) -- this
         # would normally raise the "appears 2 times" ambiguity error. The
         # role guard must preempt it.
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ) as excinfo:
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member") as excinfo:
             ground_quote("300 K and 300 K again", "300", role=None)  # type: ignore[arg-type]
         assert "appears" not in str(excinfo.value)
 
     def test_rejects_invalid_role_before_reporting_a_quote_not_found(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ) as excinfo:
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member") as excinfo:
             ground_quote("Kinetics pressure 1023", "xyz", role=None)  # type: ignore[arg-type]
         assert "was not found" not in str(excinfo.value)
 
     def test_rejects_invalid_role_before_reporting_whitespace_padding(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ) as excinfo:
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member") as excinfo:
             ground_quote("Kinetics pressure 1023", " K", role=None)  # type: ignore[arg-type]
         assert "leading or trailing whitespace" not in str(excinfo.value)
 
     def test_rejects_invalid_role_before_reporting_an_out_of_range_occurrence(self) -> None:
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ) as excinfo:
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member") as excinfo:
             ground_quote("abc abc", "abc", occurrence=5, role=None)  # type: ignore[arg-type]
         assert "out of range" not in str(excinfo.value)
 
@@ -626,9 +607,7 @@ class TestGroundQuoteRoleDispatchIsExhaustive:
         # The role guard is the VERY FIRST statement in the function body,
         # ahead of even the empty-quote check, so an invalid role is refused
         # here too, not with the empty-quote message.
-        with pytest.raises(
-            QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member"
-        ) as excinfo:
+        with pytest.raises(QuoteGroundingError, match="not a carmel.services.numeric.QuoteRole member") as excinfo:
             ground_quote("Kinetics pressure 1023", "", role=None)  # type: ignore[arg-type]
         assert "empty" not in str(excinfo.value)
 
@@ -657,9 +636,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # unit Kelvin. "K" is the first letter of "Kinetics", so this is a
         # TRAILING-edge violation (the "i" right after it).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote(
-                "Kinetics pressure 1023", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
-            )
+            ground_quote("Kinetics pressure 1023", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     def test_rejects_quote_that_is_a_prefix_of_a_larger_word(self) -> None:
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
@@ -671,18 +648,14 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # "/" is not on the trailing allowlist, so this is a fragment, not
         # the whole unit.
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote(
-                "k = 1.0 cm3/mol/s", "cm3", role=QuoteRole.UNIT, quantity=QuantityKind.VOLUME
-            )
+            ground_quote("k = 1.0 cm3/mol/s", "cm3", role=QuoteRole.UNIT, quantity=QuantityKind.VOLUME)
 
     def test_rejects_unit_fragment_truncating_an_exponent(self) -> None:
         # "m/s" is a real unit on its own, but here it is truncating "m/s2"
         # -- the trailing "2" is a digit, not on the trailing allowlist, so
         # quoting only "m/s" silently drops the exponent.
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote(
-                "a = 9.8 m/s2", "m/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY
-            )
+            ground_quote("a = 9.8 m/s2", "m/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY)
 
     def test_rejects_unit_quote_followed_by_an_open_paren(self) -> None:
         # "(" is LEADING-only on the unit allowlist -- a unit may OPEN a
@@ -690,9 +663,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # trailing edge, so "bar" inside "bar(a)" is refused, not silently
         # accepted as plain "bar" (round 40, defect 2, confirmed-bad case).
         with pytest.raises(QuoteGroundingError, match="TRAILING edge"):
-            ground_quote(
-                "the pressure was 1 bar(a)", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE
-            )
+            ground_quote("the pressure was 1 bar(a)", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE)
 
     def test_rejects_unit_quote_followed_by_a_unicode_minus_sign(self) -> None:
         # U+2212 MINUS SIGN -- not the ASCII hyphen, not on the trailing
@@ -745,9 +716,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # this fire; the current rule independently recomputes
         # find_numeral_extent and refuses because the span names no real
         # numeral at all.
-        with pytest.raises(
-            QuoteGroundingError, match="not itself a clean, maximal numeral in place"
-        ):
+        with pytest.raises(QuoteGroundingError, match="not itself a clean, maximal numeral in place"):
             ground_quote(
                 "run3K reactor",
                 "K",
@@ -763,9 +732,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # would have wrongly fired the glue exception. find_numeral_extent
         # at index 0 is None ("r" is not a digit/sign), so the span names no
         # real numeral and must be refused.
-        with pytest.raises(
-            QuoteGroundingError, match="not itself a clean, maximal numeral in place"
-        ):
+        with pytest.raises(QuoteGroundingError, match="not itself a clean, maximal numeral in place"):
             ground_quote(
                 "run3K reactor",
                 "K",
@@ -780,9 +747,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # at "c", not a numeral -- find_numeral_extent(text, 0) is None, so
         # the span is refused as not naming a genuine numeral, regardless of
         # where its end happens to land.
-        with pytest.raises(
-            QuoteGroundingError, match="not itself a clean, maximal numeral in place"
-        ):
+        with pytest.raises(QuoteGroundingError, match="not itself a clean, maximal numeral in place"):
             ground_quote(
                 "case 1K was run",
                 "K",
@@ -820,9 +785,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # ("102" in "1023K"), but its end (3) does not equal "K"'s start
         # (4) -- it is not a claim about THIS glued digit run, so the
         # exception must not fire.
-        with pytest.raises(
-            QuoteGroundingError, match="does not end exactly where this quote starts"
-        ):
+        with pytest.raises(QuoteGroundingError, match="does not end exactly where this quote starts"):
             ground_quote(
                 "1023K",
                 "K",
@@ -870,9 +833,7 @@ class TestGroundQuoteNonNumericTokenBoundary:
         text = "case 1K was the run id. Temperature was 1023 K"
         value_locator = ground_quote(text, "1023", role=QuoteRole.VALUE)
         value_span = (value_locator.start, value_locator.end)
-        with pytest.raises(
-            QuoteGroundingError, match="does not end exactly where this quote starts"
-        ):
+        with pytest.raises(QuoteGroundingError, match="does not end exactly where this quote starts"):
             ground_quote(
                 text,
                 "K",
@@ -892,29 +853,21 @@ class TestGroundQuoteNonNumericTokenBoundary:
         assert text[locator.start : locator.end] == "K"
 
     def test_accepts_letter_quote_in_parentheses(self) -> None:
-        locator = ground_quote(
-            "T (K) 1023", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
-        )
+        locator = ground_quote("T (K) 1023", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
         assert (locator.start, locator.end) == (3, 4)
 
     def test_accepts_unit_quote_bounded_by_whitespace(self) -> None:
-        locator = ground_quote(
-            "the pressure was 1 bar", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE
-        )
+        locator = ground_quote("the pressure was 1 bar", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE)
         assert (locator.start, locator.end) == (19, 22)
 
     def test_accepts_unit_quote_containing_a_slash(self) -> None:
-        locator = ground_quote(
-            "flame speed in cm/s", "cm/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY
-        )
+        locator = ground_quote("flame speed in cm/s", "cm/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY)
         assert (locator.start, locator.end) == (15, 19)
 
     def test_accepts_unit_quote_containing_the_degree_mark(self) -> None:
         # The full unit "°C", quoted whole, is not a fragment of anything --
         # it is bounded by whitespace on both edges.
-        locator = ground_quote(
-            "T = 25 °C", "°C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
-        )
+        locator = ground_quote("T = 25 °C", "°C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
         assert (locator.start, locator.end) == (7, 9)
 
     # -- QuoteRole.LABEL: strict letter/digit adjacency, no exception ------
@@ -1038,18 +991,14 @@ class TestGroundQuoteNonNumericTokenBoundary:
         # VALUE-role grounding of a whole numeral is unaffected by the new
         # role-aware UNIT/LABEL branches -- it still goes through the
         # pre-existing numeral-maximality path exactly as before this task.
-        locator = ground_quote(
-            "T (K) 1023  P (bar) 1  phi 0.5", "1023", role=QuoteRole.VALUE
-        )
+        locator = ground_quote("T (K) 1023  P (bar) 1  phi 0.5", "1023", role=QuoteRole.VALUE)
         assert (locator.start, locator.end) == (6, 10)
 
     # -- whitespace padding: refused for every role -------------------------
 
     def test_rejects_unit_quote_padded_with_leading_whitespace(self) -> None:
         with pytest.raises(QuoteGroundingError, match="leading or trailing whitespace"):
-            ground_quote(
-                "T = 1023 K", " K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
-            )
+            ground_quote("T = 1023 K", " K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     def test_rejects_label_quote_padded_with_trailing_whitespace(self) -> None:
         with pytest.raises(QuoteGroundingError, match="leading or trailing whitespace"):
@@ -1109,9 +1058,7 @@ class TestGroundQuoteUnitAcceptanceMatrix:
 
     def test_refuses_quantity_supplied_for_value_role(self) -> None:
         with pytest.raises(QuoteGroundingError, match="has no meaning for any other role"):
-            ground_quote(
-                "T = 1023 K", "1023", role=QuoteRole.VALUE, quantity=QuantityKind.TEMPERATURE
-            )
+            ground_quote("T = 1023 K", "1023", role=QuoteRole.VALUE, quantity=QuantityKind.TEMPERATURE)
 
     def test_refuses_quantity_supplied_for_label_role(self) -> None:
         with pytest.raises(QuoteGroundingError, match="has no meaning for any other role"):
@@ -1150,9 +1097,7 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         # the check, because maximality is checked against the UNION over
         # every quantity, not just the claimed one.
         with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
-            ground_quote(
-                "u = 10 cm s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
-            )
+            ground_quote("u = 10 cm s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH)
 
     def test_refuses_unit_that_is_a_suffix_of_a_longer_registered_spelling(self) -> None:
         # "C" is itself a registered TEMPERATURE spelling (the normalized
@@ -1161,9 +1106,7 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         # TEMPERATURE alias ending at this same position and starting before
         # this quote -- a suffix fragment of a longer registered spelling.
         with pytest.raises(QuoteGroundingError, match="unit_not_maximal_backward|LONGER"):
-            ground_quote(
-                "T = 10 deg C", "C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
-            )
+            ground_quote("T = 10 deg C", "C", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     # -- MUST-REFUSE: whitespace-variant forward maximality (P1-1, round 43) -
 
@@ -1178,9 +1121,7 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         # string match, or this quote is silently admitted as LENGTH when
         # the source text actually reads the VELOCITY alias.
         with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
-            ground_quote(
-                "u = 10 cm  s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
-            )
+            ground_quote("u = 10 cm  s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH)
 
     def test_refuses_unit_prefix_of_longer_spelling_separated_by_nbsp(self) -> None:
         # Same as above, but the separator is U+00A0 NO-BREAK SPACE rather
@@ -1189,18 +1130,14 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         # so this must refuse identically to the double-space and ASCII-
         # single-space cases.
         with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
-            ground_quote(
-                "u = 10 cm s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
-            )
+            ground_quote("u = 10 cm s^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH)
 
     def test_refuses_unit_prefix_of_longer_spelling_separated_by_newline(self) -> None:
         # Same as above, but the separator is a newline -- another
         # plausible PDF-extraction artefact (a line break landing between a
         # unit and its per-time suffix). Must refuse identically.
         with pytest.raises(QuoteGroundingError, match="unit_not_maximal_forward|LONGER"):
-            ground_quote(
-                "u = 10 cm\ns^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH
-            )
+            ground_quote("u = 10 cm\ns^-1", "cm", role=QuoteRole.UNIT, quantity=QuantityKind.LENGTH)
 
     def test_refuses_whitespace_variant_alias_quoted_whole_as_not_in_vocabulary(self) -> None:
         # Deliberate, documented coverage gap (round 43, P1-1): unlike
@@ -1247,9 +1184,7 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         # two discriminants apart rather than merely observing "some
         # refusal happened".
         with pytest.raises(QuoteGroundingError, match="not maximal at that edge"):
-            ground_quote(
-                "the unit is Kq nearby", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE
-            )
+            ground_quote("the unit is Kq nearby", "K", role=QuoteRole.UNIT, quantity=QuantityKind.TEMPERATURE)
 
     # -- MUST-ACCEPT: a genuinely clean, maximal unit quote grounds ---------
 
@@ -1260,9 +1195,7 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         assert (locator.start, locator.end) == (25, 26)
 
     def test_accepts_clean_pressure_unit(self) -> None:
-        locator = ground_quote(
-            "the pressure was 1 bar", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE
-        )
+        locator = ground_quote("the pressure was 1 bar", "bar", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE)
         assert (locator.start, locator.end) == (19, 22)
 
     def test_accepts_clean_time_unit(self) -> None:
@@ -1270,15 +1203,11 @@ class TestGroundQuoteUnitAcceptanceMatrix:
         assert (locator.start, locator.end) == (6, 7)
 
     def test_accepts_clean_volume_unit(self) -> None:
-        locator = ground_quote(
-            "k = 1.0 cm3 per mol", "cm3", role=QuoteRole.UNIT, quantity=QuantityKind.VOLUME
-        )
+        locator = ground_quote("k = 1.0 cm3 per mol", "cm3", role=QuoteRole.UNIT, quantity=QuantityKind.VOLUME)
         assert (locator.start, locator.end) == (8, 11)
 
     def test_accepts_clean_velocity_unit(self) -> None:
-        locator = ground_quote(
-            "a = 9.8 m/s measured", "m/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY
-        )
+        locator = ground_quote("a = 9.8 m/s measured", "m/s", role=QuoteRole.UNIT, quantity=QuantityKind.VELOCITY)
         assert (locator.start, locator.end) == (8, 11)
 
     def test_accepts_unit_glued_to_its_own_verified_value(self) -> None:
@@ -1329,9 +1258,7 @@ class TestTheProducerNeverMintsARecordFromTheRootSidecar:
         # Deliberately NOT via _store_synthetic_artifact: that helper now stores the
         # record a real re-extraction would have left, which is exactly what must be
         # absent here.
-        stored = store_artifact(
-            tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
-        )
+        stored = store_artifact(tmp_path, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
         records_dir = tmp_path / "evidence" / "literature" / stored.sha256 / "extractions"
         assert not records_dir.exists()
 
@@ -1339,8 +1266,7 @@ class TestTheProducerNeverMintsARecordFromTheRootSidecar:
             _tabular_envelope_from_artifact(tmp_path, sha256=stored.sha256)
 
         assert not records_dir.exists(), (
-            "refusing must not leave a record behind: minting one here is the laundering "
-            "this refusal exists to prevent"
+            "refusing must not leave a record behind: minting one here is the laundering this refusal exists to prevent"
         )
 
 
@@ -1438,8 +1364,7 @@ class TestProducerEndToEnd:
             lossy=False,
         )
         extracted_path = (
-            extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
-            / "extracted.json"
+            extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256) / "extracted.json"
         )
         extracted_path.write_text(json.dumps(mutated_extracted.model_dump(mode="json")), encoding="utf-8")
 
@@ -1472,18 +1397,13 @@ class TestProducerFailClosed:
         raw bytes and grounded text are both authenticated."""
         stored = _store_synthetic_artifact(tmp_path, _TEXT)
         extracted_path = artifact_dir(tmp_path, stored.sha256) / "extracted.json"
-        corrupt = ExtractedText(
-            text="tampered", normalized="tampered", sections=[], extractor="pdf:pypdf", lossy=False
-        )
+        corrupt = ExtractedText(text="tampered", normalized="tampered", sections=[], extractor="pdf:pypdf", lossy=False)
         extracted_path.write_bytes(corrupt.model_dump_json().encode("utf-8"))
 
         envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
-        assert (
-            node.verification.root_sidecar
-            is RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
-        )
+        assert node.verification.root_sidecar is RootSidecarVerification.ROOT_SIDECAR_DIGEST_MISMATCH
 
     def test_refuses_a_corrupt_extraction_record_sidecar(self, tmp_path: Path) -> None:
         """The counterweight to the test above, and where the real guarantee
@@ -1497,8 +1417,7 @@ class TestProducerFailClosed:
         selection = select_current_extraction(tmp_path, stored.sha256)
         assert selection.selected is not None
         record_sidecar = (
-            extraction_record_dir(tmp_path, stored.sha256, selection.selected.extraction_id)
-            / "extracted.json"
+            extraction_record_dir(tmp_path, stored.sha256, selection.selected.extraction_id) / "extracted.json"
         )
         record_sidecar.write_bytes(b'{"not":"an ExtractedText"}')
 
@@ -1522,9 +1441,7 @@ class TestProducerFailClosed:
             unit_quote="Pa",
         )
         with pytest.raises(QuoteGroundingError, match="not found"):
-            _tabular_envelope_from_artifact(
-                tmp_path, sha256=stored.sha256, measurements=(bad_spec, *_SPECS)
-            )
+            _tabular_envelope_from_artifact(tmp_path, sha256=stored.sha256, measurements=(bad_spec, *_SPECS))
 
     def test_refuses_corrupted_raw_bin(self, tmp_path: Path) -> None:
         """P1-B: raw.bin was never verified before this fix -- only
@@ -1561,9 +1478,7 @@ class TestProducerFailClosed:
         with pytest.raises(DatasetProducerError, match="disagree"):
             _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
-    def test_a_stale_root_derivation_binding_no_longer_blocks_production(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_stale_root_derivation_binding_no_longer_blocks_production(self, tmp_path: Path) -> None:
         """INVERTED, deliberately, and for the same reason as the corrupt-root
         -sidecar test above: ``derivation_binding`` binds the ROOT sidecar's
         digest to the root extractor identity, and neither is carried into the
@@ -1625,10 +1540,7 @@ class TestProducerFailClosed:
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
         assert node.verification.raw_artifact is RawArtifactVerification.RAW_SHA256_DIGEST_AUTHENTICATED
-        assert (
-            node.verification.extracted_text
-            is ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
-        )
+        assert node.verification.extracted_text is ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
         assert node.verification.root_sidecar is RootSidecarVerification.NO_RECORDED_DIGEST
 
     def test_refuses_a_legacy_artifact_that_is_also_corrupt_by_naming_the_integrity_failure(
@@ -1737,9 +1649,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
     def _envelope(self, tmp_path: Path, stored: StoredArtifact) -> DatasetEnvelope:
         return _tabular_envelope_from_artifact(tmp_path, sha256=stored.sha256)
 
-    def test_the_legacy_claim_keys_on_extracted_sha256_not_derivation_binding(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_legacy_claim_keys_on_extracted_sha256_not_derivation_binding(self, tmp_path: Path) -> None:
         """``NO_RECORDED_DIGEST`` must key on ``extracted_sha256`` -- the field
         that decides whether the sidecar CAN be authenticated at all.
 
@@ -1759,10 +1669,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
 
         node = envelope.source_graph.nodes[0]
         assert not isinstance(node.verification, Absent)
-        assert (
-            node.verification.root_sidecar
-            is RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
-        )
+        assert node.verification.root_sidecar is RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED
 
     def test_an_honest_claim_replays_clean(self, tmp_path: Path) -> None:
         """The counterweight. Without it, a check that flagged EVERY envelope
@@ -1820,9 +1727,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         _assert_unverifiable_only_for_the_value_locators(report)
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
 
-    def test_an_unreadable_root_meta_is_reported_as_an_unchecked_claim(
-        self, tmp_path: Path
-    ) -> None:
+    def test_an_unreadable_root_meta_is_reported_as_an_unchecked_claim(self, tmp_path: Path) -> None:
         """Unrefuted must not mean unreported (Codex round 73, P1).
 
         The test above pins that a missing root tier does not degrade the
@@ -1854,9 +1759,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         assert stored.sha256 in unchecked.reason
         assert unchecked.claim == RootSidecarVerification.NO_RECORDED_DIGEST.value
 
-    def test_an_unparseable_root_meta_is_not_reported_as_an_absent_one(
-        self, tmp_path: Path
-    ) -> None:
+    def test_an_unparseable_root_meta_is_not_reported_as_an_absent_one(self, tmp_path: Path) -> None:
         """A corrupt root tier must not be described as a missing one.
 
         Written (following Codex round 74, P2) expecting the two to report
@@ -1885,9 +1788,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         assert "missing, unreadable or invalid" in reason
         assert "is absent" not in reason
 
-    def test_every_node_with_an_uncheckable_claim_gets_its_own_entry(
-        self, tmp_path: Path
-    ) -> None:
+    def test_every_node_with_an_uncheckable_claim_gets_its_own_entry(self, tmp_path: Path) -> None:
         """Two uncheckable nodes must produce TWO entries, not one.
 
         Codex round 74 named the collapsing mutation directly: nothing pinned
@@ -1899,11 +1800,7 @@ class TestReplayRefutesAForgedRootSidecarClaim:
         root = envelope.source_graph.nodes[0]
         sibling = root.model_copy(update={"node_id": "paper_2", "parent_node_id": root.node_id})
         envelope = envelope.model_copy(
-            update={
-                "source_graph": envelope.source_graph.model_copy(
-                    update={"nodes": (root, sibling)}
-                )
-            }
+            update={"source_graph": envelope.source_graph.model_copy(update={"nodes": (root, sibling)})}
         )
         (artifact_dir(tmp_path, first.sha256) / "meta.json").unlink()
 
@@ -1940,16 +1837,12 @@ class TestProducerNodeKind:
         assert envelope.source_graph.nodes[0].kind == SourceNodeKind.PAPER_PDF
 
     def test_xml_artifact_yields_jats_xml_node(self, tmp_path: Path) -> None:
-        stored = _store_synthetic_artifact(
-            tmp_path, _TEXT, content_type="application/xml", extractor="xml"
-        )
+        stored = _store_synthetic_artifact(tmp_path, _TEXT, content_type="application/xml", extractor="xml")
         envelope = _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
         assert envelope.source_graph.nodes[0].kind == SourceNodeKind.JATS_XML
 
     def test_unrecognised_content_type_is_refused(self, tmp_path: Path) -> None:
-        stored = _store_synthetic_artifact(
-            tmp_path, _TEXT, content_type="text/html", extractor="html"
-        )
+        stored = _store_synthetic_artifact(tmp_path, _TEXT, content_type="text/html", extractor="html")
         with pytest.raises(DatasetProducerError, match="does not map to any SourceNodeKind"):
             _produce_through_the_preamble(tmp_path, sha256=stored.sha256)
 
@@ -2031,9 +1924,7 @@ class TestGroundingIsIndependentPerQuote:
     the docstring paragraph in ``produce_envelope_from_artifact`` describing
     the same gap) to be updated or removed."""
 
-    def test_value_and_unit_from_unrelated_parts_of_document_both_ground(
-        self, tmp_path: Path
-    ) -> None:
+    def test_value_and_unit_from_unrelated_parts_of_document_both_ground(self, tmp_path: Path) -> None:
         text = (
             "The reactor was held at a temperature of 1023 K during the run. "
             "In an unrelated paragraph about SI units, Pa was mentioned as the "
@@ -2094,9 +1985,7 @@ class TestActiveTableBindingTracksItsArgument:
         # therefore its spelling vocabulary and content-address), not merely
         # a version-string difference that a lazy/broken derive() could pass
         # through unnoticed.
-        extra_alias = units.UnitAlias(
-            quantity=QuantityKind.PRESSURE, raw="Pa_test_variant", normalized="Pa"
-        )
+        extra_alias = units.UnitAlias(quantity=QuantityKind.PRESSURE, raw="Pa_test_variant", normalized="Pa")
         # A SECOND extra alias whose raw spelling contains whitespace. Without
         # this one, check 4 below is vacuous: `Pa_test_variant` has no
         # whitespace at all, so `active_other.whitespace_patterns` and
@@ -2107,9 +1996,7 @@ class TestActiveTableBindingTracksItsArgument:
         # regression this test class exists to catch. A whitespace-containing
         # spelling is required to make that regression move a value this
         # test actually reads.
-        extra_whitespace_alias = units.UnitAlias(
-            quantity=QuantityKind.PRESSURE, raw="Pa test variant", normalized="Pa"
-        )
+        extra_whitespace_alias = units.UnitAlias(quantity=QuantityKind.PRESSURE, raw="Pa test variant", normalized="Pa")
         assert extra_alias not in units.TABLE_V1.aliases
         assert extra_whitespace_alias not in units.TABLE_V1.aliases
         other_table = dataclasses.replace(
@@ -2202,8 +2089,6 @@ _FURNITURE_SPECS = (
 )
 
 
-
-
 class TestFigureFurnitureIsRefused:
     """P0-c CLOSED: axis furniture can no longer become a dataset.
 
@@ -2243,16 +2128,12 @@ class TestFigureFurnitureIsRefused:
             measurements=_FURNITURE_SPECS,
         )
 
-    def test_the_producer_refuses_quotes_taken_from_axis_furniture(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_producer_refuses_quotes_taken_from_axis_furniture(self, tmp_path: Path) -> None:
         """The exact call that used to yield a VERIFIED envelope now raises."""
         with pytest.raises(DatasetProducerError, match="cannot ground a series data point"):
             self._produce(tmp_path)
 
-    def test_the_refusal_names_runtime_incapacity_not_prose_impossibility(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_refusal_names_runtime_incapacity_not_prose_impossibility(self, tmp_path: Path) -> None:
         """Prose CAN state a real series -- "At 300, 400 and 500 K the rates
         were 1.2, 2.4 and 4.8 s-1, respectively" is one. What this runtime
         cannot do is PROVE the pairing from a char span. The wording has to
@@ -2264,9 +2145,7 @@ class TestFigureFurnitureIsRefused:
         assert "this runtime" in message
         assert "ConditionSetEnvelope" in message, "the honest destination must be named"
 
-    def test_the_refusal_is_not_a_judgement_about_these_quotes(
-        self, tmp_path: Path
-    ) -> None:
+    def test_the_refusal_is_not_a_judgement_about_these_quotes(self, tmp_path: Path) -> None:
         """Specs quoting an ordinary prose sentence -- nothing furniture-like
         about them -- are refused identically. The route is closed, not the
         quotes judged. This is what stops the fix being read as a heuristic

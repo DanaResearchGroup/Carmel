@@ -94,6 +94,7 @@ from carmel.services.literature import (
     run_record_for,
 )
 from carmel.services.plan_progress import publish_lock_info
+from tests.pypdf_gate import require_pypdf
 from tests.test_acquisition import _matching_body, _patch_text_sniff_to_pdf
 
 DOI = "10.1000/test.doi"
@@ -1608,9 +1609,7 @@ class TestWantedPaperOpenAccessResolution:
     """
 
     def test_an_open_access_copy_is_fetched_and_stored_instead_of_queued(self, campaign: Campaign) -> None:
-        resolver = _FakeOaResolver(
-            {WANTED_DOI: _fully_resolved((OA_PDF_URL,), "OpenAlex: 1 OA PDF candidate")}
-        )
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "OpenAlex: 1 OA PDF candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (DOC.encode(), "text/plain")},
@@ -2050,9 +2049,7 @@ class TestReportSchemaVersionGate:
         not invent it -- an empty ``covered`` list stays the honest answer."""
         from carmel.services.literature import migrate_report_payload
 
-        v1_migrated = migrate_report_payload(
-            {"schema_version": 1, "run_id": "r", "action_id": "a", "queries": []}
-        )
+        v1_migrated = migrate_report_payload({"schema_version": 1, "run_id": "r", "action_id": "a", "queries": []})
         assert isinstance(v1_migrated, dict)
         assert v1_migrated["passes"][0]["covered"] == []
 
@@ -3205,9 +3202,7 @@ class TestAFindingRecordsWhichExtractionItsOffsetsIndex:
         "Further discussion of the measurements follows here.\n"
     )
 
-    def _patch_corpus_to_read_a_record(
-        self, monkeypatch: pytest.MonkeyPatch, *, extraction_id: str, text: str
-    ) -> None:
+    def _patch_corpus_to_read_a_record(self, monkeypatch: pytest.MonkeyPatch, *, extraction_id: str, text: str) -> None:
         """Make ``_load_corpus`` report that it read a NON-root extraction.
 
         It calls the real loader and substitutes the text and identity, so the
@@ -3417,9 +3412,7 @@ class TestAFindingRecordsWhichExtractionItsOffsetsIndex:
         with pytest.raises(ValidationError, match="extraction_id"):
             EvidenceRef(artifact_sha256="a" * 64, extraction_id=bogus)
 
-    def test_p8_a_v4_payload_claiming_a_record_is_normalised_to_root_not_honoured(
-        self, campaign: Campaign
-    ) -> None:
+    def test_p8_a_v4_payload_claiming_a_record_is_normalised_to_root_not_honoured(self, campaign: Campaign) -> None:
         """P8. The migration OVERWRITES; it does not merely fill in a blank.
 
         No v4 writer could have had grounds to say "these offsets index record <sha>" --
@@ -3784,9 +3777,7 @@ class TestALegacyRootIsUnauthenticatedNotCorrupt:
         assert legacy_sha[:12] in legacy_segment and corrupt_sha[:12] not in legacy_segment
         assert corrupt_sha[:12] in corrupt_segment and legacy_sha[:12] not in corrupt_segment
 
-    def test_g13_a_legacy_artifact_is_not_covered_without_the_action_parameter(
-        self, campaign: Campaign
-    ) -> None:
+    def test_g13_a_legacy_artifact_is_not_covered_without_the_action_parameter(self, campaign: Campaign) -> None:
         """G13. End to end through the queued action, not just ``_load_corpus``
         directly: an action carrying no ``allow_unauthenticated_legacy_roots`` key at
         all leaves the sole held legacy artifact unread and uncovered."""
@@ -3799,9 +3790,7 @@ class TestALegacyRootIsUnauthenticatedNotCorrupt:
         assert deps.ledger.usage().model_calls == 0
         assert legacy_sha  # the artifact exists; it is simply not among the covered
 
-    def test_g14_a_legacy_artifact_is_covered_when_the_action_carries_the_parameter(
-        self, campaign: Campaign
-    ) -> None:
+    def test_g14_a_legacy_artifact_is_covered_when_the_action_carries_the_parameter(self, campaign: Campaign) -> None:
         """G14. The parameter must actually reach ``_load_corpus`` from the queued
         action's ``parameters``, not merely be recorded and dropped -- the only test
         in this suite that proves that end-to-end wiring, as opposed to the gating
@@ -3911,6 +3900,7 @@ def _store_current_record(workspace_root: Path, raw_sha256: str, *, text: str) -
     hardcoded sha would make the record permanently non-current and the test would
     pass for the wrong reason -- silently exercising the root path it exists to avoid.
     """
+    require_pypdf()
     from carmel.agents.tools.extract import ExtractedText, normalize_for_match
     from carmel.services.extraction_record import store_extraction_record
     from carmel.services.semantic_deps import extraction_identity
@@ -3945,6 +3935,7 @@ def _store_record(
     which is deliberately NOT current, or not a ``pdf:pypdf`` one. Defaults still come
     from the real `extraction_identity()` for the same reason that helper does it.
     """
+    require_pypdf()
     from carmel.agents.tools.extract import ExtractedText, normalize_for_match
     from carmel.services.extraction_record import store_extraction_record
     from carmel.services.semantic_deps import extraction_identity
@@ -3986,9 +3977,7 @@ class TestTheCorpusPrefersAnAuthenticatedExtractionRecord:
     PROMOTE. A uniform rule makes deletion incapable of changing which path is taken.
     """
 
-    def test_a_legacy_root_with_one_authenticated_record_is_read_with_no_opt_in_flag(
-        self, campaign: Campaign
-    ) -> None:
+    def test_a_legacy_root_with_one_authenticated_record_is_read_with_no_opt_in_flag(self, campaign: Campaign) -> None:
         """The operator's 8 papers, after re-extraction, without the opt-in flag.
 
         The record's text is deliberately DIFFERENT from the root's, so serving the
@@ -4145,9 +4134,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
     tampering with a single file.
     """
 
-    def test_corrupting_one_meta_json_must_not_turn_a_refusal_into_a_read(
-        self, campaign: Campaign
-    ) -> None:
+    def test_corrupting_one_meta_json_must_not_turn_a_refusal_into_a_read(self, campaign: Campaign) -> None:
         """Tamper-to-PROMOTE: the attacker gains a read rather than losing one.
 
         Two current records are ambiguous and refuse. Corrupting ONE record's meta.json
@@ -4158,9 +4145,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
         """
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
-        doomed = _store_record(
-            campaign.workspace_root, legacy_sha, text="a second, differently-worded extraction"
-        )
+        doomed = _store_record(campaign.workspace_root, legacy_sha, text="a second, differently-worded extraction")
         (_records_dir(campaign.workspace_root, legacy_sha) / doomed / "meta.json").write_text(
             "{ this is not json", encoding="utf-8"
         )
@@ -4176,9 +4161,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
         )
         assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
 
-    def test_a_pdf_unavailable_record_is_not_current_once_pypdf_is_installed(
-        self, campaign: Campaign
-    ) -> None:
+    def test_a_pdf_unavailable_record_is_not_current_once_pypdf_is_installed(self, campaign: Campaign) -> None:
         """False currentness: today's extractor would never produce this record.
 
         ``pdf:unavailable`` is the degraded placeholder written when pypdf could not be
@@ -4202,9 +4185,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
         assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
         assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
 
-    def test_records_that_no_longer_match_todays_code_identity_refuse(
-        self, campaign: Campaign
-    ) -> None:
+    def test_records_that_no_longer_match_todays_code_identity_refuse(self, campaign: Campaign) -> None:
         """Records exist but none is current: a refusal, not a fall-through.
 
         "No record was ever stored" and "records exist, none matches today's extractor"
@@ -4212,9 +4193,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
         text that is checked against nothing.
         """
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
-        _store_record(
-            campaign.workspace_root, legacy_sha, text=RECORD_TEXT, code_sha256="0" * 64
-        )
+        _store_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT, code_sha256="0" * 64)
 
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
@@ -4245,7 +4224,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
 
     @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a chmod-000 directory")
     def test_an_unlistable_extractions_directory_refuses(self, campaign: Campaign) -> None:
-        """"The store cannot be read" must not present as "the store is empty"."""
+        """ "The store cannot be read" must not present as "the store is empty"."""
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
         records_dir = _records_dir(campaign.workspace_root, legacy_sha)
@@ -4258,9 +4237,7 @@ class TestEveryRouteToNoUsableRecordRefuses:
         assert corpus == [], "an unreadable record store is not an absent one"
         assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
 
-    def test_a_genuinely_absent_extractions_directory_is_the_only_fall_through(
-        self, campaign: Campaign
-    ) -> None:
+    def test_a_genuinely_absent_extractions_directory_is_the_only_fall_through(self, campaign: Campaign) -> None:
         """The one route that legitimately reaches the root tiers.
 
         This is the counterweight to every refusal above: if the refusals swallowed this
@@ -4293,9 +4270,7 @@ class TestOnePoisonedEntryDoesNotKillTheWholePass:
     where the blast radius is the whole campaign instead of one artifact.
     """
 
-    def test_a_symlinked_extractions_dir_refuses_only_its_own_document(
-        self, campaign: Campaign
-    ) -> None:
+    def test_a_symlinked_extractions_dir_refuses_only_its_own_document(self, campaign: Campaign) -> None:
         """Two healthy documents must survive a third one's escaping symlink.
 
         The failure this pins is availability, not authenticity: before the fix the
@@ -4324,18 +4299,15 @@ class TestOnePoisonedEntryDoesNotKillTheWholePass:
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
         assert sorted(artifact.sha256 for artifact, _, _ in corpus) == sorted(healthy), (
-            "one artifact whose record store escapes the workspace must not take the "
-            "healthy documents down with it"
+            "one artifact whose record store escapes the workspace must not take the healthy documents down with it"
         )
         assert outcomes[poisoned] == CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE
         assert outcomes[poisoned] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
             "escaping the workspace is never a licence to fall through to the root sidecar"
         )
 
-    def test_the_escape_is_not_reported_as_a_merely_unreadable_store(
-        self, campaign: Campaign
-    ) -> None:
-        """"Points outside the workspace" and "could not be listed" are different facts.
+    def test_the_escape_is_not_reported_as_a_merely_unreadable_store(self, campaign: Campaign) -> None:
+        """ "Points outside the workspace" and "could not be listed" are different facts.
 
         The first is a containment breach -- the store is being asked to follow a path
         out of the workspace it is supposed to be sealed inside. The second is an IO
@@ -4343,9 +4315,7 @@ class TestOnePoisonedEntryDoesNotKillTheWholePass:
         to undo, and it would tell an operator to check permissions when what they have
         is a planted or restored symlink.
         """
-        poisoned = _store_legacy(
-            campaign.workspace_root, text=DOC, url="https://example.invalid/escapes"
-        )
+        poisoned = _store_legacy(campaign.workspace_root, text=DOC, url="https://example.invalid/escapes")
         outside = campaign.workspace_root.parent / "outside-for-distinctness"
         outside.mkdir(parents=True, exist_ok=True)
         _records_dir(campaign.workspace_root, poisoned).symlink_to(outside, target_is_directory=True)
@@ -4366,9 +4336,7 @@ class TestAnIncompleteRecordStoreRefusesInTheCorpusPass:
     for a symlink that does not exist.
     """
 
-    def test_an_interrupted_write_is_reported_as_an_empty_store_not_an_absent_one(
-        self, campaign: Campaign
-    ) -> None:
+    def test_an_interrupted_write_is_reported_as_an_empty_store_not_an_absent_one(self, campaign: Campaign) -> None:
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         _records_dir(campaign.workspace_root, legacy_sha).mkdir(parents=True)
 
@@ -4383,9 +4351,7 @@ class TestAnIncompleteRecordStoreRefusesInTheCorpusPass:
     def test_a_dangling_store_link_is_reported_as_such(self, campaign: Campaign) -> None:
         legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
         artifact_root = campaign.workspace_root / "evidence" / "literature" / legacy_sha
-        (artifact_root / "extractions").symlink_to(
-            artifact_root / "never-created", target_is_directory=True
-        )
+        (artifact_root / "extractions").symlink_to(artifact_root / "never-created", target_is_directory=True)
 
         corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
 
@@ -4416,9 +4382,7 @@ class TestCorpusEnumerationDoesNotTrustMetaJsonsOwnSha256:
         assert first != second
         meta_path = artifact_dir(tmp_path, first) / "meta.json"
         meta = StoredArtifact.model_validate_json(meta_path.read_text(encoding="utf-8"))
-        meta_path.write_text(
-            meta.model_copy(update={"sha256": second}).model_dump_json(), encoding="utf-8"
-        )
+        meta_path.write_text(meta.model_copy(update={"sha256": second}).model_dump_json(), encoding="utf-8")
 
         artifacts, unreadable = list_artifacts_with_unreadable(tmp_path)
 

@@ -92,6 +92,7 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1, QuantityKind
+from tests.pypdf_gate import require_pypdf
 
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
@@ -110,6 +111,7 @@ def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerificat
         extracted_text=ExtractedTextVerification.EXTRACTION_RECORD_DIGEST_AUTHENTICATED,
         root_sidecar=RootSidecarVerification.ROOT_SIDECAR_DIGEST_AUTHENTICATED,
     )
+
 
 MAX_BYTES = 10_000_000
 
@@ -151,6 +153,7 @@ def _store_synthetic_artifact(
     content_type: str = "application/pdf",
     extractor: str = "pdf:pypdf",
 ) -> StoredArtifact:
+    require_pypdf()
     data = text.encode("utf-8")
     artifact = FetchedArtifact(
         url="https://example.invalid/paper.pdf",
@@ -161,16 +164,12 @@ def _store_synthetic_artifact(
         fetched_at=datetime.now(UTC),
     )
     extracted = ExtractedText(text=text, normalized=text.casefold(), sections=[], extractor=extractor, lossy=False)
-    stored = store_artifact(
-        workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES
-    )
+    stored = store_artifact(workspace_root, data=data, artifact=artifact, extracted=extracted, max_bytes=MAX_BYTES)
     _store_genuine_extraction_record(workspace_root, stored.sha256, extracted)
     return stored
 
 
-def _store_genuine_extraction_record(
-    workspace_root: Path, raw_sha256: str, extracted: ExtractedText
-) -> str:
+def _store_genuine_extraction_record(workspace_root: Path, raw_sha256: str, extracted: ExtractedText) -> str:
     """Give the artifact the extraction record a real re-extraction would have left.
 
     The producer no longer MINTS a record by mirroring the root sidecar's text -- doing
@@ -181,6 +180,7 @@ def _store_genuine_extraction_record(
     shape: a stored extraction is a PRECONDITION of dataset production, not a side
     effect of it.
     """
+    require_pypdf()
     from carmel.services.extraction_record import store_extraction_record
     from carmel.services.reextraction import _canonical_extracted_json_bytes
     from carmel.services.semantic_deps import extraction_identity
@@ -389,8 +389,7 @@ class TestReplayEnvelopeCatchesMutation:
         binding = node.extraction
         assert isinstance(binding, ExtractionBinding), "extraction must be present, not Absent"
         extracted_path = (
-            extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256)
-            / "extracted.json"
+            extraction_record_dir(tmp_path, binding.parent_raw_sha256, binding.extraction_sha256) / "extracted.json"
         )
         mutated_extracted = ExtractedText(
             text=_MUTATED_TEXT, normalized=_MUTATED_TEXT.casefold(), sections=[], extractor="pdf:pypdf", lossy=False
@@ -618,9 +617,7 @@ class TestReplayEnvelopeCatchesSpanResliceMismatchIndependentOfEvidence:
         shifted_ref = value.unit_ref.model_copy(update={"locator": shifted_locator})
         shifted_value = value.model_copy(update={"unit_ref": shifted_ref})
         shifted_coordinate = coordinate.model_copy(update={"value": shifted_value})
-        shifted_coordinates = tuple(
-            shifted_coordinate if c is coordinate else c for c in point.coordinates
-        )
+        shifted_coordinates = tuple(shifted_coordinate if c is coordinate else c for c in point.coordinates)
         shifted_point = point.model_copy(update={"coordinates": shifted_coordinates})
         shifted_points = tuple(shifted_point if p is point else p for p in series.points)
         shifted_series_obj = series.model_copy(update={"points": shifted_points})
@@ -638,9 +635,7 @@ class TestReplayEnvelopeGenericWalkExhaustiveness:
 
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         report = replay_envelope(tmp_path, loaded)
-        total_char_span_refs = sum(
-            1 for _, ref in iter_source_refs(loaded) if isinstance(ref.locator, CharSpanLocator)
-        )
+        total_char_span_refs = sum(1 for _, ref in iter_source_refs(loaded) if isinstance(ref.locator, CharSpanLocator))
         assert report.checked_char_spans == total_char_span_refs
 
 
@@ -1105,9 +1100,7 @@ class TestReplayEnvelopeCatchesUnitBoundaryViolation:
         glued_unit_ref = value.unit_ref.model_copy(update={"locator": glued_locator})
         tampered_value = value.model_copy(update={"unit_raw": "bar", "unit_ref": glued_unit_ref})
         tampered_coordinate = coordinate.model_copy(update={"value": tampered_value})
-        tampered_coordinates = tuple(
-            tampered_coordinate if c is coordinate else c for c in point.coordinates
-        )
+        tampered_coordinates = tuple(tampered_coordinate if c is coordinate else c for c in point.coordinates)
         tampered_point = point.model_copy(update={"coordinates": tampered_coordinates})
         tampered_points = tuple(tampered_point if p is point else p for p in series.points)
         tampered_series_obj = series.model_copy(update={"points": tampered_points})
@@ -1126,9 +1119,7 @@ class TestReplayEnvelopeContainsParserExceptions:
     finding, never an escaping crash that takes down the whole replay run.
     """
 
-    def test_recursion_error_while_parsing_extracted_json_is_unverifiable_not_a_crash(
-        self, tmp_path: Path
-    ) -> None:
+    def test_recursion_error_while_parsing_extracted_json_is_unverifiable_not_a_crash(self, tmp_path: Path) -> None:
         # ``store_extraction_record`` (the real front door) itself calls
         # ``ExtractedText.model_validate(json.loads(extracted_json_bytes))``
         # BEFORE hashing/writing anything, so it cannot be used to create
@@ -1227,9 +1218,7 @@ class TestReplayEnvelopeContainsParserExceptions:
 
         report = replay_envelope(tmp_path, tampered)  # must not raise
         assert report.evidence_outcome is not ReplayOutcome.VERIFIED
-        assert any(
-            "parse" in f.reason.lower() or "RecursionError" in f.reason for f in report.evidence_unverifiable
-        )
+        assert any("parse" in f.reason.lower() or "RecursionError" in f.reason for f in report.evidence_unverifiable)
 
 
 class TestReplayEnvelopeReportsPartialCounts:
@@ -1457,9 +1446,7 @@ class TestReplayCrossChecksRecordIdentityAgainstTheBinding:
     never inability-to-check (UNVERIFIABLE).
     """
 
-    def test_replay_fails_when_binding_extractor_code_sha256_disagrees_with_the_record(
-        self, tmp_path: Path
-    ) -> None:
+    def test_replay_fails_when_binding_extractor_code_sha256_disagrees_with_the_record(self, tmp_path: Path) -> None:
         """The binding's ``extractor_code_sha256`` is forged (via
         ``model_copy``, which bypasses schema validation exactly like a
         producer bug or a hand-edited envelope would) while
@@ -2068,9 +2055,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         # envelope, or the replayer is being asked to verify something illegal.
         return DatasetEnvelope.model_validate(json.loads(envelope.model_dump_json()))
 
-    def test_mixed_text_and_bbox_envelope_is_unverifiable_for_the_label_only(
-        self, tmp_path: Path
-    ) -> None:
+    def test_mixed_text_and_bbox_envelope_is_unverifiable_for_the_label_only(self, tmp_path: Path) -> None:
         """The crop shares its parent's ``sha256`` (legal per I5) so its bytes
         ARE in the store, and nothing text-dependent targets the crop node
         itself -- so the envelope must NOT be UNVERIFIABLE for the absent
@@ -2090,17 +2075,13 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         # VALUE refs are TABLE_CELLs and were never char spans to begin with.
         assert report.checked_char_spans == 3
         reasons = [f.reason for f in report.evidence_unverifiable]
-        assert any(
-            "label_ref" in r and "BBoxLocator" in r for r in reasons
-        ), reasons
+        assert any("label_ref" in r and "BBoxLocator" in r for r in reasons), reasons
         # Pins commit 8e052cc: a node with no extraction is a FACT about the
         # node, not a defect, and must never itself become a node-level
         # complaint -- only the text-dependent label_ref check may complain.
         assert not any("has no ExtractionBinding" in r for r in reasons), reasons
 
-    def test_a_node_that_claims_nothing_leaves_no_unchecked_claim(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_node_that_claims_nothing_leaves_no_unchecked_claim(self, tmp_path: Path) -> None:
         """A node with ``verification=Absent`` made no claim, so there is
         nothing to check and nothing left unchecked.
 
@@ -2125,9 +2106,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
 
         assert report.unchecked_store_claims == ()
 
-    def test_mixed_text_and_bbox_envelope_rejects_a_fabricated_label(
-        self, tmp_path: Path
-    ) -> None:
+    def test_mixed_text_and_bbox_envelope_rejects_a_fabricated_label(self, tmp_path: Path) -> None:
         """A `BBoxLocator` can attest that a region exists, but it can NEVER
         attest to the text stored in ``label_raw`` -- there is no renderer in
         this codebase to re-derive text from a region with. So a fabricated

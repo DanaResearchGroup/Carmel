@@ -36,6 +36,7 @@ from carmel.services.extraction_record import (
     stored_extraction_sha256,
     verify_extraction_record,
 )
+from tests.pypdf_gate import require_pypdf
 
 RAW_SHA = "a" * 64
 OTHER_RAW_SHA = "b" * 64
@@ -80,6 +81,8 @@ def _store(
     extracted_json_bytes: bytes | None = None,
     text: str = "hello",
 ) -> str:
+    if extractor.startswith("pdf:"):
+        require_pypdf()
     if extracted_json_bytes is None:
         extracted_json_bytes = _extracted_text_bytes(text, extractor=extractor)
     return store_extraction_record(
@@ -432,6 +435,9 @@ class TestStoredExtractionSha256:
         assert resolved == stored_sha
 
     def test_returns_none_when_no_matching_record_exists(self, tmp_path: Path) -> None:
+        # Addresses a 'pdf:pypdf' record directly, without going through _store,
+        # so it carries its own gate.
+        require_pypdf()
         resolved = stored_extraction_sha256(
             tmp_path,
             RAW_SHA,
@@ -722,16 +728,12 @@ class TestSelectExtraction:
         assert result.extraction_id == extraction_sha
         assert result.extracted.text == "exact record text s3"
 
-    def test_s4_exact_raises_when_no_record_at_address_and_does_not_fall_back_to_root(
-        self, tmp_path: Path
-    ) -> None:
+    def test_s4_exact_raises_when_no_record_at_address_and_does_not_fall_back_to_root(self, tmp_path: Path) -> None:
         raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S4")
         never_stored_sha = "f" * 64
 
         with pytest.raises(ExtractionSelectionError) as exc_info:
-            select_extraction(
-                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=never_stored_sha
-            )
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=never_stored_sha)
 
         # The exact defect being prevented is a silent root fallback: prove its
         # absence by confirming EXACT's only failure mode here is a raise --
@@ -747,9 +749,7 @@ class TestSelectExtraction:
         (dest / "meta.json").write_text(json.dumps(raw), encoding="utf-8")
 
         with pytest.raises(ExtractionSelectionError):
-            select_extraction(
-                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
-            )
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha)
 
     def test_s6_exact_raises_when_extraction_sha256_is_none(self, tmp_path: Path) -> None:
         raw_sha = _store_root_artifact(tmp_path, text="root text")
@@ -761,9 +761,7 @@ class TestSelectExtraction:
         raw_sha = _store_root_artifact(tmp_path, text="root text")
 
         with pytest.raises(ValueError):
-            select_extraction(
-                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256="not-a-sha"
-            )
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256="not-a-sha")
 
     # -- S8-S12: CURRENT --------------------------------------------------------
 
@@ -783,9 +781,7 @@ class TestSelectExtraction:
         assert result.extraction_id == extraction_sha
         assert result.extracted.text == "current text s8"
 
-    def test_s9_current_raises_when_no_records_at_all_and_does_not_fall_back_to_root(
-        self, tmp_path: Path
-    ) -> None:
+    def test_s9_current_raises_when_no_records_at_all_and_does_not_fall_back_to_root(self, tmp_path: Path) -> None:
         raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S9")
 
         with pytest.raises(ExtractionSelectionError) as exc_info:
@@ -800,9 +796,7 @@ class TestSelectExtraction:
         with pytest.raises(ExtractionSelectionError):
             select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT)
 
-    def test_s11_current_raises_when_two_records_are_current_at_once_and_names_both(
-        self, tmp_path: Path
-    ) -> None:
+    def test_s11_current_raises_when_two_records_are_current_at_once_and_names_both(self, tmp_path: Path) -> None:
         identity = semantic_deps.extraction_identity()
         raw_sha = _store_root_artifact(tmp_path, text="root text")
         sha_a = _store(
@@ -828,9 +822,7 @@ class TestSelectExtraction:
         assert sha_a in message
         assert sha_b in message
 
-    def test_s12_current_raises_when_the_single_current_record_fails_authentication(
-        self, tmp_path: Path
-    ) -> None:
+    def test_s12_current_raises_when_the_single_current_record_fails_authentication(self, tmp_path: Path) -> None:
         identity = semantic_deps.extraction_identity()
         raw_sha = _store_root_artifact(tmp_path, text="ROOT TEXT S12")
         extraction_sha = _store(
@@ -889,9 +881,7 @@ class TestSelectExtraction:
         )
 
         with pytest.raises(ExtractionSelectionError, match="ambiguous"):
-            select_extraction(
-                tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT, extraction_sha256=extraction_sha
-            )
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.CURRENT, extraction_sha256=extraction_sha)
 
     # -- S15: malformed raw_sha256 --------------------------------------------
 
@@ -934,9 +924,7 @@ class TestSelectExtraction:
 
     # -- S17: the record body is authenticated, not just the record address ----
 
-    def test_s17_exact_raises_when_extracted_json_bytes_do_not_match_the_meta_digest(
-        self, tmp_path: Path
-    ) -> None:
+    def test_s17_exact_raises_when_extracted_json_bytes_do_not_match_the_meta_digest(self, tmp_path: Path) -> None:
         """S17: a record whose ``extracted.json`` was swapped underneath an intact meta.
 
         This is NOT the same scenario as S5. S5 forges ``meta.json`` so the record no
@@ -978,16 +966,12 @@ class TestSelectExtraction:
         assert load_extraction_record(tmp_path, raw_sha, extraction_sha) is not None
 
         with pytest.raises(ExtractionSelectionError, match="does not authenticate") as exc_info:
-            select_extraction(
-                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
-            )
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha)
 
         # Fail closed: the tampered text must not reach the caller by any route.
         assert "TAMPERED TEXT S17" not in str(exc_info.value)
 
-    def test_s18_exact_raises_when_bytes_are_tampered_but_the_text_is_unchanged(
-        self, tmp_path: Path
-    ) -> None:
+    def test_s18_exact_raises_when_bytes_are_tampered_but_the_text_is_unchanged(self, tmp_path: Path) -> None:
         """S18: the ONLY scenario that isolates the extracted.json BYTES digest guard.
 
         S17 no longer does. Once the parsed text is also authenticated against
@@ -1006,9 +990,7 @@ class TestSelectExtraction:
         same_text = "identical text either way"
         honest = json.loads(_extracted_text_bytes(same_text))
         honest["lossy"] = True
-        extraction_sha = _store(
-            tmp_path, raw_sha256=raw_sha, extracted_json_bytes=json.dumps(honest).encode("utf-8")
-        )
+        extraction_sha = _store(tmp_path, raw_sha256=raw_sha, extracted_json_bytes=json.dumps(honest).encode("utf-8"))
         dest = tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha
 
         # Flip ONLY the lossy flag. The text is untouched, so the parsed-text digest
@@ -1019,21 +1001,16 @@ class TestSelectExtraction:
         (dest / "extracted.json").write_bytes(tampered_bytes)
 
         meta_on_disk = json.loads((dest / "meta.json").read_text(encoding="utf-8"))
-        assert (
-            hashlib.sha256(same_text.encode("utf-8")).hexdigest()
-            == meta_on_disk["extracted_text_sha256"]
-        ), "the text digest must still agree, or this test is just S17 again"
+        assert hashlib.sha256(same_text.encode("utf-8")).hexdigest() == meta_on_disk["extracted_text_sha256"], (
+            "the text digest must still agree, or this test is just S17 again"
+        )
 
         with pytest.raises(ExtractionSelectionError, match="extracted.json bytes on disk hash to"):
-            select_extraction(
-                tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha
-            )
+            select_extraction(tmp_path, raw_sha, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha)
 
     # -- H1/H2: the PARSED text is authenticated against extracted_text_sha256, not just extracted_sha256 --
 
-    def test_h1_exact_raises_when_parsed_text_does_not_match_meta_extracted_text_sha256(
-        self, tmp_path: Path
-    ) -> None:
+    def test_h1_exact_raises_when_parsed_text_does_not_match_meta_extracted_text_sha256(self, tmp_path: Path) -> None:
         """H1: a record whose two digests disagree, but which still self-authenticates.
 
         ``extracted_sha256`` and ``extracted_text_sha256`` disagree with each
@@ -1093,9 +1070,7 @@ class TestSelectExtraction:
         assert load_extraction_record(tmp_path, RAW_SHA, extraction_sha256) is not None
 
         with pytest.raises(ExtractionSelectionError, match="extracted_text_sha256"):
-            select_extraction(
-                tmp_path, RAW_SHA, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha256
-            )
+            select_extraction(tmp_path, RAW_SHA, prefer=ExtractionPreference.EXACT, extraction_sha256=extraction_sha256)
 
     def test_h2_exact_with_agreeing_digests_still_returns_normally(self, tmp_path: Path) -> None:
         """H2: the honest case is unaffected -- guards against a fix that refuses everything."""
@@ -1147,9 +1122,7 @@ class TestTheSelectorRefusesRatherThanCrashesOrGuesses:
             "that a record it cannot attribute is current"
         )
 
-    def test_an_unreadable_extracted_json_refuses_instead_of_escaping_as_an_oserror(
-        self, tmp_path: Path
-    ) -> None:
+    def test_an_unreadable_extracted_json_refuses_instead_of_escaping_as_an_oserror(self, tmp_path: Path) -> None:
         """A record whose body cannot be READ is as unusable as one that is absent.
 
         The narrow ``FileNotFoundError`` catch let a permissions/EIO failure escape as an
@@ -1159,9 +1132,7 @@ class TestTheSelectorRefusesRatherThanCrashesOrGuesses:
         if os.geteuid() == 0:
             pytest.skip("root can read a chmod-000 file")
         raw_sha, extraction_sha = _store_artifact_with_record(tmp_path)
-        body = (
-            tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha / "extracted.json"
-        )
+        body = tmp_path / "evidence" / "literature" / raw_sha / "extractions" / extraction_sha / "extracted.json"
         body.chmod(0o000)
         try:
             selection = select_current_extraction(tmp_path, raw_sha)
@@ -1173,10 +1144,8 @@ class TestTheSelectorRefusesRatherThanCrashesOrGuesses:
 
 
 class TestAnUnreadableEvidenceStoreIsNotAnEmptyOne:
-    def test_listing_an_unlistable_store_raises_rather_than_reporting_nothing(
-        self, tmp_path: Path
-    ) -> None:
-        """"I could not look" must not present as "there is nothing there".
+    def test_listing_an_unlistable_store_raises_rather_than_reporting_nothing(self, tmp_path: Path) -> None:
+        """ "I could not look" must not present as "there is nothing there".
 
         A caller handed an empty list reports full coverage of nothing, and a barren pass
         that looks conclusive is worse than a failing one -- nobody re-runs a pass that
@@ -1230,9 +1199,7 @@ class TestAContainmentBreachRefusesRatherThanCrashingThePass:
             "the operator must be told the store escaped, not merely that it failed"
         )
 
-    def test_a_malformed_raw_sha_still_raises_because_that_is_a_caller_bug(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_malformed_raw_sha_still_raises_because_that_is_a_caller_bug(self, tmp_path: Path) -> None:
         """The distinction the typed refusal must NOT swallow.
 
         A store that points outside the workspace is a fact about the store, and the
@@ -1267,9 +1234,7 @@ class TestCurrentSelectionEnforcesItsOwnInvariant:
         assert smuggled is not None, "fixture must supply a real SelectedExtraction"
 
         with pytest.raises(ValueError, match="SELECTED"):
-            CurrentSelection(
-                kind=CurrentSelectionKind.NO_CURRENT_RECORD, detail="refuses", selected=smuggled
-            )
+            CurrentSelection(kind=CurrentSelectionKind.NO_CURRENT_RECORD, detail="refuses", selected=smuggled)
 
 
 class TestTheDecisionGradeApiIsTheExportedOne:
@@ -1343,9 +1308,7 @@ class TestAnIncompleteStoreIsNotAnAbsentOne:
     text that is checked against nothing.
     """
 
-    def test_an_empty_extractions_dir_is_an_unfinished_write_not_an_absent_store(
-        self, tmp_path: Path
-    ) -> None:
+    def test_an_empty_extractions_dir_is_an_unfinished_write_not_an_absent_store(self, tmp_path: Path) -> None:
         """``store_extraction_record`` makes the directory BEFORE the record.
 
         So a crash, a full disk, or a SIGKILL between those two steps leaves exactly this
@@ -1363,9 +1326,7 @@ class TestAnIncompleteStoreIsNotAnAbsentOne:
         )
         assert selection.selected is None
 
-    def test_a_dangling_extractions_symlink_does_not_forge_an_absent_store(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_dangling_extractions_symlink_does_not_forge_an_absent_store(self, tmp_path: Path) -> None:
         """``exists()`` follows symlinks, so a dangling one reports False.
 
         The target is chosen INSIDE the workspace on purpose: an outside target is already
@@ -1375,9 +1336,7 @@ class TestAnIncompleteStoreIsNotAnAbsentOne:
         """
         raw_sha = _store_root_artifact(tmp_path, text="synthetic text behind a dangling link")
         artifact_root = tmp_path / "evidence" / "literature" / raw_sha
-        (artifact_root / "extractions").symlink_to(
-            artifact_root / "never-created", target_is_directory=True
-        )
+        (artifact_root / "extractions").symlink_to(artifact_root / "never-created", target_is_directory=True)
 
         selection = select_current_extraction(tmp_path, raw_sha)
 
@@ -1386,9 +1345,7 @@ class TestAnIncompleteStoreIsNotAnAbsentOne:
         )
         assert selection.selected is None
 
-    def test_a_genuinely_absent_extractions_dir_is_still_the_one_fall_through(
-        self, tmp_path: Path
-    ) -> None:
+    def test_a_genuinely_absent_extractions_dir_is_still_the_one_fall_through(self, tmp_path: Path) -> None:
         """The counterweight: without this, the fix would just ban the legacy corpus."""
         raw_sha = _store_root_artifact(tmp_path, text="synthetic text that never had a record")
         assert not (tmp_path / "evidence" / "literature" / raw_sha / "extractions").exists()
@@ -1447,12 +1404,10 @@ class TestOnlyReextractionMayWriteToTheRecordStore:
         A call-site count alone would be satisfied by a `reextract_artifact`
         that quietly started reading `extracted.json`, which is the exact
         laundering this pins against."""
-        source = (
-            Path(__file__).resolve().parent.parent / "carmel" / "services" / "reextraction.py"
-        ).read_text(encoding="utf-8")
-        code = "\n".join(
-            line for line in source.splitlines() if not line.lstrip().startswith("#")
+        source = (Path(__file__).resolve().parent.parent / "carmel" / "services" / "reextraction.py").read_text(
+            encoding="utf-8"
         )
+        code = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("#"))
         for forbidden in ('"extracted.json"', "'extracted.json'", '"text.txt"', "'text.txt'"):
             assert forbidden not in code, (
                 f"carmel/services/reextraction.py now names {forbidden} in code. It must derive "

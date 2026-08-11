@@ -194,7 +194,18 @@ jobs:
           # One representative module per optional package, named explicitly
           # (rather than "any test anywhere") so a rename or reshuffle fails
           # loudly here instead of silently narrowing what this gate checks.
-          required_modules = ["test_bridge", "test_extract", "test_chem"]
+          required_modules = [
+              "test_bridge",
+              "test_extract",
+              "test_chem",
+              # The literature/dataset lane. These modules build REAL pypdf
+              # extraction records, so without the extra they skip wholesale via
+              # tests/pypdf_gate.py -- 165 tests that would otherwise have gone
+              # green-by-skipping here while the base job was red.
+              "test_dataset_producer",
+              "test_dataset_replay",
+              "test_condition_set_producer",
+          ]
           root = ET.parse(report).getroot()
           cases = list(root.iter("testcase"))
           if not cases:
@@ -219,9 +230,9 @@ jobs:
 
           # A handful of unrelated tests may legitimately skip for other
           # reasons; what this gate forbids is a
-          # `pytest.importorskip("pydantic_ai" | "pypdf" | "rdkit")` firing
-          # inside these three modules, which only happens if the agents
-          # extra failed to install or import.
+          # `pytest.importorskip("pydantic_ai" | "pypdf" | "rdkit")` -- or a
+          # `tests/pypdf_gate.require_pypdf()` -- firing inside these modules,
+          # which only happens if the agents extra failed to install or import.
           if skipped_of_interest:
               sys.exit(
                   "::error::agents-path test(s) skipped even with the agents extra "
