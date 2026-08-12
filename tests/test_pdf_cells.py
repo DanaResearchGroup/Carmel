@@ -90,6 +90,17 @@ class TestTheMotivatingCase:
         assert refusal is not None
         assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
 
+    def test_a_sign_set_as_a_superscript_is_still_seen(self) -> None:
+        """`1.0` with its exponent's minus raised ~3 pt. At the old 0.75 pt band this
+        was out of scope and returned None -- a factor-of-a-thousand error declared a
+        documented limitation. The band reaches the superscript zone precisely so this
+        is inspected rather than excused."""
+        number = _fragment("1.0", 103.5, 115.0, baseline_y=700.0)
+        raised = _fragment("−3", 116.0, 122.0, baseline_y=703.0)
+        refusal = refuse_region(_extraction(number, raised), _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
+
     def test_distance_does_not_rescue_the_sign(self) -> None:
         """No distance cutoff, deliberately: the sign-to-digit gap (3.50 pt) sits BELOW
         the median genuine column gap (3.97 pt), so any cutoff that admits this number
@@ -194,17 +205,34 @@ class TestTheClaimIsCheckedNotTaken:
     """
 
     def test_a_baseline_moved_off_the_members_refuses(self) -> None:
-        """Shift the claimed baseline 1 pt and the band no longer contains the sign.
+        """Shift the claimed baseline and the band stops containing the sign.
 
         With the band centred on a number the producer supplies, a producer that wants
         a clean answer just supplies a different number.
         """
         sign = _fragment("/C0", 96.5, 100.0, baseline_y=700.0)
         number = _fragment("1.0", 103.5, 115.0, baseline_y=700.0)
-        moved = ClaimedRegion(page=1, x_start=103.5, x_end=115.0, baseline_y=701.0, members=(number,))
+        moved = ClaimedRegion(
+            page=1,
+            x_start=103.5,
+            x_end=115.0,
+            baseline_y=700.0 + BASELINE_BAND + 0.5,
+            members=(number,),
+        )
         refusal = refuse_region(_extraction(sign, number), moved)
         assert refusal is not None
         assert refusal.reason is RegionRefusalReason.MEMBER_OUTSIDE_REGION
+
+    def test_a_baseline_nudged_within_the_band_still_sees_the_sign(self) -> None:
+        """A shift too small to detach the member from the box does not detach the band
+        from the sign either. The two checks overlap on purpose: whichever gap the
+        producer tries to slip through, the other one still refuses."""
+        sign = _fragment("/C0", 96.5, 100.0, baseline_y=700.0)
+        number = _fragment("1.0", 103.5, 115.0, baseline_y=700.0)
+        nudged = ClaimedRegion(page=1, x_start=103.5, x_end=115.0, baseline_y=700.5, members=(number,))
+        refusal = refuse_region(_extraction(sign, number), nudged)
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
 
     def test_a_member_that_is_not_in_the_extraction_refuses(self) -> None:
         """A forged fragment has no page, no neighbours and no provenance. Without this

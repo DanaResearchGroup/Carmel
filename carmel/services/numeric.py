@@ -309,7 +309,7 @@ def _touches_a_digit(token: str, *, from_end: bool) -> bool:
     return inner.isdigit()
 
 
-def classify_abutting_affix(token: str, *, from_end: bool) -> AffixClass | None:
+def classify_abutting_affix(token: str, *, from_end: bool, always_reaches: bool = False) -> AffixClass | None:
     """Classify the affix at the EDGE of ``token`` that touches the value beside it.
 
     :func:`classify_affix` only sees a token that is *entirely* an affix, which misses
@@ -323,6 +323,12 @@ def classify_abutting_affix(token: str, *, from_end: bool) -> AffixClass | None:
     does). The direction is not cosmetic -- see :data:`_LEFT_REACHING`. A leading sign
     on your right-hand neighbour is that neighbour's own sign, and refusing on it would
     reject every row containing a negative number.
+
+    ``always_reaches`` overrides that directional filter, and exists for exactly one
+    caller: a RAISED neighbour. ``−3`` sitting on the baseline to your right is the
+    next cell's negative value, but the same ``−3`` set 3 pt higher is your exponent,
+    because a superscript binds to what precedes it. Position, not content, is what
+    separates the two, and only the caller can see position -- so the caller says so.
     """
     stripped = token.strip()
     if not stripped:
@@ -333,7 +339,7 @@ def classify_abutting_affix(token: str, *, from_end: bool) -> AffixClass | None:
     affix = _AFFIX_TOKENS.get(stripped[-1] if from_end else stripped[0])
     if affix is None:
         return None
-    if not from_end and affix not in _LEFT_REACHING:
+    if not from_end and not always_reaches and affix not in _LEFT_REACHING:
         return None
     if affix is AffixClass.DECIMAL and not _touches_a_digit(stripped, from_end=from_end):
         # A decimal point sits BETWEEN digits. A period ending `Fig.`, `Table.` or

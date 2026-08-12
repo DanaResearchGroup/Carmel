@@ -34,12 +34,14 @@ back. The rule below instead takes the nearest fragment OUTSIDE the claimed regi
 any distance, which has no such crack: whatever was not claimed is a candidate.
 
 **What this costs, and why that number needs a qualifier.** Refusing is not free, and
-the price depends on the PROPOSAL, not on this module: the identical rule refuses 3.50%
-of run-shaped numeric proposals and 15.44% of tight single-fragment boxes on the same
-corpus. The difference is dominated by producers claiming ``3`` out of ``3.14``, which
-this layer refuses correctly. **A refusal rate may never be quoted without the proposal
-shape it was measured on**, and no producer exists yet, so this module has no single
-cost. Re-measure against the real proposal shape when one does.
+the price depends on the PROPOSAL, not on this module: on the same corpus the identical
+rule refuses 22.11% of tight single-fragment boxes and 7.74% of run-shaped proposals.
+The difference is dominated by producers claiming ``3`` out of ``3.14``, which this
+layer refuses correctly. The two figures are not even measured over the same
+denominator -- a wider band changes what counts as one row, and so changes what a
+run-shaped proposal IS. **A refusal rate may never be quoted without the proposal shape
+it was measured on**, and no producer exists yet, so this module has no single cost.
+Re-measure against the real proposal shape when one does.
 
 **What ``None`` means.** Only that no reason to refuse was found. It is NOT an
 approval, NOT evidence, and NOT a verification. Nothing here may be persisted as a
@@ -68,24 +70,62 @@ from carmel.services.pdf_fragments import FragmentExtraction, GlyphMapping, Text
 #: formulation exists. Stating it as a policy constant is the honest alternative to
 #: hiding it inside a comparison.
 #:
-#: Measured against the real corpus (5332 single-fragment numeric proposals), the
-#: refusal cost is FLAT across a plateau and then climbs as the neighbouring rows start
-#: leaking in:
+#: Set from the corpus, and NOT from the reasoning that first suggested it. The value
+#: here was 0.75 pt, justified as "wide enough for sub-point baseline jitter, narrow
+#: enough that the line above stays out". The second half of that was simply false:
+#: measured line spacing on this corpus is **10.4-11.5 pt**, so nothing at 2 pt was
+#: ever the next row, and the band was excluding same-line content for a danger that
+#: does not exist there.
 #:
-#: =========================  =======  ==============
-#: band                       refused  sign-class hits
-#: =========================  =======  ==============
-#: 0.0 pt (exact baseline)     14.82%             265
-#: 0.75 pt (this value)        15.44%             284
-#: 2.0 pt                      21.32%             475
-#: 0.6 x font_height (~4.8pt)  21.91%             486
-#: =========================  =======  ==============
+#: What the baselines actually do (7676 gaps between distinct baselines on a page):
+#: 38.4% fall in [0, 2) pt, then a shallow trough of ~28% spread across [2, 8), then
+#: 28.8% in [8, 12) which is the real line spacing. **There is no valley to cut at.**
+#: The same-line and next-line populations overlap through the middle exactly as the
+#: detached-sign gap and the genuine column gap do horizontally -- the same structural
+#: result, one axis over.
 #:
-#: 0.75 pt sits at the top of the plateau: wide enough to tolerate the sub-point
-#: baseline jitter real PDFs emit within one typeset line, narrow enough that the line
-#: above and below stay out. The font-RELATIVE policy in the last row is refuted, not
-#: merely more expensive -- it behaves like the 2 pt band.
-BASELINE_BAND = 0.75
+#: So the band is chosen on refusal behaviour instead (5332 single-fragment numeric
+#: proposals):
+#:
+#: ========  =======  ===============
+#: band      refused  sign-class hits
+#: ========  =======  ===============
+#: 0.0 pt     14.82%              265
+#: 0.75 pt    15.44%              284
+#: 2.0 pt     21.32%              475
+#: 4.0 pt     22.11%              489
+#: 6.0 pt     22.34%              490
+#: 9.0 pt     22.02%              476
+#: ========  =======  ===============
+#:
+#: The step from 0.75 to 2.0 admits **191 additional sign-class hits** -- detached
+#: signs that the narrow band was silently missing, which is the precise failure this
+#: module exists to prevent. Past 2.0 the curve saturates: 4.0 buys 14 more hits for
+#: 0.79 pp, 6.0 buys one more, and 9.0 goes DOWN, because a band that wide starts
+#: pulling in a nearer safe neighbour that displaces a dangerous farther one.
+#:
+#: 4.0 pt sits inside that plateau rather than on its edge, and it is deliberately wide
+#: enough to reach the 3-5 pt superscript zone, so a sign or exponent set as a
+#: superscript is inspected instead of being declared out of scope. Under-refusing is
+#: the dangerous direction here; a refusal costs a datum, a missed sign costs its sign.
+#:
+#: **This remains a declared scope limit, not geometric truth.** The substrate offers
+#: baselines and rendered heights, never glyph boxes, so vertical extent is necessarily
+#: inferred and no threshold-free formulation exists. A font-RELATIVE policy was tried
+#: and refuted: it behaves like a fixed ~4.8 pt band, and the field it depended on
+#: turned out to be a corpus-wide constant (see ``TextFragment.font_height``).
+BASELINE_BAND = 4.0
+
+#: How far above the claimed baseline a neighbour must sit before it is read as a
+#: SUPERSCRIPT rather than as same-line text.
+#:
+#: Only ever widens what refuses, never narrows it, so it cannot hide a dangerous
+#: neighbour: above this rise, a leading sign on the right stops being read as the next
+#: cell's own sign and starts being read as this value's exponent. Set at the top of the
+#: measured same-line jitter cluster -- 38.4% of baseline gaps fall in [0, 2) pt, which
+#: is ordinary within-line variation, while a real superscript in this corpus sits
+#: 3-5 pt up.
+_SUPERSCRIPT_RISE = 2.0
 
 
 class RegionRefusalReason(StrEnum):
@@ -372,7 +412,15 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
                 RegionRefusalReason.ADJACENT_UNREADABLE,
                 f"the nearest fragment to the {side} carries an unmapped-glyph marker",
             )
-        affix = classify_abutting_affix(_edge_token(neighbour.text, from_end=from_end), from_end=from_end)
+        # A RAISED neighbour is a superscript, and a superscript binds to what precedes
+        # it -- so `−3` above and right of `1.0` is its exponent, not the next cell's
+        # negative value. Only the geometry can tell those apart, so the direction rule
+        # in `classify_abutting_affix` is overridden here rather than guessed there.
+        affix = classify_abutting_affix(
+            _edge_token(neighbour.text, from_end=from_end),
+            from_end=from_end,
+            always_reaches=neighbour.baseline_y > region.baseline_y + _SUPERSCRIPT_RISE,
+        )
         if affix is not None:
             return RegionRefusal(
                 RegionRefusalReason.ADJACENT_UNREADABLE,
