@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import pytest
 
+import carmel.services.pdf_fragments as pdf_fragments
 from carmel.services.pdf_fragments import (
+    MAX_PAGE_CONTENT_BYTES,
     FragmentExtraction,
     GlyphMapping,
     extract_fragments,
@@ -601,3 +603,101 @@ class TestLossRecordsWhatWasLost:
         result = extract_fragments(_two_page_pdf(page, page))
         assert len(result.fragments) == 3
         assert result.truncated is True
+
+
+def _split_contents_pdf(first: bytes, second: bytes) -> bytes:
+    """One page whose `/Contents` is an ARRAY of two streams that concatenate.
+
+    The shape a per-stream cap would miss: the parser sees their concatenation, so only
+    their SUM bounds what it allocates.
+    """
+    return _pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 6 0 R >> >> /Contents [4 0 R 5 0 R] >>",
+            b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
+            b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+    )
+
+
+class TestOnePageCannotCostUnboundedMemory:
+    """`MAX_PDF_FRAGMENTS` counts fragments, and both expensive things happen before the
+    first fragment exists. Capping the page's decompressed content stream is what bounds
+    them -- including the one huge `BT` group, which on real papers is up to 99.5% of a
+    page and so cannot be interrupted between groups."""
+
+    def test_an_oversized_page_fails_that_page_and_not_the_document(self, monkeypatch) -> None:
+        require_pypdf()
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 40)
+        small = b"BT /F1 9 Tf 1 0 0 1 72 700 Tm (ok) Tj ET"
+        big = b"BT /F1 9 Tf 1 0 0 1 72 700 Tm (" + b"x" * 200 + b") Tj ET"
+        result = extract_fragments(_two_page_pdf(small, big))
+
+        assert result.available is True
+        assert result.lossy is True
+        assert [failure.page for failure in result.page_failures] == [2]
+        assert "PageContentTooLarge" in result.page_failures[0].error
+        assert [fragment.text for fragment in result.fragments] == ["ok"]
+
+    def test_the_recorded_error_states_the_size_and_leaks_no_path(self, monkeypatch) -> None:
+        require_pypdf()
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 10)
+        result = extract_fragments(_one_page_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET"))
+
+        error = result.page_failures[0].error
+        assert error.startswith("PageContentTooLarge: ")
+        assert "10-byte cap" in error
+        assert "/home/" not in error
+
+    def test_the_cap_is_checked_before_the_stream_is_parsed(self, monkeypatch) -> None:
+        """The whole point. A cap applied after `ContentStream` has built its operation
+        list measures the damage instead of preventing it."""
+        require_pypdf()
+        import pypdf.generic
+
+        def _must_not_run(*args: object, **kwargs: object) -> None:
+            raise AssertionError("the content stream was parsed despite exceeding the cap")
+
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 10)
+        monkeypatch.setattr(pypdf.generic, "ContentStream", _must_not_run)
+        result = extract_fragments(_one_page_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET"))
+
+        assert "PageContentTooLarge" in result.page_failures[0].error
+
+    def test_a_page_split_across_streams_is_bounded_by_their_sum(self, monkeypatch) -> None:
+        """Otherwise the cap is evaded by splitting one huge stream into many small
+        ones, which the parser concatenates back together anyway."""
+        require_pypdf()
+        first = b"BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET"
+        second = b"BT /F1 9 Tf 1 0 0 1 72 680 Tm (B) Tj ET"
+
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", len(first) + len(second) + 8)
+        allowed = extract_fragments(_split_contents_pdf(first, second))
+        assert allowed.page_failures == ()
+        assert sorted(fragment.text for fragment in allowed.fragments) == ["A", "B"]
+
+        # Each part alone fits; only their sum does not.
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", len(first) + 4)
+        refused = extract_fragments(_split_contents_pdf(first, second))
+        assert "PageContentTooLarge" in refused.page_failures[0].error
+
+    def test_a_page_exactly_on_the_cap_is_kept(self, monkeypatch) -> None:
+        """`>` and not `>=`: a cap that refuses the value it names would make every
+        headroom figure in its docstring off by one."""
+        require_pypdf()
+        monkeypatch.setattr(pdf_fragments, "_decoded_content_length", lambda contents: 100)
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 100)
+        assert extract_fragments(_one_page_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET")).page_failures == ()
+
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 99)
+        refused = extract_fragments(_one_page_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET"))
+        assert "PageContentTooLarge" in refused.page_failures[0].error
+
+    def test_the_shipped_cap_admits_the_largest_real_corpus_page(self) -> None:
+        """836,591 B is the largest decompressed page in the 8-paper corpus (median
+        22,035 B). Pinned so that lowering the cap has to face the measurement."""
+        assert MAX_PAGE_CONTENT_BYTES >= 836_591 * 7

@@ -311,6 +311,41 @@ _PINNED_PYPDF_VERSION = "6.14.2"
 #: text lane's own cap was written against.
 MAX_PDF_FRAGMENTS = 1_000_000
 
+#: Hard cap on the DECOMPRESSED content-stream bytes of a single page, checked before
+#: pypdf parses it. A page over this is recorded as a page failure and skipped; the rest
+#: of the document still extracts.
+#:
+#: This is the bound that :data:`MAX_PDF_FRAGMENTS` cannot provide. That cap counts
+#: fragments, and both of the expensive things happen before the first one exists:
+#: ``ContentStream`` materialises the whole operation list up front, and
+#: ``recurse_to_target_op`` consumes one entire ``BT``/``ET`` group per call. The second
+#: was assumed to be an edge case and is not -- measured on the corpus, **the largest
+#: single ``BT`` group is a median 32% of its page's operations and up to 99.5%**, so on
+#: real papers one group routinely IS the page and the between-groups budget check
+#: cannot interrupt it. Bounding the page is therefore what bounds the group, and there
+#: is no need to reach inside pypdf's parser to do it.
+#:
+#: Sized from measurement, and from the ceiling the sibling cap already declares. Parsed
+#: operations cost **19.0 bytes of Python heap per decompressed byte at the median and
+#: 33.2x at the worst** across 73 corpus pages (489 B per operation). 6 MB x 33.2 is
+#: ~199 MB, the same ~200 MB peak retention :data:`MAX_PDF_FRAGMENTS` was sized against,
+#: so the two caps now express one memory ceiling instead of two unrelated numbers.
+#:
+#: Headroom over legitimate documents is 7.2x: the largest real page in the 8-paper
+#: corpus decompresses to 836,591 B (median 22,035 B). That corpus holds no
+#: supplementary-information PDF, so a dense vector figure could plausibly exceed the
+#: cap -- which costs ONE page, recorded as a failure and therefore visible, rather than
+#: the document.
+#:
+#: **What it does not bound**, stated exactly because a comment that overstates a guard
+#: is worse than no guard: the transient decode itself. Measuring the length requires
+#: decoding, so a compression bomb still allocates its decompressed size once as a
+#: ``bytes`` object before the check can reject it. What the cap removes is the 33x
+#: amplification of turning those bytes into Python objects, which is the part that
+#: takes a large allocation to an unrecoverable one. Bounding the decode too would mean
+#: reimplementing pypdf's filter stack against an output limit its API does not expose.
+MAX_PAGE_CONTENT_BYTES = 6_000_000
+
 #: The ``error`` recorded for a page whose page-tree entry was UNINSPECTABLE.
 #:
 #: DUPLICATED from ``carmel.agents.tools.extract`` rather than imported from it, and the
@@ -325,6 +360,14 @@ MAX_PDF_FRAGMENTS = 1_000_000
 _UNINSPECTABLE_PAGE_ERROR = "page-tree entry could not be inspected; kept as a possible page"
 
 
+class PageContentTooLarge(Exception):
+    """One page's decompressed content stream exceeds :data:`MAX_PAGE_CONTENT_BYTES`.
+
+    A page failure, not an engine failure: the class name lands verbatim in the stored
+    ``FragmentPageFailure.error``, so it is spelled without a leading underscore.
+    """
+
+
 class _EngineMismatch(Exception):
     """The pypdf engine is not shaped the way this module requires.
 
@@ -332,6 +375,26 @@ class _EngineMismatch(Exception):
     says the ENGINE is wrong, not that one document page is. The distinction is the
     difference between ``available=False`` and a plausible-looking empty result.
     """
+
+
+def _decoded_content_length(contents: Any) -> int:
+    """Decompressed size of a page's ``/Contents``, without retaining the bytes.
+
+    ``/Contents`` is either one stream or an array of them that concatenate into a
+    single stream, and only the sum bounds the parse -- a page split into a thousand
+    small streams costs the same as one large one.
+
+    Duck-typed on ``list`` rather than importing ``ArrayObject``, because pypdf's
+    ``ArrayObject`` subclasses it and the engine tuple exists to keep the number of
+    pypdf internals this module names to a minimum. A part that is neither raises, and
+    the caller records the page as failed -- the fail-closed direction.
+
+    This decodes, and :class:`ContentStream` will decode again immediately afterwards.
+    The duplicated CPU is accepted deliberately: the alternative is to let the parse run
+    first and measure the damage after it is done.
+    """
+    parts = contents if isinstance(contents, list) else [contents]
+    return sum(len(part.get_object().get_data()) for part in parts)
 
 
 def _page_fragments(
@@ -348,8 +411,8 @@ def _page_fragments(
     ``TextStateParams`` before the conversion loop runs at all, and the cap then fires
     after the damage.
 
-    Two things it does NOT bound, stated exactly rather than glossed, because a comment
-    that overstates a guard is worse than no guard:
+    Two things the FRAGMENT budget does not bound, stated exactly rather than glossed,
+    because a comment that overstates a guard is worse than no guard:
 
     * ``recurse_to_target_op`` consumes one whole ``BT``/``ET`` (or ``q``/``Q``) group
       per call and returns every show in it at once. The check below therefore fires
@@ -357,16 +420,23 @@ def _page_fragments(
     * ``ContentStream`` materialises the entire operation list up front, inside pypdf,
       before this function sees anything.
 
-    Both are bounded only by the document's decompressed content-stream size, so a
-    compression bomb still costs them. Closing either means not using pypdf's parser --
-    i.e. hand-rolling the content-stream interpreter this module exists to avoid.
+    Both scale with the page's decompressed content-stream size and nothing else, which
+    is why that size -- and not either of them individually -- is what gets capped
+    below. See :data:`MAX_PAGE_CONTENT_BYTES` for the measurement it is set from, and
+    for the one thing it still does not bound.
     """
     recurse_to_target_op, resolve_font, text_state_manager, content_stream = engine
 
     contents = page.get("/Contents")
     if contents is None:
         return [], False
-    content = content_stream(contents.get_object(), page.pdf, "bytes")
+    resolved = contents.get_object()
+    decoded_bytes = _decoded_content_length(resolved)
+    if decoded_bytes > MAX_PAGE_CONTENT_BYTES:
+        raise PageContentTooLarge(
+            f"page content stream is {decoded_bytes} decompressed bytes, over the {MAX_PAGE_CONTENT_BYTES}-byte cap"
+        )
+    content = content_stream(resolved, page.pdf, "bytes")
     ops: Iterator[tuple[list[Any], bytes]] = iter(content.operations)
 
     fonts = page._layout_mode_fonts()
