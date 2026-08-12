@@ -138,7 +138,20 @@ class TextFragment:
     edge -- comparing it against a bbox-based engine leaves a constant descender
     offset."""
 
-    font_size: float
+    font_height: float
+    """The RENDERED height of the text, in page-space units -- the nominal size already
+    composed with the text matrix.
+
+    Deliberately NOT pypdf's ``font_size``, which is the raw ``Tf`` operand and is a
+    trap. Publishers overwhelmingly emit ``Tf /F1 1`` and carry the real size in the
+    text matrix instead, so ``font_size`` is **1.0 for 78 169 of the 78 178 fragments**
+    in the real corpus: a field that looks like a point size, reads as a point size, and
+    is a constant. Any font-relative policy built on it -- a vertical band of
+    ``0.6 * font_size``, say -- silently degenerates to a fixed 0.6 units without ever
+    looking wrong. ``font_height`` on the same shows recovers the actual 7.97 / 6.38 /
+    9.0 pt type. Recording the composed height is the only honest choice; recording the
+    operand and calling it a size is how a downstream threshold becomes a constant."""
+
     rotated: bool
     """True when the text is rotated with respect to the page. Retained rather than
     dropped; see :func:`_page_fragments`."""
@@ -245,7 +258,7 @@ def _engine() -> tuple[Any, ...] | None:
             logger.warning("pypdf TextStateManager lacks %s; fragments unavailable", name)
             return None
     # Check FIELDS as well as class attributes. `TextStateParams` is a dataclass, and
-    # a field without a default (`font_size` is one) exists only on instances, so a
+    # a field without a default (`font_height` is one) exists only on instances, so a
     # bare `hasattr` on the class reports it missing and would refuse every healthy
     # pypdf. The properties (`tx`, `ty`, `text`, ...) do live on the class, so the
     # available surface is the union of the two.
@@ -279,7 +292,7 @@ def _engine() -> tuple[Any, ...] | None:
     return recurse_to_target_op, resolve_font, TextStateManager, ContentStream
 
 
-_REQUIRED_PARAM_ATTRS = ("text", "tx", "ty", "displaced_tx", "font_size", "rotated")
+_REQUIRED_PARAM_ATTRS = ("text", "tx", "ty", "displaced_tx", "font_height", "rotated")
 
 _PINNED_PYPDF_VERSION = "6.14.2"
 """Must track the ``agents`` extra's exact pin in ``pyproject.toml``."""
@@ -416,7 +429,7 @@ def _page_fragments(
                 x_start=float(show.tx),
                 x_end=float(show.displaced_tx),
                 baseline_y=float(show.ty),
-                font_size=float(show.font_size),
+                font_height=float(show.font_height),
                 rotated=bool(show.rotated),
                 glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
             )

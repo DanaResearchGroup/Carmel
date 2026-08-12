@@ -122,6 +122,22 @@ class TestGeometryIsAbsoluteAndExact:
         assert _by_text(frags, "X").x_start == pytest.approx(305.0)
         assert _by_text(frags, "X").baseline_y == pytest.approx(512.0)
 
+    def test_the_recorded_height_is_the_rendered_one_not_the_tf_operand(self) -> None:
+        """The trap that made ``font_size`` a constant across the whole real corpus.
+
+        Both streams render 9-unit type. The first says so in the ``Tf`` operand; the
+        second sets ``Tf /F1 1`` and carries the 9 in the text matrix instead -- which
+        is what real publisher PDFs overwhelmingly do (``Tf`` was 1.0 on 78 169 of
+        78 178 corpus fragments). Recording the operand makes these two disagree, and a
+        font-relative threshold built on it silently becomes a constant. They must
+        agree.
+        """
+        require_pypdf()
+        by_operand = _by_text(_fragments("BT /F1 9 Tf\n1 0 0 1 72 700 Tm (A) Tj\nET"), "A")
+        by_matrix = _by_text(_fragments("BT /F1 1 Tf\n9 0 0 9 72 700 Tm (A) Tj\nET"), "A")
+        assert by_operand.font_height == pytest.approx(9.0)
+        assert by_matrix.font_height == pytest.approx(9.0)
+
     def test_td_capital_and_t_star_advance_lines(self) -> None:
         require_pypdf()
         frags = _fragments("BT /F1 10 Tf\n72 700 TD (first) Tj\n0 -14 TD (second) Tj\nT* (third) Tj\nET")
