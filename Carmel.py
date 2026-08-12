@@ -152,6 +152,19 @@ def create_parser() -> argparse.ArgumentParser:
             "a revised prompt."
         ),
     )
+    corpus.add_argument(
+        "--allow-unauthenticated-legacy-roots",
+        action="store_true",
+        help=(
+            "Read held artifacts whose stored text cannot be authenticated against "
+            "anything, because they were stored before the digest that would bind it "
+            "existed. By default a corpus pass refuses these -- the honest "
+            "alternative is to re-extract the document into an authenticated record "
+            "instead of setting this flag. This does NOT admit an artifact whose "
+            "bytes are actually damaged; a failed integrity check is refused "
+            "regardless of this flag."
+        ),
+    )
     corpus.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
     corpus.add_argument(
         "--config",
@@ -163,6 +176,49 @@ def create_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Append the action and stop, without running it",
+    )
+
+    reextract = subparsers.add_parser(
+        "reextract",
+        help="Re-parse a stored artifact's raw.bin and append a new extraction record",
+        description=(
+            "Re-parse a stored artifact's raw.bin with today's extractor and append a new, "
+            "separately-addressed extraction record under evidence/literature/<raw_sha256>/"
+            "extractions/. The corpus pass PREFERS such a record over the root sidecar, so "
+            "re-extracting is how a legacy artifact becomes readable without the "
+            "unauthenticated-legacy-root opt-in, and dataset production now requires one. "
+            "Dry run (the default) does the real read/parse/cleanliness check and reports "
+            "what it would do without writing anything; pass --apply to actually write."
+        ),
+    )
+    reextract.add_argument("--campaign", help="Campaign ID")
+    reextract.add_argument(
+        "--sha",
+        default=None,
+        help="raw_sha256 of a single stored artifact to re-extract (mutually exclusive with --all)",
+    )
+    reextract.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-extract every artifact in the campaign's evidence store (mutually exclusive with --sha)",
+    )
+    reextract.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "Actually append the new extraction record. Without this flag the command is a "
+            "dry run: it still does the real read/parse/cleanliness check, but writes nothing."
+        ),
+    )
+    reextract.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
+    reextract.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help=(
+            "Carmel config file with an 'agents' section (required; supplies "
+            "budget.max_artifact_bytes -- no default is invented here)"
+        ),
     )
 
     return parser
@@ -284,6 +340,137 @@ def _cmd_literature(campaign_id: str, workspaces: Path | None, config: Path | No
     return 0
 
 
+_CONSUMER_NOTICE = (
+    "NOTE: extraction records ARE read. The corpus pass prefers an authenticated current "
+    "record over the root sidecar, and dataset production requires one, so appending a "
+    "record here changes what later passes read."
+)
+
+
+def _looks_like_sha256(name: str) -> bool:
+    """True if ``name`` has the shape of a lowercase hex sha256 digest.
+
+    Used to scan ``evidence/literature/`` directly by directory name, deliberately
+    bypassing ``list_artifacts()``/``list_artifacts_with_unreadable()``: those helpers
+    read each artifact's meta.json to build their listing, so an artifact whose
+    meta.json is unreadable would silently drop out of a ``--all`` run instead of
+    being attempted and having its refusal reported.
+    """
+    return len(name) == 64 and all(c in "0123456789abcdef" for c in name)
+
+
+def _reextract_one(ws: Path, *, raw_sha256: str, max_bytes: int, apply: bool) -> int:
+    """Re-extract a single artifact and print its outcome. Never raises.
+
+    Always previews first (real read/parse/cleanliness check, no write) so both the
+    dry-run and --apply paths report "already present" from the exact same check --
+    they can never disagree about whether a write is needed. Only when --apply is set
+    AND the extraction is not already present does it actually write, via
+    reextract_artifact.
+
+    Returns 0 on success (including "already present" / dry-run preview), 1 on a
+    refusal (ReextractionError), so callers can count failures for --all.
+    """
+    from carmel.services.reextraction import ReextractionError, preview_reextraction, reextract_artifact
+
+    try:
+        extraction_sha256, already_present = preview_reextraction(ws, raw_sha256=raw_sha256, max_bytes=max_bytes)
+    except ReextractionError as exc:
+        print(f"REFUSED         {raw_sha256}: {exc}")
+        return 1
+
+    if not apply:
+        if already_present:
+            print(f"DRY-RUN         {raw_sha256}: extraction {extraction_sha256} already present; nothing to write")
+        else:
+            print(f"DRY-RUN         {raw_sha256}: would write extraction {extraction_sha256}; nothing written")
+        return 0
+
+    if already_present:
+        print(f"ALREADY-PRESENT {raw_sha256}: extraction {extraction_sha256}")
+        return 0
+
+    written_sha256 = reextract_artifact(ws, raw_sha256=raw_sha256, max_bytes=max_bytes)
+    print(f"WRITTEN         {raw_sha256}: extraction {written_sha256}")
+    return 0
+
+
+def _cmd_reextract(
+    campaign_id: str,
+    workspaces: Path | None,
+    config: Path | None,
+    *,
+    sha: str | None,
+    all_artifacts: bool,
+    apply: bool,
+) -> int:
+    """Re-parse a stored artifact's raw.bin and append a new extraction record.
+
+    Dry run is the default (opposite polarity from ``corpus-pass --dry-run``, which
+    opts IN to dry mode): here ``--apply`` opts IN to mutation, so an operator who
+    forgets the flag gets a safe preview rather than an accidental write.
+
+    Extraction records ARE read -- the fourth site still carrying the obsolete "no
+    consumer reads them yet" claim, which `f5ea5bb` corrected in three other places and
+    missed here. The corpus pass prefers an authenticated current record over the root
+    sidecar, and dataset production requires one, so appending a record here changes what
+    later passes read. See :mod:`carmel.services.reextraction`.
+    """
+    if sha is not None and all_artifacts:
+        print("--sha and --all are mutually exclusive. Use one or the other.", file=sys.stderr)
+        return 1
+    if sha is None and not all_artifacts:
+        print("Either --sha <raw_sha256> or --all is required.", file=sys.stderr)
+        return 1
+
+    from carmel.paths import resolve_workspaces_root
+    from carmel.services.campaigns import find_campaign_workspace
+    from carmel.services.evidence import EVIDENCE_LITERATURE_DIR
+
+    try:
+        agent_config = _load_agent_config(config)
+    except (OSError, ValueError) as e:
+        print(f"Failed to load config: {e}", file=sys.stderr)
+        return 1
+    if agent_config is None:
+        print(
+            "No agent config available: pass --config FILE whose 'agents' section sets budget.max_artifact_bytes.",
+            file=sys.stderr,
+        )
+        return 1
+    max_bytes = agent_config.budget.max_artifact_bytes  # type: ignore[attr-defined]
+
+    workspaces_root = resolve_workspaces_root(workspaces)
+    ws = find_campaign_workspace(workspaces_root, campaign_id)
+    if ws is None:
+        print(f"Campaign {campaign_id!r} not found under {workspaces_root}", file=sys.stderr)
+        return 1
+
+    print(_CONSUMER_NOTICE)
+
+    if sha is not None:
+        return _reextract_one(ws, raw_sha256=sha, max_bytes=max_bytes, apply=apply)
+
+    evidence_root = ws / EVIDENCE_LITERATURE_DIR
+    try:
+        candidates = sorted(p.name for p in evidence_root.iterdir() if p.is_dir() and _looks_like_sha256(p.name))
+    except OSError as exc:
+        print(f"Could not scan evidence store at {evidence_root}: {exc}", file=sys.stderr)
+        return 1
+
+    if not candidates:
+        print(f"No artifacts found under {evidence_root}.")
+        return 0
+
+    failures = 0
+    for raw_sha256 in candidates:
+        if _reextract_one(ws, raw_sha256=raw_sha256, max_bytes=max_bytes, apply=apply) != 0:
+            failures += 1
+
+    print(f"{len(candidates)} artifact(s) processed, {failures} refused.")
+    return 1 if failures else 0
+
+
 def _cmd_corpus_pass(
     campaign_id: str,
     budget_tokens: int | None,
@@ -293,6 +480,7 @@ def _cmd_corpus_pass(
     dry_run: bool,
     reread_all: bool = False,
     dispatch_queued: bool = False,
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> int:
     """Append a corpus pass to a campaign's plan and run it.
 
@@ -321,6 +509,14 @@ def _cmd_corpus_pass(
             print(
                 "--reread-all cannot be combined with --dispatch-queued: re-read scope is "
                 "fixed when the pass is appended, not when it is dispatched.",
+                file=sys.stderr,
+            )
+            return 1
+        if allow_unauthenticated_legacy_roots:
+            print(
+                "--allow-unauthenticated-legacy-roots cannot be combined with --dispatch-queued: "
+                "the queued pass already carries the parameters it was approved under, and "
+                "bolting a fresh permission on at dispatch time would defeat the approval.",
                 file=sys.stderr,
             )
             return 1
@@ -394,7 +590,11 @@ def _cmd_corpus_pass(
     assert budget_tokens is not None
     try:
         action = append_corpus_pass_action(
-            ws, budget_tokens=budget_tokens, model_name=model_name, reread_all=reread_all
+            ws,
+            budget_tokens=budget_tokens,
+            model_name=model_name,
+            reread_all=reread_all,
+            allow_unauthenticated_legacy_roots=allow_unauthenticated_legacy_roots,
         )
     except FileNotFoundError:
         # Distinguished from the generic OSError below because the remedy is
@@ -725,11 +925,13 @@ def _cmd_requests(
     from carmel.schemas.acquisition import AcquisitionStatus
     from carmel.services.acquisition import (
         AlreadyAcquired,
+        ManifestUnreadable,
         admit_file,
         collect_inbox,
         drop_path_for,
         inbox_dir,
         pending_requests,
+        reason_phrase,
     )
     from carmel.services.campaigns import find_campaign_workspace
 
@@ -768,7 +970,12 @@ def _cmd_requests(
         return 1
 
     if collect:
-        changed = collect_inbox(ws, max_bytes=max_bytes)
+        try:
+            changed = collect_inbox(ws, max_bytes=max_bytes)
+        except ManifestUnreadable as exc:
+            print(f"Could not read the acquisition manifest: {exc}")
+            print("Fix or restore the file above before retrying -- it was left untouched.")
+            return 1
         if not changed:
             print("Nothing new in the inbox.")
             print(f"Drop papers into: {inbox_dir(ws)}")
@@ -815,7 +1022,12 @@ def _cmd_requests(
         print("Nothing was admitted to the evidence store. Drop the correct document.")
         return 1
 
-    pending = pending_requests(ws)
+    try:
+        pending = pending_requests(ws)
+    except ManifestUnreadable as exc:
+        print(f"Could not read the acquisition manifest: {exc}")
+        print("Fix or restore the file above before retrying -- it was left untouched.")
+        return 1
     if not pending:
         print("No papers are awaiting acquisition.")
         return 0
@@ -828,7 +1040,7 @@ def _cmd_requests(
             print(f"    doi   : {request.doi}")
         print(f"    get   : {request.landing_url}")
         detail = f" -- {request.detail}" if request.detail else ""
-        print(f"    why   : {request.reason.value}{detail}")
+        print(f"    why   : {reason_phrase(request.reason)}{detail}")
         if request.status == AcquisitionStatus.REJECTED and request.identity_note:
             print(f"    last  : REJECTED -- {request.identity_note}")
         print(f"    then  : carmel requests --campaign {campaign_id} --add <file> --slug {request.slug}")
@@ -870,6 +1082,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             reread_all=args.reread_all,
             dispatch_queued=args.dispatch_queued,
+            allow_unauthenticated_legacy_roots=args.allow_unauthenticated_legacy_roots,
         )
 
     if args.command == "new-campaign":
@@ -877,6 +1090,16 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "requests":
         return _cmd_requests(args.campaign, args.workspaces, args.add, args.slug, args.config, args.collect)
+
+    if args.command == "reextract":
+        return _cmd_reextract(
+            args.campaign,
+            args.workspaces,
+            args.config,
+            sha=args.sha,
+            all_artifacts=args.all,
+            apply=args.apply,
+        )
 
     parser.print_help()
     return 1

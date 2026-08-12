@@ -39,7 +39,26 @@ dev = [
 # pricing table in `models.py` was cross-checked against
 # (see `_MODEL_PRICING_USD_PER_1M_TOKENS`'s verified-on comment) is pinned rather
 # than left to whatever pydantic-ai happens to require.
-agents = ["pydantic-ai>=2.0", "genai-prices>=0.0.70", "pypdf>=5.0", "rdkit>=2024.3"]
+#
+# pypdf is pinned EXACTLY, and a range here would be a comment that promises more than it
+# delivers. `_is_current` compares the recorded `pypdf_version` STRING for equality (see
+# `_PYPDF_DEPENDENT_EXTRACTORS` and `_build_identity_payload`), so the version is not
+# bounded by this constraint -- it is part of the content address of every `pdf:pypdf`
+# extraction record. ANY resolved version other than the one that wrote the store, patch
+# releases included, makes every such record non-current at once, and the campaign then
+# refuses each affected document until `Carmel.py reextract --apply` has run.
+#
+# A range cannot express that invariant. `>=6.0,<7` is only a major-version fence: it still
+# lets a fresh `pip install` land 6.15 and orphan a working store behind the operator's
+# back, which is the exact failure this constraint exists to prevent. (An earlier `>=5.0,<6`
+# was worse still -- aimed backwards, it would have installed 5.x when every record in the
+# live workspace was written by 6.14.2.)
+#
+# Bumping pypdf is therefore a deliberate act with a re-extraction pass attached: change the
+# pin here, then run `Carmel.py reextract --apply` against each workspace. An install-time
+# resolver conflict is the intended failure mode; a silently invalidated evidence store is
+# not.
+agents = ["pydantic-ai>=2.0", "genai-prices>=0.0.70", "pypdf==6.14.2", "rdkit>=2024.3"]
 
 [project.scripts]
 carmel = "Carmel:cli"

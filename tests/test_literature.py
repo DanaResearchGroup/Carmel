@@ -28,7 +28,7 @@ from carmel.agents.literature_agent import (
     VerifierAssessment,
 )
 from carmel.agents.models import AgentBridgeError, MockModel
-from carmel.agents.tools.academic import OaResolution, OpenAccessResolver
+from carmel.agents.tools.academic import OaLookupCoverage, OaResolution, OpenAccessResolver
 from carmel.agents.tools.extract import extract_text
 from carmel.agents.tools.fetch import FetchedArtifact, FetchError, HttpFetchTool, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
@@ -50,18 +50,36 @@ from carmel.schemas import (
 from carmel.schemas.acquisition import AcquisitionReason, AcquisitionStatus
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
+    CURRENT_REPORT_SCHEMA_VERSION,
+    ROOT_EXTRACTION_ID,
     ArtifactProvenance,
+    CorpusReadOutcome,
+    CoveredDocument,
     GroundingStatus,
     LiteraturePassMode,
     LiteratureReport,
+    PassRecord,
     StopReason,
+    StoredArtifact,
 )
 from carmel.services import chem
 from carmel.services import literature as literature_module
-from carmel.services.acquisition import inbox_dir, load_manifest, record_request
+from carmel.services.acquisition import (
+    _REASON_PHRASES,
+    README_NAME,
+    REQUESTS_DIR,
+    inbox_dir,
+    load_manifest,
+    record_request,
+)
 from carmel.services.campaigns import create_campaign
 from carmel.services.decision_log import read_events
-from carmel.services.evidence import EVIDENCE_LITERATURE_DIR, store_artifact
+from carmel.services.evidence import (
+    EVIDENCE_LITERATURE_DIR,
+    artifact_dir,
+    list_artifacts_with_unreadable,
+    store_artifact,
+)
 from carmel.services.literature import (
     LITERATURE_REPORT_NAME,
     LOCK_GRACE_S,
@@ -76,6 +94,8 @@ from carmel.services.literature import (
     run_record_for,
 )
 from carmel.services.plan_progress import publish_lock_info
+from tests.pypdf_gate import require_pypdf
+from tests.test_acquisition import _matching_body, _patch_text_sniff_to_pdf
 
 DOI = "10.1000/test.doi"
 # An admissible host: production refuses to auto-admit documents from hosts
@@ -482,6 +502,9 @@ class TestValidateDocument:
 
     def test_application_pdf_with_real_content_is_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class _FakePage:
+            def get(self, key: str, default: object = None) -> object:
+                return "/Page" if key == "/Type" else default
+
             def extract_text(self) -> str:
                 return QUOTE
 
@@ -1152,6 +1175,144 @@ class TestSchemas:
         assessment = VerifierAssessment.model_validate(_assessment())
         assert assessment.credence == pytest.approx(0.9)
 
+    @pytest.mark.parametrize(
+        "bad_extraction_id",
+        [
+            pytest.param("root2", id="short_string"),
+            pytest.param("a" * 63 + "g", id="non_hex_char"),
+            pytest.param("A" * 64, id="uppercase_hex"),
+            # Python's ``$`` matches just before a trailing newline, so a validator
+            # written with ``re.match`` accepts this and carries a value that is not a
+            # sha256 around as though it were one. ``fullmatch`` is what refuses it.
+            pytest.param("a" * 64 + "\n", id="trailing_newline"),
+        ],
+    )
+    def test_t9_covered_document_rejects_a_bad_extraction_id(self, bad_extraction_id: str) -> None:
+        """T9. ``extraction_id`` must be either the ``"root"`` sentinel or 64
+        lowercase-hex characters -- anything else is refused, not coerced."""
+        with pytest.raises(ValueError):
+            CoveredDocument(raw_sha256="a" * 64, extraction_id=bad_extraction_id)
+
+    @pytest.mark.parametrize(
+        "bad_raw_sha256",
+        [
+            pytest.param("deadbeef", id="short_string"),
+            pytest.param("a" * 63 + "g", id="non_hex_char"),
+            pytest.param("A" * 64, id="uppercase_hex"),
+            pytest.param("a" * 64 + "\n", id="trailing_newline"),
+        ],
+    )
+    def test_t10_covered_document_rejects_a_bad_raw_sha256(self, bad_raw_sha256: str) -> None:
+        """T10. ``raw_sha256`` must be 64 lowercase-hex characters."""
+        with pytest.raises(ValueError):
+            CoveredDocument(raw_sha256=bad_raw_sha256, extraction_id=ROOT_EXTRACTION_ID)
+
+    def test_t10b_covered_document_refuses_the_retired_verified_deep_value(self) -> None:
+        """``CoveredDocument`` must refuse a ``verification_standard`` of the OLD,
+        retired value ``"verified_deep"``. That vocabulary was retired precisely
+        because it overclaimed (it named a conclusion, not the check actually
+        performed), so a permanent record must not silently accept it -- an operator
+        reading `verified_deep` off a report years later would believe something the
+        rename exists to stop anyone from claiming."""
+        with pytest.raises(ValueError, match="invalid verification_standard"):
+            CoveredDocument(
+                raw_sha256="a" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                verification_standard="verified_deep",
+            )
+
+    def test_t10c_covered_document_refuses_a_standard_naming_a_document_never_read(self) -> None:
+        """Every ``CorpusReadOutcome`` that names a REFUSAL must be rejected here.
+
+        A coverage entry asserts a document WAS read; a standard like
+        ``extraction_record_authentication_failed`` or
+        ``multiple_current_extraction_records`` says it was not. Accepting one would let
+        a report permanently claim coverage of text nobody ever served -- and coverage
+        drives what a later pass treats as already done, so the document would never be
+        looked at again.
+
+        Loops over the refusal members rather than spot-checking one, so a member added
+        later is caught here instead of discovered in a report years on.
+        """
+        refusals = [
+            CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED,
+            CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS,
+            CorpusReadOutcome.INTEGRITY_FAILED,
+            CorpusReadOutcome.MISSING_TEXT,
+            CorpusReadOutcome.UNREADABLE_META,
+        ]
+        for refusal in refusals:
+            with pytest.raises(ValueError, match="invalid verification_standard"):
+                CoveredDocument(
+                    raw_sha256="a" * 64,
+                    extraction_id=ROOT_EXTRACTION_ID,
+                    verification_standard=refusal.value,
+                )
+
+    def test_t11_pass_record_rejects_the_old_covered_sha256_key(self) -> None:
+        """T11. ``PassRecord`` sets ``extra="forbid"``, so a payload still carrying
+        the retired ``covered_sha256`` key proves the rename is real, not merely
+        additive."""
+        with pytest.raises(ValueError):
+            PassRecord.model_validate(
+                {
+                    "run_id": "r",
+                    "action_id": "a",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered_sha256": ["a" * 64],
+                }
+            )
+
+    def test_t12_a_report_round_trips_several_covered_pairs(self, campaign: Campaign) -> None:
+        """T12. A report written with a pass carrying several covered pairs reads
+        back with exactly those pairs -- schema round trip, not just construction."""
+        pairs = [
+            CoveredDocument(
+                raw_sha256="a" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                verification_standard=CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
+            ),
+            CoveredDocument(
+                raw_sha256="b" * 64,
+                extraction_id="c" * 64,
+                verification_standard=CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
+            ),
+        ]
+        pass_record = PassRecord(
+            run_id="r",
+            action_id="a",
+            created_at=datetime.now(UTC),
+            mode=LiteraturePassMode.CORPUS,
+            model_name="mock",
+            stop_reason=StopReason.SELF_TERMINATED,
+            usage=BudgetUsage(model_calls=1, tokens=100, cost_usd=0.01, fetches=0, fetch_bytes=0, elapsed_s=1.0),
+            warnings=[],
+            covered=pairs,
+        )
+        report = LiteratureReport(
+            report_id="rep-1",
+            campaign_id=campaign.campaign_id,
+            created_at=datetime.now(UTC),
+            passes=[pass_record],
+        )
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(report.model_dump_json())
+
+        reloaded = load_literature_report(campaign.workspace_root)
+
+        assert reloaded.passes[0].covered == pairs
+
 
 class _StatusFetchTool:
     """Fetch tool that fails every URL with a chosen HTTP status.
@@ -1178,6 +1339,14 @@ class TestManualAcquisitionsAreCollectedByARun:
     except at the point where it would have been used.
     """
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # `_queue_and_drop` writes a plain-text body to stand in for "the paper the
+        # operator dropped" -- this class is about the inbox-collection wiring at the
+        # start of a run, not format gating, which is exercised on its own in
+        # tests/test_acquisition.py::TestPlainTextLandingPageRefused.
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     @staticmethod
     def _queue_and_drop(workspace_root: Path, body: str) -> str:
         """Queue a request the way a run would, then drop a matching file for it."""
@@ -1193,7 +1362,8 @@ class TestManualAcquisitionsAreCollectedByARun:
 
     def test_a_dropped_paper_is_admitted_at_the_start_of_the_next_run(self, campaign: Campaign) -> None:
         slug = self._queue_and_drop(
-            campaign.workspace_root, f"{TITLE_FOR_DROP}\nDOI: {DOI}\nAbstract: measurements follow."
+            campaign.workspace_root,
+            _matching_body("Abstract: measurements follow.\n", title=TITLE_FOR_DROP, doi=DOI),
         )
         deps, _, config = _make_deps([_proposal(done=True)])
 
@@ -1381,6 +1551,18 @@ OA_PDF_URL = "https://pubs.rsc.org/en/content/articlepdf/2020/re/c9re00429g"
 RELEVANCE = "direct benchmark at the campaign's exact conditions"
 
 
+def _fully_resolved(candidates: tuple[str, ...], note: str) -> OaResolution:
+    """An :class:`OaResolution` from a lookup that fully ran -- the common fixture shape.
+
+    ``coverage`` is deliberately required with no default, so every construction site
+    must state what it observed. Most fixtures below exercise the FETCH path and only
+    need a resolution that ran; they say so once through this helper. The tests that are
+    about coverage itself build :class:`OaResolution` directly, so the value they turn on
+    stays visible in the test body.
+    """
+    return OaResolution(candidates=candidates, note=note, coverage=OaLookupCoverage.COMPLETE)
+
+
 class _FakeOaResolver:
     """Canned DOI -> OaResolution, recording every resolution request."""
 
@@ -1393,7 +1575,7 @@ class _FakeOaResolver:
         self.calls.append(doi)
         self.titles.append(title)
         return self._resolutions.get(
-            doi, OaResolution(candidates=(), note="no open-access copy advertised by any open-access index")
+            doi, _fully_resolved((), "no open-access copy advertised by any open-access index")
         )
 
 
@@ -1427,9 +1609,7 @@ class TestWantedPaperOpenAccessResolution:
     """
 
     def test_an_open_access_copy_is_fetched_and_stored_instead_of_queued(self, campaign: Campaign) -> None:
-        resolver = _FakeOaResolver(
-            {WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="OpenAlex: 1 OA PDF candidate")}
-        )
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "OpenAlex: 1 OA PDF candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (DOC.encode(), "text/plain")},
@@ -1453,7 +1633,7 @@ class TestWantedPaperOpenAccessResolution:
 
     def test_candidates_are_tried_in_order_until_one_succeeds(self, campaign: Campaign) -> None:
         second = "https://zenodo.org/records/1/files/green.pdf"
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL, second), "2 candidates")})
         fetch = _RoutedFetchTool(ok={second: (DOC.encode(), "text/plain")}, statuses={OA_PDF_URL: 404})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = fetch
@@ -1465,7 +1645,7 @@ class TestWantedPaperOpenAccessResolution:
         assert [a.sha256 for a in report.artifacts] == [hashlib.sha256(DOC.encode()).hexdigest()]
 
     def test_a_403_on_the_oa_copy_is_queued_as_an_observed_paywall(self, campaign: Campaign) -> None:
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _StatusFetchTool(403)
 
@@ -1494,7 +1674,7 @@ class TestWantedPaperOpenAccessResolution:
         provenance out of the store.
         """
         hostile = "https://evil.example.net/looks-like-a-paper.pdf"
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(hostile,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((hostile,), "1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         fetched: list[str] = []
 
@@ -1525,7 +1705,7 @@ class TestWantedPaperOpenAccessResolution:
         assert not host_is_admissible("https://proxy.my-university.edu.evil.net/p.pdf", ["proxy.my-university.edu"])
 
     def test_a_404_on_the_oa_copy_is_queued_as_fetch_failed_not_paywalled(self, campaign: Campaign) -> None:
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _StatusFetchTool(404)
 
@@ -1539,7 +1719,7 @@ class TestWantedPaperOpenAccessResolution:
         """403 is the reason the operator can act on (a subscription): if ANY candidate
         observed one, that is the request's reason, not whichever failure came first."""
         second = "https://arxiv.org/pdf/2401.00002v1"
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL, second), note="2 candidates")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL, second), "2 candidates")})
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=resolver)
         deps.fetch = _RoutedFetchTool(ok={}, statuses={OA_PDF_URL: 404, second: 403})
 
@@ -1553,7 +1733,7 @@ class TestWantedPaperOpenAccessResolution:
         """The live probe found 5 of 11 advertised PDF URLs served an HTML landing page;
         storing one as 'the paper' would silently retire the acquisition request while
         leaving Carmel with no readable full text."""
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (b"<html><body>Please sign in</body></html>", "text/html")},
@@ -1572,7 +1752,7 @@ class TestWantedPaperOpenAccessResolution:
         received zero bytes, and stored it as a successful acquisition -- suppressing
         the manual queue that is the whole fallback. A zero-byte fetch must be treated
         as a failed acquisition, not evidence."""
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (b"", "text/plain")},
@@ -1593,7 +1773,7 @@ class TestWantedPaperOpenAccessResolution:
     def test_a_response_with_bytes_but_no_extractable_text_is_queued_as_empty(self, campaign: Campaign) -> None:
         """Non-empty bytes that extract to whitespace-only text are just as unusable
         as zero bytes and must be rejected the same way."""
-        resolver = _FakeOaResolver({WANTED_DOI: OaResolution(candidates=(OA_PDF_URL,), note="1 candidate")})
+        resolver = _FakeOaResolver({WANTED_DOI: _fully_resolved((OA_PDF_URL,), "1 candidate")})
         deps, _, config = _make_deps(
             [_wanted_proposal()],
             fetch={OA_PDF_URL: (b"   \n\t  ", "text/plain")},
@@ -1630,7 +1810,7 @@ class TestWantedPaperOpenAccessResolution:
         truncated = OaResolution(
             candidates=(),
             note="OpenAlex: 0 OA PDF candidates; arXiv: lookup failed (read operation timed out)",
-            complete=False,
+            coverage=OaLookupCoverage.PARTIAL,
         )
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver({WANTED_DOI: truncated}))
 
@@ -1643,7 +1823,9 @@ class TestWantedPaperOpenAccessResolution:
     def test_a_completed_resolution_that_found_nothing_is_still_no_open_access_copy(self, campaign: Campaign) -> None:
         """The complement of the test above -- the honest negative must survive."""
         exhausted = OaResolution(
-            candidates=(), note="OpenAlex: 0 OA PDF candidates; Unpaywall: 0 OA PDF candidates", complete=True
+            candidates=(),
+            note="OpenAlex: 0 OA PDF candidates; Unpaywall: 0 OA PDF candidates",
+            coverage=OaLookupCoverage.COMPLETE,
         )
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=_FakeOaResolver({WANTED_DOI: exhausted}))
 
@@ -1653,17 +1835,31 @@ class TestWantedPaperOpenAccessResolution:
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
 
     def test_without_a_resolver_the_paper_is_still_queued_without_asserting_a_paywall(self, campaign: Campaign) -> None:
-        """Even with no resolver wired (mock tier), 'paywalled' must not be recorded:
-        nothing observed a paywall."""
+        """Even with no resolver wired (mock tier), neither 'paywalled' nor 'no open-access
+        copy was found' must be recorded: nothing observed a paywall, and no lookup ran at
+        all, so the honest state is OA_LOOKUP_NOT_ATTEMPTED, not the honest-negative
+        NO_OPEN_ACCESS_COPY -- that reason is reserved for a lookup that actually ran and
+        came back empty.
+        """
         deps, _, config = _make_deps([_wanted_proposal()], oa_resolver=None)
 
         run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         requests = load_manifest(campaign.workspace_root).requests
-        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED]
+        assert requests[0].reason != AcquisitionReason.NO_OPEN_ACCESS_COPY
+        assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
         assert "resolver" in requests[0].detail
 
+        readme = (campaign.workspace_root / REQUESTS_DIR / README_NAME).read_text(encoding="utf-8")
+        assert "no open-access copy was found" not in readme
+
     def test_a_wanted_paper_without_a_doi_skips_resolution(self, campaign: Campaign) -> None:
+        """A paper with no DOI is not a special case that earns the honest-negative
+        NO_OPEN_ACCESS_COPY: the title-matched providers (arXiv, ChemRxiv) exist
+        precisely so a paper can be found without a DOI, so no lookup ran and the honest
+        state is OA_LOOKUP_NOT_ATTEMPTED.
+        """
         resolver = _FakeOaResolver()
         proposal = _proposal(findings=[])
         proposal["wanted"] = [{"title": WANTED_TITLE, "landing_url": "https://example.org/paper"}]
@@ -1673,12 +1869,24 @@ class TestWantedPaperOpenAccessResolution:
 
         assert resolver.calls == []
         requests = load_manifest(campaign.workspace_root).requests
-        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED]
+        assert requests[0].reason != AcquisitionReason.NO_OPEN_ACCESS_COPY
+        assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
         assert "no DOI" in requests[0].detail
 
     def test_consent_withheld_makes_zero_network_calls_end_to_end(self, campaign: Campaign) -> None:
         """A run with consent withheld, wired with the REAL resolver and REAL fetch
-        tool, must never open a socket: the booby-trapped opener proves it."""
+        tool, must never open a socket: the booby-trapped opener proves it.
+
+        The consent-withheld branch inside ``OpenAccessResolver.resolve`` is
+        unreachable in production today -- ``build_deps`` returns early with no
+        resolver at all for the mock provider (the default), and for any real
+        provider ``build_model`` raises ``AgentBridgeError`` before this resolver is
+        ever constructed when consent is withheld. This test constructs the resolver
+        directly, the same way ``_make_deps`` wires it below, so it still reaches
+        that branch; no provider ran, so the honest state is OA_LOOKUP_NOT_ATTEMPTED,
+        not the honest-negative NO_OPEN_ACCESS_COPY.
+        """
 
         def _boom(url: str, **kwargs: Any) -> Any:
             raise AssertionError(f"network call attempted without consent: {url}")
@@ -1700,7 +1908,8 @@ class TestWantedPaperOpenAccessResolution:
         run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         requests = load_manifest(campaign.workspace_root).requests
-        assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
+        assert [r.reason for r in requests] == [AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED]
+        assert requests[0].reason != AcquisitionReason.NO_OPEN_ACCESS_COPY
         assert "consent" in requests[0].detail
 
     def test_every_provider_answering_404_is_no_open_access_copy_not_incomplete(self, campaign: Campaign) -> None:
@@ -1732,6 +1941,16 @@ class TestWantedPaperOpenAccessResolution:
         requests = load_manifest(campaign.workspace_root).requests
         assert [r.reason for r in requests] == [AcquisitionReason.NO_OPEN_ACCESS_COPY]
         assert requests[0].reason != AcquisitionReason.OA_LOOKUP_INCOMPLETE
+
+    def test_every_acquisition_reason_has_an_operator_facing_phrase(self) -> None:
+        """Total mapping check: `_REASON_PHRASES` must cover every member of
+        `AcquisitionReason`, `OA_LOOKUP_NOT_ATTEMPTED` included. The dict has no
+        `else`/default branch by design -- an unmapped reason must fail loudly
+        (`KeyError`) at render time rather than silently leaking `reason.value`, so
+        this test is the only thing that catches a newly added reason before an
+        operator does.
+        """
+        assert set(_REASON_PHRASES) == set(AcquisitionReason)
 
 
 class TestReportSchemaVersionGate:
@@ -1771,6 +1990,120 @@ class TestReportSchemaVersionGate:
         assert isinstance(migrated, dict)
         assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION
         assert len(migrated["passes"]) == 1
+
+    def _v3_pass(self, *, covered_sha256: list[str]) -> dict[str, Any]:
+        return {
+            "run_id": "r",
+            "action_id": "a",
+            "created_at": datetime.now(UTC).isoformat(),
+            "mode": LiteraturePassMode.CORPUS.value,
+            "model_name": "mock",
+            "stop_reason": StopReason.SELF_TERMINATED.value,
+            "usage": {
+                "model_calls": 1,
+                "tokens": 100,
+                "cost_usd": 0.01,
+                "fetches": 0,
+                "fetch_bytes": 0,
+                "elapsed_s": 1.0,
+            },
+            "warnings": [],
+            "covered_sha256": covered_sha256,
+        }
+
+    def test_t5_a_v3_payloads_covered_sha256_migrates_to_covered_pairs_with_root(self) -> None:
+        """T5. A v3 payload's ``covered_sha256: [a, b]`` migrates to a v4 ``covered``
+        equal to those two shas each paired with ``ROOT_EXTRACTION_ID``, and the
+        payload's ``schema_version`` is the current one -- which, having also passed
+        through the v5->v6 step, stamps each pair's ``verification_standard`` as
+        ``"unrecorded"``."""
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        sha_a, sha_b = "a" * 64, "b" * 64
+        payload = {"schema_version": 3, "passes": [self._v3_pass(covered_sha256=[sha_a, sha_b])]}
+
+        migrated = migrate_report_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert migrated["schema_version"] == CURRENT_REPORT_SCHEMA_VERSION == 6
+        assert migrated["passes"][0]["covered"] == [
+            {"raw_sha256": sha_a, "extraction_id": ROOT_EXTRACTION_ID, "verification_standard": "unrecorded"},
+            {"raw_sha256": sha_b, "extraction_id": ROOT_EXTRACTION_ID, "verification_standard": "unrecorded"},
+        ]
+
+    def test_t6_the_old_covered_sha256_key_is_gone_after_migration(self) -> None:
+        """T6. ``covered_sha256`` must be removed, not left alongside ``covered`` --
+        ``PassRecord`` forbids extra fields, so leaving it would break validation."""
+        from carmel.services.literature import migrate_report_payload
+
+        payload = {"schema_version": 3, "passes": [self._v3_pass(covered_sha256=["a" * 64])]}
+
+        migrated = migrate_report_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert "covered_sha256" not in migrated["passes"][0]
+
+    def test_t7_v1_and_v2_reports_still_migrate_to_an_empty_covered_list(self) -> None:
+        """T7. What a v1/v2 pass covered was never written down, so migration must
+        not invent it -- an empty ``covered`` list stays the honest answer."""
+        from carmel.services.literature import migrate_report_payload
+
+        v1_migrated = migrate_report_payload({"schema_version": 1, "run_id": "r", "action_id": "a", "queries": []})
+        assert isinstance(v1_migrated, dict)
+        assert v1_migrated["passes"][0]["covered"] == []
+
+        v2_payload = {
+            "schema_version": 2,
+            "passes": [
+                {
+                    "run_id": "r",
+                    "action_id": "a",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.SEARCH.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                }
+            ],
+        }
+        v2_migrated = migrate_report_payload(v2_payload)
+        assert isinstance(v2_migrated, dict)
+        assert v2_migrated["passes"][0]["covered"] == []
+
+    def test_t8_a_payload_already_at_the_current_version_passes_through_unchanged(self) -> None:
+        """T8. A payload already at the current version (6) is idempotent -- returned
+        as-is, not re-migrated."""
+        from carmel.schemas.literature import CURRENT_REPORT_SCHEMA_VERSION
+        from carmel.services.literature import migrate_report_payload
+
+        assert CURRENT_REPORT_SCHEMA_VERSION == 6
+        payload = {
+            "schema_version": 6,
+            "passes": [
+                {
+                    **self._v3_pass(covered_sha256=[]),
+                    "covered": [
+                        {
+                            "raw_sha256": "a" * 64,
+                            "extraction_id": ROOT_EXTRACTION_ID,
+                            "verification_standard": "unrecorded",
+                        }
+                    ],
+                }
+            ],
+        }
+        del payload["passes"][0]["covered_sha256"]
+
+        assert migrate_report_payload(payload) is payload
 
 
 class TestReportAccumulatesAcrossPasses:
@@ -1812,7 +2145,7 @@ class TestReportAccumulatesAcrossPasses:
         # v1 recorded no coverage, so the migration must not invent any -- an empty
         # list reads as "not recorded" and makes the next corpus pass re-read once,
         # which is the conservative direction.
-        assert report.passes[0].covered_sha256 == []
+        assert report.passes[0].covered == []
         assert report.run_id == "run-1"
         assert report.action_id == "act-1"
         assert report.stop_reason == StopReason.SELF_TERMINATED
@@ -2164,7 +2497,7 @@ class TestCorpusPass:
         report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
 
         assert report.findings == []
-        assert sorted(report.latest.covered_sha256) == sorted([first, second])
+        assert sorted(cd.raw_sha256 for cd in report.latest.covered) == sorted([first, second])
 
     def test_a_second_pass_does_not_re_read_what_the_first_already_mined(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
@@ -2176,7 +2509,7 @@ class TestCorpusPass:
         first_deps, _, first_config = _make_deps([_corpus_proposal([])])
         first = run_corpus_pass(campaign.workspace_root, campaign, _action(), first_deps, config=first_config)
         assert first_deps.ledger.usage().model_calls == 1
-        assert len(first.latest.covered_sha256) == 1
+        assert len(first.latest.covered) == 1
 
         # A second pass with NO new documents must make no model call at all.
         second_deps, _, second_config = _make_deps([_corpus_proposal([])])
@@ -2203,8 +2536,8 @@ class TestCorpusPass:
         report = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
 
         assert second_deps.ledger.usage().model_calls == 1
-        assert report.latest.covered_sha256 == [new]
-        assert old not in report.latest.covered_sha256
+        assert [cd.raw_sha256 for cd in report.latest.covered] == [new]
+        assert old not in [cd.raw_sha256 for cd in report.latest.covered]
 
     def test_a_document_the_budget_refused_is_not_recorded_as_covered(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
@@ -2235,8 +2568,8 @@ class TestCorpusPass:
         assert deps.ledger.usage().model_calls == 1
         assert report.latest.stop_reason == StopReason.MAX_MODEL_CALLS
         # The heart of it: one call read one document, so exactly one is covered.
-        assert len(report.latest.covered_sha256) == 1, (
-            f"a refused reservation was recorded as covered: {report.latest.covered_sha256}"
+        assert len(report.latest.covered) == 1, (
+            f"a refused reservation was recorded as covered: {report.latest.covered}"
         )
 
         # And the refused document is still reachable -- not silently skipped forever.
@@ -2245,7 +2578,7 @@ class TestCorpusPass:
         second = run_corpus_pass(campaign.workspace_root, campaign, second_action, second_deps, config=second_config)
 
         assert second_deps.ledger.usage().model_calls == 1, "the unread document was skipped by the next pass"
-        assert len(second.latest.covered_sha256) == 1
+        assert len(second.latest.covered) == 1
 
     def test_reread_all_overrides_the_scoping(self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch) -> None:
         """The operator's escape hatch: a changed model or prompt is a real reason."""
@@ -2259,7 +2592,7 @@ class TestCorpusPass:
         report = run_corpus_pass(campaign.workspace_root, campaign, forced, second_deps, config=second_config)
 
         assert second_deps.ledger.usage().model_calls == 1
-        assert report.latest.covered_sha256 == [sha]
+        assert [cd.raw_sha256 for cd in report.latest.covered] == [sha]
 
     def test_a_corpus_pass_appends_to_an_existing_search_report(
         self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
@@ -2280,6 +2613,224 @@ class TestCorpusPass:
         assert [p.run_id for p in report.passes] == [first.run_id, report.run_id]
         assert [q.text for q in report.queries] == ["first query"], "a corpus pass contributes no queries"
         assert report.findings_for(report.run_id) == report.findings
+
+
+class TestCoverageIsKeyedByExtractionIdentity:
+    """Coverage must be keyed by (raw_sha256, extraction_id), not raw_sha256 alone.
+
+    A single stored document can have more than one extraction (the root
+    ``extracted.json`` sidecar today, plus per-extraction sidecars re-extraction can
+    produce later). Recording coverage as a bare raw sha256 makes "this raw document
+    was covered" indistinguishable from "this SPECIFIC extraction of it was covered"
+    -- so a document mined under one extraction identity would be silently skipped
+    forever, even once a materially different extraction of the same document became
+    available to read.
+    """
+
+    def test_t1_red_a_document_covered_under_a_different_extraction_identity_is_not_skipped(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T1, and the RED test required before any non-test file was touched.
+
+        Writes a previous report directly (rather than through a real pass) because
+        this increment deliberately keeps ``_load_corpus`` root-sidecar-only (see
+        Non-goals) -- it cannot itself discover a non-root extraction to read, so the
+        only way to exercise "covered under a DIFFERENT extraction identity" is to
+        assert it into the previous report's ``covered`` records directly.
+
+        Against the schema this branch starts from, a bare raw sha256 is the entire
+        coverage key: once ``sha`` is covered, EVERY reading of that raw document is
+        skipped, with no way to say "but not that extraction." That is exactly the
+        bug this test is written to prove.
+        """
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        other_extraction_id = "b" * 64
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": other_extraction_id}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 1, (
+            "a document covered under a DIFFERENT extraction identity was skipped as "
+            "already mined; raw sha256 alone is not a valid coverage key -- "
+            f"warnings={report.latest.warnings}"
+        )
+
+    def test_t2_a_document_covered_under_the_same_extraction_identity_is_skipped(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T2. The mirror of T1: same raw sha256 AND same extraction identity ->
+        the document is skipped, exactly as bare raw-sha coverage always was."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 0, (
+            "a document covered under the SAME (raw sha256, extraction identity) pair "
+            f"was re-read; warnings={report.latest.warnings}"
+        )
+        assert report.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+
+    def test_t3_only_the_uncovered_document_of_two_is_read(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T3. A corpus of two documents where exactly one (raw sha256, extraction
+        identity) pair is covered -> only the uncovered document is read."""
+        _patch_chem_success(monkeypatch)
+        covered_sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        uncovered_sha = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.com/papers/second")
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": covered_sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([_corpus_proposal([])])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 1, (
+            f"expected exactly one new document to be read; warnings={report.latest.warnings}"
+        )
+        assert [cd.raw_sha256 for cd in report.latest.covered] == [uncovered_sha]
+
+    def test_t4_when_every_held_document_is_covered_the_pass_still_stops_as_already_mined(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T4. When every held document's (raw sha256, extraction identity) pair is
+        covered, the pass still stops with the existing "already mined" stop reason
+        and warning -- re-keying coverage must not disturb that outcome."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        previous_payload = {
+            "schema_version": 4,
+            "report_id": "rep-prev",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-prev",
+                    "action_id": "act-prev",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "artifacts": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(previous_payload))
+        deps, _, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert deps.ledger.usage().model_calls == 0
+        assert report.latest.stop_reason == StopReason.NO_NEW_INFORMATION
+        assert any("already" in w and "mined" in w for w in report.latest.warnings), (
+            f"expected an 'already mined' warning; warnings={report.latest.warnings}"
+        )
 
 
 class TestTheDailyCapIsActuallyWired:
@@ -2471,6 +3022,7 @@ class TestOutcomeReflectsThisPassOnly:
                     "action_id": f"act-{run_id}",
                     "evidence": {
                         "artifact_sha256": "a" * 64,
+                        "extraction_id": ROOT_EXTRACTION_ID,
                         "quote_start": 0,
                         "quote_end": len(QUOTE),
                     },
@@ -2609,3 +3161,1244 @@ class TestTheReservationMatchesThePromptSize:
         from carmel.services.literature import estimated_tokens_for
 
         assert estimated_tokens_for("x" * 200_000) > estimated_tokens_for("x" * 100_000)
+
+
+class TestAFindingRecordsWhichExtractionItsOffsetsIndex:
+    """``EvidenceRef`` must name the extraction its offsets were computed against.
+
+    An ``EvidenceRef`` stores ``quote_start``/``quote_end`` as offsets into "the
+    artifact's extracted text". That was unambiguous while an artifact had exactly one
+    text. It stopped being so when the nested extraction-record store landed: one raw
+    sha256 can now carry a root ``extracted.json`` sidecar AND any number of
+    authenticated re-extraction records, each with its own text and therefore its own
+    offsets for the same quote.
+
+    Nothing reads these offsets today -- there is no literature replayer, only the
+    dataset one -- so this is not a live mis-resolution. It is a capture defect, and
+    that is what makes it urgent rather than deferrable: the report is append-only and
+    stored character offsets are NEVER migrated, so a finding accepted without this
+    identity can never afterwards be told which text it indexed. The only moment the
+    information exists to be captured is the moment of acceptance.
+    """
+
+    #: A stand-in for an authenticated re-extraction record's address. The tests below
+    #: patch ``_load_corpus`` rather than mint a real record, because teaching
+    #: ``_load_corpus`` to SELECT a record is the next increment and is deliberately
+    #: out of scope here -- what must be proven now is that whatever it read gets
+    #: recorded on the finding.
+    RECORD_ID = hashlib.sha256(b"a-re-extraction-record").hexdigest()
+
+    #: The same quote, in a text where it sits at a DIFFERENT offset than in ``DOC``.
+    #: The leading matter is what shifts it; without a shift the two texts would agree
+    #: on the offsets and the ambiguity would be invisible.
+    RECORD_DOC = (
+        "A shock tube study of oxygen ignition\n"
+        "J. Smith and A. Jones (2020)\n"
+        f"doi: {DOI}\n\n"
+        "Abstract text here.\n\n"
+        "A paragraph recovered only by the newer extractor, which the root sidecar\n"
+        "dropped entirely, and which therefore shifts everything after it.\n\n"
+        f"{QUOTE}\n"
+        "Further discussion of the measurements follows here.\n"
+    )
+
+    def _patch_corpus_to_read_a_record(self, monkeypatch: pytest.MonkeyPatch, *, extraction_id: str, text: str) -> None:
+        """Make ``_load_corpus`` report that it read a NON-root extraction.
+
+        It calls the real loader and substitutes the text and identity, so the
+        StoredArtifact, the digest verification and the skipped-sha bookkeeping are
+        all still the production ones.
+        """
+        real = literature_module._load_corpus
+
+        def _patched(workspace_root: Path, **kwargs: Any) -> Any:
+            corpus, outcomes = real(workspace_root, **kwargs)
+            return (
+                [(artifact, extract_text(text.encode(), "text/plain"), extraction_id) for artifact, _, _ in corpus],
+                outcomes,
+            )
+
+        monkeypatch.setattr(literature_module, "_load_corpus", _patched)
+
+    def test_p1_red_offsets_from_a_non_root_extraction_are_recorded_against_that_extraction(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P1, RED. THE ambiguity test.
+
+        A pass reads a non-root extraction and accepts a finding from it. The offsets
+        index the RECORD's text. Nothing on the finding says so, so a later reader
+        holding only ``artifact_sha256`` would resolve them against the root sidecar
+        and slice out the wrong span -- which the final assertion demonstrates is not
+        a hypothetical: the same offsets against the root text do not yield the quote.
+        """
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        self._patch_corpus_to_read_a_record(monkeypatch, extraction_id=self.RECORD_ID, text=self.RECORD_DOC)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        evidence = report.findings[0].evidence
+        assert evidence.artifact_sha256 == sha
+        assert evidence.extraction_id == self.RECORD_ID, (
+            "the finding was mined from a re-extraction record, so its offsets index that "
+            "record's text -- the finding must say so"
+        )
+        start, end = evidence.quote_start, evidence.quote_end
+        assert start is not None and end is not None
+        assert self.RECORD_DOC[start:end] == QUOTE, "the recorded offsets must index the text actually read"
+        assert DOC[start:end] != QUOTE, (
+            "if the same offsets also resolved correctly against the root text there would be "
+            "no ambiguity to close, and this test would prove nothing"
+        )
+
+    def test_p2_a_corpus_finding_from_the_root_sidecar_is_recorded_as_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P2. The honest case, and the guard against a fix that stamps every finding
+        with a record id."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        evidence = report.findings[0].evidence
+        assert evidence.extraction_id == ROOT_EXTRACTION_ID
+        start, end = evidence.quote_start, evidence.quote_end
+        assert start is not None and end is not None
+        assert DOC[start:end] == QUOTE
+
+    def test_p3_a_search_pass_finding_is_recorded_as_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P3. The OTHER call site. A search pass fetches and extracts in one breath and
+        stores the result as the root sidecar, so root is a fact about that path, not a
+        default -- but it still has to be stated, because the field has no default."""
+        _patch_chem_success(monkeypatch)
+        deps, _, config = _make_deps(
+            [
+                _proposal(findings=[_finding_dict()], done=True),
+                _assessment(),
+            ],
+            search={"oxygen ignition delay shock tube": [SearchResult(title="t", url=SOURCE_URL, snippet="s")]},
+        )
+
+        report = run_literature_research(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert len(report.findings) == 1, f"expected one grounded finding, got rejections: {report.rejected}"
+        assert report.findings[0].evidence.extraction_id == ROOT_EXTRACTION_ID
+
+    def test_p4_an_evidence_ref_cannot_be_built_without_stating_an_extraction(self) -> None:
+        """P4. No default. A default would let a producer that never considered the
+        question silently claim the root -- which is the exact ambiguity being closed.
+        ``CharSpanLocator.text_space`` makes the same argument for the dataset lane."""
+        from pydantic import ValidationError
+
+        from carmel.schemas.literature import EvidenceRef
+
+        with pytest.raises(ValidationError, match="extraction_id"):
+            EvidenceRef(artifact_sha256="a" * 64, quote_start=0, quote_end=5)  # type: ignore[call-arg]
+
+    def test_p5_a_v4_report_migrates_every_evidence_ref_to_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """P5. Every ref written before this field existed was necessarily root-derived:
+        ``_ground_and_record``'s only two callers read text via ``_fetch_and_store``
+        (fresh extraction, stored as the root sidecar) and ``_load_corpus`` (root
+        sidecar only). Root here is a fact about what could have been read, not a
+        default standing in for an unstated intent."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        start = DOC.index(QUOTE)
+        legacy = self._legacy_v4_report(campaign, sha=sha, start=start)
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(legacy))
+
+        report = load_literature_report(campaign.workspace_root)
+
+        assert report is not None
+        assert len(report.findings) == 1
+        evidence = report.findings[0].evidence
+        assert evidence.extraction_id == ROOT_EXTRACTION_ID
+        assert evidence.quote_start == start, "a migration must never move a stored character offset"
+        assert evidence.quote_end == start + len(QUOTE)
+
+    @staticmethod
+    def _legacy_v4_report(campaign: Campaign, *, sha: str, start: int) -> dict[str, Any]:
+        """A v4 report holding one grounded finding whose evidence has no
+        ``extraction_id`` -- i.e. exactly what was on disk before this field existed."""
+        return {
+            "schema_version": 4,
+            "report_id": "rep-legacy",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [
+                {
+                    "run_id": "run-legacy",
+                    "action_id": "act-legacy",
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "mode": LiteraturePassMode.CORPUS.value,
+                    "model_name": "mock",
+                    "stop_reason": StopReason.SELF_TERMINATED.value,
+                    "usage": {
+                        "model_calls": 1,
+                        "tokens": 100,
+                        "cost_usd": 0.01,
+                        "fetches": 0,
+                        "fetch_bytes": 0,
+                        "elapsed_s": 1.0,
+                    },
+                    "warnings": [],
+                    "covered": [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+            "queries": [],
+            "rejected": [],
+            "findings": [
+                {
+                    "finding_id": "f-legacy",
+                    "run_id": "run-legacy",
+                    "action_id": "act-legacy",
+                    "payload": {
+                        "category": "experimental_benchmark",
+                        "reactor_type": "shock_tube",
+                        "observable": "ignition_delay_time",
+                        "observable_raw": "ignition delay time",
+                        "species": [{"raw_name": "O2"}],
+                        "measured": [{"value": 1.25, "unit": "ms"}],
+                    },
+                    "citation": {
+                        "title": "A shock tube study of oxygen ignition",
+                        "authors": ["J. Smith"],
+                        "year": 2020,
+                        "doi": DOI,
+                    },
+                    "verbatim_quote": QUOTE,
+                    "evidence": {
+                        "artifact_sha256": sha,
+                        "quote_start": start,
+                        "quote_end": start + len(QUOTE),
+                    },
+                    "grounding": {
+                        "status": GroundingStatus.GROUNDED_EXACT.value,
+                        "grounded": True,
+                        "match_ratio": 1.0,
+                        "identity_ok": True,
+                    },
+                }
+            ],
+        }
+
+    @pytest.mark.parametrize(
+        "bogus",
+        ["ROOT", "Root", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 64 + "\n", "", "  "],
+    )
+    def test_p7_an_extraction_id_that_is_neither_root_nor_a_sha256_is_refused(self, bogus: str) -> None:
+        """P7. The field's SHAPE, not merely its presence.
+
+        Found by a mutation audit: with the shape check neutered, the whole literature
+        suite still passed, so nothing was certifying that this value even looks like an
+        extraction identity. The trailing-newline case is the specific reason the check
+        uses ``fullmatch`` rather than ``match`` -- Python's ``$`` also matches just
+        BEFORE a trailing newline, so ``"a" * 64 + "\\n"`` would otherwise be accepted
+        and then used as a filesystem path component.
+        """
+        from pydantic import ValidationError
+
+        from carmel.schemas.literature import EvidenceRef
+
+        with pytest.raises(ValidationError, match="extraction_id"):
+            EvidenceRef(artifact_sha256="a" * 64, extraction_id=bogus)
+
+    def test_p8_a_v4_payload_claiming_a_record_is_normalised_to_root_not_honoured(self, campaign: Campaign) -> None:
+        """P8. The migration OVERWRITES; it does not merely fill in a blank.
+
+        No v4 writer could have had grounds to say "these offsets index record <sha>" --
+        that impossibility IS the argument for stamping root -- and ``EvidenceRef``'s
+        ``extra="forbid"`` meant a payload carrying the key was previously rejected
+        outright. A migration that only defaulted the key would silently promote that
+        impossible claim into an accepted one, attached to offsets nothing can re-check.
+        Also found by a mutation audit: nothing distinguished ``setdefault`` from a
+        plain assignment.
+        """
+        start = DOC.index(QUOTE)
+        payload = self._legacy_v4_report(campaign, sha="c" * 64, start=start)
+        payload["findings"][0]["evidence"]["extraction_id"] = "d" * 64
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(payload))
+
+        report = load_literature_report(campaign.workspace_root)
+
+        assert report is not None
+        assert report.findings[0].evidence.extraction_id == ROOT_EXTRACTION_ID
+
+    def test_p6_a_report_from_a_future_schema_version_still_fails_closed(self, campaign: Campaign) -> None:
+        """P6. The version bump must not cost the fail-closed guard on future reports.
+        A bump that forgets to move the ceiling turns 'refuse a report I cannot
+        understand' into 'accept it and silently drop its unknown fields on the next
+        write'."""
+        from carmel.services.literature import ReportSchemaTooNewError
+
+        future = {
+            "schema_version": CURRENT_REPORT_SCHEMA_VERSION + 1,
+            "report_id": "rep-future",
+            "campaign_id": campaign.campaign_id,
+            "created_at": datetime.now(UTC).isoformat(),
+            "passes": [],
+            "queries": [],
+            "findings": [],
+            "rejected": [],
+        }
+        (campaign.workspace_root / LITERATURE_REPORT_NAME).write_text(json.dumps(future))
+
+        with pytest.raises(ReportSchemaTooNewError, match="Upgrade Carmel"):
+            load_literature_report(campaign.workspace_root)
+
+
+def _store_legacy(workspace_root: Path, *, text: str, url: str) -> str:
+    """Store one document in the shape the operator's REAL corpus is actually in.
+
+    Every one of the 8 manually-acquired papers in the live workspace was written
+    before ``extracted_sha256``, ``extractor_version`` and ``derivation_binding``
+    existed, so its ``meta.json`` does not carry those keys AT ALL -- they are absent,
+    not null. Nothing in this suite constructed that shape before, and that absence is
+    exactly why the whole suite stayed green while every real document was unreadable.
+
+    Root sidecars are never rewritten to upgrade a legacy artifact, so this helper
+    reproduces the shape by dropping the keys after a normal store rather than by
+    pretending a legacy writer could have produced them.
+    """
+    sha = _store(workspace_root, text=text, url=url)
+    meta_path = workspace_root / "evidence" / "literature" / sha / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    for absent_before_it_existed in ("extracted_sha256", "extractor_version", "derivation_binding"):
+        meta.pop(absent_before_it_existed, None)
+    meta_path.write_text(json.dumps(meta))
+    return sha
+
+
+def _corrupt_raw_bytes(workspace_root: Path, sha256: str) -> None:
+    """Make ``raw.bin`` stop matching the directory that names it."""
+    (workspace_root / "evidence" / "literature" / sha256 / "raw.bin").write_bytes(b"not the stored bytes")
+
+
+class TestALegacyRootIsUnauthenticatedNotCorrupt:
+    """A corpus pass must not report "your bytes are broken" about intact bytes.
+
+    ``_load_corpus`` gates every held artifact on ``verify_artifact(deep=True)``, which
+    requires a ``derivation_binding`` no legacy artifact carries. So all 8 real papers
+    are skipped on every pass -- and dropped into the SAME undifferentiated ``skipped``
+    list as an artifact whose ``raw.bin`` genuinely no longer hashes to its own name,
+    logged with the same "failed digest verification" line. Their digests are fine.
+
+    That is the UNAUTHENTICATED/INTEGRITY_FAILED conflation this project forbids, and
+    the two call for opposite operator responses: one is "re-extract, or opt in"; the
+    other is "these bytes are damaged, re-acquire the paper."
+    """
+
+    def test_g1_red_a_legacy_root_is_reported_differently_from_corrupt_bytes(self, campaign: Campaign) -> None:
+        """G1, and the RED test required before any non-test file is touched.
+
+        Deliberately asserts only that the two are DISTINGUISHABLE, not what either
+        is called. A test that pinned the spelling would pass for a rename alone; the
+        defect is that the caller has no way to tell the two apart at all.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        corrupt_sha = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.org/second")
+        _corrupt_raw_bytes(campaign.workspace_root, corrupt_sha)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == [], (
+            "neither document should be READ here: the legacy one is unauthenticated and the "
+            "corrupt one is broken -- this test is about how they are REPORTED"
+        )
+        assert outcomes[legacy_sha] != outcomes[corrupt_sha], (
+            "an intact legacy root and genuinely corrupt bytes must not be reported as the "
+            "same thing -- one is 're-extract or opt in', the other is 're-acquire the paper'"
+        )
+
+    def test_g2_a_legacy_root_is_read_when_the_operator_opts_in(self, campaign: Campaign) -> None:
+        """G2. ``allow_unauthenticated_legacy_roots=True`` actually reads a legacy root.
+
+        The opt-in exists precisely so an operator who has decided the risk is
+        acceptable can get their 8 real papers read at all -- if the flag flipped the
+        outcome label without ever admitting the artifact into ``corpus``, the opt-in
+        would be theatre.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+
+        corpus, outcomes = literature_module._load_corpus(
+            campaign.workspace_root, allow_unauthenticated_legacy_roots=True
+        )
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == [legacy_sha]
+        assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_g3_a_legacy_root_is_not_read_by_default(self, campaign: Campaign) -> None:
+        """G3. The opt-in defaults to False -- fail closed unless the operator says
+        otherwise. Calling ``_load_corpus`` with no keyword at all must behave exactly
+        like the explicit ``allow_unauthenticated_legacy_roots=False`` case."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == []
+        assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_g4_corrupt_bytes_stay_unread_even_with_the_opt_in(self, campaign: Campaign) -> None:
+        """G4. The opt-in is for artifacts that are merely unauthenticated, not for
+        ones whose bytes are actually damaged -- ``allow_unauthenticated_legacy_roots=True``
+        must not launder a corrupt artifact into being read."""
+        corrupt_sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _corrupt_raw_bytes(campaign.workspace_root, corrupt_sha)
+
+        corpus, outcomes = literature_module._load_corpus(
+            campaign.workspace_root, allow_unauthenticated_legacy_roots=True
+        )
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == []
+        assert outcomes[corrupt_sha] == CorpusReadOutcome.INTEGRITY_FAILED
+
+    def test_g5_a_fully_bound_artifact_is_self_consistent_metadata_and_read_with_no_opt_in(
+        self, campaign: Campaign
+    ) -> None:
+        """G5. A modern artifact with an intact ``derivation_binding`` needs no opt-in
+        at all -- it is the strict, no-compromise case the whole tiering exists to
+        keep distinct from the legacy one."""
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == [sha]
+        assert outcomes[sha] == CorpusReadOutcome.SELF_CONSISTENT_METADATA
+
+    def test_g6_a_binding_dropped_artifact_is_sidecar_digest_only_and_read_with_no_opt_in(
+        self, campaign: Campaign
+    ) -> None:
+        """G6. An artifact that still carries ``extracted_sha256`` but has lost its
+        ``derivation_binding`` is a real, distinct middle tier: not the strict
+        ``SELF_CONSISTENT_METADATA`` case, but also not the wholly-unauthenticated legacy case --
+        so it is read WITHOUT the opt-in, unlike a legacy root."""
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        meta_path = campaign.workspace_root / "evidence" / "literature" / sha / "meta.json"
+        meta = json.loads(meta_path.read_text())
+        del meta["derivation_binding"]
+        meta_path.write_text(json.dumps(meta))
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == [sha]
+        assert outcomes[sha] == CorpusReadOutcome.SIDECAR_DIGEST_ONLY
+
+    def test_g7_a_document_read_under_the_opt_in_is_covered_at_the_legacy_standard(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G7. When ``_corpus_loop`` reads a document that ``_load_corpus`` classified
+        ``UNAUTHENTICATED_LEGACY_ROOT``, the ``CoveredDocument`` it appends must carry
+        THAT standard, not a stronger one it never actually met. This is the single
+        write site in ``_corpus_loop`` that maps ``outcomes[sha256]`` onto
+        ``CoveredDocument.verification_standard`` -- forcing the outcome here isolates
+        that mapping from the gating logic G2/G3 already cover."""
+        _patch_chem_success(monkeypatch)
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        real_load_corpus = literature_module._load_corpus
+
+        def _forced_legacy(workspace_root: Path, **kwargs: Any) -> Any:
+            corpus, _ = real_load_corpus(workspace_root, **kwargs)
+            return corpus, {artifact.sha256: CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT for artifact, _, _ in corpus}
+
+        monkeypatch.setattr(literature_module, "_load_corpus", _forced_legacy)
+        deps, _, config = _make_deps([_corpus_proposal([_corpus_finding(sha256=sha)]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        covered = report.passes[0].covered
+        assert [c.raw_sha256 for c in covered] == [sha]
+        assert covered[0].verification_standard == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value
+
+    def test_g8_the_v5_to_v6_migration_stamps_unrecorded_on_an_existing_covered_record(
+        self,
+    ) -> None:
+        """G8. A v5 payload's ``covered`` entries (which never had
+        ``verification_standard`` at all) gain the value ``"unrecorded"`` once migrated
+        -- the honest admission that no pre-v6 writer ever recorded a standard."""
+        from carmel.services.literature import migrate_report_payload
+
+        payload = {
+            "schema_version": 5,
+            "passes": [
+                {
+                    **self._v3_pass_like(),
+                    "covered": [{"raw_sha256": "a" * 64, "extraction_id": ROOT_EXTRACTION_ID}],
+                }
+            ],
+        }
+
+        migrated = migrate_report_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert migrated["passes"][0]["covered"] == [
+            {"raw_sha256": "a" * 64, "extraction_id": ROOT_EXTRACTION_ID, "verification_standard": "unrecorded"}
+        ]
+
+    def test_g9_the_v5_to_v6_migration_overwrites_rather_than_honours_a_present_value(
+        self,
+    ) -> None:
+        """G9. Pins the setdefault-vs-assign mutation directly: a v5 payload cannot
+        legitimately carry ``verification_standard`` at all (``CoveredDocument`` was
+        ``extra="forbid"`` and the field did not exist), so if one is present anyway
+        the migration must overwrite it with ``"unrecorded"``, not honour it. A
+        ``setdefault`` substitution here would silently accept a claim no v5 writer
+        could have had grounds to make -- the exact mutation a prior audit caught in
+        ``_migrate_v4_to_v5``."""
+        from carmel.services.literature import migrate_report_payload
+
+        payload = {
+            "schema_version": 5,
+            "passes": [
+                {
+                    **self._v3_pass_like(),
+                    "covered": [
+                        {
+                            "raw_sha256": "a" * 64,
+                            "extraction_id": ROOT_EXTRACTION_ID,
+                            "verification_standard": "self_consistent_metadata",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        migrated = migrate_report_payload(payload)
+
+        assert isinstance(migrated, dict)
+        assert migrated["passes"][0]["covered"][0]["verification_standard"] == "unrecorded", (
+            "a pre-existing value must be OVERWRITTEN, not honoured -- no v5 writer could "
+            "have legitimately set this field at all"
+        )
+
+    def test_g10_covered_document_refuses_an_unreadable_standard(self) -> None:
+        """G10. ``verification_standard`` accepts only the outcomes that mean "this was
+        actually read" (plus the migration sentinel ``"unrecorded"``) -- the other
+        ``CorpusReadOutcome`` members name ways a document was NOT read, so nothing
+        could have been read under them, and pure nonsense must be refused too."""
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError, match="verification_standard"):
+            CoveredDocument(
+                raw_sha256="a" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                verification_standard=CorpusReadOutcome.INTEGRITY_FAILED.value,
+            )
+        with pytest.raises(ValidationError, match="verification_standard"):
+            CoveredDocument(
+                raw_sha256="a" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                verification_standard="nonsense",
+            )
+
+    def test_g11_the_legacy_root_log_line_does_not_claim_failed_verification(
+        self, campaign: Campaign, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """G11. The log line for a legacy root must not reuse the "failed digest
+        verification" phrasing that describes genuinely corrupt bytes -- an operator
+        grepping logs for that phrase to find damaged papers must not also catch every
+        intact-but-unauthenticated legacy paper."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+
+        with caplog.at_level("WARNING", logger="carmel.services.literature"):
+            literature_module._load_corpus(campaign.workspace_root)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert not any("failed digest verification" in m and legacy_sha in m for m in messages), (
+            "the legacy root must not be described with the corrupt-bytes phrasing"
+        )
+        assert any("cannot be authenticated" in m and legacy_sha in m for m in messages), (
+            "the legacy root must be described with its own, distinct phrasing"
+        )
+
+    def _v3_pass_like(self) -> dict[str, Any]:
+        return {
+            "run_id": "r",
+            "action_id": "a",
+            "created_at": datetime.now(UTC).isoformat(),
+            "mode": LiteraturePassMode.CORPUS.value,
+            "model_name": "mock",
+            "stop_reason": StopReason.SELF_TERMINATED.value,
+            "usage": {
+                "model_calls": 1,
+                "tokens": 100,
+                "cost_usd": 0.01,
+                "fetches": 0,
+                "fetch_bytes": 0,
+                "elapsed_s": 1.0,
+            },
+            "warnings": [],
+        }
+
+    def test_g12_the_operator_facing_warning_says_why_each_document_went_unread(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G12. The typed outcome must survive to the operator, not die inside the loader.
+
+        `_corpus_loop` flattened every unread class back into one bare sha list for the
+        warning and the `literature.corpus_artifacts_unreadable` event, which reproduces
+        the exact conflation this whole increment exists to remove -- one layer up, where
+        it is the only version a human ever sees. An operator told "2 artifacts could not
+        be read" cannot act: one of these needs re-extraction or an opt-in, the other
+        needs the paper re-acquired.
+        """
+        _patch_chem_success(monkeypatch)
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        corrupt_sha = _store(campaign.workspace_root, text=SECOND_DOC, url="https://example.org/second")
+        _corrupt_raw_bytes(campaign.workspace_root, corrupt_sha)
+        deps, _, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        unreadable = [w for w in report.passes[0].warnings if legacy_sha[:12] in w]
+        assert unreadable, "the operator must be told about the artifact that went unread"
+        warning = unreadable[0]
+        assert CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value in warning, (
+            "the warning must name WHY this document went unread, not merely that it did"
+        )
+        assert CorpusReadOutcome.INTEGRITY_FAILED.value in warning, (
+            "and it must name the different reason for the genuinely damaged one"
+        )
+        # Each sha must sit under its OWN reason. Asserting only that both reasons
+        # appear somewhere in the string would pass for one undifferentiated blob that
+        # lists every reason and every sha together -- which tells the operator nothing
+        # about which document is which, the very thing this test exists to pin.
+        segments = {seg.split(":")[0].strip(): seg for seg in warning.split("--", 1)[1].split(";")}
+        legacy_segment = segments[CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value]
+        corrupt_segment = segments[CorpusReadOutcome.INTEGRITY_FAILED.value]
+        assert legacy_sha[:12] in legacy_segment and corrupt_sha[:12] not in legacy_segment
+        assert corrupt_sha[:12] in corrupt_segment and legacy_sha[:12] not in corrupt_segment
+
+    def test_g13_a_legacy_artifact_is_not_covered_without_the_action_parameter(self, campaign: Campaign) -> None:
+        """G13. End to end through the queued action, not just ``_load_corpus``
+        directly: an action carrying no ``allow_unauthenticated_legacy_roots`` key at
+        all leaves the sole held legacy artifact unread and uncovered."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        assert [c.raw_sha256 for c in report.latest.covered] == []
+        assert deps.ledger.usage().model_calls == 0
+        assert legacy_sha  # the artifact exists; it is simply not among the covered
+
+    def test_g14_a_legacy_artifact_is_covered_when_the_action_carries_the_parameter(self, campaign: Campaign) -> None:
+        """G14. The parameter must actually reach ``_load_corpus`` from the queued
+        action's ``parameters``, not merely be recorded and dropped -- the only test
+        in this suite that proves that end-to-end wiring, as opposed to the gating
+        logic (G2/G3) or the recorded standard (G7), which are covered separately."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([_corpus_proposal([])])
+        action = _action().model_copy(update={"parameters": {"allow_unauthenticated_legacy_roots": True}})
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
+
+        assert [c.raw_sha256 for c in report.latest.covered] == [legacy_sha]
+
+    def test_g15_the_parameter_is_not_passed_to_a_search_mode_pass(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """G15. A SEARCH-mode pass has no held corpus to gate, so
+        ``allow_unauthenticated_legacy_roots`` must not reach ``_research_loop`` at all
+        -- and a search pass whose action happens to carry the key regardless must
+        still run normally rather than being refused by an unexpected keyword."""
+        _patch_chem_success(monkeypatch)
+        deps, _, config = _make_deps([_proposal(findings=[_finding_dict()]), _assessment()])
+        action = _action().model_copy(update={"parameters": {"allow_unauthenticated_legacy_roots": True}})
+
+        report = run_literature_research(campaign.workspace_root, campaign, action, deps, config=config)
+
+        assert report.stop_reason == StopReason.SELF_TERMINATED
+        assert len(report.findings) == 1
+
+
+class TestAPermissionIsReadStrictlyFromThePlan:
+    """`bool()` was the wrong reader for an untyped parameter bag.
+
+    `PlannedAction.parameters` is a plain dict reloaded from `plan.json`, so what
+    arrives is whatever JSON held. `bool("false")` is True -- so a plan carrying the
+    STRING "false" GRANTED the permission it was plainly trying to decline, in the one
+    place that decides whether unauthenticated text may be read at all.
+
+    Found by spar round 64, on code shipped the same session. Review did not catch it
+    and neither did 20 new tests, because every test built its parameters in Python
+    where a bool stays a bool -- the defect only exists on the round trip through disk.
+    """
+
+    def _state(self) -> Any:
+        return literature_module._RunState(queries=[], artifacts=[], findings=[], rejected=[], warnings=[])
+
+    def test_d1_the_string_false_does_not_grant_a_permission(self) -> None:
+        """D1. The exact fail-open: truthy string, falsy intent."""
+        state = self._state()
+        name = "allow_unauthenticated_legacy_roots"
+        assert literature_module._permission_from({name: "false"}, name, state) is False
+
+    def test_d2_a_malformed_value_is_surfaced_not_silently_swallowed(self) -> None:
+        """D2. Refusing quietly would leave the operator believing their plan took effect."""
+        state = self._state()
+        literature_module._permission_from({"reread_all": "false"}, "reread_all", state)
+        assert any("reread_all" in w and "NOT granted" in w for w in state.warnings), (
+            "an operator who wrote a non-boolean must be told their intent did not take effect"
+        )
+
+    def test_d3_the_literal_true_still_grants(self) -> None:
+        """D3. Guards against a fix that refuses everything."""
+        state = self._state()
+        assert literature_module._permission_from({"reread_all": True}, "reread_all", state) is True
+        assert state.warnings == []
+
+    def test_d4_an_int_one_does_not_grant(self) -> None:
+        """D4. `1 == True` in Python, so an `==` comparison would let this back in."""
+        state = self._state()
+        assert literature_module._permission_from({"reread_all": 1}, "reread_all", state) is False
+
+    def test_d5_an_absent_permission_is_a_clean_refusal_with_no_warning(self) -> None:
+        """D5. Absence is the normal case and must not become noise."""
+        state = self._state()
+        assert literature_module._permission_from({}, "reread_all", state) is False
+        assert state.warnings == []
+
+    def test_d6_the_literal_false_is_a_clean_refusal_with_no_warning(self) -> None:
+        """D6. An explicitly-declined permission is well-formed, not malformed."""
+        state = self._state()
+        assert literature_module._permission_from({"reread_all": False}, "reread_all", state) is False
+        assert state.warnings == []
+
+    def test_d7_end_to_end_a_plan_carrying_the_string_false_does_not_read_a_legacy_root(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D7. The only test that proves the strict read is on the PATH, not just callable.
+
+        Goes through a real corpus pass with the parameter as it would survive a JSON
+        round trip, rather than asserting on the helper in isolation.
+        """
+        _patch_chem_success(monkeypatch)
+        _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        deps, _, config = _make_deps([])
+        action = _action()
+        action.parameters["allow_unauthenticated_legacy_roots"] = "false"
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, action, deps, config=config)
+
+        assert report.passes[0].covered == [], "a string must never grant the permission to read unauthenticated text"
+
+
+def _store_current_record(workspace_root: Path, raw_sha256: str, *, text: str) -> str:
+    """Append ONE extraction record that is current for today's extractor identity.
+
+    Stamped with the real `extraction_identity()` rather than a fixed string, because
+    `current_extraction_records` compares against what today's code reports: a
+    hardcoded sha would make the record permanently non-current and the test would
+    pass for the wrong reason -- silently exercising the root path it exists to avoid.
+    """
+    require_pypdf()
+    from carmel.agents.tools.extract import ExtractedText, normalize_for_match
+    from carmel.services.extraction_record import store_extraction_record
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    extracted = ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=[], extractor="pdf:pypdf", lossy=False
+    )
+    payload = json.dumps(extracted.model_dump(mode="json"), indent=2, sort_keys=True).encode("utf-8")
+    return store_extraction_record(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        extractor="pdf:pypdf",
+        extractor_code_sha256=identity.code_sha256,
+        pypdf_version=identity.pypdf_version,
+        extracted_json_bytes=payload,
+    )
+
+
+def _store_record(
+    workspace_root: Path,
+    raw_sha256: str,
+    *,
+    text: str,
+    extractor: str = "pdf:pypdf",
+    code_sha256: str | None = None,
+    pypdf_version: str | None = None,
+) -> str:
+    """Append ONE extraction record with the identity fields spelled out.
+
+    The generalisation of :func:`_store_current_record` for tests that need a record
+    which is deliberately NOT current, or not a ``pdf:pypdf`` one. Defaults still come
+    from the real `extraction_identity()` for the same reason that helper does it.
+    """
+    require_pypdf()
+    from carmel.agents.tools.extract import ExtractedText, normalize_for_match
+    from carmel.services.extraction_record import store_extraction_record
+    from carmel.services.semantic_deps import extraction_identity
+
+    identity = extraction_identity()
+    extracted = ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=[], extractor=extractor, lossy=False
+    )
+    payload = json.dumps(extracted.model_dump(mode="json"), indent=2, sort_keys=True).encode("utf-8")
+    return store_extraction_record(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        extractor=extractor,
+        extractor_code_sha256=code_sha256 if code_sha256 is not None else identity.code_sha256,
+        pypdf_version=pypdf_version if pypdf_version is not None else identity.pypdf_version,
+        extracted_json_bytes=payload,
+    )
+
+
+def _records_dir(workspace_root: Path, raw_sha256: str) -> Path:
+    return workspace_root / "evidence" / "literature" / raw_sha256 / "extractions"
+
+
+RECORD_TEXT = "Text served from the authenticated extraction record, not the root sidecar."
+
+
+class TestTheCorpusPrefersAnAuthenticatedExtractionRecord:
+    """A record that authenticates is read in preference to the root sidecar.
+
+    The root `extracted.json` of an older artifact is checked against nothing at all,
+    so the gate refuses it. Re-extraction was supposed to be the way out, but it writes
+    only under `extractions/` while the gate read only root fields -- so re-extracting
+    changed nothing about whether a document could be read.
+
+    The preference is UNIFORM, not a fallback triggered by the root failing to
+    authenticate. A fallback keyed on root failure would mean deleting
+    `extracted_sha256` from a modern root silently switches which text is served, and
+    the store cannot tell "old legacy root" from "field just deleted" -- deletion would
+    PROMOTE. A uniform rule makes deletion incapable of changing which path is taken.
+    """
+
+    def test_a_legacy_root_with_one_authenticated_record_is_read_with_no_opt_in_flag(self, campaign: Campaign) -> None:
+        """The operator's 8 papers, after re-extraction, without the opt-in flag.
+
+        The record's text is deliberately DIFFERENT from the root's, so serving the
+        root would fail this test rather than passing by coincidence -- the difference
+        is the whole point. Using the record's mere existence to bless the ROOT text
+        would authenticate one artifact by pointing at a different one.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [artifact.sha256 for artifact, _, _ in corpus] == [legacy_sha], (
+            "a legacy root with one authenticated current record must be READ without the opt-in"
+        )
+        _, extracted, extraction_id = corpus[0]
+        assert extracted.text == RECORD_TEXT, "the RECORD's text must be served, never the root sidecar's"
+        assert extracted.text != DOC
+        assert extraction_id == record_sha, "coverage must name the record that was actually read"
+        assert extraction_id != ROOT_EXTRACTION_ID
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_a_record_whose_text_fails_its_digest_is_not_read_and_not_downgraded_to_the_root(
+        self, campaign: Campaign
+    ) -> None:
+        """A tampered record must not buy a read of the unauthenticated root text.
+
+        Falling back here would hand an attacker exactly the downgrade the operator
+        never authorised: break the record, get the root served instead.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        record_json = (
+            campaign.workspace_root
+            / "evidence"
+            / "literature"
+            / legacy_sha
+            / "extractions"
+            / record_sha
+            / "extracted.json"
+        )
+        tampered = json.loads(record_json.read_text(encoding="utf-8"))
+        tampered["text"] = "swapped after the digest was recorded"
+        record_json.write_text(json.dumps(tampered, indent=2, sort_keys=True), encoding="utf-8")
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "a record that fails its own digest must not be read"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "and must NOT silently downgrade to the root path"
+        )
+
+    def test_a_corrupt_raw_bin_is_not_read_even_with_a_valid_current_record(self, campaign: Campaign) -> None:
+        """A record must never launder a corrupt artifact.
+
+        The shallow integrity check is absolute and runs first: whatever records exist,
+        bytes that no longer hash to their own directory name are not evidence.
+        """
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, sha, text=RECORD_TEXT)
+        _corrupt_raw_bytes(campaign.workspace_root, sha)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == []
+        assert outcomes[sha] == CorpusReadOutcome.INTEGRITY_FAILED
+
+    def test_deleting_extracted_sha256_from_a_modern_root_does_not_change_the_served_text(
+        self, campaign: Campaign
+    ) -> None:
+        """Deletion cannot promote -- asserted directly rather than argued.
+
+        If the record path were a FALLBACK for a root that fails to authenticate, then
+        deleting one root field would flip which text is served. Because the preference
+        is uniform, deletion changes nothing: the record already won.
+        """
+        sha = _store(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, sha, text=RECORD_TEXT)
+
+        before, _ = literature_module._load_corpus(campaign.workspace_root)
+
+        meta_path = campaign.workspace_root / "evidence" / "literature" / sha / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        del meta["extracted_sha256"]
+        meta_path.write_text(json.dumps(meta), encoding="utf-8")
+
+        after, _ = literature_module._load_corpus(campaign.workspace_root)
+
+        assert [(a.sha256, e.text, x) for a, e, x in before] == [(sha, RECORD_TEXT, record_sha)]
+        assert [(a.sha256, e.text, x) for a, e, x in after] == [(sha, RECORD_TEXT, record_sha)], (
+            "deleting a root field must not change which text is served, in either direction"
+        )
+
+    def test_the_operator_is_told_when_a_document_was_read_from_a_record(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Which text was served is not a detail the operator should have to dig for.
+
+        A document read from a record is a different document from the same raw bytes
+        read through the root sidecar, and it is quoted under a different extraction id.
+        Pinned here because the previous round's audit showed that a fix nothing asserts
+        on is free to regress silently.
+        """
+        _patch_chem_success(monkeypatch)
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        record_sha = _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        deps, _, config = _make_deps([_corpus_proposal([]), _assessment()])
+
+        report = run_corpus_pass(campaign.workspace_root, campaign, _action(), deps, config=config)
+
+        warnings = "\n".join(report.passes[0].warnings)
+        assert "authenticated extraction record" in warnings
+        assert legacy_sha[:12] in warnings and record_sha[:12] in warnings
+        covered = report.passes[0].covered
+        assert [c.extraction_id for c in covered] == [record_sha]
+        assert [c.verification_standard for c in covered] == [
+            CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED.value
+        ], "the permanent record must name the standard the document was ACTUALLY read under"
+
+    def test_two_records_current_at_once_is_ambiguous_and_does_not_fall_back_to_the_root(
+        self, campaign: Campaign
+    ) -> None:
+        """Ambiguity among records is not a licence to serve unchecked text.
+
+        Every record here may be perfectly intact -- it is the STORE that cannot say
+        which one speaks for this document. That is a different fact from a broken
+        record, so it gets its own outcome rather than sending the operator hunting for
+        a corrupt file that does not exist.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        _store_current_record(campaign.workspace_root, legacy_sha, text="a second, differently-worded extraction")
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "with two current records the document must not be read at all"
+        assert outcomes[legacy_sha] == CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS
+        assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED, (
+            "nothing failed to authenticate -- saying so would send the operator after a "
+            "corrupt file that does not exist"
+        )
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "and it must not quietly fall through to the root sidecar"
+        )
+
+
+class TestEveryRouteToNoUsableRecordRefuses:
+    """Only a genuinely absent ``extractions/`` may fall through to the root tiers.
+
+    `4c0aa23` guarded exactly one route -- a record that is FOUND and fails to
+    authenticate. Every other way of arriving at "zero current records" still served
+    unauthenticated root text, and two of those routes are worse than the downgrade that
+    commit fixed: one of them SELECTS rather than falls through, and one is reachable by
+    tampering with a single file.
+    """
+
+    def test_corrupting_one_meta_json_must_not_turn_a_refusal_into_a_read(self, campaign: Campaign) -> None:
+        """Tamper-to-PROMOTE: the attacker gains a read rather than losing one.
+
+        Two current records are ambiguous and refuse. Corrupting ONE record's meta.json
+        makes `list_extraction_records` skip it, so the count falls to one and the
+        survivor is served as authenticated corpus text. That is strictly worse than the
+        downgrade the record-preference was introduced to prevent, because deleting
+        evidence must never be able to unlock a read.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        doomed = _store_record(campaign.workspace_root, legacy_sha, text="a second, differently-worded extraction")
+        (_records_dir(campaign.workspace_root, legacy_sha) / doomed / "meta.json").write_text(
+            "{ this is not json", encoding="utf-8"
+        )
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], (
+            "a sha-shaped record that cannot be read is a candidate, not noise -- it must "
+            "block the read, not silently reduce the count to one"
+        )
+        assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED, (
+            "corrupting one file must never PROMOTE the survivor to an authenticated read"
+        )
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_a_pdf_unavailable_record_is_not_current_once_pypdf_is_installed(self, campaign: Campaign) -> None:
+        """False currentness: today's extractor would never produce this record.
+
+        ``pdf:unavailable`` is the degraded placeholder written when pypdf could not be
+        imported. It is deliberately excluded from the pypdf-version comparison -- which
+        is right at STORE time, where demanding a version there provably is none would be
+        wrong, but wrong at QUERY time: with pypdf installed, today's extraction would
+        produce ``pdf:pypdf``, so the placeholder is stale and must not be served.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_record(
+            campaign.workspace_root,
+            legacy_sha,
+            text="degraded placeholder written when pypdf was missing",
+            extractor="pdf:unavailable",
+            pypdf_version="unknown",
+        )
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "a degraded placeholder must not be served as a current record"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_records_that_no_longer_match_todays_code_identity_refuse(self, campaign: Campaign) -> None:
+        """Records exist but none is current: a refusal, not a fall-through.
+
+        "No record was ever stored" and "records exist, none matches today's extractor"
+        are different facts about the document, and only the first one licenses reading
+        text that is checked against nothing.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT, code_sha256="0" * 64)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "a stale record is not a licence to serve the root sidecar"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_an_undiscoverable_pypdf_version_refuses_and_says_so(
+        self, campaign: Campaign, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken pypdf install must not silently revert the whole campaign to root text.
+
+        `_pypdf_version()` collapses every failure to ``"unknown"``, which matches no
+        stored version, so EVERY pypdf-extracted record in the campaign stops being
+        current at once. The operator must be told their environment cannot identify the
+        extractor dependency -- not that their documents are stale.
+        """
+        from carmel.services import semantic_deps
+
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        monkeypatch.setattr(semantic_deps, "_pypdf_version", lambda: "unknown")
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "an unidentifiable extractor dependency must refuse, not downgrade"
+        assert outcomes[legacy_sha] == CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root can read a chmod-000 directory")
+    def test_an_unlistable_extractions_directory_refuses(self, campaign: Campaign) -> None:
+        """ "The store cannot be read" must not present as "the store is empty"."""
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _store_current_record(campaign.workspace_root, legacy_sha, text=RECORD_TEXT)
+        records_dir = _records_dir(campaign.workspace_root, legacy_sha)
+        records_dir.chmod(0o000)
+        try:
+            corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+        finally:
+            records_dir.chmod(0o700)
+
+        assert corpus == [], "an unreadable record store is not an absent one"
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+    def test_a_genuinely_absent_extractions_directory_is_the_only_fall_through(self, campaign: Campaign) -> None:
+        """The one route that legitimately reaches the root tiers.
+
+        This is the counterweight to every refusal above: if the refusals swallowed this
+        case too, the legacy corpus would be unreadable rather than opt-in, and the
+        refusals would be indistinguishable from a blanket ban.
+        """
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        assert not _records_dir(campaign.workspace_root, legacy_sha).exists()
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == [], "still gated behind the legacy-root opt-in"
+        assert outcomes[legacy_sha] == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "an artifact that never had a record must still reach the root tiers"
+        )
+
+
+class TestOnePoisonedEntryDoesNotKillTheWholePass:
+    """A containment failure must cost ONE document, not the whole corpus.
+
+    `f5ea5bb` made every route to "no usable extraction record" refuse rather than serve
+    unauthenticated root text. It left one route that does not refuse -- it CRASHES.
+    ``_validated_records_dir`` raises ``ValueError`` when an artifact's ``extractions/``
+    resolves outside the workspace, and nothing between it and the per-artifact loop in
+    ``_load_corpus`` catches it, so a single poisoned entry aborts the pass for every
+    OTHER document too.
+
+    The root tier immediately below already degrades on its own ``ValueError`` rather
+    than propagating it, so the record tier is the odd one out -- and it is the tier
+    where the blast radius is the whole campaign instead of one artifact.
+    """
+
+    def test_a_symlinked_extractions_dir_refuses_only_its_own_document(self, campaign: Campaign) -> None:
+        """Two healthy documents must survive a third one's escaping symlink.
+
+        The failure this pins is availability, not authenticity: before the fix the
+        assertion below could not even be reached, because the call raised out of the
+        loop and the two healthy artifacts were never classified at all.
+        """
+        healthy = [
+            _store_legacy(
+                campaign.workspace_root,
+                text=f"Healthy synthetic document {index}. Measured 1.{index} ms.\n",
+                url=f"https://example.invalid/healthy-{index}",
+            )
+            for index in range(2)
+        ]
+        for sha in healthy:
+            _store_current_record(campaign.workspace_root, sha, text=RECORD_TEXT)
+        poisoned = _store_legacy(
+            campaign.workspace_root,
+            text="Poisoned synthetic document. Measured 9.9 ms.\n",
+            url="https://example.invalid/poisoned",
+        )
+        outside = campaign.workspace_root.parent / "outside-the-workspace"
+        outside.mkdir(parents=True, exist_ok=True)
+        _records_dir(campaign.workspace_root, poisoned).symlink_to(outside, target_is_directory=True)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert sorted(artifact.sha256 for artifact, _, _ in corpus) == sorted(healthy), (
+            "one artifact whose record store escapes the workspace must not take the healthy documents down with it"
+        )
+        assert outcomes[poisoned] == CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE
+        assert outcomes[poisoned] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "escaping the workspace is never a licence to fall through to the root sidecar"
+        )
+
+    def test_the_escape_is_not_reported_as_a_merely_unreadable_store(self, campaign: Campaign) -> None:
+        """ "Points outside the workspace" and "could not be listed" are different facts.
+
+        The first is a containment breach -- the store is being asked to follow a path
+        out of the workspace it is supposed to be sealed inside. The second is an IO
+        error. Folding them into one outcome is the exact collapse this whole arc exists
+        to undo, and it would tell an operator to check permissions when what they have
+        is a planted or restored symlink.
+        """
+        poisoned = _store_legacy(campaign.workspace_root, text=DOC, url="https://example.invalid/escapes")
+        outside = campaign.workspace_root.parent / "outside-for-distinctness"
+        outside.mkdir(parents=True, exist_ok=True)
+        _records_dir(campaign.workspace_root, poisoned).symlink_to(outside, target_is_directory=True)
+
+        _, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert outcomes[poisoned] != CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE, (
+            "a containment breach must not be reported as a permissions problem"
+        )
+
+
+class TestAnIncompleteRecordStoreRefusesInTheCorpusPass:
+    """The two forged/accidental routes to the root fall-through, end to end.
+
+    Asserts the OUTCOME, not merely that the read refused: an operator facing an
+    interrupted write is told to re-extract, and one facing a broken link is told their
+    store has a pointer to nothing. Collapsing them would send the first person hunting
+    for a symlink that does not exist.
+    """
+
+    def test_an_interrupted_write_is_reported_as_an_empty_store_not_an_absent_one(self, campaign: Campaign) -> None:
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        _records_dir(campaign.workspace_root, legacy_sha).mkdir(parents=True)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == []
+        assert outcomes[legacy_sha] == CorpusReadOutcome.EMPTY_EXTRACTION_RECORD_STORE_PRESENT
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "a write that was begun and did not finish must not license the root sidecar"
+        )
+
+    def test_a_dangling_store_link_is_reported_as_such(self, campaign: Campaign) -> None:
+        legacy_sha = _store_legacy(campaign.workspace_root, text=DOC, url=SOURCE_URL)
+        artifact_root = campaign.workspace_root / "evidence" / "literature" / legacy_sha
+        (artifact_root / "extractions").symlink_to(artifact_root / "never-created", target_is_directory=True)
+
+        corpus, outcomes = literature_module._load_corpus(campaign.workspace_root)
+
+        assert corpus == []
+        assert outcomes[legacy_sha] == CorpusReadOutcome.EXTRACTION_RECORD_STORE_LINK_DANGLING
+        assert outcomes[legacy_sha] != CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT, (
+            "planting one broken symlink must not forge the store's most permissive answer"
+        )
+
+
+class TestCorpusEnumerationDoesNotTrustMetaJsonsOwnSha256:
+    """The DIRECTORY NAME is the content address. `meta.sha256` is a field in a
+    mutable file that happens to sit inside it, and every consumer of
+    `list_artifacts_with_unreadable` works from that field -- verifying,
+    selecting extraction records, and recording coverage BY IT.
+
+    So a `meta.json` whose `sha256` names a DIFFERENT (also real, also valid)
+    artifact directory silently redirects the whole pass: it would verify one
+    artifact and record coverage for another, with both passing their own
+    checks. The dataset producer has cross-checked field against directory for
+    some time; enumeration had not, which left the corpus path as the one that
+    could still be redirected.
+    """
+
+    def test_a_meta_naming_another_directory_is_reported_unreadable(self, tmp_path: Path) -> None:
+        first = _store(tmp_path, text="first document text", url="https://example.org/a")
+        second = _store(tmp_path, text="second document text", url="https://example.org/b")
+        assert first != second
+        meta_path = artifact_dir(tmp_path, first) / "meta.json"
+        meta = StoredArtifact.model_validate_json(meta_path.read_text(encoding="utf-8"))
+        meta_path.write_text(meta.model_copy(update={"sha256": second}).model_dump_json(), encoding="utf-8")
+
+        artifacts, unreadable = list_artifacts_with_unreadable(tmp_path)
+
+        # Reported, not silently dropped: this function's contract is that
+        # anything it could not turn into a trustworthy StoredArtifact is
+        # surfaced, never quietly shrinking the store's apparent size.
+        assert first in unreadable
+        assert [a.sha256 for a in artifacts] == [second]
+
+    def test_an_untampered_store_still_enumerates_completely(self, tmp_path: Path) -> None:
+        """The counterweight. A check that rejected every artifact would satisfy
+        the test above and look correct."""
+        first = _store(tmp_path, text="first document text", url="https://example.org/a")
+        second = _store(tmp_path, text="second document text", url="https://example.org/b")
+
+        artifacts, unreadable = list_artifacts_with_unreadable(tmp_path)
+
+        assert unreadable == []
+        assert {a.sha256 for a in artifacts} == {first, second}

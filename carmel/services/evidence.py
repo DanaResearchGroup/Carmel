@@ -35,6 +35,37 @@ idempotent re-store, ``raw.bin``'s digest, ``meta.json``'s recorded sha256/byte-
 and the presence of ``text.txt``/``extracted.json`` are all verified against the
 directory name. Any mismatch is treated as on-disk corruption (bit rot, partial
 write, tampering) and repaired from the caller's bytes-in-hand rather than trusted.
+
+Neither of the checks above proves that ``extracted.json`` was actually DERIVED FROM
+``raw.bin`` -- only that each file, taken alone, matches its own recorded digest. A
+stale or swapped extraction (produced from different bytes, or by a different/older
+extractor) that also carries a self-consistent ``extracted_sha256`` would pass both
+checks. Whether re-running the extractor on ``raw.bin`` is even guaranteed to
+reproduce ``extracted.json`` byte-for-byte was investigated directly:
+
+- :mod:`carmel.agents.tools.extract` embeds no timestamps or UUIDs anywhere in
+  :class:`~carmel.agents.tools.extract.ExtractedText` (its fields are ``text``,
+  ``normalized``, ``sections``, ``page_count``, ``extractor``, ``lossy`` -- see that
+  module's docstring), and its extraction paths (PDF page loop, HTML tag stripping,
+  plain-text passthrough) run single-threaded with no parallelism, so nothing there
+  varies run to run for the SAME library versions.
+- But the PDF path (the common case) delegates the actual text extraction to the
+  third-party ``pypdf`` library (``import pypdf`` in
+  ``carmel/agents/tools/extract.py``, ``_extract_pdf``'s ``reader.pages[i]
+  .extract_text()``), and that dependency is unpinned in this project
+  (``pyproject.toml``: ``pypdf>=5.0``). Different installed versions of the SAME
+  library are not guaranteed to extract byte-identical text from identical PDF
+  bytes -- ``pypdf``'s extraction algorithm has changed release to release -- and
+  the persisted ``extractor`` string ("pdf:pypdf") does not even record which
+  version produced a given ``extracted.json``.
+- Conclusion: extraction is **not proven deterministic** across time/library
+  upgrades. Re-running the extractor and diffing the result would therefore be
+  unsound as a verification step -- a legitimate ``pypdf`` upgrade between store
+  time and verify time would make an untouched, perfectly good artifact fail a
+  byte-diff check. So :func:`verify_artifact`'s ``deep=True`` path does NOT
+  re-extract; instead it checks a *derivation binding* recorded at store time (see
+  :data:`StoredArtifact.derivation_binding` for exactly what that does and does not
+  prove).
 """
 
 from __future__ import annotations
@@ -53,9 +84,11 @@ from carmel.services.artifacts import read_bytes, read_json, write_bytes, write_
 
 __all__ = [
     "EVIDENCE_LITERATURE_DIR",
+    "EvidenceStoreUnreadableError",
     "artifact_dir",
     "list_artifacts",
     "list_artifacts_with_unreadable",
+    "load_artifact_meta",
     "load_artifact_text",
     "store_artifact",
     "verify_artifact",
@@ -64,6 +97,21 @@ __all__ = [
 logger = get_logger("services.evidence")
 
 EVIDENCE_LITERATURE_DIR = "evidence/literature"
+
+
+class EvidenceStoreUnreadableError(OSError):
+    """The evidence store exists but could not be enumerated.
+
+    Deliberately an exception rather than an empty result. Every other "I could not read
+    this" in this module degrades to skipping ONE artifact, which the caller folds into
+    its reported coverage; there is no equivalent move for the store as a whole, because
+    a caller handed an empty list cannot tell "nothing is stored" from "I could not
+    look", and reports full coverage of nothing either way.
+
+    A subclass of ``OSError`` so a caller that already handles I/O failure around store
+    access keeps working, while one that wants to name this case specifically can.
+    """
+
 
 _RAW_NAME = "raw.bin"
 _TEXT_NAME = "text.txt"
@@ -293,6 +341,53 @@ def _extracted_sidecar_intact(extracted_path: Path, meta: StoredArtifact) -> boo
         return False
 
 
+def _extractor_identity(extractor: str) -> str:
+    """Best-effort extractor identity+version string for the derivation binding.
+
+    For the ``"pdf:pypdf"`` extractor this records the ACTUAL installed ``pypdf``
+    version (e.g. ``"pdf:pypdf==5.1.0"``), because that dependency is unpinned
+    (``pypdf>=5.0`` in ``pyproject.toml``) and different installed versions of the
+    same library are not guaranteed to extract byte-identical text from identical
+    PDF bytes -- see the module docstring's determinism analysis. For every other
+    extractor (``"html"``, ``"text"``, ``"pdf:unavailable"``, ``"unknown"``) there
+    is no third-party version to record -- those paths are stdlib-only -- so the
+    extractor string itself is the whole identity.
+
+    Args:
+        extracted.extractor: The extractor string recorded on the ``ExtractedText``.
+
+    Returns:
+        The identity+version string to fold into :func:`_derivation_binding`.
+    """
+    if extractor == "pdf:pypdf":
+        try:
+            import pypdf
+
+            return f"{extractor}=={pypdf.__version__}"
+        except Exception:  # noqa: BLE001 - version discovery is best-effort, never fatal
+            return extractor
+    return extractor
+
+
+def _derivation_binding(raw_sha256: str, extracted_sha256: str, extractor_identity: str) -> str:
+    """Bind extractor identity, raw digest, and sidecar digest into one digest.
+
+    Read exactly what the result proves -- documented in full on
+    :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding`, which this
+    function's docstring must not repeat and drift from. In short: internal
+    consistency of a single ``meta.json`` record, never literal re-derivation.
+
+    Args:
+        raw_sha256: Digest of the stored ``raw.bin`` bytes.
+        extracted_sha256: Digest of the stored ``extracted.json`` bytes.
+        extractor_identity: Result of :func:`_extractor_identity`.
+
+    Returns:
+        sha256 hex digest of the three inputs, joined by ``"|"``.
+    """
+    return hashlib.sha256(f"{extractor_identity}|{raw_sha256}|{extracted_sha256}".encode()).hexdigest()
+
+
 def _load_meta(meta_path: Path) -> StoredArtifact | None:
     """Best-effort load of an existing ``meta.json``; None if absent/unreadable."""
     try:
@@ -327,6 +422,7 @@ def _write_all(
     # to describe the bytes actually on disk, and re-deriving them here would silently
     # drift the moment `write_json`'s formatting changed.
     extracted_digest = hashlib.sha256(extracted_path.read_bytes()).hexdigest()
+    extractor_identity = _extractor_identity(extracted.extractor)
     stored = StoredArtifact(
         sha256=digest,
         source_url=artifact.url,
@@ -339,6 +435,8 @@ def _write_all(
         lossy=extracted.lossy,
         license_note=license_note,
         provenance=provenance,
+        extractor_version=extractor_identity,
+        derivation_binding=_derivation_binding(digest, extracted_digest, extractor_identity),
     )
     write_json(meta_path, stored)
     return stored
@@ -366,7 +464,9 @@ def _validate_sha256(workspace_root: Path, sha256: str) -> Path:
             the resolved artifact directory would fall outside the resolved
             workspace root.
     """
-    if not _SHA256_RE.match(sha256):
+    # Matched with fullmatch, never match: Python's `$` also matches just BEFORE a
+    # trailing newline, so match would let "a" * 64 + "\n" through.
+    if not _SHA256_RE.fullmatch(sha256):
         raise ValueError(f"invalid sha256 digest: {sha256!r} (expected 64 lowercase hex characters)")
     root = normalize_path(workspace_root)
     return _assert_contained(root, artifact_dir(root, sha256))
@@ -394,19 +494,57 @@ def list_artifacts_with_unreadable(workspace_root: Path) -> tuple[list[StoredArt
     names lets the caller fold them into the coverage it reports (F11).
     """
     root = Path(workspace_root) / EVIDENCE_LITERATURE_DIR
+    if not root.exists():
+        # A workspace that has never held an artifact. Genuinely empty, and saying so is
+        # honest -- this is the ONLY route by which this function reports an empty store.
+        return [], []
     try:
         entries = sorted(root.iterdir())
-    except OSError:
-        return [], []
+    except OSError as exc:
+        # NOT `return [], []`. That is the very failure this function's docstring argues
+        # against, applied to the whole store rather than to one artifact: "the store
+        # cannot be read" would present as "the store is empty", and a pass over an empty
+        # store reports full coverage of nothing. A barren pass would look conclusive,
+        # which is strictly worse than failing -- nobody re-runs a pass that said it was
+        # done.
+        raise EvidenceStoreUnreadableError(
+            f"the evidence store at {root} exists but could not be listed: {exc}. Refusing to "
+            "report it as empty -- an unreadable store establishes nothing about what it holds"
+        ) from exc
 
     artifacts: list[StoredArtifact] = []
     unreadable: list[str] = []
     for entry in entries:
-        if not entry.is_dir() or not _SHA256_RE.match(entry.name):
+        if not entry.is_dir() or not _SHA256_RE.fullmatch(entry.name):
             continue
         meta = _load_meta(entry / _META_NAME)
         if meta is None:
             logger.warning("evidence store: skipping %s (no readable meta.json)", entry.name)
+            unreadable.append(entry.name)
+            continue
+        if meta.sha256 != entry.name:
+            # The DIRECTORY NAME is the content address; `meta.sha256` is a field
+            # inside a mutable file that happens to sit in it. Every caller of this
+            # function then works from `artifact.sha256` -- verifying, selecting
+            # extraction records, and recording coverage BY THAT VALUE -- so a
+            # meta.json whose sha256 field names some OTHER directory silently
+            # redirects all of it: the corpus pass would verify one artifact and
+            # record coverage for another, both of which exist and both of which
+            # pass their own checks.
+            #
+            # Reported UNREADABLE, not skipped silently and not raised. It is the
+            # same class as an unparseable meta.json -- this directory cannot be
+            # turned into a trustworthy StoredArtifact -- and this function's whole
+            # contract is that anything it could not read is surfaced to the caller
+            # rather than quietly reducing the store's apparent size. The producer
+            # has enforced this cross-check for some time
+            # (`_authenticate_raw_bytes_and_read_source_metadata`); enumeration had
+            # not, so the corpus path was the one that could still be redirected.
+            logger.warning(
+                "evidence store: skipping %s (meta.json records sha256=%s, which names a different artifact directory)",
+                entry.name,
+                meta.sha256,
+            )
             unreadable.append(entry.name)
             continue
         artifacts.append(meta)
@@ -422,6 +560,32 @@ def list_artifacts(workspace_root: Path) -> list[StoredArtifact]:
     use that function instead and account for what it could not read.
     """
     return list_artifacts_with_unreadable(workspace_root)[0]
+
+
+def load_artifact_meta(workspace_root: Path, sha256: str) -> StoredArtifact | None:
+    """Load the :class:`StoredArtifact` metadata for one artifact, by sha256.
+
+    Direct single-artifact lookup, as opposed to :func:`list_artifacts` (which
+    scans and parses every ``meta.json`` in the store and silently drops
+    unreadable ones -- fine for corpus enumeration, wrong for "resolve THIS
+    artifact"). Goes through the same sha-shape and containment validation as
+    every other read path in this module.
+
+    Args:
+        workspace_root: Root of the campaign workspace.
+        sha256: Hex digest identifying the artifact.
+
+    Returns:
+        The persisted metadata, or None when no artifact is stored under
+        ``sha256`` or its ``meta.json`` is missing/unreadable/invalid.
+
+    Raises:
+        ValueError: If ``sha256`` is not a well-formed 64-character lowercase
+            hex digest, or if the resolved artifact directory would fall
+            outside the resolved workspace root.
+    """
+    dest_dir = _validate_sha256(workspace_root, sha256)
+    return _load_meta(dest_dir / _META_NAME)
 
 
 def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | None:
@@ -478,7 +642,7 @@ def load_artifact_text(workspace_root: Path, sha256: str) -> ExtractedText | Non
     )
 
 
-def verify_artifact(workspace_root: Path, sha256: str) -> bool:
+def verify_artifact(workspace_root: Path, sha256: str, *, deep: bool = False) -> bool:
     """Re-read the stored bytes and confirm they still match their recorded digests.
 
     This is what makes the stored provenance auditable rather than merely
@@ -492,15 +656,36 @@ def verify_artifact(workspace_root: Path, sha256: str) -> bool:
     ``extracted_sha256`` existed carry no sidecar digest and are judged on
     ``raw.bin`` alone, exactly as they were when written.
 
+    Neither check above proves ``extracted.json`` was actually DERIVED FROM
+    ``raw.bin`` -- only that each file, taken alone, matches its own recorded
+    digest. A stale or swapped extraction whose ``extracted_sha256`` was updated to
+    match its (wrong) new bytes would pass both checks. ``deep=True`` opts into an
+    additional derivation-binding check for that gap -- see
+    :data:`~carmel.schemas.literature.StoredArtifact.derivation_binding` for
+    precisely what it does and does not prove (in short: internal consistency of
+    the stored metadata record, never literal re-derivation from ``raw.bin`` -- see
+    this module's docstring for why true re-derivation is unsound to check at all).
+    It defaults to False so the cheap, backward-compatible check remains the
+    default for existing callers.
+
     Args:
         workspace_root: Root of the campaign workspace.
         sha256: Hex digest identifying the artifact (and its directory name).
+        deep: When True, additionally require the derivation binding recorded in
+            ``meta.json`` to match one freshly recomputed from ``meta.json``'s own
+            ``extractor_version``, ``sha256``, and ``extracted_sha256`` fields.
+            Artifacts stored before this field existed (``derivation_binding is
+            None``) fail this check -- deep verification is a strictly stronger,
+            opt-in standard that legacy artifacts never had the chance to meet; the
+            default (non-deep) check above is unaffected and keeps working for them.
 
     Returns:
-        True if ``raw.bin`` exists, its sha256 matches ``sha256``, and the
-        ``extracted.json`` sidecar matches its recorded digest (when one exists);
-        False if the artifact is absent or any of those bytes have been
-        corrupted/tampered.
+        True if ``raw.bin`` exists, its sha256 matches ``sha256``, the
+        ``extracted.json`` sidecar matches its recorded digest (when one exists),
+        and -- when ``deep`` is True -- the recorded derivation binding is
+        internally consistent; False if the artifact is absent, any of those bytes
+        have been corrupted/tampered, or (``deep=True``) the binding is missing or
+        inconsistent.
 
     Raises:
         ValueError: If ``sha256`` is not a well-formed 64-character lowercase hex
@@ -529,4 +714,34 @@ def verify_artifact(workspace_root: Path, sha256: str) -> bool:
         # `extracted_sha256=None`, which _extracted_sidecar_intact still accepts.
         logger.warning("evidence store: %s has no readable meta.json; cannot verify", sha256)
         return False
-    return _extracted_sidecar_intact(dest_dir / _EXTRACTED_NAME, meta)
+    if not _extracted_sidecar_intact(dest_dir / _EXTRACTED_NAME, meta):
+        return False
+    if not deep:
+        return True
+    return _derivation_binding_intact(meta)
+
+
+def _derivation_binding_intact(meta: StoredArtifact) -> bool:
+    """Recompute the derivation binding from ``meta``'s own fields and compare.
+
+    Fail-closed, same pattern as the rest of this module: a legacy artifact with no
+    recorded ``derivation_binding``/``extractor_version`` (predates the field) or
+    with no recorded ``extracted_sha256`` (predates THAT field, so there is nothing
+    to bind) cannot satisfy a check it never had the data for, and is treated as
+    failing deep verification rather than as "can't tell so allow it". This is a
+    deliberate, documented exception to "fail closed by default" ONLY in the sense
+    that the DEFAULT (non-deep) check above is unaffected -- ``deep=True`` is opt-in,
+    and legacy artifacts keep passing the default check exactly as before.
+
+    Args:
+        meta: Metadata already loaded and known non-None.
+
+    Returns:
+        True iff ``meta.derivation_binding`` equals a fresh
+        :func:`_derivation_binding` of ``meta``'s own ``extractor_version``,
+        ``sha256``, and ``extracted_sha256``.
+    """
+    if meta.derivation_binding is None or meta.extractor_version is None or meta.extracted_sha256 is None:
+        return False
+    recomputed = _derivation_binding(meta.sha256, meta.extracted_sha256, meta.extractor_version)
+    return recomputed == meta.derivation_binding

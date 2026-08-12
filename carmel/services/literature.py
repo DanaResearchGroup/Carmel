@@ -27,6 +27,7 @@ import os
 import shutil
 import socket
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -54,6 +55,7 @@ from carmel.agents.literature_agent import (
 from carmel.agents.models import build_model
 from carmel.agents.tools.academic import (
     CrossrefSearchTool,
+    OaLookupCoverage,
     OpenAccessResolver,
     OpenAccessResolverProtocol,
     OpenAlexSearchTool,
@@ -84,7 +86,10 @@ from carmel.schemas.acquisition import AcquisitionReason
 from carmel.schemas.campaign import Campaign
 from carmel.schemas.literature import (
     CURRENT_REPORT_SCHEMA_VERSION,
+    ROOT_EXTRACTION_ID,
     STOP_REASON_FOR_DIMENSION,
+    CorpusReadOutcome,
+    CoveredDocument,
     CredenceVerdict,
     EvidenceRef,
     GroundingStatus,
@@ -111,6 +116,10 @@ from carmel.services.evidence import (
     store_artifact,
     verify_artifact,
 )
+from carmel.services.extraction_record import (
+    CurrentSelectionKind,
+    select_current_extraction,
+)
 from carmel.services.grounding import find_quote, ground_finding
 from carmel.services.plan_progress import (
     DEFAULT_LOCK_GRACE_S,
@@ -122,6 +131,28 @@ from carmel.services.plan_progress import (
 from carmel.services.provenance import record_agent_provenance
 
 logger = get_logger("services.literature")
+
+#: How each refusing :class:`CurrentSelectionKind` is reported to the operator.
+#:
+#: Exhaustive over every kind EXCEPT the two that are not refusals:
+#: :attr:`~CurrentSelectionKind.SELECTED` (the document was read) and
+#: :attr:`~CurrentSelectionKind.NO_RECORDS_STORED` (the one route that legitimately
+#: falls through to the root tiers). A mapping rather than a chain of ``if``s so that
+#: adding a kind without deciding how to report it fails with a ``KeyError`` at the
+#: point of use, instead of silently taking some default branch -- which, in a function
+#: whose default branch serves unauthenticated text, is precisely the failure mode this
+#: whole selector exists to remove.
+_RECORD_REFUSAL_OUTCOMES: dict[CurrentSelectionKind, CorpusReadOutcome] = {
+    CurrentSelectionKind.NO_CURRENT_RECORD: CorpusReadOutcome.NO_CURRENT_EXTRACTION_RECORD,
+    CurrentSelectionKind.MULTIPLE_CURRENT_RECORDS: (CorpusReadOutcome.MULTIPLE_CURRENT_EXTRACTION_RECORDS),
+    CurrentSelectionKind.UNUSABLE_RECORD_PRESENT: (CorpusReadOutcome.UNUSABLE_EXTRACTION_RECORD_PRESENT),
+    CurrentSelectionKind.STORE_UNREADABLE: CorpusReadOutcome.EXTRACTION_RECORD_STORE_UNREADABLE,
+    CurrentSelectionKind.RECORD_STORE_ESCAPES_WORKSPACE: (CorpusReadOutcome.EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE),
+    CurrentSelectionKind.EMPTY_RECORD_STORE_PRESENT: (CorpusReadOutcome.EMPTY_EXTRACTION_RECORD_STORE_PRESENT),
+    CurrentSelectionKind.RECORD_STORE_LINK_DANGLING: (CorpusReadOutcome.EXTRACTION_RECORD_STORE_LINK_DANGLING),
+    CurrentSelectionKind.EXTRACTOR_IDENTITY_UNAVAILABLE: (CorpusReadOutcome.EXTRACTOR_IDENTITY_UNAVAILABLE),
+    CurrentSelectionKind.RECORD_AUTHENTICATION_FAILED: (CorpusReadOutcome.EXTRACTION_RECORD_AUTHENTICATION_FAILED),
+}
 
 LITERATURE_REPORT_NAME = "literature_report.json"
 RUN_LOCK_DIR_NAME = ".run.lock"
@@ -230,6 +261,18 @@ def migrate_report_payload(payload: object) -> object:
     the corpus once. That is the conservative direction: re-reading costs tokens,
     while inventing coverage would silently skip documents nobody has mined.
 
+    v4 re-keys coverage from a bare raw sha256 to the PAIR (raw sha256, extraction
+    identity), because a single stored document can hold more than one extraction
+    (the root sidecar, plus whatever re-extraction has since produced) and coverage
+    of one must not be read as coverage of another. The v3->v4 step maps each raw
+    sha in ``covered_sha256`` to a pair with ``extraction_id`` set to
+    :data:`ROOT_EXTRACTION_ID`. That mapping is not a guess: for as long as v3 was the
+    current schema, `_load_corpus` loaded text solely via `load_artifact_text`, which
+    reads the ROOT sidecar, so root text is the only thing any v3 pass could possibly
+    have mined. It can now also serve an authenticated extraction record, which is
+    exactly why this mapping is stated as a fact about PAST passes and must never be
+    re-derived from what the loader does today.
+
     This is a CHAIN, applied step by step from the payload's own version. It used to
     be a single branch that ran the v1 lift for ANY version below current, which was
     correct only while current was 2: at v3 a v2 payload would have been fed through
@@ -264,6 +307,12 @@ def migrate_report_payload(payload: object) -> object:
         migrated = _migrate_v1_to_v2(migrated)
     if version < 3:
         migrated = _migrate_v2_to_v3(migrated)
+    if version < 4:
+        migrated = _migrate_v3_to_v4(migrated)
+    if version < 5:
+        migrated = _migrate_v4_to_v5(migrated)
+    if version < 6:
+        migrated = _migrate_v5_to_v6(migrated)
     # Not a literal. This produces whatever the CURRENT schema is, so hardcoding the
     # number means the next version bump silently stamps migrated reports with a
     # stale version -- and the `version == CURRENT` early return above then treats
@@ -317,6 +366,118 @@ def _migrate_v2_to_v3(payload: dict[str, Any]) -> dict[str, Any]:
         migrated["passes"] = [
             {**p, "covered_sha256": p.get("covered_sha256", [])} if isinstance(p, dict) else p for p in passes
         ]
+    return migrated
+
+
+def _migrate_v3_to_v4(payload: dict[str, Any]) -> dict[str, Any]:
+    """Re-key each pass's ``covered_sha256`` to ``covered``, a list of (raw sha256,
+    extraction identity) pairs.
+
+    Every raw sha in the old list is mapped to ``ROOT_EXTRACTION_ID``. This is not a
+    guess: while v3 was current, `_load_corpus` loaded document text solely via
+    `load_artifact_text`, which reads the ROOT `extracted.json` sidecar, so root text
+    is the only thing any v3 pass could possibly have mined. The loader can now also
+    serve an authenticated extraction record; this mapping describes what OLD passes
+    did and is not affected by that. The old
+    ``covered_sha256`` key is removed, not left alongside the new one -- `PassRecord`
+    sets ``extra="forbid"``, so a payload still carrying it would be rejected.
+    """
+    migrated = dict(payload)
+    passes = migrated.get("passes")
+    if isinstance(passes, list):
+        new_passes = []
+        for p in passes:
+            if not isinstance(p, dict):
+                new_passes.append(p)
+                continue
+            new_p = dict(p)
+            old_covered = new_p.pop("covered_sha256", [])
+            new_p["covered"] = [{"raw_sha256": sha, "extraction_id": ROOT_EXTRACTION_ID} for sha in old_covered]
+            new_passes.append(new_p)
+        migrated["passes"] = new_passes
+    return migrated
+
+
+def _migrate_v4_to_v5(payload: dict[str, Any]) -> dict[str, Any]:
+    """Set ``extraction_id`` to :data:`ROOT_EXTRACTION_ID` on every finding's
+    ``evidence`` mapping.
+
+    This is not a guess: at the time pre-v5 findings were written,
+    `_ground_and_record`'s only two callers obtained the text a finding was grounded
+    against either from `_fetch_and_store` (which extracts freshly and stores the
+    result as the root sidecar) or from `_load_corpus` (which then loaded text solely
+    via `load_artifact_text`, i.e. the root sidecar). So root text is the only thing
+    any pre-v5 finding could possibly have been grounded against. `_load_corpus` can
+    now also serve an authenticated extraction record, which changes nothing about
+    findings already on disk -- and is why this reasoning is pinned to when those
+    findings were written rather than to today's loader. ``quote_start``/``quote_end`` and every other field are left
+    untouched -- this migration only adds the identity that was previously implicit.
+    """
+    migrated = dict(payload)
+    findings = migrated.get("findings")
+    if isinstance(findings, list):
+        new_findings = []
+        for f in findings:
+            if not isinstance(f, dict):
+                new_findings.append(f)
+                continue
+            evidence = f.get("evidence")
+            if isinstance(evidence, dict):
+                new_f = dict(f)
+                new_evidence = dict(evidence)
+                # Assigned unconditionally, NOT via setdefault. By the argument above, a
+                # pre-v5 payload cannot legitimately carry this key at all, and
+                # ``EvidenceRef`` sets ``extra="forbid"``, so one that did used to be
+                # REJECTED outright. Honouring such a value would quietly turn that
+                # refusal into acceptance of a claim -- "these offsets index record
+                # <sha>" -- that no v4 writer could have had grounds to make, and that
+                # nothing downstream can check once the offsets are frozen.
+                new_evidence["extraction_id"] = ROOT_EXTRACTION_ID
+                new_f["evidence"] = new_evidence
+                new_findings.append(new_f)
+            else:
+                new_findings.append(f)
+        migrated["findings"] = new_findings
+    return migrated
+
+
+def _migrate_v5_to_v6(payload: dict[str, Any]) -> dict[str, Any]:
+    """Stamp ``"unrecorded"`` onto every pass's ``covered`` entries'
+    ``verification_standard``.
+
+    ``"unrecorded"`` is a fact, not a guess: no pre-v6 writer ever considered which
+    :class:`~carmel.schemas.literature.CorpusReadOutcome` a document was read under,
+    because the field did not exist, so the honest value for every existing record is
+    "this was never recorded" rather than a reconstruction from the store's CURRENT
+    state (which may since have changed, and in any case cannot speak for what the
+    pass actually checked at the time).
+
+    Assigned unconditionally, NOT via setdefault. A pre-v6 payload cannot legitimately
+    carry this key at all -- ``CoveredDocument`` sets ``extra="forbid"``, so one that
+    did was REJECTED outright -- and honouring such a value would quietly turn that
+    refusal into acceptance of a claim ("this was read to standard <x>") that no v5
+    writer could have had grounds to make. A mutation audit previously caught exactly
+    this ``setdefault`` substitution in ``_migrate_v4_to_v5``; the same guard applies
+    here.
+    """
+    migrated = dict(payload)
+    passes = migrated.get("passes")
+    if isinstance(passes, list):
+        new_passes = []
+        for p in passes:
+            if not isinstance(p, dict):
+                new_passes.append(p)
+                continue
+            covered = p.get("covered")
+            if isinstance(covered, list):
+                new_p = dict(p)
+                new_p["covered"] = [
+                    {**c, "verification_standard": "unrecorded"} if isinstance(c, dict) else c for c in covered
+                ]
+                new_passes.append(new_p)
+            else:
+                new_passes.append(p)
+        migrated["passes"] = new_passes
     return migrated
 
 
@@ -826,12 +987,17 @@ class _RunState:
     parsing warning text."""
     acquisition_slugs: list[str] = field(default_factory=list)
     """Slugs queued for manual acquisition during this run, for the run summary."""
-    covered: list[str] = field(default_factory=list)
-    """Artifact shas this pass actually READ, whether or not they yielded a finding.
+    covered: list[CoveredDocument] = field(default_factory=list)
+    """(artifact sha, extraction identity) pairs this pass actually READ, whether or
+    not they yielded a finding.
 
-    Appended BEFORE the model call, not after: a document the budget cut short was
-    still paid for and partially processed, and recording it only on success would
-    make the next pass re-read exactly the documents that already proved expensive."""
+    Keyed by the pair, not the raw sha alone, because a single stored document can
+    have more than one extraction on disk, and re-reading a paper under a NEW
+    extraction is real work, not a repeat.
+
+    Appended AFTER the model call returns and BEFORE its proposal is processed -- see
+    the ordering comment at the append site in ``_corpus_loop`` for why both halves of
+    that ordering matter."""
 
     def query_records(self, pass_record: PassRecord) -> list[QueryRecord]:
         """This run's executed queries, attributed to the pass that ran them."""
@@ -875,6 +1041,10 @@ def _process_finding(
         action_id=action_id,
         run_id=run_id,
         queue_acquisition=True,
+        # This path fetches and extracts in one breath (`_fetch_and_store` above) and
+        # stores the result as the root sidecar, so root is a fact about this path,
+        # not a default.
+        extraction_id=ROOT_EXTRACTION_ID,
     )
 
 
@@ -891,6 +1061,7 @@ def _ground_and_record(
     action_id: str,
     run_id: str,
     queue_acquisition: bool,
+    extraction_id: str,
 ) -> None:
     """Ground one proposed finding against resolved bytes; verify and record it only
     if it survives.
@@ -903,6 +1074,10 @@ def _ground_and_record(
     ``queue_acquisition`` is False for a corpus pass. There, a failed grounding means
     the quote is not in a document Carmel already holds, so asking a human to go and
     obtain that same document would be nonsense.
+
+    ``extraction_id`` is required, not defaulted, for the same reason the
+    ``EvidenceRef`` field it feeds is required: a caller that forgets to state which
+    text ``extracted`` actually is must fail loudly, not silently claim the root.
     """
     finding_id = uuid.uuid4().hex
     if stored is not None and all(a.sha256 != stored.sha256 for a in state.artifacts):
@@ -982,6 +1157,7 @@ def _ground_and_record(
             verbatim_quote=proposed.verbatim_quote,
             evidence=EvidenceRef(
                 artifact_sha256=stored.sha256,
+                extraction_id=extraction_id,
                 quote_start=match.start if match else None,
                 quote_end=match.end if match else None,
                 page=match.page if match else None,
@@ -1125,7 +1301,7 @@ def _attempt_oa_fetch(
 
 def _resolve_oa_candidates(
     paper_doi: str | None, paper_title: str | None, deps: LiteratureDeps
-) -> tuple[list[str], str, bool]:
+) -> tuple[list[str], str, OaLookupCoverage]:
     """Deterministically resolve a wanted paper's OA candidates, with an honest note.
 
     Args:
@@ -1136,28 +1312,32 @@ def _resolve_oa_candidates(
         deps: Injected dependencies (the resolver in particular).
 
     Returns:
-        ``(candidates, note, complete)``: candidate URLs capped at
+        ``(candidates, note, coverage)``: candidate URLs capped at
         :data:`MAX_OA_FETCH_ATTEMPTS_PER_PAPER`, a note describing what resolution did
-        (or why it could not run) for the operator-facing ``detail``, and whether every
-        enabled provider actually answered. ``complete=False`` means an empty
-        ``candidates`` establishes nothing -- see
-        :attr:`~carmel.agents.tools.academic.OaResolution.complete`.
+        (or why it could not run) for the operator-facing ``detail``, and how much of
+        resolution actually ran -- see :class:`~carmel.agents.tools.academic.OaLookupCoverage`.
+        Anything short of :attr:`~carmel.agents.tools.academic.OaLookupCoverage.COMPLETE`
+        means an empty ``candidates`` establishes nothing.
 
-        The two early returns below are ``complete=True`` deliberately: "this paper has
-        no DOI" and "no resolver is configured" are fully-established facts about why
-        resolution did not run, not truncated attempts.
+        The two early returns below synthesise
+        :attr:`~carmel.agents.tools.academic.OaLookupCoverage.NOT_ATTEMPTED` directly:
+        no resolution object exists in either case, because no provider ever ran.
     """
     if paper_doi is None:
-        return [], "paper has no DOI, so automated open-access resolution was not attempted", True
+        return (
+            [],
+            "paper has no DOI, so automated open-access resolution was not attempted",
+            OaLookupCoverage.NOT_ATTEMPTED,
+        )
     if deps.oa_resolver is None:
-        return [], "no open-access resolver is configured for this run", True
+        return [], "no open-access resolver is configured for this run", OaLookupCoverage.NOT_ATTEMPTED
     resolution = deps.oa_resolver.resolve(paper_doi, title=paper_title)
     candidates = list(resolution.candidates)
     note = resolution.note
     if len(candidates) > MAX_OA_FETCH_ATTEMPTS_PER_PAPER:
         note = f"{note}; trying the first {MAX_OA_FETCH_ATTEMPTS_PER_PAPER} of {len(candidates)} candidates"
         candidates = candidates[:MAX_OA_FETCH_ATTEMPTS_PER_PAPER]
-    return candidates, note, resolution.complete
+    return candidates, note, resolution.coverage
 
 
 def _queue_wanted_paper(
@@ -1198,7 +1378,7 @@ def _queue_wanted_paper(
         state.warnings.append(f"ignored a requested paper with neither a DOI nor a URL: {paper.title!r}")
         return
 
-    candidates, resolution_note, resolution_complete = _resolve_oa_candidates(doi, paper.title or None, deps)
+    candidates, resolution_note, resolution_coverage = _resolve_oa_candidates(doi, paper.title or None, deps)
 
     attempts: list[tuple[str, str]] = []
     observed_reason: AcquisitionReason | None = None
@@ -1225,10 +1405,15 @@ def _queue_wanted_paper(
     if observed_reason is None:
         # No candidate was even attempted. Only claim "no open-access copy exists" when
         # resolution actually finished; if it was cut short (per-paper lookup cap, or a
-        # provider failing in transit) nothing has been established, so say exactly that.
-        reason = (
-            AcquisitionReason.NO_OPEN_ACCESS_COPY if resolution_complete else AcquisitionReason.OA_LOOKUP_INCOMPLETE
-        )
+        # provider failing in transit) nothing has been established, so say exactly
+        # that; and if no provider ever ran (no DOI, no resolver, consent withheld) say
+        # that instead of either. Total map, no else and no default: a coverage value
+        # this dict does not know about must fail loudly, not silently fall through.
+        reason = {
+            OaLookupCoverage.NOT_ATTEMPTED: AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED,
+            OaLookupCoverage.PARTIAL: AcquisitionReason.OA_LOOKUP_INCOMPLETE,
+            OaLookupCoverage.COMPLETE: AcquisitionReason.NO_OPEN_ACCESS_COPY,
+        }[resolution_coverage]
         observed = resolution_note
     else:
         reason = observed_reason
@@ -1422,7 +1607,7 @@ def _research_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
-    already_covered: frozenset[str] = frozenset(),
+    already_covered: frozenset[tuple[str, str]] = frozenset(),
 ) -> None:
     """The bounded propose->ground->verify loop. Mutates ``state`` in place."""
     # A search pass discovers documents rather than re-reading held ones, so prior
@@ -1538,22 +1723,81 @@ def _research_loop(
             return
 
 
-def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, ExtractedText]], list[str]]:
-    """Every held artifact paired with its extracted text, and the shas that were not.
+def _permission_from(parameters: Mapping[str, Any], name: str, state: _RunState) -> bool:
+    """Read one permission out of an action's untyped parameter bag, strictly.
 
-    An artifact whose text cannot be loaded is skipped: it cannot be quoted from, so
-    including it in the listing would only invite the agent to propose a finding that
-    the gate must then reject.
+    ``PlannedAction.parameters`` is a plain ``dict[str, Any]`` reloaded from
+    ``plan.json``, so what arrives here is whatever JSON happened to hold -- and
+    ``bool()`` was the wrong reader for it. ``bool("false")`` is True. So is
+    ``bool("no")``, ``bool(0.1)``, and ``bool([])``'s inverse for any non-empty list.
+    A parameter bag carrying the STRING ``"false"`` therefore GRANTED the permission
+    it was plainly trying to decline, which is a fail-open in the one place that
+    decides whether unauthenticated text may be read at all.
 
-    The skipped shas are RETURNED rather than dropped (spar round 7, P2). A pass that
-    silently reads 6 of 8 held papers and reports nothing looks exactly like a pass
-    that read all 8 and found nothing, and the two call for opposite responses -- fix
-    the corrupt sidecar, or accept that the corpus is exhausted. Coverage the operator
-    cannot see is coverage they will assume.
+    Only the literal booleans are honoured. Anything else is refused AND surfaced as
+    a warning on the pass, rather than quietly treated as either answer: a value that
+    is neither True nor False is a corrupt plan, and an operator who wrote one needs
+    to see that their intent did not take effect. Refusing silently would leave them
+    believing a permission was granted (or withheld) on evidence that never existed --
+    the same assertion-for-observation conflation this module refuses elsewhere.
 
-    "Skipped" therefore spans all three ways a held document can go unread: an
-    unreadable ``meta.json`` (which never yields a StoredArtifact at all), a failed
-    digest verification, and missing extracted text.
+    Args:
+        parameters: The action's parameter bag, exactly as reloaded from disk.
+        name: The permission to read.
+        state: Run state, for recording a warning when the value is malformed.
+
+    Returns:
+        True only when ``name`` maps to the literal ``True``; False when it is absent
+        or maps to the literal ``False``; False, with a warning, for anything else.
+    """
+    if name not in parameters:
+        return False
+    value = parameters[name]
+    # `is` rather than `==`, deliberately: `1 == True` and `0 == False` in Python, so
+    # `==` would let an int back in through the door this function exists to close.
+    if value is True:
+        return True
+    if value is False:
+        return False
+    state.warnings.append(
+        f"action parameter {name!r} is not a boolean (got {type(value).__name__} {value!r}); "
+        "the permission was NOT granted"
+    )
+    logger.warning("action parameter %r is not a boolean (%r); permission refused", name, value)
+    return False
+
+
+def _load_corpus(
+    workspace_root: Path,
+    *,
+    allow_unauthenticated_legacy_roots: bool = False,
+) -> tuple[list[tuple[StoredArtifact, ExtractedText, str]], dict[str, CorpusReadOutcome]]:
+    """Every held artifact paired with its extracted text and the extraction it was
+    read from, plus the typed outcome EVERY held artifact was actually classified
+    under -- read or not.
+
+    The extraction identity is the address of whatever was actually served: a nested
+    extraction record's ``extraction_sha256`` when one was read, and
+    :data:`ROOT_EXTRACTION_ID` when the root ``extracted.json`` sidecar was. A record is
+    preferred whenever exactly one is current for today's extractor identity and it
+    authenticates.
+
+    That preference is UNIFORM, not a fallback for a root that fails to authenticate.
+    Were it a fallback, deleting ``extracted_sha256`` from a modern root would silently
+    switch which text is served, and nothing on disk distinguishes "legacy root" from
+    "field just deleted" -- so the deletion would PROMOTE. Preferring the record
+    unconditionally makes deletion incapable of changing which path is taken.
+
+    This function reports what it actually read, not what it could have read.
+
+    The outcomes mapping is RETURNED rather than a bare skipped-shas list dropped
+    (spar round 7, P2, now generalised). A pass that silently reads 6 of 8 held
+    papers and reports nothing looks exactly like a pass that read all 8 and found
+    nothing, and the two call for opposite responses -- fix the corrupt sidecar, or
+    accept that the corpus is exhausted. Coverage the operator cannot see is coverage
+    they will assume. Every artifact this function considered, read or not, gets
+    exactly one :class:`CorpusReadOutcome` entry: one mechanism, total coverage,
+    rather than a "skipped" list that only ever named the failures.
 
     Every artifact is VERIFIED against its digest before it is read (spar round 8). The
     search pass fetches and extracts in the same breath, so its text is necessarily
@@ -1562,35 +1806,125 @@ def _load_corpus(workspace_root: Path) -> tuple[list[tuple[StoredArtifact, Extra
     :func:`verify_artifact` re-hashes ``raw.bin`` and refuses the artifact if the stored
     bytes no longer match the directory naming them.
 
-    What this does NOT prove, stated plainly rather than left implied: ``extracted.json``
-    is a DERIVED cache, and verifying ``raw.bin`` does not establish that the cache was
-    derived from those bytes. Someone able to rewrite the sidecar in place could still
-    present text that the raw bytes do not contain. Closing that would mean re-extracting
-    every document on every pass, and it buys little here -- anyone who can write into
-    the evidence store can equally rewrite the report, so this is not a privilege
-    boundary. The realistic failure this DOES catch is the non-adversarial one: bytes
-    truncated by a full disk or an interrupted write.
+    Two tiers of verification are distinguished rather than one boolean, because
+    ``deep=True`` verification requires a ``derivation_binding`` that no artifact
+    stored before that field existed carries -- which describes every document in a
+    long-lived real corpus, not a corrupted one. ``SELF_CONSISTENT_METADATA`` passed the strict
+    check; ``SIDECAR_DIGEST_ONLY`` only ever had its raw bytes and (if present) its
+    sidecar digest checked, with no binding tying the two together;
+    ``UNAUTHENTICATED_LEGACY_ROOT`` never had even its sidecar digest recorded, so
+    nothing at all authenticates the text it would serve. Only the first two are read
+    by default; the third is read only when ``allow_unauthenticated_legacy_roots=True``.
+    ``INTEGRITY_FAILED`` -- the default check itself failing -- is never read,
+    regardless of that flag: the opt-in exists for artifacts that are merely
+    unauthenticated, not for ones whose bytes are actually damaged.
+
+    What deep verification does NOT prove, stated plainly rather than left implied:
+    ``extracted.json`` is a DERIVED cache, and verifying ``raw.bin`` does not
+    establish that the cache was derived from those bytes. Someone able to rewrite the
+    sidecar in place could still present text that the raw bytes do not contain.
+    Closing that would mean re-extracting every document on every pass, and it buys
+    little here -- anyone who can write into the evidence store can equally rewrite
+    the report, so this is not a privilege boundary. The realistic failure this DOES
+    catch is the non-adversarial one: bytes truncated by a full disk or an
+    interrupted write.
+
+    Args:
+        workspace_root: Root workspace.
+        allow_unauthenticated_legacy_roots: Opt-in to read artifacts classified
+            ``UNAUTHENTICATED_LEGACY_ROOT``. Defaults to False (fail-closed): an
+            unauthenticated root sidecar is refused unless the operator explicitly
+            says so.
     """
-    corpus: list[tuple[StoredArtifact, ExtractedText]] = []
+    corpus: list[tuple[StoredArtifact, ExtractedText, str]] = []
+    outcomes: dict[str, CorpusReadOutcome] = {}
     # An artifact directory with no readable meta.json never becomes a StoredArtifact,
-    # so it cannot be skipped by the loop below -- it would vanish from the corpus AND
-    # from the coverage this function reports. Seed the skipped list with those (F11).
-    artifacts, skipped = list_artifacts_with_unreadable(workspace_root)
+    # so it cannot be classified by the loop below -- it would vanish from the corpus
+    # AND from the coverage this function reports. Seed the outcomes with those (F11).
+    artifacts, unreadable = list_artifacts_with_unreadable(workspace_root)
+    for sha256 in unreadable:
+        outcomes[sha256] = CorpusReadOutcome.UNREADABLE_META
     for artifact in artifacts:
         try:
-            intact = verify_artifact(workspace_root, artifact.sha256)
+            shallow_intact = verify_artifact(workspace_root, artifact.sha256, deep=False)
         except ValueError:
-            intact = False
-        if not intact:
+            shallow_intact = False
+        if not shallow_intact:
             logger.warning("evidence store: %s failed digest verification and was not read", artifact.sha256)
-            skipped.append(artifact.sha256)
+            outcomes[artifact.sha256] = CorpusReadOutcome.INTEGRITY_FAILED
             continue
+
+        # Prefer a digest-authenticated extraction record over the root sidecar, for
+        # EVERY artifact -- deliberately not as a fallback for a root that fails to
+        # authenticate. A fallback keyed on root failure would mean deleting
+        # `extracted_sha256` from a modern root silently switches which text is served,
+        # and nothing on disk distinguishes "legacy root" from "field just deleted", so
+        # the deletion would PROMOTE. Preferring the record unconditionally makes
+        # deletion incapable of changing which path is taken.
+        #
+        # This sits AFTER the shallow check on purpose: an artifact whose raw.bin no
+        # longer hashes to its own name is not evidence, whatever records point at it.
+        # A record must never launder a corrupt artifact.
+        #
+        # ONE scan decides this, and it returns a typed result rather than a count or an
+        # exception. Both of those shapes previously hid a decision: a count could be
+        # WRONG (a corrupt meta.json made a candidate record vanish, turning an ambiguous
+        # store into an apparently unambiguous one and PROMOTING a read), and a single
+        # exception type meant "not exactly one current record" and "the record failed to
+        # authenticate" -- which license opposite decisions -- were distinguishable only
+        # by matching message prose.
+        #
+        # Of everything this scan can establish, exactly ONE (no record was ever stored)
+        # may fall through to the root tiers below. Every other route to "nothing to
+        # prefer here" is a downgrade wearing a different face, and refuses.
+        selection = select_current_extraction(workspace_root, artifact.sha256)
+        if selection.kind is CurrentSelectionKind.SELECTED:
+            selected = selection.selected
+            if selected is None:  # pragma: no cover - CurrentSelection's own invariant
+                raise AssertionError("SELECTED selection carried no extraction")
+            outcomes[artifact.sha256] = CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED
+            corpus.append((artifact, selected.extracted, selected.extraction_id))
+            continue
+        if selection.kind is not CurrentSelectionKind.NO_RECORDS_STORED:
+            logger.warning(
+                "evidence store: %s was NOT read from an extraction record (%s). The root sidecar "
+                "is deliberately NOT served instead -- every route to 'no usable record' except a "
+                "store that never held one is a downgrade, not a licence",
+                artifact.sha256,
+                selection.detail,
+            )
+            outcomes[artifact.sha256] = _RECORD_REFUSAL_OUTCOMES[selection.kind]
+            continue
+
+        try:
+            deep_intact = verify_artifact(workspace_root, artifact.sha256, deep=True)
+        except ValueError:
+            deep_intact = False
+        if deep_intact:
+            outcome = CorpusReadOutcome.SELF_CONSISTENT_METADATA
+        elif artifact.extracted_sha256 is not None:
+            outcome = CorpusReadOutcome.SIDECAR_DIGEST_ONLY
+        else:
+            outcome = CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT
+
+        if outcome == CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT and not allow_unauthenticated_legacy_roots:
+            logger.warning(
+                "evidence store: %s has no derivation binding AND no extracted_sha256, "
+                "so it cannot be authenticated at all -- was NOT read. Re-extract it into "
+                "an authenticated record, or re-run this pass with the explicit opt-in "
+                "to read unauthenticated legacy roots",
+                artifact.sha256,
+            )
+            outcomes[artifact.sha256] = outcome
+            continue
+
         extracted = load_artifact_text(workspace_root, artifact.sha256)
         if extracted is None:
-            skipped.append(artifact.sha256)
+            outcomes[artifact.sha256] = CorpusReadOutcome.MISSING_TEXT
         else:
-            corpus.append((artifact, extracted))
-    return corpus, skipped
+            outcomes[artifact.sha256] = outcome
+            corpus.append((artifact, extracted, ROOT_EXTRACTION_ID))
+    return corpus, outcomes
 
 
 #: Characters per token, used to size a budget reservation from a prompt.
@@ -1668,7 +2002,8 @@ def _corpus_loop(
     log_path: Path,
     action_id: str,
     run_id: str,
-    already_covered: frozenset[str] = frozenset(),
+    already_covered: frozenset[tuple[str, str]] = frozenset(),
+    allow_unauthenticated_legacy_roots: bool = False,
 ) -> None:
     """The corpus-only pass: read what is held, propose, ground, verify.
 
@@ -1700,10 +2035,23 @@ def _corpus_loop(
     here the document is in front of the agent immediately, and a second round would
     re-read identical input at full cost.
     """
-    corpus, skipped = _load_corpus(workspace_root)
+    corpus, outcomes = _load_corpus(
+        workspace_root, allow_unauthenticated_legacy_roots=allow_unauthenticated_legacy_roots
+    )
+    read_shas = {artifact.sha256 for artifact, _, _ in corpus}
+    skipped = [sha256 for sha256 in outcomes if sha256 not in read_shas]
+    # Grouped by REASON, not merely counted. Flattening every unread class back into
+    # one list here would reproduce, one layer up, the exact conflation the typed
+    # outcomes exist to remove -- and this is the only version a human ever sees. The
+    # classes call for opposite responses: an unauthenticated legacy root wants
+    # re-extraction or the explicit opt-in, damaged bytes want the paper re-acquired,
+    # and an unreadable meta.json wants the directory itself looked at.
+    unread_by_reason: dict[str, list[str]] = {}
+    for sha256 in skipped:
+        unread_by_reason.setdefault(outcomes[sha256].value, []).append(sha256)
     if already_covered:
         before = len(corpus)
-        corpus = [(a, e) for a, e in corpus if a.sha256 not in already_covered]
+        corpus = [(a, e, x) for a, e, x in corpus if (a.sha256, x) not in already_covered]
         n_skipped = before - len(corpus)
         if n_skipped:
             state.warnings.append(
@@ -1719,15 +2067,44 @@ def _corpus_loop(
             )
     if skipped:
         state.warnings.append(
-            f"{len(skipped)} held artifact(s) could not be read and were NOT covered by this pass: "
-            + ", ".join(sha[:12] for sha in skipped)
+            f"{len(skipped)} held artifact(s) were NOT covered by this pass -- "
+            + "; ".join(
+                f"{reason}: " + ", ".join(sha[:12] for sha in shas) for reason, shas in sorted(unread_by_reason.items())
+            )
         )
         append_typed_event(
             log_path,
             event="literature.corpus_artifacts_unreadable",
             action_id=action_id,
             run_id=run_id,
-            payload={"sha256": skipped, "n_skipped": len(skipped)},
+            # `sha256` is kept as it was so nothing reading this event breaks, and the
+            # per-reason grouping is ADDED beside it rather than replacing it.
+            payload={"sha256": skipped, "n_skipped": len(skipped), "unread_by_reason": unread_by_reason},
+        )
+    # Which text was served is not a detail: a document read from a record is a
+    # DIFFERENT document from the same raw bytes read through the root sidecar, and it
+    # is quoted under a different extraction id. Saying so here means the operator sees
+    # it while the pass runs, instead of only by reading the stored report afterwards.
+    from_records = sorted(
+        (artifact.sha256, extraction_id) for artifact, _, extraction_id in corpus if extraction_id != ROOT_EXTRACTION_ID
+    )
+    if from_records:
+        state.warnings.append(
+            f"{len(from_records)} document(s) were read from an authenticated extraction record "
+            "rather than the root sidecar -- "
+            + ", ".join(f"{sha[:12]} via {extraction_id[:12]}" for sha, extraction_id in from_records)
+        )
+        append_typed_event(
+            log_path,
+            event="literature.corpus_read_from_extraction_record",
+            action_id=action_id,
+            run_id=run_id,
+            payload={
+                "n_from_records": len(from_records),
+                "read_from_records": [
+                    {"sha256": sha, "extraction_id": extraction_id} for sha, extraction_id in from_records
+                ],
+            },
         )
     if not corpus:
         state.stop_reason = StopReason.NO_NEW_INFORMATION
@@ -1741,12 +2118,12 @@ def _corpus_loop(
         return
 
     agent = build_corpus_agent(model=deps.model, ledger=deps.ledger)
-    for artifact, extracted in corpus:
+    for artifact, extracted, extraction_id in corpus:
         deps.ledger.check_wall_clock()
         # Only the document actually shown is resolvable. The agent is looking at one
         # paper, so a digest naming any other is a mistake worth surfacing, even when
         # that other paper happens to be in the store.
-        by_sha = {artifact.sha256: (artifact, extracted)}
+        by_sha = {artifact.sha256: (artifact, extracted, extraction_id)}
         corpus_prompt = _corpus_prompt(campaign, artifact, extracted)
         result = agent.run(corpus_prompt, estimated_tokens=estimated_tokens_for(corpus_prompt))
         # Recorded once the call has RETURNED, which is the moment the tokens are
@@ -1761,7 +2138,13 @@ def _corpus_loop(
         #   * Before the proposal is processed, so a document that WAS paid for and
         #     then failed downstream (grounding, validation) is not re-bought. That
         #     is the case the original ordering was reaching for, and it is kept.
-        state.covered.append(artifact.sha256)
+        state.covered.append(
+            CoveredDocument(
+                raw_sha256=artifact.sha256,
+                extraction_id=extraction_id,
+                verification_standard=outcomes[artifact.sha256].value,
+            )
+        )
         proposal = CorpusProposal.model_validate(result.output)
         append_typed_event(
             log_path,
@@ -1790,7 +2173,7 @@ def _process_corpus_proposal(
     *,
     config: AgentConfig,
     state: _RunState,
-    by_sha: dict[str, tuple[StoredArtifact, ExtractedText]],
+    by_sha: dict[str, tuple[StoredArtifact, ExtractedText, str]],
     log_path: Path,
     action_id: str,
     run_id: str,
@@ -1823,7 +2206,7 @@ def _process_corpus_proposal(
             )
             continue
 
-        artifact, extracted = resolved
+        artifact, extracted, extraction_id = resolved
         key = (proposed.artifact_sha256, proposed.verbatim_quote.strip()[:200])
         if key in seen:
             continue
@@ -1846,6 +2229,7 @@ def _process_corpus_proposal(
             action_id=action_id,
             run_id=run_id,
             queue_acquisition=False,
+            extraction_id=extraction_id,
         )
 
 
@@ -2047,27 +2431,51 @@ def _run_pass(
         # What earlier passes already mined. `reread_all` is the operator's escape
         # hatch: coverage is recorded per document, so re-reading is otherwise never
         # automatic, and a changed prompt or a newer model is a real reason to want it.
-        reread_all = bool(action.parameters.get("reread_all", False))
-        already_covered: frozenset[str] = frozenset()
+        reread_all = _permission_from(action.parameters, "reread_all", state)
+        # Opt-in to reading a held artifact whose stored text carries no digest
+        # binding it to anything (`CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT`).
+        # Meaningless outside the corpus path -- a search pass has no held corpus to
+        # gate -- so it is read here but only ever threaded through on that branch
+        # below, rather than added to `_research_loop`'s signature where it would
+        # silently do nothing.
+        allow_unauthenticated_legacy_roots = _permission_from(
+            action.parameters, "allow_unauthenticated_legacy_roots", state
+        )
+        already_covered: frozenset[tuple[str, str]] = frozenset()
         if mode == LiteraturePassMode.CORPUS and previous is not None and not reread_all:
-            already_covered = frozenset(sha for record in previous.passes for sha in record.covered_sha256)
+            already_covered = frozenset(
+                (cd.raw_sha256, cd.extraction_id) for record in previous.passes for cd in record.covered
+            )
 
         slot_acquired = False
         try:
             session_budget().acquire_run_slot(config.budget.max_concurrent_runs)
             slot_acquired = True
-            loop = _corpus_loop if mode == LiteraturePassMode.CORPUS else _research_loop
-            loop(
-                workspace_root,
-                campaign,
-                deps,
-                config=config,
-                state=state,
-                log_path=log_path,
-                action_id=action.action_id,
-                run_id=run_id,
-                already_covered=already_covered,
-            )
+            if mode == LiteraturePassMode.CORPUS:
+                _corpus_loop(
+                    workspace_root,
+                    campaign,
+                    deps,
+                    config=config,
+                    state=state,
+                    log_path=log_path,
+                    action_id=action.action_id,
+                    run_id=run_id,
+                    already_covered=already_covered,
+                    allow_unauthenticated_legacy_roots=allow_unauthenticated_legacy_roots,
+                )
+            else:
+                _research_loop(
+                    workspace_root,
+                    campaign,
+                    deps,
+                    config=config,
+                    state=state,
+                    log_path=log_path,
+                    action_id=action.action_id,
+                    run_id=run_id,
+                    already_covered=already_covered,
+                )
         except BudgetExceededError as exc:
             state.stop_reason = STOP_REASON_FOR_DIMENSION[exc.dimension]
             state.warnings.append(f"budget exceeded: {exc}")
@@ -2102,7 +2510,7 @@ def _run_pass(
                 stop_reason=state.stop_reason,
                 usage=deps.ledger.usage(),
                 warnings=state.warnings,
-                covered_sha256=list(state.covered),
+                covered=list(state.covered),
             ),
             state=state,
             report_id=report_id,

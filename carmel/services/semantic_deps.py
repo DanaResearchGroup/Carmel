@@ -1,0 +1,952 @@
+# Copyright 2026 Dana Research Group
+# SPDX-License-Identifier: Apache-2.0
+
+"""Content-addressed identity for the *code* behind a versioned heuristic.
+
+:attr:`~carmel.schemas.datasets.MeasuredValue.repairs` is the persisted output
+of a versioned heuristic in :mod:`carmel.services.numeric`
+(:func:`~carmel.services.numeric.normalize_numeric_span`). Its validator
+re-runs that heuristic and demands an exact match against the stored
+``repairs``. Nothing on a stored ``MeasuredValue`` records WHICH version of
+the heuristic produced it, so editing ``numeric.py`` later would make old,
+already-valid records fail validation indistinguishably from forged ones --
+there is no way to tell "this record disagrees with the current heuristic
+because the heuristic changed" from "this record was never valid at all."
+
+This module builds the identity primitive that closes that gap: a content
+address for a piece of Python source code (a function/class and everything it
+transitively calls, at module scope), plus a small append-only registry
+mapping known content addresses to a stable ``dependency_id``. This identity
+is consumed by :class:`~carmel.schemas.datasets.SemanticDependencyUse` (which
+embeds a ``content_sha256`` and resolves it against this module's registry)
+and, through it, by
+:meth:`~carmel.schemas.datasets.MeasuredValue._validate_repair_chain_agrees_with_raw_text`,
+which is the validator that actually re-runs
+:func:`~carmel.services.numeric.normalize_numeric_span` and rejects a
+``MeasuredValue`` whose ``repair_dependency`` names a registered-but-SUPERSEDED
+sha rather than silently re-validating against whatever the heuristic
+currently does.
+
+Three limitations are load-bearing and must not be relaxed silently:
+
+1. **The transitive closure computed by :func:`compute_dependency_sha` is
+   WITHIN-MODULE ONLY.** Walking ``ast.Name`` references only ever resolves a
+   name against OTHER module-level definitions found in the same source
+   text; a name that is actually an imported symbol resolves to nothing and
+   is silently excluded from the hash. This is only safe to use against
+   :mod:`carmel.services.numeric` today because that module imports nothing
+   from ``carmel.*`` at all (see ``tests/test_semantic_deps.py``'s guard test,
+   which asserts this by parsing the real module's imports). If ``numeric.py``
+   ever gains a ``carmel.*`` import that its repair heuristic depends on, this
+   closure is no longer sufficient to capture the heuristic's full behavior,
+   and that guard test will fail loudly rather than let the sha silently stop
+   covering part of the heuristic.
+2. **``ast.dump`` output is not formally guaranteed stable across Python
+   versions.** A toolchain upgrade could in principle change the exact dump
+   string for an AST whose *meaning* did not change, which would change every
+   sha this module computes even though the underlying heuristic is
+   unchanged -- i.e. the sha is toolchain-relative in principle. This is
+   intentionally CONTAINED, not fixed: :mod:`tests.test_semantic_deps` pins
+   the seeded dependency's current sha as a hardcoded string literal, so a
+   toolchain change that alters ``ast.dump``'s rendering surfaces as a loud,
+   specific test failure (fix: add a new registry entry for the new sha) --
+   never as silent, undetected drift.
+3. **The closure never crosses a module boundary, by design -- not merely by
+   omission.** :meth:`~carmel.schemas.datasets.MeasuredValue._validate_repair_chain_agrees_with_raw_text`
+   (the consumer described above) also depends on
+   :func:`~carmel.services.dataset_store.canonical_decimal`, which lives in a
+   DIFFERENT module (``carmel.services.dataset_store``, not
+   ``carmel.services.numeric``). This module deliberately does NOT attempt a
+   cross-module transitive closure to cover that dependency too -- doing so
+   would require walking imports across arbitrary module boundaries, which
+   this module's within-module-only design (limitation 1, above) explicitly
+   does not do. ``canonical_decimal``'s own correctness is simply outside the
+   scope of what a ``content_sha256`` computed by this module can attest to;
+   this is a named, accepted limitation, not a bug to fix here.
+
+This module also does not model FULL numeric parsing -- see
+:data:`DEPENDENCIES_BY_SHA`'s seeded entries and their docstrings for exactly
+what each seeded dependency does and does not cover. Glyph-health ASSESSMENT is
+a separate registered dependency (:data:`GLYPH_HEALTH_DEPENDENCY_ID`); the
+repair entry still does not cover it, and the two are deliberately not merged.
+
+4. **A fourth limitation applies specifically to
+   :data:`EXTRACT_TEXT_DEPENDENCY_ID` (the identity for
+   :func:`~carmel.agents.tools.extract.extract_text`): the third-party
+   ``pypdf`` package is imported LAZILY inside
+   :func:`~carmel.agents.tools.extract._extract_pdf`'s function body, not at
+   module scope.** :func:`compute_dependency_sha`'s within-module AST closure
+   (limitation 1, above) only ever walks ``ast.Name`` references against
+   OTHER module-level definitions found in the same source text -- it never
+   executes anything, so it cannot observe a name bound by a runtime-local
+   ``import`` statement, let alone attribute the behavior of the imported
+   package's own code to a hash. This means ``EXTRACT_TEXT_DEPENDENCY_ID``'s
+   ``content_sha256`` captures Carmel's own extraction code faithfully but
+   says NOTHING about which version of ``pypdf`` produced a given extraction
+   -- two extractions with the identical ``content_sha256`` can still differ
+   if the installed ``pypdf`` version differs. :class:`ExtractionIdentity`
+   and :func:`extraction_identity` exist to make that pypdf version a
+   required, separate component of a complete extraction identity, exactly
+   mirroring the pattern already used for exactly this purpose by
+   :func:`carmel.services.evidence._extractor_identity` (best-effort,
+   never-fatal version discovery via ``pypdf.__version__``).
+"""
+
+from __future__ import annotations
+
+import ast
+import hashlib
+import re
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from enum import StrEnum
+from types import MappingProxyType
+
+from carmel.services.dataset_store import canonical_json_bytes
+
+__all__ = [
+    "CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID",
+    "GLYPH_HEALTH_DEPENDENCY_ID",
+    "EXTRACT_TEXT_DEPENDENCY_ID",
+    "DEPENDENCIES_BY_SHA",
+    "CURRENT_SHA_BY_DEPENDENCY_ID",
+    "ExtractionIdentity",
+    "InputPolicy",
+    "SemanticDependencyDefinition",
+    "SemanticDependencyInvariantError",
+    "UnknownSemanticDependencyError",
+    "compute_dependency_sha",
+    "current_sha_for",
+    "dependency_for_sha",
+    "extraction_identity",
+]
+
+GLYPH_HEALTH_DEPENDENCY_ID = "carmel.numeric.glyph_health"
+"""The stable ``dependency_id`` for the glyph-health ASSESSMENT dependency.
+
+Deliberately a SEPARATE identity from
+:data:`CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID`, never an extension of it. The
+two heuristics have genuinely different closures -- editing
+``assess_glyph_health`` must not re-address stored repair claims, and editing
+the repair chain must not re-address stored glyph assessments. That split is
+empirically real, not aspirational: the two entry-point sets share only
+``GlyphHealth`` and ``_ASCII6_UNCERTAINTY_RE``, and each computes a different
+content sha.
+
+Unlike the repair dependency, this one's input is NOT a sibling field of the
+record that cites it -- it is a whole extracted document text living in the
+evidence store -- so it carries
+:attr:`InputPolicy.EXTERNAL_DIGEST_REQUIRED` and is the first real user of
+that branch.
+"""
+
+CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID = "carmel.numeric.context_free_span_repair"
+"""The stable ``dependency_id`` for the span-repair dependency in this registry.
+
+Exported so callers outside this module (schema-layer validators, in
+particular) that need to pin ``MeasuredValue.repair_dependency`` to exactly
+this dependency never re-type the string literal by hand -- see
+:func:`_seed_registry`, which uses this same constant rather than an inline
+copy.
+"""
+
+EXTRACT_TEXT_DEPENDENCY_ID = "carmel.extraction.extract_text"
+"""The stable ``dependency_id`` for :func:`~carmel.agents.tools.extract.extract_text`.
+
+Its ``content_sha256`` is the within-module transitive closure of
+``extract_text`` in ``carmel/agents/tools/extract.py`` -- Carmel's own PDF/
+HTML/XML text-extraction code, page classification, and text normalization,
+but NOT the third-party ``pypdf`` package's own behavior (see the module
+docstring's fourth limitation, and :class:`ExtractionIdentity`).
+
+Like :data:`GLYPH_HEALTH_DEPENDENCY_ID`, this dependency's input is not a
+sibling field of the record that cites it -- it is a whole document's raw
+bytes -- so it carries :attr:`InputPolicy.EXTERNAL_DIGEST_REQUIRED`.
+
+This increment ONLY registers the identity in this module; wiring it into
+:mod:`carmel.services.evidence` or any schema/producer/replay code is a
+separate, later increment (out of scope here by design).
+"""
+
+
+class SemanticDependencyError(ValueError):
+    """Base class for every error this module raises."""
+
+
+class SemanticDependencyInvariantError(SemanticDependencyError):
+    """Raised when a :class:`SemanticDependencyDefinition` violates its own invariants."""
+
+
+class UnknownSemanticDependencyError(SemanticDependencyError):
+    """Raised when a sha256 or a dependency_id names nothing in this module's registry.
+
+    Covers both :func:`dependency_for_sha` (unknown/malformed ``content_sha256``)
+    and :func:`current_sha_for` (unknown ``dependency_id``) -- both are "this
+    key is absent from the registry" in the same sense, so they share one
+    error type rather than two indistinguishable-in-practice ones.
+    """
+
+
+def _bound_names_in_target(target: ast.expr) -> list[str]:
+    """Return every plain name bound by an assignment/``for``/``with`` target.
+
+    Python's assignment-target grammar is closed: a target is one of
+    ``Name | Tuple | List | Starred | Attribute | Subscript``. ``Attribute``
+    (``obj.attr = ...``) and ``Subscript`` (``obj[k] = ...``) do not bind any
+    NEW referenceable name -- they mutate something already bound elsewhere --
+    so they contribute nothing here and are safely ignored. ``Tuple``/``List``/
+    ``Starred`` are recursed into. This covers every real target shape with no
+    residual "can't resolve this" case, so no shape here needs to raise.
+    """
+    names: list[str] = []
+    if isinstance(target, ast.Name):
+        names.append(target.id)
+    elif isinstance(target, (ast.Tuple, ast.List)):
+        for element in target.elts:
+            names.extend(_bound_names_in_target(element))
+    elif isinstance(target, ast.Starred):
+        names.extend(_bound_names_in_target(target.value))
+    return names
+
+
+def _named_expr_targets(node: ast.AST) -> list[str]:
+    """Return every name bound by a walrus (``:=``) expression within ``node``.
+
+    A ``NamedExpr`` binds to the nearest enclosing function/module scope (PEP
+    572), not to a comprehension's own scope, so a module-level walrus
+    anywhere inside a top-level statement (including inside a comprehension in
+    that statement) is a module-level binding. ``ast.walk`` would also descend
+    into any nested ``FunctionDef``/``AsyncFunctionDef``/``ClassDef``/``Lambda``
+    bodies, whose own walrus bindings belong to THAT scope, not the module --
+    so this walks manually and stops at those boundaries instead of using
+    ``ast.walk`` directly.
+    """
+    names: list[str] = []
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        for child in ast.iter_child_nodes(current):
+            if isinstance(child, ast.NamedExpr):
+                if isinstance(child.target, ast.Name):
+                    names.append(child.target.id)
+                stack.append(child.value)
+            elif isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                continue
+            else:
+                stack.append(child)
+    return names
+
+
+def _collect_bindings(node: ast.stmt, into: dict[str, ast.stmt], owner: ast.stmt) -> None:
+    """Recursively collect every module-level name bound by ``node`` into ``into``.
+
+    ``owner`` is the top-level module statement that ``node`` lives inside (or
+    ``node`` itself, at the top level) -- every name found anywhere inside a
+    top-level ``if``/``try``/``for``/``with`` block is keyed to that whole
+    top-level statement, since that is the coarsest unit this module's closure
+    algorithm can meaningfully hash or include/exclude as one piece.
+
+    ``ast.Match`` (structural pattern matching) is deliberately NOT handled: a
+    ``match`` statement's capture-pattern binding shapes (``case Point(x=x,
+    y=y):``, ``case [a, *rest]:``, ``case {"k": v}:``, ``case _ as name:``, ...)
+    are too open-ended to enumerate with confidence here. Rather than silently
+    ignore a shape that might bind a module-level name (the exact
+    silent-corruption failure mode this function exists to close), a
+    module-level ``match`` statement makes this function raise loudly instead
+    -- see the module docstring's within-module-only limitation for the same
+    "fail loudly rather than silently drop coverage" policy applied elsewhere.
+    """
+    if isinstance(node, ast.Match):
+        raise SemanticDependencyInvariantError(
+            "module-level 'match' statements are not supported by "
+            "_module_level_definitions: their capture-pattern binding shapes are too "
+            "open-ended to resolve confidently, so this raises loudly rather than risk "
+            "silently missing a module-level binding"
+        )
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        into[node.name] = owner
+        return
+    if isinstance(node, ast.Assign):
+        for target in node.targets:
+            for name in _bound_names_in_target(target):
+                into[name] = owner
+    elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        into[node.target.id] = owner
+    elif isinstance(node, (ast.For, ast.AsyncFor)):
+        for name in _bound_names_in_target(node.target):
+            into[name] = owner
+        for child in (*node.body, *node.orelse):
+            _collect_bindings(child, into, owner)
+    elif isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                for name in _bound_names_in_target(item.optional_vars):
+                    into[name] = owner
+        for child in node.body:
+            _collect_bindings(child, into, owner)
+    elif isinstance(node, ast.If):
+        for child in (*node.body, *node.orelse):
+            _collect_bindings(child, into, owner)
+    elif isinstance(node, ast.Try):
+        for child in (*node.body, *node.orelse, *node.finalbody):
+            _collect_bindings(child, into, owner)
+        for handler in node.handlers:
+            for child in handler.body:
+                _collect_bindings(child, into, owner)
+    for name in _named_expr_targets(node):
+        into[name] = owner
+
+
+def _module_level_definitions(tree: ast.Module) -> dict[str, ast.stmt]:
+    """Collect every module-level definition in ``tree``, keyed by name.
+
+    ``FunctionDef``/``AsyncFunctionDef``/``ClassDef`` are keyed on their own
+    name. ``Assign``/``AnnAssign``/``For``/``With`` targets are keyed on every
+    plain ``ast.Name`` they bind, including through tuple/list/starred
+    unpacking (see :func:`_bound_names_in_target`). A top-level ``if``/``try``/
+    ``for``/``with`` block's entire nested body is walked recursively (see
+    :func:`_collect_bindings`) so a name bound inside one of those blocks is
+    not invisible to the closure; every name found anywhere inside such a
+    block is keyed to that whole top-level statement, since that is the
+    coarsest unit available to include/exclude as one piece. A top-level
+    walrus (``:=``) binds a module-level name the same way (see
+    :func:`_named_expr_targets`). A module-level ``match`` statement is
+    refused outright rather than silently under-covered -- see
+    :func:`_collect_bindings`.
+
+    ``Attribute``/``Subscript`` assignment targets bind no new name and are
+    correctly ignored (see :func:`_bound_names_in_target`). A bare expression
+    statement, and any name that is actually an imported symbol, is not a
+    resolvable module-level name and is never added here -- a reference to
+    such a thing from within a definition's body is treated exactly like any
+    other unresolved reference: silently excluded from the closure (see the
+    module docstring's within-module-only limitation). Import BINDINGS
+    themselves (as opposed to references to imported names) are hashed
+    separately by :func:`_normalized_imports`, not folded into this closure.
+    """
+    definitions: dict[str, ast.stmt] = {}
+    for node in tree.body:
+        _collect_bindings(node, definitions, node)
+    return definitions
+
+
+def _normalized_imports(tree: ast.Module) -> list[tuple[str, str, str | None]]:
+    """Return a deterministic, order-independent list of every module-level import binding.
+
+    Each entry is ``(module, name, alias)`` where ``module`` is ``""`` for a
+    plain ``import x`` and the dotted source module for ``from x import y``;
+    ``name`` is the imported symbol (or sub-module) name; ``alias`` is the
+    ``as`` name if given, else ``None``. Sorted so the result -- and therefore
+    the hash built from it -- does not depend on import statement order.
+
+    This exists to close a silent-corruption hole: swapping ``import re`` for
+    ``import regex as re`` rebinds the name ``re`` to a completely different
+    module without changing a single character any existing definition-based
+    closure would see (since a *reference* to ``re`` inside a definition's
+    body still resolves to nothing under the within-module-only closure,
+    exactly as before the swap). Hashing the import bindings themselves is the
+    only way this module's sha can notice such a swap.
+    """
+    imports: list[tuple[str, str, str | None]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                imports.append(("", alias.name, alias.asname))
+        elif isinstance(node, ast.ImportFrom):
+            module = "." * node.level + (node.module or "")
+            for alias in node.names:
+                imports.append((module, alias.name, alias.asname))
+    return sorted(imports)
+
+
+def _referenced_names(node: ast.AST) -> set[str]:
+    """Return every name referenced anywhere inside ``node`` (``ast.Name.id`` values)."""
+    return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+
+def _transitive_closure(entry_points: Sequence[str], definitions: Mapping[str, ast.stmt]) -> dict[str, ast.stmt]:
+    """Walk the transitive closure of module-level names reachable from ``entry_points``.
+
+    Starting from ``entry_points``, repeatedly walks each already-included
+    definition's body for ``ast.Name`` references, adding any referenced name
+    that resolves to another module-level definition, until a fixpoint (no
+    new name is added). A referenced name that does NOT resolve to a
+    module-level definition (an import, a builtin, a local variable inside a
+    nested function) is silently skipped -- it is not part of this module's
+    surface to hash.
+    """
+    closure: dict[str, ast.stmt] = {}
+    frontier = list(entry_points)
+    while frontier:
+        name = frontier.pop()
+        if name in closure:
+            continue
+        definition = definitions.get(name)
+        if definition is None:
+            continue
+        closure[name] = definition
+        for referenced in _referenced_names(definition):
+            if referenced in definitions and referenced not in closure:
+                frontier.append(referenced)
+    return closure
+
+
+def _strip_docstrings(tree: ast.Module) -> ast.Module:
+    """Strip a leading docstring expression from ``tree`` and every nested
+    function/class/module body inside it, recursively.
+
+    A "docstring" here is exactly: a body's first statement being an
+    ``ast.Expr`` whose value is an ``ast.Constant`` holding a ``str``. Applies
+    at every nesting level ``ast.walk`` visits -- module, class, function, and
+    any function/class nested inside another -- not only at the top level of
+    ``tree`` itself.
+    """
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            body = node.body
+            if (
+                body
+                and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)
+            ):
+                remainder = body[1:]
+                node.body = remainder if remainder else [ast.Pass()]
+    return tree
+
+
+def _normalized_dump(definition: ast.stmt) -> str:
+    """Render ``definition`` to a formatting-insensitive, docstring-insensitive string.
+
+    Two steps, in order: ``ast.unparse`` (which already drops comments and
+    original whitespace/formatting by construction, since it re-renders from
+    the AST rather than echoing source text), then re-parse the unparsed
+    source and strip docstrings recursively (see :func:`_strip_docstrings`)
+    before rendering the final ``ast.dump`` with default arguments (i.e.
+    ``annotate_fields=True, include_attributes=False`` -- the defaults omit
+    ``lineno``/``col_offset``/etc, so position information never affects the
+    dump either).
+    """
+    unparsed_source = ast.unparse(definition)
+    reparsed = ast.parse(unparsed_source)
+    stripped = _strip_docstrings(reparsed)
+    # `stripped` is a Module wrapping exactly one statement (the definition);
+    # dump that statement itself, not the wrapping Module, so an unrelated
+    # change to how Module nodes are represented can never leak in.
+    (only_statement,) = stripped.body
+    return ast.dump(only_statement)
+
+
+def compute_dependency_sha(module_source: str, entry_points: Sequence[str]) -> str:
+    """Compute a content address for the transitive closure of ``entry_points`` in ``module_source``.
+
+    Algorithm:
+
+    1. Parse ``module_source`` and collect its module-level definitions (see
+       :func:`_module_level_definitions`).
+    2. Walk the transitive closure of module-level names reachable from
+       ``entry_points`` (see :func:`_transitive_closure`) -- WITHIN-MODULE
+       ONLY; see the module docstring's first limitation.
+    3. Normalize each definition in the closure via ``ast.unparse`` followed
+       by recursive docstring stripping (see :func:`_normalized_dump`), then
+       render it with ``ast.dump`` using default arguments.
+    4. Separately, collect every module-level import binding (see
+       :func:`_normalized_imports`) -- this is hashed alongside the closure,
+       not folded into it, so that rebinding an imported name (e.g.
+       ``import re`` becoming ``import regex as re``) changes the sha even
+       though no definition's own source text changed.
+    5. Build a ``{"closure": {name: dump_string, ...}, "imports": [...]}``
+       payload, sorted by name/import order, and hash it via this project's
+       existing canonicalization helper,
+       :func:`~carmel.services.dataset_store.canonical_json_bytes` (never a
+       hand-rolled ``"|"``-joined string -- see
+       :func:`carmel.services.evidence._derivation_binding` for why that
+       shape is an anti-pattern this project already has one instance of and
+       should not gain a second).
+
+    Args:
+        module_source: The full source text of a Python module.
+        entry_points: Module-level names to start the transitive closure
+            from. Every entry point must itself resolve to a module-level
+            definition in ``module_source``.
+
+    Returns:
+        A 64-character lowercase hex SHA-256 digest.
+
+    Raises:
+        SemanticDependencyInvariantError: If any ``entry_points`` name does
+            not resolve to a module-level definition in ``module_source``.
+    """
+    tree = ast.parse(module_source)
+    definitions = _module_level_definitions(tree)
+    for entry_point in entry_points:
+        if entry_point not in definitions:
+            raise SemanticDependencyInvariantError(
+                f"entry point {entry_point!r} is not a module-level definition in the given module source "
+                f"(known module-level names: {sorted(definitions)!r})"
+            )
+    closure = _transitive_closure(entry_points, definitions)
+    dumps_by_name = {name: _normalized_dump(closure[name]) for name in sorted(closure)}
+    payload = {
+        "closure": dumps_by_name,
+        # canonical_json_bytes accepts `list`, not `tuple` -- each (module, name,
+        # alias) entry is converted to a list here so the payload is JSON-safe.
+        "imports": [list(entry) for entry in _normalized_imports(tree)],
+    }
+    return hashlib.sha256(canonical_json_bytes(payload)).hexdigest()
+
+
+class InputPolicy(StrEnum):
+    """How much of a semantic dependency's input a re-validator must supply itself.
+
+    - ``SIBLING_FIELD``: the heuristic's full input is already present as a
+      sibling field on the same record being validated (e.g. ``raw_text`` on
+      a ``MeasuredValue``) -- no fabricated or externally supplied context is
+      needed to re-run it.
+    - ``EXTERNAL_DIGEST_REQUIRED``: re-running the heuristic requires context
+      that is not itself part of the record and must be looked up and
+      digest-bound separately (reserved for a future dependency; nothing
+      seeded in this registry uses it yet).
+    - ``NOT_APPLICABLE``: the dependency is not the kind of thing that is
+      "re-run" against record input at all (reserved; nothing seeded in this
+      registry uses it yet).
+    """
+
+    SIBLING_FIELD = "sibling_field"
+    EXTERNAL_DIGEST_REQUIRED = "external_digest_required"
+    NOT_APPLICABLE = "not_applicable"
+
+
+_DEPENDENCY_ID_RE = re.compile(r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$")
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticDependencyDefinition:
+    """One registered, content-addressed version of a versioned code dependency.
+
+    Modeled on :class:`~carmel.services.units.ConversionTable`: a frozen
+    stdlib dataclass living in the services layer, not a pydantic model --
+    this is registry data consumed by schema-layer validators, not itself
+    part of a stored dataset's schema.
+
+    Attributes:
+        dependency_id: A stable slug naming WHAT this dependency is (e.g.
+            ``"carmel.numeric.context_free_span_repair"``), shared by every
+            historical entry that has ever implemented it. Dotted lowercase
+            segments, each starting with a letter (see :data:`_DEPENDENCY_ID_RE`).
+        content_sha256: The :func:`compute_dependency_sha` digest of the
+            EXACT code that implements this dependency as of this entry.
+            Never mutated once shipped -- see :data:`DEPENDENCIES_BY_SHA`'s
+            append-only contract.
+        input_policy: Which :class:`InputPolicy` a re-validator must follow
+            to re-run this dependency correctly.
+        is_current: Whether THIS entry is the current (most recently shipped,
+            not-yet-superseded) version for its ``dependency_id``. EXPLICIT,
+            never inferred from tuple/iteration order -- see
+            :func:`_build_registry`, which enforces that exactly one entry per
+            ``dependency_id`` across the whole registry sets this ``True``.
+    """
+
+    dependency_id: str
+    content_sha256: str
+    input_policy: InputPolicy
+    is_current: bool
+
+    def __post_init__(self) -> None:
+        if not _SHA256_HEX_RE.fullmatch(self.content_sha256):
+            raise SemanticDependencyInvariantError(
+                f"content_sha256 {self.content_sha256!r} must be exactly 64 lowercase hex characters "
+                "(a SHA-256 hex digest)"
+            )
+        if not self.dependency_id or not _DEPENDENCY_ID_RE.fullmatch(self.dependency_id):
+            raise SemanticDependencyInvariantError(
+                f"dependency_id {self.dependency_id!r} must be a non-empty, dotted, lowercase slug "
+                "(e.g. 'carmel.numeric.context_free_span_repair')"
+            )
+        if not isinstance(self.input_policy, InputPolicy):
+            raise SemanticDependencyInvariantError(
+                f"input_policy {self.input_policy!r} must be an InputPolicy member; a stdlib "
+                "dataclass does not enforce field types at runtime, so this is checked explicitly "
+                "here rather than trusted from a type annotation alone"
+            )
+
+
+def _numeric_module_source() -> str:
+    import inspect
+
+    from carmel.services import numeric
+
+    source = inspect.getsource(numeric)
+    return source
+
+
+def _extract_module_source() -> str:
+    import inspect
+
+    from carmel.agents.tools import extract
+
+    source = inspect.getsource(extract)
+    return source
+
+
+# The within-module-only closure limitation documented in this module's docstring is
+# only sound as long as the module being hashed imports nothing from carmel.* itself.
+#
+# This is a DEVELOPMENT-TIME invariant, so it is enforced from the test suite
+# (tests/test_semantic_deps.py walks the target module's AST independently) and
+# deliberately NOT at import time. Running it on import would make merely importing this
+# module read a target module's source off disk, which raises OSError under frozen/
+# zipimport deployments where inspect.getsource cannot reach a source file -- turning a
+# packaging change into an unexplained import crash in `carmel serve`. A check that can
+# only fire in a checkout, where the test suite already runs, belongs in the test suite.
+#
+# Generalized (module_source, module_name) rather than hardcoded to
+# carmel.services.numeric: this is now shared by that module's guard test and by
+# carmel.agents.tools.extract's guard test (see tests/test_semantic_deps.py), and would
+# otherwise have to be duplicated verbatim for every new within-module-only closure this
+# registry gains.
+def _assert_no_carmel_imports(module_source: str, module_name: str) -> None:
+    tree = ast.parse(module_source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "carmel" or alias.name.startswith("carmel."):
+                    raise SemanticDependencyInvariantError(
+                        f"{module_name} now imports from carmel.* "
+                        f"({alias.name!r}); compute_dependency_sha's transitive closure is "
+                        "within-module only and can no longer be assumed to capture this "
+                        "module's full behavior -- see the semantic_deps module docstring"
+                    )
+        elif (
+            isinstance(node, ast.ImportFrom)
+            and node.module is not None
+            and (node.module == "carmel" or node.module.startswith("carmel."))
+        ):
+            raise SemanticDependencyInvariantError(
+                f"{module_name} now imports from carmel.* "
+                f"({node.module!r}); compute_dependency_sha's transitive closure is "
+                "within-module only and can no longer be assumed to capture this "
+                "module's full behavior -- see the semantic_deps module docstring"
+            )
+
+
+# HARDCODED, not derived from live source or any other computation at import
+# time. This is the crux of the append-only doctrine: DEPENDENCIES_BY_SHA's seeded entry
+# must be a PINNED HISTORICAL FACT ("this sha validated stored data as of this registry
+# entry"), independent of whatever carmel/services/numeric.py currently contains. Deriving
+# it by hashing the live numeric.py source at import time would silently
+# move this "pinned" sha every time numeric.py's repair heuristic changed, making the
+# append-only contract structurally unimplementable (there would never be an old, fixed
+# entry to add a new one alongside) and would additionally break under frozen/zipimport
+# deployments where `inspect.getsource` cannot read the module's source file at all.
+#
+# This literal was independently verified once via:
+#   compute_dependency_sha(
+#       inspect.getsource(carmel.services.numeric),
+#       ["normalize_numeric_span", "REPAIR_NAMES"],
+#   )
+# tests/test_semantic_deps.py::test_seeded_dependency_sha_matches_a_hardcoded_pin
+# re-verifies that equality on every test run. If that test ever fails, it means
+# numeric.py's repair heuristic (or this toolchain's ast.dump rendering) changed -- the
+# fix is to ADD A NEW registry entry at a new sha, never to edit this literal or the
+# registry row that uses it.
+_CONTEXT_FREE_SPAN_REPAIR_SHA256 = "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
+
+# HARDCODED for exactly the same reasons as the literal above; the whole comment
+# there applies here verbatim. Independently verified once via:
+#   compute_dependency_sha(
+#       inspect.getsource(carmel.services.numeric), ["assess_glyph_health"]
+#   )
+# Adding "GlyphHealth" as a second entry point does NOT change this value -- the
+# class is already pulled into the closure transitively by assess_glyph_health's
+# return statement -- so the single entry point is not an under-specification.
+#
+# NOTE this sha and _CONTEXT_FREE_SPAN_REPAIR_SHA256 are NOT independently
+# versioned: compute_dependency_sha folds the WHOLE module's import list into
+# every payload, so any import edit in numeric.py moves BOTH shas at once, even
+# one touching neither closure. That over-firing is deliberate and must not be
+# "fixed" by scoping imports to the closure: over-firing costs a spurious
+# re-address (loud, cheap), while under-hashing costs a behaviour change with no
+# identity change (silent corruption -- the exact failure this module exists to
+# prevent).
+_GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a"
+
+# HARDCODED for exactly the same reasons as the two literals above; the whole comment on
+# _CONTEXT_FREE_SPAN_REPAIR_SHA256 applies here verbatim. Independently verified once via:
+#   compute_dependency_sha(
+#       inspect.getsource(carmel.agents.tools.extract), ["extract_text"]
+#   )
+# This closure captures Carmel's own extraction/normalization code (PDF page
+# classification, HTML/XML extraction, whitespace/hyphen/ligature repair, abstract- and
+# references-region detection) but NOT the third-party pypdf package's own behavior --
+# see the module docstring's fourth limitation and ExtractionIdentity, below. If this
+# test ever fails, it means extract.py's extraction surface (or this toolchain's
+# ast.dump rendering) changed -- the fix is to ADD A NEW registry entry at a new sha,
+# never to edit this literal or the registry row that uses it.
+_EXTRACT_TEXT_SHA256 = "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168"
+
+
+def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
+    """Return the append-only registry's initial contents.
+
+    NAME PRECISION: "context_free_span_repair" -- not "numeric_parsing" and not
+    "glyph_health_admission". The eventual re-validator that will consume this
+    registry (not built yet) re-runs normalize_numeric_span() with FABRICATED
+    context: SourceContext.OPERATOR_RAW and an all-False GlyphHealth (see
+    carmel.schemas.datasets._HEALTHY_GLYPH_HEALTH and
+    MeasuredValue._validate_repair_chain_agrees_with_raw_text). That means this
+    dependency's sha pins only the CONTEXT-FREE repair chain a bare raw_text
+    string can drive on its own -- never the glyph-health-aware branches of
+    normalize_numeric_span that only trigger for a real document's assessed
+    GlyphHealth, and never anything about full numeric parsing beyond this one
+    heuristic. Do not rename or redocument this entry to imply broader coverage.
+
+    The glyph-health entry is the ASSESSMENT half that the repair entry above
+    explicitly excludes. Its input is a whole extracted document text held in the
+    evidence store rather than a sibling field of the citing record, hence
+    EXTERNAL_DIGEST_REQUIRED: without a recorded digest of the exact text that
+    was assessed, a disagreement between a stored assessment and a fresh one is
+    uninterpretable (same input under a changed heuristic, or a different input
+    entirely?). Recording the digest is what makes that distinguishable later.
+
+    HONEST SCOPE: validation of a stored assessment can check registry identity,
+    digest shape and the node's extraction binding. It CANNOT re-run
+    assess_glyph_health, because the input is out-of-payload. A stored
+    assessment is therefore UNVERIFIED-BY-CONSTRUCTION until the replayer
+    milestone lands. Do not describe it as verified anywhere.
+    """
+    return (
+        SemanticDependencyDefinition(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=_CONTEXT_FREE_SPAN_REPAIR_SHA256,
+            input_policy=InputPolicy.SIBLING_FIELD,
+            is_current=True,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=GLYPH_HEALTH_DEPENDENCY_ID,
+            content_sha256=_GLYPH_HEALTH_SHA256,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=True,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=EXTRACT_TEXT_DEPENDENCY_ID,
+            content_sha256=_EXTRACT_TEXT_SHA256,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=True,
+        ),
+    )
+
+
+def _build_registry(
+    entries: tuple[SemanticDependencyDefinition, ...],
+) -> tuple[Mapping[str, SemanticDependencyDefinition], Mapping[str, str]]:
+    """Build the two registry mappings, enforcing invariants that are otherwise
+    only INFERRED from tuple contents (never checked).
+
+    Enforces, at import time, fail-loudly (not silently-collapse-into-a-dict):
+
+    - No two entries may share a ``content_sha256`` -- a dict/MappingProxyType
+      built directly from ``entries`` would silently let a later duplicate
+      shadow an earlier one, which is exactly the kind of silent collapse this
+      function exists to refuse.
+    - Exactly one entry per ``dependency_id`` may set ``is_current=True`` --
+      never zero (an orphaned dependency_id with no current version) and never
+      more than one (an ambiguous "current").
+
+    Args:
+        entries: The full seeded registry, in any order.
+
+    Returns:
+        A ``(DEPENDENCIES_BY_SHA, CURRENT_SHA_BY_DEPENDENCY_ID)`` pair, each
+        wrapped in a read-only :class:`~types.MappingProxyType`.
+
+    Raises:
+        SemanticDependencyInvariantError: If any of the invariants above is
+            violated by ``entries``.
+    """
+    by_sha: dict[str, SemanticDependencyDefinition] = {}
+    for entry in entries:
+        if entry.content_sha256 in by_sha:
+            raise SemanticDependencyInvariantError(
+                f"content_sha256={entry.content_sha256!r} is registered more than once "
+                f"(dependency_id={entry.dependency_id!r} collides with "
+                f"{by_sha[entry.content_sha256].dependency_id!r}); each registry entry must "
+                "have a unique content address, never silently collapsed into one"
+            )
+        by_sha[entry.content_sha256] = entry
+
+    current_by_id: dict[str, str] = {}
+    for entry in entries:
+        if not entry.is_current:
+            continue
+        if entry.dependency_id in current_by_id:
+            raise SemanticDependencyInvariantError(
+                f"dependency_id={entry.dependency_id!r} has more than one entry with "
+                "is_current=True; exactly one entry per dependency_id must be current, "
+                "and which one is current must never be ambiguous"
+            )
+        current_by_id[entry.dependency_id] = entry.content_sha256
+
+    all_dependency_ids = {entry.dependency_id for entry in entries}
+    missing_current = all_dependency_ids - current_by_id.keys()
+    if missing_current:
+        raise SemanticDependencyInvariantError(
+            f"dependency_id(s) {sorted(missing_current)!r} have no entry with "
+            "is_current=True; every dependency_id in the registry must have exactly one "
+            "current version, never zero"
+        )
+
+    return MappingProxyType(by_sha), MappingProxyType(current_by_id)
+
+
+_SEEDED_DEPENDENCIES: tuple[SemanticDependencyDefinition, ...] = _seed_registry()
+
+DEPENDENCIES_BY_SHA: Mapping[str, SemanticDependencyDefinition]
+CURRENT_SHA_BY_DEPENDENCY_ID: Mapping[str, str]
+DEPENDENCIES_BY_SHA, CURRENT_SHA_BY_DEPENDENCY_ID = _build_registry(_SEEDED_DEPENDENCIES)
+"""Every semantic dependency version this module knows about, keyed by content address
+(:data:`DEPENDENCIES_BY_SHA`), and the CURRENT ``content_sha256`` for each known
+``dependency_id`` (:data:`CURRENT_SHA_BY_DEPENDENCY_ID`).
+
+APPEND-ONLY, exactly like :data:`~carmel.services.units.TABLES_BY_SHA`: a new
+version of a dependency (the heuristic's code changed) is added as a NEW
+entry alongside the old one, never by mutating or removing an existing
+entry's ``content_sha256``. Multiple entries may share the same
+``dependency_id`` at once (one per historical code version); which one is
+"current" is the separate, EXPLICIT ``is_current`` field on each entry (see
+:class:`SemanticDependencyDefinition`) -- never inferred from iteration or
+tuple order. :func:`_build_registry` enforces, at import time, that exactly
+one entry per ``dependency_id`` sets ``is_current=True`` and that no two
+entries share a ``content_sha256``.
+"""
+
+
+def dependency_for_sha(sha256: str) -> SemanticDependencyDefinition:
+    """Return the :class:`SemanticDependencyDefinition` whose content address is ``sha256``.
+
+    Args:
+        sha256: A dependency's content address (see
+            :attr:`SemanticDependencyDefinition.content_sha256`).
+
+    Returns:
+        The matching entry.
+
+    Raises:
+        UnknownSemanticDependencyError: If ``sha256`` does not name any
+            dependency this module's registry knows -- including if
+            ``sha256`` is not even well-formed (this function does not
+            special-case malformed input differently from genuinely unknown
+            input; both are simply absent from the registry).
+    """
+    try:
+        return DEPENDENCIES_BY_SHA[sha256]
+    except KeyError:
+        raise UnknownSemanticDependencyError(
+            f"no semantic dependency known for content_sha256 {sha256!r}; known: {sorted(DEPENDENCIES_BY_SHA)!r}"
+        ) from None
+
+
+def current_sha_for(dependency_id: str) -> str:
+    """Return the CURRENT ``content_sha256`` registered for ``dependency_id``.
+
+    Args:
+        dependency_id: A dependency's stable slug (see
+            :attr:`SemanticDependencyDefinition.dependency_id`).
+
+    Returns:
+        The current entry's content address.
+
+    Raises:
+        UnknownSemanticDependencyError: If ``dependency_id`` names no
+            dependency this module's registry knows.
+    """
+    try:
+        return CURRENT_SHA_BY_DEPENDENCY_ID[dependency_id]
+    except KeyError:
+        raise UnknownSemanticDependencyError(
+            f"no semantic dependency known for dependency_id {dependency_id!r}; known: "
+            f"{sorted(CURRENT_SHA_BY_DEPENDENCY_ID)!r}"
+        ) from None
+
+
+_PYPDF_VERSION_UNKNOWN = "unknown"
+"""Sentinel returned by :func:`_pypdf_version` when ``pypdf`` cannot be introspected.
+
+Deliberately a plain, obviously-not-a-real-version string (not ``None`` and not an
+empty string) so a caller that forgets to check for it produces an identity that is
+visibly wrong (``"unknown"``) rather than one that looks superficially plausible.
+"""
+
+
+def _pypdf_version() -> str:
+    """Best-effort installed ``pypdf`` version string, never fatal.
+
+    Mirrors :func:`carmel.services.evidence._extractor_identity`'s pattern for exactly
+    the same reason: version discovery for an optional/lazily-imported third-party
+    package must never be allowed to crash a caller that only wants an identity for
+    logging/comparison purposes. Any failure (package absent, import error, missing
+    ``__version__`` attribute, or anything else) collapses to
+    :data:`_PYPDF_VERSION_UNKNOWN` rather than propagating.
+    """
+    try:
+        import pypdf
+
+        return str(pypdf.__version__)
+    except Exception:  # noqa: BLE001 - version discovery is best-effort, never fatal
+        return _PYPDF_VERSION_UNKNOWN
+
+
+@dataclass(frozen=True)
+class ExtractionIdentity:
+    """The complete, two-part content identity for a run of
+    :func:`~carmel.agents.tools.extract.extract_text`.
+
+    A single ``content_sha256`` (:data:`EXTRACT_TEXT_DEPENDENCY_ID`'s current sha) is
+    NOT a complete extraction identity by itself -- see the module docstring's fourth
+    limitation: the AST closure that produces that sha is within-module only, and
+    ``pypdf`` is imported lazily inside
+    :func:`~carmel.agents.tools.extract._extract_pdf`'s function body, so the closure
+    cannot observe, and the sha says nothing about, which ``pypdf`` version actually
+    ran. Two extractions can share an identical ``code_sha256`` while having been
+    produced by genuinely different ``pypdf`` behavior. This dataclass makes both
+    components explicit and separately inspectable, rather than encoding them into one
+    opaque string a future consumer would have to parse (and could parse wrong) to
+    recover either half.
+
+    A frozen dataclass rather than a plain string was chosen deliberately: this module
+    already uses frozen dataclasses (:class:`SemanticDependencyDefinition`) for its
+    other identity-shaped values, and a struct keeps ``code_sha256`` and
+    ``pypdf_version`` independently accessible and comparable without a caller having
+    to agree on (and correctly parse) a delimiter convention.
+
+    Attributes:
+        code_sha256: The current ``content_sha256`` registered for
+            :data:`EXTRACT_TEXT_DEPENDENCY_ID` -- Carmel's own extraction code, and
+            nothing about ``pypdf``.
+        pypdf_version: The installed ``pypdf`` version string, or
+            :data:`_PYPDF_VERSION_UNKNOWN` if it could not be determined.
+    """
+
+    code_sha256: str
+    pypdf_version: str
+
+
+def extraction_identity() -> ExtractionIdentity:
+    """Return the current composite identity for Carmel's extraction code.
+
+    Combines :data:`EXTRACT_TEXT_DEPENDENCY_ID`'s current registered sha (Carmel's own
+    extraction/normalization code) with the installed ``pypdf`` version (the
+    third-party component the AST closure cannot see -- see the module docstring's
+    fourth limitation). Neither half alone is a complete extraction identity; see
+    :class:`ExtractionIdentity`.
+
+    This increment ONLY exposes this helper from :mod:`carmel.services.semantic_deps`.
+    Wiring it into :mod:`carmel.services.evidence` (e.g. alongside or in place of
+    ``_extractor_identity``) or any schema/producer/replay code is a separate, later
+    increment, out of scope here by design.
+    """
+    return ExtractionIdentity(
+        code_sha256=current_sha_for(EXTRACT_TEXT_DEPENDENCY_ID),
+        pypdf_version=_pypdf_version(),
+    )

@@ -33,6 +33,7 @@ from carmel.agents.tools.academic import (
     UNPAYWALL_ENDPOINT,
     CrossrefSearchTool,
     OaCandidate,
+    OaLookupCoverage,
     OaTier,
     OpenAccessResolver,
     OpenAlexSearchTool,
@@ -465,7 +466,7 @@ class TestOpenAccessResolverCompleteness:
         resolution = resolver.resolve(_RESOLVER_DOI)
 
         assert resolution.candidates == ()
-        assert resolution.complete is False
+        assert resolution.coverage is OaLookupCoverage.PARTIAL
         assert "lookup failed" in resolution.note
 
     def test_a_resolution_where_every_provider_answered_is_complete(self, ledger: BudgetLedger) -> None:
@@ -483,7 +484,7 @@ class TestOpenAccessResolverCompleteness:
         resolution = resolver.resolve(_RESOLVER_DOI)
 
         assert resolution.candidates == ()
-        assert resolution.complete is True
+        assert resolution.coverage is OaLookupCoverage.COMPLETE
 
     def test_a_provider_404_does_not_mark_the_resolution_incomplete(self, ledger: BudgetLedger) -> None:
         """A 404 means the provider was reached and answered normally with "no record
@@ -509,7 +510,7 @@ class TestOpenAccessResolverCompleteness:
         resolution = resolver.resolve(_RESOLVER_DOI)
 
         assert resolution.candidates == ()
-        assert resolution.complete is True
+        assert resolution.coverage is OaLookupCoverage.COMPLETE
         assert "Unpaywall: no record" in resolution.note
 
     def test_a_provider_500_still_marks_the_resolution_incomplete(self, ledger: BudgetLedger) -> None:
@@ -535,7 +536,7 @@ class TestOpenAccessResolverCompleteness:
         resolution = resolver.resolve(_RESOLVER_DOI)
 
         assert resolution.candidates == ()
-        assert resolution.complete is False
+        assert resolution.coverage is OaLookupCoverage.PARTIAL
         assert "lookup failed" in resolution.note
 
     def test_404_and_transient_failure_produce_visibly_different_notes(self, ledger: BudgetLedger) -> None:
@@ -579,7 +580,7 @@ class TestOpenAccessResolverCompleteness:
 
         resolution = resolver.resolve(_RESOLVER_DOI)
 
-        assert resolution.complete is True
+        assert resolution.coverage is OaLookupCoverage.COMPLETE
         assert "CORE" in resolution.note
 
 
@@ -1331,7 +1332,7 @@ class TestElsevierResolver:
             resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
 
         assert not any(u.startswith(ELSEVIER_ARTICLE_ENDPOINT) for u in seen)
-        assert first.complete is True
+        assert first.coverage is OaLookupCoverage.COMPLETE
         assert "Elsevier: skipped (no API key configured)" in first.note
         elsevier_warnings = [r for r in caplog.records if "CARMEL_ELSEVIER_API_KEY" in r.getMessage()]
         assert len(elsevier_warnings) == 1
@@ -1347,7 +1348,7 @@ class TestElsevierResolver:
         resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
 
         assert f"{ELSEVIER_ARTICLE_ENDPOINT}/{_RESOLVER_DOI}" in resolution.candidates
-        assert resolution.complete is True
+        assert resolution.coverage is OaLookupCoverage.COMPLETE
 
     def test_403_authentication_error_marks_incomplete_and_names_the_remedy(
         self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
@@ -1368,7 +1369,7 @@ class TestElsevierResolver:
         resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
 
         assert not any(c.startswith(ELSEVIER_ARTICLE_ENDPOINT) for c in resolution.candidates)
-        assert resolution.complete is False
+        assert resolution.coverage is OaLookupCoverage.PARTIAL
         assert "institutional entitlement" in resolution.note
         assert "CARMEL_ELSEVIER_INSTTOKEN" in resolution.note
 
@@ -1383,7 +1384,7 @@ class TestElsevierResolver:
         resolution = resolver.resolve(_RESOLVER_DOI, title=_WANTED_TITLE)
 
         assert not any(c.startswith(ELSEVIER_ARTICLE_ENDPOINT) for c in resolution.candidates)
-        assert resolution.complete is True
+        assert resolution.coverage is OaLookupCoverage.COMPLETE
 
 
 class TestOpenAlexBestOaLocationFallback:

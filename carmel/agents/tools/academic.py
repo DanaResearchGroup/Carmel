@@ -35,7 +35,7 @@ from __future__ import annotations
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
 from typing import Any, Protocol
 from urllib.parse import quote, quote_plus
 from xml.etree import ElementTree
@@ -1020,6 +1020,55 @@ def elsevier_oa_candidates(payload: Any, *, doi: str) -> list[OaCandidate]:
     return [OaCandidate(url=f"{ELSEVIER_ARTICLE_ENDPOINT}/{doi}", tier=OaTier.PUBLISHER)]
 
 
+class OaLookupCoverage(StrEnum):
+    """How much of open-access resolution actually ran for one DOI.
+
+    Replaces :class:`OaResolution`'s old boolean ``complete`` field. That field had
+    exactly one reader in the whole codebase
+    (:func:`~carmel.services.literature._resolve_oa_candidates`) and was being asked
+    to distinguish three states through one bit: a caller that only ever sees
+    ``True``/``False`` cannot tell "no provider ever ran" apart from "every provider
+    ran and finished" -- and that collapse is exactly how
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.NO_OPEN_ACCESS_COPY` ended up
+    asserted for papers where no provider ever answered (no DOI, no resolver
+    configured, consent withheld). A second boolean alongside the first was rejected
+    for the same reason: ``attempted``/``complete`` would admit the nonsense state
+    ``(attempted=False, complete=False)`` and push the invariant into a validator
+    nobody would write.
+    """
+
+    NOT_ATTEMPTED = "not_attempted"
+    """No provider ran at all. Nothing was asked, so nothing is established about
+    whether an open-access copy exists -- not even the honest negative. A caller must
+    queue such a paper as
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED`,
+    never as :attr:`~carmel.schemas.acquisition.AcquisitionReason.NO_OPEN_ACCESS_COPY`:
+    a lookup that never ran must not be reported as a finding."""
+
+    PARTIAL = "partial"
+    """Resolution was CUT SHORT -- the per-paper lookup cap was reached, or a
+    provider's lookup failed in transit (timeout, HTTP error) -- so an empty
+    ``candidates`` establishes nothing about whether an OA copy exists. A caller must
+    then queue the paper as
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.OA_LOOKUP_INCOMPLETE`, never as
+    ``NO_OPEN_ACCESS_COPY``: "we did not finish looking" is not "there is nothing there".
+    This is the same asserted-vs-observed distinction already fixed once for
+    ``PAYWALLED``; it must not creep back in one level down.
+
+    A provider declining via :class:`_ProviderSkip` (a missing optional API key, say)
+    deliberately does NOT degrade coverage to ``PARTIAL``. That is a stable
+    configuration fact, already spelled out in ``note``, not a transient unknown --
+    and since CORE ships keyless by default, counting it as partial would mark every
+    paper's resolution partial and make the distinction worthless."""
+
+    COMPLETE = "complete"
+    """Every enabled provider that could run did -- each either answered (with
+    candidates, or a definite "no record", e.g. HTTP 404) or declined via
+    :class:`_ProviderSkip` for a stable configuration reason. An empty ``candidates``
+    here is an honest negative: a caller may queue the paper as
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.NO_OPEN_ACCESS_COPY`."""
+
+
 @dataclass(frozen=True)
 class OaResolution:
     """The outcome of one DOI's open-access resolution.
@@ -1037,23 +1086,17 @@ class OaResolution:
     candidates: tuple[str, ...]
     """OA PDF URLs to try fetching, best first, deduplicated across indexes."""
     note: str
-    complete: bool = True
-    """Whether every enabled provider actually got to answer.
+    coverage: OaLookupCoverage
+    """How much of resolution actually ran; see :class:`OaLookupCoverage`.
 
-    ``False`` means resolution was CUT SHORT -- the per-paper lookup cap was reached, or
-    a provider's lookup failed in transit (timeout, HTTP error) -- so an empty
-    ``candidates`` establishes nothing about whether an OA copy exists. A caller must
-    then queue the paper as
-    :attr:`~carmel.schemas.acquisition.AcquisitionReason.OA_LOOKUP_INCOMPLETE`, never as
-    ``NO_OPEN_ACCESS_COPY``: "we did not finish looking" is not "there is nothing there".
-    This is the same asserted-vs-observed distinction already fixed once for
-    ``PAYWALLED``; it must not creep back in one level down.
-
-    A provider declining via :class:`_ProviderSkip` (a missing optional API key, say)
-    deliberately does NOT clear this flag. That is a stable configuration fact, already
-    spelled out in ``note``, not a transient unknown -- and since CORE ships keyless by
-    default, counting it as incomplete would mark every paper incomplete and make the
-    distinction worthless.
+    Deliberately REQUIRED, with no default. The boolean this replaced defaulted to the
+    value meaning "everything ran", so any construction site that merely forgot it
+    claimed a completed lookup -- which is precisely how the consent-withheld early
+    return came to assert
+    :attr:`~carmel.schemas.acquisition.AcquisitionReason.NO_OPEN_ACCESS_COPY` for a
+    paper nothing had looked up. A default here could only ever be the promoting value,
+    since every other value is a caveat no caller would default to; so the safe shape is
+    to have none, and make every caller state what it actually observed.
     """
 
 
@@ -1203,16 +1246,23 @@ class OpenAccessResolver(_KeylessSearchTool):
                 run-level condition, not a per-paper resolution outcome.
         """
         if not self._external_provider_consent:
+            # Unreachable in production today: `build_deps` returns early with no
+            # resolver at all for the mock provider (the default), and for any real
+            # provider `build_model` raises `AgentBridgeError` when consent is
+            # withheld before this resolver is ever constructed. Fixed anyway because
+            # a caller that constructs the resolver directly -- the tests do -- can
+            # still reach it, and no provider ran, so coverage is NOT_ATTEMPTED.
             return OaResolution(
                 candidates=(),
                 note="open-access resolution skipped: external_provider_consent is False",
+                coverage=OaLookupCoverage.NOT_ATTEMPTED,
             )
 
         notes: list[str] = []
         ranked: list[OaCandidate] = []
         self._lookup_calls = 0
         # Cleared the moment a provider is cut short or fails in transit, so an empty
-        # result is never reported as "no OA copy exists" (see OaResolution.complete).
+        # result is never reported as "no OA copy exists" (see OaLookupCoverage).
         complete = True
 
         for name, lookup in self._providers:
@@ -1264,7 +1314,8 @@ class OpenAccessResolver(_KeylessSearchTool):
             if candidate.url not in candidates:
                 candidates.append(candidate.url)
 
-        return OaResolution(candidates=tuple(candidates), note="; ".join(notes), complete=complete)
+        coverage = OaLookupCoverage.COMPLETE if complete else OaLookupCoverage.PARTIAL
+        return OaResolution(candidates=tuple(candidates), note="; ".join(notes), coverage=coverage)
 
     # ------------------------- provider lookups -------------------------
 

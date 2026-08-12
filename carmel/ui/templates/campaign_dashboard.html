@@ -266,7 +266,7 @@
             Save as <code>{{ paper.slug }}.pdf</code>
             {% if paper.doi %} · DOI <code>{{ paper.doi }}</code>{% endif %}
             · <a href="{{ paper.landing_url }}" rel="noopener noreferrer" target="_blank">obtain</a>
-            <br><small>{{ paper.reason.value }}{% if paper.detail %} — {{ paper.detail }}{% endif %}</small>
+            <br><small>{{ reason_phrases[paper.slug] }}{% if paper.detail %} — {{ paper.detail }}{% endif %}</small>
           </li>
         {% endfor %}
       </ul>

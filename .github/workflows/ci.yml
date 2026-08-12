@@ -45,16 +45,23 @@ jobs:
   # environment is the one supported mypy target; the `agents` job below
   # (its display name says "(required)") owns typecheck there.
   #
-  # ENFORCEMENT GAP: despite that "(required)" in its name, the `agents` job
-  # is NOT actually listed in the repo's "Protect Main" ruleset
-  # (`gh api repos/DanaResearchGroup/Carmel/rulesets/14702943` ->
-  # required_status_checks), only `Lint + format + typecheck (required)`,
-  # `Tests + packaging smoke (required) (3.14)`, `Check CLA signature`, and
-  # `build` are. So as of this change, a red mypy result in the `agents` job
-  # cannot block a merge -- it can only go red without gating anything. This
-  # is an admin-only fix: someone with repo admin rights needs to add the
-  # `agents` job to the ruleset's required status checks to restore typecheck
-  # as an actual merge gate.
+  # ENFORCEMENT (verified 2026-08-12; this WAS a real gap when first written):
+  # the `agents` job IS now listed in the repo's "Protect Main" ruleset, so a
+  # red mypy result here genuinely blocks a merge. The five required contexts
+  # are `Lint + format + typecheck (required)`,
+  # `Tests + packaging smoke (required) (3.14)`, `Check CLA signature`,
+  # `build`, and `Agents extra -- tests + typecheck (required)`.
+  #
+  # Re-check with `gh api repos/DanaResearchGroup/Carmel/rulesets/14702943`
+  # (-> rules[].parameters.required_status_checks) rather than trusting this
+  # comment. The paragraph that used to sit here stayed stale after the gap
+  # was closed, and an adversarial review then took it at face value and
+  # reported the merge gate as weaker than it actually is. A stale claim about
+  # enforcement is worse than no claim: depending on which way it has rotted it
+  # produces either false alarm or misplaced confidence.
+  #
+  # NOTE: the ruleset matches on the display-name context string, so RENAMING
+  # a job silently drops it from the required set.
   lint:
     name: Lint + format + typecheck (required)
     runs-on: ubuntu-latest
@@ -194,7 +201,18 @@ jobs:
           # One representative module per optional package, named explicitly
           # (rather than "any test anywhere") so a rename or reshuffle fails
           # loudly here instead of silently narrowing what this gate checks.
-          required_modules = ["test_bridge", "test_extract", "test_chem"]
+          required_modules = [
+              "test_bridge",
+              "test_extract",
+              "test_chem",
+              # The literature/dataset lane. These modules build REAL pypdf
+              # extraction records, so without the extra they skip wholesale via
+              # tests/pypdf_gate.py -- 165 tests that would otherwise have gone
+              # green-by-skipping here while the base job was red.
+              "test_dataset_producer",
+              "test_dataset_replay",
+              "test_condition_set_producer",
+          ]
           root = ET.parse(report).getroot()
           cases = list(root.iter("testcase"))
           if not cases:
@@ -219,9 +237,9 @@ jobs:
 
           # A handful of unrelated tests may legitimately skip for other
           # reasons; what this gate forbids is a
-          # `pytest.importorskip("pydantic_ai" | "pypdf" | "rdkit")` firing
-          # inside these three modules, which only happens if the agents
-          # extra failed to install or import.
+          # `pytest.importorskip("pydantic_ai" | "pypdf" | "rdkit")` -- or a
+          # `tests/pypdf_gate.require_pypdf()` -- firing inside these modules,
+          # which only happens if the agents extra failed to install or import.
           if skipped_of_interest:
               sys.exit(
                   "::error::agents-path test(s) skipped even with the agents extra "

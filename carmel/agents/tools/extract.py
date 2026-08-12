@@ -14,6 +14,7 @@ before recording an offset.
 from __future__ import annotations
 
 import contextlib
+import enum
 import io
 import logging
 import re
@@ -140,6 +141,37 @@ class TextSection(BaseModel):
     page: int | None = None
 
 
+class PageExtractionFailure(BaseModel):
+    """Records that a single PDF page is not fully trustworthy.
+
+    Two distinct causes land here, and both keep the page rather than dropping
+    it (see the per-page ``try`` in :func:`_extract_pdf`): the surviving text is
+    kept, and this record is the audit trail for why the result is `lossy=True`.
+
+    1. The page's ``extract_text()`` call raised -- the text for that page is
+       genuinely missing.
+    2. The page-tree entry itself was UNINSPECTABLE (its ``/Type``/``/Contents``
+       keys could not even be read), so it was kept on the fail-safe assumption
+       that it might be a real page -- even if ``extract_text()`` on it then
+       succeeded. This case is a structural uncertainty about whether the entry
+       is a page at all, not an extraction exception.
+
+    Attributes:
+        page: 1-indexed PDF page number that failed or was uninspectable.
+        error: A short, redacted description of the exception (type name plus
+            a path-scrubbed message), or a static message for the
+            uninspectable-entry case. Never contains filesystem paths -- the
+            input PDF bytes come from content-addressed storage, and a raw
+            exception message could otherwise leak a local path into a stored
+            artifact.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    page: int
+    error: str
+
+
 class ExtractedText(BaseModel):
     """The result of extracting text from a fetched document.
 
@@ -158,7 +190,14 @@ class ExtractedText(BaseModel):
         extractor: Which extractor produced this: "pdf:pypdf", "pdf:unavailable",
             "html", "text", or "unknown".
         lossy: True when extraction is known to have dropped or approximated content
-            (missing optional dependency, unsupported content type, or a parse error).
+            (missing optional dependency, unsupported content type, a parse error,
+            or one or more individual PDF pages failing -- see ``page_failures``).
+        page_failures: PDF pages whose ``extract_text()`` raised and were skipped.
+            Always empty for non-PDF extractors. When every attempted page fails,
+            ``text`` and ``sections`` end up empty (the same "total failure" shape
+            downstream consumers already fail closed on), but this field still
+            carries WHY, rather than the bare empty result -- an already-loud
+            refusal is strictly better with a reason attached than without.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -169,6 +208,7 @@ class ExtractedText(BaseModel):
     page_count: int | None = None
     extractor: str
     lossy: bool = False
+    page_failures: tuple[PageExtractionFailure, ...] = ()
 
 
 def normalize_for_match(s: str) -> str:
@@ -603,6 +643,79 @@ def _quiet_pypdf() -> Iterator[None]:
                 _pypdf_mute_previous = None
 
 
+_PATH_LIKE_RE = re.compile(r"(?:[A-Za-z]:)?(?:[\\/][^\s\\/:*?\"<>|]+){2,}")
+
+
+def _describe_page_error(exc: Exception) -> str:
+    """Render a per-page extraction exception as a short, path-redacted string.
+
+    Stored in :class:`PageExtractionFailure.error`, which lands in a
+    content-addressed artifact -- so a raw ``str(exc)`` is not safe to keep
+    verbatim. ``pypdf`` exceptions do not normally embed local filesystem
+    paths (extraction here always reads from an in-memory ``io.BytesIO``,
+    never a file path), but nothing in its API contract guarantees that for
+    every code path or future version, so any path-shaped substring is
+    scrubbed defensively rather than trusted to be absent.
+    """
+    message = _PATH_LIKE_RE.sub("<redacted-path>", str(exc))
+    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+class _PageKind(enum.Enum):
+    """Three-state classification of a ``/Pages /Kids`` entry.
+
+    REAL: carries ``/Type /Page`` or a ``/Contents`` key -- kept, counted, and
+        extracted normally.
+    PHANTOM: inspected without error, but has neither key (e.g. a linearized
+        PDF's linearization parameter dict reachable via ``/Kids``) -- excluded
+        from ``page_count`` and from extraction.
+    UNINSPECTABLE: the inspection itself raised, so it is unknown whether the
+        entry is a real page -- kept and counted (never dropped), but the
+        uncertainty must surface as ``lossy=True`` rather than being absorbed
+        silently.
+    """
+
+    REAL = "real"
+    PHANTOM = "phantom"
+    UNINSPECTABLE = "uninspectable"
+
+
+def _classify_pdf_page(page: object) -> _PageKind:
+    """Classify a ``/Pages /Kids`` entry as real, phantom, or uninspectable.
+
+    ``pypdf``'s ``reader.pages`` walks ``/Kids`` without checking ``/Type``: a
+    linearized PDF can carry its linearization parameter dictionary as a ``/Kids``
+    entry, and ``reader.pages`` counts it as a page even though it has no
+    ``/Contents`` and no ``/MediaBox``.
+
+    The fail-safe direction here is to never drop real text, so the test for a
+    REAL page is deliberately permissive rather than the spec-strict
+    ``/Type == "/Page"``: a page is REAL if it carries EITHER ``/Type /Page`` OR a
+    ``/Contents`` key. A strict ``/Type`` test would silently discard a
+    real-but-sloppy page that omits the spec-required ``/Type`` (accepted by
+    pypdf and most viewers regardless); this classifier cannot do that, because
+    any content-bearing page is REAL regardless of whether ``/Type`` is present.
+    A linearization dict has neither key, so it is PHANTOM. The one case this
+    still misses is a genuinely BLANK page that omits both ``/Type`` and
+    ``/Contents`` -- it carries no text either way, so only its position in the
+    document is lost, never any content.
+    """
+    try:
+        if page.get("/Type") == "/Page":  # type: ignore[attr-defined]
+            return _PageKind.REAL
+        return _PageKind.REAL if "/Contents" in page else _PageKind.PHANTOM  # type: ignore[operator]
+    except Exception:
+        # An entry we cannot even INSPECT is kept, not dropped. Excluding it would
+        # contradict the fail-safe direction above: "could not read this entry's
+        # keys" is not evidence that it holds no text, and a `pypdf` change that
+        # made these lookups raise would otherwise silently empty out every
+        # document at once. Keeping it costs an honest `lossy=True`: the caller
+        # records this as a structural uncertainty (distinct from an
+        # `extract_text()` exception) so the extraction is never reported clean
+        # while carrying a page it could not verify.
+        return _PageKind.UNINSPECTABLE
+
+
 def _extract_pdf(data: bytes) -> ExtractedText:
     """Extract text from a PDF via the optional ``pypdf`` dependency.
 
@@ -624,15 +737,45 @@ def _extract_pdf(data: bytes) -> ExtractedText:
             reader = pypdf.PdfReader(io.BytesIO(data))
             # `len(reader.pages)` is cheap (it reads the page tree, not page content), so
             # checking it before calling any `extract_text()` bounds the page count up
-            # front rather than after the fact.
-            page_count = len(reader.pages)
+            # front rather than after the fact. But `reader.pages` itself walks
+            # `/Pages /Kids` WITHOUT checking `/Type`, so a linearized PDF's
+            # linearization parameter dict (also reachable via `/Kids`) gets counted
+            # as a page -- filter those out here, once, before anything downstream
+            # (page numbering, MAX_PDF_PAGES bounding) sees an inflated count.
+            #
+            # Counted lazily and RETAINED only up to `MAX_PDF_PAGES`, rather than
+            # materializing every page object into one list first. A plain
+            # comprehension over `reader.pages` would hold a wrapper per entry for a
+            # PDF declaring a huge page tree -- reintroducing, at the page-object
+            # layer, exactly the "allocate everything, bound it afterwards" ordering
+            # that the character cap below was written to close. `page_count` still
+            # counts every real page, so it stays exact for the density check in
+            # `carmel.services.grounding`; only retention is bounded.
+            real_pages: list[pypdf.PageObject] = []
+            # 1-indexed positions within `real_pages` (which is exactly the future
+            # `i + 1` page numbering below) whose page-tree entry was UNINSPECTABLE:
+            # kept because we cannot prove it holds no text, but the extraction must
+            # still surface `lossy=True` for it even if `extract_text()` succeeds.
+            uninspectable_page_numbers: set[int] = set()
+            page_count = 0
+            for page in reader.pages:
+                kind = _classify_pdf_page(page)
+                if kind is _PageKind.PHANTOM:
+                    continue
+                page_count += 1
+                if len(real_pages) < MAX_PDF_PAGES:
+                    real_pages.append(page)
+                    if kind is _PageKind.UNINSPECTABLE:
+                        uninspectable_page_numbers.add(len(real_pages))
     except Exception:
         return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
 
     parts: list[str] = []
     sections: list[TextSection] = []
+    page_failures: list[PageExtractionFailure] = []
     cursor = 0
     separator = "\n\n"
+    have_prior_page = False
     # `truncated` (-> `lossy=True`) covers BOTH ways a PDF can exceed the bounds we
     # enforce: too many pages, or too many characters. Either one means the returned
     # text is a partial view of the document, and `lossy=True` is load-bearing: the
@@ -640,32 +783,61 @@ def _extract_pdf(data: bytes) -> ExtractedText:
     # partial document.
     truncated = page_count > MAX_PDF_PAGES
     pages_to_process = min(page_count, MAX_PDF_PAGES)
-    try:
-        with _quiet_pypdf():
-            for i in range(pages_to_process):
-                # Stop calling `extract_text()` -- the expensive, memory-allocating step
-                # -- the moment the running character count would already exceed the cap,
-                # rather than materializing every remaining page and trimming only the
-                # RETURNED value afterwards. That "trim after the fact" ordering is
-                # exactly the gap this fix closes: it let a compression-bomb PDF blow past
-                # peak memory before `_cap_text` (below) ever got a chance to run.
-                if cursor >= MAX_EXTRACTED_TEXT_CHARS:
-                    truncated = True
-                    break
-                page_text = reader.pages[i].extract_text() or ""
-                start = cursor
-                parts.append(page_text)
-                cursor += len(page_text)
-                sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
-                if i < pages_to_process - 1:
-                    parts.append(separator)
-                    cursor += len(separator)
-    except Exception:
-        return ExtractedText(text="", normalized="", sections=[], extractor="pdf:pypdf", lossy=True)
+    with _quiet_pypdf():
+        for i in range(pages_to_process):
+            # Stop calling `extract_text()` -- the expensive, memory-allocating step
+            # -- the moment the running character count would already exceed the cap,
+            # rather than materializing every remaining page and trimming only the
+            # RETURNED value afterwards. That "trim after the fact" ordering is
+            # exactly the gap this fix closes: it let a compression-bomb PDF blow past
+            # peak memory before `_cap_text` (below) ever got a chance to run.
+            if cursor >= MAX_EXTRACTED_TEXT_CHARS:
+                truncated = True
+                break
+            # Per-page, not per-document: a single damaged page (pypdf's layout mode
+            # raises e.g. `KeyError('/Contents')` on a contentless page in real corpus
+            # PDFs) must not discard every page around it. Catching around just this
+            # call keeps the pages that DO extract cleanly and records the ones that
+            # don't, instead of the old behavior of losing an entire multi-page paper
+            # to one bad page.
+            try:
+                page_text = real_pages[i].extract_text() or ""
+            except Exception as exc:
+                page_failures.append(PageExtractionFailure(page=i + 1, error=_describe_page_error(exc)))
+                continue
+            if (i + 1) in uninspectable_page_numbers:
+                # `extract_text()` succeeded, but the page-tree entry itself could
+                # not be inspected, so we still cannot verify this is actually a
+                # page. Record it as a structural uncertainty -- distinct from an
+                # `extract_text()` exception -- so `lossy=True` follows even though
+                # the text (appended below) is kept in full. One record per page:
+                # the `except` branch above already handles the case where
+                # `extract_text()` also fails, so this only fires on the success path.
+                page_failures.append(
+                    PageExtractionFailure(
+                        page=i + 1,
+                        error="page-tree entry could not be inspected; kept as a possible page",
+                    )
+                )
+            if have_prior_page:
+                parts.append(separator)
+                cursor += len(separator)
+            start = cursor
+            parts.append(page_text)
+            cursor += len(page_text)
+            sections.append(TextSection(label="body", start=start, end=cursor, page=i + 1))
+            have_prior_page = True
 
     text = "".join(parts)
     text, sections, cap_truncated = _cap_text(text, sections)
-    truncated = truncated or cap_truncated
+    # Any page failure makes this extraction partial, exactly like truncation does:
+    # the surviving text is real but incomplete, so `lossy=True` must follow even
+    # when only one page out of many failed. When EVERY attempted page fails, `parts`
+    # stays empty and `text`/`sections` naturally collapse to the same "total failure"
+    # shape the grounding gate and `produce_envelope_from_artifact` already fail
+    # closed on -- but `page_failures` still carries why, rather than a bare empty
+    # result.
+    truncated = truncated or cap_truncated or bool(page_failures)
     sections = _label_special_sections(text, sections)
     return ExtractedText(
         text=text,
@@ -674,6 +846,7 @@ def _extract_pdf(data: bytes) -> ExtractedText:
         page_count=page_count,
         extractor="pdf:pypdf",
         lossy=truncated,
+        page_failures=tuple(page_failures),
     )
 
 
@@ -721,6 +894,27 @@ def _extract_html(data: bytes) -> ExtractedText:
     )
 
 
+def _extract_xml(data: bytes) -> ExtractedText:
+    """Extract text from XML (e.g. JATS full text) by tag-stripping, exactly as HTML.
+
+    :class:`_HTMLTextExtractor` handles this without change: dropping markup and
+    keeping character data works the same for ``<article-title>`` as for ``<h1>``, and
+    JATS carries no ``<script>``/``<style>`` content for the stripping to miss.
+    Kept as its own function (and ``extractor`` label) rather than reusing
+    :func:`_extract_html` so the two content types remain distinguishable downstream --
+    HTML is refused as a primary document by manual acquisition, XML is not.
+    """
+    parser = _HTMLTextExtractor()
+    parser.feed(_decode_bytes(data))
+    parser.close()
+    text = "".join(parser.parts)
+    text, sections, truncated = _cap_text(text, [TextSection(label="body", start=0, end=len(text))])
+    sections = _label_special_sections(text, sections)
+    return ExtractedText(
+        text=text, normalized=normalize_for_match(text), sections=sections, extractor="xml", lossy=truncated
+    )
+
+
 def _extract_plain_text(data: bytes) -> ExtractedText:
     """Take ``text/*`` content verbatim (still section-labeled for references/abstract)."""
     text = _decode_bytes(data)
@@ -742,14 +936,19 @@ def extract_text(data: bytes, content_type: str) -> ExtractedText:
     Returns:
         An :class:`ExtractedText`. PDF extraction is via the optional ``pypdf``
         dependency (``lossy=True`` and ``extractor="pdf:unavailable"`` when it is not
-        installed). HTML is stripped of ``<script>``/``<style>`` content using only the
-        stdlib. Any other ``text/*`` type is taken verbatim. An unrecognized content
-        type yields empty text with ``lossy=True``.
+        installed). HTML and XML are stripped of markup using only the stdlib. Any
+        other ``text/*`` type is taken verbatim. An unrecognized content type yields
+        empty text with ``lossy=True``.
     """
     if content_type == "application/pdf":
         return _extract_pdf(data)
     if content_type == "text/html":
         return _extract_html(data)
+    # Checked BEFORE the generic ``text/*`` prefix: ``application/xml`` does not start
+    # with ``text/`` and would otherwise fall through to the empty ``unknown`` result,
+    # while ``text/xml`` would be taken verbatim, tags and all.
+    if content_type in ("application/xml", "text/xml"):
+        return _extract_xml(data)
     if content_type.startswith("text/"):
         return _extract_plain_text(data)
     return ExtractedText(text="", normalized="", sections=[], extractor="unknown", lossy=True)

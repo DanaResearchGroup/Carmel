@@ -398,12 +398,28 @@ def create_app(
         # than only in a README on disk: most papers in this field cannot be fetched, so
         # an empty-looking report with a full acquisition queue is the normal outcome and
         # would otherwise read as "the agent found nothing".
-        from carmel.schemas.acquisition import AcquisitionStatus
-        from carmel.services.acquisition import inbox_dir, load_manifest
+        from carmel.schemas.acquisition import AcquisitionRequest, AcquisitionStatus
+        from carmel.services.acquisition import ManifestUnreadable, inbox_dir, load_manifest, reason_phrase
 
-        acquisition = load_manifest(ws)
-        pending_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REQUESTED]
-        rejected_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REJECTED]
+        pending_papers: list[AcquisitionRequest] = []
+        rejected_papers: list[AcquisitionRequest] = []
+        try:
+            acquisition = load_manifest(ws)
+        except ManifestUnreadable as e:
+            # Same instinct as the literature-report handling above: the file exists but
+            # could not be loaded, which is worth its own log signal rather than
+            # degrading silently to "no papers pending" -- an operator whose whole
+            # queue just became unreadable must not have the dashboard tell them
+            # everything is fine.
+            _log.warning("acquisition manifest for %s is present but unreadable: %s", ws, e)
+        else:
+            pending_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REQUESTED]
+            rejected_papers = [r for r in acquisition.requests if r.status == AcquisitionStatus.REJECTED]
+        # Rendered here, not in the template: the template must never import Python
+        # (`reason_phrase`) into Jinja, and a raw `paper.reason.value` would leak an
+        # enum's underscored wire value (e.g. `oa_lookup_not_attempted`) straight into
+        # operator-facing text -- exactly the leak `reason_phrase` exists to prevent.
+        reason_phrases = {r.slug: reason_phrase(r.reason) for r in pending_papers}
 
         return render_template(
             "campaign_dashboard.html",
@@ -418,6 +434,7 @@ def create_app(
             literature_report=literature_report,
             pending_papers=pending_papers,
             rejected_papers=rejected_papers,
+            reason_phrases=reason_phrases,
             inbox_path=str(inbox_dir(ws)),
             diagnostics=diagnostics,
             arc_diagnostics=arc_diagnostics,

@@ -10,6 +10,7 @@ from carmel.agents.budget import BudgetDimension, BudgetUsage
 from carmel.agents.literature_agent import ProposedFinding, VerifierAssessment
 from carmel.schemas.campaign import ReactorType
 from carmel.schemas.literature import (
+    ROOT_EXTRACTION_ID,
     STOP_REASON_FOR_DIMENSION,
     Citation,
     CredenceVerdict,
@@ -80,6 +81,37 @@ class TestCitation:
             Citation(title="x", url="https://example.com", surprise="y")  # type: ignore[call-arg]
 
 
+class TestEvidenceRefArtifactSha256Shape:
+    """``artifact_sha256`` names the stored document a finding's quote came from and
+    is used to locate that document's directory -- it must be a genuine 64-lowercase-hex
+    digest, never a path fragment or a look-alike string."""
+
+    def test_rejects_a_path_traversal_string(self) -> None:
+        with pytest.raises(ValidationError, match="invalid artifact_sha256"):
+            EvidenceRef(artifact_sha256="../x", extraction_id=ROOT_EXTRACTION_ID)
+
+    def test_rejects_a_trailing_newline(self) -> None:
+        """Python's ``$`` matches just BEFORE a trailing newline, so a validator
+        written with ``re.match`` accepts this. ``fullmatch`` is what refuses it."""
+        with pytest.raises(ValidationError, match="invalid artifact_sha256"):
+            EvidenceRef(artifact_sha256="a" * 64 + "\n", extraction_id=ROOT_EXTRACTION_ID)
+
+    @pytest.mark.parametrize(
+        "bad_digest",
+        [
+            pytest.param("A" * 64, id="uppercase_hex"),
+            pytest.param("a" * 63, id="too_short"),
+        ],
+    )
+    def test_rejects_the_wrong_shape(self, bad_digest: str) -> None:
+        with pytest.raises(ValidationError, match="invalid artifact_sha256"):
+            EvidenceRef(artifact_sha256=bad_digest, extraction_id=ROOT_EXTRACTION_ID)
+
+    def test_accepts_a_well_formed_digest(self) -> None:
+        ref = EvidenceRef(artifact_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID)
+        assert ref.artifact_sha256 == "a" * 64
+
+
 class TestFindingPayloadDiscriminatedUnion:
     def test_experimental_benchmark_selected(self) -> None:
         finding = _make_finding(_experimental_payload())
@@ -111,7 +143,7 @@ class TestFindingPayloadDiscriminatedUnion:
                 payload=payload,  # type: ignore[arg-type]
                 citation=_citation(doi="10.1/x"),
                 verbatim_quote="quote",
-                evidence=EvidenceRef(artifact_sha256="a" * 64),
+                evidence=EvidenceRef(artifact_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID),
                 grounding=_grounding(),
             )
 
@@ -149,7 +181,7 @@ def _make_finding(payload: object) -> LiteratureFinding:
         payload=payload,  # type: ignore[arg-type]
         citation=_citation(doi="10.1000/abc"),
         verbatim_quote="the ignition delay was 1.2 ms",
-        evidence=EvidenceRef(artifact_sha256="a" * 64),
+        evidence=EvidenceRef(artifact_sha256="a" * 64, extraction_id=ROOT_EXTRACTION_ID),
         grounding=_grounding(),
     )
 
@@ -197,6 +229,91 @@ class TestExtraForbid:
             Quantity(value=1.0, unit="K", bogus_field=1)  # type: ignore[call-arg]
 
 
+class TestQuantityFiniteGuard:
+    """A non-finite value can never be a trustworthy measured quantity, and a stored
+    inf/nan would later become an ungroundable str(float) anchor ('inf'/'nan') in the
+    grounding gate -- so it is rejected at construction."""
+
+    def test_rejects_an_infinite_value(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=float("inf"), unit="K")
+
+    def test_rejects_a_negative_infinite_value(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=float("-inf"), unit="K")
+
+    def test_rejects_a_nan_value(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=float("nan"), unit="K")
+
+    def test_accepts_an_ordinary_finite_value(self) -> None:
+        quantity = Quantity(value=850.0, unit="microseconds")
+        assert quantity.value == 850.0
+
+    def test_rejects_a_non_finite_uncertainty(self) -> None:
+        with pytest.raises(ValidationError):
+            Quantity(value=850.0, unit="microseconds", uncertainty=float("inf"))
+
+    def test_accepts_an_ordinary_finite_uncertainty(self) -> None:
+        quantity = Quantity(value=850.0, unit="microseconds", uncertainty=10.0)
+        assert quantity.uncertainty == 10.0
+
+
+class TestExperimentalBenchmarkPayloadFiniteGuard:
+    """The same non-finite-value posture as :class:`TestQuantityFiniteGuard`, applied
+    to every range/scalar condition field: a stored inf/nan here would likewise
+    become an ungroundable str(float) anchor in the grounding gate."""
+
+    def test_rejects_a_non_finite_temperature_range_bound(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                temperature_range_K=(1000.0, float("inf")),
+            )
+
+    def test_rejects_a_non_finite_pressure_range_bound(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                pressure_range_bar=(float("nan"), 2.0),
+            )
+
+    def test_rejects_a_non_finite_equivalence_ratio_range_bound(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                equivalence_ratio_range=(0.5, float("-inf")),
+            )
+
+    def test_rejects_a_non_finite_residence_time(self) -> None:
+        with pytest.raises(ValidationError):
+            ExperimentalBenchmarkPayload(
+                reactor_type=ReactorType.SHOCK_TUBE,
+                observable=ObservableKind.IGNITION_DELAY_TIME,
+                observable_raw="ignition delay time",
+                residence_time_s=float("inf"),
+            )
+
+    def test_accepts_ordinary_finite_ranges_and_residence_time(self) -> None:
+        payload = ExperimentalBenchmarkPayload(
+            reactor_type=ReactorType.SHOCK_TUBE,
+            observable=ObservableKind.IGNITION_DELAY_TIME,
+            observable_raw="ignition delay time",
+            temperature_range_K=(1000.0, 1500.0),
+            pressure_range_bar=(1.0, 2.0),
+            equivalence_ratio_range=(0.5, 1.5),
+            residence_time_s=2.0,
+        )
+        assert payload.temperature_range_K == (1000.0, 1500.0)
+        assert payload.residence_time_s == 2.0
+
+
 class TestStopReasonForDimension:
     def test_covers_every_budget_dimension(self) -> None:
         for dimension in BudgetDimension:
@@ -231,7 +348,13 @@ class TestLiteratureReportRoundTrip:
             payload=_experimental_payload(),
             citation=_citation(doi="https://doi.org/10.1000/XYZ"),
             verbatim_quote="the ignition delay was 1.2 ms at 1200 K",
-            evidence=EvidenceRef(artifact_sha256="b" * 64, quote_start=10, quote_end=40, page=3),
+            evidence=EvidenceRef(
+                artifact_sha256="b" * 64,
+                extraction_id=ROOT_EXTRACTION_ID,
+                quote_start=10,
+                quote_end=40,
+                page=3,
+            ),
             grounding=_grounding(),
             credence=CredenceVerdict(
                 credence=0.8,

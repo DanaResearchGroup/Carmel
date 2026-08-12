@@ -10,6 +10,7 @@ import yaml
 from Carmel import main
 from carmel.paths import WORKSPACE_SUBDIRS
 from carmel.version import __version__
+from tests.test_acquisition import _matching_body, _patch_text_sniff_to_pdf
 
 
 class TestVersionCommand:
@@ -604,6 +605,15 @@ class TestRequestsCommand:
     and admitting must report the identity verdict immediately -- waiting for a whole
     literature run to learn whether a file was accepted is what made this painful."""
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # This class's fixtures write plain-text bodies to stand in for "the right
+        # paper" -- these tests are about CLI wiring (exit codes, --collect/--add
+        # reporting), not about format gating, which is exercised on its own in
+        # TestPlainTextLandingPageRefused. Without this seam every "accepted" case here
+        # would now be REJECTED by the new text/plain admission guard.
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     def _campaign_with_request(self, tmp_path: Path) -> tuple[str, Path]:
         from Carmel import main
         from carmel.schemas.acquisition import AcquisitionReason
@@ -676,6 +686,38 @@ class TestRequestsCommand:
         assert "awaiting a human" in out
         assert "--add" in out and "--slug" in out
 
+    def test_the_listing_never_prints_a_raw_reason_value(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The "why" line must render the operator-facing phrase, never the enum value.
+
+        A raw value reaches the operator as ``oa_lookup_not_attempted``, underscores
+        intact -- exactly the leak the phrase table exists to prevent, and a leak that
+        widens silently every time a member is added. Asserting the ABSENCE of the raw
+        value is the load-bearing half: asserting only that the phrase is present would
+        still pass if both were printed.
+        """
+        from Carmel import main
+        from carmel.schemas.acquisition import AcquisitionReason
+        from carmel.services.acquisition import reason_phrase, record_request
+        from carmel.services.campaigns import load_campaign
+
+        cid, ws = self._campaign_with_request(tmp_path)
+        record_request(
+            ws,
+            title="Laminar burning velocity of syngas at elevated pressure",
+            doi="10.1016/j.test.2020.02.002",
+            landing_url="https://doi.org/10.1016/j.test.2020.02.002",
+            reason=AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED,
+            detail="no open-access resolver is configured, so no lookup could run",
+        )
+        assert load_campaign(ws).campaign_id == cid
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path)]) == 0
+        out = capsys.readouterr().out
+        assert AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED.value not in out
+        assert reason_phrase(AcquisitionReason.OA_LOOKUP_NOT_ATTEMPTED) in out
+
     def test_the_wrong_paper_is_rejected_and_nothing_is_admitted(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -694,8 +736,11 @@ class TestRequestsCommand:
         cid, _ = self._campaign_with_request(tmp_path)
         right = tmp_path / "right.txt"
         right.write_text(
-            "Shock tube study of ammonia oxidation ignition delay times\n"
-            "DOI: 10.1016/j.test.2019.01.001\nAbstract: we report ignition delay times.\n",
+            _matching_body(
+                "Abstract: we report ignition delay times.\n",
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
             encoding="utf-8",
         )
 
@@ -713,7 +758,10 @@ class TestRequestsCommand:
         wrong.write_text("Something else entirely\n", encoding="utf-8")
         right = tmp_path / "right.txt"
         right.write_text(
-            "Shock tube study of ammonia oxidation ignition delay times\nDOI: 10.1016/j.test.2019.01.001\n",
+            _matching_body(
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
             encoding="utf-8",
         )
 
@@ -734,8 +782,11 @@ class TestRequestsCommand:
         drop = drop_path_for(ws, slug, suffix=".txt")
         drop.parent.mkdir(parents=True, exist_ok=True)
         drop.write_text(
-            "Shock tube study of ammonia oxidation ignition delay times\n"
-            "DOI: 10.1016/j.test.2019.01.001\nAbstract: we report ignition delay times.\n",
+            _matching_body(
+                "Abstract: we report ignition delay times.\n",
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
             encoding="utf-8",
         )
 
@@ -820,6 +871,14 @@ class TestRequestsCommandAddDirectory:
     _SECOND_TITLE = "Shock tube study of ammonia oxidation ignition delay times"
     _SECOND_DOI = "10.1016/j.test.2019.01.001"
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same seam as TestRequestsCommand: these fixtures write plain-text bodies
+        # (named .pdf to mirror real publisher filenames, since sniffing is by content,
+        # never filename) and this class is about directory-add wiring, not format
+        # gating.
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     def _campaign_with_requests(self, tmp_path: Path, titles_dois: list[tuple[str, str]]) -> tuple[str, Path]:
         from Carmel import main
         from carmel.schemas.acquisition import AcquisitionReason
@@ -849,10 +908,13 @@ class TestRequestsCommandAddDirectory:
         # Real publisher filenames: spaces, parentheses, hyphens -- the whole point is
         # that these are irrelevant to matching, which happens on document content.
         (lit / "Experimental studies of the fundamental flame speeds of syngas (H2-CO)-air mixtures.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "Shock tube study (ammonia oxidation) - ignition delay times [2019].pdf").write_text(
-            f"{self._SECOND_TITLE}\nDOI: {self._SECOND_DOI}\nAbstract: we report ignition delay times.\n",
+            _matching_body(
+                "Abstract: we report ignition delay times.\n", title=self._SECOND_TITLE, doi=self._SECOND_DOI
+            ),
             encoding="utf-8",
         )
 
@@ -876,7 +938,8 @@ class TestRequestsCommandAddDirectory:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "good.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "bad.pdf").write_text("An entirely unrelated document about catalytic converters.\n", encoding="utf-8")
 
@@ -906,7 +969,8 @@ class TestRequestsCommandAddDirectory:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "good.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "bad.pdf").write_text("An entirely unrelated document about catalytic converters.\n", encoding="utf-8")
 
@@ -930,7 +994,8 @@ class TestRequestsCommandAddDirectory:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "good.pdf").write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
         (lit / "subdir").mkdir()
         (lit / "subdir" / "nested.pdf").write_text("should never be seen\n", encoding="utf-8")
@@ -954,7 +1019,7 @@ class TestRequestsCommandAddDirectory:
         cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
         lit = tmp_path / "lit"
         lit.mkdir()
-        (lit / "good.pdf").write_text(f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\n", encoding="utf-8")
+        (lit / "good.pdf").write_text(_matching_body(title=self._FIRST_TITLE, doi=self._FIRST_DOI), encoding="utf-8")
 
         from Carmel import main
 
@@ -974,7 +1039,8 @@ class TestRequestsCommandAddDirectory:
         cid, _ = self._campaign_with_requests(tmp_path, [(self._FIRST_TITLE, self._FIRST_DOI)])
         right = tmp_path / "right.pdf"
         right.write_text(
-            f"{self._FIRST_TITLE}\nDOI: {self._FIRST_DOI}\nAbstract: measurements follow.\n", encoding="utf-8"
+            _matching_body("Abstract: measurements follow.\n", title=self._FIRST_TITLE, doi=self._FIRST_DOI),
+            encoding="utf-8",
         )
 
         from Carmel import main
@@ -1012,6 +1078,12 @@ class TestRequestsCommandReIngest:
     _TITLE = "Shock tube ammonia oxidation ignition delay times"
     _DOI = "10.1016/j.test.2019.01.001"
 
+    @pytest.fixture(autouse=True)
+    def _pdf_sniff(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Same seam as TestRequestsCommand: this class is about re-ingest idempotency
+        # (SKIPPED vs REJECTED reporting), not format gating.
+        _patch_text_sniff_to_pdf(monkeypatch)
+
     def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
         from Carmel import main
         from carmel.schemas.acquisition import AcquisitionReason
@@ -1034,7 +1106,7 @@ class TestRequestsCommandReIngest:
         lit = tmp_path / "lit"
         lit.mkdir()
         (lit / "publisher-named-download.txt").write_text(
-            f"{self._TITLE}\nDOI: {self._DOI}\nAbstract: ignition delay times.\n", encoding="utf-8"
+            _matching_body("Abstract: ignition delay times.\n", title=self._TITLE, doi=self._DOI), encoding="utf-8"
         )
         return lit
 
@@ -1588,3 +1660,376 @@ class TestDispatchingAnAlreadyQueuedCorpusPass:
 
         assert code == 1
         assert "--budget-tokens is required" in capsys.readouterr().err
+
+    def test_allow_unauthenticated_legacy_roots_is_recorded_on_the_queued_action(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C1. The flag must actually reach the queued action's parameters, not
+        merely be accepted and dropped -- that is the operator's authorisation for
+        the next dispatch, recorded the same way ``reread_all`` is."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "250000",
+                "--workspaces",
+                str(tmp_path),
+                "--allow-unauthenticated-legacy-roots",
+                "--dry-run",
+            ]
+        )
+
+        assert code == 0
+        capsys.readouterr()
+        actions = load_plan(ws).actions
+        corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert corpus_action.parameters.get("allow_unauthenticated_legacy_roots") is True
+
+    def test_the_key_is_absent_without_the_flag(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        """C2. Absent, not present-and-False -- matching ``reread_all``'s own
+        convention, so a downstream ``.get(..., False)`` reads the fail-closed
+        default rather than an explicit but redundant False."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            ["corpus-pass", "--campaign", cid, "--budget-tokens", "250000", "--workspaces", str(tmp_path), "--dry-run"]
+        )
+
+        assert code == 0
+        capsys.readouterr()
+        actions = load_plan(ws).actions
+        corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert "allow_unauthenticated_legacy_roots" not in corpus_action.parameters
+
+    def test_the_planner_grants_no_permission_a_caller_did_not_ask_for(self, tmp_path: Path) -> None:
+        """C7. The DEFAULTS, pinned at the API boundary rather than through the CLI.
+
+        Every CLI path passes both flags explicitly, so a mutation flipping either
+        default to True survives the whole suite -- found by a raise-guard audit, not
+        by review. The default is what a programmatic caller that never considered the
+        question gets, and for a permission that must be the refusal: a caller who did
+        not ask to read unauthenticated text has not authorised reading it.
+        """
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import append_corpus_pass_action, load_plan
+
+        _cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        append_corpus_pass_action(ws, budget_tokens=100_000, model_name="m")
+
+        action = next(a for a in load_plan(ws).actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert action.parameters == {}, (
+            "a call that named neither flag must grant neither permission -- an empty "
+            "parameters dict is the only shape that says 'nothing was authorised here'"
+        )
+
+    def test_allow_unauthenticated_legacy_roots_composes_with_reread_all(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C3. The composition trap: two independent boolean flags, each recorded
+        under its own key, must not let one clobber the other's dict entry."""
+        from Carmel import main
+        from carmel.schemas.approval import ActionKind
+        from carmel.services.planner import load_plan
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--budget-tokens",
+                "250000",
+                "--workspaces",
+                str(tmp_path),
+                "--allow-unauthenticated-legacy-roots",
+                "--reread-all",
+                "--dry-run",
+            ]
+        )
+
+        assert code == 0
+        capsys.readouterr()
+        actions = load_plan(ws).actions
+        corpus_action = next(a for a in actions if a.kind == ActionKind.LITERATURE_CORPUS_PASS)
+        assert corpus_action.parameters.get("allow_unauthenticated_legacy_roots") is True
+        assert corpus_action.parameters.get("reread_all") is True
+
+    def test_allow_unauthenticated_legacy_roots_may_not_be_combined_with_dispatch_queued(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """C4. The queued pass already carries the parameters it was approved
+        under; bolting a fresh permission on at dispatch time would defeat the
+        approval -- exactly the reasoning that already refuses --budget-tokens
+        there."""
+        from Carmel import main
+
+        cid, ws = TestCorpusPassCommand()._campaign(tmp_path)
+
+        code = main(
+            [
+                "corpus-pass",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--dispatch-queued",
+                "--allow-unauthenticated-legacy-roots",
+            ]
+        )
+
+        assert code == 1
+        assert "cannot be combined" in capsys.readouterr().err
+        assert ws  # nothing was appended under the rejected authorisation
+
+
+class TestReextractCommand:
+    """The operator-facing verb for re-parsing a stored artifact's raw.bin and
+    appending a new, separately-addressed extraction record.
+
+    Dry run is the default (opposite polarity from ``corpus-pass --dry-run``): a
+    plain ``carmel reextract --sha ...`` must never write, only ``--apply`` does.
+    """
+
+    def _campaign(self, tmp_path: Path) -> tuple[str, Path]:
+        from Carmel import main
+        from carmel.services.campaigns import load_campaign
+
+        assert main(["new-campaign", "--config", str(_write_campaign_config(tmp_path))]) == 0
+        ws = tmp_path / "ws"
+        return load_campaign(ws).campaign_id, ws
+
+    def _config(self, tmp_path: Path) -> Path:
+        # Any config with an 'agents' section works: --config is only there to supply
+        # budget.max_artifact_bytes, no default is invented in Carmel.py itself.
+        return _write_campaign_config(tmp_path)
+
+    def test_neither_sha_nor_all_is_a_usage_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        cid, _ = self._campaign(tmp_path)
+        config = str(self._config(tmp_path))
+
+        code = main(["reextract", "--campaign", cid, "--workspaces", str(tmp_path), "--config", config])
+
+        assert code == 1
+        assert "--sha <raw_sha256> or --all is required" in capsys.readouterr().err
+
+    def test_dry_run_writes_nothing(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Dry run source text"))
+
+        from carmel.services.extraction_record import list_extraction_records
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+            ]
+        )
+
+        assert code == 0
+        assert list_extraction_records(ws, raw_sha256=raw_sha256) == []
+
+    def test_dry_run_reports_the_would_be_sha(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from carmel.services.reextraction import preview_reextraction
+        from tests.test_reextraction import MAX_BYTES, _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Reported source text"))
+        expected_sha256, _ = preview_reextraction(ws, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+            ]
+        )
+
+        assert code == 0
+        assert expected_sha256 in capsys.readouterr().out
+
+    def test_apply_writes_a_new_extraction_record(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from carmel.services.extraction_record import list_extraction_records
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Apply source text"))
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+                "--apply",
+            ]
+        )
+
+        assert code == 0
+        assert len(list_extraction_records(ws, raw_sha256=raw_sha256)) == 1
+        assert "WRITTEN" in capsys.readouterr().out
+
+    def test_apply_twice_is_a_no_op(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from carmel.services.extraction_record import list_extraction_records
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Idempotent apply source text"))
+        config = str(self._config(tmp_path))
+
+        args = [
+            "reextract",
+            "--campaign",
+            cid,
+            "--workspaces",
+            str(tmp_path),
+            "--config",
+            config,
+            "--sha",
+            raw_sha256,
+            "--apply",
+        ]
+        assert main(args) == 0
+        capsys.readouterr()
+        assert main(args) == 0
+        out = capsys.readouterr().out
+
+        assert len(list_extraction_records(ws, raw_sha256=raw_sha256)) == 1
+        assert "ALREADY-PRESENT" in out
+
+    def test_all_reports_the_bad_artifact_and_still_processes_the_good_one(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from carmel.services.extraction_record import list_extraction_records
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        good_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Good artifact source text"))
+        bad_sha256 = _store_synthetic_artifact(ws, b"not a pdf at all, no header")
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--all",
+                "--apply",
+            ]
+        )
+
+        out = capsys.readouterr().out
+        assert code == 1
+        assert f"REFUSED         {bad_sha256}" in out
+        assert "does not sniff as a PDF" in out
+        assert f"WRITTEN         {good_sha256}" in out
+        assert len(list_extraction_records(ws, raw_sha256=good_sha256)) == 1
+
+    def test_apply_refuses_a_bogus_record_directory_instead_of_reporting_already_present(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """ "Already present" must mean an AUTHENTICATED record, never merely a
+        directory existing at the computed address. A directory occupying that
+        address without authenticating to it (here: empty) is a distinct, fatal
+        collision -- ``--apply`` must neither report it as ALREADY-PRESENT (a
+        false success) nor silently exit 0; it must surface an explicit refusal,
+        same as any other ``REFUSED`` case."""
+        from carmel.services.extraction_record import extraction_record_dir
+        from carmel.services.reextraction import preview_reextraction
+        from tests.test_reextraction import MAX_BYTES, _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Bogus record dir CLI source text"))
+        extraction_sha256, _ = preview_reextraction(ws, raw_sha256=raw_sha256, max_bytes=MAX_BYTES)
+        bogus_dir = extraction_record_dir(ws, raw_sha256, extraction_sha256)
+        bogus_dir.mkdir(parents=True)  # exists, but authenticates to nothing: empty.
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+                "--apply",
+            ]
+        )
+
+        out = capsys.readouterr().out
+        assert code == 1
+        assert "ALREADY-PRESENT" not in out
+        assert f"REFUSED         {raw_sha256}" in out
+        assert "does not authenticate as a stored extraction record" in out
+
+    def test_no_consumer_notice_appears_in_run_output(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        from tests.test_reextraction import _build_tiny_pdf, _store_synthetic_artifact
+
+        cid, ws = self._campaign(tmp_path)
+        raw_sha256 = _store_synthetic_artifact(ws, _build_tiny_pdf(b"Notice source text"))
+
+        code = main(
+            [
+                "reextract",
+                "--campaign",
+                cid,
+                "--workspaces",
+                str(tmp_path),
+                "--config",
+                str(self._config(tmp_path)),
+                "--sha",
+                raw_sha256,
+            ]
+        )
+
+        assert code == 0
+        out = capsys.readouterr().out
+        assert "extraction records are read" in out.lower()
+
+    def test_consumer_notice_appears_in_help_text(self, capsys: pytest.CaptureFixture[str]) -> None:
+        with pytest.raises(SystemExit):
+            main(["reextract", "--help"])
+        out = capsys.readouterr().out
+        # argparse line-wraps the description to the terminal width, so compare on
+        # whitespace-normalized text rather than requiring the phrase on one line.
+        normalized = " ".join(out.lower().split())
+        assert "the corpus pass prefers such a record over the root sidecar" in normalized

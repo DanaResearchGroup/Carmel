@@ -9,11 +9,13 @@ directly comparable.
 
 from __future__ import annotations
 
+import math
+import re
 from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from carmel.agents.budget import BudgetDimension, BudgetUsage
 from carmel.schemas.campaign import ReactorType
@@ -21,6 +23,7 @@ from carmel.schemas.campaign import ReactorType
 __all__ = [
     "STOP_REASON_FOR_DIMENSION",
     "Citation",
+    "CoveredDocument",
     "CredenceVerdict",
     "EvidenceRef",
     "ExperimentalBenchmarkPayload",
@@ -37,6 +40,7 @@ __all__ = [
     "QMProperty",
     "Quantity",
     "RejectedFinding",
+    "ROOT_EXTRACTION_ID",
     "SpeciesRef",
     "StopReason",
     "StoredArtifact",
@@ -99,10 +103,17 @@ class Quantity(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    value: float
+    value: float = Field(allow_inf_nan=False)
+    """Finite by construction (``allow_inf_nan=False``): a non-finite value can never
+    be a trustworthy measured quantity, and a stored inf/nan would later surface in
+    the grounding gate as the str(float) required anchor ``'inf'``/``'nan'``, which no
+    source text can ever corroborate."""
     unit: str = Field(min_length=1)
     """Normalized SI-ish unit string."""
-    uncertainty: float | None = None
+    uncertainty: float | None = Field(default=None, allow_inf_nan=False)
+    """Same finite-by-construction guard as ``value``, for the same reason: a
+    stored inf/nan uncertainty would surface as an ungroundable str(float)
+    anchor."""
     raw_text: str | None = None
     """Verbatim text as printed in the source, for grounding checks."""
 
@@ -161,7 +172,15 @@ class ExperimentalBenchmarkPayload(BaseModel):
     temperature_range_K: tuple[float, float] | None = None
     pressure_range_bar: tuple[float, float] | None = None
     equivalence_ratio_range: tuple[float, float] | None = None
-    residence_time_s: float | None = None
+    #: Same finite-by-construction rationale as `Quantity.value`: a stored
+    #: inf/nan bound would surface as an ungroundable str(float) anchor. NOT
+    #: expressed as `Field(allow_inf_nan=False)` on the tuple-typed fields above
+    #: -- probed empirically first (see `_reject_non_finite_range` below) and
+    #: pydantic's `allow_inf_nan` check assumes a bare float/int input; handed a
+    #: tuple it raises an unconditional `TypeError` (a crash, not a clean
+    #: `ValidationError`) even for an ordinary finite tuple. So the three range
+    #: fields instead get an explicit `field_validator` that checks each bound.
+    residence_time_s: float | None = Field(default=None, allow_inf_nan=False)
     species: list[SpeciesRef] = Field(default_factory=list, max_length=20)
     measured: list[Quantity] = Field(default_factory=list, max_length=8)
     apparatus: str | None = None
@@ -172,6 +191,16 @@ class ExperimentalBenchmarkPayload(BaseModel):
     #: 8/20 are not calibrated against the 69-paper corpus -- generous ceilings
     #: chosen to comfortably exceed any legitimate single-finding benchmark report
     #: while still bounding the anchor-checking cost.
+
+    @field_validator("temperature_range_K", "pressure_range_bar", "equivalence_ratio_range")
+    @classmethod
+    def _reject_non_finite_range(cls, value: tuple[float, float] | None) -> tuple[float, float] | None:
+        """Both bounds of a range must be finite, for the same reason
+        `Quantity.value` is finite by construction: a stored inf/nan bound would
+        surface as an ungroundable str(float) anchor in the grounding gate."""
+        if value is not None and not all(math.isfinite(bound) for bound in value):
+            raise ValueError(f"range bounds must be finite, got {value!r}")
+        return value
 
 
 class PriorModelPayload(BaseModel):
@@ -215,11 +244,44 @@ class EvidenceRef(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     artifact_sha256: str = Field(min_length=1)
+    extraction_id: str = Field(min_length=1)
+    """Which of ``artifact_sha256``'s texts ``quote_start``/``quote_end`` index: either
+    :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex ``extraction_sha256`` naming a nested
+    re-extraction record. Naming the raw sha256 alone used to be unambiguous, back when a
+    stored artifact had exactly one extracted text; it no longer is, now that the same raw
+    sha256 can carry a root ``extracted.json`` sidecar AND any number of authenticated
+    re-extraction records, each with its own text and therefore its own offsets for the
+    same quote.
+
+    REQUIRED, with no default, and that absence is deliberate: a producer that never
+    considered the question would otherwise silently claim the root, which is exactly the
+    ambiguity this field exists to close. Character offsets are also never migrated once
+    stored (this project's standing constraint on ``quote_start``/``quote_end``), so a
+    finding accepted without recording which text it indexed could never afterwards be
+    told. See ``CharSpanLocator.text_space`` in ``carmel/schemas/datasets.py`` for the same
+    argument made about a sibling ambiguity.
+    """
     quote_start: int | None = None
-    """Offset into ExtractedText.text."""
+    """Offset into the text named by ``extraction_id``."""
     quote_end: int | None = None
     page: int | None = None
     section_label: str | None = None
+
+    @field_validator("artifact_sha256")
+    @classmethod
+    def _validate_artifact_sha256_shape(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"invalid artifact_sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
+    @field_validator("extraction_id")
+    @classmethod
+    def _validate_extraction_id_shape(cls, value: str) -> str:
+        if value != ROOT_EXTRACTION_ID and not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or 64 lowercase hex characters)"
+            )
+        return value
 
 
 class GroundingStatus(StrEnum):
@@ -395,6 +457,30 @@ class StoredArtifact(BaseModel):
     provenance: ArtifactProvenance = ArtifactProvenance.FETCHED
     """Defaults to ``FETCHED`` so artifacts stored before this field existed keep
     their (correct) meaning: at that time fetching was the only way in."""
+    #: Extractor identity+version string used to produce ``extracted.json``, e.g.
+    #: ``"pdf:pypdf==5.1.0"``, or ``None`` for artifacts stored before this field
+    #: existed. See :func:`carmel.services.evidence._extractor_identity`: ``pypdf``
+    #: is an unpinned dependency (``pypdf>=5.0``), and different installed versions
+    #: of the SAME library are not guaranteed to extract byte-identical text from
+    #: identical PDF bytes, so the exact version in play is worth recording.
+    extractor_version: str | None = None
+    #: sha256 of ``f"{extractor_version}|{sha256}|{extracted_sha256}"`` -- a binding
+    #: of the extractor identity, the raw bytes' digest, and the sidecar's digest
+    #: into one value. ``None`` for artifacts stored before this field existed.
+    #:
+    #: Read exactly what this proves, and no more. It is NOT proof that
+    #: ``extracted.json`` was actually re-derived from ``raw.bin``: re-running the
+    #: extractor is not guaranteed to reproduce byte-identical output (see the
+    #: determinism analysis in ``carmel.services.evidence``), so this digest is
+    #: never recomputed from a fresh extraction. All it proves is INTERNAL
+    #: CONSISTENCY of this ``meta.json`` record -- that ``extracted_sha256`` was not
+    #: changed independently of ``derivation_binding`` after the two were bound
+    #: together at store time. It closes exactly one gap: a stale or swapped
+    #: ``extracted.json`` whose ``extracted_sha256`` was updated to match the new
+    #: (wrong) sidecar, but whose ``derivation_binding`` was left stale because
+    #: nothing recomputed it. It is no defence against a forger who updates both
+    #: fields together.
+    derivation_binding: str | None = None
 
 
 class LiteraturePassMode(StrEnum):
@@ -411,6 +497,269 @@ class LiteraturePassMode(StrEnum):
 
     SEARCH = "search"
     CORPUS = "corpus"
+
+
+class CorpusReadOutcome(StrEnum):
+    """What actually happened when a corpus pass considered ONE held artifact.
+
+    Replaces a single undifferentiated ``skipped`` list, which reported an intact
+    legacy artifact -- one whose bytes are fine but predates ``derivation_binding`` --
+    identically to one whose ``raw.bin`` genuinely no longer hashes to its own name.
+    Those two demand opposite operator responses ("re-extract, or opt in" versus
+    "re-acquire the paper"), so conflating them is forbidden in this project.
+
+    The tiering below is keyed on ``extracted_sha256`` being present, NOT on
+    ``derivation_binding`` being present, and that choice is load-bearing rather than
+    incidental. Keying a tier on the ABSENCE of ``derivation_binding`` would be a
+    downgrade attack with extra steps: "the field was never written" (a legacy
+    artifact) and "the field was deleted" (an artifact someone tampered with) are
+    indistinguishable in the store, so an attacker able to delete the field could
+    manufacture the more permissive tier at will. Keying on ``extracted_sha256``
+    instead is safe in a way that is not, because of its DIRECTION -- deleting
+    ``extracted_sha256`` does not promote an artifact, it DEMOTES one, moving it from
+    ``SIDECAR_DIGEST_ONLY`` down into ``UNAUTHENTICATED_LEGACY_ROOT``, which is
+    refused by default. The same attack that would have laundered a downgrade through
+    ``derivation_binding`` therefore buys the attacker only a refusal here, never an
+    admission.
+    """
+
+    SELF_CONSISTENT_METADATA = "self_consistent_metadata"
+    """``verify_artifact(..., deep=True)`` passed: ``raw.bin`` re-hashes to its own
+    name, the recorded sidecar digest matches ``extracted.json``, and the recorded
+    derivation binding matches one recomputed from ``meta.json``'s own
+    ``extractor_version``/``sha256``/``extracted_sha256``. All three inputs to that
+    recomputation live in the same mutable file, so this is internal consistency of a
+    metadata record, and NOT evidence that the served text came from the stored
+    bytes. What it does buy: it catches the realistic non-adversarial failure, a
+    truncated or interrupted write."""
+
+    SIDECAR_DIGEST_ONLY = "sidecar_digest_only"
+    """As :attr:`SELF_CONSISTENT_METADATA`, minus the binding: deep verification
+    failed, but the default (non-deep) check passed AND ``meta.extracted_sha256`` is
+    not ``None`` -- the sidecar that is actually read WAS digest-checked, but nothing
+    ties it to the raw bytes."""
+
+    UNAUTHENTICATED_LEGACY_ROOT = "unauthenticated_legacy_root"
+    """No sidecar digest was ever recorded: the default check passed, but
+    ``meta.extracted_sha256`` is ``None``, so the text this would serve is checked
+    against nothing at all. Refused by default; readable only under an explicit
+    operator opt-in."""
+
+    EXTRACTION_RECORD_DIGEST_AUTHENTICATED = "extraction_record_digest_authenticated"
+    """Read from a nested extraction record rather than from the root sidecar: exactly
+    one record was current for today's extractor identity, it self-authenticated to its
+    own content address, and its stored text matched its recorded
+    ``extracted_text_sha256``.
+
+    This does NOT establish that the text was derived from ``raw.bin`` -- no check here
+    re-runs the extractor -- and it does not inherit any standard from the root, which
+    is not consulted at all on this path. It is strictly a statement about the record
+    that was actually served.
+
+    Preferred over every root tier whenever it applies, INCLUDING over
+    :attr:`SELF_CONSISTENT_METADATA`. That uniformity is the point: were the record path
+    a fallback for a root that fails to authenticate, deleting ``extracted_sha256`` from
+    a modern root would silently switch which text is served, and nothing on disk
+    distinguishes "legacy root" from "field just deleted" -- so deletion would PROMOTE.
+    Preferring the record unconditionally makes deletion incapable of changing which
+    path is taken."""
+
+    MULTIPLE_CURRENT_EXTRACTION_RECORDS = "multiple_current_extraction_records"
+    """More than one record is current for today's extractor identity at once. Never
+    read, and deliberately NOT resolved by picking one.
+
+    Kept distinct from :attr:`EXTRACTION_RECORD_AUTHENTICATION_FAILED` because the two
+    say opposite things about the store: there, one record was found and it was broken;
+    here, every record may be perfectly intact and the STORE is ambiguous about which
+    one speaks for this document. Collapsing them would send the operator hunting for a
+    corrupt file that does not exist.
+
+    Falling through to the root sidecar instead would be the same downgrade a failed
+    record must not buy: ambiguity among records is not a licence to serve text checked
+    against nothing."""
+
+    EXTRACTION_RECORD_AUTHENTICATION_FAILED = "extraction_record_authentication_failed"
+    """Exactly one record was current, and it failed to authenticate. Never read -- and
+    deliberately NOT downgraded to the root sidecar either.
+
+    Falling back here would hand an attacker precisely the downgrade no operator
+    authorised: break the record, and the unauthenticated root text gets served in its
+    place. A broken record is a refusal, not a reason to trust something else."""
+
+    NO_CURRENT_EXTRACTION_RECORD = "no_current_extraction_record"
+    """Extraction records exist for this artifact, but none matches today's extractor
+    identity. Never read, and deliberately NOT downgraded to the root sidecar.
+
+    Kept distinct from having no records at all, which is the one situation that DOES
+    reach the root tiers. "Nothing was ever stored" and "something was stored and it is
+    stale" are different facts, and only the first can honestly be said to leave the
+    root as the best available evidence: here a better answer existed and has expired,
+    so the fix is re-extraction (``Carmel.py reextract``), not a downgrade."""
+
+    EXTRACTOR_IDENTITY_UNAVAILABLE = "extractor_identity_unavailable"
+    """Today's extractor identity could not be determined, so currentness is unknowable.
+
+    In practice: ``pypdf`` could not be introspected, and
+    :func:`~carmel.services.semantic_deps._pypdf_version` collapses every such failure
+    to ``"unknown"``, which matches no stored version. That silently un-currents EVERY
+    pypdf-extracted record in the campaign at once, so without this member a broken
+    pypdf install would revert an entire corpus to unauthenticated root text with
+    nothing said about it.
+
+    Distinct from :attr:`NO_CURRENT_EXTRACTION_RECORD` because it is a fact about the
+    ENVIRONMENT, not the documents. Reporting staleness here would send the operator to
+    re-extract every paper when what is actually broken is their pypdf install."""
+
+    UNUSABLE_EXTRACTION_RECORD_PRESENT = "unusable_extraction_record_present"
+    """At least one sha-shaped entry under ``extractions/`` could not be read at all.
+
+    Never read, because a candidate record that cannot be examined cannot be counted,
+    and the count is load-bearing. Skipping it instead -- which is what a plain list of
+    readable records does -- lets corrupting ONE ``meta.json`` turn two current records
+    (ambiguous, refuses) into one (selected, served). That is a tamper-to-PROMOTE: the
+    attacker gains a read by destroying evidence, the opposite direction from the
+    downgrade :attr:`EXTRACTION_RECORD_AUTHENTICATION_FAILED` guards."""
+
+    EXTRACTION_RECORD_STORE_UNREADABLE = "extraction_record_store_unreadable"
+    """The ``extractions/`` directory exists but could not be enumerated (permissions,
+    EIO, ...). Never read.
+
+    "The store could not answer" is not "the store answered that there is nothing
+    here", and only the latter may fall through to the root tiers."""
+
+    EMPTY_EXTRACTION_RECORD_STORE_PRESENT = "empty_extraction_record_store_present"
+    """The ``extractions/`` directory exists and holds no record. Never read.
+
+    ``store_extraction_record`` creates the directory before it creates the record, so an
+    interrupted write -- a crash, a full disk, a SIGKILL -- leaves exactly this state. It
+    is NOT "this artifact predates the record store": a write was begun. Reading the root
+    sidecar here would let a crash mid-write silently downgrade the document, and because
+    records are append-only nothing afterwards repairs it. Re-extraction is the fix."""
+
+    EXTRACTION_RECORD_STORE_LINK_DANGLING = "extraction_record_store_link_dangling"
+    """Something is at the ``extractions/`` path but it cannot be entered. Never read.
+
+    A symlink whose target does not exist is the reachable case. Detected with ``lexists``
+    rather than ``exists``, which follows symlinks and so reported a broken link as an
+    ABSENT store -- making the single most permissive outcome forgeable by planting one
+    link."""
+
+    EXTRACTION_RECORD_STORE_ESCAPES_WORKSPACE = "extraction_record_store_escapes_workspace"
+    """The ``extractions/`` directory resolves OUTSIDE the workspace root. Never read.
+
+    Distinct from :attr:`EXTRACTION_RECORD_STORE_UNREADABLE`, which is an IO error the
+    operator fixes with permissions. This is a containment breach -- a planted symlink, a
+    restored backup, a stray bind mount -- and the honest report is that the store was
+    pointed somewhere it may not go, not that it was hard to read.
+
+    Before this outcome existed the condition raised out of the per-artifact loop, so ONE
+    such artifact aborted the corpus pass for every other document. Refusing costs one
+    paper; raising cost the campaign."""
+
+    INTEGRITY_FAILED = "integrity_failed"
+    """The bytes themselves do not match what was recorded: the default (non-deep)
+    check itself failed, because ``raw.bin`` is absent or no longer hashes to the
+    directory naming it, or a RECORDED sidecar digest no longer matches. Never read,
+    regardless of any opt-in -- an opt-in for unauthenticated-but-intact bytes must
+    not launder bytes that are not even intact."""
+
+    MISSING_TEXT = "missing_text"
+    """Verification (at whichever tier applies) passed, but ``load_artifact_text``
+    returned ``None`` anyway: there is nothing to quote from."""
+
+    UNREADABLE_META = "unreadable_meta"
+    """Seeded from :func:`~carmel.services.evidence.list_artifacts_with_unreadable`: a
+    directory with no readable ``meta.json`` never becomes a :class:`StoredArtifact` at
+    all, so none of the checks above ever ran against it."""
+
+
+#: Matched with ``fullmatch``, never ``match``. Python's ``$`` also matches just BEFORE a
+#: trailing newline, so ``re.match`` on this pattern accepts ``"a" * 64 + "\n"`` -- a value
+#: that is not a sha256 but would be carried around as though it were one. The anchors are
+#: kept for readability; ``fullmatch`` is what actually closes that hole.
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+#: Sentinel ``extraction_id`` naming the root ``extracted.json`` sidecar -- the text
+#: extracted directly from a stored artifact's own bytes, as opposed to a later
+#: re-extraction under ``evidence/literature/<raw_sha256>/extractions/<extraction_sha256>/``
+#: (see ``carmel.services.reextraction``). Deliberately the literal string ``"root"``
+#: rather than a 64-hex digest: a root sidecar is not content-addressed by its own hash.
+#: Its identity is the raw document's address, not its own bytes', so it has no sha256 of
+#: its own to key on. That identity is stable precisely because root sidecars are
+#: immutable -- this project never rewrites one, not even to upgrade a legacy one.
+#: A short literal also can never collide with a genuine 64-lowercase-hex extraction_id,
+#: so "root" and "some specific extraction" are always distinguishable by shape alone.
+ROOT_EXTRACTION_ID = "root"
+
+
+class CoveredDocument(BaseModel):
+    """One (document, extraction) pair a corpus pass actually read.
+
+    Coverage keyed by raw sha256 alone cannot distinguish "this raw document was
+    read" from "this SPECIFIC extraction of it was read" -- a single stored document
+    can have more than one extraction on disk (the root sidecar, plus whatever
+    re-extraction has produced since). Keying by the pair means a document covered
+    under one extraction identity is correctly NOT skipped when a later pass would
+    read it under a different one.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw_sha256: str = Field(min_length=1)
+    extraction_id: str = Field(min_length=1)
+    """Either :data:`ROOT_EXTRACTION_ID` or a 64-lowercase-hex extraction sha256."""
+    verification_standard: str = Field(min_length=1)
+    """Which :class:`CorpusReadOutcome` this document was actually read under: one of
+    ``EXTRACTION_RECORD_DIGEST_AUTHENTICATED``, ``SELF_CONSISTENT_METADATA``,
+    ``SIDECAR_DIGEST_ONLY``, ``UNAUTHENTICATED_LEGACY_ROOT``, or the literal
+    ``"unrecorded"``.
+
+    REQUIRED, with no default, for the same reason :attr:`EvidenceRef.extraction_id`
+    has none. Reports are APPEND-ONLY: if a pass does not record whether a document
+    was read deep, shallow, or unauthenticated, no future reader can ever reconstruct
+    it, because the answer depended on the store's state and the operator's flag at
+    that instant, and neither is recoverable afterwards. A default would let a
+    producer that never considered the question silently claim a standard it did not
+    check, which is exactly the ambiguity this field exists to close.
+
+    ``"unrecorded"`` is for MIGRATED records only -- stamped onto every ``covered``
+    entry that predates this field, because no earlier writer could have had grounds
+    to claim any real standard. A live pass must never write it.
+    """
+
+    @field_validator("raw_sha256")
+    @classmethod
+    def _validate_raw_sha256_shape(cls, value: str) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"invalid raw_sha256: {value!r} (expected 64 lowercase hex characters)")
+        return value
+
+    @field_validator("extraction_id")
+    @classmethod
+    def _validate_extraction_id_shape(cls, value: str) -> str:
+        if value != ROOT_EXTRACTION_ID and not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"invalid extraction_id: {value!r} (expected {ROOT_EXTRACTION_ID!r} or 64 lowercase hex characters)"
+            )
+        return value
+
+    @field_validator("verification_standard")
+    @classmethod
+    def _validate_verification_standard_shape(cls, value: str) -> str:
+        allowed = {
+            CorpusReadOutcome.EXTRACTION_RECORD_DIGEST_AUTHENTICATED.value,
+            CorpusReadOutcome.SELF_CONSISTENT_METADATA.value,
+            CorpusReadOutcome.SIDECAR_DIGEST_ONLY.value,
+            CorpusReadOutcome.UNAUTHENTICATED_LEGACY_ROOT.value,
+            "unrecorded",
+        }
+        if value not in allowed:
+            raise ValueError(
+                f"invalid verification_standard: {value!r} (expected one of "
+                f"{sorted(allowed)!r} -- the other CorpusReadOutcome members name ways a "
+                "document was NOT read, so nothing could have been read under them)"
+            )
+        return value
 
 
 class QueryRecord(BaseModel):
@@ -439,16 +788,23 @@ class PassRecord(BaseModel):
     stop_reason: StopReason
     usage: BudgetUsage
     warnings: list[str] = Field(default_factory=list)
-    covered_sha256: list[str] = Field(default_factory=list)
-    """The artifacts this pass actually READ, whether or not they yielded a finding.
+    covered: list[CoveredDocument] = Field(default_factory=list)
+    """The (document, extraction) pairs this pass actually READ, whether or not they
+    yielded a finding.
 
     Recorded so a later corpus pass can skip what has already been mined. Findings
     alone cannot answer that: a document read and found barren produces nothing to
     attribute, and is exactly the document a later pass must not pay to re-read.
 
+    Keyed by the PAIR, not the raw sha256 alone: a single stored document can have
+    more than one extraction on disk, and coverage of one extraction must not be
+    read as coverage of a different one (see :class:`CoveredDocument`).
+
     Empty on a search pass, and on any v2 report migrated forward -- for those, what
     was covered was never written down, so the honest value is "nothing recorded"
-    rather than a guess reconstructed from findings.
+    rather than a guess reconstructed from findings. A v3 report migrates its
+    ``covered_sha256`` forward with every entry's ``extraction_id`` set to
+    :data:`ROOT_EXTRACTION_ID`, since that field only ever recorded root-sidecar reads.
     """
 
 
@@ -456,7 +812,7 @@ class PassRecord(BaseModel):
 #: outright by :func:`~carmel.services.literature.migrate_report_payload` rather than
 #: read on a best-effort basis, so an older Carmel cannot silently rewrite (and thereby
 #: truncate) a report written by a newer one.
-CURRENT_REPORT_SCHEMA_VERSION = 3
+CURRENT_REPORT_SCHEMA_VERSION = 6
 
 
 class LiteratureReport(BaseModel):
