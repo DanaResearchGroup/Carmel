@@ -45,16 +45,23 @@ jobs:
   # environment is the one supported mypy target; the `agents` job below
   # (its display name says "(required)") owns typecheck there.
   #
-  # ENFORCEMENT GAP: despite that "(required)" in its name, the `agents` job
-  # is NOT actually listed in the repo's "Protect Main" ruleset
-  # (`gh api repos/DanaResearchGroup/Carmel/rulesets/14702943` ->
-  # required_status_checks), only `Lint + format + typecheck (required)`,
-  # `Tests + packaging smoke (required) (3.14)`, `Check CLA signature`, and
-  # `build` are. So as of this change, a red mypy result in the `agents` job
-  # cannot block a merge -- it can only go red without gating anything. This
-  # is an admin-only fix: someone with repo admin rights needs to add the
-  # `agents` job to the ruleset's required status checks to restore typecheck
-  # as an actual merge gate.
+  # ENFORCEMENT (verified 2026-08-12; this WAS a real gap when first written):
+  # the `agents` job IS now listed in the repo's "Protect Main" ruleset, so a
+  # red mypy result here genuinely blocks a merge. The five required contexts
+  # are `Lint + format + typecheck (required)`,
+  # `Tests + packaging smoke (required) (3.14)`, `Check CLA signature`,
+  # `build`, and `Agents extra -- tests + typecheck (required)`.
+  #
+  # Re-check with `gh api repos/DanaResearchGroup/Carmel/rulesets/14702943`
+  # (-> rules[].parameters.required_status_checks) rather than trusting this
+  # comment. The paragraph that used to sit here stayed stale after the gap
+  # was closed, and an adversarial review then took it at face value and
+  # reported the merge gate as weaker than it actually is. A stale claim about
+  # enforcement is worse than no claim: depending on which way it has rotted it
+  # produces either false alarm or misplaced confidence.
+  #
+  # NOTE: the ruleset matches on the display-name context string, so RENAMING
+  # a job silently drops it from the required set.
   lint:
     name: Lint + format + typecheck (required)
     runs-on: ubuntu-latest
