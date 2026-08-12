@@ -209,6 +209,87 @@ REPAIR_NAMES: frozenset[str] = frozenset(
 )
 
 
+class AffixClass(StrEnum):
+    """What kind of numeral-modifying affix a standalone token is.
+
+    Lives HERE, beside the grammar whose literals it is built from, because this module
+    already owns the sign/repair/mojibake vocabulary
+    (:data:`_CORE_VALUE_RE`, :data:`REPAIR_NAMES`). A second copy grown in a geometry
+    module would drift from the parser that actually decides what a numeral means --
+    the same collision :class:`carmel.services.pdf_fragments.GlyphMapping` was renamed
+    to avoid.
+    """
+
+    SIGN = "sign"
+    DECIMAL = "decimal"
+    EXPONENT = "exponent"
+    RELATIONAL = "relational"
+
+
+#: The EXPLICIT affix vocabulary: tokens that cannot stand as a value on their own AND
+#: silently change the meaning of a numeral they abut.
+#:
+#: Explicit rather than "anything that cannot stand alone", because that broader rule
+#: was MEASURED against the real corpus and is far too aggressive: reference brackets
+#: (``[23]``) and lone footnote letters are legitimate standalone table cells, and
+#: including them takes a neighbour-refusal rule from 3.10% of proposals to 22.5%.
+#:
+#: Bare ``10`` is deliberately ABSENT despite being half of every ``x 10^n``
+#: construct. ``10`` standing alone is an ordinary value, and a column of round
+#: numbers is not suspicious; the multiplication glyph that makes it an exponent is
+#: itself in :attr:`AffixClass.EXPONENT`, so the construct is caught by its operator
+#: instead of by its operand.
+#:
+#: EXPONENT holds only TRUE multiplication glyphs, not their ASCII lookalikes, and the
+#: corpus is unambiguous about why. As standalone tokens, ``e`` occurs 1781 times,
+#: ``x`` 115, ``X`` 52 and ``*`` 9 -- and they are word-split fragments ("e" out of
+#: running prose, "x" out of "experimental"/"expanding"), the mole-fraction LABEL
+#: (``X`` is followed by the broken-``=`` mojibake 5 times), and a footnote marker
+#: ("*Corresponding author"). None is a multiplication sign. ``×`` and ``·`` occur
+#: standalone 0 and 1 times respectively, so including them guards the real construct
+#: at essentially zero measured cost.
+#:
+#: A superscript exponent (the ``-3`` of ``10^-3``) is NOT covered here at all: it sits
+#: off the baseline, so it falls outside a caller's vertical band rather than being
+#: classified. That is a stated limit of the band, not a gap in this vocabulary.
+#:
+#: The mojibake entries are the SAME broken-``ToUnicode`` shapes
+#: :func:`_normalize_single_value` repairs -- thorn for ``+`` (hence SIGN) and ``1/4``
+#: for ``=`` (hence RELATIONAL, not SIGN: it is a broken relational operator, and the
+#: refusal an operator reads should name what the glyph really was).
+_AFFIX_TOKENS: dict[str, AffixClass] = {
+    **dict.fromkeys(["-", "+", "−", "–", "±", "∓", "þ"], AffixClass.SIGN),
+    **dict.fromkeys([".", ","], AffixClass.DECIMAL),
+    **dict.fromkeys(["×", "·"], AffixClass.EXPONENT),
+    **dict.fromkeys(
+        ["=", "<", ">", "≤", "≥", "~", "≈", "≃", "≅", "¼"],
+        AffixClass.RELATIONAL,
+    ),
+}
+
+#: A glyph that had no usable ``ToUnicode`` mapping. Such a token is classed SIGN
+#: because that is the damage it does: the corpus's detached minus signs arrive as
+#: ``/C0``, and reading one as absent inverts the number's sign silently. Kept
+#: deliberately narrow on both sides for the reason
+#: :data:`carmel.services.pdf_fragments._UNMAPPED_MARKER_RE` gives -- an unanchored
+#: ``/C\d+`` flags ``/C2H4`` and every ``H2/CO`` species list in a combustion corpus.
+_UNMAPPED_AFFIX_RE = re.compile(r"^(?:\(cid:\d+\)|/[cC]\d+|�)$")
+
+
+def classify_affix(token: str) -> AffixClass | None:
+    """Classify a STANDALONE token as a numeral-modifying affix, or ``None``.
+
+    ``None`` means only "not a member of the explicit affix vocabulary". It is NOT a
+    claim that the token is a safe value, and no caller may treat it as one.
+    """
+    stripped = token.strip()
+    if not stripped:
+        return None
+    if _UNMAPPED_AFFIX_RE.match(stripped):
+        return AffixClass.SIGN
+    return _AFFIX_TOKENS.get(stripped)
+
+
 #: THE single shared GRAMMAR BODY, codebase-wide, for where a numeral "candidate"
 #: begins in free-running text -- factored out so two independent trailing-boundary
 #: choices (see :data:`NUMERAL_CANDIDATE_RE` and :data:`NUMERAL_EXTENT_RE` below)
