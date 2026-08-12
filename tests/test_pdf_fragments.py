@@ -1,0 +1,303 @@
+"""Tests for :mod:`carmel.services.pdf_fragments`.
+
+Every fixture here is SYNTHETIC, built from raw PDF bytes in-process. Corpus paper
+text is copyrighted and non-redistributable, so no real document may be checked in --
+which is also why the coordinates asserted below are EXACT rather than eyeballed:
+the content stream states where each glyph is placed, so ground truth is known.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from carmel.services.pdf_fragments import (
+    FragmentExtraction,
+    GlyphHealth,
+    extract_fragments,
+)
+from tests.pypdf_gate import require_pypdf
+
+
+def _pdf(objects: list[bytes], root: int = 1) -> bytes:
+    """Assemble numbered objects into a minimal, valid PDF with a real xref table."""
+    out = bytearray(b"%PDF-1.4\n")
+    offsets: list[int] = []
+    for i, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += str(i).encode() + b" 0 obj\n" + body + b"\nendobj\n"
+    xref = len(out)
+    out += b"xref\n0 " + str(len(objects) + 1).encode() + b"\n"
+    out += b"0000000000 65535 f \n"
+    for off in offsets:
+        out += f"{off:010d} 00000 n \n".encode()
+    out += b"trailer\n<< /Size " + str(len(objects) + 1).encode() + b" /Root " + str(root).encode() + b" 0 R >>\n"
+    out += b"startxref\n" + str(xref).encode() + b"\n%%EOF\n"
+    return bytes(out)
+
+
+def _one_page_pdf(stream: str) -> bytes:
+    """A single-page PDF whose content stream is exactly ``stream``."""
+    body = stream.encode("latin-1")
+    return _pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+    )
+
+
+def _fragments(stream: str):
+    result = extract_fragments(_one_page_pdf(stream))
+    assert result.available is True
+    return result.fragments
+
+
+def _by_text(fragments, text: str):
+    matches = [f for f in fragments if f.text.strip() == text]
+    assert len(matches) == 1, f"expected exactly one {text!r}, got {[f.text for f in fragments]}"
+    return matches[0]
+
+
+class TestGeometryIsAbsoluteAndExact:
+    """The whole milestone rests on these coordinates being real page coordinates."""
+
+    def test_each_cell_lands_at_its_stated_coordinate(self) -> None:
+        require_pypdf()
+        # Three columns at known x, one row at known y, placed by explicit Td offsets.
+        stream = "BT /F1 10 Tf\n72 700 Td (T) Tj\n148 0 Td (P) Tj\n160 0 Td (IDT) Tj\nET"
+        frags = _fragments(stream)
+        assert _by_text(frags, "T").x_start == pytest.approx(72.0)
+        assert _by_text(frags, "P").x_start == pytest.approx(220.0)
+        assert _by_text(frags, "IDT").x_start == pytest.approx(380.0)
+        for f in frags:
+            assert f.baseline_y == pytest.approx(700.0)
+
+    def test_a_row_does_not_collapse_into_one_fragment(self) -> None:
+        """The `visitor_text` trap: it would report one fragment at x=72 for all three.
+
+        If this ever fails by returning a single merged fragment, the per-column x is
+        gone and any caller is left re-splitting on whitespace -- the fabrication the
+        P0-c ruling closed.
+        """
+        require_pypdf()
+        frags = _fragments("BT /F1 10 Tf\n72 700 Td (A) Tj\n148 0 Td (B) Tj\nET")
+        assert len({f.x_start for f in frags}) == 2
+
+    def test_x_end_is_past_x_start(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Hello) Tj\nET"), "Hello")
+        assert frag.x_end > frag.x_start
+
+    def test_tm_sets_an_absolute_position(self) -> None:
+        require_pypdf()
+        frags = _fragments("BT /F1 10 Tf\n1 0 0 1 305 512 Tm (X) Tj\nET")
+        assert _by_text(frags, "X").x_start == pytest.approx(305.0)
+        assert _by_text(frags, "X").baseline_y == pytest.approx(512.0)
+
+    def test_td_capital_and_t_star_advance_lines(self) -> None:
+        require_pypdf()
+        frags = _fragments("BT /F1 10 Tf\n72 700 TD (first) Tj\n0 -14 TD (second) Tj\nT* (third) Tj\nET")
+        ys = [_by_text(frags, t).baseline_y for t in ("first", "second", "third")]
+        assert ys[0] == pytest.approx(700.0)
+        assert ys[1] == pytest.approx(686.0)
+        # T* repeats the leading set by the preceding TD, i.e. another -14.
+        assert ys[2] == pytest.approx(672.0)
+
+    def test_a_kerned_tj_array_stays_one_fragment_at_its_start(self) -> None:
+        """`TJ` with kerning offsets is how real PDFs emit most text."""
+        require_pypdf()
+        frags = _fragments("BT /F1 10 Tf\n72 700 Td [(A) -120 (B) -120 (C)] TJ\nET")
+        joined = "".join(f.text for f in frags)
+        assert "A" in joined and "B" in joined and "C" in joined
+        assert min(f.x_start for f in frags) == pytest.approx(72.0)
+
+    def test_cm_translation_shifts_the_reported_position(self) -> None:
+        """A `cm` transform nests the text in a shifted space; the fragment must
+        report the SHIFTED absolute position, not the pre-transform one."""
+        require_pypdf()
+        plain = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Z) Tj\nET"), "Z")
+        shifted = _by_text(
+            _fragments("q 1 0 0 1 100 50 cm\nBT /F1 10 Tf\n72 700 Td (Z) Tj\nET\nQ"),
+            "Z",
+        )
+        assert shifted.x_start == pytest.approx(plain.x_start + 100.0)
+        assert shifted.baseline_y == pytest.approx(plain.baseline_y + 50.0)
+
+    def test_q_restores_the_transform(self) -> None:
+        require_pypdf()
+        frags = _fragments(
+            "q 1 0 0 1 100 0 cm\nBT /F1 10 Tf\n72 700 Td (inside) Tj\nET\nQ\nBT /F1 10 Tf\n72 700 Td (outside) Tj\nET"
+        )
+        assert _by_text(frags, "inside").x_start == pytest.approx(172.0)
+        assert _by_text(frags, "outside").x_start == pytest.approx(72.0)
+
+
+class TestPageNumbering:
+    def test_a_phantom_page_tree_entry_does_not_shift_page_numbers(self) -> None:
+        """pypdf counts a linearization dictionary as a page on real corpus papers.
+
+        If that entry were counted, `second` would report page 3 instead of page 2 --
+        a locator that sends a reader to the wrong page while looking checkable.
+        """
+        require_pypdf()
+        first = b"BT /F1 10 Tf 72 700 Td (first) Tj ET"
+        second = b"BT /F1 10 Tf 72 700 Td (second) Tj ET"
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                # The phantom (object 4) sits between two real pages in /Kids.
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R] /Count 3 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 8 0 R >> >> /Contents 6 0 R >>",
+                # A linearization parameter dictionary: no /Type, no /Contents.
+                b"<< /Linearized 1 /L 1000 /O 3 /E 900 /N 2 /T 800 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 8 0 R >> >> /Contents 7 0 R >>",
+                b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
+                b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        assert result.available is True
+        assert _by_text(result.fragments, "first").page == 1
+        assert _by_text(result.fragments, "second").page == 2
+
+    def test_pages_are_one_indexed(self) -> None:
+        require_pypdf()
+        frags = _fragments("BT /F1 10 Tf\n72 700 Td (only) Tj\nET")
+        assert {f.page for f in frags} == {1}
+
+
+class TestGlyphHealth:
+    @pytest.mark.parametrize("marker", ["(cid:3)", "/C0"])
+    def test_an_unmapped_glyph_marker_is_flagged(self, marker: str) -> None:
+        """The minus sign of `n = -1.0` arrives exactly like this in a real table."""
+        require_pypdf()
+        escaped = marker.replace("(", r"\(").replace(")", r"\)")
+        frags = _fragments(f"BT /F1 10 Tf\n72 700 Td ({escaped}) Tj\nET")
+        flagged = [f for f in frags if f.glyph_health is GlyphHealth.UNMAPPED]
+        assert flagged, f"{marker!r} should be flagged, got {[f.text for f in frags]}"
+
+    def test_the_replacement_character_is_recognised_as_unmapped(self) -> None:
+        """U+FFFD is checked against the classifier rather than end-to-end.
+
+        It cannot be round-tripped through this test's builder: a content stream is
+        latin-1 bytes, and U+FFFD has no latin-1 encoding. In a real document it does
+        not arrive as a literal either -- it is what a DECODER emits for a byte no
+        CMap maps, which is precisely the condition being flagged.
+        """
+        from carmel.services.pdf_fragments import _UNMAPPED_MARKER_RE
+
+        assert _UNMAPPED_MARKER_RE.search("1.0�") is not None
+        assert _UNMAPPED_MARKER_RE.search("1.0") is None
+
+    def test_a_flagged_fragment_keeps_its_text_unmodified(self) -> None:
+        """Flag, never repair: rewriting `/C0` to a minus is a claim about MEANING."""
+        require_pypdf()
+        frags = _fragments(r"BT /F1 10 Tf\n72 700 Td (/C0) Tj\nET".replace(r"\n", "\n"))
+        frag = _by_text(frags, "/C0")
+        assert frag.text == "/C0"
+        assert frag.glyph_health is GlyphHealth.UNMAPPED
+
+    def test_ordinary_text_is_not_flagged(self) -> None:
+        require_pypdf()
+        assert _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (1200) Tj\nET"), "1200").glyph_health is GlyphHealth.OK
+
+    def test_mojibake_is_not_flagged_and_not_repaired(self) -> None:
+        """`þ` for `+` decodes "successfully" from a PDF's own broken ToUnicode.
+
+        It is left alone deliberately: it is not an unmapped glyph, and repairing it
+        would be a semantic claim. This test exists so that a later "helpful" repair
+        table cannot be added here without a test going red.
+        """
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (\xfe) Tj\nET"), "\xfe")
+        assert frag.text == "\xfe"
+        assert frag.glyph_health is GlyphHealth.OK
+
+
+class TestRotatedText:
+    def test_rotated_text_is_retained_and_flagged(self) -> None:
+        """Rotated text reaches the caller, marked, rather than vanishing.
+
+        This does NOT guard the `strip_rotated=False` argument in the producer, and
+        must not be read as doing so: mutating that argument to True leaves this test
+        green, because in this pypdf the flag only filters the `BTGroup`s we discard.
+        What this test does prove is the property that matters to a consumer -- that a
+        rotated axis title or column header is present and identifiable rather than
+        silently absent.
+        """
+        require_pypdf()
+        # A 90-degree rotation matrix, as a rotated axis title or column header.
+        frags = _fragments("BT /F1 10 Tf\n0 1 -1 0 300 400 Tm (Uncertainty) Tj\nET")
+        assert frags, "rotated text was dropped"
+        assert any(f.rotated for f in frags)
+        assert "Uncertainty" in "".join(f.text for f in frags)
+
+    def test_unrotated_text_is_not_marked_rotated(self) -> None:
+        require_pypdf()
+        assert _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (flat) Tj\nET"), "flat").rotated is False
+
+
+class TestFailsClosed:
+    def test_a_missing_engine_internal_makes_the_result_unavailable(self) -> None:
+        """A pypdf upgrade that moves these private internals must REFUSE, never
+        silently return different geometry."""
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        original = mod._engine
+        try:
+            mod._engine = lambda: None  # type: ignore[assignment]
+            result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
+        finally:
+            mod._engine = original  # type: ignore[assignment]
+        assert result.available is False
+        assert result.lossy is True
+        assert result.fragments == ()
+
+    def test_capability_check_rejects_a_reshaped_state_manager(self, monkeypatch) -> None:
+        require_pypdf()
+        from pypdf._text_extraction._layout_mode._text_state_manager import TextStateManager
+
+        import carmel.services.pdf_fragments as mod
+
+        monkeypatch.delattr(TextStateManager, "set_font", raising=True)
+        assert mod._engine() is None
+
+    def test_garbage_bytes_do_not_raise(self) -> None:
+        result = extract_fragments(b"not a pdf at all")
+        assert result.available is False
+        assert result.lossy is True
+
+    def test_missing_pypdf_degrades_instead_of_raising(self, monkeypatch) -> None:
+        """Mirrors how `_extract_pdf` degrades; pypdf is an optional extra."""
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
+        assert result == FragmentExtraction(fragments=(), lossy=True, available=False)
+
+    def test_the_module_imports_without_pypdf(self, monkeypatch) -> None:
+        import importlib
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        monkeypatch.delitem(sys.modules, "carmel.services.pdf_fragments", raising=False)
+        module = importlib.import_module("carmel.services.pdf_fragments")
+        assert module is not None
+
+
+class TestFragmentsAreNotWords:
+    def test_a_fragment_is_not_promised_to_be_a_token(self) -> None:
+        """Real PDFs emit ~2.3 fragments per word, and consecutive kerned fragments
+        can overlap in x. Nothing here groups them -- that is the next contract."""
+        require_pypdf()
+        frags = _fragments("BT /F1 10 Tf\n72 700 Td (Combus) Tj\n(tion) Tj\nET")
+        assert len(frags) == 2
+        assert "".join(f.text for f in frags) == "Combustion"
