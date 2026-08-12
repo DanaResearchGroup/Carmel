@@ -12,7 +12,7 @@ import pytest
 
 from carmel.services.pdf_fragments import (
     FragmentExtraction,
-    GlyphHealth,
+    GlyphMapping,
     extract_fragments,
 )
 from tests.pypdf_gate import require_pypdf
@@ -51,8 +51,15 @@ def _one_page_pdf(stream: str) -> bytes:
 
 
 def _fragments(stream: str):
+    """Fragments from a clean synthetic page.
+
+    Asserts `lossy is False` as well: without it, a per-page failure that swallowed
+    every fragment would leave these tests asserting over an empty tuple, and several
+    would pass vacuously.
+    """
     result = extract_fragments(_one_page_pdf(stream))
     assert result.available is True
+    assert result.lossy is False, f"unexpected loss: {result.page_failures}"
     return result.fragments
 
 
@@ -173,14 +180,14 @@ class TestPageNumbering:
         assert {f.page for f in frags} == {1}
 
 
-class TestGlyphHealth:
+class TestGlyphMapping:
     @pytest.mark.parametrize("marker", ["(cid:3)", "/C0"])
     def test_an_unmapped_glyph_marker_is_flagged(self, marker: str) -> None:
         """The minus sign of `n = -1.0` arrives exactly like this in a real table."""
         require_pypdf()
         escaped = marker.replace("(", r"\(").replace(")", r"\)")
         frags = _fragments(f"BT /F1 10 Tf\n72 700 Td ({escaped}) Tj\nET")
-        flagged = [f for f in frags if f.glyph_health is GlyphHealth.UNMAPPED]
+        flagged = [f for f in frags if f.glyph_mapping is GlyphMapping.UNMAPPED]
         assert flagged, f"{marker!r} should be flagged, got {[f.text for f in frags]}"
 
     def test_the_replacement_character_is_recognised_as_unmapped(self) -> None:
@@ -202,11 +209,13 @@ class TestGlyphHealth:
         frags = _fragments(r"BT /F1 10 Tf\n72 700 Td (/C0) Tj\nET".replace(r"\n", "\n"))
         frag = _by_text(frags, "/C0")
         assert frag.text == "/C0"
-        assert frag.glyph_health is GlyphHealth.UNMAPPED
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
 
     def test_ordinary_text_is_not_flagged(self) -> None:
         require_pypdf()
-        assert _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (1200) Tj\nET"), "1200").glyph_health is GlyphHealth.OK
+        assert (
+            _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (1200) Tj\nET"), "1200").glyph_mapping is GlyphMapping.MAPPED
+        )
 
     def test_mojibake_is_not_flagged_and_not_repaired(self) -> None:
         """`þ` for `+` decodes "successfully" from a PDF's own broken ToUnicode.
@@ -218,7 +227,7 @@ class TestGlyphHealth:
         require_pypdf()
         frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (\xfe) Tj\nET"), "\xfe")
         assert frag.text == "\xfe"
-        assert frag.glyph_health is GlyphHealth.OK
+        assert frag.glyph_mapping is GlyphMapping.MAPPED
 
 
 class TestRotatedText:
@@ -287,6 +296,19 @@ class TestFailsClosed:
         import importlib
         import sys
 
+        import carmel.services
+
+        # Restoring `sys.modules` alone is NOT enough to undo a re-import, and getting
+        # this wrong silently poisons every later test in the file.
+        # `importlib.import_module` also rebinds the attribute on the PARENT package,
+        # so `carmel.services.pdf_fragments` keeps pointing at the throwaway module
+        # even after monkeypatch puts the original back into `sys.modules`. A later
+        # `import carmel.services.pdf_fragments as mod` then resolves through the
+        # package attribute and hands back the STALE copy -- so monkeypatching `mod`
+        # patches an object the code under test never consults, and the assertions
+        # evaluate against unpatched behaviour while looking like they passed.
+        # Observed: it broke three later tests in this file.
+        monkeypatch.setattr(carmel.services, "pdf_fragments", carmel.services.pdf_fragments)
         monkeypatch.setitem(sys.modules, "pypdf", None)
         monkeypatch.delitem(sys.modules, "carmel.services.pdf_fragments", raising=False)
         module = importlib.import_module("carmel.services.pdf_fragments")
@@ -301,3 +323,142 @@ class TestFragmentsAreNotWords:
         frags = _fragments("BT /F1 10 Tf\n72 700 Td (Combus) Tj\n(tion) Tj\nET")
         assert len(frags) == 2
         assert "".join(f.text for f in frags) == "Combustion"
+
+
+class TestUnmappedMarkerDoesNotFireOnChemistry:
+    """False positives here are not cosmetic.
+
+    This is a combustion codebase: species labels, mixture ratios and appendix
+    numbering are full of slashes followed by C and a digit. An unanchored `/C\\d+`
+    substring match flags all of them as corrupt. The flag is advisory today, but it
+    is being built to feed a refusal gate, and a gate that refuses `C2H4` rows would
+    quietly delete real chemistry.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        ["/C2H4", "C1/C2", "H2/CO", "nC7H16/O2", "A/C3", "/C2H2", "Fig/C1a"],
+    )
+    def test_ordinary_chemistry_is_not_flagged(self, text: str) -> None:
+        from carmel.services.pdf_fragments import _UNMAPPED_MARKER_RE
+
+        assert _UNMAPPED_MARKER_RE.search(text) is None, f"{text!r} must not be flagged"
+
+    @pytest.mark.parametrize("text", ["/C0", "-/C0 1.0", "(cid:3)", "x(cid:127)y"])
+    def test_real_markers_still_fire(self, text: str) -> None:
+        from carmel.services.pdf_fragments import _UNMAPPED_MARKER_RE
+
+        assert _UNMAPPED_MARKER_RE.search(text) is not None, f"{text!r} must be flagged"
+
+
+class TestAnEngineMismatchIsNotAPageFailure:
+    """`available=False` and `lossy=True` must never be conflated.
+
+    An engine-wide incompatibility that degraded to "every page failed" would report
+    `available=True` with zero fragments -- indistinguishable from a legitimately
+    empty document, which is exactly the conflation this codebase forbids.
+    """
+
+    def test_an_engine_mismatch_raised_while_paging_makes_the_result_unavailable(self, monkeypatch) -> None:
+        """Same raise site, two exception types, two different classifications.
+
+        An earlier version of this test patched `_REQUIRED_PARAM_ATTRS` and passed for
+        the WRONG reason: `_engine` reads that tuple too, so the refusal happened at
+        the front door and the propagation path under test never ran. Mutation testing
+        exposed it -- demoting the `_EngineMismatch` re-raise to `lossy = True` left
+        the suite fully green. Patching the raise directly is what makes the contrast
+        with `test_a_failing_page_is_named_not_merely_counted` (a ValueError from the
+        very same call, which correctly degrades to lossy) actually load-bearing.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        def _mismatch(page, page_number, engine):
+            raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
+
+        monkeypatch.setattr(mod, "_page_fragments", _mismatch)
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
+        assert result.available is False
+        assert result.fragments == ()
+        # Crucially NOT recorded as a page failure: the engine is wrong, not the page.
+        assert result.page_failures == ()
+
+    def test_a_wrong_pypdf_version_refuses_rather_than_recalibrating(self, monkeypatch) -> None:
+        """No attribute check can catch a release that keeps every name and changes
+        what the numbers MEAN, so the exact pin is asserted at runtime."""
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        monkeypatch.setattr(mod, "_PINNED_PYPDF_VERSION", "0.0.0-not-a-real-version")
+        assert mod._engine() is None
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
+        assert result.available is False
+
+
+class TestLossRecordsWhatWasLost:
+    def test_a_failing_page_is_named_not_merely_counted(self, monkeypatch) -> None:
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        real = mod._page_fragments
+
+        def _boom(page, page_number, engine):
+            if page_number == 2:
+                raise ValueError("synthetic page explosion")
+            return real(page, page_number, engine)
+
+        monkeypatch.setattr(mod, "_page_fragments", _boom)
+        first = b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET"
+        second = b"BT /F1 10 Tf 72 700 Td (beta) Tj ET"
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+                b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
+                b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        assert result.available is True
+        assert result.lossy is True
+        assert [f.page for f in result.page_failures] == [2]
+        assert "synthetic page explosion" in result.page_failures[0].error
+        # The page that DID parse is still returned -- partial, and honest about it.
+        assert any(f.text.strip() == "alpha" for f in result.fragments)
+
+    def test_the_page_cap_matches_the_text_lane(self, monkeypatch) -> None:
+        """If the two lanes capped differently, a fragment could carry a page number
+        the text lane says does not exist."""
+        require_pypdf()
+        import carmel.agents.tools.extract as extract_mod
+
+        monkeypatch.setattr(extract_mod, "MAX_PDF_PAGES", 1)
+        first = b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET"
+        second = b"BT /F1 10 Tf 72 700 Td (beta) Tj ET"
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+                b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
+                b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        assert result.truncated is True
+        assert result.lossy is True
+        assert {f.page for f in result.fragments} == {1}
+
+    def test_the_pypdf_version_travels_with_the_result(self) -> None:
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
+        assert result.pypdf_version

@@ -33,6 +33,10 @@ private API (see :func:`_engine`), which is guarded rather than assumed.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import importlib.metadata
+import io
 import logging
 import re
 from dataclasses import dataclass
@@ -44,7 +48,8 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = [
     "FragmentExtraction",
-    "GlyphHealth",
+    "FragmentPageFailure",
+    "GlyphMapping",
     "TextFragment",
     "extract_fragments",
 ]
@@ -52,14 +57,19 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 
-class GlyphHealth(StrEnum):
+class GlyphMapping(StrEnum):
     """Whether a fragment's glyphs decoded to real characters.
 
-    This is a flag, never a repair. See :data:`_UNMAPPED_MARKER_RE` for why the
-    distinction is load-bearing.
+    Named ``GlyphMapping`` rather than the more obvious ``GlyphHealth`` because
+    :class:`carmel.services.numeric.GlyphHealth` already exists and means something
+    DIFFERENT: a document-level corruption assessment used to quarantine numerals.
+    Two same-named types at different scopes would eventually be passed to each
+    other's call sites, and the mistake would typecheck under ``Any``.
+
+    This is a flag, never a repair. See :data:`_UNMAPPED_MARKER_RE`.
     """
 
-    OK = "ok"
+    MAPPED = "mapped"
     """Every glyph decoded to a character. Says nothing about whether that character
     is the RIGHT one -- a PDF with a broken ``ToUnicode`` map can decode ``+`` as
     ``þ`` and ``=`` as ``¼`` perfectly "successfully"."""
@@ -83,11 +93,16 @@ class GlyphHealth(StrEnum):
 # to ``=``, which the same PDFs also need -- is a SEMANTIC claim about what the
 # document meant, and grounding proves LOCATION, never MEANING. A repair table needs
 # its own gate and its own evidence; it does not belong in a mechanical extractor.
+# The `/C\d+` arm is DELIBERATELY bounded on both sides. An unanchored `/C\d+`
+# substring match is catastrophic in a combustion codebase: it flags `/C2H4`, `C1/C2`,
+# `H2/CO`-style species lists, appendix labels and file paths as corrupt. The lookarounds
+# require the token to stand alone, so `/C0` matches while `/C2H4` (letter after) and
+# `C1/C2` (digit before the slash) do not.
 _UNMAPPED_MARKER_RE = re.compile(
     r"""
-    \(cid: \d+ \)     # (cid:3)  -- raw character id, no mapping at all
-    | /C \d+          # /C0      -- a glyph-NAME escape that reached the text layer
-    | �          # U+FFFD   -- replacement character
+    \( cid: \d+ \)              # (cid:3)  -- raw character id, no mapping at all
+    | (?<![0-9A-Za-z]) /C \d+ (?![0-9A-Za-z])   # /C0 -- a standalone glyph-NAME escape
+    | �                    # U+FFFD   -- replacement character
     """,
     re.VERBOSE,
 )
@@ -128,7 +143,24 @@ class TextFragment:
     """True when the text is rotated with respect to the page. Retained rather than
     dropped; see :func:`_page_fragments`."""
 
-    glyph_health: GlyphHealth
+    glyph_mapping: GlyphMapping
+
+
+@dataclass(frozen=True)
+class FragmentPageFailure:
+    """One page that could not be turned into fragments.
+
+    Recorded rather than merely counted, mirroring
+    :class:`carmel.agents.tools.extract.PageExtractionFailure`. A bare ``lossy=True``
+    says "something was lost" without saying WHAT, so an operator cannot tell a
+    single unreadable page from a document that mostly failed -- and a locator built
+    from the pages that DID parse would look complete.
+    """
+
+    page: int
+    error: str
+    """Short, path-redacted description. Built by the text lane's own
+    ``_describe_page_error`` so the redaction rules stay in one place."""
 
 
 @dataclass(frozen=True)
@@ -138,13 +170,32 @@ class FragmentExtraction:
     fragments: tuple[TextFragment, ...] = ()
     lossy: bool = False
     """True when this extraction is known to be incomplete: a page failed, a page
-    could not be inspected, or the engine was unavailable. Mirrors
+    could not be inspected, or the document was truncated. Mirrors
     ``ExtractedText.lossy``, and like it, fails toward admitting loss."""
 
     available: bool = True
-    """False when pypdf is absent or the capability check refused. Distinct from
-    ``lossy``: ``available=False`` means NOTHING was extracted and no claim about
-    this document can be made, rather than that something partial was."""
+    """False when pypdf is absent, the capability check refused, or the engine proved
+    incompatible partway through. Distinct from ``lossy``: ``available=False`` means
+    NOTHING here can be relied on and no claim about this document may be made, while
+    ``lossy=True`` means what IS here is real but incomplete. Conflating them is the
+    specific error this pair exists to prevent -- an engine-wide incompatibility that
+    returned zero fragments while reporting ``available=True`` would read exactly like
+    a legitimately empty document."""
+
+    page_failures: tuple[FragmentPageFailure, ...] = ()
+    truncated: bool = False
+    """True when the document has more pages than ``MAX_PDF_PAGES`` and the tail was
+    not processed. The cap is shared with the text lane so the two lanes agree on
+    which pages exist; see :func:`extract_fragments`."""
+
+    pypdf_version: str = ""
+    """The pypdf version this extraction actually ran against.
+
+    Recorded because the geometry is the evidence, and a pypdf that changed baseline
+    semantics, CTM composition, page-rotation normalisation or ``TJ`` displacement
+    could keep every attribute name intact -- passing :func:`_engine` -- while
+    silently returning DIFFERENT numbers. No capability check can catch that, so the
+    version travels with the result and the pin is asserted at runtime."""
 
 
 def _engine() -> tuple[Any, ...] | None:
@@ -172,21 +223,72 @@ def _engine() -> tuple[Any, ...] | None:
         from pypdf._text_extraction._layout_mode._text_state_manager import (
             TextStateManager,
         )
+        from pypdf._text_extraction._layout_mode._text_state_params import (
+            TextStateParams,
+        )
         from pypdf.generic import ContentStream
     except Exception:  # pragma: no cover - exercised via monkeypatch in tests
         logger.debug("pypdf layout-mode internals unavailable", exc_info=True)
         return None
 
     # The imports resolving is not enough: the names could survive while the objects
-    # behind them change shape. Check the pieces actually read below.
+    # behind them change shape. Check every piece actually read below -- including the
+    # TextStateParams attributes, which must be checked HERE rather than only at the
+    # point of use. A per-page AttributeError is caught as a page failure and degrades
+    # to `lossy=True`, so an engine-wide mismatch would otherwise present as "a valid
+    # document where every page happened to fail" instead of "the engine is wrong".
     for name in ("set_font", "set_state_param"):
         if not callable(getattr(TextStateManager, name, None)):
             logger.warning("pypdf TextStateManager lacks %s; fragments unavailable", name)
             return None
+    # Check FIELDS as well as class attributes. `TextStateParams` is a dataclass, and
+    # a field without a default (`font_size` is one) exists only on instances, so a
+    # bare `hasattr` on the class reports it missing and would refuse every healthy
+    # pypdf. The properties (`tx`, `ty`, `text`, ...) do live on the class, so the
+    # available surface is the union of the two.
+    available_names = set(dir(TextStateParams))
+    with contextlib.suppress(TypeError):  # only if pypdf stops using a dataclass
+        available_names |= {field.name for field in dataclasses.fields(TextStateParams)}
+    for attr in _REQUIRED_PARAM_ATTRS:
+        if attr not in available_names:
+            logger.warning("pypdf TextStateParams lacks %s; fragments unavailable", attr)
+            return None
+
+    # The geometry is the evidence, and no attribute check can detect a release that
+    # keeps every name while changing what the numbers MEAN. pypdf is pinned exactly
+    # (`pypdf==6.14.2`) precisely because an extraction's dependency identity has to be
+    # provable, and the pin's own comment in pyproject.toml makes bumping a deliberate
+    # act with a re-extraction pass attached. Refusing here is the runtime half of that
+    # policy: an unpinned pypdf makes this lane UNAVAILABLE rather than silently
+    # differently-calibrated.
+    try:
+        installed = importlib.metadata.version("pypdf")
+    except Exception:
+        logger.warning("pypdf version is unknown; fragments unavailable")
+        return None
+    if installed != _PINNED_PYPDF_VERSION:
+        logger.warning(
+            "pypdf %s is not the pinned %s; fragment geometry is unverified, refusing",
+            installed,
+            _PINNED_PYPDF_VERSION,
+        )
+        return None
     return recurse_to_target_op, resolve_font, TextStateManager, ContentStream
 
 
 _REQUIRED_PARAM_ATTRS = ("text", "tx", "ty", "displaced_tx", "font_size", "rotated")
+
+_PINNED_PYPDF_VERSION = "6.14.2"
+"""Must track the ``agents`` extra's exact pin in ``pyproject.toml``."""
+
+
+class _EngineMismatch(Exception):
+    """The pypdf engine is not shaped the way this module requires.
+
+    Raised from page processing but deliberately NOT treated as a page failure: it
+    says the ENGINE is wrong, not that one document page is. The distinction is the
+    difference between ``available=False`` and a plausible-looking empty result.
+    """
 
 
 def _page_fragments(page: Any, page_number: int, engine: tuple[Any, ...]) -> list[TextFragment]:
@@ -234,9 +336,10 @@ def _page_fragments(page: Any, page_number: int, engine: tuple[Any, ...]) -> lis
     fragments: list[TextFragment] = []
     for show in shows:
         if any(not hasattr(show, attr) for attr in _REQUIRED_PARAM_ATTRS):
-            # Belt-and-braces against a pypdf change that slipped past `_engine`:
-            # refuse the page rather than emit fragments with defaulted geometry.
-            raise AttributeError("pypdf TextStateParams is missing a required attribute")
+            # Belt-and-braces against a pypdf change that slipped past `_engine`.
+            # `_EngineMismatch` rather than a plain error: this must abort the WHOLE
+            # extraction as unavailable, not degrade one page to lossy.
+            raise _EngineMismatch("pypdf TextStateParams is missing a required attribute")
         text = show.text
         if not text:
             continue
@@ -249,7 +352,7 @@ def _page_fragments(page: Any, page_number: int, engine: tuple[Any, ...]) -> lis
                 baseline_y=float(show.ty),
                 font_size=float(show.font_size),
                 rotated=bool(show.rotated),
-                glyph_health=(GlyphHealth.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphHealth.OK),
+                glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
             )
         )
     return fragments
@@ -276,16 +379,23 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
     except Exception:
         return FragmentExtraction(lossy=True, available=False)
 
-    from carmel.agents.tools.extract import _classify_pdf_page, _PageKind, _quiet_pypdf
+    from carmel.agents.tools.extract import (
+        MAX_PDF_PAGES,
+        _classify_pdf_page,
+        _describe_page_error,
+        _PageKind,
+        _quiet_pypdf,
+    )
 
     engine = _engine()
     if engine is None:
         return FragmentExtraction(lossy=True, available=False)
 
-    import io
-
+    version = importlib.metadata.version("pypdf")
     fragments: list[TextFragment] = []
+    failures: list[FragmentPageFailure] = []
     lossy = False
+    truncated = False
     try:
         with _quiet_pypdf():
             reader = PdfReader(io.BytesIO(data))
@@ -297,14 +407,35 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                 if kind is _PageKind.PHANTOM:
                     continue
                 page_number += 1
+                if page_number > MAX_PDF_PAGES:
+                    # Same cap, counted the same way, as the text lane. Sharing it is
+                    # the point: if one lane stopped at 2000 real pages and the other
+                    # walked on, a fragment could carry a page number the text lane
+                    # says does not exist, and the two provenance stories would
+                    # disagree about the same document.
+                    truncated = True
+                    lossy = True
+                    break
                 if kind is _PageKind.UNINSPECTABLE:
                     lossy = True
                 try:
                     fragments.extend(_page_fragments(page, page_number, engine))
-                except Exception:
+                except _EngineMismatch:
+                    # Not a page failure. The engine is wrong, so nothing extracted
+                    # from this document can be relied on.
+                    raise
+                except Exception as exc:
                     logger.debug("fragment extraction failed on page %d", page_number, exc_info=True)
+                    failures.append(FragmentPageFailure(page=page_number, error=_describe_page_error(exc)))
                     lossy = True
     except Exception:
-        return FragmentExtraction(lossy=True, available=False)
+        return FragmentExtraction(lossy=True, available=False, pypdf_version=version)
 
-    return FragmentExtraction(fragments=tuple(fragments), lossy=lossy, available=True)
+    return FragmentExtraction(
+        fragments=tuple(fragments),
+        lossy=lossy,
+        available=True,
+        page_failures=tuple(failures),
+        truncated=truncated,
+        pypdf_version=version,
+    )
