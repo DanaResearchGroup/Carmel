@@ -113,7 +113,7 @@ class TestWhatMustNotRefuse:
         """Reference brackets, footnote letters and round numbers are real table cells.
 
         Refusing on "any token that cannot stand alone" was MEASURED and takes the cost
-        from 3.10% to 22.5% of proposals. Bare `10` is here too: it is half of every
+        from 3.50% to 22.5% of proposals. Bare `10` is here too: it is half of every
         `x 10^n` construct, but on its own it is an ordinary value, and the true
         multiplication glyph that makes it an exponent is itself an affix.
 
@@ -182,6 +182,174 @@ class TestEdgeTokenClassification:
         refusal = refuse_region(_extraction(number, right), _region(number))
         assert refusal is not None
         assert refusal.affix is AffixClass.EXPONENT
+
+
+class TestTheClaimIsCheckedNotTaken:
+    """Every field of `ClaimedRegion` is caller-controlled, so each is a way back in.
+
+    These are the round-104 findings, and three of them are the ORIGINAL exclusion
+    attack wearing a different hat: the producer still ends up holding `1.0` with no
+    complaint, having moved the band, forged the member, or *included* the sign rather
+    than omitted it.
+    """
+
+    def test_a_baseline_moved_off_the_members_refuses(self) -> None:
+        """Shift the claimed baseline 1 pt and the band no longer contains the sign.
+
+        With the band centred on a number the producer supplies, a producer that wants
+        a clean answer just supplies a different number.
+        """
+        sign = _fragment("/C0", 96.5, 100.0, baseline_y=700.0)
+        number = _fragment("1.0", 103.5, 115.0, baseline_y=700.0)
+        moved = ClaimedRegion(page=1, x_start=103.5, x_end=115.0, baseline_y=701.0, members=(number,))
+        refusal = refuse_region(_extraction(sign, number), moved)
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.MEMBER_OUTSIDE_REGION
+
+    def test_a_member_that_is_not_in_the_extraction_refuses(self) -> None:
+        """A forged fragment has no page, no neighbours and no provenance. Without this
+        check an empty extraction can be handed fabricated members and come back clean.
+        """
+        real = _fragment("1.0", 103.5, 115.0)
+        forged = _fragment("9.9", 103.5, 115.0)
+        refusal = refuse_region(_extraction(real), _region(forged))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.FOREIGN_MEMBER
+
+    def test_naming_the_sign_as_a_member_does_not_silence_the_refusal(self) -> None:
+        """The exclusion attack INVERTED, and the sharpest of the round-104 findings.
+
+        The producer claims the box around `1.0` but lists the detached `/C0` as a
+        member. That removes it from the outsiders, so the adjacency check never sees
+        it -- and the producer still records `1.0`, sign lost, with nothing raised.
+        """
+        sign = _fragment("/C0", 96.5, 100.0)
+        number = _fragment("1.0", 103.5, 115.0)
+        smuggled = ClaimedRegion(page=1, x_start=103.5, x_end=115.0, baseline_y=700.0, members=(number, sign))
+        refusal = refuse_region(_extraction(sign, number), smuggled)
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.MEMBER_OUTSIDE_REGION
+
+    @pytest.mark.parametrize(
+        ("x_start", "x_end"),
+        [(float("nan"), 115.0), (103.5, float("nan")), (115.0, 103.5), (float("-inf"), 115.0)],
+    )
+    def test_a_box_that_is_not_a_box_refuses(self, x_start: float, x_end: float) -> None:
+        """NaN makes every `<` in this module quietly False, so an unchecked NaN box
+        satisfies the straddle test, finds no neighbours, and returns `None` -- the most
+        permissive answer -- without one predicate having actually run.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        broken = ClaimedRegion(page=1, x_start=x_start, x_end=x_end, baseline_y=700.0, members=(number,))
+        refusal = refuse_region(_extraction(number), broken)
+        assert refusal is not None
+        assert refusal.reason in {
+            RegionRefusalReason.INVALID_GEOMETRY,
+            RegionRefusalReason.MEMBER_OUTSIDE_REGION,
+        }
+
+    def test_a_fragment_whose_extent_runs_backwards_refuses(self) -> None:
+        """Mirrored or negative-scale text yields `x_end < x_start` while `rotated` is
+        still False, inverting left, right and overlap at once."""
+        mirrored = _fragment("1.0", 115.0, 103.5)
+        region = ClaimedRegion(page=1, x_start=103.5, x_end=115.0, baseline_y=700.0, members=(mirrored,))
+        refusal = refuse_region(_extraction(mirrored), region)
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.INVALID_GEOMETRY
+
+    def test_loss_that_cannot_be_located_refuses(self) -> None:
+        """`lossy` with neither carrier is loss this module cannot place. The page-
+        specific test stays precise, so this needs its own check."""
+        number = _fragment("1.0", 103.5, 115.0)
+        extraction = _extraction(number, lossy=True)
+        refusal = refuse_region(extraction, _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.PAGE_INCOMPLETE
+
+
+class TestAffixesAttachedToOtherText:
+    """Real typesetting does not leave affixes alone in their own fragment."""
+
+    def test_a_value_split_across_its_decimal_point_refuses(self) -> None:
+        """`3` `.14`, touching exactly. Not overlap, so STRADDLED cannot fire, and the
+        edge token is `.14` rather than `.`, so an exact-match classifier misses it --
+        and `3.14` is silently recorded as `3`.
+        """
+        three = _fragment("3", 103.5, 110.0)
+        rest = _fragment(".14", 110.0, 120.0)
+        refusal = refuse_region(_extraction(three, rest), _region(three))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
+        assert refusal.affix is AffixClass.DECIMAL
+
+    @pytest.mark.parametrize("exponent", ["×10", "·10", "×10−3"])
+    def test_an_unspaced_exponent_refuses(self, exponent: str) -> None:
+        """Ordinary printed scientific notation, not adversarial input. Reading it as a
+        neighbouring cell drops a factor of a thousand."""
+        number = _fragment("1.0", 103.5, 115.0)
+        right = _fragment(exponent, 118.0, 135.0)
+        refusal = refuse_region(_extraction(number, right), _region(number))
+        assert refusal is not None
+        assert refusal.affix is AffixClass.EXPONENT
+
+    @pytest.mark.parametrize("left_text", ["Fig.", "et al.", "conditions.", "sample,"])
+    def test_an_abbreviation_period_is_not_a_decimal_point(self, left_text: str) -> None:
+        """A decimal point sits BETWEEN digits; a period ending `Fig.` is English.
+
+        Without the digit-adjacency requirement this class alone accounts for 491
+        left-hand refusals over the corpus instead of 200, and none of the extra 291 is
+        a number split across its point -- the module would be refusing on abbreviation
+        style rather than on numeral semantics.
+        """
+        left = _fragment(left_text, 60.0, 100.0)
+        number = _fragment("3", 103.5, 110.0)
+        assert refuse_region(_extraction(left, number), _region(number)) is None
+
+    def test_a_digit_before_the_period_refuses_even_when_it_reads_as_prose(self) -> None:
+        """`Table 2.` is a caption, but at the abutting edge it is digit-then-point --
+        character-identical to the `3.` of a split `3.14`. Geometry cannot separate
+        them, so this fails toward refusal rather than guessing which one it is."""
+        left = _fragment("Table 2.", 60.0, 100.0)
+        number = _fragment("3", 103.5, 110.0)
+        refusal = refuse_region(_extraction(left, number), _region(number))
+        assert refusal is not None
+        assert refusal.affix is AffixClass.DECIMAL
+
+    def test_a_number_split_across_its_point_still_refuses_from_the_left(self) -> None:
+        """The mirror of the case above: `3.` then `14` really is one value cut in two,
+        and the digit before the point is what distinguishes it from `Fig.`."""
+        left = _fragment("3.", 90.0, 103.5)
+        number = _fragment("14", 103.5, 115.0)
+        refusal = refuse_region(_extraction(left, number), _region(number))
+        assert refusal is not None
+        assert refusal.affix is AffixClass.DECIMAL
+
+    def test_a_leading_sign_on_the_right_is_that_cells_own_sign(self) -> None:
+        """Direction matters. A sign binds to the number on ITS right, so `-2.5` to our
+        right is a negative neighbouring cell, not our affix. Refusing here would reject
+        every row containing a negative number.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        right = _fragment("-2.5", 130.0, 145.0)
+        assert refuse_region(_extraction(number, right), _region(number)) is None
+
+    def test_a_trailing_sign_on_the_left_is_ours(self) -> None:
+        """The mirror image: a sign at the END of the left neighbour reaches toward us."""
+        left = _fragment("k =-", 60.0, 100.0)
+        number = _fragment("1.0", 103.5, 115.0)
+        refusal = refuse_region(_extraction(left, number), _region(number))
+        assert refusal is not None
+        assert refusal.affix is AffixClass.SIGN
+
+    def test_an_unmapped_neighbour_refuses_even_when_no_token_matches(self) -> None:
+        """`n=/C0` is UNMAPPED, but its edge token matches no affix. Refusing on the
+        FLAG rather than the token stops the check depending on whether the marker
+        happened to land alone in its own fragment."""
+        left = _fragment("n=/C0", 60.0, 100.0, mapping=GlyphMapping.UNMAPPED)
+        number = _fragment("1.0", 103.5, 115.0)
+        refusal = refuse_region(_extraction(left, number), _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
 
 
 class TestTheRegionItself:

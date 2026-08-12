@@ -34,8 +34,8 @@ back. The rule below instead takes the nearest fragment OUTSIDE the claimed regi
 any distance, which has no such crack: whatever was not claimed is a candidate.
 
 **What this costs, and why that number needs a qualifier.** Refusing is not free, and
-the price depends on the PROPOSAL, not on this module: the identical rule refuses 3.10%
-of run-shaped numeric proposals and 13.65% of tight single-fragment boxes on the same
+the price depends on the PROPOSAL, not on this module: the identical rule refuses 3.50%
+of run-shaped numeric proposals and 15.44% of tight single-fragment boxes on the same
 corpus. The difference is dominated by producers claiming ``3`` out of ``3.14``, which
 this layer refuses correctly. **A refusal rate may never be quoted without the proposal
 shape it was measured on**, and no producer exists yet, so this module has no single
@@ -52,10 +52,11 @@ off from. Persist refusals; persist nothing else.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
-from carmel.services.numeric import AffixClass, classify_affix
+from carmel.services.numeric import AffixClass, classify_abutting_affix
 from carmel.services.pdf_fragments import FragmentExtraction, GlyphMapping, TextFragment
 
 #: How far from the claimed baseline a fragment may sit and still count as being on the
@@ -74,10 +75,10 @@ from carmel.services.pdf_fragments import FragmentExtraction, GlyphMapping, Text
 #: =========================  =======  ==============
 #: band                       refused  sign-class hits
 #: =========================  =======  ==============
-#: 0.0 pt (exact baseline)     13.33%             265
-#: 0.75 pt (this value)        13.65%             271
-#: 2.0 pt                      19.49%             462
-#: 0.6 x font_height (~4.8pt)  19.95%             467
+#: 0.0 pt (exact baseline)     14.82%             265
+#: 0.75 pt (this value)        15.44%             284
+#: 2.0 pt                      21.32%             475
+#: 0.6 x font_height (~4.8pt)  21.91%             486
 #: =========================  =======  ==============
 #:
 #: 0.75 pt sits at the top of the plateau: wide enough to tolerate the sub-point
@@ -139,6 +140,26 @@ class RegionRefusalReason(StrEnum):
     (see :func:`carmel.services.numeric.classify_affix`). This is the detached-sign
     case, and the reason this module exists."""
 
+    INVALID_GEOMETRY = "invalid_geometry"
+    """The claimed box is not a box: a non-finite coordinate, or an x-extent that does
+    not increase. Every comparison below is a float ``<``, and NaN makes all of them
+    quietly False -- so an unchecked NaN box passes every refusal and returns ``None``,
+    which is the most permissive answer available. Also catches a fragment whose own
+    extent runs backwards, which mirrored or negative-scale text can produce while
+    ``rotated`` is still False."""
+
+    FOREIGN_MEMBER = "foreign_member"
+    """A claimed member is not one of the fragments in this extraction. Nothing further
+    can be checked about it -- it has no page, no neighbours and no provenance here --
+    and a region built from fabricated members would otherwise satisfy every test below
+    while describing text the document never contained."""
+
+    MEMBER_OUTSIDE_REGION = "member_outside_region"
+    """A claimed member lies outside the claimed box, or off its page or band. This is
+    the exclusion attack inverted: naming the detached ``−`` as a MEMBER while drawing
+    the box around ``1.0`` removes it from the outsiders, so the adjacency check never
+    sees it and the sign is lost with no refusal raised."""
+
     STRADDLED = "straddled"
     """A fragment that is NOT a member overlaps the claimed region horizontally. The
     region's own boundary is therefore not clean: something was cut through rather than
@@ -156,6 +177,22 @@ class ClaimedRegion:
     make this module check its own arithmetic instead of the producer's claim, and the
     exclusion attack in this module's docstring is precisely a producer excluding a
     fragment that geometry would have included.
+
+    **But an unchecked claim is a second way in, and it is the same way in.** Every
+    field here is caller-controlled, so each one is an attack surface that
+    :func:`refuse_region` must close before it trusts any of them:
+
+    * a ``baseline_y`` set 1 pt off the members' real baseline moves the band away from
+      the detached sign, and the region comes back clean;
+    * a ``members`` tuple holding a fragment that is not in the extraction at all
+      fabricates content that no page ever carried;
+    * naming the detached ``−`` as a MEMBER while drawing the box around ``1.0`` gets
+      it filtered out of the outsiders and silences the very refusal it should trigger.
+
+    The last one is the original exclusion attack wearing a different hat: the producer
+    still ends up with ``1.0`` and no complaint, having *included* the sign rather than
+    omitted it. Membership is therefore a claim to be checked against the box, not a
+    fact to be taken.
     """
 
     page: int
@@ -174,7 +211,21 @@ class RegionRefusal:
     """Short, human-readable. Never the document's text beyond the offending token."""
 
     affix: AffixClass | None = None
-    """Set only for :attr:`RegionRefusalReason.ADJACENT_UNREADABLE`."""
+    """Set only for :attr:`RegionRefusalReason.ADJACENT_UNREADABLE`, and not always
+    even then -- an unmapped neighbour refuses without being classified."""
+
+
+def _is_sane_extent(start: float, end: float) -> bool:
+    """A horizontal extent that is finite and runs the way page space runs.
+
+    Both halves are load-bearing. NaN makes every ``<`` comparison in this module
+    quietly False, so an unchecked NaN box would satisfy the straddle test, find no
+    neighbours, and return ``None`` -- the most permissive answer -- without a single
+    predicate having actually run. And an extent running backwards is not hypothetical:
+    mirrored or negative-scale text yields ``x_end < x_start`` while ``rotated`` is
+    still False, which inverts left, right and overlap all at once.
+    """
+    return math.isfinite(start) and math.isfinite(end) and start <= end
 
 
 def _edge_token(text: str, *, from_end: bool) -> str:
@@ -208,16 +259,57 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
             "the fragment lane is unavailable for this document",
         )
 
-    if extraction.truncated or any(failure.page == region.page for failure in extraction.page_failures):
+    # `lossy` without either carrier is loss this module cannot LOCATE, so it cannot
+    # tell whether this page kept everything. Checked separately from the page-specific
+    # test below, which stays precise on purpose: recording failures per page is what
+    # lets a clean page next to a broken one still be answerable.
+    unlocatable_loss = extraction.lossy and not (extraction.truncated or extraction.page_failures)
+    if (
+        extraction.truncated
+        or unlocatable_loss
+        or any(failure.page == region.page for failure in extraction.page_failures)
+    ):
         return RegionRefusal(
             RegionRefusalReason.PAGE_INCOMPLETE,
             f"page {region.page} is incomplete, so an absent neighbour proves nothing",
         )
 
+    if not _is_sane_extent(region.x_start, region.x_end) or not math.isfinite(region.baseline_y):
+        return RegionRefusal(
+            RegionRefusalReason.INVALID_GEOMETRY,
+            "the claimed box has a non-finite or non-increasing extent",
+        )
+
     if not region.members:
         return RegionRefusal(RegionRefusalReason.EMPTY, "the region claims no fragments")
 
+    # Identity, not equality: two fragments with the same text and geometry are still
+    # different pieces of evidence, and the question here is whether THIS object is one
+    # the extraction produced -- which is also what makes the `id()` membership test
+    # below sound, since every member is now known to be a live element of that tuple.
+    extraction_ids = {id(fragment) for fragment in extraction.fragments}
+
     for member in region.members:
+        if id(member) not in extraction_ids:
+            return RegionRefusal(
+                RegionRefusalReason.FOREIGN_MEMBER,
+                "a claimed member is not a fragment of this extraction",
+            )
+        if not _is_sane_extent(member.x_start, member.x_end) or not math.isfinite(member.baseline_y):
+            return RegionRefusal(
+                RegionRefusalReason.INVALID_GEOMETRY,
+                "a member fragment has a non-finite or non-increasing extent",
+            )
+        if (
+            member.page != region.page
+            or member.x_start < region.x_start
+            or member.x_end > region.x_end
+            or abs(member.baseline_y - region.baseline_y) > BASELINE_BAND
+        ):
+            return RegionRefusal(
+                RegionRefusalReason.MEMBER_OUTSIDE_REGION,
+                "a claimed member lies outside the claimed box",
+            )
         if member.glyph_mapping is GlyphMapping.UNMAPPED:
             return RegionRefusal(
                 RegionRefusalReason.UNMAPPED_MEMBER,
@@ -270,7 +362,17 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
     for neighbour, from_end, side in ((left, True, "left"), (right, False, "right")):
         if neighbour is None:
             continue
-        affix = classify_affix(_edge_token(neighbour.text, from_end=from_end))
+        # An unmapped neighbour refuses on the FLAG, before any token matching. Its
+        # text is markers, so an edge token like `n=/C0` matches no affix while the
+        # fragment is exactly the unreadable thing next to the number that this module
+        # exists to catch. Asking the classifier first would make the check depend on
+        # the marker landing alone in its own fragment.
+        if neighbour.glyph_mapping is GlyphMapping.UNMAPPED:
+            return RegionRefusal(
+                RegionRefusalReason.ADJACENT_UNREADABLE,
+                f"the nearest fragment to the {side} carries an unmapped-glyph marker",
+            )
+        affix = classify_abutting_affix(_edge_token(neighbour.text, from_end=from_end), from_end=from_end)
         if affix is not None:
             return RegionRefusal(
                 RegionRefusalReason.ADJACENT_UNREADABLE,

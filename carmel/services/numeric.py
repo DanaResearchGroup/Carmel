@@ -232,7 +232,7 @@ class AffixClass(StrEnum):
 #: Explicit rather than "anything that cannot stand alone", because that broader rule
 #: was MEASURED against the real corpus and is far too aggressive: reference brackets
 #: (``[23]``) and lone footnote letters are legitimate standalone table cells, and
-#: including them takes a neighbour-refusal rule from 3.10% of proposals to 22.5%.
+#: including them takes a neighbour-refusal rule from 3.50% of proposals to 22.5%.
 #:
 #: Bare ``10`` is deliberately ABSENT despite being half of every ``x 10^n``
 #: construct. ``10`` standing alone is an ordinary value, and a column of round
@@ -288,6 +288,62 @@ def classify_affix(token: str) -> AffixClass | None:
     if _UNMAPPED_AFFIX_RE.match(stripped):
         return AffixClass.SIGN
     return _AFFIX_TOKENS.get(stripped)
+
+
+#: Which way an affix REACHES. A sign binds to the number on its right (``-1.0``), so a
+#: leading ``-`` on the token to your right belongs to that token's own value and is no
+#: threat to you. A decimal point, a multiplication glyph and a relational operator all
+#: reach both ways -- the ``.`` of ``3`` ``.14`` binds LEFT, and mistaking that for a
+#: neighbouring cell turns ``3.14`` into ``3``.
+_LEFT_REACHING = frozenset({AffixClass.DECIMAL, AffixClass.EXPONENT, AffixClass.RELATIONAL})
+
+
+def _touches_a_digit(token: str, *, from_end: bool) -> bool:
+    """Whether the character just INSIDE the abutting edge is a digit.
+
+    ``"3."`` from the end -> True (a value split across its point). ``"Fig."`` -> False
+    (a sentence). ``"."`` alone -> False here, but that case never reaches this
+    function: a token that is entirely an affix is classified before it.
+    """
+    inner = token[-2:-1] if from_end else token[1:2]
+    return inner.isdigit()
+
+
+def classify_abutting_affix(token: str, *, from_end: bool) -> AffixClass | None:
+    """Classify the affix at the EDGE of ``token`` that touches the value beside it.
+
+    :func:`classify_affix` only sees a token that is *entirely* an affix, which misses
+    the shapes real typesetting produces: a value split as ``3`` / ``.14``, or an
+    exponent set as ``×10`` or ``×10−3`` with no space. Those are ordinary printed
+    scientific notation, not adversarial input, and treating them as unrelated
+    neighbouring cells silently drops a decimal fraction or a factor of a thousand.
+
+    ``from_end`` selects which edge abuts the value: ``True`` for a token on the LEFT
+    (its trailing edge touches you), ``False`` for one on the RIGHT (its leading edge
+    does). The direction is not cosmetic -- see :data:`_LEFT_REACHING`. A leading sign
+    on your right-hand neighbour is that neighbour's own sign, and refusing on it would
+    reject every row containing a negative number.
+    """
+    stripped = token.strip()
+    if not stripped:
+        return None
+    whole = classify_affix(stripped)
+    if whole is not None:
+        return whole
+    affix = _AFFIX_TOKENS.get(stripped[-1] if from_end else stripped[0])
+    if affix is None:
+        return None
+    if not from_end and affix not in _LEFT_REACHING:
+        return None
+    if affix is AffixClass.DECIMAL and not _touches_a_digit(stripped, from_end=from_end):
+        # A decimal point sits BETWEEN digits. A period ending `Fig.`, `Table.` or
+        # `et al.` is English punctuation, and treating it as a decimal makes this
+        # function refuse on prose: it is the difference between 118 and 491 left-hand
+        # refusals over the corpus, and none of the extra 373 is a number split across
+        # its point. Requiring a digit on the inside keeps the refusals about numeral
+        # semantics rather than about abbreviation style.
+        return None
+    return affix
 
 
 #: THE single shared GRAMMAR BODY, codebase-wide, for where a numeral "candidate"
