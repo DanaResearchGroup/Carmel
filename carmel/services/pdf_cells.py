@@ -43,6 +43,14 @@ run-shaped proposal IS. **A refusal rate may never be quoted without the proposa
 it was measured on**, and no producer exists yet, so this module has no single cost.
 Re-measure against the real proposal shape when one does.
 
+**Why there are two entry points.** :func:`refuse_region` answers the operational
+question -- may this region be vouched for -- and one reason is enough to say no. But a
+first-wins reason makes a TALLY over many regions lie: check order, not the corpus,
+decides which category a region lands in, so ``STRADDLED`` looks rare simply because
+``UNMAPPED_MEMBER`` is tested earlier. :func:`region_refusals` exists so that a
+measurement can count what is actually there, and so that any consumer measuring this
+layer measures THIS layer rather than a re-implementation of it.
+
 **What ``None`` means.** Only that no reason to refuse was found. It is NOT an
 approval, NOT evidence, and NOT a verification. Nothing here may be persisted as a
 positive artifact -- there is deliberately no ``RegionCheck``, no ``clean``, no
@@ -208,6 +216,39 @@ class RegionRefusalReason(StrEnum):
     CORRECT, since a box drawn around the ``3`` of ``3.14`` really does cut one."""
 
 
+#: Reasons after which nothing further about the region can be EVALUATED, so
+#: :func:`region_refusals` stops there and its result is a truncated census.
+#:
+#: Membership is a claim about evaluability, never about severity. A halting reason has
+#: destroyed the input that the remaining checks read: an unavailable or incomplete
+#: extraction means an absent neighbour proves nothing; a non-finite extent makes every
+#: ``<`` below quietly False; a foreign or out-of-box member means the members tuple no
+#: longer partitions the page, so the outsider set that every band check reads is
+#: computed from a claim already known to be false.
+#:
+#: Everything absent from this set is an INDEPENDENT finding, and the reason this
+#: constant exists: an unmapped member no longer hides a straddler, and a straddler no
+#: longer hides the detached sign next to it.
+#:
+#: ``ROTATED_NEIGHBOUR`` halts, and that one is a genuine limit rather than a
+#: convenience. A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally,
+#: so it can be neither ruled out as the nearest neighbour nor recorded as a straddler
+#: -- recording it as one would be inventing a finding from a meaningless extent. **A
+#: tally of ``STRADDLED`` is therefore a lower bound**, short by at most the regions
+#: that halt here: 74 of 5332 (1.4%) on the 8-paper corpus.
+HALTS_EVALUATION: frozenset[RegionRefusalReason] = frozenset(
+    {
+        RegionRefusalReason.EXTRACTION_UNAVAILABLE,
+        RegionRefusalReason.PAGE_INCOMPLETE,
+        RegionRefusalReason.INVALID_GEOMETRY,
+        RegionRefusalReason.EMPTY,
+        RegionRefusalReason.FOREIGN_MEMBER,
+        RegionRefusalReason.MEMBER_OUTSIDE_REGION,
+        RegionRefusalReason.ROTATED_NEIGHBOUR,
+    }
+)
+
+
 @dataclass(frozen=True)
 class ClaimedRegion:
     """The box a producer drew, and the fragments it says are inside it.
@@ -285,16 +326,46 @@ def _edge_token(text: str, *, from_end: bool) -> str:
 def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> RegionRefusal | None:
     """Refuse ``region``, or return ``None`` if no reason to refuse was found.
 
-    Takes the WHOLE :class:`~carmel.services.pdf_fragments.FragmentExtraction` rather
-    than one page's fragments, because the page-local view cannot see ``available``,
-    ``page_failures`` or ``truncated`` -- and would therefore return ``None``, the most
-    permissive answer, exactly when the evidence is known to be partial.
+    One reason is all it takes to refuse, so this returns the first one found and stops
+    mattering there. **Do not tally these** -- the category you get is decided by the
+    order of the checks in :func:`region_refusals`, not by the region. Count that
+    function's full result instead.
 
     Read :attr:`RegionRefusalReason` and this module's docstring before treating a
     ``None`` here as anything at all.
     """
+    refusals = region_refusals(extraction, region)
+    return refusals[0] if refusals else None
+
+
+def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tuple[RegionRefusal, ...]:
+    """Every reason to refuse ``region`` that could be evaluated, in check order.
+
+    Empty means no reason to refuse was found -- see this module's docstring for what
+    that does and does not mean. It is the same non-answer as :func:`refuse_region`
+    returning ``None``, wearing a different type.
+
+    Takes the WHOLE :class:`~carmel.services.pdf_fragments.FragmentExtraction` rather
+    than one page's fragments, because the page-local view cannot see ``available``,
+    ``page_failures`` or ``truncated`` -- and would therefore find nothing, the most
+    permissive answer, exactly when the evidence is known to be partial.
+
+    **The result is a census only up to its last element.** If that element's reason is
+    in :data:`HALTS_EVALUATION`, the checks after it never ran and their absence says
+    nothing about the region. Any consumer counting reasons across a corpus must count
+    the halts too, or it will report the remaining categories as rarer than they are.
+
+    At most one refusal per reason: a region with three unmapped members has one
+    ``UNMAPPED_MEMBER``, because the unit being counted is the region.
+    """
+    found: dict[RegionRefusalReason, RegionRefusal] = {}
+
+    def note(reason: RegionRefusalReason, detail: str, affix: AffixClass | None = None) -> tuple[RegionRefusal, ...]:
+        found.setdefault(reason, RegionRefusal(reason, detail, affix))
+        return tuple(found.values())
+
     if not extraction.available:
-        return RegionRefusal(
+        return note(
             RegionRefusalReason.EXTRACTION_UNAVAILABLE,
             "the fragment lane is unavailable for this document",
         )
@@ -309,19 +380,19 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
         or unlocatable_loss
         or any(failure.page == region.page for failure in extraction.page_failures)
     ):
-        return RegionRefusal(
+        return note(
             RegionRefusalReason.PAGE_INCOMPLETE,
             f"page {region.page} is incomplete, so an absent neighbour proves nothing",
         )
 
     if not _is_sane_extent(region.x_start, region.x_end) or not math.isfinite(region.baseline_y):
-        return RegionRefusal(
+        return note(
             RegionRefusalReason.INVALID_GEOMETRY,
             "the claimed box has a non-finite or non-increasing extent",
         )
 
     if not region.members:
-        return RegionRefusal(RegionRefusalReason.EMPTY, "the region claims no fragments")
+        return note(RegionRefusalReason.EMPTY, "the region claims no fragments")
 
     # Identity, not equality: two fragments with the same text and geometry are still
     # different pieces of evidence, and the question here is whether THIS object is one
@@ -331,34 +402,44 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
 
     for member in region.members:
         if id(member) not in extraction_ids:
-            return RegionRefusal(
+            return note(
                 RegionRefusalReason.FOREIGN_MEMBER,
                 "a claimed member is not a fragment of this extraction",
             )
         if not _is_sane_extent(member.x_start, member.x_end) or not math.isfinite(member.baseline_y):
-            return RegionRefusal(
+            return note(
                 RegionRefusalReason.INVALID_GEOMETRY,
                 "a member fragment has a non-finite or non-increasing extent",
             )
-        if (
-            member.page != region.page
-            or member.x_start < region.x_start
-            or member.x_end > region.x_end
-            or abs(member.baseline_y - region.baseline_y) > BASELINE_BAND
-        ):
-            return RegionRefusal(
+        if member.page != region.page:
+            return note(
                 RegionRefusalReason.MEMBER_OUTSIDE_REGION,
-                "a claimed member lies outside the claimed box",
+                "a claimed member lies on another page",
             )
         if member.glyph_mapping is GlyphMapping.UNMAPPED:
-            return RegionRefusal(
+            note(
                 RegionRefusalReason.UNMAPPED_MEMBER,
                 "a member fragment carries an unmapped-glyph marker, not text",
             )
         if member.rotated:
-            return RegionRefusal(
+            # Its extent is not a horizontal one, so the box test below would compare
+            # the region against a number that does not mean what the comparison
+            # assumes. Recording the rotation and declining to place it is the honest
+            # move; declaring it outside the box would be inventing a second finding
+            # out of the first one's uncertainty.
+            note(
                 RegionRefusalReason.ROTATED_MEMBER,
                 "a member fragment is rotated, so its horizontal extent is not one",
+            )
+            continue
+        if (
+            member.x_start < region.x_start
+            or member.x_end > region.x_end
+            or abs(member.baseline_y - region.baseline_y) > BASELINE_BAND
+        ):
+            return note(
+                RegionRefusalReason.MEMBER_OUTSIDE_REGION,
+                "a claimed member lies outside the claimed box",
             )
 
     member_ids = {id(member) for member in region.members}
@@ -373,13 +454,13 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
     outsiders = [fragment for fragment in band if fragment.text.strip()]
 
     if any(fragment.rotated for fragment in outsiders):
-        return RegionRefusal(
+        return note(
             RegionRefusalReason.ROTATED_NEIGHBOUR,
             "a rotated fragment shares the band; its geometry is not comparable",
         )
 
     if any(fragment.x_end > region.x_start and fragment.x_start < region.x_end for fragment in outsiders):
-        return RegionRefusal(
+        note(
             RegionRefusalReason.STRADDLED,
             "a non-member fragment overlaps the region, so its boundary is not clean",
         )
@@ -408,7 +489,7 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
         # exists to catch. Asking the classifier first would make the check depend on
         # the marker landing alone in its own fragment.
         if neighbour.glyph_mapping is GlyphMapping.UNMAPPED:
-            return RegionRefusal(
+            return note(
                 RegionRefusalReason.ADJACENT_UNREADABLE,
                 f"the nearest fragment to the {side} carries an unmapped-glyph marker",
             )
@@ -422,10 +503,10 @@ def refuse_region(extraction: FragmentExtraction, region: ClaimedRegion) -> Regi
             always_reaches=neighbour.baseline_y > region.baseline_y + _SUPERSCRIPT_RISE,
         )
         if affix is not None:
-            return RegionRefusal(
+            return note(
                 RegionRefusalReason.ADJACENT_UNREADABLE,
                 f"the nearest fragment to the {side} is a {affix.value} affix",
                 affix=affix,
             )
 
-    return None
+    return tuple(found.values())

@@ -13,9 +13,11 @@ import pytest
 from carmel.services.numeric import AffixClass
 from carmel.services.pdf_cells import (
     BASELINE_BAND,
+    HALTS_EVALUATION,
     ClaimedRegion,
     RegionRefusalReason,
     refuse_region,
+    region_refusals,
 )
 from carmel.services.pdf_fragments import (
     FragmentExtraction,
@@ -480,3 +482,106 @@ class TestNoApprovalAffordanceExists:
         for reason in RegionRefusalReason:
             assert "not_" not in reason.value
             assert reason.value not in {"none", "ok", "clean", "accepted"}
+
+
+class TestTheCensusIsNotBiasedByCheckOrder:
+    """`refuse_region` answers a yes/no question and one reason ends it. Counting those
+    reasons across a corpus measures the order of the checks instead of the corpus, so
+    `region_refusals` reports every reason it could actually evaluate."""
+
+    def test_a_straddler_no_longer_hides_the_detached_sign(self) -> None:
+        """The pair that motivated this: both are real findings about the same region,
+        and under first-wins the sign -- the dangerous one -- was the one discarded."""
+        sign = _fragment("-", 95.0, 98.0)
+        number = _fragment("1.0", 100.0, 110.0)
+        straddler = _fragment("14", 105.0, 120.0)
+        reasons = [refusal.reason for refusal in region_refusals(_extraction(sign, number, straddler), _region(number))]
+        assert reasons == [
+            RegionRefusalReason.STRADDLED,
+            RegionRefusalReason.ADJACENT_UNREADABLE,
+        ]
+
+    def test_a_member_level_finding_no_longer_hides_a_band_level_one(self) -> None:
+        sign = _fragment("-", 95.0, 98.0)
+        number = _fragment("1.0", 100.0, 110.0, mapping=GlyphMapping.UNMAPPED)
+        reasons = [refusal.reason for refusal in region_refusals(_extraction(sign, number), _region(number))]
+        assert reasons == [
+            RegionRefusalReason.UNMAPPED_MEMBER,
+            RegionRefusalReason.ADJACENT_UNREADABLE,
+        ]
+
+    def test_a_rotated_member_is_recorded_but_not_also_placed(self) -> None:
+        """Its extent is not a horizontal one, so declaring it outside the box would
+        manufacture a second finding out of the first one's uncertainty."""
+        number = _fragment("1.0", 400.0, 410.0, rotated=True)
+        region = ClaimedRegion(page=1, x_start=100.0, x_end=110.0, baseline_y=700.0, members=(number,))
+        reasons = [refusal.reason for refusal in region_refusals(_extraction(number), region)]
+        assert reasons == [RegionRefusalReason.ROTATED_MEMBER]
+
+    def test_a_reason_is_counted_once_per_region_however_many_fragments_earn_it(self) -> None:
+        first = _fragment("1", 100.0, 105.0, mapping=GlyphMapping.UNMAPPED)
+        second = _fragment("0", 105.0, 110.0, mapping=GlyphMapping.UNMAPPED)
+        reasons = [refusal.reason for refusal in region_refusals(_extraction(first, second), _region(first, second))]
+        assert reasons == [RegionRefusalReason.UNMAPPED_MEMBER]
+
+    def test_a_halting_reason_truncates_the_census_and_says_so(self) -> None:
+        """A forged member and a detached sign. Only the forgery is reported, because
+        the members tuple no longer partitions the page and the outsider set every band
+        check reads is computed from it."""
+        sign = _fragment("-", 95.0, 98.0)
+        real = _fragment("1.0", 100.0, 110.0)
+        forged = _fragment("1.0", 100.0, 110.0)
+        refusals = region_refusals(_extraction(sign, real), _region(forged))
+        assert [refusal.reason for refusal in refusals] == [RegionRefusalReason.FOREIGN_MEMBER]
+        assert refusals[-1].reason in HALTS_EVALUATION
+
+    def test_a_halting_reason_is_only_ever_the_last_element(self) -> None:
+        """The invariant that makes the result readable: everything before the end was
+        followed by checks that ran, so its absence from the tail is informative."""
+        sign = _fragment("-", 95.0, 98.0)
+        number = _fragment("1.0", 100.0, 110.0)
+        unmapped = _fragment("1.0", 100.0, 110.0, mapping=GlyphMapping.UNMAPPED)
+        rotated_far = _fragment("x", 200.0, 210.0, rotated=True)
+        shapes = [
+            (_extraction(sign, number), _region(number)),
+            (_extraction(sign, unmapped), _region(unmapped)),
+            (_extraction(sign, number, _fragment("14", 105.0, 120.0)), _region(number)),
+            (_extraction(sign, unmapped, rotated_far), _region(unmapped)),
+            (_extraction(number, lossy=True), _region(number)),
+            (_extraction(number), _region(number)),
+        ]
+        for extraction, region in shapes:
+            refusals = region_refusals(extraction, region)
+            for refusal in refusals[:-1]:
+                assert refusal.reason not in HALTS_EVALUATION
+
+    def test_the_yes_no_answer_is_the_first_element_of_the_census(self) -> None:
+        """Two entry points, one set of checks -- so a consumer measuring this layer
+        measures the layer that runs, not a second implementation that drifts."""
+        sign = _fragment("-", 95.0, 98.0)
+        number = _fragment("1.0", 100.0, 110.0)
+        unmapped = _fragment("1.0", 100.0, 110.0, mapping=GlyphMapping.UNMAPPED)
+        for extraction, region in (
+            # Multi-reason shapes first: on a one-reason region every choice of index
+            # agrees, so a single-reason case asserts nothing about WHICH one is taken.
+            (_extraction(sign, number, _fragment("14", 105.0, 120.0)), _region(number)),
+            (_extraction(sign, unmapped), _region(unmapped)),
+            (_extraction(sign, number), _region(number)),
+            (_extraction(number), _region(number)),
+            (_extraction(number, lossy=True), _region(number)),
+        ):
+            refusals = region_refusals(extraction, region)
+            refusal = refuse_region(extraction, region)
+            assert refusal == (refusals[0] if refusals else None)
+
+    def test_every_reason_is_triaged_as_halting_or_independent(self) -> None:
+        """A new reason must be classified deliberately: `HALTS_EVALUATION` is a claim
+        about what the check destroyed, and defaulting it either way is a guess."""
+        independent = {
+            RegionRefusalReason.UNMAPPED_MEMBER,
+            RegionRefusalReason.ROTATED_MEMBER,
+            RegionRefusalReason.STRADDLED,
+            RegionRefusalReason.ADJACENT_UNREADABLE,
+        }
+        assert HALTS_EVALUATION | independent == set(RegionRefusalReason)
+        assert not HALTS_EVALUATION & independent
