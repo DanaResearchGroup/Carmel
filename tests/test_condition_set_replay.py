@@ -69,6 +69,8 @@ from carmel.schemas.datasets import (
 from carmel.services import dataset_replay
 from carmel.services.dataset_producer import MeasurementSpec
 from carmel.services.dataset_replay import (
+    _STITCH_GATE,
+    RefutationStatus,
     ReplayFinding,
     ReplayOutcome,
     ReplayReport,
@@ -173,6 +175,41 @@ def _scalar_claim_with_uncertainty() -> GroundedScalarClaim:
             upper=_pressure("1.7", 1),
             lower=_pressure("1.3", 2),
         ),
+    )
+
+
+def _forged_scalar_claim() -> GroundedScalarClaim:
+    """Label from the pressure sentence, value stolen from the temperature.
+
+    Every ref is honest in isolation: "pressure", "298" and "atm" are each
+    exactly where their locator says. Only the RELATION is fabricated, which is
+    precisely what re-slicing a span cannot detect.
+
+    Module-level rather than a method on the stitching test class, because the
+    attempted-refutations tests need the same forgery and reaching into another
+    test class for it would couple two suites through an instance.
+    """
+    return GroundedScalarClaim(
+        claim_id="fabricated_pressure",
+        label_raw="pressure",
+        label_ref=_span("pressure"),
+        value=MeasuredValue(
+            raw_text="298",
+            canonical_decimal_value="298",
+            quantity_kind=QuantityKind.PRESSURE,
+            unit_raw="atm",
+            unit_normalized="atm",
+            conversion_table_sha256=TABLE_V1.sha256,
+            repairs=(),
+            repair_dependency=SemanticDependencyUse(
+                dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            ),
+            value_ref=_span("298"),
+            unit_ref=_nth_span("atm", 0),
+        ),
+        uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
     )
 
 
@@ -978,40 +1015,10 @@ class TestSpanStitchingIsRefutedOnTheREADPathToo:
     runs here, against independently re-read text.
     """
 
-    def _forged(self) -> GroundedScalarClaim:
-        """Label from the pressure sentence, value stolen from the temperature.
-
-        Every ref is honest in isolation: "pressure", "298" and "atm" are each
-        exactly where their locator says. Only the RELATION is fabricated,
-        which is precisely what re-slicing a span cannot detect.
-        """
-        return GroundedScalarClaim(
-            claim_id="fabricated_pressure",
-            label_raw="pressure",
-            label_ref=_span("pressure"),
-            value=MeasuredValue(
-                raw_text="298",
-                canonical_decimal_value="298",
-                quantity_kind=QuantityKind.PRESSURE,
-                unit_raw="atm",
-                unit_normalized="atm",
-                conversion_table_sha256=TABLE_V1.sha256,
-                repairs=(),
-                repair_dependency=SemanticDependencyUse(
-                    dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
-                    content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
-                    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
-                ),
-                value_ref=_span("298"),
-                unit_ref=_nth_span("atm", 0),
-            ),
-            uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
-        )
-
     def _replayed(self, tmp_path: Path) -> ReplayReport:
         envelope = _minimal_condition_set(
             tmp_path,
-            scalar_claims=(self._forged(),),
+            scalar_claims=(_forged_scalar_claim(),),
             conversion_tables=(_embedded_table_v1(),),
         )
         return replay_condition_set(tmp_path, envelope)
@@ -1063,7 +1070,7 @@ class TestSpanStitchingIsRefutedOnTheREADPathToo:
         Found by adversarial review (Codex round 96), not by the suite -- the
         dead branch was unreachable, so no test could have exercised it.
         """
-        forged = self._forged()
+        forged = _forged_scalar_claim()
         claim = forged.model_copy(
             update={"value": forged.value.model_copy(update={"conversion_table_sha256": "0" * 64})}
         )
@@ -1077,3 +1084,160 @@ class TestSpanStitchingIsRefutedOnTheREADPathToo:
         finding = next(f for f in report.findings if f.ref_path == "scalar_claims[0]")
         assert finding.category is ReplayOutcome.UNVERIFIABLE
         assert "no known table" in finding.reason
+
+
+class TestASurvivingClaimLeavesARecordOfHavingBeenAttacked:
+    """A refutation gate that says nothing on success is indistinguishable from
+    a gate that never ran.
+
+    ``refute_stitched_claim`` can only ever show a claim WRONG. Before the
+    ``attempted_refutations`` axis existed, a claim it declined to refute left
+    no trace at all in the report -- so a reader could not tell "this survived a
+    falsification attempt" from "no gate ever looked at this", and the two call
+    for very different amounts of trust.
+
+    The axis also carries the rule that surviving is not proof: an entry of ANY
+    status bars ``overall_outcome`` from reading VERIFIED.
+    """
+
+    def _honest(self, tmp_path: Path) -> ReplayReport:
+        envelope = _minimal_condition_set(
+            tmp_path,
+            scalar_claims=(_scalar_claim_with_uncertainty(),),
+            conversion_tables=(_embedded_table_v1(),),
+        )
+        return replay_condition_set(tmp_path, envelope)
+
+    def test_the_surviving_claim_is_recorded_as_not_refuted(self, tmp_path: Path) -> None:
+        report = self._honest(tmp_path)
+
+        # Nothing is wrong with this claim -- it produces no finding at all.
+        assert not [f for f in report.findings if f.ref_path == "scalar_claims[0]"]
+
+        # And yet it is not silent about it: the attempt is on the record,
+        # naming which attack was mounted against which claim.
+        (attempt,) = report.attempted_refutations
+        assert attempt.claim_path == "scalar_claims[0]"
+        assert attempt.status is RefutationStatus.NOT_REFUTED
+
+        # The gate name is asserted as a LITERAL, not against the constant the
+        # producer uses. `assert attempt.gate == _STITCH_GATE` compares the
+        # implementation to itself: it holds for any value, including a wrong
+        # one, and proves only that both sides imported the same symbol
+        # (Codex round 98).
+        assert attempt.gate == "carmel.services.stitching:refute_stitched_claim"
+        assert attempt.gate == _STITCH_GATE, "the producer's constant drifted from the name above"
+
+    def test_a_surviving_claim_carries_no_grounds_for_believing_it(self, tmp_path: Path) -> None:
+        """NOT_REFUTED has nothing to report, and the type refuses to let it
+        pretend otherwise. A `reason` here would read as a justification --
+        which is exactly the inference a falsification gate cannot license."""
+        (attempt,) = self._honest(tmp_path).attempted_refutations
+        assert attempt.reason is None
+        assert attempt.found == ()
+
+    def test_surviving_every_attack_still_does_not_verify(self, tmp_path: Path) -> None:
+        """This envelope's evidence checks all pass, its one scalar claim
+        withstood the gate, and the report still refuses to say VERIFIED.
+
+        **This assertion is MASKED and cannot catch the wire's removal.** Every
+        condition set carries ``attribution_ref``, which always leaves an
+        ``UncheckedSemanticClaim``, so ``overall_outcome`` is UNVERIFIABLE here
+        no matter what the attempted-refutations axis does -- verified by
+        deleting the wire and watching this test still pass (Codex round 98
+        independently flagged it). It is kept as an end-to-end statement of the
+        intended reading, and the mutation-sensitive version lives in
+        ``TestNotRefutedIsNotVerified`` in ``tests/test_dataset_replay.py``,
+        built on a hand-constructed report with nothing else wrong with it.
+        """
+        report = self._honest(tmp_path)
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+    def test_a_refuted_claim_is_recorded_on_both_axes(self, tmp_path: Path) -> None:
+        """The axis ADDS a record; it never replaces the finding. A refutation
+        that moved off `findings` onto this list would be invisible to
+        `evidence_outcome`, which is the verdict on the data."""
+        envelope = _minimal_condition_set(
+            tmp_path,
+            scalar_claims=(_forged_scalar_claim(),),
+            conversion_tables=(_embedded_table_v1(),),
+        )
+        report = replay_condition_set(tmp_path, envelope)
+
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        (attempt,) = report.attempted_refutations
+        assert attempt.status is RefutationStatus.REFUTED
+        assert attempt.reason
+        assert report.overall_outcome is ReplayOutcome.FAILED
+
+    def test_every_scalar_claim_leaves_exactly_one_record(self, tmp_path: Path) -> None:
+        """The invariant that makes the axis readable: one entry per claim,
+        whatever happened. A sweep that recorded only its failures would leave a
+        surviving claim looking exactly like an unexamined one -- the defect
+        this axis closes, reintroduced one level down."""
+        honest = _scalar_claim_with_uncertainty()
+        forged = _forged_scalar_claim()
+        envelope = _minimal_condition_set(
+            tmp_path,
+            # Sorted ascending by claim_id, which the envelope validator
+            # requires: "fabricated_pressure" sorts before "initial_pressure".
+            scalar_claims=(forged, honest),
+            conversion_tables=(_embedded_table_v1(),),
+        )
+        report = replay_condition_set(tmp_path, envelope)
+
+        # Two claims of DIFFERENT outcomes, so a sweep that recorded only one
+        # kind cannot pass. One entry each, in claim order, each naming its own
+        # index -- a single-claim fixture proves none of that.
+        assert [a.claim_path for a in report.attempted_refutations] == [
+            "scalar_claims[0]",
+            "scalar_claims[1]",
+        ]
+        assert [a.status for a in report.attempted_refutations] == [
+            RefutationStatus.REFUTED,
+            RefutationStatus.NOT_REFUTED,
+        ]
+
+    def test_a_claim_whose_node_is_broken_still_leaves_a_record(self, tmp_path: Path) -> None:
+        """The skip path. When the claim's node carries a store-level problem,
+        the gate never runs and no per-claim finding is filed -- the finding
+        belongs to the node. Without an attempt record the claim would leave no
+        trace at all on the only axis that tracks per-claim work, which is the
+        exact silence this axis exists to end.
+        """
+        envelope = _minimal_condition_set(
+            tmp_path,
+            scalar_claims=(_scalar_claim_with_uncertainty(),),
+            conversion_tables=(_embedded_table_v1(),),
+        )
+        # Corrupt the stored bytes so the node fails independent verification.
+        node = envelope.source_graph.nodes[0]
+        raw = artifact_dir(tmp_path, node.sha256) / "raw.bin"
+        raw.write_bytes(b"not the bytes this node was addressed by")
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        (attempt,) = report.attempted_refutations
+        assert attempt.claim_path == "scalar_claims[0]"
+        assert attempt.status is RefutationStatus.UNRUNNABLE
+        # The gate never ran, so it never survived -- the distinction the two
+        # statuses exist to keep.
+        assert attempt.status is not RefutationStatus.NOT_REFUTED
+        # And no finding was double-filed against the claim itself.
+        assert not [f for f in report.findings if f.ref_path == "scalar_claims[0]"]
+
+    def test_an_unrunnable_gate_is_never_recorded_as_survival(self, tmp_path: Path) -> None:
+        """UNRUNNABLE and NOT_REFUTED are never conflated: there, an attack ran
+        and missed; here, no attack was ever mounted."""
+        forged = _forged_scalar_claim()
+        claim = forged.model_copy(
+            update={"value": forged.value.model_copy(update={"conversion_table_sha256": "0" * 64})}
+        )
+        base = _minimal_condition_set(tmp_path)
+        envelope = ConditionSetEnvelope.model_construct(**{**dict(base), "scalar_claims": (claim,)})
+        report = replay_condition_set(tmp_path, envelope)
+
+        (attempt,) = report.attempted_refutations
+        assert attempt.status is RefutationStatus.UNRUNNABLE
+        assert "no known table" in (attempt.reason or "")

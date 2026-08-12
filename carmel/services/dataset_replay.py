@@ -250,6 +250,8 @@ from carmel.services.stitching import (
 from carmel.services.units import QuantityKind
 
 __all__ = [
+    "AttemptedRefutation",
+    "RefutationStatus",
     "ReplayFinding",
     "ReplayOutcome",
     "ReplayReport",
@@ -297,6 +299,13 @@ class ReplayOutcome(StrEnum):
 
     VERIFIED = "verified"
     """Every applicable check ran, and every one of them passed.
+
+    "Passed" means a check that could have shown something WRONG did not. It
+    does not extend to a falsification gate that ran and failed to refute:
+    surviving an attack is not a check passing, because that gate has no
+    passing state to reach. Those are recorded on
+    :attr:`ReplayReport.attempted_refutations`, and any entry there keeps
+    :attr:`ReplayReport.overall_outcome` off this member.
 
     Scope-neutral on purpose: this member no longer carries the caveat, because
     the FIELD now carries the scope. It used to say "every applicable EVIDENCE
@@ -523,6 +532,168 @@ class UncheckedSemanticClaim:
                 )
 
 
+class RefutationStatus(StrEnum):
+    """What one attempted falsification actually concluded.
+
+    Deliberately NOT members of :class:`ReplayOutcome`, and the distinction is
+    the whole reason this enum exists. ``ReplayOutcome`` answers "what does this
+    report claim", and its three members are exhaustive over that question. A
+    falsification attempt answers a different question -- "did the attack land"
+    -- whose honest answers include one that ``ReplayOutcome`` has no member
+    for: the attack ran and did not land, which is not proof of anything.
+
+    Adding that as a fourth ``ReplayOutcome`` member was the obvious move and is
+    wrong twice over: it would break every three-way branch over the outcome
+    enum, and ``ReplayFinding`` bans only ``VERIFIED``, so a ``NOT_REFUTED``
+    finding would be constructed happily and then match neither the FAILED nor
+    the UNVERIFIABLE test in the derivation -- present in the report, invisible
+    to the verdict. That is the exact failure mode the ``VERIFIED``-finding ban
+    exists to stop.
+    """
+
+    NOT_REFUTED = "not_refuted"
+    """The gate ran, in full, and declined to refute the claim.
+
+    **This is not verification, and the name is chosen so it cannot be read as
+    verification.** A refutation gate has exactly one power: to show that a
+    claim disagrees with the evidence. Failing to exercise it says the attack
+    this gate knows how to mount did not land -- it says nothing about attacks
+    it does not know how to mount, and nothing about whether the claim is true.
+    A surviving claim is unrefuted, never confirmed."""
+
+    REFUTED = "refuted"
+    """The gate ran and the claim contradicts the re-read evidence.
+
+    Always accompanied by a ``FAILED`` :class:`ReplayFinding` AT THE SAME PATH,
+    and :class:`ReplayReport` enforces that rather than trusting it -- the axis
+    records that an attack was attempted and never replaces the finding that
+    reports it. Without the enforcement a report could carry a refutation with
+    no finding, and answer ``FAILED`` while holding no account of what failed."""
+
+    UNRUNNABLE = "unrunnable"
+    """The gate could not run at all, so nothing was attempted. Never conflated
+    with :attr:`NOT_REFUTED`: there, an attack ran and missed; here, no attack
+    was ever mounted, and strictly less is known.
+
+    Usually accompanied by an ``UNVERIFIABLE`` :class:`ReplayFinding`, but
+    deliberately NOT always, and this is not enforced. When the claim's node
+    already carries a store-level problem, the finding is filed against the NODE
+    and re-filing it per claim would report one defect as several -- so the
+    attempt is recorded here with no sibling finding at the claim's own path.
+    An earlier version of this docstring claimed "always", which was simply
+    false against that path (Codex round 98)."""
+
+
+@dataclass(frozen=True)
+class AttemptedRefutation:
+    """One record that replay TRIED to falsify one claim, and what came of it.
+
+    The fourth axis of :class:`ReplayReport`, and the only one that is populated
+    when nothing is wrong. The other three record defects, unchecked store
+    claims and unchecked semantic claims; this one records WORK -- which claims
+    were attacked, by which gate, and which survived.
+
+    It exists because a refutation gate that declines to refute previously left
+    no trace whatsoever. A reader of the report could not distinguish "this
+    claim withstood a falsification attempt" from "nothing ever looked at this
+    claim", and those are very different states to act on. Silence is the one
+    thing a falsification-based verifier must never emit on success, because
+    silence is what an absent verifier also emits.
+    """
+
+    claim_path: str
+    """Where in the envelope the attacked claim lives, e.g.
+    ``scalar_claims[0]`` -- the same path vocabulary
+    :attr:`ReplayFinding.ref_path` uses, so a refuted entry and its finding can
+    be lined up by a reader."""
+
+    gate: str
+    """Which falsification was attempted, as ``module:function``. Named rather
+    than implied because "not refuted" is only meaningful once a reader knows
+    WHICH attack missed -- an unqualified "survived" is exactly the overclaim
+    this axis exists to prevent."""
+
+    status: RefutationStatus
+    """Which of the three outcomes the attempt produced."""
+
+    reason: str | None = None
+    """Why, for :attr:`RefutationStatus.REFUTED` (what disagreed) and
+    :attr:`RefutationStatus.UNRUNNABLE` (what stopped the gate). ``None`` for
+    :attr:`RefutationStatus.NOT_REFUTED`, which has nothing to report: a
+    surviving claim raises no complaint, and prose here would read as a
+    justification for trusting it."""
+
+    found: tuple[str, ...] = ()
+    """What the gate found instead -- the competing constructs a refutation is
+    built on. Empty unless :attr:`status` is :attr:`RefutationStatus.REFUTED`,
+    and that is enforced below rather than merely stated here: a gate that could
+    not run found nothing by definition, so an UNRUNNABLE entry carrying
+    concrete constructs describes something that did not happen."""
+
+    def __post_init__(self) -> None:
+        # `tuple(some_str)` splits it into CHARACTERS, and every one of them
+        # passes the per-element check at the end of this method: `found="atm"`
+        # would be stored as ("a", "t", "m") and reported as three competing
+        # constructs the gate never found. A bare str is precisely the
+        # iterable-of-str a caller passes here by mistake, so it is refused
+        # BEFORE the normalisation, not after (Codex round 98).
+        if isinstance(self.found, str | bytes):
+            raise ValueError(
+                f"AttemptedRefutation.found must be a sequence of strings, not a bare "
+                f"{type(self.found).__name__} ({self.found!r}) -- iterating one splits it into "
+                "single characters, each of which passes every check below, so the report would "
+                "carry one construct per letter and nothing would notice"
+            )
+        object.__setattr__(self, "found", tuple(self.found))
+        if type(self.status) is not RefutationStatus:
+            raise ValueError(
+                f"AttemptedRefutation.status must be exactly a RefutationStatus member, got "
+                f"{type(self.status)!r}: this value decides whether the entry downgrades "
+                "overall_outcome to FAILED or to UNVERIFIABLE, and a StrEnum look-alike compares "
+                "equal to a member while failing every identity test the derivation is written with"
+            )
+        for name in ("claim_path", "gate"):
+            text = getattr(self, name)
+            if type(text) is not str or not text.strip():
+                raise ValueError(
+                    f"AttemptedRefutation.{name} must be a non-empty, non-blank str, got {text!r} "
+                    "-- an entry that cannot name which claim was attacked, or which attack was "
+                    "mounted, records that work happened without recording what the work was"
+                )
+        if self.status is RefutationStatus.NOT_REFUTED:
+            # A surviving claim has no complaint to file. Allowing prose here
+            # would invite exactly the sentence this axis exists to prevent
+            # someone writing -- a reason the claim should be believed, filed
+            # under a status that means only that one attack missed.
+            if self.reason is not None:
+                raise ValueError(
+                    f"AttemptedRefutation with status=NOT_REFUTED must carry reason=None, got "
+                    f"{self.reason!r}: a claim that survived a falsification attempt has nothing "
+                    "to report, and a reason here would read as grounds for believing it"
+                )
+        else:
+            if self.reason is None or not self.reason.strip():
+                raise ValueError(
+                    f"AttemptedRefutation with status={self.status!r} must carry a non-blank "
+                    "reason: both REFUTED and UNRUNNABLE assert that something specific happened, "
+                    "and an entry that cannot say what is indistinguishable from one that did not "
+                    "run at all"
+                )
+        if self.status is not RefutationStatus.REFUTED and self.found != ():
+            # Stated on the field and enforced nowhere, this let an UNRUNNABLE
+            # entry carry concrete constructs -- a report saying in one breath
+            # that the gate never ran and that here is what it found. Only a
+            # landed refutation has competing constructs to show.
+            raise ValueError(
+                f"AttemptedRefutation with status={self.status!r} must carry empty found, got "
+                f"{self.found!r}: `found` holds the competing constructs a refutation is built "
+                "on, and there is no refutation here"
+            )
+        for index, item in enumerate(self.found):
+            if type(item) is not str or not item.strip():
+                raise ValueError(f"AttemptedRefutation.found[{index}] must be a non-empty, non-blank str, got {item!r}")
+
+
 @dataclass(frozen=True)
 class ReplayReport:
     """The structured result of replaying one :class:`DatasetEnvelope`.
@@ -581,6 +752,22 @@ class ReplayReport:
     every call site that was never revisited -- the same defect as the bare
     ``outcome`` this report already removed, one level down."""
 
+    attempted_refutations: tuple[AttemptedRefutation, ...] = ()
+    """Falsifications this replay ATTEMPTED -- see :class:`AttemptedRefutation`.
+
+    Unlike the three axes above, this one is populated when nothing is wrong: a
+    claim that survives its gate leaves a
+    :attr:`RefutationStatus.NOT_REFUTED` entry. That is the point. A refutation
+    gate that stays silent on success is indistinguishable from a gate that
+    never ran, and this list is what makes the two distinguishable in the
+    report itself rather than in the reader's memory of which gates exist.
+
+    Every entry, whatever its status, prevents :attr:`overall_outcome` from
+    reading VERIFIED -- including ``NOT_REFUTED``, which is the one that matters:
+    "we tried to break this claim and could not" is not "this claim is
+    verified", and a report that let the former print as the latter would be
+    making precisely the inference this whole lane is built to refuse."""
+
     support_only_char_spans: int = 0
     """Char-span refs that were resolved and re-sliced to confirm the span
     EXISTS, but which carry no recorded text to compare against, so no quote
@@ -600,6 +787,7 @@ class ReplayReport:
         object.__setattr__(self, "findings", tuple(self.findings))
         object.__setattr__(self, "unchecked_store_claims", tuple(self.unchecked_store_claims))
         object.__setattr__(self, "unchecked_semantic_claims", tuple(self.unchecked_semantic_claims))
+        object.__setattr__(self, "attempted_refutations", tuple(self.attempted_refutations))
 
         # Normalising the CONTAINER says nothing about what is in it. Both
         # derivations read `.category` off each finding and match it on
@@ -635,6 +823,42 @@ class ReplayReport:
                         "so an arbitrary object here silently decides a verdict, and a claim "
                         "from the other axis would misreport which axis was left untested"
                     )
+
+        # Same rule, fourth axis. This one decides between FAILED and
+        # UNVERIFIABLE (not merely whether to downgrade), so a look-alike whose
+        # `.status` matches no branch would leave a report carrying an
+        # attempted refutation that reads VERIFIED anyway -- the single outcome
+        # this axis exists to make impossible.
+        for index, attempt in enumerate(self.attempted_refutations):
+            if type(attempt) is not AttemptedRefutation:
+                raise ValueError(
+                    f"attempted_refutations[{index}] is a {type(attempt).__name__}, not an "
+                    "AttemptedRefutation -- the outcome derivation reads .status off each entry "
+                    "and matches it on identity, so a look-alike would decide a verdict without "
+                    "being bound by any of the rules AttemptedRefutation enforces"
+                )
+
+        # A REFUTED attempt asserts a demonstrated disagreement, and a report
+        # that asserts one owes its reader the account of it. Without this, a
+        # report could answer FAILED while `findings` was empty -- a verdict
+        # with nothing behind it, and `evidence_outcome` would meanwhile still
+        # read VERIFIED off those same empty findings, so the two properties
+        # would contradict each other on one object (Codex round 98).
+        #
+        # Enforcing it here rather than patching `overall_outcome` is what keeps
+        # the two consistent BY CONSTRUCTION, and it is why that property has no
+        # REFUTED branch: the pairing makes `evidence_outcome` FAILED already,
+        # so such a branch could never be the one that decided anything. A
+        # branch that cannot be reached is not a check.
+        failed_paths = {f.ref_path for f in self.findings if f.category is ReplayOutcome.FAILED}
+        for index, attempt in enumerate(self.attempted_refutations):
+            if attempt.status is RefutationStatus.REFUTED and attempt.claim_path not in failed_paths:
+                raise ValueError(
+                    f"attempted_refutations[{index}] is REFUTED at {attempt.claim_path!r} but no "
+                    "FAILED finding sits at that path -- a report claiming a refutation landed "
+                    "must carry the finding that says what disagreed, or it answers FAILED with "
+                    "no account of why while evidence_outcome still reads VERIFIED"
+                )
 
         # `bool` subclasses `int`, so `True` satisfies every bound below and
         # reads as a count of 1; a float satisfies them too and can make the
@@ -733,10 +957,17 @@ class ReplayReport:
         """What this report can honestly claim, across every axis it covers.
 
         ``VERIFIED`` here means: every applicable check ran, every one passed,
-        and nothing was left untested. It is the verdict a consumer may act on
+        nothing was left untested, and no falsification was attempted that could
+        only ever have failed to land. It is the verdict a consumer may act on
         WITHOUT also inspecting a side list -- which is the whole reason it
-        exists, so nothing that widens "what was left untested" may be added to
-        this report without also being wired in here.
+        exists, so nothing that widens "what was left untested", and nothing
+        that records an attempted refutation, may be added to this report
+        without also being wired in here.
+
+        That last clause is not a widening of "untested": a survived
+        falsification attempt IS a check that ran to completion. It bars
+        VERIFIED anyway, because the gate behind it can only ever show a claim
+        wrong, so its non-firing establishes nothing to verify.
         """
         evidence = self.evidence_outcome
         # A demonstrated disagreement outranks an untested claim: FAILED must
@@ -744,11 +975,33 @@ class ReplayReport:
         # two are never conflated, in EITHER direction.
         if evidence is ReplayOutcome.FAILED:
             return ReplayOutcome.FAILED
+        # There is deliberately NO branch for RefutationStatus.REFUTED here. It
+        # would be unreachable: __post_init__ refuses any report whose REFUTED
+        # attempt has no FAILED finding at the same path, so the branch above
+        # has already returned FAILED for every report that could reach one.
+        # The first draft had that branch, and an unreachable branch is not a
+        # check -- it is a check-shaped comment that no test can ever cover
+        # (the lesson of the `if table is None` guard against a function that
+        # raises, Codex round 96). The invariant lives in the constructor, where
+        # it can actually refuse.
+        #
         # BOTH axes, and every future one. A list that widens "what was left
         # untested" and is not wired in here recreates the original overclaim
         # one level up: this property's entire promise is that a consumer need
         # not also read a side list to know what the report earned.
         if self.unchecked_store_claims or self.unchecked_semantic_claims:
+            return ReplayOutcome.UNVERIFIABLE
+        # The remaining statuses are NOT_REFUTED and UNRUNNABLE, and NEITHER may
+        # reach VERIFIED. UNRUNNABLE is the ordinary case -- a check that could
+        # not run never verifies. NOT_REFUTED is the load-bearing one: it is a
+        # check that ran, in full, and passed, which everywhere else in this
+        # module is exactly what VERIFIED means. It is not that here, because
+        # the gate is a falsification gate: it can only ever show a claim
+        # WRONG, so surviving it is evidence of nothing. Deleting this branch
+        # would make a claim no attack could break print as a claim proved true
+        # -- the inference the dual-lane design exists to refuse, arrived at
+        # through the verifier rather than through the LLM.
+        if self.attempted_refutations:
             return ReplayOutcome.UNVERIFIABLE
         return evidence
 
@@ -2610,11 +2863,31 @@ def replay_stored_dataset(workspace_root: Path, sha256: str, *, reveal_text: boo
     return replay_envelope(workspace_root, envelope, reveal_text=reveal_text)
 
 
+class _StitchingRefutationPass(NamedTuple):
+    """What one sweep of the stitching gate produced, on both axes.
+
+    Two lists rather than one, because they answer different questions and are
+    consumed by different fields: ``findings`` reports what went WRONG, and
+    ``attempts`` reports what was TRIED. A claim that survives contributes only
+    to the second, which is the entire reason the second exists.
+    """
+
+    findings: tuple[ReplayFinding, ...]
+    attempts: tuple[AttemptedRefutation, ...]
+
+
+_STITCH_GATE = "carmel.services.stitching:refute_stitched_claim"
+"""The gate name recorded on every :class:`AttemptedRefutation` this module
+files. A module-level constant so the producer and its tests cannot drift apart
+on the spelling -- a test that hardcodes its own copy of this string proves the
+test's spelling, not the producer's."""
+
+
 def _refute_condition_set_stitching(
     envelope: ConditionSetEnvelope,
     text_by_node_id: Mapping[str, str],
     node_problems: Mapping[str, ReplayFinding],
-) -> tuple[ReplayFinding, ...]:
+) -> _StitchingRefutationPass:
     """Re-run the span-stitching refutation (P0-d) against INDEPENDENTLY re-read text.
 
     The producer runs this same gate at write time, which says nothing about an
@@ -2634,14 +2907,46 @@ def _refute_condition_set_stitching(
     :attr:`ReplayOutcome.UNVERIFIABLE`. Collapsing the two would let a refuted
     fabrication hide among the "could not check" entries that
     ``overall_outcome`` is already UNVERIFIABLE for.
+
+    **Every scalar claim of a schema-valid envelope leaves exactly one**
+    :class:`AttemptedRefutation`, whatever happened to it -- including the
+    claims this function declines to file a finding for. That total is the
+    invariant worth having: a per-claim record makes "the gate ran and missed"
+    distinguishable from "the gate never reached this claim", and a sweep that
+    recorded only its failures would leave a surviving claim looking exactly
+    like an unexamined one.
+
+    The schema qualifier is load-bearing, not a hedge. A claim built through
+    ``model_construct`` can hold a value no validator would pass -- an
+    unhashable ``conversion_table_sha256`` makes ``table_for_sha`` raise
+    ``TypeError`` rather than ``UnknownConversionTableError`` -- and the sweep
+    then aborts with that claim, and every later one, unrecorded. Hardening
+    every gate against arbitrary schema-bypassed input is a separate, named
+    piece of work; what matters here is that the invariant states its own scope
+    instead of promising something it does not deliver (Codex round 98).
     """
     findings: list[ReplayFinding] = []
+    attempts: list[AttemptedRefutation] = []
     for index, claim in enumerate(envelope.scalar_claims):
         path = f"scalar_claims[{index}]"
         node_id = claim.label_ref.node_id
         if node_id in node_problems:
             # Already reported against the node itself; re-reporting it here
-            # would double-count one defect as two.
+            # would double-count one defect as two. The ATTEMPT record is not a
+            # second report of that defect, though -- it is this axis's account
+            # of a claim whose gate never ran, and omitting it would leave the
+            # claim with no trace on the only axis that tracks per-claim work.
+            attempts.append(
+                AttemptedRefutation(
+                    claim_path=path,
+                    gate=_STITCH_GATE,
+                    status=RefutationStatus.UNRUNNABLE,
+                    reason=(
+                        f"node {node_id!r} carries a store-level problem reported against the "
+                        "node itself, so this claim's label/value association was never attacked"
+                    ),
+                )
+            )
             continue
         text = text_by_node_id.get(node_id)
         if text is None:
@@ -2654,6 +2959,14 @@ def _refute_condition_set_stitching(
                         "span-stitching refutation could not run and this claim's "
                         "label/value association is UNCHECKED"
                     ),
+                )
+            )
+            attempts.append(
+                AttemptedRefutation(
+                    claim_path=path,
+                    gate=_STITCH_GATE,
+                    status=RefutationStatus.UNRUNNABLE,
+                    reason=f"node {node_id!r} has no independently re-read text",
                 )
             )
             continue
@@ -2676,6 +2989,14 @@ def _refute_condition_set_stitching(
                     ),
                 )
             )
+            attempts.append(
+                AttemptedRefutation(
+                    claim_path=path,
+                    gate=_STITCH_GATE,
+                    status=RefutationStatus.UNRUNNABLE,
+                    reason=(f"conversion_table_sha256={claim.value.conversion_table_sha256!r} names no known table"),
+                )
+            )
             continue
         outcome = refute_stitched_claim(claim, text, table=table)
         if isinstance(outcome, StitchRefutation):
@@ -2688,6 +3009,15 @@ def _refute_condition_set_stitching(
                     actual=", ".join(outcome.found) if outcome.found else "no number+unit construct",
                 )
             )
+            attempts.append(
+                AttemptedRefutation(
+                    claim_path=path,
+                    gate=_STITCH_GATE,
+                    status=RefutationStatus.REFUTED,
+                    reason=outcome.reason,
+                    found=outcome.found,
+                )
+            )
         elif isinstance(outcome, StitchGateUnrunnable):
             findings.append(
                 ReplayFinding(
@@ -2696,7 +3026,28 @@ def _refute_condition_set_stitching(
                     reason=f"claim {claim.claim_id!r} could not be checked: {outcome.reason}",
                 )
             )
-    return tuple(findings)
+            attempts.append(
+                AttemptedRefutation(
+                    claim_path=path,
+                    gate=_STITCH_GATE,
+                    status=RefutationStatus.UNRUNNABLE,
+                    reason=outcome.reason,
+                )
+            )
+        else:
+            # The gate ran in full and declined to refute. NO finding: nothing
+            # is wrong. The attempt record is the only trace this claim leaves,
+            # and it says exactly what happened -- one named attack was mounted
+            # and missed -- rather than the silence that would be
+            # indistinguishable from never having looked.
+            attempts.append(
+                AttemptedRefutation(
+                    claim_path=path,
+                    gate=_STITCH_GATE,
+                    status=RefutationStatus.NOT_REFUTED,
+                )
+            )
+    return _StitchingRefutationPass(findings=tuple(findings), attempts=tuple(attempts))
 
 
 def replay_condition_set(
@@ -2717,6 +3068,13 @@ def replay_condition_set(
     UNVERIFIABLE for every condition set this can ever replay -- that is the
     honest answer, not a defect: :attr:`ReplayReport.evidence_outcome` still
     says whether every location claim held.
+
+    A second, independent reason now says the same thing: every scalar claim
+    leaves an :class:`AttemptedRefutation`, and any entry on that axis bars
+    VERIFIED. The two reasons are deliberately not merged. They would have to be
+    removed separately, and each states a different limit -- one that a location
+    does not carry a meaning, the other that surviving a falsification attempt
+    is not proof.
     """
     text_by_node_id: dict[str, str] = {}
     node_problems: dict[str, ReplayFinding] = {}
@@ -2810,6 +3168,7 @@ def replay_condition_set(
     total_char_spans = len(walked_char_span_paths | inventory_char_span_paths)
 
     node_level_findings = tuple(node_level_problems.values())
+    stitching = _refute_condition_set_stitching(envelope, text_by_node_id, node_problems)
     all_findings = (
         tuple(pair_findings)
         + tuple(unit_findings)
@@ -2817,7 +3176,7 @@ def replay_condition_set(
         + tuple(claim_findings)
         + reconciliation_findings
         + uncertainty_reconciliation
-        + _refute_condition_set_stitching(envelope, text_by_node_id, node_problems)
+        + stitching.findings
     )
 
     # A replay that independently re-sliced ZERO paired character spans must
@@ -2843,6 +3202,7 @@ def replay_condition_set(
         findings=all_findings,
         unchecked_store_claims=tuple(unchecked_store_claims),
         unchecked_semantic_claims=semantic_claims,
+        attempted_refutations=stitching.attempts,
         support_only_char_spans=support_only_char_spans,
     )
 

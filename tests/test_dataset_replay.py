@@ -21,8 +21,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from carmel.agents.tools.extract import ExtractedText, PageExtractionFailure
 from carmel.agents.tools.fetch import FetchedArtifact
@@ -70,8 +73,13 @@ from carmel.services.dataset_producer import (
     ground_quote,
 )
 from carmel.services.dataset_replay import (
+    AttemptedRefutation,
+    RefutationStatus,
     ReplayFinding,
     ReplayOutcome,
+    ReplayReport,
+    SemanticGap,
+    UncheckedSemanticClaim,
     _independently_verify_node_text,
     check_char_spans,
     replay_envelope,
@@ -2150,3 +2158,249 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         # reached. Asserting the byte-level reason is what makes it a real test.
         reasons = [f.reason for f in report.evidence_unverifiable]
         assert any("no readable raw.bin" in r and "'crop'" in r for r in reasons), reasons
+
+
+class TestNotRefutedIsNotVerified:
+    """The rule that "we could not break this" never prints as "this is true".
+
+    ``AttemptedRefutation`` records falsification attempts, and the gate behind
+    it is a refutation gate: it has exactly one power, to show a claim WRONG.
+    Surviving it is therefore evidence of nothing, and a report carrying such a
+    survival must not read VERIFIED.
+
+    These tests build ``ReplayReport`` directly rather than through a replay.
+    The type is public and constructible by anyone, so the derivation has to
+    hold for every report, not only the ones this module happens to build --
+    the same reason ``evidence_outcome`` enforces its own coverage rules
+    instead of trusting its one caller.
+    """
+
+    def _clean(self, **kwargs: object) -> ReplayReport:
+        """A report with nothing whatsoever wrong with it."""
+        return ReplayReport(checked_char_spans=3, total_char_spans=3, unchecked_char_spans=0, **kwargs)  # type: ignore[arg-type]
+
+    def test_the_baseline_really_does_verify(self) -> None:
+        """Without this, the test below proves nothing: it must be the
+        attempted refutation that blocks VERIFIED, not some other blemish the
+        fixture carried in by accident."""
+        report = self._clean()
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.VERIFIED
+
+    def test_a_survived_attack_blocks_verified(self) -> None:
+        """THE wire. Every data check passed, no claim went unchecked, and one
+        claim withstood a falsification attempt -- and the report still refuses
+        to say VERIFIED.
+
+        If this test ever passes with the `attempted_refutations` branch
+        deleted from `overall_outcome`, the axis has become decoration.
+        """
+        report = self._clean(
+            attempted_refutations=(
+                AttemptedRefutation(
+                    claim_path="scalar_claims[0]",
+                    gate="carmel.services.stitching:refute_stitched_claim",
+                    status=RefutationStatus.NOT_REFUTED,
+                ),
+            )
+        )
+        # The DATA verdict is untouched: the evidence checks did all pass, and
+        # saying otherwise would make the evidence look worse than it was.
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+    def _refuted(self, claim_path: str = "scalar_claims[0]") -> AttemptedRefutation:
+        return AttemptedRefutation(
+            claim_path=claim_path,
+            gate="carmel.services.stitching:refute_stitched_claim",
+            status=RefutationStatus.REFUTED,
+            reason="a competing construct sits inside the derived window",
+            found=("298 K",),
+        )
+
+    def _with_refutation(self, **kwargs: object) -> ReplayReport:
+        """A report carrying a landed refutation AND the finding that accounts
+        for it -- the only shape the report type accepts."""
+        return ReplayReport(
+            checked_char_spans=3,
+            total_char_spans=3,
+            unchecked_char_spans=0,
+            findings=(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path="scalar_claims[0]",
+                    reason="claim is refuted",
+                ),
+            ),
+            attempted_refutations=(self._refuted(),),
+            **kwargs,  # type: ignore[arg-type]
+        )
+
+    def test_a_landed_refutation_is_failed_not_merely_unverifiable(self) -> None:
+        """A demonstrated disagreement outranks an untested claim. Collapsing
+        REFUTED into UNVERIFIABLE would let a refuted fabrication hide among the
+        "could not check" entries."""
+        assert self._with_refutation().overall_outcome is ReplayOutcome.FAILED
+
+    def test_a_refutation_with_nothing_behind_it_is_refused(self) -> None:
+        """A report that answers FAILED owes its reader the account of what
+        failed. Without this rule `overall_outcome` would read FAILED off the
+        axis while `evidence_outcome` read VERIFIED off the empty findings --
+        two properties of one object contradicting each other.
+
+        Enforcing the pairing HERE, at construction, is also what lets
+        `overall_outcome` carry no REFUTED branch: such a branch could never be
+        reached, and an unreachable branch is not a check.
+        """
+        with pytest.raises(ValueError, match="no FAILED finding sits at that path"):
+            self._clean(attempted_refutations=(self._refuted(),))
+
+    def test_the_pairing_is_matched_by_path_not_merely_by_presence(self) -> None:
+        """A FAILED finding elsewhere in the report does not account for THIS
+        claim's refutation."""
+        with pytest.raises(ValueError, match="no FAILED finding sits at that path"):
+            ReplayReport(
+                checked_char_spans=3,
+                total_char_spans=3,
+                unchecked_char_spans=0,
+                findings=(
+                    ReplayFinding(
+                        category=ReplayOutcome.FAILED,
+                        ref_path="scalar_claims[7]",
+                        reason="a different claim entirely",
+                    ),
+                ),
+                attempted_refutations=(self._refuted(),),
+            )
+
+    def test_a_demonstrated_disagreement_outranks_an_untested_claim(self) -> None:
+        """Order matters and nothing else pinned it: with a FAILED finding, an
+        unchecked semantic claim AND an attempted refutation all present, the
+        answer must be FAILED. Move the unchecked-claim branch above the
+        evidence branch and this is the only test that notices."""
+        report = self._with_refutation(
+            unchecked_semantic_claims=(
+                UncheckedSemanticClaim(
+                    claim_path="attribution",
+                    claim="own_experiment",
+                    gap=SemanticGap.NO_SUPPORT_OFFERED,
+                    reason="an enum has no recorded quote",
+                ),
+            )
+        )
+        assert report.overall_outcome is ReplayOutcome.FAILED
+
+    def test_an_unrunnable_gate_blocks_verified_too(self) -> None:
+        report = self._clean(
+            attempted_refutations=(
+                AttemptedRefutation(
+                    claim_path="scalar_claims[0]",
+                    gate="carmel.services.stitching:refute_stitched_claim",
+                    status=RefutationStatus.UNRUNNABLE,
+                    reason="no independently re-read text for the claim's node",
+                ),
+            )
+        )
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+    def test_a_look_alike_cannot_smuggle_a_verdict_past_the_report(self) -> None:
+        """The derivation reads `.status` and matches on identity, so an object
+        that merely quacks like an AttemptedRefutation would take part in the
+        verdict while bound by none of its rules."""
+
+        @dataclass(frozen=True)
+        class NotReally:
+            claim_path: str = "scalar_claims[0]"
+            gate: str = "g"
+            status: str = "not_refuted"
+
+        with pytest.raises(ValueError, match="not an AttemptedRefutation"):
+            self._clean(attempted_refutations=(NotReally(),))
+
+    def test_a_string_status_is_refused(self) -> None:
+        """`RefutationStatus` is a StrEnum, so `"refuted"` compares EQUAL to the
+        member while failing every `is` test the derivation uses -- present in
+        the report, invisible to the verdict."""
+        with pytest.raises(ValueError, match="exactly a RefutationStatus member"):
+            AttemptedRefutation(
+                claim_path="scalar_claims[0]",
+                gate="g",
+                status="refuted",  # type: ignore[arg-type]
+            )
+
+    def test_a_surviving_claim_may_not_carry_grounds_for_believing_it(self) -> None:
+        """NOT_REFUTED has nothing to report. A `reason` here would be a
+        sentence arguing the claim should be trusted, filed under a status that
+        means only that one particular attack missed."""
+        with pytest.raises(ValueError, match="nothing to report"):
+            AttemptedRefutation(
+                claim_path="scalar_claims[0]",
+                gate="g",
+                status=RefutationStatus.NOT_REFUTED,
+                reason="the value reads correctly in context",
+            )
+
+    def test_a_refutation_must_say_what_it_found(self) -> None:
+        with pytest.raises(ValueError, match="non-blank reason"):
+            AttemptedRefutation(
+                claim_path="scalar_claims[0]",
+                gate="g",
+                status=RefutationStatus.REFUTED,
+                reason="   ",
+            )
+
+    def test_an_entry_must_name_the_claim_and_the_gate(self) -> None:
+        """ "Not refuted" is only meaningful once a reader knows WHICH attack
+        missed; an unqualified "survived" is the overclaim this axis prevents."""
+        for kwargs in ({"claim_path": " "}, {"gate": ""}):
+            with pytest.raises(ValueError, match="non-blank str"):
+                AttemptedRefutation(
+                    **{
+                        "claim_path": "scalar_claims[0]",
+                        "gate": "g",
+                        "status": RefutationStatus.NOT_REFUTED,
+                        **kwargs,
+                    }  # type: ignore[arg-type]
+                )
+
+    def test_the_axis_is_frozen_against_the_callers_list(self) -> None:
+        """`frozen=True` stops the field being rebound, not the object it points
+        at. Both outcomes are derived on every access, so a caller mutating the
+        list it handed in would change a verdict already read."""
+        mutable: list[AttemptedRefutation] = []
+        report = self._clean(attempted_refutations=mutable)
+        mutable.append(
+            AttemptedRefutation(
+                claim_path="scalar_claims[0]",
+                gate="g",
+                status=RefutationStatus.NOT_REFUTED,
+            )
+        )
+        assert report.attempted_refutations == ()
+        assert report.overall_outcome is ReplayOutcome.VERIFIED
+
+    def test_a_bare_string_is_not_a_list_of_findings(self) -> None:
+        """`tuple("atm")` is `("a", "t", "m")`, and every one of those passes
+        the per-element check -- so the report would carry one competing
+        construct per LETTER and nothing downstream would notice. A bare str is
+        the mistake a caller actually makes here."""
+        with pytest.raises(ValueError, match="not a bare str"):
+            AttemptedRefutation(
+                claim_path="scalar_claims[0]",
+                gate="g",
+                status=RefutationStatus.REFUTED,
+                reason="r",
+                found="atm",  # type: ignore[arg-type]
+            )
+
+    def test_a_gate_that_never_ran_cannot_have_found_anything(self) -> None:
+        """UNRUNNABLE means no attack was mounted. An entry saying so while
+        listing concrete constructs describes something that did not happen."""
+        with pytest.raises(ValueError, match="must carry empty found"):
+            AttemptedRefutation(
+                claim_path="scalar_claims[0]",
+                gate="g",
+                status=RefutationStatus.UNRUNNABLE,
+                reason="no re-read text for the node",
+                found=("298 K",),
+            )
