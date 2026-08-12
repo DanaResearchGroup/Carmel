@@ -441,31 +441,25 @@ class TestAbsenceReasonsAreNotInterchangeable:
         assert kind.reason is AbsenceReason.NOT_EXTRACTED_YET
 
 
-class TestSpanStitchingFabricatesAVerifiedCondition:
-    """CHARACTERIZATION of a live hole, the P0-c shape as it appears HERE.
+class TestSpanStitchingIsRefused:
+    """The P0-d refusal: a scalar assembled from spans that do not cohere.
 
-    This class asserts what the code does TODAY, and today's behaviour is wrong.
-    Read the assertions as a description of the hole, not as a specification.
+    This class REPLACED a characterization of the same shape. Until this rule
+    landed, a caller could stitch the label "pressure" to the value "823" and
+    the unit "atm" -- a pressure of 823 atm the paper never states -- and every
+    span grounded, and replay reported VERIFIED with zero findings. The old
+    class asserted that behaviour, with a docstring saying a green run meant
+    the hole was still open. Found by adversarial review (Codex round 92), not
+    by the suite.
 
-    A scalar claim is assembled from THREE independently grounded quotes: a
-    label, a value, and a unit. Each is verified to be an exact located substring
-    of the authenticated document. NOTHING verifies that the three belong to each
-    other. The synthetic methods text says "The initial temperature was 823 K and
-    the pressure was held at 1.2 atm", and a caller can stitch the label
-    "pressure" to the value "823" and the unit "atm" -- a pressure of 823 atm
-    that the paper never states -- and every span grounds, and replay reports
-    VERIFIED with zero findings.
+    The defence is NOT co-location: the false triple is drawn from ONE
+    sentence, so any bounded measurement window would still bless it. It is a
+    rule about which quotes the paper predicates of which, enforced as a
+    REFUTATION over the span covering the claim's three grounds -- see
+    :mod:`carmel.services.stitching`.
 
-    Grounding proves LOCATION, never MEANING. Co-location does not fix this
-    either: the false triple here is drawn from ONE sentence, so a bounded
-    measurement context would still bless it. The defense has to be a rule about
-    ASSERTION STRUCTURE -- which of these quotes the paper actually predicates of
-    which -- and that is standing work (the prose-local scalar rule, found
-    insufficient for attribution in an earlier sparring round).
-
-    When the real defense lands, production must REFUSE this spec and this class
-    must be rewritten to assert the refusal. A green run here means the hole is
-    still open. Found by adversarial review (Codex round 92), not by the suite.
+    Passing this gate is not verification, and no test here should ever be
+    written to assert that it is.
     """
 
     def _stitched(self) -> ScalarConditionSpec:
@@ -477,26 +471,55 @@ class TestSpanStitchingFabricatesAVerifiedCondition:
             unit_quote="atm",
         )
 
-    def test_the_producer_accepts_a_value_stolen_from_another_quantity(self, tmp_path: Path) -> None:
-        """Production does not object. It has no basis on which to object: every
-        quote IS in the document, exactly where the locator says it is."""
-        envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
-        claim = envelope.scalar_claims[0]
-        assert claim.label_raw == "pressure"
-        assert claim.value.raw_text == "823"
-        assert claim.value.unit_raw == "atm"
+    def _mislabeled(self) -> ScalarConditionSpec:
+        """The sibling fabrication: an HONEST pressure value under a label that
+        belongs to the temperature. Its window holds one PRESSURE pair, so a
+        rule counting only same-kind pairs would bless it."""
+        return ScalarConditionSpec(
+            claim_id="mislabeled_pressure",
+            label_quote="temperature",
+            quantity_kind=units.QuantityKind.PRESSURE,
+            value_quote="1.2",
+            unit_quote="atm",
+        )
 
-    def test_replay_verifies_a_condition_the_paper_never_states(self, tmp_path: Path) -> None:
-        """The hole in one assertion: the strongest verdict the evidence scope
-        can issue, over a fabricated association."""
-        envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
-        report = replay_condition_set(tmp_path, envelope)
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
-        assert report.findings == ()
+    def test_the_producer_refuses_a_value_stolen_from_another_quantity(self, tmp_path: Path) -> None:
+        with pytest.raises(ConditionSetProducerError) as excinfo:
+            _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
+        assert "fabricated_pressure" in str(excinfo.value)
 
-    def test_the_fabricated_condition_is_not_even_physically_absurd(self, tmp_path: Path) -> None:
-        """823 atm is a perfectly ordinary shock-tube pressure, which is why a
-        downstream range or plausibility check would not catch this either. The
-        defense cannot be plausibility; it has to be provenance."""
-        envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
-        assert envelope.scalar_claims[0].value.raw_text == "823"
+    def test_the_refusal_names_what_it_found_rather_than_only_that_it_refused(self, tmp_path: Path) -> None:
+        """A refusal a reader cannot check is a refusal they must take on
+        faith. The message names the window and both constructs in it."""
+        with pytest.raises(ConditionSetProducerError) as excinfo:
+            _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
+        message = str(excinfo.value)
+        assert "823 K" in message
+        assert "1.2 atm" in message
+
+    def test_a_label_belonging_to_another_quantity_is_also_refused(self, tmp_path: Path) -> None:
+        """Closing the stitch while leaving this open would be theatre: the two
+        are the same defect reached from opposite ends."""
+        with pytest.raises(ConditionSetProducerError) as excinfo:
+            _produce(tmp_path, scalars=(self._mislabeled(),), categoricals=(), unextracted=())
+        assert "mislabeled_pressure" in str(excinfo.value)
+
+    def test_the_honest_claims_the_same_sentence_states_still_produce(self, tmp_path: Path) -> None:
+        """The rule must discriminate, not merely refuse. Both true readings of
+        the very sentence the fabrication was drawn from survive it -- a gate
+        that also killed these would be worthless at any yield."""
+        envelope = _produce(tmp_path, categoricals=(), unextracted=())
+        claims = {claim.claim_id: claim for claim in envelope.scalar_claims}  # type: ignore[attr-defined]
+        assert set(claims) == {"initial_temperature", "pressure"}
+        assert claims["initial_temperature"].value.raw_text == "823"
+        assert claims["pressure"].value.raw_text == "1.2"
+
+    def test_the_gate_can_fail_the_way_the_defect_fails(self, tmp_path: Path) -> None:
+        """A verifier that cannot fail is not a verifier. With uniqueness
+        disabled the fabrication is accepted again, which is what proves the
+        uniqueness test -- not some neighbouring check -- is load-bearing."""
+        from unittest.mock import patch
+
+        with patch("carmel.services.stitching.refute_stitched_scalar", return_value=None):
+            envelope = _produce(tmp_path, scalars=(self._stitched(),), categoricals=(), unextracted=())
+        assert envelope.scalar_claims[0].value.raw_text == "823"  # type: ignore[attr-defined]

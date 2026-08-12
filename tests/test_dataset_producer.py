@@ -37,6 +37,7 @@ from carmel.schemas.datasets import (
 )
 from carmel.schemas.literature import StoredArtifact
 from carmel.services.condition_set_producer import (
+    ConditionSetProducerError,
     DeviceClassSpec,
     ScalarConditionSpec,
     produce_condition_set_from_artifact,
@@ -1915,16 +1916,20 @@ class TestProducerGlyphHealthQuarantine:
             )
 
 
-class TestGroundingIsIndependentPerQuote:
-    """P1-F (documented, deliberately NOT fixed by this change): value, unit,
-    and label quotes for one axis are each grounded INDEPENDENTLY anywhere in
-    the document -- nothing checks they were stated together. This is a
-    pinning test of that CURRENT, UNSOUND behaviour: it must FAIL the day a
-    bounded measurement-context check closes the gap, forcing this test (and
-    the docstring paragraph in ``produce_envelope_from_artifact`` describing
-    the same gap) to be updated or removed."""
+class TestGroundingIsIndependentPerQuoteButNoLongerUnchecked:
+    """P1-F, CLOSED. This class used to pin the unsound behaviour and said it
+    "must FAIL the day a bounded measurement-context check closes the gap,
+    forcing this test to be updated or removed". P0-d is that day.
 
-    def test_value_and_unit_from_unrelated_parts_of_document_both_ground(self, tmp_path: Path) -> None:
+    Grounding is still independent per quote -- that part was never the defect,
+    and :func:`~carmel.services.dataset_producer.ground_quote` is unchanged. What
+    changed is that independent grounds are no longer UNCHECKED: the span
+    covering a scalar claim's three grounds must hold exactly one number+unit
+    construct, so quotes drawn from unrelated parts of a document can still each
+    be located but can no longer be assembled into a stored claim.
+    """
+
+    def test_value_and_unit_from_unrelated_parts_of_document_are_refused(self, tmp_path: Path) -> None:
         text = (
             "The reactor was held at a temperature of 1023 K during the run. "
             "In an unrelated paragraph about SI units, Pa was mentioned as the "
@@ -1932,32 +1937,40 @@ class TestGroundingIsIndependentPerQuote:
         )
         stored = _store_synthetic_artifact(tmp_path, text)
         # "1023" comes from the temperature sentence; "Pa" comes from the
-        # unrelated SI-units sentence. Nothing binds them to the same
-        # physical statement -- yet this spec grounds and validates cleanly.
-        # Reached through the condition-set producer, which is now the only
-        # path that grounds a value at all. The gap is unchanged by that move:
-        # it was never about datasets, it is about grounding being independent
-        # per quote. Its sharpest live form is
-        # TestSpanStitchingFabricatesAVerifiedCondition in
-        # tests/test_condition_set_producer.py.
-        envelope = produce_condition_set_from_artifact(
-            tmp_path,
-            sha256=stored.sha256,
-            attribution=ConditionAttribution.OWN_EXPERIMENT,
-            attribution_quote="temperature",
-            subject=DeviceClassSpec(label_quote="temperature"),
-            scalars=(
-                ScalarConditionSpec(
-                    claim_id="pressure",
-                    label_quote="static gauge reading",
-                    quantity_kind=QuantityKind.PRESSURE,
-                    value_quote="1023",
-                    unit_quote="Pa",
+        # unrelated SI-units sentence. Nothing binds them to the same physical
+        # statement, and the producer now says so instead of storing it.
+        with pytest.raises(ConditionSetProducerError) as excinfo:
+            produce_condition_set_from_artifact(
+                tmp_path,
+                sha256=stored.sha256,
+                attribution=ConditionAttribution.OWN_EXPERIMENT,
+                attribution_quote="temperature",
+                subject=DeviceClassSpec(label_quote="temperature"),
+                scalars=(
+                    ScalarConditionSpec(
+                        claim_id="pressure",
+                        label_quote="static gauge reading",
+                        quantity_kind=QuantityKind.PRESSURE,
+                        value_quote="1023",
+                        unit_quote="Pa",
+                    ),
                 ),
-            ),
+            )
+        assert "pressure" in str(excinfo.value)
+
+    def test_each_quote_on_its_own_still_grounds(self, tmp_path: Path) -> None:
+        """The independence itself is intact and still correct: the refusal is
+        about assembling a CLAIM from unrelated grounds, not about whether a
+        quote can be located. A rule that broke per-quote grounding would have
+        broken the label/value split that makes provenance honest."""
+        text = (
+            "The reactor was held at a temperature of 1023 K during the run. "
+            "In an unrelated paragraph about SI units, Pa was mentioned as the "
+            "SI unit of static gauge reading."
         )
-        # Reachable and schema-valid today: this IS the gap P1-F describes.
-        assert envelope.scalar_claims[0].claim_id == "pressure"
+        assert ground_quote(text, "1023", role=QuoteRole.VALUE).start == text.index("1023")
+        located = ground_quote(text, "Pa", role=QuoteRole.UNIT, quantity=QuantityKind.PRESSURE)
+        assert located.start == text.index("Pa")
 
 
 class TestActiveTableBindingTracksItsArgument:
@@ -2182,8 +2195,10 @@ class TestFigureFurnitureIsRefused:
         two labels, two values, two units -- fall inside a single short span,
         so such a check would have accepted the fabricated envelope unchanged.
         That is why V7 refuses the route rather than tightening co-location,
-        and it is the same reason co-location cannot close the span-stitching
-        hole pinned in ``TestSpanStitchingFabricatesAVerifiedCondition``.
+        and it is the same reason co-location could not close the span-stitching
+        hole either -- what closed that one (``TestSpanStitchingIsRefused`` in
+        tests/test_condition_set_producer.py) is uniqueness of the number+unit
+        construct inside the window, which a co-location check does not test.
 
         Measured directly against the text now that no envelope can be built
         from it -- the point is a property of the SOURCE, not of the envelope

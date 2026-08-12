@@ -242,6 +242,11 @@ from carmel.services.numeric import (
     has_clean_token_boundary,
     unit_boundary_violation,
 )
+from carmel.services.stitching import (
+    StitchGateUnrunnable,
+    StitchRefutation,
+    refute_stitched_claim,
+)
 from carmel.services.units import QuantityKind
 
 __all__ = [
@@ -2204,7 +2209,10 @@ def verify_measured_value_unit_boundary(
 
     What this does NOT prove, even when it returns ``None``: that the value,
     unit, and label spans of one measurement genuinely belong together (see
-    this module's own docstring, M-D4 grouping); that the original writer's
+    this module's own docstring, M-D4 grouping -- for a CONDITION SET that
+    association is now separately refutable by
+    :func:`_refute_condition_set_stitching`, which refutes and never verifies,
+    so a claim surviving it is still unproven here); that the original writer's
     occurrence/search disambiguation among multiple candidate matches was
     the right one; or that a faithfully-recorded locator was pointed at the
     CORRECT extraction rather than merely a clean one. It proves only that
@@ -2602,6 +2610,90 @@ def replay_stored_dataset(workspace_root: Path, sha256: str, *, reveal_text: boo
     return replay_envelope(workspace_root, envelope, reveal_text=reveal_text)
 
 
+def _refute_condition_set_stitching(
+    envelope: ConditionSetEnvelope,
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding],
+) -> tuple[ReplayFinding, ...]:
+    """Re-run the span-stitching refutation (P0-d) against INDEPENDENTLY re-read text.
+
+    The producer runs this same gate at write time, which says nothing about an
+    envelope stored before the rule existed or built by any route that does not
+    go through the producer -- and :func:`replay_condition_set` accepts the
+    object it is handed without revalidating it. A gate that lives only on the
+    write path is bypassable by exactly the callers most worth checking.
+
+    Each claim is checked against the table its OWN ``conversion_table_sha256``
+    records, never against whatever table is current: re-checking a claim under
+    a table it never used could refute a claim that was honest under the table
+    it actually recorded, and would silently change verdicts whenever a new
+    table shipped.
+
+    A refutation is :attr:`ReplayOutcome.FAILED` -- a check that RAN and found a
+    definite disagreement. Everything that prevents the check from running is
+    :attr:`ReplayOutcome.UNVERIFIABLE`. Collapsing the two would let a refuted
+    fabrication hide among the "could not check" entries that
+    ``overall_outcome`` is already UNVERIFIABLE for.
+    """
+    findings: list[ReplayFinding] = []
+    for index, claim in enumerate(envelope.scalar_claims):
+        path = f"scalar_claims[{index}]"
+        node_id = claim.label_ref.node_id
+        if node_id in node_problems:
+            # Already reported against the node itself; re-reporting it here
+            # would double-count one defect as two.
+            continue
+        text = text_by_node_id.get(node_id)
+        if text is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=path,
+                    reason=(
+                        f"node {node_id!r} has no independently re-read text, so the "
+                        "span-stitching refutation could not run and this claim's "
+                        "label/value association is UNCHECKED"
+                    ),
+                )
+            )
+            continue
+        table = units.table_for_sha(claim.value.conversion_table_sha256)
+        if table is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=path,
+                    reason=(
+                        f"conversion_table_sha256={claim.value.conversion_table_sha256!r} names "
+                        "no known table, so the span-stitching refutation has no unit vocabulary "
+                        "to read this claim's window with. It is never re-checked against a "
+                        "different table than the one it recorded"
+                    ),
+                )
+            )
+            continue
+        outcome = refute_stitched_claim(claim, text, table=table)
+        if isinstance(outcome, StitchRefutation):
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=path,
+                    reason=f"claim {claim.claim_id!r} is refuted: {outcome.reason}",
+                    expected=f"{claim.value.raw_text} {claim.value.unit_raw}",
+                    actual=", ".join(outcome.found) if outcome.found else "no number+unit construct",
+                )
+            )
+        elif isinstance(outcome, StitchGateUnrunnable):
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=path,
+                    reason=f"claim {claim.claim_id!r} could not be checked: {outcome.reason}",
+                )
+            )
+    return tuple(findings)
+
+
 def replay_condition_set(
     workspace_root: Path, envelope: ConditionSetEnvelope, *, reveal_text: bool = False
 ) -> ReplayReport:
@@ -2720,6 +2812,7 @@ def replay_condition_set(
         + tuple(claim_findings)
         + reconciliation_findings
         + uncertainty_reconciliation
+        + _refute_condition_set_stitching(envelope, text_by_node_id, node_problems)
     )
 
     # A replay that independently re-sliced ZERO paired character spans must

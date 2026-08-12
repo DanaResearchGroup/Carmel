@@ -71,6 +71,7 @@ from carmel.services.dataset_producer import MeasurementSpec
 from carmel.services.dataset_replay import (
     ReplayFinding,
     ReplayOutcome,
+    ReplayReport,
     SemanticGap,
     UncheckedSemanticClaim,
     _TextPairing,
@@ -965,3 +966,90 @@ class TestTheReconciliationActuallyFires:
         """The guard above must not be firing for some unrelated reason."""
         report = replay_condition_set(tmp_path, _minimal_condition_set(tmp_path))
         assert report.findings == ()
+
+
+class TestSpanStitchingIsRefutedOnTheREADPathToo:
+    """P0-d, from the side the producer cannot defend.
+
+    The producer refuses a stitched claim at write time. That says nothing
+    about an envelope stored before the rule existed, nor about one built by
+    any route that does not go through the producer -- and this function
+    accepts the object it is handed without revalidating it. So the same gate
+    runs here, against independently re-read text.
+    """
+
+    def _forged(self) -> GroundedScalarClaim:
+        """Label from the pressure sentence, value stolen from the temperature.
+
+        Every ref is honest in isolation: "pressure", "298" and "atm" are each
+        exactly where their locator says. Only the RELATION is fabricated,
+        which is precisely what re-slicing a span cannot detect.
+        """
+        return GroundedScalarClaim(
+            claim_id="fabricated_pressure",
+            label_raw="pressure",
+            label_ref=_span("pressure"),
+            value=MeasuredValue(
+                raw_text="298",
+                canonical_decimal_value="298",
+                quantity_kind=QuantityKind.PRESSURE,
+                unit_raw="atm",
+                unit_normalized="atm",
+                conversion_table_sha256=TABLE_V1.sha256,
+                repairs=(),
+                repair_dependency=SemanticDependencyUse(
+                    dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+                    content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+                    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                ),
+                value_ref=_span("298"),
+                unit_ref=_nth_span("atm", 0),
+            ),
+            uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        )
+
+    def _replayed(self, tmp_path: Path) -> ReplayReport:
+        envelope = _minimal_condition_set(
+            tmp_path,
+            scalar_claims=(self._forged(),),
+            conversion_tables=(_embedded_table_v1(),),
+        )
+        return replay_condition_set(tmp_path, envelope)
+
+    def test_the_forged_claim_is_reported_failed(self, tmp_path: Path) -> None:
+        report = self._replayed(tmp_path)
+        refutations = [
+            finding
+            for finding in report.findings
+            if finding.ref_path == "scalar_claims[0]" and finding.category is ReplayOutcome.FAILED
+        ]
+        assert len(refutations) == 1
+
+    def test_the_refutation_is_failed_and_never_unverifiable(self, tmp_path: Path) -> None:
+        """A check that RAN and disagreed is FAILED. Filing it as "could not
+        check" would bury it among the entries overall_outcome is already
+        UNVERIFIABLE for, which is where a fabrication would be invisible."""
+        report = self._replayed(tmp_path)
+        finding = next(f for f in report.findings if f.ref_path == "scalar_claims[0]")
+        assert finding.category is ReplayOutcome.FAILED
+
+    def test_the_evidence_outcome_is_not_clean(self, tmp_path: Path) -> None:
+        """The verdict a consumer actually reads. Before this gate the whole
+        envelope replayed with evidence_outcome VERIFIED."""
+        report = self._replayed(tmp_path)
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+
+    def test_an_honest_claim_over_the_same_text_still_replays_clean(self, tmp_path: Path) -> None:
+        """Discrimination, not blanket refusal: the true reading of the very
+        sentence the forgery drew from produces no stitching finding."""
+        envelope = _minimal_condition_set(
+            tmp_path,
+            scalar_claims=(_scalar_claim_with_uncertainty(),),
+            conversion_tables=(_embedded_table_v1(),),
+        )
+        report = replay_condition_set(tmp_path, envelope)
+        assert not [
+            finding
+            for finding in report.findings
+            if finding.ref_path == "scalar_claims[0]" and finding.category is ReplayOutcome.FAILED
+        ]

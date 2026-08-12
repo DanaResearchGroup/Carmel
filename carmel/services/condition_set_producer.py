@@ -25,13 +25,25 @@ by the paper. It proves that each quote is where the locator says it is, and it
 derives the numeric/unit normalization deterministically from the value quote.
 Everything past that is the caller's assertion, recorded unverified.
 
-The gap is not hypothetical, and it is pinned as open:
-``tests/test_condition_set_producer.py::TestSpanStitchingFabricatesAVerified\
-Condition`` shows a caller stitching the label "pressure" to the value "823" and
-the unit "atm" out of a sentence that says 823 K and 1.2 atm. Every span grounds;
-replay reports VERIFIED; the paper never states that condition. Co-location does
-not close it either -- that false triple comes from a single sentence. Closing it
-needs a rule about ASSERTION STRUCTURE, which is standing work.
+One shape of that gap is now CLOSED, and the closure is narrow enough to state
+exactly. A caller used to be able to stitch the label "pressure" to the value
+"823" and the unit "atm" out of a sentence that says 823 K and 1.2 atm: every
+span grounded, replay reported VERIFIED, and the paper never stated that
+condition. Co-location could not close it -- that false triple comes from a
+single sentence -- so the rule is uniqueness instead: the span COVERING a
+claim's three grounds must hold exactly one number+unit construct, that
+construct must be the claimed value and unit compared by offset, and its unit
+must denote the declared quantity. See :mod:`carmel.services.stitching`; the
+same gate re-runs in
+:func:`carmel.services.dataset_replay.replay_condition_set`, because a
+write-path-only gate says nothing about an envelope built by another route.
+
+That gate REFUTES; it never verifies. A claim surviving it is not thereby
+shown to be what the paper predicates -- only that one named refutation was
+attempted and did not fire. Known shapes it does NOT refuse: a one-sided bound
+or method threshold ("above 60 cm/s") reads as a single construct, and shared
+dimensionless spellings cannot separate mole fraction from equivalence ratio
+from a relative uncertainty.
 
 GROUNDING PROVES LOCATION, NEVER MEANING. Every ``SourceRef`` this producer emits
 is independently verified to be an exact, located substring of the authenticated
@@ -81,6 +93,11 @@ from carmel.services.dataset_producer import (
     ground_quote,
 )
 from carmel.services.numeric import QuoteRole
+from carmel.services.stitching import (
+    StitchGateUnrunnable,
+    StitchRefutation,
+    refute_stitched_claim,
+)
 
 __all__ = [
     "CategoricalConditionSpec",
@@ -259,6 +276,36 @@ def _ref(text: str, quote: str, *, role: QuoteRole, occurrence: int | None) -> S
     )
 
 
+def _refuse_stitched(claim: GroundedScalarClaim, text: str) -> GroundedScalarClaim:
+    """Refuse a scalar claim whose three grounds provably do not cohere.
+
+    The producer holds the document text, so it is the earliest place this can
+    be caught -- but it is deliberately NOT the only place. The same gate runs
+    in :func:`~carmel.services.dataset_replay.replay_condition_set`, because a
+    producer-side refusal says nothing about an envelope that was stored before
+    this rule existed, or constructed by any route that does not come through
+    here.
+
+    Passing this gate is NOT a verification. It means one named refutation was
+    attempted and did not fire; whether the paper actually predicates this label
+    of this number remains unproven, and nothing downstream may upgrade it.
+    """
+    outcome = refute_stitched_claim(claim, text)
+    if isinstance(outcome, StitchRefutation):
+        raise ConditionSetProducerError(
+            f"scalar claim {claim.claim_id!r} (label {claim.label_raw!r}, value "
+            f"{claim.value.raw_text!r} {claim.value.unit_raw!r}) is refused: {outcome.reason}"
+        )
+    if isinstance(outcome, StitchGateUnrunnable):
+        raise ConditionSetProducerError(
+            f"scalar claim {claim.claim_id!r} cannot be checked for span stitching: "
+            f"{outcome.reason}. This producer grounds every quote as a character span into "
+            "one root node, so reaching this state means the claim was built by a route that "
+            "does not hold that invariant -- it is refused rather than stored unchecked"
+        )
+    return claim
+
+
 def _duplicate_ids(ids: list[str], *, owner: str) -> None:
     """Refuse duplicate ids across ALL of a condition set's collections.
 
@@ -387,21 +434,24 @@ def produce_condition_set_from_artifact(
         )
 
     scalar_claims = tuple(
-        GroundedScalarClaim(
-            claim_id=spec.claim_id,
-            label_raw=spec.label_quote,
-            label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
-            value=_measured_value(
-                text,
-                spec,
-                where=f"claim {spec.claim_id!r}",
-                document_source_context=grounding.document_source_context,
-                document_glyph_health=grounding.document_glyph_health,
+        _refuse_stitched(
+            GroundedScalarClaim(
+                claim_id=spec.claim_id,
+                label_raw=spec.label_quote,
+                label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
+                value=_measured_value(
+                    text,
+                    spec,
+                    where=f"claim {spec.claim_id!r}",
+                    document_source_context=grounding.document_source_context,
+                    document_glyph_health=grounding.document_glyph_health,
+                ),
+                # This producer reads no uncertainty from the document. That is a
+                # NOT_EXTRACTED_YET refusal, not an assertion that the paper stated
+                # none -- the two must never conflate.
+                uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             ),
-            # This producer reads no uncertainty from the document. That is a
-            # NOT_EXTRACTED_YET refusal, not an assertion that the paper stated
-            # none -- the two must never conflate.
-            uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            text,
         )
         for spec in scalars
     )
