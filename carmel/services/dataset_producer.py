@@ -980,6 +980,30 @@ class MeasurementSpec:
     extracted text. The optional ``*_occurrence`` fields are the caller's
     explicit disambiguation for a quote that appears more than once (see
     :func:`ground_quote`); ``None`` claims the quote is unique.
+
+    DORMANT -- and, of the six dataset-extraction constructs, the most
+    misleading one to read on its own, because everything above describes a
+    real interaction: a caller states meaning, ``ground_quote`` computes
+    offsets, a ``MeasurementSpec`` gets built. What the paragraphs above do
+    not say is that this object has no consumer that can ever finish the
+    job. It exists solely as the parameter type for
+    :func:`produce_envelope_from_artifact` below, and that function refuses
+    EVERY call unconditionally -- see its docstring for the full argument,
+    which this note only summarizes: this runtime can only locate a value
+    with a ``CharSpanLocator`` into extracted running text, and
+    :meth:`~carmel.schemas.datasets.DatasetEnvelope._validate_no_char_span_grounds_a_series_value`
+    (V7) rejects a char span as the source of a series VALUE, because a
+    series asserts a structured pairing of coordinates to observations that
+    running text carries no row structure to prove. So a caller may
+    construct a well-formed ``MeasurementSpec`` -- its own validation below
+    still runs, and still matters, because a malformed spec must fail
+    loudly even though no spec, malformed or not, can ever succeed -- and
+    hand it to the producer, and the producer will refuse it every time,
+    reporting it back only by count (see :func:`_describe_count`).
+    Restoring this interaction needs something that can first emit a
+    ``TABLE_CELL`` locator (a table parser) or a ``FIGURE_CROP`` node (a
+    figure digitizer); until then this class is schema + refusal apparatus,
+    not a live parameter object.
     """
 
     axis_id: str
