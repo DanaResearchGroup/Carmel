@@ -50,6 +50,23 @@ def _one_page_pdf(stream: str) -> bytes:
     )
 
 
+def _two_page_pdf(first: bytes, second: bytes) -> bytes:
+    """A two-page PDF whose pages carry ``first`` and ``second`` as content streams."""
+    return _pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
+            b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
+            b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+    )
+
+
 def _fragments(stream: str):
     """Fragments from a clean synthetic page.
 
@@ -373,7 +390,7 @@ class TestAnEngineMismatchIsNotAPageFailure:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine):
+        def _mismatch(page, page_number, engine, budget):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -402,26 +419,15 @@ class TestLossRecordsWhatWasLost:
 
         real = mod._page_fragments
 
-        def _boom(page, page_number, engine):
+        def _boom(page, page_number, engine, budget):
             if page_number == 2:
                 raise ValueError("synthetic page explosion")
-            return real(page, page_number, engine)
+            return real(page, page_number, engine, budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _boom)
-        first = b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET"
-        second = b"BT /F1 10 Tf 72 700 Td (beta) Tj ET"
-        pdf = _pdf(
-            [
-                b"<< /Type /Catalog /Pages 2 0 R >>",
-                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>",
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
-                b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
-                b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
-                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-            ]
+        pdf = _two_page_pdf(
+            b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET",
+            b"BT /F1 10 Tf 72 700 Td (beta) Tj ET",
         )
         result = extract_fragments(pdf)
         assert result.available is True
@@ -438,20 +444,9 @@ class TestLossRecordsWhatWasLost:
         import carmel.agents.tools.extract as extract_mod
 
         monkeypatch.setattr(extract_mod, "MAX_PDF_PAGES", 1)
-        first = b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET"
-        second = b"BT /F1 10 Tf 72 700 Td (beta) Tj ET"
-        pdf = _pdf(
-            [
-                b"<< /Type /Catalog /Pages 2 0 R >>",
-                b"<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>",
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 5 0 R >>",
-                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
-                b"/Resources << /Font << /F1 7 0 R >> >> /Contents 6 0 R >>",
-                b"<< /Length " + str(len(first)).encode() + b" >>\nstream\n" + first + b"\nendstream",
-                b"<< /Length " + str(len(second)).encode() + b" >>\nstream\n" + second + b"\nendstream",
-                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-            ]
+        pdf = _two_page_pdf(
+            b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET",
+            b"BT /F1 10 Tf 72 700 Td (beta) Tj ET",
         )
         result = extract_fragments(pdf)
         assert result.truncated is True
@@ -462,3 +457,74 @@ class TestLossRecordsWhatWasLost:
         require_pypdf()
         result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
         assert result.pypdf_version
+
+    def test_an_uninspectable_page_is_named_not_merely_counted(self, monkeypatch) -> None:
+        """`lossy` is a whole-document flag and cannot say WHICH page is uncertain.
+
+        A per-page gate that asks "is page 2 sound?" reads `page_failures`, so an
+        UNINSPECTABLE page recorded only as `lossy=True` would let that gate pass a
+        page the text lane records as uncertain -- two lanes disagreeing about one
+        page, which is the divergence `_classify_pdf_page` is shared to prevent.
+        """
+        require_pypdf()
+        import carmel.agents.tools.extract as extract_mod
+
+        real_classify = extract_mod._classify_pdf_page
+        # Counted PER READER, not globally: this test drives BOTH lanes over the same
+        # bytes, so each builds its own `PdfReader` and walks the page tree again. A
+        # single running counter would fire on page 2 of the first walk and on nothing
+        # at all in the second.
+        seen: dict[int, int] = {}
+
+        def _uninspectable_second(page):
+            seen[id(page.pdf)] = seen.get(id(page.pdf), 0) + 1
+            if seen[id(page.pdf)] == 2:
+                return extract_mod._PageKind.UNINSPECTABLE
+            return real_classify(page)
+
+        monkeypatch.setattr(extract_mod, "_classify_pdf_page", _uninspectable_second)
+        pdf = _two_page_pdf(
+            b"BT /F1 10 Tf 72 700 Td (alpha) Tj ET",
+            b"BT /F1 10 Tf 72 700 Td (beta) Tj ET",
+        )
+        result = extract_fragments(pdf)
+        assert result.available is True
+        assert result.lossy is True
+        assert [f.page for f in result.page_failures] == [2]
+        # The page is KEPT, never dropped: it may well be a real page.
+        assert any(f.text.strip() == "beta" for f in result.fragments)
+
+        # And the two lanes must DESCRIBE that page identically. Compared against what
+        # the text lane actually emits for the same document, not against a shared
+        # constant: the message is duplicated on purpose (hoisting it would perturb
+        # `extract_text`'s pinned semantic-dependency sha, under which stored
+        # extractions were produced), so behaviour is the only honest thing to pin it
+        # to. If either lane's wording drifts, this fails.
+        text_result = extract_mod.extract_text(pdf, "application/pdf")
+        assert [f.page for f in text_result.page_failures] == [2]
+        assert result.page_failures[0].error == text_result.page_failures[0].error
+
+    def test_a_single_page_cannot_exhaust_the_fragment_budget(self, monkeypatch) -> None:
+        """The page cap does not bound this lane: one page may carry unboundedly many
+        text-show operations, and each one costs a retained Python object."""
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 3)
+        shows = " ".join(f"({i}) Tj" for i in range(50))
+        result = extract_fragments(_one_page_pdf(f"BT /F1 10 Tf 72 700 Td {shows} ET"))
+        assert result.available is True
+        assert len(result.fragments) == 3
+        assert result.truncated is True
+        assert result.lossy is True
+
+    def test_the_fragment_budget_spans_pages_rather_than_resetting(self, monkeypatch) -> None:
+        """A per-page budget would let an N-page document retain N times the cap."""
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 3)
+        page = b"BT /F1 10 Tf 72 700 Td " + b" ".join(f"({i}) Tj".encode() for i in range(2)) + b" ET"
+        result = extract_fragments(_two_page_pdf(page, page))
+        assert len(result.fragments) == 3
+        assert result.truncated is True

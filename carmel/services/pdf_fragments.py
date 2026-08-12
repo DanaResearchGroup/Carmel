@@ -184,9 +184,12 @@ class FragmentExtraction:
 
     page_failures: tuple[FragmentPageFailure, ...] = ()
     truncated: bool = False
-    """True when the document has more pages than ``MAX_PDF_PAGES`` and the tail was
-    not processed. The cap is shared with the text lane so the two lanes agree on
-    which pages exist; see :func:`extract_fragments`."""
+    """True when this document exceeded a bound and the rest was not processed.
+
+    Covers BOTH bounds, exactly as ``ExtractedText.lossy`` covers both of the text
+    lane's: more pages than ``MAX_PDF_PAGES``, or more fragments than
+    :data:`MAX_PDF_FRAGMENTS`. The page cap is shared with the text lane so the two
+    lanes agree on which pages exist; see :func:`extract_fragments`."""
 
     pypdf_version: str = ""
     """The pypdf version this extraction actually ran against.
@@ -281,6 +284,33 @@ _REQUIRED_PARAM_ATTRS = ("text", "tx", "ty", "displaced_tx", "font_size", "rotat
 _PINNED_PYPDF_VERSION = "6.14.2"
 """Must track the ``agents`` extra's exact pin in ``pyproject.toml``."""
 
+#: Hard cap on how many fragments one document may yield, independent of
+#: ``MAX_PDF_PAGES``. The page cap alone does NOT bound this lane: a single page may
+#: carry unboundedly many text-show operations, and unlike the text lane -- whose
+#: per-page output is one string it can measure against
+#: ``MAX_EXTRACTED_TEXT_CHARS`` -- this one accumulates a Python object per operation.
+#:
+#: Sized from measurement, not taste. A fragment costs ~200 bytes (measured), the real
+#: corpus runs 1071 fragments/page at 2.4 characters per fragment, so the text lane's
+#: 500k-character ceiling corresponds to roughly 200k fragments for the largest
+#: legitimate document (a supplementary-information PDF). 1M is 5x headroom over that
+#: while bounding peak retention at ~200 MB -- the same order as the ~381 MB peak the
+#: text lane's own cap was written against.
+MAX_PDF_FRAGMENTS = 1_000_000
+
+#: The ``error`` recorded for a page whose page-tree entry was UNINSPECTABLE.
+#:
+#: DUPLICATED from ``carmel.agents.tools.extract`` rather than imported from it, and the
+#: duplication is deliberate. Hoisting the text lane's literal into a shared constant
+#: changes ``extract_text``'s semantic-dependency closure, and that sha is the identity
+#: under which every already-stored extraction was produced
+#: (``tests/test_semantic_deps.py``). Perturbing a stored-evidence identity to
+#: de-duplicate a string in a lane that has no stored artifacts yet is the wrong trade.
+#: Drift is prevented instead by a test that reads the message the TEXT LANE ACTUALLY
+#: EMITS at runtime and asserts this equals it -- a stronger check than a shared name,
+#: because it compares behaviour rather than a symbol.
+_UNINSPECTABLE_PAGE_ERROR = "page-tree entry could not be inspected; kept as a possible page"
+
 
 class _EngineMismatch(Exception):
     """The pypdf engine is not shaped the way this module requires.
@@ -291,13 +321,22 @@ class _EngineMismatch(Exception):
     """
 
 
-def _page_fragments(page: Any, page_number: int, engine: tuple[Any, ...]) -> list[TextFragment]:
-    """Recover every text-show operation on one page, with absolute geometry."""
+def _page_fragments(
+    page: Any, page_number: int, engine: tuple[Any, ...], budget: int
+) -> tuple[list[TextFragment], bool]:
+    """Recover every text-show operation on one page, with absolute geometry.
+
+    Stops after ``budget`` fragments and reports that it did, so a single page cannot
+    exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own. The budget bounds
+    what this function RETAINS; the intermediate operation list belongs to pypdf and
+    is bounded instead by the document's own byte size, which the fetch cap already
+    limits.
+    """
     recurse_to_target_op, resolve_font, text_state_manager, content_stream = engine
 
     contents = page.get("/Contents")
     if contents is None:
-        return []
+        return [], False
     content = content_stream(contents.get_object(), page.pdf, "bytes")
     ops: Iterator[tuple[list[Any], bytes]] = iter(content.operations)
 
@@ -335,6 +374,8 @@ def _page_fragments(page: Any, page_number: int, engine: tuple[Any, ...]) -> lis
 
     fragments: list[TextFragment] = []
     for show in shows:
+        if len(fragments) >= budget:
+            return fragments, True
         if any(not hasattr(show, attr) for attr in _REQUIRED_PARAM_ATTRS):
             # Belt-and-braces against a pypdf change that slipped past `_engine`.
             # `_EngineMismatch` rather than a plain error: this must abort the WHOLE
@@ -355,7 +396,7 @@ def _page_fragments(page: Any, page_number: int, engine: tuple[Any, ...]) -> lis
                 glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
             )
         )
-    return fragments
+    return fragments, False
 
 
 def extract_fragments(data: bytes) -> FragmentExtraction:
@@ -416,10 +457,10 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     truncated = True
                     lossy = True
                     break
-                if kind is _PageKind.UNINSPECTABLE:
-                    lossy = True
                 try:
-                    fragments.extend(_page_fragments(page, page_number, engine))
+                    page_fragments, hit_budget = _page_fragments(
+                        page, page_number, engine, MAX_PDF_FRAGMENTS - len(fragments)
+                    )
                 except _EngineMismatch:
                     # Not a page failure. The engine is wrong, so nothing extracted
                     # from this document can be relied on.
@@ -428,6 +469,25 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     logger.debug("fragment extraction failed on page %d", page_number, exc_info=True)
                     failures.append(FragmentPageFailure(page=page_number, error=_describe_page_error(exc)))
                     lossy = True
+                    continue
+                fragments.extend(page_fragments)
+                if kind is _PageKind.UNINSPECTABLE:
+                    # RECORDED, not merely counted as `lossy`, and worded exactly as the
+                    # text lane words it. A consumer asking "is page N sound?" reads
+                    # `page_failures`, because `lossy` is a whole-document flag that
+                    # cannot say WHICH page; a structural uncertainty visible only as
+                    # `lossy` would let a per-page gate pass this page while the text
+                    # lane records it as uncertain. Two lanes disagreeing about the same
+                    # page is the failure this module exists to avoid.
+                    #
+                    # Success path only, mirroring the text lane: the `except` above
+                    # already recorded this page, so this cannot double-record it.
+                    failures.append(FragmentPageFailure(page=page_number, error=_UNINSPECTABLE_PAGE_ERROR))
+                    lossy = True
+                if hit_budget:
+                    truncated = True
+                    lossy = True
+                    break
     except Exception:
         return FragmentExtraction(lossy=True, available=False, pypdf_version=version)
 
