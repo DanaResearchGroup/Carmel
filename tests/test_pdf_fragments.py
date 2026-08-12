@@ -470,15 +470,15 @@ class TestLossRecordsWhatWasLost:
         import carmel.agents.tools.extract as extract_mod
 
         real_classify = extract_mod._classify_pdf_page
-        # Counted PER READER, not globally: this test drives BOTH lanes over the same
-        # bytes, so each builds its own `PdfReader` and walks the page tree again. A
-        # single running counter would fire on page 2 of the first walk and on nothing
-        # at all in the second.
-        seen: dict[int, int] = {}
 
         def _uninspectable_second(page):
-            seen[id(page.pdf)] = seen.get(id(page.pdf), 0) + 1
-            if seen[id(page.pdf)] == 2:
+            # Keyed on the page's OWN content, not on a call counter and not on
+            # `id(page.pdf)`. This test drives BOTH lanes over the same bytes, so each
+            # builds its own `PdfReader` and walks the page tree again: a running
+            # counter fires on page 2 of the first walk and on nothing in the second,
+            # and an `id()` key is reusable after GC. The content is what actually
+            # identifies the page.
+            if b"beta" in page.get("/Contents").get_object().get_data():
                 return extract_mod._PageKind.UNINSPECTABLE
             return real_classify(page)
 
@@ -517,6 +517,63 @@ class TestLossRecordsWhatWasLost:
         assert len(result.fragments) == 3
         assert result.truncated is True
         assert result.lossy is True
+
+    def test_the_budget_bounds_the_show_list_not_only_the_converted_fragments(self, monkeypatch) -> None:
+        """One show becomes at most one fragment, so capping only the conversion loop
+        lets a hostile page retain millions of `TextStateParams` before the cap fires.
+
+        Measured through pypdf's own call count: the engine consumes one whole BT group
+        per call, so a bounded run must stop calling it once the budget is met. This is
+        also the honest granularity of the guard -- a SINGLE group holding a million
+        shows is still unbounded, which the docstring says outright.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        calls = 0
+        real_engine = mod._engine()
+        assert real_engine is not None
+        recurse, resolve_font, manager, content_stream = real_engine
+
+        def _counting_recurse(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return recurse(*args, **kwargs)
+
+        monkeypatch.setattr(mod, "_engine", lambda: (_counting_recurse, resolve_font, manager, content_stream))
+        monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 3)
+        groups = " ".join(f"BT /F1 10 Tf 72 {700 - i} Td ({i}) Tj ET" for i in range(60))
+        result = extract_fragments(_one_page_pdf(groups))
+        assert len(result.fragments) == 3
+        assert result.truncated is True
+        # 4, not 60: the loop stops one group after the budget is met.
+        assert calls <= 4, f"walked {calls} text groups for a budget of 3"
+
+    def test_a_page_past_the_cap_is_never_parsed_at_all(self, monkeypatch) -> None:
+        """The cap is checked BEFORE parsing the next page, not after.
+
+        This guard has NO behavioural signature -- entering with a zero budget produces
+        the identical `truncated=True` result, which is why deleting it leaves every
+        other test green (verified by mutation). What it actually buys is that the next
+        page's content stream is never materialised, so the only honest way to test it
+        is to observe the work not being done.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        real = mod._page_fragments
+        parsed: list[int] = []
+
+        def _recording(page, page_number, engine, budget):
+            parsed.append(page_number)
+            return real(page, page_number, engine, budget)
+
+        monkeypatch.setattr(mod, "_page_fragments", _recording)
+        monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 1)
+        page = b"BT /F1 10 Tf 72 700 Td (a) Tj ET"
+        result = extract_fragments(_two_page_pdf(page, page))
+        assert result.truncated is True
+        assert parsed == [1], f"page 2 was parsed despite the cap already being met: {parsed}"
 
     def test_the_fragment_budget_spans_pages_rather_than_resetting(self, monkeypatch) -> None:
         """A per-page budget would let an N-page document retain N times the cap."""

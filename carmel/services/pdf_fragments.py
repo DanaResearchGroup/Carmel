@@ -327,10 +327,26 @@ def _page_fragments(
     """Recover every text-show operation on one page, with absolute geometry.
 
     Stops after ``budget`` fragments and reports that it did, so a single page cannot
-    exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own. The budget bounds
-    what this function RETAINS; the intermediate operation list belongs to pypdf and
-    is bounded instead by the document's own byte size, which the fetch cap already
-    limits.
+    exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own.
+
+    The budget bounds BOTH accumulating lists, not only the fragments converted at the
+    end. Bounding the conversion alone does not work: one show becomes at most one
+    fragment, so a page emitting ten million shows costs ten million retained
+    ``TextStateParams`` before the conversion loop runs at all, and the cap then fires
+    after the damage.
+
+    Two things it does NOT bound, stated exactly rather than glossed, because a comment
+    that overstates a guard is worse than no guard:
+
+    * ``recurse_to_target_op`` consumes one whole ``BT``/``ET`` (or ``q``/``Q``) group
+      per call and returns every show in it at once. The check below therefore fires
+      BETWEEN groups, so a single group containing a million shows is not bounded.
+    * ``ContentStream`` materialises the entire operation list up front, inside pypdf,
+      before this function sees anything.
+
+    Both are bounded only by the document's decompressed content-stream size, so a
+    compression bomb still costs them. Closing either means not using pypdf's parser --
+    i.e. hand-rolling the content-stream interpreter this module exists to avoid.
     """
     recurse_to_target_op, resolve_font, text_state_manager, content_stream = engine
 
@@ -343,7 +359,16 @@ def _page_fragments(
     fonts = page._layout_mode_fonts()
     state_mgr = text_state_manager()
     shows: list[Any] = []
+    stopped_early = False
     for operands, op in ops:
+        if len(shows) >= budget:
+            # Reported as truncation even though the conversion loop below will not
+            # reach its own budget check (it converts exactly `budget` shows and stops
+            # naturally). Without this the page would look complete. A page holding
+            # EXACTLY `budget` shows followed by non-text operators reports truncation
+            # it did not suffer -- deliberate: this lane fails toward admitting loss.
+            stopped_early = True
+            break
         if op in (b"BT", b"q"):
             # `strip_rotated=False` is DEFENSIVE, not load-bearing, and the
             # distinction was established by mutating it and watching the tests stay
@@ -396,7 +421,7 @@ def _page_fragments(
                 glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
             )
         )
-    return fragments, False
+    return fragments, stopped_early
 
 
 def extract_fragments(data: bytes) -> FragmentExtraction:
@@ -454,6 +479,13 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     # walked on, a fragment could carry a page number the text lane
                     # says does not exist, and the two provenance stories would
                     # disagree about the same document.
+                    truncated = True
+                    lossy = True
+                    break
+                if len(fragments) >= MAX_PDF_FRAGMENTS:
+                    # BEFORE parsing, not after. A page that ended exactly ON the cap
+                    # leaves a zero budget, and entering with it would pay for the whole
+                    # content stream only to report truncation on the way out.
                     truncated = True
                     lossy = True
                     break
