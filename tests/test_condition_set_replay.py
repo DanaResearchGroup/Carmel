@@ -1053,3 +1053,27 @@ class TestSpanStitchingIsRefutedOnTheREADPathToo:
             for finding in report.findings
             if finding.ref_path == "scalar_claims[0]" and finding.category is ReplayOutcome.FAILED
         ]
+
+    def test_an_unknown_conversion_table_is_unverifiable_not_a_traceback(self, tmp_path: Path) -> None:
+        """`units.table_for_sha` RAISES on an unknown sha; it never returns
+        None. The first version of this gate tested `is None`, so the branch
+        was dead and a forged envelope naming an unshipped table turned replay
+        into a traceback. A replayer owes a verdict about broken input.
+
+        Found by adversarial review (Codex round 96), not by the suite -- the
+        dead branch was unreachable, so no test could have exercised it.
+        """
+        forged = self._forged()
+        claim = forged.model_copy(
+            update={"value": forged.value.model_copy(update={"conversion_table_sha256": "0" * 64})}
+        )
+        # `model_construct` skips validation, which is the only way to reach
+        # this state: a validated envelope cannot cite a table it does not
+        # embed, and cannot embed one nothing cites. That is exactly the
+        # forged/stale shape a public replayer must survive.
+        base = _minimal_condition_set(tmp_path)
+        envelope = ConditionSetEnvelope.model_construct(**{**dict(base), "scalar_claims": (claim,)})
+        report = replay_condition_set(tmp_path, envelope)
+        finding = next(f for f in report.findings if f.ref_path == "scalar_claims[0]")
+        assert finding.category is ReplayOutcome.UNVERIFIABLE
+        assert "no known table" in finding.reason

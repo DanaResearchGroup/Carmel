@@ -10,13 +10,13 @@ from __future__ import annotations
 
 import pytest
 
-from carmel.services.dataset_producer import _ACTIVE
+from carmel.services.dataset_producer import _ACTIVE, binding_for_known_sha
 from carmel.services.stitching import (
     iter_unit_bearing_numerals,
     refute_stitched_scalar,
     unit_spellings,
 )
-from carmel.services.units import TABLE_V1, QuantityKind
+from carmel.services.units import TABLE_V1, TABLES_BY_SHA, QuantityKind
 
 _SENTENCE = "The initial temperature was 823 K and the pressure was held at 1.2 atm"
 
@@ -47,6 +47,19 @@ class TestTheVocabularyIsTheProducersOwn:
     def test_the_gate_invents_no_spelling_the_producer_rejects(self) -> None:
         gate = set(unit_spellings(TABLE_V1))
         assert not gate - set(_ACTIVE.spellings_union)
+
+    def test_the_agreement_holds_for_every_shipped_table_not_just_the_current_one(
+        self,
+    ) -> None:
+        """Comparing only TABLE_V1 against the CURRENT binding proves the two
+        agree today. A future TABLE_V2 is exactly when they could diverge, and
+        a replayed claim resolves its own table by sha -- so the property must
+        hold for every table the registry ships. Codex round 96."""
+        for sha, table in TABLES_BY_SHA.items():
+            binding = binding_for_known_sha(sha)
+            assert binding is not None
+            gate = unit_spellings(table)
+            assert set(gate) == set(binding.spellings_union)
 
     def test_a_spelling_maps_to_every_quantity_it_can_denote(self) -> None:
         """A set, not one kind: real spellings collide, and collapsing that
@@ -141,11 +154,44 @@ class TestWhatCountsAsAUnitBearingNumeral:
         found = list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text)))
         assert found == []
 
+    @pytest.mark.parametrize("gap", ["\u00a0", "\u2009", " ", "\t", "  "])
+    def test_intra_line_whitespace_binds_a_unit_to_its_numeral(self, gap: str) -> None:
+        """PDF extraction emits NBSP and thin space between a number and its
+        unit. Reading those as "no construct" refuses honest claims -- a
+        fail-closed direction, but the wrong one: they ARE bound in the source.
+        Found by adversarial review (Codex round 96)."""
+        text = f"the pressure was 1.2{gap}atm"
+        (only,) = list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text)))
+        assert (only.value_text, only.unit_text) == ("1.2", "atm")
+
+    @pytest.mark.parametrize("gap", ["\n", "\r", "\u2028", "\u0085"])
+    def test_a_line_separator_still_does_not_bind(self, gap: str) -> None:
+        """The distinction the widening must preserve: extracted text wraps
+        mid-sentence, so a numeral ending one line has no reliable relationship
+        to a token beginning the next."""
+        text = f"the pressure was 1.2{gap}atm"
+        assert list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text))) == []
+
     def test_a_unit_that_is_only_a_prefix_of_a_longer_word_is_not_a_unit(self) -> None:
         found = list(
             iter_unit_bearing_numerals("held for 5 minutes", window_start=0, window_end=len("held for 5 minutes"))
         )
         assert found == []
+
+    def test_a_slash_composite_yields_no_construct(self) -> None:
+        """ "1.0/1.5 atm" states a PAIR. The numeral grammar folds hyphen ranges
+        into one match but NOT slash composites, so the second endpoint used to
+        look like the window's sole construct and a composite could be stored as
+        a scalar. Codex round 96."""
+        text = "the pressure was 1.0/1.5 atm"
+        assert list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text))) == []
+
+    @pytest.mark.parametrize(("text", "unit"), [("a rate of 40 1/s", "1/s"), ("a speed of 40 cm/s", "cm/s")])
+    def test_a_unit_that_legitimately_contains_a_slash_still_binds(self, text: str, unit: str) -> None:
+        """The guard must not swallow real units. "1/s" even contains a digit
+        before the slash, which is the shape the composite check looks for."""
+        (only,) = list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text)))
+        assert only.unit_text == unit
 
     def test_the_longest_spelling_wins(self) -> None:
         text = "a speed of 40 cm/s"

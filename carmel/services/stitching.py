@@ -74,6 +74,15 @@ __all__ = [
 ]
 
 
+_LINE_SEPARATORS = frozenset("\n\r\v\f  ")
+"""Whitespace that ends a LINE rather than separating tokens within one.
+
+Everything else that :meth:`str.isspace` accepts binds a unit to its numeral --
+notably U+00A0 NO-BREAK SPACE and U+2009 THIN SPACE, both of which real PDF
+extraction emits between a number and its unit.
+"""
+
+
 @dataclass(frozen=True, slots=True)
 class UnitBearingNumeral:
     """One ``number + unit`` construct located in a window of extracted text."""
@@ -145,6 +154,26 @@ def unit_spellings(table: ConversionTable) -> Mapping[str, frozenset[QuantityKin
     return {unit: frozenset(kinds) for unit, kinds in spellings.items()}
 
 
+def _is_composite_endpoint(text: str, start: int) -> bool:
+    """Is the numeral at ``start`` one endpoint of a slash composite?
+
+    :data:`~carmel.services.numeric.NUMERAL_CANDIDATE_RE` folds a hyphen/en-dash
+    range into ONE match, so ``"1-5 atm"`` is already a single (unparseable)
+    numeral. A SLASH composite is not folded: ``"1.0/1.5 atm"`` yields two
+    matches, the first of which has no unit after it, leaving the second looking
+    like the window's sole construct. Reported by Codex round 96.
+    """
+    cursor = start - 1
+    while cursor >= 0 and text[cursor].isspace() and text[cursor] not in _LINE_SEPARATORS:
+        cursor -= 1
+    if cursor < 0 or text[cursor] != "/":
+        return False
+    cursor -= 1
+    while cursor >= 0 and text[cursor].isspace() and text[cursor] not in _LINE_SEPARATORS:
+        cursor -= 1
+    return cursor >= 0 and text[cursor].isdigit()
+
+
 def iter_unit_bearing_numerals(
     text: str,
     *,
@@ -159,9 +188,16 @@ def iter_unit_bearing_numerals(
     regex written here, so what this gate counts as a number is what the rest of
     the pipeline counts as a number.
 
-    A unit must follow its numeral separated by nothing but spaces or tabs. A
-    newline does NOT bind: extracted PDF text routinely wraps mid-sentence, and
-    a numeral at the end of one line has no reliable relationship to a token
+    A unit must follow its numeral separated by nothing but INTRA-LINE
+    whitespace. That is any whitespace character except the line separators in
+    :data:`_LINE_SEPARATORS`, rather than only space and tab: PDF text
+    extraction routinely emits U+00A0 NO-BREAK SPACE and U+2009 THIN SPACE
+    between a number and its unit, and treating those as "no construct here"
+    would silently refuse honest claims -- a fail-closed direction, but a wrong
+    one, because the number and unit really are bound in the source.
+
+    A line break does NOT bind, deliberately: extracted text wraps mid-sentence,
+    and a numeral ending one line has no reliable relationship to a token
     beginning the next. Longest spellings match first, so ``"cm/s"`` is never
     read as the ``"cm"`` its prefix spells.
     """
@@ -170,8 +206,15 @@ def iter_unit_bearing_numerals(
     for match in NUMERAL_CANDIDATE_RE.finditer(text, window_start, window_end):
         if match.end() > window_end:
             continue
+        if _is_composite_endpoint(text, match.start()):
+            # "1.0/1.5 atm" states a PAIR. Counting its second endpoint as the
+            # window's sole construct would let a composite value be stored as
+            # a scalar -- the COMPOSITE_VALUE refusal squeezed into a number.
+            # Yielding nothing makes the window construct-less, which the
+            # caller refuses: the safe direction.
+            continue
         cursor = match.end()
-        while cursor < window_end and text[cursor] in " \t":
+        while cursor < window_end and text[cursor].isspace() and text[cursor] not in _LINE_SEPARATORS:
             cursor += 1
         for unit in by_length:
             stop = cursor + len(unit)

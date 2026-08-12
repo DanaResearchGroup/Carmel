@@ -2657,8 +2657,13 @@ def _refute_condition_set_stitching(
                 )
             )
             continue
-        table = units.table_for_sha(claim.value.conversion_table_sha256)
-        if table is None:
+        try:
+            table = units.table_for_sha(claim.value.conversion_table_sha256)
+        except units.UnknownConversionTableError:
+            # `table_for_sha` RAISES on an unknown sha -- it never returns None.
+            # A replayer owes a verdict about broken input, not a traceback, and
+            # a forged or stale envelope naming a table this build does not ship
+            # is exactly the input most worth surviving.
             findings.append(
                 ReplayFinding(
                     category=ReplayOutcome.UNVERIFIABLE,
