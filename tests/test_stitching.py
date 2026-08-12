@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from carmel.services.dataset_producer import _ACTIVE, binding_for_known_sha
+from carmel.services.numeric import unit_boundary_violation
 from carmel.services.stitching import (
     iter_unit_bearing_numerals,
     refute_stitched_scalar,
@@ -172,11 +173,35 @@ class TestWhatCountsAsAUnitBearingNumeral:
         text = f"the pressure was 1.2{gap}atm"
         assert list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text))) == []
 
-    def test_a_unit_that_is_only_a_prefix_of_a_longer_word_is_not_a_unit(self) -> None:
-        found = list(
-            iter_unit_bearing_numerals("held for 5 minutes", window_start=0, window_end=len("held for 5 minutes"))
-        )
-        assert found == []
+    @pytest.mark.parametrize(
+        "text",
+        ["held for 5 minutes", "held at 300 K-corrected values", "held at 1 atm(a) nominal"],
+    )
+    def test_a_spelling_the_admission_gate_refuses_is_not_a_construct(self, text: str) -> None:
+        """The scanner asks `unit_boundary_violation` itself rather than
+        re-deriving its rules. It used to test only "not followed by alnum",
+        which disagreed with the real gate on a hyphen or paren suffix: both
+        "300 K-corrected" and "1 atm(a)" counted as clean constructs where
+        `ground_quote` refuses them. Drift in EITHER direction is a bug -- an
+        invented construct falsely refutes an honest claim by making its window
+        look crowded, and a missed one lets a fabrication through. Codex r97.
+        """
+        assert list(iter_unit_bearing_numerals(text, window_start=0, window_end=len(text))) == []
+
+    def test_the_scanner_and_the_admission_gate_agree_construct_by_construct(self) -> None:
+        """Pins the agreement itself rather than a sample of it: every construct
+        the scanner yields must be a unit quote the admission gate calls clean."""
+        text = "held at 300 K, then 1.2 atm, a speed of 40 cm/s, a rate of 40 1/s, 300 K-corrected, 1 atm(a), 5 minutes"
+        for found in iter_unit_bearing_numerals(text, window_start=0, window_end=len(text)):
+            assert (
+                unit_boundary_violation(
+                    text,
+                    found.unit_start,
+                    found.unit_end,
+                    value_span=(found.value_start, found.value_end),
+                )
+                is None
+            )
 
     def test_a_slash_composite_yields_no_construct(self) -> None:
         """ "1.0/1.5 atm" states a PAIR. The numeral grammar folds hyphen ranges

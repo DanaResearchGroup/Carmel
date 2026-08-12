@@ -60,7 +60,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
 from carmel.schemas.datasets import CharSpanLocator, GroundedScalarClaim
-from carmel.services.numeric import NUMERAL_CANDIDATE_RE
+from carmel.services.numeric import NUMERAL_CANDIDATE_RE, unit_boundary_violation
 from carmel.services.units import TABLE_V1, ConversionTable, QuantityKind
 
 __all__ = [
@@ -220,10 +220,15 @@ def iter_unit_bearing_numerals(
             stop = cursor + len(unit)
             if stop > window_end or text[cursor:stop] != unit:
                 continue
-            # Refuse a spelling that is merely the prefix of a longer word:
-            # "5 minutes" must not read as 5 min, and "300 Kelvin-corrected"
-            # must not read as 300 K.
-            if stop < len(text) and (text[stop].isalnum() or text[stop] == "_"):
+            # Ask the ADMISSION gate itself whether this is a clean unit quote,
+            # rather than re-deriving its rules here. A hand-written "not
+            # followed by alnum" test was what this line used to be, and it
+            # disagreed with the real gate: "300 K-corrected" and "1 atm(a)"
+            # counted as clean constructs where `ground_quote` refuses them,
+            # so the scanner could both invent constructs (false refutation of
+            # an honest claim, from a window that looked crowded) and miss the
+            # crowding that should have refuted a fabricated one. Codex r97.
+            if unit_boundary_violation(text, cursor, stop, value_span=(match.start(), match.end())) is not None:
                 continue
             yield UnitBearingNumeral(
                 value_start=match.start(),
