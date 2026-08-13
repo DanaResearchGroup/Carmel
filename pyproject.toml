@@ -94,7 +94,11 @@ fail_under = 90
 # Python floor. Restating the floor is exactly how these two silently
 # drifted two minor versions apart.
 line-length = 120
-extend-exclude = ["tests/fixtures"]
+# "probes" is a local-only scratch directory (git-excluded, never committed) holding the
+# measurement instruments used to decide what this parser may honestly claim. Excluded so
+# `ruff format` cannot rewrite an instrument mid-measurement, and so a developer who has
+# one checked out does not get a permanently red `make lint`.
+extend-exclude = ["tests/fixtures", "probes"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B", "SIM"]
