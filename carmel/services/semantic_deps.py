@@ -1007,9 +1007,24 @@ _FRAGMENT_GEOMETRY_SHA256_V2 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3
 _FRAGMENT_GEOMETRY_OWN_SHA256_V3 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
 _FRAGMENT_GEOMETRY_SHA256_V3 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
 
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "d446c737b7d37cf50adaf4070250bc75f721f958b62680981bc89f8a5b474967"
+# SUPERSEDED, and kept forever -- the FOURTH fragment-geometry entry, registered while
+# `_page_fragments` still took pypdf's `recurse_to_target_op` at its word about WHERE each
+# text-show operation starts. It is wrong twice, established against ISO 32000-1 9.4.4 on
+# synthetic PDFs whose every operand and glyph width was chosen so the answer could be
+# computed by hand (pypdf matched the specification on 7 of 11 such cases): a show operator
+# never advances the pen, so consecutive `Tj` runs stack at one x; and a `TJ` array charges
+# `Tc` once per ELEMENT rather than once per glyph, so every element after the first starts
+# short. 22 and 7,815 sites respectively, on 11 and 61 of the corpus's 75 pages.
+# `_walk_operations` replaces that walk, so every fragment's `x_start` moves on any page
+# with either construct. This is the largest of the four moves by far -- the previous three
+# changed which pages FAILED, this one changes the coordinates themselves -- and it is still
+# the OWN half alone that moved.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V4 = "d446c737b7d37cf50adaf4070250bc75f721f958b62680981bc89f8a5b474967"
+_FRAGMENT_GEOMETRY_SHA256_V4 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545"
+
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "dbd9b8a255b6339438cb4551fcb6c8d0aa3e434694f5ccf71abf921a076d9cbd"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545"
+_FRAGMENT_GEOMETRY_SHA256 = "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1062,6 +1077,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V3: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V3,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V4: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V4,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1180,6 +1200,19 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V3,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        # The FOURTH supersession, and the first that changes COORDINATES rather than which
+        # pages fail. The three before it were all about refusal boundaries, so an artifact
+        # stored under any of them would have been either absent or identical; an artifact
+        # stored under this one would carry different numbers for the same page. Nothing is
+        # stored yet, which is the fourth time that has been the reason a supersession was
+        # cheap -- and the last time it will be worth saying, because the honest reading is
+        # that this lane's geometry should be treated as unstable until a producer exists.
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V4,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

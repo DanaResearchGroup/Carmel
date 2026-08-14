@@ -42,10 +42,7 @@ import re
 import zlib
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from collections.abc import Iterator
+from typing import Any
 
 __all__ = [
     "FragmentExtraction",
@@ -233,13 +230,7 @@ def _engine() -> tuple[Any, ...] | None:
     mismatch; the caller turns that into ``available=False``.
     """
     try:
-        from pypdf._text_extraction._layout_mode._fixed_width_page import (
-            recurse_to_target_op,
-            resolve_font,
-        )
-        from pypdf._text_extraction._layout_mode._text_state_manager import (
-            TextStateManager,
-        )
+        from pypdf._text_extraction._layout_mode._fixed_width_page import resolve_font
         from pypdf._text_extraction._layout_mode._text_state_params import (
             TextStateParams,
         )
@@ -254,10 +245,25 @@ def _engine() -> tuple[Any, ...] | None:
     # point of use. A per-page AttributeError is caught as a page failure and degrades
     # to `lossy=True`, so an engine-wide mismatch would otherwise present as "a valid
     # document where every page happened to fail" instead of "the engine is wrong".
-    for name in ("set_font", "set_state_param"):
-        if not callable(getattr(TextStateManager, name, None)):
-            logger.warning("pypdf TextStateManager lacks %s; fragments unavailable", name)
-            return None
+    #
+    # `TextStateParams` is CONSTRUCTED here, not merely read, so the constructor's own
+    # signature is part of the contract and gets its own check. Positional construction
+    # is deliberate -- it is how pypdf's own `TextStateManager.text_state_params` builds
+    # one -- and a release that reordered two same-typed float fields (`Tc` and `Tw`,
+    # say) would keep every name, pass every `hasattr`, and silently swap character
+    # spacing for word spacing in every advance this module computes.
+    try:
+        declared = tuple(field.name for field in dataclasses.fields(TextStateParams))
+    except TypeError:  # only if pypdf stops using a dataclass
+        logger.warning("pypdf TextStateParams is no longer a dataclass; fragments unavailable")
+        return None
+    if declared[: len(_REQUIRED_PARAM_FIELD_ORDER)] != _REQUIRED_PARAM_FIELD_ORDER:
+        logger.warning(
+            "pypdf TextStateParams fields are %s, not the expected %s; fragments unavailable",
+            declared[: len(_REQUIRED_PARAM_FIELD_ORDER)],
+            _REQUIRED_PARAM_FIELD_ORDER,
+        )
+        return None
     # Check FIELDS as well as class attributes. `TextStateParams` is a dataclass, and
     # a field without a default (`font_height` is one) exists only on instances, so a
     # bare `hasattr` on the class reports it missing and would refuse every healthy
@@ -306,8 +312,26 @@ def _engine() -> tuple[Any, ...] | None:
             _PINNED_PYPDF_VERSION,
         )
         return None
-    return recurse_to_target_op, resolve_font, TextStateManager, ContentStream
+    return resolve_font, TextStateParams, ContentStream
 
+
+_REQUIRED_PARAM_FIELD_ORDER = (
+    "value",
+    "font",
+    "font_size",
+    "Tc",
+    "Tw",
+    "Tz",
+    "TL",
+    "Ts",
+    "transform",
+)
+"""The leading constructor parameters of ``TextStateParams``, in order.
+
+:func:`_walk_operations` builds one per text-show operation POSITIONALLY, so this is a
+signature contract and not a spelling check; see :func:`_engine` for what a silent
+reordering would do.
+"""
 
 _REQUIRED_PARAM_ATTRS = (
     "text",
@@ -316,6 +340,10 @@ _REQUIRED_PARAM_ATTRS = (
     "displaced_tx",
     "font_height",
     "rotated",
+    # Read by `_advance` to compute the displacement one show applies to the text
+    # matrix. pypdf's own `displacement_matrix()` wraps it, but this module needs the
+    # scalar rather than the matrix, and needs it BEFORE the `Tc` correction is added.
+    "word_tx",
     # Read by `_pen_x_after` to charge `Tc` once per glyph. Listed here with the rest
     # rather than probed at the point of use for the reason the docstring above gives:
     # a per-page `AttributeError` degrades one page to lossy, which would present an
@@ -723,6 +751,492 @@ def _pen_x_after(show: Any) -> float:
     return float(show.displaced_tx) + undercharged * float(show.transform[0])
 
 
+class UnsupportedContentConstruct(Exception):
+    """A content-stream construct whose text geometry this walker will not guess at.
+
+    Raised rather than logged and stepped over. :func:`extract_fragments` turns any
+    exception from one page into a :class:`FragmentPageFailure` plus ``lossy=True``, so
+    this is the fail-closed channel: a page whose operator stream contains something
+    that moves text in a way :func:`_walk_operations` does not model is reported as a
+    page that could not be read, never as a page with fewer fragments. The distinction
+    matters because the two are indistinguishable downstream -- a table missing its
+    third column reads exactly like a two-column table.
+    """
+
+
+class _BudgetExhausted(Exception):
+    """Internal: the per-page fragment budget ran out mid-walk.
+
+    A separate type from :class:`UnsupportedContentConstruct` because it means the
+    opposite thing. Hitting the budget is a bound working as designed and is reported as
+    truncation; an unsupported construct is a refusal. Conflating them would let a
+    truncated page present as a malformed one, or worse the reverse.
+    """
+
+
+_IDENTITY: tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+#: The text-state operators that take a single numeric operand, mapped to the
+#: :class:`_TextState` field each one sets. ``Tf`` is absent deliberately: it takes two
+#: operands of different kinds and resolves a font, so it gets its own branch.
+#: Text rendering modes that paint no glyphs at all: 3 is "neither fill nor stroke", 7 is
+#: "add to clipping path, paint nothing". Both are how an invisible OCR layer is drawn.
+_INVISIBLE_RENDER_MODES = frozenset({3.0, 7.0})
+
+_TEXT_STATE_OPS: dict[bytes, str] = {
+    b"Tc": "char_spacing",
+    b"Tw": "word_spacing",
+    b"Tz": "horizontal_scale",
+    b"TL": "leading",
+    b"Ts": "rise",
+}
+
+
+def _mult(m: list[float], n: list[float]) -> list[float]:
+    """Compose two 3x2 PDF matrices: apply ``m``, then ``n``.
+
+    Six multiply-adds of ISO 32000-1 8.3.3, owned here rather than imported from
+    ``pypdf._text_extraction.mult``. Matrix composition is defined by the specification
+    and not by pypdf, and the whole point of :func:`_walk_operations` is that the
+    positioning arithmetic is this module's -- borrowing the multiply would put the one
+    piece the engine exists to own back behind a private import.
+    """
+    return [
+        m[0] * n[0] + m[1] * n[2],
+        m[0] * n[1] + m[1] * n[3],
+        m[2] * n[0] + m[3] * n[2],
+        m[2] * n[1] + m[3] * n[3],
+        m[4] * n[0] + m[5] * n[2] + n[4],
+        m[4] * n[1] + m[5] * n[3] + n[5],
+    ]
+
+
+def _num(value: Any) -> float:
+    """One numeric operand, or a refusal.
+
+    A content stream is not required to be well formed, and an operand that is not a
+    number where the specification demands one means the operator's effect is unknown.
+    Defaulting it to zero would silently place every later glyph on the page.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedContentConstruct("a positioning operand that is not a number") from exc
+
+
+@dataclass
+class _TextState:
+    """The text-state parameters of ISO 32000-1 table 105, as this walker tracks them.
+
+    Mutable and copied wholesale on ``q``, because these are part of the GRAPHICS state:
+    ``Q`` restores ``Tc``, ``Tw``, ``Tz``, ``TL``, ``Ts`` and the font along with the
+    CTM. pypdf's ``TextStateManager`` saves only the font and font size across ``q``, so
+    a ``Tc`` set inside a saved block leaks out of it there; here it does not.
+    """
+
+    font: Any = None
+    font_size: float = 0.0
+    char_spacing: float = 0.0
+    word_spacing: float = 0.0
+    horizontal_scale: float = 100.0
+    leading: float = 0.0
+    rise: float = 0.0
+    render_mode: float = 0.0
+
+
+def _advance(show: Any) -> float:
+    """The TEXT-SPACE displacement one show applies to the text matrix.
+
+    ISO 32000-1 9.4.4 gives the displacement of a single glyph as::
+
+        tx = ((w0 - Tj / 1000) * Tfs + Tc + Tw) * Th
+
+    summed over the glyphs shown, with ``Tw`` charged only on the single-byte code 32
+    and the ``Tj`` term contributed by ``TJ`` array numbers rather than by glyphs.
+    pypdf's ``word_tx`` computes that sum with ``Tc`` added ONCE per call instead of
+    once per glyph, which is the same undercount :func:`_pen_x_after` repairs for the
+    published right edge -- and repairing it there was never enough, because the
+    undercounted advance is also what the next show is positioned from.
+
+    Deliberately expressed as pypdf's own number plus the missing term rather than as a
+    fresh width sum. Font width lookup, ``/Encoding`` decoding, the space-character
+    test and the ``Tz`` scale all stay in pypdf's hands: this module owns the matrix
+    arithmetic and nothing else. The known consequence is that where pypdf's width
+    lookup is itself wrong -- a ``/Differences`` font whose codes decode to multi-
+    character glyph NAMES, where it accumulates one width per name character -- the
+    advance is wrong here too. Those shows are already published as
+    :attr:`GlyphMapping.UNMAPPED`.
+    """
+    base = float(show.word_tx(show.value))
+    glyphs = _glyphs_drawn(show)
+    if glyphs < 2 or not show.Tc:
+        return base
+    return base + (glyphs - 1) * float(show.Tc) * (float(show.Tz) / 100.0)
+
+
+def _refuse_form_xobject(operands: list[Any], xobjects: Any) -> None:
+    """Refuse a ``Do`` that could be drawing text, and let an image through.
+
+    pypdf's layout-mode walker has no ``Do`` branch at all, so text inside a form
+    XObject is invisible to it -- not misplaced, ABSENT. That is the more dangerous of
+    the two failure modes and it is the one this module inherited.
+
+    Recursing into the form is the complete fix and it is not built, on measurement
+    rather than on taste. Censused over the eight-paper corpus: **70 ``Do`` calls on 37
+    of 75 pages, and not one of them resolves to a ``/Form`` XObject** -- every one is
+    an image. Recursion would therefore be a resource-dictionary walk, a ``/Matrix``
+    composition, a cycle guard and a depth limit, none of which any document in hand
+    would execute, tested only against fixtures written to exercise it. A refusal is
+    honest at zero corpus cost, and it converts a silent hole into a recorded page
+    failure. When a corpus arrives that needs the text, the refusal is what will make
+    that visible.
+
+    Everything that is not exactly an ``/Image`` refuses, not only a ``/Form``. An
+    allowlist rather than a denylist because the question being asked is "can I prove
+    this draws no text", and a missing, malformed or unrecognised ``/Subtype`` proves
+    nothing. All 71 XObjects in the corpus are ``/Image``.
+    """
+    if not operands:
+        raise UnsupportedContentConstruct("a /Do operator with no operand")
+    name = operands[0]
+    try:
+        entry = xobjects.get(name) if xobjects is not None else None
+        subtype = entry.get_object().get("/Subtype") if entry is not None else None
+    except Exception as exc:  # noqa: BLE001 - any resolution failure is a refusal
+        raise UnsupportedContentConstruct("a /Do naming an unresolvable XObject") from exc
+    if entry is None:
+        raise UnsupportedContentConstruct("a /Do naming an XObject the page does not declare")
+    if subtype != "/Image":
+        raise UnsupportedContentConstruct(
+            f"a /Do on an XObject of subtype {subtype!r}, which may draw text this module does not position"
+        )
+
+
+@dataclass(frozen=True)
+class _PageResources:
+    """The three resource sub-dictionaries the walker consults, resolved once per page.
+
+    Resolved up front rather than per operator so that an unreadable resource dictionary
+    fails the page at a predictable point instead of partway through the operator stream,
+    and so the walker itself stays a pure function of its operand stream plus this.
+    """
+
+    xobjects: Any = None
+    """``/XObject``. ``None`` is not "no XObjects" -- it is "this page does not say", and
+    a ``Do`` against it refuses either way."""
+
+    ext_gstates: Any = None
+    """``/ExtGState``. Consulted only to see whether a named state carries ``/Font``."""
+
+    vertical_fonts: frozenset[str] = frozenset()
+    """Font resource names this module refuses to position; see
+    :func:`_unpositionable_fonts`."""
+
+
+def _resolve_resource(page: Any, key: str) -> Any:
+    resources = page.get("/Resources")
+    if resources is None:
+        return None
+    try:
+        entry = resources.get_object().get(key)
+        return None if entry is None else entry.get_object()
+    except Exception:  # noqa: BLE001 - an unreadable resource dict is "does not say"
+        logger.debug("page /Resources %s could not be resolved", key, exc_info=True)
+        return None
+
+
+def _unpositionable_fonts(fonts: Any) -> frozenset[str]:
+    """Font resource names whose writing mode this module will not assume is horizontal.
+
+    The engine advances the pen in x, unconditionally. That is the scope boundary the
+    user set -- no vertical writing modes -- and a boundary that is not enforced is not a
+    boundary: a Type0 font with a vertical CMap advances in y, and the walker would place
+    every glyph after the first at a fabricated x while raising nothing.
+
+    Two things refuse, and the split is deliberate:
+
+    * an ``/Encoding`` NAME ending in ``-V``, which is how the predefined vertical CMaps
+      are spelled (``/Identity-V``, ``/UniJIS-UCS2-V``, ...). Reading a name is not
+      reading a CMap.
+    * an ``/Encoding`` that is a STREAM, i.e. an embedded CMap. Its ``WMode`` is inside
+      the CMap, and reading CMaps is exactly what this module was told not to do. Most
+      embedded CMaps are horizontal, so this refuses more than it must -- fail-closed on
+      the side where being wrong publishes coordinates.
+
+    Censused over the corpus: 633 ``/Type1`` font resources and one ``/Type0``, whose
+    encoding is ``/Identity-H``. Nothing here refuses any document in hand.
+    """
+    if fonts is None:
+        return frozenset()
+    refused: set[str] = set()
+    for name in fonts:
+        try:
+            encoding = fonts[name].get_object().get("/Encoding")
+        except Exception:  # noqa: BLE001 - an unreadable font entry is unpositionable
+            refused.add(str(name))
+            continue
+        if encoding is None:
+            continue
+        if isinstance(encoding, str):
+            if encoding.endswith("-V"):
+                refused.add(str(name))
+        elif not hasattr(encoding, "get"):
+            refused.add(str(name))
+        elif encoding.get("/Type") == "/CMap" or hasattr(encoding, "get_data"):
+            # An embedded CMap, dictionary or stream. `/WMode` lives inside it and this
+            # module does not read CMaps.
+            #
+            # Written as `/Type == /CMap` and NOT as "has a /Type", which is what the
+            # first cut said and which refused every Type1 font in the test suite: a
+            # simple `/Encoding` dictionary carrying `/Differences` declares
+            # `/Type /Encoding`, so "has a /Type" matched the overwhelmingly common
+            # horizontal case. The guard was a false positive against real data while
+            # passing its own reasoning -- caught by the corpus-shaped fixture in
+            # `test_a_placeholder_glyph_name_is_one_glyph_not_its_spelling`, which is
+            # exactly the population it would have destroyed.
+            refused.add(str(name))
+    return frozenset(refused)
+
+
+def _page_resources(page: Any) -> _PageResources:
+    return _PageResources(
+        xobjects=_resolve_resource(page, "/XObject"),
+        ext_gstates=_resolve_resource(page, "/ExtGState"),
+        vertical_fonts=_unpositionable_fonts(_resolve_resource(page, "/Font")),
+    )
+
+
+def _refuse_gs_that_sets_a_font(operands: list[Any], ext_gstates: Any) -> None:
+    """Refuse a ``gs`` whose graphics-state dictionary carries ``/Font``.
+
+    An ExtGState may set the font and size without a ``Tf``, and a walker that ignores
+    ``gs`` then advances using the PREVIOUS font's widths -- wrong coordinates with
+    nothing raised. Only ``/Font`` refuses: ``gs`` is overwhelmingly line width, blend
+    mode and alpha, none of which move a glyph, and the corpus carries 2,862 of them on
+    73 of 75 pages with **zero** carrying ``/Font``. Refusing on the operator itself
+    would fail almost every page in hand to guard a construct none of them contains.
+
+    Stated rather than implied: alpha is NOT handled. A ``gs`` that sets fill alpha to
+    zero makes text invisible, and this module will still publish its geometry. That is
+    a VISIBILITY question, and this is a position engine; see the ``Tr`` refusal in
+    :func:`_walk_operations` for the one visibility case that is handled, and why.
+    """
+    if not operands:
+        raise UnsupportedContentConstruct("a gs operator with no operand")
+    if ext_gstates is None:
+        raise UnsupportedContentConstruct("a gs naming a state the page does not declare")
+    try:
+        state = ext_gstates.get(operands[0])
+        carries_font = state is not None and "/Font" in state.get_object()
+    except Exception as exc:  # noqa: BLE001 - any resolution failure is a refusal
+        raise UnsupportedContentConstruct("a gs naming an unresolvable graphics state") from exc
+    if state is None:
+        raise UnsupportedContentConstruct("a gs naming a state the page does not declare")
+    if carries_font:
+        raise UnsupportedContentConstruct("a gs that sets the font without a Tf")
+
+
+def _walk_operations(
+    operations: list[tuple[list[Any], bytes]],
+    *,
+    fonts: dict[str, Any],
+    resolve_font: Any,
+    params_cls: Any,
+    resources: _PageResources,
+    budget: int,
+) -> tuple[list[Any], bool]:
+    """Recompute where every text-show operation on one page actually starts.
+
+    This is the scoped position engine. It owns exactly one thing -- the horizontal text
+    positioning arithmetic of ISO 32000-1 9.4.2-9.4.4 -- and hands everything else back
+    to pypdf: fonts are resolved by ``resolve_font``, operands are decoded and per-show
+    quantities (``text``, ``font_height``, ``rotated``, the rotation normalisation) are
+    derived by constructing a real ``TextStateParams`` around the transform computed
+    here. There is no CMap reading, no ``ToUnicode`` handling and no vertical writing
+    mode in this function, and there is not meant to be.
+
+    **Why it exists.** pypdf's ``recurse_to_target_op`` is wrong about where text starts,
+    in two distinct ways, both established against the SPECIFICATION rather than against
+    a peer library -- eleven synthetic PDFs whose every operand and every glyph width was
+    chosen so the expected origins could be computed by hand. pypdf matched on 7 of 11:
+
+    * A show operator does not advance the pen at all. ``(01) Tj (23) Tj`` puts both runs
+      at the same x, because the ``Tj`` branch appends the show and never applies a
+      displacement; only a ``TJ`` array's NUMBERS displace anything. 22 sites on 11 of
+      the corpus's 75 pages.
+    * Within a ``TJ`` array the displacement applied between elements charges ``Tc``
+      once for the whole element, so every element after the first starts short by
+      ``Tc`` times the number of glyphs before it. 7,815 elements on 61 of 75 pages.
+
+    The second defect is invisible in body text, where ``Tc`` is zero, and dominates
+    exactly where this lane's evidence is: figure tick rows are drawn as ``Tc``-spaced
+    runs with ``Tc`` set to the tick pitch.
+
+    **What it does not fix.** Widths. Every width used here is the one pypdf looks up,
+    so a font whose metrics pypdf gets wrong is still wrong -- see :func:`_advance`.
+    This walker moves the pen correctly through the widths it is given; it does not
+    check them.
+
+    Returns the shows in stream order, and whether ``budget`` cut the walk short.
+    """
+    ctm: list[float] = list(_IDENTITY)
+    state = _TextState()
+    stack: list[tuple[list[float], _TextState]] = []
+    # `None` outside a text object. A positioning or showing operator that arrives with
+    # no `BT` in effect has no text matrix to act on, and inventing an identity for it
+    # would place the text at the page origin rather than admit the stream is malformed.
+    tm: list[float] | None = None
+    tlm: list[float] | None = None
+    shows: list[Any] = []
+
+    def require_text_object() -> tuple[list[float], list[float]]:
+        if tm is None or tlm is None:
+            raise UnsupportedContentConstruct("a text operator outside any BT/ET object")
+        return tm, tlm
+
+    def next_line(dx: float, dy: float) -> None:
+        nonlocal tm, tlm
+        _tm, _tlm = require_text_object()
+        tlm = _mult([1.0, 0.0, 0.0, 1.0, dx, dy], _tlm)
+        tm = list(tlm)
+
+    def show(value: Any) -> None:
+        nonlocal tm
+        _tm, _tlm = require_text_object()
+        if state.font is None:
+            raise UnsupportedContentConstruct("a text-show operator before any Tf")
+        if state.render_mode in _INVISIBLE_RENDER_MODES:
+            # Modes 3 and 7 paint no glyphs. An OCR layer beneath a scanned page is
+            # exactly this, and publishing its geometry would put an invisible copy of a
+            # number in competition with the visible one at the same coordinates. Refused
+            # rather than skipped: skipping drops the only text such a page has, silently.
+            # Zero corpus cost -- there is not one `Tr` operator in the eight papers.
+            raise UnsupportedContentConstruct(
+                f"a text-show operator in rendering mode {state.render_mode:g}, which paints nothing"
+            )
+        if len(shows) >= budget:
+            raise _BudgetExhausted
+        params = params_cls(
+            value,
+            state.font,
+            state.font_size,
+            state.char_spacing,
+            state.word_spacing,
+            state.horizontal_scale,
+            state.leading,
+            state.rise,
+            _mult(_tm, ctm),
+        )
+        shows.append(params)
+        # The pen advances along the ORIGINAL text matrix, never along the one
+        # `TextStateParams.__post_init__` may have rewritten. pypdf rewrites the
+        # transform of rotated text by a non-length-preserving factor of its own
+        # invention; feeding that back into the next show's position would propagate an
+        # invented number down the rest of the text object.
+        tm = _mult([1.0, 0.0, 0.0, 1.0, _advance(params), 0.0], _tm)
+
+    try:
+        for operands, op in operations:
+            if op == b"q":
+                stack.append((list(ctm), dataclasses.replace(state)))
+            elif op == b"Q":
+                if not stack:
+                    raise UnsupportedContentConstruct("a Q with no matching q")
+                ctm, state = stack.pop()
+            elif op == b"cm":
+                if len(operands) < 6:
+                    raise UnsupportedContentConstruct("a cm with fewer than six operands")
+                ctm = _mult([_num(v) for v in operands[:6]], ctm)
+            elif op == b"BT":
+                # A text object starts with both matrices at identity, and neither
+                # survives `ET`. Nested `BT` is illegal; treating it as a reset matches
+                # what the operator means where it is legal.
+                tm = list(_IDENTITY)
+                tlm = list(_IDENTITY)
+            elif op == b"ET":
+                tm = tlm = None
+            elif op in (b"Td", b"TD"):
+                if len(operands) < 2:
+                    raise UnsupportedContentConstruct("a Td/TD with fewer than two operands")
+                dx, dy = _num(operands[0]), _num(operands[1])
+                if op == b"TD":
+                    state.leading = -dy
+                next_line(dx, dy)
+            elif op == b"Tm":
+                if len(operands) < 6:
+                    raise UnsupportedContentConstruct("a Tm with fewer than six operands")
+                require_text_object()
+                tlm = [_num(v) for v in operands[:6]]
+                tm = list(tlm)
+            elif op == b"T*":
+                next_line(0.0, -state.leading)
+            elif op == b"Tf":
+                if len(operands) < 2:
+                    raise UnsupportedContentConstruct("a Tf with fewer than two operands")
+                if str(operands[0]) in resources.vertical_fonts:
+                    raise UnsupportedContentConstruct(
+                        "a Tf naming a font whose writing mode this module cannot prove is horizontal"
+                    )
+                state.font = resolve_font(fonts, operands[0])
+                state.font_size = _num(operands[1])
+            elif op in _TEXT_STATE_OPS:
+                if not operands:
+                    raise UnsupportedContentConstruct("a text-state operator with no operand")
+                setattr(state, _TEXT_STATE_OPS[op], _num(operands[0]))
+            elif op == b"Tj":
+                if not operands:
+                    raise UnsupportedContentConstruct("a Tj with no operand")
+                show(operands[0])
+            elif op == b"TJ":
+                if not operands:
+                    raise UnsupportedContentConstruct("a TJ with no operand")
+                for element in operands[0]:
+                    if isinstance(element, bytes | str):
+                        show(element)
+                        continue
+                    # A number in a TJ array displaces the pen by `-k/1000 * Tfs * Th`
+                    # and charges NEITHER `Tc` nor `Tw` -- it is not a glyph. Applied to
+                    # `tm` directly, so a run of numbers with no strings between them
+                    # accumulates the way the specification says it does.
+                    _tm, _tlm = require_text_object()
+                    tm = _mult(
+                        [
+                            1.0,
+                            0.0,
+                            0.0,
+                            1.0,
+                            -_num(element) / 1000.0 * state.font_size * (state.horizontal_scale / 100.0),
+                            0.0,
+                        ],
+                        _tm,
+                    )
+            elif op == b"'":
+                if not operands:
+                    raise UnsupportedContentConstruct("a ' with no operand")
+                next_line(0.0, -state.leading)
+                show(operands[0])
+            elif op == b'"':
+                if len(operands) < 3:
+                    raise UnsupportedContentConstruct('a " with fewer than three operands')
+                # `aw ac string "` sets word and character spacing PERMANENTLY, not just
+                # for this show, then does the implied `T*`.
+                state.word_spacing = _num(operands[0])
+                state.char_spacing = _num(operands[1])
+                next_line(0.0, -state.leading)
+                show(operands[2])
+            elif op == b"Tr":
+                if not operands:
+                    raise UnsupportedContentConstruct("a Tr with no operand")
+                state.render_mode = _num(operands[0])
+            elif op == b"gs":
+                _refuse_gs_that_sets_a_font(operands, resources.ext_gstates)
+            elif op == b"Do":
+                _refuse_form_xobject(operands, resources.xobjects)
+    except _BudgetExhausted:
+        return shows, True
+    return shows, False
+
+
 def _page_fragments(
     page: Any, page_number: int, engine: tuple[Any, ...], budget: int
 ) -> tuple[list[TextFragment], bool]:
@@ -737,21 +1251,20 @@ def _page_fragments(
     ``TextStateParams`` before the conversion loop runs at all, and the cap then fires
     after the damage.
 
-    Two things the FRAGMENT budget does not bound, stated exactly rather than glossed,
-    because a comment that overstates a guard is worse than no guard:
+    :func:`_walk_operations` checks the budget at the point where a show is CONSTRUCTED,
+    including inside a ``TJ`` array, so unlike the group-at-a-time walker this replaced
+    there is no longer any nesting level at which shows accumulate unbounded. What the
+    fragment budget still does not bound, stated exactly rather than glossed, because a
+    comment that overstates a guard is worse than no guard: ``ContentStream``
+    materialises the entire operation list up front, inside pypdf, before this function
+    sees anything.
 
-    * ``recurse_to_target_op`` consumes one whole ``BT``/``ET`` (or ``q``/``Q``) group
-      per call and returns every show in it at once. The check below therefore fires
-      BETWEEN groups, so a single group containing a million shows is not bounded.
-    * ``ContentStream`` materialises the entire operation list up front, inside pypdf,
-      before this function sees anything.
-
-    Both scale with the page's decompressed content-stream size and nothing else, which
+    That scales with the page's decompressed content-stream size and nothing else, which
     is why that size -- and not either of them individually -- is what gets capped
     below. See :data:`MAX_PAGE_CONTENT_BYTES` for the measurement it is set from, and
     for the one thing it still does not bound.
     """
-    recurse_to_target_op, resolve_font, text_state_manager, content_stream = engine
+    resolve_font, params_cls, content_stream = engine
 
     contents = page.get("/Contents")
     if contents is None:
@@ -764,48 +1277,15 @@ def _page_fragments(
     # silent no-op that reads like protection.
     _decoded_content_length(resolved, MAX_PAGE_CONTENT_BYTES)
     content = content_stream(resolved, page.pdf, "bytes")
-    ops: Iterator[tuple[list[Any], bytes]] = iter(content.operations)
 
-    fonts = page._layout_mode_fonts()
-    state_mgr = text_state_manager()
-    shows: list[Any] = []
-    stopped_early = False
-    for operands, op in ops:
-        if len(shows) >= budget:
-            # Reported as truncation even though the conversion loop below will not
-            # reach its own budget check (it converts exactly `budget` shows and stops
-            # naturally). Without this the page would look complete. A page holding
-            # EXACTLY `budget` shows followed by non-text operators reports truncation
-            # it did not suffer -- deliberate: this lane fails toward admitting loss.
-            stopped_early = True
-            break
-        if op in (b"BT", b"q"):
-            # `strip_rotated=False` is DEFENSIVE, not load-bearing, and the
-            # distinction was established by mutating it and watching the tests stay
-            # green. In this pypdf the flag is consulted only while assembling the
-            # `BTGroup`s -- which this module discards -- while the per-show list it
-            # returns alongside them is appended to unconditionally. So today it
-            # changes nothing here, and NO TEST CAN CATCH ITS REMOVAL; do not add one
-            # that appears to, because it would pass against either value.
-            #
-            # It is still passed explicitly, because the flag's stated contract is
-            # "remove rotated text" and a future pypdf could honour that on this list
-            # too. Rotated column headers and rotated axis titles are common, and
-            # dropping them would mean a table read as complete with a header row
-            # missing -- a silent hole, which is the failure mode this lane exists to
-            # refuse. Cheap insurance against a documented behaviour arriving.
-            _groups, tjs = recurse_to_target_op(
-                ops,
-                state_mgr,
-                b"ET" if op == b"BT" else b"Q",
-                fonts,
-                strip_rotated=False,
-            )
-            shows.extend(tjs)
-        elif op == b"Tf":
-            state_mgr.set_font(resolve_font(fonts, operands[0]), operands[1])
-        else:
-            state_mgr.set_state_param(op, operands)
+    shows, stopped_early = _walk_operations(
+        content.operations,
+        fonts=page._layout_mode_fonts(),
+        resolve_font=resolve_font,
+        params_cls=params_cls,
+        resources=_page_resources(page),
+        budget=budget,
+    )
 
     fragments: list[TextFragment] = []
     for show in shows:

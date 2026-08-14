@@ -454,13 +454,33 @@ class TestFailsClosed:
         assert result.lossy is True
         assert result.fragments == ()
 
-    def test_capability_check_rejects_a_reshaped_state_manager(self, monkeypatch) -> None:
+    def test_capability_check_rejects_params_missing_a_method_it_calls(self, monkeypatch) -> None:
         require_pypdf()
-        from pypdf._text_extraction._layout_mode._text_state_manager import TextStateManager
+        from pypdf._text_extraction._layout_mode._text_state_params import TextStateParams
 
         import carmel.services.pdf_fragments as mod
 
-        monkeypatch.delattr(TextStateManager, "set_font", raising=True)
+        monkeypatch.delattr(TextStateParams, "word_tx", raising=True)
+        assert mod._engine() is None
+
+    def test_capability_check_rejects_reordered_constructor_fields(self, monkeypatch) -> None:
+        """`TextStateParams` is CONSTRUCTED positionally, so its field ORDER is contract.
+
+        A release that swapped two same-typed float fields -- `Tc` and `Tw`, say -- would
+        keep every name, pass every `hasattr`, and silently trade character spacing for
+        word spacing in every advance computed. Nothing else in the gate can see that.
+
+        Driven from this module's side of the comparison rather than by rewriting the
+        dataclass, which cannot be done without rebuilding it: the assertion is that the
+        two disagreeing is what refuses, and disagreement has no preferred direction.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        swapped = list(mod._REQUIRED_PARAM_FIELD_ORDER)
+        swapped[3], swapped[4] = swapped[4], swapped[3]
+        assert swapped != list(mod._REQUIRED_PARAM_FIELD_ORDER)
+        monkeypatch.setattr(mod, "_REQUIRED_PARAM_FIELD_ORDER", tuple(swapped))
         assert mod._engine() is None
 
     def test_garbage_bytes_do_not_raise(self) -> None:
@@ -689,32 +709,32 @@ class TestLossRecordsWhatWasLost:
         """One show becomes at most one fragment, so capping only the conversion loop
         lets a hostile page retain millions of `TextStateParams` before the cap fires.
 
-        Measured through pypdf's own call count: the engine consumes one whole BT group
-        per call, so a bounded run must stop calling it once the budget is met. This is
-        also the honest granularity of the guard -- a SINGLE group holding a million
-        shows is still unbounded, which the docstring says outright.
+        Measured by counting how many `TextStateParams` are ever CONSTRUCTED, which is
+        the object being retained. The walker checks the budget at that construction
+        point, inside `TJ` arrays as well as between operators, so unlike the
+        group-at-a-time engine this replaced there is no nesting level at which shows
+        accumulate past the cap: 3, not 60, and not "3 plus whatever the group held".
         """
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        calls = 0
+        built = 0
         real_engine = mod._engine()
         assert real_engine is not None
-        recurse, resolve_font, manager, content_stream = real_engine
+        resolve_font, params_cls, content_stream = real_engine
 
-        def _counting_recurse(*args, **kwargs):
-            nonlocal calls
-            calls += 1
-            return recurse(*args, **kwargs)
+        def _counting_params(*args, **kwargs):
+            nonlocal built
+            built += 1
+            return params_cls(*args, **kwargs)
 
-        monkeypatch.setattr(mod, "_engine", lambda: (_counting_recurse, resolve_font, manager, content_stream))
+        monkeypatch.setattr(mod, "_engine", lambda: (resolve_font, _counting_params, content_stream))
         monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 3)
         groups = " ".join(f"BT /F1 10 Tf 72 {700 - i} Td ({i}) Tj ET" for i in range(60))
         result = extract_fragments(_one_page_pdf(groups))
         assert len(result.fragments) == 3
         assert result.truncated is True
-        # 4, not 60: the loop stops one group after the budget is met.
-        assert calls <= 4, f"walked {calls} text groups for a budget of 3"
+        assert built == 3, f"built {built} shows for a budget of 3"
 
     def test_a_page_past_the_cap_is_never_parsed_at_all(self, monkeypatch) -> None:
         """The cap is checked BEFORE parsing the next page, not after.
