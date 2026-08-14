@@ -287,6 +287,33 @@ class TestTheClaimIsCheckedNotTaken:
         assert refusal is not None
         assert refusal.reason is RegionRefusalReason.INVALID_GEOMETRY
 
+    def test_a_zero_width_claimed_box_refuses(self) -> None:
+        """A region of zero width contains nothing and can straddle nothing, so it would
+        reach the neighbour search and return `None` -- the same permissive non-answer the
+        NaN check exists to stop. The refusal text said "non-increasing" while the
+        predicate accepted equality, so the gate was looser than its own message.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        flat = ClaimedRegion(page=1, x_start=109.0, x_end=109.0, baseline_y=700.0, members=(number,))
+        refusal = refuse_region(_extraction(number), flat)
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.INVALID_GEOMETRY
+
+    def test_a_zero_width_member_fragment_does_not_refuse(self) -> None:
+        """The other half of that fix, and the half a later reader would "simplify" away.
+
+        A combining diacritic draws over the glyph before it and does not advance the pen,
+        so `x_start == x_end` is what a CORRECT extractor reports. On the eight-paper
+        corpus 23 such fragments are `MAPPED` -- real accents on real words, in 7 of the 8
+        papers. Tightening the fragment predicate to `<` alongside the region one would
+        refuse every region containing an accented character.
+        """
+        accent = _fragment("´", 109.0, 109.0)
+        word = _fragment("1.0", 103.5, 115.0)
+        region = ClaimedRegion(page=1, x_start=100.0, x_end=120.0, baseline_y=700.0, members=(word, accent))
+        refusal = refuse_region(_extraction(word, accent), region)
+        assert refusal is None or refusal.reason is not RegionRefusalReason.INVALID_GEOMETRY
+
     def test_loss_that_cannot_be_located_refuses(self) -> None:
         """`lossy` with neither carrier is loss this module cannot place. The page-
         specific test stays precise, so this needs its own check."""

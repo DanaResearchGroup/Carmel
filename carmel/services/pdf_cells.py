@@ -297,7 +297,7 @@ class RegionRefusal:
 
 
 def _is_sane_extent(start: float, end: float) -> bool:
-    """A horizontal extent that is finite and runs the way page space runs.
+    """A FRAGMENT's horizontal extent: finite, and running the way page space runs.
 
     Both halves are load-bearing. NaN makes every ``<`` comparison in this module
     quietly False, so an unchecked NaN box would satisfy the straddle test, find no
@@ -305,8 +305,31 @@ def _is_sane_extent(start: float, end: float) -> bool:
     predicate having actually run. And an extent running backwards is not hypothetical:
     mirrored or negative-scale text yields ``x_end < x_start`` while ``rotated`` is
     still False, which inverts left, right and overlap all at once.
+
+    ZERO WIDTH IS ADMITTED HERE, DELIBERATELY, and this is the one place the fragment
+    rule and the region rule part company. A combining diacritic draws over the glyph
+    before it and does not advance the pen, so ``x_start == x_end`` is what a correct
+    extractor reports for it. Measured on the eight-paper corpus: 149 of 78,178
+    fragments have zero width, and 23 of those are ``MAPPED`` -- ``´`` and ``¨``, real
+    accents on real words, spread across 7 of the 8 papers. Refusing them would refuse
+    every region containing an accented character, which is why this predicate is
+    ``<=`` and not ``<``. The remaining 126 are ``UNMAPPED`` (``/C24``-style markers),
+    already carried by :attr:`GlyphMapping` rather than by geometry.
     """
     return math.isfinite(start) and math.isfinite(end) and start <= end
+
+
+def _is_sane_region_extent(start: float, end: float) -> bool:
+    """A CLAIMED REGION's horizontal extent, which must be strictly positive.
+
+    A region is an area someone claims a cell occupies, not a glyph, so the combining
+    -mark exemption above does not apply to it: a box of zero width contains nothing,
+    can straddle nothing, and would sail through the neighbour search to ``None`` --
+    the same permissive non-answer the NaN check exists to stop. The refusal text said
+    "non-increasing" while the predicate accepted equality, so the gate was looser than
+    its own message for as long as both call sites shared one function.
+    """
+    return math.isfinite(start) and math.isfinite(end) and start < end
 
 
 def _edge_token(text: str, *, from_end: bool) -> str:
@@ -385,10 +408,10 @@ def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tu
             f"page {region.page} is incomplete, so an absent neighbour proves nothing",
         )
 
-    if not _is_sane_extent(region.x_start, region.x_end) or not math.isfinite(region.baseline_y):
+    if not _is_sane_region_extent(region.x_start, region.x_end) or not math.isfinite(region.baseline_y):
         return note(
             RegionRefusalReason.INVALID_GEOMETRY,
-            "the claimed box has a non-finite or non-increasing extent",
+            "the claimed box has a non-finite, backwards or zero-width extent",
         )
 
     if not region.members:
@@ -409,7 +432,7 @@ def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tu
         if not _is_sane_extent(member.x_start, member.x_end) or not math.isfinite(member.baseline_y):
             return note(
                 RegionRefusalReason.INVALID_GEOMETRY,
-                "a member fragment has a non-finite or non-increasing extent",
+                "a member fragment has a non-finite or backwards extent",
             )
         if member.page != region.page:
             return note(
