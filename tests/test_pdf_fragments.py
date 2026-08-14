@@ -940,6 +940,67 @@ class TestOnePageCannotCostUnboundedMemory:
         assert result.available is True
         assert result.lossy is True
 
+    def test_a_truncated_flate_stream_is_refused_rather_than_measured_short(self) -> None:
+        """A valid deflate PREFIX inflates cleanly and reports no error at all.
+
+        This is the silent direction, which is why it gets its own test rather than riding
+        along with the corrupt-stream one above. Measured on the exact fixture below:
+        dropping the last 20 compressed bytes still yields 3,654 of the 8,200 real bytes,
+        with ``unconsumed_tail`` EMPTY -- empty precisely because every compressed byte was
+        consumed -- and no ``zlib.error`` raised. A guard checking only that tail therefore
+        accepts the prefix, returns 3,654 as the page's size, and the page is parsed as
+        though it were whole: fewer operations, no failure recorded, a short page that looks
+        complete. ``eof`` is the only witness that separates "consumed all the input" from
+        "reached the end of the stream".
+        """
+        require_pypdf()
+        body = ("BT /F1 9 Tf 1 0 0 1 72 700 Tm (ok) Tj ET " * 200).encode("latin-1")
+        truncated = zlib.compress(body)[:-20]
+
+        engine = zlib.decompressobj()
+        salvaged = engine.decompress(truncated, 10_000_000)
+        assert not engine.eof and engine.unconsumed_tail == b""
+        assert 0 < len(salvaged) < len(body), "fixture must inflate a SHORT prefix silently"
+
+        result = extract_fragments(_one_page_filtered_pdf("", filters="/FlateDecode", raw=truncated))
+        assert "PageContentUndecodable" in result.page_failures[0].error
+        assert "truncated prefix" in result.page_failures[0].error
+        assert result.lossy is True
+
+    def test_bytes_after_the_deflate_end_are_refused_rather_than_ignored(self) -> None:
+        """Trailing bytes inflate to ``eof=True`` with the extras parked on ``unused_data``.
+
+        This function never measured them and ``ContentStream`` may still parse them, so
+        admitting the stream returns a number that bounds less than the caller believes.
+        """
+        require_pypdf()
+        body = b"BT /F1 9 Tf 1 0 0 1 72 700 Tm (ok) Tj ET"
+        result = extract_fragments(
+            _one_page_filtered_pdf("", filters="/FlateDecode", raw=zlib.compress(body) + b"TRAILING GARBAGE")
+        )
+        assert "PageContentUndecodable" in result.page_failures[0].error
+        assert "past the end of its deflate data" in result.page_failures[0].error
+
+    def test_a_trailing_newline_after_the_deflate_end_is_admitted(self) -> None:
+        """The counterweight to the test above, and it exists because the guard without it
+        was measured to be WRONG on real documents.
+
+        PDF's stream syntax puts an EOL before ``endstream``, and ``/Length`` need not cover
+        it. 43 of the 8-paper corpus's 161 content streams carry exactly one trailing
+        ``b"\\n"``. Refusing on ``unused_data`` alone therefore failed 43 real pages across 4
+        of 8 papers and took the corpus from 78,178 fragments to 34,151 -- a guard costing
+        56% of the evidence to catch a byte the format requires.
+
+        Pinned in the admitting direction on purpose: the refusal test above passes whether
+        or not whitespace is exempt, so it alone would not notice the exemption being
+        "tidied away" by someone reading only the stricter rule.
+        """
+        require_pypdf()
+        body = b"BT /F1 9 Tf 1 0 0 1 72 700 Tm (ok) Tj ET"
+        result = extract_fragments(_one_page_filtered_pdf("", filters="/FlateDecode", raw=zlib.compress(body) + b"\n"))
+        assert result.page_failures == ()
+        assert [fragment.text for fragment in result.fragments] == ["ok"]
+
     def test_the_two_page_failure_reasons_are_never_conflated(self) -> None:
         """Too big and undecodable are different claims: one is about the document, the
         other about this module's reach. Reporting an unhandled filter as an oversized

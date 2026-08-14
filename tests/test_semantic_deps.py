@@ -100,6 +100,7 @@ _HISTORICALLY_SHIPPED_SHAS = frozenset(
         "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb",
         "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b",
         "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e",
+        "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545",
     }
 )
 
@@ -1204,7 +1205,7 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
 #   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
 # This is the half that moves when fragment GEOMETRY changes: it is the sha that
 # distinguishes 7895e00 ("Charge character spacing once per glyph") from its parent.
-_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "d446c737b7d37cf50adaf4070250bc75f721f958b62680981bc89f8a5b474967"
 
 # The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
 # historical row rather than only asserted in prose. Its own component moved when
@@ -1225,9 +1226,16 @@ _PINNED_FRAGMENT_GEOMETRY_SHA256_V2 = "3fc972d0394184267e85a9a9e42387423eed53875
 # function-scope.
 _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
 
+# The SUPERSEDED third entry. Its own component moved when the bounded decode stopped
+# accepting a TRUNCATED deflate stream as a measured one -- `unconsumed_tail` is empty for a
+# valid prefix, so only `eof` can tell "consumed all input" from "reached the end". Borrowed
+# did not move: three for three.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V3 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V3 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
+
 # HARDCODED. The registered content_sha256 itself, verified once via:
 #   compose_component_sha({"borrowed_sha256": <borrowed>, "own_sha256": <own>})
-_PINNED_FRAGMENT_GEOMETRY_SHA256 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545"
 
 # The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
 # completeness claim of the composite identity, spelled out as data: extract_fragments runs
@@ -1632,13 +1640,14 @@ def test_the_supersession_moved_only_the_own_component() -> None:
     """What the composite split buys, demonstrated on the real supersessions rather than on
     synthetic sources: both changes were entirely inside pdf_fragments, so the OWN half
     moved each time and the BORROWED half never did. A single opaque sha could not say
-    that, and saying it twice is what turns one observation into the property the split
-    was built to provide."""
+    that, and saying it three times over is what turns one observation into the property the
+    split was built to provide."""
     generations = [
         _fragment_geometry_components(sha)
         for sha in (
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V1,
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V2,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
             _PINNED_FRAGMENT_GEOMETRY_SHA256,
         )
     ]

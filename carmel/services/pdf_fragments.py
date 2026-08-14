@@ -371,13 +371,22 @@ MAX_PDF_FRAGMENTS = 1_000_000
 #: cap -- which costs ONE page, recorded as a failure and therefore visible, rather than
 #: the document.
 #:
-#: **What it does not bound**, stated exactly because a comment that overstates a guard
-#: is worse than no guard: the transient decode itself. Measuring the length requires
-#: decoding, so a compression bomb still allocates its decompressed size once as a
-#: ``bytes`` object before the check can reject it. What the cap removes is the 33x
-#: amplification of turning those bytes into Python objects, which is the part that
-#: takes a large allocation to an unrecoverable one. Bounding the decode too would mean
-#: reimplementing pypdf's filter stack against an output limit its API does not expose.
+#: **What it does not bound.** Not the transient decode -- that WAS true and is no longer,
+#: and the correction is kept visible rather than quietly deleted because the superseded
+#: text is the reason the current code is shaped as it is.
+#:
+#: This comment used to say a compression bomb still allocates its decompressed size once
+#: before the check can reject it, on the grounds that bounding the decode would mean
+#: reimplementing pypdf's filter stack. :func:`_decoded_content_length` now bounds it, and
+#: the argument that said it could not be done was refuted by measuring rather than by
+#: reasoning: every content stream in the corpus is a single-stage ``/FlateDecode`` with no
+#: ``/DecodeParms``, so ``zlib.decompressobj`` bounds the only filter present and an exact
+#: allowlist of one fails everything else closed. A bomb now stops at the cap.
+#:
+#: What the cap still does not bound is the COMPRESSED input: the stored bytes are read
+#: whole before any output limit applies, so a large incompressible stream under the cap is
+#: still copied and scanned. That is bounded by the artifact size instead, which is checked
+#: before this module ever sees the document.
 MAX_PAGE_CONTENT_BYTES = 6_000_000
 
 #: The ``error`` recorded for a page whose page-tree entry was UNINSPECTABLE.
@@ -403,6 +412,12 @@ _UNINSPECTABLE_PAGE_ERROR = "page-tree entry could not be inspected; kept as a p
 #: measurement of what refusing everything else costs (nothing, on 161 of 161 streams) and
 #: for what that zero does not prove.
 _ALLOWED_CONTENT_FILTER = "/FlateDecode"
+
+#: The six bytes PDF counts as whitespace (ISO 32000-1 table 1). Spelled out rather than
+#: reusing `bytes.isspace`, whose set is Python's and includes vertical tab, which PDF does
+#: not; a guard that refuses on trailing bytes must use the FORMAT's definition of "not
+#: content", or it decides what a PDF is allowed to contain on Python's authority.
+_PDF_WHITESPACE = b"\x00\t\n\x0c\r "
 
 
 class PageContentTooLarge(Exception):
@@ -535,6 +550,36 @@ def _decoded_content_length(contents: Any, limit: int) -> int:
                 raise PageContentUndecodable(f"page content stream could not be inflated: {exc}") from exc
             if engine.unconsumed_tail:
                 raise PageContentTooLarge(f"page content stream decompresses past the {limit}-byte cap")
+            if not engine.eof:
+                # Input exhausted with the zlib stream still open: the stream is TRUNCATED,
+                # and its valid prefix inflated cleanly. Checking `unconsumed_tail` alone
+                # cannot see this -- that tail is empty precisely because every compressed
+                # byte was consumed -- so without this branch a truncated stream is measured,
+                # declared "sized", and handed on as if it were whole. Refused rather than
+                # sized, because a length established from a prefix is not the length of the
+                # content, and a page parsed from half a stream fails in the silent
+                # direction: fewer operations, no error, a short page that looks complete.
+                raise PageContentUndecodable(
+                    "page content stream ends mid-deflate; its length cannot be established from a truncated prefix"
+                )
+            trailing = bytes(engine.unused_data).strip(_PDF_WHITESPACE)
+            if trailing:
+                # Bytes after the deflate stream's own end marker that are not PDF
+                # whitespace. This function did not measure them and `ContentStream` may
+                # well parse them, so the number returned would bound less than the caller
+                # believes.
+                #
+                # The whitespace exemption is measured, not defensive: 43 of the corpus's
+                # 161 content streams carry exactly one trailing b"\n" -- the EOL that PDF's
+                # own stream syntax puts before `endstream` and that `/Length` need not
+                # cover. Refusing on `unused_data` alone failed 43 real pages across 4 of 8
+                # papers and dropped the corpus from 78,178 fragments to 34,151. A guard
+                # that costs 56% of the evidence to catch a byte the format requires is
+                # measuring the format rather than the document.
+                raise PageContentUndecodable(
+                    f"page content stream carries {len(trailing)} non-whitespace bytes past "
+                    "the end of its deflate data; the size cannot be established"
+                )
             total += len(decoded)
         if total > limit:
             raise PageContentTooLarge(f"page content stream decompresses past the {limit}-byte cap")

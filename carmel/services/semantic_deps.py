@@ -996,9 +996,20 @@ _FRAGMENT_GEOMETRY_SHA256_V1 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7
 _FRAGMENT_GEOMETRY_OWN_SHA256_V2 = "96b5852b71496f062dd1d36b255f98feb952baf89fe7e4fb995b93ce00a56f5e"
 _FRAGMENT_GEOMETRY_SHA256_V2 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b"
 
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
+# SUPERSEDED, and kept forever -- the THIRD fragment-geometry entry, registered while the
+# bounded decode checked only `unconsumed_tail`. That witness cannot see a TRUNCATED stream:
+# a valid deflate prefix consumes all of its input, so the tail is empty, no `zlib.error` is
+# raised, and the measured length is the prefix's rather than the content's. Measured on a
+# fixture: 3,654 of 8,200 bytes returned silently. Checking `eof` (and `unused_data`) turns
+# that into a page failure, which changes which pages become failures and therefore moved the
+# OWN component. The BORROWED component did not move -- the third time in a row the split has
+# localized a change to `pdf_fragments`.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V3 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
+_FRAGMENT_GEOMETRY_SHA256_V3 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
+
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "d446c737b7d37cf50adaf4070250bc75f721f958b62680981bc89f8a5b474967"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
+_FRAGMENT_GEOMETRY_SHA256 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1046,6 +1057,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V2: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V2,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V3: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V3,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1153,6 +1169,17 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V2,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        # The THIRD supersession, and the first one bought by a defect an adversarial review
+        # found rather than by a change already planned: the bounded decode admitted a
+        # TRUNCATED stream as a measured one. Three supersessions in three sessions is worth
+        # noting rather than normalising -- but each moved the OWN half only, so the split is
+        # doing the job it was built for, and the cost of each has stayed at four edits.
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V3,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),
