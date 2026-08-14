@@ -1022,9 +1022,28 @@ _FRAGMENT_GEOMETRY_SHA256_V3 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc
 _FRAGMENT_GEOMETRY_OWN_SHA256_V4 = "d446c737b7d37cf50adaf4070250bc75f721f958b62680981bc89f8a5b474967"
 _FRAGMENT_GEOMETRY_SHA256_V4 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545"
 
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "dbd9b8a255b6339438cb4551fcb6c8d0aa3e434694f5ccf71abf921a076d9cbd"
+# SUPERSEDED, and kept forever -- the FIFTH fragment-geometry entry, registered while
+# `_walk_operations` still STEPPED OVER every operator it did not name. It published
+# geometry for a page whose stream reframed it (`/Rotate`, `/UserUnit`), whose text was
+# painted at zero fill alpha or under a soft mask, or that carried an inline image or a
+# compatibility section -- and, worst of the set, it published FABRICATED TEXT: a
+# `NameObject` inside a `TJ` array subclasses `str`, so `[(01) /Nm (23)] TJ` emitted a
+# fragment reading `/Nm` at real page coordinates, text that no glyph drew wearing
+# perfectly checkable geometry.
+#
+# Unlike V4 this moves no coordinate. Every one of these constructs is absent from the
+# eight-paper corpus -- 78,178 fragments and 0 page failures before and after, not one
+# fragment moved -- so what the new sha marks is a change in what the extractor REFUSES,
+# not in what it computes. That is exactly why it must still supersede: a page that now
+# fails would previously have produced fragments, and an artifact cannot be allowed to
+# claim the newer identity for the older behaviour. The BORROWED component is unmoved for
+# the fifth consecutive time.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V5 = "dbd9b8a255b6339438cb4551fcb6c8d0aa3e434694f5ccf71abf921a076d9cbd"
+_FRAGMENT_GEOMETRY_SHA256_V5 = "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a"
+
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "4dd477809aaf0874e427e72cf8ff5e12391455f525bd56ea385999c57eff1101"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a"
+_FRAGMENT_GEOMETRY_SHA256 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1082,6 +1101,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V4: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V4,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V5: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V5,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1213,6 +1237,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V4,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V5,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

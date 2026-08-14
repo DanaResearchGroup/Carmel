@@ -27,7 +27,11 @@ from dataclasses import dataclass
 
 import pytest
 
-from carmel.services.pdf_fragments import extract_fragments
+from carmel.services.pdf_fragments import (
+    UnsupportedContentConstruct,
+    _num,
+    extract_fragments,
+)
 from tests.pypdf_gate import require_pypdf
 
 #: Declared width of each character, per mille.
@@ -81,17 +85,23 @@ def build_page(
     *,
     resources: str = "/Font << /F1 4 0 R >>",
     extra_objects: list[tuple[str, bytes | None]] | None = None,
+    page_extra: str = "",
 ) -> bytes:
     """``build_pdf`` with the page's resource dictionary and extra objects under test.
 
     Objects 1-5 are fixed (catalog, pages, page, the declared-widths font, the content
     stream), so ``extra_objects`` start at 6 and a resource string can reference ``6 0 R``
     without counting. Each extra is ``(dictionary, stream_bytes_or_None)``.
+
+    ``page_extra`` goes into the PAGE dictionary rather than the content stream, which is
+    the only way to reach the entries that reframe a page from outside its operators --
+    ``/Rotate`` and ``/UserUnit``.
     """
     bodies: list[str | None] = [
         "<< /Type /Catalog /Pages 2 0 R >>",
         "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << {resources} >> /Contents 5 0 R >>",
+        f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] {page_extra} "
+        f"/Resources << {resources} >> /Contents 5 0 R >>",
         "<< /Type /Font /Subtype /Type1 /BaseFont /AAAAAA+ProbeTestFont "
         "/Encoding /WinAnsiEncoding "
         f"/FirstChar {FIRST_CHAR} /LastChar {LAST_CHAR} /Widths [{_widths_array()}] >>",
@@ -453,3 +463,303 @@ def test_a_do_on_an_image_is_not_refused() -> None:
     )
     assert not extraction.page_failures
     assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_an_operator_the_walker_does_not_model_is_refused() -> None:
+    """The walker had no final ``else``: anything it did not name was stepped over.
+
+    An inline image is the sharp case. ``BI ... ID <binary> EI`` carries raw bytes that an
+    operand parser can read as operators, so a walk that ignores ``BI`` continues from a
+    state it cannot vouch for -- and every fragment after it is published anyway.
+    """
+    require_pypdf()
+    reason = _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET\nBI /W 1 /H 1 /CS /G /BPC 8 ID \x00 EI")
+    assert "does not model" in reason
+
+
+def test_a_compatibility_section_is_refused_rather_than_obeyed() -> None:
+    """``BX`` means "ignore operators you do not recognise", which is the instruction the
+    guard exists to disobey. Obeying it would let any unmodelled construct through by
+    simply announcing itself first."""
+    require_pypdf()
+    assert "does not model" in _refusal("BX BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET EX")
+
+
+def test_the_ignorable_operators_do_not_refuse() -> None:
+    """30 distinct unnamed operators appear in the corpus across 236,621 calls -- paths,
+    colours, line state, marked content. The allowlist has to cover all of them, or the
+    final ``else`` refuses every page in hand rather than the unmodelled ones."""
+    require_pypdf()
+    noise = (
+        "q 0.5 w 1 J 1 j 10 M [3 2] 0 d /RelativeColorimetric ri 0 i "
+        "0 0 1 RG 1 0 0 rg 0 g 0 G 0 0 0 1 K 0 0 0 0 k /DeviceGray CS /DeviceGray cs "
+        "0 SC 0 sc 0 SCN 0 scn "
+        "100 100 m 200 200 l 150 150 100 100 120 120 c 130 130 140 140 v 150 150 160 160 y h "
+        "10 10 50 50 re S f f* B B* b b* n W W* "
+        "/Span << /Lang (en) >> BDC /MC0 BMC EMC EMC /P MP /P << /X 1 >> DP"
+    )
+    extraction = extract_fragments(build_page(f"{noise} Q BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET"))
+    assert not extraction.page_failures, extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_zero_fill_alpha_is_refused_in_a_filling_mode() -> None:
+    """``/ca 0`` paints nothing, exactly as ``3 Tr`` does, arriving through the graphics
+    state instead of through a text operator."""
+    require_pypdf()
+    reason = _refusal(
+        "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+        resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /ca 0 >> >>",
+    )
+    assert "fully transparent" in reason
+
+
+def test_zero_stroke_alpha_does_not_refuse_filled_text() -> None:
+    """The measurement that decides the shape of the alpha guard.
+
+    2,552 of the corpus's 2,862 ``gs`` invocations set ``/CA 0`` on 7 pages -- and not one
+    corpus page carries a single ``Tr`` operator, so every glyph is drawn in mode 0,
+    filled only. A guard reading "any alpha of zero refuses" would have failed 7 real
+    pages over a parameter that does not touch their text. Which alpha counts is the
+    rendering mode's business.
+    """
+    require_pypdf()
+    extraction = extract_fragments(
+        build_page(
+            "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+            resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /CA 0 >> >>",
+        )
+    )
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_zero_stroke_alpha_is_refused_when_the_mode_only_strokes() -> None:
+    """Mode 1 strokes and does not fill, so ``/CA 0`` is exactly as invisible there as
+    ``/ca 0`` is in mode 0. The same state refuses or not depending on the mode, which is
+    why the check cannot live at the ``gs``."""
+    require_pypdf()
+    reason = _refusal(
+        "BT /F1 10 Tf /GS1 gs 1 Tr 1 0 0 1 100 700 Tm (012) Tj ET",
+        resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /CA 0 >> >>",
+    )
+    assert "fully transparent" in reason
+
+
+def test_a_partially_transparent_glyph_is_still_evidence() -> None:
+    """``== 0`` and not a threshold: a glyph at 1% opacity is faint, not absent, and
+    picking a visibility cutoff would be this module inventing a perceptual judgement."""
+    require_pypdf()
+    extraction = extract_fragments(
+        build_page(
+            "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+            resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /ca 0.01 >> >>",
+        )
+    )
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_graphics_state_restore_restores_the_alpha_too() -> None:
+    """``/ca`` is graphics state, so ``Q`` undoes it. If the alpha did not ride on the
+    saved state, text drawn after the restore would inherit an invisibility that the page
+    had already taken back."""
+    require_pypdf()
+    extraction = extract_fragments(
+        build_page(
+            "q /GS1 gs Q BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET",
+            resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /ca 0 >> >>",
+        )
+    )
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_soft_mask_is_refused() -> None:
+    """A soft mask can erase what is painted, and evaluating one means owning the mask's
+    own content stream. All nine ``/SMask`` entries in the corpus are ``/None``."""
+    require_pypdf()
+    reason = _refusal(
+        "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+        resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /SMask 6 0 R >> >>",
+        extra_objects=[("<< /Type /Mask /S /Alpha >>", None)],
+    )
+    assert "soft mask" in reason
+
+
+def test_an_smask_of_none_is_not_refused() -> None:
+    """``/SMask /None`` is how a page TURNS OFF a soft mask, and it is the only form the
+    corpus contains. Refusing it would refuse the disabling of the very thing guarded."""
+    require_pypdf()
+    extraction = extract_fragments(
+        build_page(
+            "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+            resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /SMask /None >> >>",
+        )
+    )
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_rotated_page_is_refused_rather_than_published_in_an_unrotated_frame() -> None:
+    """``/Rotate`` never appears in the content stream, so the walker cannot see it. Its
+    coordinates stay arithmetically consistent while naming a position on an axis the
+    reader never sees -- a locator that is checkable and wrong."""
+    require_pypdf()
+    for angle in (90, 180, 270, -90):
+        reason = _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET", page_extra=f"/Rotate {angle}")
+        assert "rotated" in reason, angle
+
+
+def test_a_rotation_of_zero_is_not_refused() -> None:
+    """All 75 corpus pages declare ``/Rotate 0`` or nothing at all. A guard on the
+    presence of the key rather than on its value would refuse every one of them."""
+    require_pypdf()
+    for angle in (0, 360, -360):
+        extraction = extract_fragments(
+            build_page("BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET", page_extra=f"/Rotate {angle}")
+        )
+        assert not extraction.page_failures, angle
+        assert [f.text for f in extraction.fragments] == ["012"], angle
+
+
+def test_a_page_declaring_a_user_unit_is_refused() -> None:
+    """Every distance this module publishes, and every threshold compared against one,
+    is in default user space. ``/UserUnit`` says that is not the scale."""
+    require_pypdf()
+    reason = _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET", page_extra="/UserUnit 2.0")
+    assert "UserUnit" in reason
+
+
+def test_a_positioning_operand_that_is_not_a_number_is_refused() -> None:
+    """An operand of the wrong TYPE, reached the only way pypdf's parser allows it.
+
+    ``nan``, ``inf`` and ``true`` are not PDF number syntax: the tokenizer returns each as
+    an OPERATOR, so they arrive at the walker's final ``else`` instead. Inside a ``TJ``
+    array they are parsed as objects, and that is where a non-numeric displacement can
+    actually reach :func:`_num`.
+    """
+    require_pypdf()
+    for element in ("true", "null"):
+        reason = _refusal(f"BT /F1 10 Tf 1 0 0 1 100 700 Tm [(01) {element} (23)] TJ ET")
+        assert "not a number" in reason, element
+
+
+def test_the_num_guard_refuses_values_its_own_parser_cannot_deliver() -> None:
+    """The two branches of :func:`_num` that no fixture PDF can reach.
+
+    pypdf returns ``true`` as an operator and a ``BooleanObject`` (not a ``bool``) inside
+    an array, and it refuses a numeric token longer than 64 characters, so neither a
+    ``bool`` nor a non-finite float can arrive from a real document today. Both are
+    contracts on the function rather than parser guards -- ``float(True)`` is 1.0, and a
+    ``nan`` coordinate compares false against the page box -- and a contract with no test
+    is a comment. Tested directly, so it is clear that is what they are.
+    """
+    require_pypdf()
+    for value in (True, False, float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(UnsupportedContentConstruct):
+            _num(value)
+
+
+def test_a_tj_operand_that_is_not_an_array_is_refused() -> None:
+    """``TJ`` takes an array. A bytes operand is iterable too, and iterating it yields
+    INTEGERS -- every one of which the loop would apply as a displacement, silently
+    turning a string into a run of pen movements."""
+    require_pypdf()
+    assert "not an array" in _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) TJ ET")
+
+
+def test_a_name_inside_a_tj_array_is_not_published_as_text() -> None:
+    """The sharpest of these guards, because it FABRICATES rather than misplaces.
+
+    ``NameObject`` subclasses ``str``, so the walker's ``isinstance(element, bytes | str)``
+    test admitted it and ``[(01) /Nm (23)] TJ`` published a fragment reading ``/Nm`` at
+    real page coordinates -- text no glyph drew, wearing checkable geometry. Found by
+    trying it, not by review: every one of the corpus's 60,589 ``TJ`` string elements is a
+    ``ByteStringObject``, so nothing in the evidence would ever have shown it.
+    """
+    require_pypdf()
+    reason = _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm [(01) /Nm (23)] TJ ET")
+    assert "not a string of bytes" in reason
+
+
+def test_a_name_operand_to_tj_is_not_published_as_text() -> None:
+    """The same hole through the single-string operator: ``/Nm Tj``."""
+    require_pypdf()
+    assert "not a string of bytes" in _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm /Nm Tj ET")
+
+
+def test_a_user_unit_of_one_is_not_refused() -> None:
+    """On the VALUE, not on the key. ``/UserUnit 1`` is the default and rescales nothing,
+    so refusing its presence would fail a page for stating explicitly what every other
+    page says by omission -- the same false positive shape as refusing ``/Rotate 0``."""
+    require_pypdf()
+    extraction = extract_fragments(build_page("BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET", page_extra="/UserUnit 1"))
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_an_alpha_outside_zero_to_one_is_refused() -> None:
+    """ISO 32000-1 table 58 makes a constant alpha a number in [0, 1]. Outside it the file
+    says something no renderer agrees on, and the visibility test would read ``/ca 2`` as
+    "opaque, carry on"."""
+    require_pypdf()
+    for value in ("2", "-1"):
+        reason = _refusal(
+            "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+            resources=(f"/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /ca {value} >> >>"),
+        )
+        assert "outside the [0, 1] range" in reason, value
+
+
+def test_an_undefined_rendering_mode_is_refused() -> None:
+    """Table 106 defines exactly eight modes, as integers. ``3.5 Tr`` is not a shade
+    between invisible and clip -- and both visibility tests would have read it as ordinary
+    visible text and carried on."""
+    require_pypdf()
+    for mode in ("3.5", "8", "-1"):
+        reason = _refusal(f"BT /F1 10 Tf {mode} Tr 1 0 0 1 100 700 Tm (012) Tj ET")
+        assert "not one of the eight defined modes" in reason, mode
+
+
+def test_an_indirect_smask_of_none_is_not_refused() -> None:
+    """``/SMask`` may be an indirect reference, and ``str()`` on one renders
+    ``IndirectObject(...)`` -- which is not ``/None``, so a mask being turned OFF through a
+    reference would have refused the page."""
+    require_pypdf()
+    extraction = extract_fragments(
+        build_page(
+            "BT /F1 10 Tf /GS1 gs 1 0 0 1 100 700 Tm (012) Tj ET",
+            resources="/Font << /F1 4 0 R >> /ExtGState << /GS1 << /Type /ExtGState /SMask 6 0 R >> >>",
+            extra_objects=[("/None", None)],
+        )
+    )
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_optional_content_is_refused_rather_than_read_as_evidence() -> None:
+    """``/OC ... BDC`` binds its contents to a layer that may be switched off: text in the
+    file, positioned exactly as this module would report it, that no reader ever sees.
+    Whether the layer is on lives in the catalog and in the viewer's own state, so the
+    operator alone cannot settle it."""
+    require_pypdf()
+    reason = _refusal(
+        "/OC /MC0 BDC BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET EMC",
+        resources="/Font << /F1 4 0 R >> /Properties << /MC0 6 0 R >>",
+        extra_objects=[("<< /Type /OCG /Name (hidden) >>", None)],
+    )
+    assert "optional-content" in reason
+
+
+def test_an_ordinary_structure_tag_is_not_refused() -> None:
+    """The corpus carries 606 ``BDC`` operators on 62 of 75 pages -- ``/Figure``, ``/P``,
+    ``/Caption``, ``/Artifact`` -- and not one ``/OC``. A guard on ``BDC`` itself would
+    have failed 62 pages; a guard on the tag costs nothing."""
+    require_pypdf()
+    for tag in ("/Figure", "/P", "/Artifact", "/Caption"):
+        extraction = extract_fragments(
+            build_page(f"{tag} << /MCID 0 >> BDC BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET EMC")
+        )
+        assert not extraction.page_failures, tag
+        assert [f.text for f in extraction.fragments] == ["012"], tag

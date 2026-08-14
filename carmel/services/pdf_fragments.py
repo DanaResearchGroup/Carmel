@@ -38,6 +38,7 @@ import dataclasses
 import importlib.metadata
 import io
 import logging
+import math
 import re
 import zlib
 from dataclasses import dataclass
@@ -641,6 +642,17 @@ def _glyphs_drawn(show: Any) -> int:
     module's business. Those fragments are already published as
     :attr:`GlyphMapping.UNMAPPED`, so the geometry that stays doubtful is geometry a
     caller is already told not to trust.
+
+    **The standing report that this is a character count rather than a code count is
+    true, and has no population.** Censused against a decoding that establishes the code
+    count independently, over all 78,178 corpus shows: this function returns the true
+    count on every one of them. 78,177 shows use a dictionary ``/Encoding``, which pypdf
+    indexes BY BYTE, so one byte is one code by construction; exactly one uses a str
+    encoding (``utf-16-be``), where the decoded length is the code count as well. The
+    case the report describes -- a str-encoded font whose one code decodes to several
+    characters -- would need a codec that expands, and none is in use here. Left as a
+    known-empty risk rather than repaired, because a repair would be untested correction
+    logic and the number it would change is not wrong on any document in hand.
     """
     value = show.value
     if not isinstance(value, bytes):
@@ -673,6 +685,33 @@ def _pen_x_after(show: Any) -> float:
     module owns is the term pypdf undercharges. Verified against pdfplumber (pdfminer,
     sharing no code with pypdf): on the runs where both libraries return the same
     characters, the corrected end matches pdfplumber's per-character geometry exactly.
+
+    **A third defect lives in the width lookup this deliberately borrows, and it is
+    measured, recorded and NOT corrected here.** pypdf builds its width table keyed by
+    ``chr(code)`` (``_collect_tt_t1_character_widths``: ``current_widths[chr(idx +
+    first_char)] = int(width)``) and reads it back by the DECODED CHARACTER
+    (``get_text_width``: ``character_widths.get(char, ...)``). Those are the same key only
+    while the encoding is Latin-1-shaped. Where a ``/Differences`` array maps a code
+    elsewhere in Unicode the lookup misses, and the miss is silent in both directions.
+    Censused against ``/Widths`` read by index, which is the only reading of ``/Widths``
+    the specification supports:
+
+    * 787 of 275,031 corpus codes (0.29%) have ``decoded_char != chr(code)``;
+    * 763 of them take the font's fabricated ``default`` width -- median error 0.542 pt,
+      max 4.383 pt;
+    * 24 HIT another code's key and silently take ITS width -- median 2.331 pt;
+    * 751 shows on 44 of 75 pages, in 5 of 8 papers, mostly ``209 -> '—'`` and
+      ``171 -> '´'`` in subset fonts.
+
+    The error displaces every glyph behind it in the same show and shifts the published
+    ``x_end``. It is recorded rather than repaired for one reason that is a measurement
+    and not a preference: 72 of those 751 shows contain a DIGIT, and their ``x_end`` error
+    is median 0.097 pt, max 0.462 pt. Owning the lookup means reading ``/Widths`` by code
+    plus ``/MissingWidth``, the standard-14 metrics, ``/W`` for composite fonts and the
+    Type 3 font matrix -- four correction paths, of which this corpus would exercise one,
+    to move a number by under half a point where it touches evidence. Space widths take a
+    different path again (``font.space_width``, fabricated when the declared entry is
+    zero) and were checked separately: 6,208 space atoms, none wrong.
 
     Two things this does NOT claim:
 
@@ -783,6 +822,11 @@ _IDENTITY: tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 1.0
 #: "add to clipping path, paint nothing". Both are how an invisible OCR layer is drawn.
 _INVISIBLE_RENDER_MODES = frozenset({3.0, 7.0})
 
+#: The eight rendering modes ISO 32000-1 table 106 defines. Anything else refuses: an
+#: undefined mode is not a shade of the defined ones, and both visibility tests above
+#: would read it as ordinary visible text.
+_RENDER_MODES = frozenset(float(mode) for mode in range(8))
+
 _TEXT_STATE_OPS: dict[bytes, str] = {
     b"Tc": "char_spacing",
     b"Tw": "word_spacing",
@@ -790,6 +834,87 @@ _TEXT_STATE_OPS: dict[bytes, str] = {
     b"TL": "leading",
     b"Ts": "rise",
 }
+
+#: Operators the walker steps over because the SPECIFICATION says they cannot move a
+#: glyph -- path construction and painting, clipping, colour, the scalar graphics-state
+#: parameters, shading and marked content (ISO 32000-1 Table A.1).
+#:
+#: This list exists so that the walker can refuse everything NOT on it. Without a final
+#: ``else`` an unrecognised operator is silently stepped over, which is the same failure
+#: mode as every construct guarded above: coordinates published for a stream the engine
+#: did not understand. The list is drawn from the specification's operator summary rather
+#: than from the corpus, deliberately -- an allowlist built from what eight papers happen
+#: to contain would refuse ordinary PDFs for using an ordinary operator.
+#:
+#: Censused: 30 distinct unnamed operators appear in the corpus, 236,621 calls, every one
+#: of them on this list. The refusal therefore costs nothing and fires only on something
+#: genuinely unmodelled.
+#:
+#: Four families are deliberately ABSENT, so they refuse:
+#:
+#: * ``BI``/``ID``/``EI`` -- an inline image carries raw binary between ``ID`` and ``EI``
+#:   which a naive operand parser can mistake for operators.
+#: * ``BX``/``EX`` -- a compatibility section means "ignore operators you do not know",
+#:   which is precisely the instruction this guard exists to disobey.
+#: * ``d0``/``d1`` -- Type 3 glyph metrics, only legal inside a glyph procedure, which
+#:   this walker never enters. Meeting one means the stream is not what it claims.
+#: * ``sh`` is present (a shading fill paints no glyph), but ``Do`` is not: it has its own
+#:   branch and its own refusal.
+_IGNORED_OPERATORS: frozenset[bytes] = frozenset(
+    {
+        # graphics state, scalar parameters only
+        b"w",
+        b"J",
+        b"j",
+        b"M",
+        b"d",
+        b"ri",
+        b"i",
+        # path construction
+        b"m",
+        b"l",
+        b"c",
+        b"v",
+        b"y",
+        b"h",
+        b"re",
+        # path painting
+        b"S",
+        b"s",
+        b"f",
+        b"F",
+        b"f*",
+        b"B",
+        b"B*",
+        b"b",
+        b"b*",
+        b"n",
+        # clipping -- see `_walk_operations` on why a clip path is recorded, not modelled
+        b"W",
+        b"W*",
+        # colour
+        b"CS",
+        b"cs",
+        b"SC",
+        b"SCN",
+        b"sc",
+        b"scn",
+        b"G",
+        b"g",
+        b"RG",
+        b"rg",
+        b"K",
+        b"k",
+        # shading
+        b"sh",
+        # marked content
+        b"MP",
+        b"DP",
+        b"BMC",
+        b"BDC",
+        b"EMC",
+    }
+)
 
 
 def _mult(m: list[float], n: list[float]) -> list[float]:
@@ -817,11 +942,65 @@ def _num(value: Any) -> float:
     A content stream is not required to be well formed, and an operand that is not a
     number where the specification demands one means the operator's effect is unknown.
     Defaulting it to zero would silently place every later glyph on the page.
+
+    Two things that ARE floats but are not numbers in the sense the operator needs:
+
+    * ``True`` is ``float(True) == 1.0``. A boolean where a coordinate belongs means the
+      stream was parsed as something other than what it is, and taking it as the number 1
+      hides that behind a plausible one-unit displacement.
+    * ``nan`` and ``inf``. ``float("nan")`` succeeds, and a ``nan`` in the text matrix
+      propagates through every later ``_mult`` to produce coordinates that compare false
+      against everything -- including against the page box, so a containment test silently
+      excludes the fragment rather than reporting a bad one.
     """
+    if isinstance(value, bool):
+        # Unreachable through pypdf's own tokenizer, which returns `true` as an OPERATOR
+        # and a `BooleanObject` (not a `bool`) inside an array. Kept as a contract on this
+        # function rather than as a parser guard, because `float(True)` is 1.0 and a
+        # boolean silently becoming a one-unit displacement is not a failure anyone would
+        # look for. Covered by a direct unit test, not by a fixture PDF.
+        raise UnsupportedContentConstruct("a positioning operand that is a boolean")
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError) as exc:
         raise UnsupportedContentConstruct("a positioning operand that is not a number") from exc
+    if not math.isfinite(number):
+        # Also unreachable today, and for a reason worth writing down because it is not
+        # this module's to keep: pypdf refuses a numeric token longer than 64 characters
+        # (`LimitReachedError`), and no shorter PDF number literal overflows to `inf`.
+        # A `nan` in the text matrix propagates through every later `_mult` and compares
+        # false against everything -- including the page box, so a containment test would
+        # silently EXCLUDE the fragment rather than report a bad one.
+        raise UnsupportedContentConstruct(f"a positioning operand that is not finite ({number})")
+    return number
+
+
+def _show_operand(value: Any) -> bytes:
+    """One text-show operand, which must be a string of BYTES.
+
+    ``Tj``, ``TJ``, ``'`` and ``"`` show a string, and pypdf's content-stream parser
+    returns every string operand in the eight-paper corpus -- 60,589 inside ``TJ`` arrays
+    and 17,589 from ``Tj`` -- as a ``ByteStringObject``, which is a ``bytes`` subclass.
+    Two other things can arrive at these operators and neither is a string:
+
+    * a ``NameObject``. It subclasses ``str``, so the obvious ``isinstance(value, bytes |
+      str)`` test admits it, and ``[(01) /Nm (23)] TJ`` then publishes a fragment whose
+      text is ``/Nm`` at real coordinates -- text FABRICATED out of a token that drew
+      nothing. That is the failure class this lane exists to prevent, arriving through
+      a type test rather than through an inference.
+    * a ``TextStringObject``, which pypdf produces when a string decodes as UTF-16 or
+      PDFDoc. It is also a ``str``, and it is worse than useless here: the decoding has
+      already replaced the CODE BYTES with characters, and the font's ``/Encoding`` and
+      ``/Widths`` are indexed by those bytes. Its glyphs would be measured against the
+      wrong table while looking perfectly well formed.
+
+    So the type test is ``bytes`` exactly, and everything else refuses.
+    """
+    if not isinstance(value, bytes):
+        raise UnsupportedContentConstruct(
+            f"a text-show operand of type {type(value).__name__}, which is not a string of bytes"
+        )
+    return value
 
 
 @dataclass
@@ -842,6 +1021,12 @@ class _TextState:
     leading: float = 0.0
     rise: float = 0.0
     render_mode: float = 0.0
+    fill_alpha: float = 1.0
+    """``/ca``. Part of the graphics state, so ``q``/``Q`` save and restore it with the
+    rest of this dataclass."""
+    stroke_alpha: float = 1.0
+    """``/CA``. Separate from :attr:`fill_alpha` because which of the two makes text
+    invisible depends on the rendering mode, and conflating them refuses real pages."""
 
 
 def _advance(show: Any) -> float:
@@ -998,6 +1183,83 @@ def _unpositionable_fonts(fonts: Any) -> frozenset[str]:
     return frozenset(refused)
 
 
+def _refuse_optional_content(operands: list[Any]) -> None:
+    """Refuse a marked-content section that makes its contents OPTIONAL.
+
+    ``/OC ... BDC`` binds everything up to the matching ``EMC`` to an optional-content
+    group, and a group can be off: the text is in the file, positioned exactly as this
+    module would report it, and no reader ever sees it. That is the same hazard as
+    rendering mode 3 and zero fill alpha, arriving through a third channel -- and unlike
+    those two it cannot be settled from the operator alone, because whether the layer is
+    visible lives in the document catalog's ``/OCProperties`` and in a viewer's own
+    configuration state.
+
+    Every other marked-content tag is ignorable and stays so. The corpus carries 606
+    ``BDC`` operators across 62 pages -- ``/Figure``, ``/P``, ``/Caption``, ``/Artifact``
+    and the rest of the Tagged PDF structure vocabulary -- and **not one** ``/OC``. A
+    guard on ``BDC`` itself would have failed 62 of 75 pages; a guard on the tag costs
+    nothing and closes the channel.
+    """
+    if not operands:
+        raise UnsupportedContentConstruct("a BDC with no operands")
+    if str(operands[0]) == "/OC":
+        raise UnsupportedContentConstruct(
+            "a BDC binding its contents to an optional-content group, which may be hidden"
+        )
+
+
+def _refuse_a_reframed_page(page: Any) -> None:
+    """Refuse a page whose own dictionary moves the frame the walker measures in.
+
+    :func:`_walk_operations` starts the CTM at the identity, which makes every coordinate
+    it publishes a default user-space coordinate. Two page-level entries break that
+    silently, and neither appears anywhere in the content stream the walker reads:
+
+    * ``/Rotate``. The page is displayed turned by a multiple of 90 degrees. Coordinates
+      stay in an unrotated space, so ``x_start`` is still arithmetically "correct" while
+      naming a position on an axis the reader never sees. A locator built from it points
+      a human at the wrong side of the page -- checkable, and wrong.
+    * ``/UserUnit``. The page declares that one unit is not 1/72 inch. Every distance this
+      module publishes, and every threshold compared against one, is then in the wrong
+      scale by a factor nothing records.
+
+    Both refuse rather than being applied. Applying ``/Rotate`` is a four-line matrix and
+    it is still a correction, tested against nothing: all 75 corpus pages declare
+    ``/Rotate 0`` and not one declares ``/UserUnit``, so a rotation branch would ship
+    unexercised, while a refusal that never fires costs nothing and turns a silently
+    reframed page into a recorded failure.
+    """
+    try:
+        rotate = page.get("/Rotate")
+        user_unit = page.get("/UserUnit")
+    except Exception as exc:  # noqa: BLE001 - a page whose own dict is unreadable refuses
+        raise UnsupportedContentConstruct("a page whose dictionary cannot be read") from exc
+    if rotate is not None:
+        try:
+            turned = float(rotate.get_object() if hasattr(rotate, "get_object") else rotate)
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedContentConstruct("a page whose /Rotate is not a number") from exc
+        # A multiple of 360 is no rotation. Anything else, including the negative and
+        # out-of-range values the specification allows, refuses.
+        if turned % 360.0 != 0.0:
+            raise UnsupportedContentConstruct(
+                f"a page rotated by {turned:g} degrees, which this module does not reframe"
+            )
+    if user_unit is not None:
+        try:
+            unit = float(user_unit.get_object() if hasattr(user_unit, "get_object") else user_unit)
+        except (TypeError, ValueError) as exc:
+            raise UnsupportedContentConstruct("a page whose /UserUnit is not a number") from exc
+        # On the VALUE, not on the key. `/UserUnit 1` is the default and rescales nothing,
+        # so refusing its mere presence would fail a page that states explicitly what every
+        # other page says by omission -- the same shape of false positive as refusing
+        # `/Rotate 0` would be.
+        if unit != 1.0:
+            raise UnsupportedContentConstruct(
+                f"a page declaring /UserUnit {unit:g}, whose distances are not in default user space"
+            )
+
+
 def _page_resources(page: Any) -> _PageResources:
     return _PageResources(
         xobjects=_resolve_resource(page, "/XObject"),
@@ -1006,34 +1268,94 @@ def _page_resources(page: Any) -> _PageResources:
     )
 
 
-def _refuse_gs_that_sets_a_font(operands: list[Any], ext_gstates: Any) -> None:
-    """Refuse a ``gs`` whose graphics-state dictionary carries ``/Font``.
+def _painted_invisibly(state: _TextState) -> bool:
+    """Whether text shown in this state would leave no mark on the page.
+
+    ISO 32000-1 table 106: mode 0 fills, 1 strokes, 2 does both, 4/5/6 repeat those three
+    and also add to the clipping path. Modes 3 and 7 paint nothing at all and are refused
+    before this is reached. Text is invisible when every operation its mode performs is
+    fully transparent -- so a filled glyph needs only ``/ca``, a stroked one only ``/CA``,
+    and a fill-and-stroke glyph is invisible only when BOTH are zero.
+
+    Deliberately ``== 0`` and not a threshold. A glyph at 1% opacity is faint, not absent,
+    and it is still evidence; picking a visibility cutoff would be this module inventing a
+    perceptual judgement it has no basis for.
+    """
+    mode = state.render_mode
+    fills = mode in (0.0, 2.0, 4.0, 6.0)
+    strokes = mode in (1.0, 2.0, 5.0, 6.0)
+    if not fills and not strokes:
+        return False  # an unknown mode is not a claim of invisibility
+    return (not fills or state.fill_alpha == 0.0) and (not strokes or state.stroke_alpha == 0.0)
+
+
+def _apply_ext_gstate(operands: list[Any], ext_gstates: Any, state: _TextState) -> None:
+    """Apply the parts of a named graphics state that bear on text, or refuse.
 
     An ExtGState may set the font and size without a ``Tf``, and a walker that ignores
     ``gs`` then advances using the PREVIOUS font's widths -- wrong coordinates with
-    nothing raised. Only ``/Font`` refuses: ``gs`` is overwhelmingly line width, blend
-    mode and alpha, none of which move a glyph, and the corpus carries 2,862 of them on
-    73 of 75 pages with **zero** carrying ``/Font``. Refusing on the operator itself
-    would fail almost every page in hand to guard a construct none of them contains.
+    nothing raised. It may also set the alphas, and an alpha of zero paints nothing at
+    all: the same hazard as rendering mode 3, arriving through the graphics state instead
+    of through a text operator.
 
-    Stated rather than implied: alpha is NOT handled. A ``gs`` that sets fill alpha to
-    zero makes text invisible, and this module will still publish its geometry. That is
-    a VISIBILITY question, and this is a position engine; see the ``Tr`` refusal in
-    :func:`_walk_operations` for the one visibility case that is handled, and why.
+    Refusing on the operator itself is not available. The corpus carries 2,862 ``gs``
+    invocations on 73 of 75 pages, so a blanket refusal would fail almost every page in
+    hand. What refuses is named:
+
+    * ``/Font`` -- zero in the corpus.
+    * ``/SMask`` other than ``/None``. A soft mask can erase what is painted, and
+      evaluating one means owning the mask's own content stream. All nine ``/SMask``
+      entries in the corpus are ``/None``.
+
+    The alphas are RECORDED rather than refused, and the difference is the whole reason
+    this function is not a blanket alpha guard. ``/CA`` is the STROKE alpha, and 2,552 of
+    the corpus's ``gs`` invocations set ``/CA 0`` on 7 pages -- while not one page in the
+    corpus contains a single ``Tr`` operator, so every glyph is drawn in mode 0, filled
+    only, and its stroke alpha is irrelevant to whether it is visible. A guard that read
+    "any alpha of zero refuses" would have failed 7 real pages for a construct that does
+    not touch their text. Which alpha matters is decided per show, by the rendering mode,
+    in :func:`_walk_operations`.
     """
     if not operands:
         raise UnsupportedContentConstruct("a gs operator with no operand")
     if ext_gstates is None:
         raise UnsupportedContentConstruct("a gs naming a state the page does not declare")
     try:
-        state = ext_gstates.get(operands[0])
-        carries_font = state is not None and "/Font" in state.get_object()
+        entry = ext_gstates.get(operands[0])
+        resolved = None if entry is None else entry.get_object()
     except Exception as exc:  # noqa: BLE001 - any resolution failure is a refusal
         raise UnsupportedContentConstruct("a gs naming an unresolvable graphics state") from exc
-    if state is None:
+    if resolved is None:
         raise UnsupportedContentConstruct("a gs naming a state the page does not declare")
-    if carries_font:
+    if "/Font" in resolved:
         raise UnsupportedContentConstruct("a gs that sets the font without a Tf")
+    if "/SMask" in resolved:
+        try:
+            # RESOLVED before it is compared. `/SMask` may be an indirect reference, and
+            # `str()` on one renders `IndirectObject(...)` -- which is not `/None`, so a
+            # mask that is being turned OFF through a reference would refuse the page.
+            mask = resolved["/SMask"].get_object()
+        except Exception as exc:  # noqa: BLE001 - an unresolvable mask is a refusal
+            raise UnsupportedContentConstruct("a gs whose /SMask cannot be resolved") from exc
+        if str(mask) != "/None":
+            raise UnsupportedContentConstruct("a gs that installs a soft mask, which may erase the text it paints")
+    for key, field in (("/ca", "fill_alpha"), ("/CA", "stroke_alpha")):
+        if key in resolved:
+            try:
+                value = resolved[key].get_object()
+            except Exception as exc:  # noqa: BLE001 - an unresolvable alpha is a refusal
+                raise UnsupportedContentConstruct(f"a gs whose {key} cannot be resolved") from exc
+            alpha = _num(value)
+            if not 0.0 <= alpha <= 1.0:
+                # ISO 32000-1 table 58: a constant alpha is a number in [0, 1]. Outside it
+                # the file is saying something no renderer agrees on -- clamp, ignore, or
+                # error, all three occur -- and this module's own visibility test would
+                # read `/ca 2` as "opaque, carry on". A state that cannot be evaluated is
+                # not a state to publish coordinates from.
+                raise UnsupportedContentConstruct(
+                    f"a gs whose {key} is {alpha:g}, outside the [0, 1] range an alpha may take"
+                )
+            setattr(state, field, alpha)
 
 
 def _walk_operations(
@@ -1114,6 +1436,14 @@ def _walk_operations(
             raise UnsupportedContentConstruct(
                 f"a text-show operator in rendering mode {state.render_mode:g}, which paints nothing"
             )
+        if _painted_invisibly(state):
+            # The same hazard as mode 3, reached through the graphics state instead. Which
+            # alpha counts is decided HERE and not at the `gs`, because the mode in effect
+            # when the state was installed need not be the mode in effect when text is
+            # finally shown.
+            raise UnsupportedContentConstruct(
+                f"a text-show operator whose paint is fully transparent in rendering mode {state.render_mode:g}"
+            )
         if len(shows) >= budget:
             raise _BudgetExhausted
         params = params_cls(
@@ -1186,13 +1516,20 @@ def _walk_operations(
             elif op == b"Tj":
                 if not operands:
                     raise UnsupportedContentConstruct("a Tj with no operand")
-                show(operands[0])
+                show(_show_operand(operands[0]))
             elif op == b"TJ":
                 if not operands:
                     raise UnsupportedContentConstruct("a TJ with no operand")
+                if not isinstance(operands[0], list):
+                    # `TJ` takes an array. Anything else that happens to be iterable would
+                    # be walked as one: a bytes operand yields INTEGERS, every one of which
+                    # this loop would apply as a displacement, silently converting a string
+                    # into a run of pen movements. All 9,372 corpus `TJ` operands are
+                    # arrays. `ArrayObject` subclasses `list`, so this admits them.
+                    raise UnsupportedContentConstruct("a TJ whose operand is not an array")
                 for element in operands[0]:
                     if isinstance(element, bytes | str):
-                        show(element)
+                        show(_show_operand(element))
                         continue
                     # A number in a TJ array displaces the pen by `-k/1000 * Tfs * Th`
                     # and charges NEITHER `Tc` nor `Tw` -- it is not a glyph. Applied to
@@ -1214,7 +1551,7 @@ def _walk_operations(
                 if not operands:
                     raise UnsupportedContentConstruct("a ' with no operand")
                 next_line(0.0, -state.leading)
-                show(operands[0])
+                show(_show_operand(operands[0]))
             elif op == b'"':
                 if len(operands) < 3:
                     raise UnsupportedContentConstruct('a " with fewer than three operands')
@@ -1223,15 +1560,36 @@ def _walk_operations(
                 state.word_spacing = _num(operands[0])
                 state.char_spacing = _num(operands[1])
                 next_line(0.0, -state.leading)
-                show(operands[2])
+                show(_show_operand(operands[2]))
             elif op == b"Tr":
                 if not operands:
                     raise UnsupportedContentConstruct("a Tr with no operand")
-                state.render_mode = _num(operands[0])
+                mode = _num(operands[0])
+                if mode not in _RENDER_MODES:
+                    # ISO 32000-1 table 106 defines exactly eight modes, as integers.
+                    # `3.5 Tr` is not "somewhere between invisible and clip": it is a
+                    # stream saying something the specification does not define, and both
+                    # the invisibility test and `_painted_invisibly` would have read it as
+                    # an ordinary visible mode and carried on.
+                    raise UnsupportedContentConstruct(
+                        f"a Tr naming rendering mode {mode:g}, which is not one of the eight defined modes"
+                    )
+                state.render_mode = mode
             elif op == b"gs":
-                _refuse_gs_that_sets_a_font(operands, resources.ext_gstates)
+                _apply_ext_gstate(operands, resources.ext_gstates, state)
             elif op == b"Do":
                 _refuse_form_xobject(operands, resources.xobjects)
+            elif op == b"BDC":
+                _refuse_optional_content(operands)
+            elif op not in _IGNORED_OPERATORS:
+                # The final `else` this walk did without. Everything above is either
+                # modelled or refused by name; without this an operator that is NEITHER --
+                # an inline image, a compatibility section, a Type 3 glyph-metric operator,
+                # a corrupted token -- was stepped over in silence, and every fragment after
+                # it was published from a state the engine could not vouch for.
+                raise UnsupportedContentConstruct(
+                    f"an operator this walker does not model: {op.decode('latin-1', 'replace')!r}"
+                )
     except _BudgetExhausted:
         return shows, True
     return shows, False
@@ -1266,6 +1624,7 @@ def _page_fragments(
     """
     resolve_font, params_cls, content_stream = engine
 
+    _refuse_a_reframed_page(page)
     contents = page.get("/Contents")
     if contents is None:
         return [], False
