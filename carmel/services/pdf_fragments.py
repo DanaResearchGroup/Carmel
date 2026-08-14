@@ -412,10 +412,43 @@ MAX_PDF_FRAGMENTS = 1_000_000
 #: ``/DecodeParms``, so ``zlib.decompressobj`` bounds the only filter present and an exact
 #: allowlist of one fails everything else closed. A bomb now stops at the cap.
 #:
-#: What the cap still does not bound is the COMPRESSED input: the stored bytes are read
-#: whole before any output limit applies, so a large incompressible stream under the cap is
-#: still copied and scanned. That is bounded by the artifact size instead, which is checked
-#: before this module ever sees the document.
+#: What the cap still does not bound, named in full because an earlier version of this
+#: comment listed only the first of the two and so read as a completeness it did not have:
+#:
+#: 1. The COMPRESSED input. The stored bytes are read whole before any output limit
+#:    applies, so a large incompressible stream under the cap is still copied and scanned.
+#:    That is bounded by the artifact size instead (``max_artifact_bytes``, 25 MB), which is
+#:    checked before this module ever sees the document.
+#:
+#: 2. **Every stream that is not** ``/Contents``. This cap is per page and reads one key;
+#:    nothing else pypdf inflates passes through it. Two such paths exist and they are not
+#:    equally exercised, so both are measured rather than asserted -- by instrumenting
+#:    ``zlib`` and attributing every decompressed byte over the 8-paper corpus:
+#:
+#:    - FONT and ``/ToUnicode`` streams, inflated during pypdf's font resolution. PRESENT
+#:      on 8 of 8 documents, at 1-6 kB over 2-13 calls each -- small, real, and outside
+#:      this cap entirely.
+#:    - ``/ObjStm``, which pypdf MUST inflate to resolve any object stored inside it, and
+#:      which therefore runs before a page key can even be read. ZERO bytes on 8 of 8
+#:      corpus documents, because these are all classic cross-reference-table PDFs. That
+#:      zero is a property of the corpus and NOT a bound: object streams are ordinary in
+#:      PDF 1.5+, and where one is present its inflation is unbounded.
+#:
+#: No bound is available for either IN THIS MODULE. Wrapping pypdf's filter stack is the
+#: one thing it refuses to do (see :func:`_decoded_content_length`), and pypdf is pinned and
+#: not to be patched or forked -- so within these functions the amplification on a
+#: non-``/Contents`` stream is bounded by nothing, and the 25 MB artifact cap bounds its
+#: INPUT rather than its output.
+#:
+#: "In this module" is doing real work in that sentence and an earlier draft omitted it,
+#: which made it a stronger claim than the code can support. A bound DOES exist one layer
+#: out: parse in a constrained worker process under ``RLIMIT_AS`` and a CPU timeout, kill it
+#: on breach, and report the page or document as failed. That reaches every path at once --
+#: ``/ObjStm``, fonts, the object graph, and pypdf's own allocations -- precisely because it
+#: does not care which stream was responsible. It is unbuilt: ``extract_fragments`` runs
+#: in-process today, and moving it is an architectural change with its own identity and
+#: failure-reporting consequences, not a line in this file. Named here so the limit reads as
+#: a decision with a known repair rather than as an impossibility.
 MAX_PAGE_CONTENT_BYTES = 6_000_000
 
 #: The ``error`` recorded for a page whose page-tree entry was UNINSPECTABLE.
@@ -1921,6 +1954,15 @@ def _page_fragments(
     # what let the decode allocate the whole stream before the comparison could run. A
     # belt-and-braces `> MAX` here would now be unreachable, and an unreachable guard is a
     # silent no-op that reads like protection.
+    #
+    # These two lines inflate the same bytes TWICE, and the duplication is the guard.
+    # Measured by attributing decompressed bytes over the corpus: the two paths are equal
+    # to the byte and to the call on all 8 documents (e.g. 1.104 MB in 18 calls each).
+    # The obvious optimisation -- have `_decoded_content_length` return the data it just
+    # decompressed, or measure via `get_data()` and reuse pypdf's cache -- is the exact
+    # shape of the bomb this guard closed: either one puts an unbounded inflation FIRST.
+    # pypdf's own inflation on the next line is safe only because it is second, and it is
+    # only second because nothing here keeps its output.
     _decoded_content_length(resolved, MAX_PAGE_CONTENT_BYTES)
     content = content_stream(resolved, page.pdf, "bytes")
 
