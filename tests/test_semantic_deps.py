@@ -456,6 +456,29 @@ def test_registry_is_append_only_and_never_drops_a_previously_shipped_sha() -> N
     )
 
 
+def test_every_registry_row_is_recorded_in_the_historical_set() -> None:
+    """The other direction, and the one that was missing.
+
+    `_HISTORICALLY_SHIPPED_SHAS` says in prose that every new registry row gets its digest
+    added here in the same commit, and until this test nothing checked it: a row could be
+    added and left unrecorded, and the append-only guard above would stay green forever
+    because it only looks for digests that VANISHED. A guard whose coverage depends on
+    someone remembering to extend it is exactly the guard that silently stops covering the
+    newest thing -- which is always the thing least reviewed.
+
+    This is not circular with the guard above even though the two assertions together pin
+    the set exactly. `_HISTORICALLY_SHIPPED_SHAS` is hand-written from the pinned literals
+    and never computed from the registry, so one direction still catches a dropped row and
+    the other catches an unrecorded one.
+    """
+    unrecorded = set(DEPENDENCIES_BY_SHA) - _HISTORICALLY_SHIPPED_SHAS
+    assert not unrecorded, (
+        f"registry rows {sorted(unrecorded)!r} are not listed in _HISTORICALLY_SHIPPED_SHAS. "
+        "Add the literal there in this same commit -- copied from the pin, never read back "
+        "from DEPENDENCIES_BY_SHA, or the tripwire is computed from the thing it watches."
+    )
+
+
 def test_dependencies_by_sha_is_read_only() -> None:
     with pytest.raises(TypeError):
         DEPENDENCIES_BY_SHA["not-a-real-sha"] = None  # type: ignore[index]
