@@ -827,6 +827,185 @@ _INVISIBLE_RENDER_MODES = frozenset({3.0, 7.0})
 #: would read it as ordinary visible text.
 _RENDER_MODES = frozenset(float(mode) for mode in range(8))
 
+#: Rendering modes that ADD THE GLYPHS TO THE CLIPPING PATH as well as painting them
+#: (ISO 32000-1 table 106: modes 4, 5 and 6; mode 7 clips without painting and is already
+#: in :data:`_INVISIBLE_RENDER_MODES`).
+#:
+#: Refused at the show, not at the ``Tr``, so a mode that is set and then replaced before
+#: any text is shown does not fail a page. The glyph shown in one of these modes is itself
+#: perfectly visible -- what this walker cannot model is what it does to every LATER glyph,
+#: which is now confined to the intersection of the clip with these glyph outlines. Owning
+#: that means owning glyph outlines, which is further outside this module than paths are.
+#:
+#: Censused: `Tr` is never set to 4, 5 or 6 anywhere in the eight-paper corpus. Zero shows,
+#: zero pages.
+_CLIPPING_RENDER_MODES = frozenset({4.0, 5.0, 6.0})
+
+#: The path-painting and path-ending operators, at which a clipping path marked by ``W`` or
+#: ``W*`` TAKES EFFECT (ISO 32000-1 8.5.4: ``W`` only flags the current path; the graphics
+#: state's clipping path is intersected with it after the path is painted or ended).
+#:
+#: ``n`` is in this set and is NOT ink: it ends a path without painting it, which is the
+#: usual way a clip is set (``... re W n``). Every other member paints.
+_PATH_PAINTING_OPERATORS: frozenset[bytes] = frozenset({b"S", b"s", b"f", b"F", b"f*", b"B", b"B*", b"b", b"b*", b"n"})
+
+#: Path constructors that build something this module cannot reduce to a rectangle. ``h``
+#: is deliberately absent: closing a subpath adds no geometry, so ``re h`` is still a
+#: rectangle. ``re`` has its own branch.
+_UNMODELLED_PATH_OPERATORS: frozenset[bytes] = frozenset({b"m", b"l", b"c", b"v", b"y"})
+
+
+class _UnknownClip:
+    """A clipping path is in force whose extent this module cannot model.
+
+    A distinct sentinel rather than ``None`` because the two must never merge: ``None``
+    means "no clip, publish freely" and this means "a clip exists, refuse everything".
+    Collapsing them is how a fail-closed guard becomes a no-op.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostic only
+        return "UNKNOWN_CLIP"
+
+
+UNKNOWN_CLIP = _UnknownClip()
+
+#: A clip is one of: ``None`` (none in force), an axis-aligned page-space rectangle
+#: ``(x0, y0, x1, y1)``, or :data:`UNKNOWN_CLIP`.
+_Clip = tuple[float, float, float, float] | _UnknownClip | None
+
+#: How far a glyph reaches above and below its baseline, as fractions of the rendered
+#: height. Nominal typographic values, NOT this font's: the true numbers live in a
+#: ``/FontDescriptor`` this module does not read, and the ascent is rounded UP to a full em
+#: so that erring costs a refusal rather than a publication.
+#:
+#: The descent is required to be inside the clip, and one earlier version of this guard did
+#: not require it. That version reasoned that vertical clipping only shaves parts of glyphs
+#: -- that trimming the tail off a ``y`` leaves a ``y`` -- and it was wrong in exactly this
+#: project's domain: a comma hangs below the baseline, and a clip that takes it turns
+#: ``1,234`` into ``1234``. Losing a separator changes a number by three orders of
+#: magnitude while leaving text that looks perfectly clean, which is the same silent
+#: numeric corruption the horizontal test exists to prevent. Below-baseline ink is
+#: evidence.
+_DESCENT_FRACTION = 0.22
+_ASCENT_FRACTION = 1.0
+
+#: How far outside the clip the nominal box above may reach and still count as contained.
+#:
+#: Not a fudge factor and not a threshold tuned until a page passed -- it is there because
+#: the two things being compared are not the same kind of quantity. The clip rectangle is
+#: exact, derived from operands in the stream. The glyph box is NOMINAL: an em-square
+#: estimate built from :attr:`TextFragment.font_height` and the fractions above, never a
+#: measured ink extent. Demanding exact containment of an estimate is not strictness, it is
+#: false precision, and it reports a disagreement between the estimate and reality as if it
+#: were a fact about the document.
+#:
+#: Set well below the smallest ink that can carry meaning. The comma this guard exists to
+#: protect descends roughly 1.8 pt at the type sizes in the corpus, so a quarter point
+#: cannot conceal one; the sub-pixel overhangs it does absorb are real and routine, because
+#: producers set an axis label flush with the plot boundary and its descender crosses that
+#: boundary by design. On the one corpus page where a clip is in force over text, the
+#: nominal box hangs 0.05 pt below the clip -- seven times under this tolerance, and about
+#: a fifth of a pixel at 300 dpi.
+#:
+#: What this consciously does not prove: text clipped to a horizontal band that keeps the
+#: full nominal box is not caught at all, and the box is an estimate either way. This is
+#: not a proof of legibility and nothing downstream may treat it as one.
+_CLIP_CONTAINMENT_TOLERANCE = 0.25
+
+
+def _rect_from_re(operands: list[Any], ctm: list[float]) -> tuple[float, float, float, float] | _UnknownClip:
+    """One ``x y w h re`` as a page-space rectangle, or :data:`UNKNOWN_CLIP`.
+
+    Refuses to model a ``re`` under a CTM with any rotation or skew: the operator draws a
+    rectangle in USER space, and under a sheared CTM its page-space image is a
+    parallelogram that no ``(x0, y0, x1, y1)`` describes. ``b`` and ``c`` are the shear
+    terms of ISO 32000-1 8.3.3's matrix; a negative ``a`` or ``d`` is only a flip, which
+    ``min``/``max`` below absorbs.
+    """
+    if len(operands) < 4:
+        raise UnsupportedContentConstruct("a re with fewer than four operands")
+    if abs(ctm[1]) > 1e-9 or abs(ctm[2]) > 1e-9:
+        return UNKNOWN_CLIP
+    x, y, width, height = (_num(value) for value in operands[:4])
+    corners = [
+        _mult([1.0, 0.0, 0.0, 1.0, x, y], ctm),
+        _mult([1.0, 0.0, 0.0, 1.0, x + width, y + height], ctm),
+    ]
+    xs = [corner[4] for corner in corners]
+    ys = [corner[5] for corner in corners]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _clip_from_path(path_rects: list[tuple[float, float, float, float] | _UnknownClip], path_unknown: bool) -> _Clip:
+    """What clip the current path establishes: its single rectangle, or nothing knowable.
+
+    More than one ``re`` before a single ``W`` is ONE path with several subpaths, whose
+    filled region depends on the winding rule -- a union, or a rectangle with a hole. It is
+    NOT the intersection of the rectangles, and reading it as one would enlarge the region
+    this module believes it may publish inside, which is the direction that publishes
+    hidden text rather than the direction that refuses visible text.
+    """
+    if path_unknown or len(path_rects) != 1:
+        return UNKNOWN_CLIP
+    return path_rects[0]
+
+
+def _intersect_clips(current: _Clip, incoming: _Clip) -> _Clip:
+    """Intersect the clip in force with a newly established one.
+
+    ``UNKNOWN_CLIP`` is absorbing in both directions, and that asymmetry with ordinary set
+    intersection is the point: intersecting a known rectangle with an unknown region does
+    NOT leave the rectangle. The result is a subset of it whose shape is unknown, and only
+    a guard that refuses can say so.
+    """
+    if isinstance(current, _UnknownClip) or isinstance(incoming, _UnknownClip):
+        return UNKNOWN_CLIP
+    if current is None:
+        return incoming
+    if incoming is None:
+        return current
+    return (
+        max(current[0], incoming[0]),
+        max(current[1], incoming[1]),
+        min(current[2], incoming[2]),
+        min(current[3], incoming[3]),
+    )
+
+
+def _refuse_text_outside_a_clip(params: Any, clip: _Clip) -> None:
+    """Refuse a show that a clip in force does not provably contain.
+
+    PROVABLY is the whole of it. The test is on the fragment's full extent and not on its
+    origin, because a clip that contains the origin can still cut away every glyph after
+    the first, and this module would then publish an ``x_end`` for ink that was never laid
+    down. Anything that makes the extent unknowable -- an unmodelled clip shape, rotated
+    text whose box is not axis-aligned -- refuses rather than approximates.
+    """
+    if clip is None:
+        return
+    if isinstance(clip, _UnknownClip):
+        raise UnsupportedContentConstruct(
+            "a text-show operator under a clipping path this module cannot reduce to a rectangle"
+        )
+    if bool(getattr(params, "rotated", False)):
+        raise UnsupportedContentConstruct("a text-show operator that is rotated under a clipping path")
+    x_start = float(params.tx)
+    x_end = _pen_x_after(params)
+    height = abs(float(params.font_height))
+    baseline = float(params.ty)
+    box = (
+        min(x_start, x_end),
+        baseline - _DESCENT_FRACTION * height,
+        max(x_start, x_end),
+        baseline + _ASCENT_FRACTION * height,
+    )
+    slack = _CLIP_CONTAINMENT_TOLERANCE
+    if box[0] < clip[0] - slack or box[1] < clip[1] - slack or box[2] > clip[2] + slack or box[3] > clip[3] + slack:
+        raise UnsupportedContentConstruct("a text-show operator whose extent a clipping path does not provably contain")
+
+
 _TEXT_STATE_OPS: dict[bytes, str] = {
     b"Tc": "char_spacing",
     b"Tw": "word_spacing",
@@ -860,6 +1039,33 @@ _TEXT_STATE_OPS: dict[bytes, str] = {
 #:   this walker never enters. Meeting one means the stream is not what it claims.
 #: * ``sh`` is present (a shading fill paints no glyph), but ``Do`` is not: it has its own
 #:   branch and its own refusal.
+#:
+#: ``W``/``W*`` are NOT on this list: they have their own branch, because a clipping path
+#: is a visibility channel and text shown under one is refused. The number that decided
+#: that is worth recording, because the obvious one is wrong by a factor of seventy:
+#: clipping OPERATORS appear on 50 of the corpus's 75 pages, and for a long time this
+#: comment cited that figure to argue the channel could not be refused without failing two
+#: thirds of the corpus. It counts ``W`` occurrences. Clips actually IN FORCE at the moment
+#: a glyph is shown are 2 shows of 26,961, on 1 page of 73 -- because the overwhelmingly
+#: common shape is ``re W n`` inside ``q ... Q``, which clips a figure and is discarded
+#: before any text. Refusing it costs one real page, not fifty. See
+#: :func:`_walk_operations`'s ``show`` for the cost that was accepted and why.
+#:
+#: KNOWN GAP, and unlike clipping this one is NOT closed -- occlusion. A fill or an image
+#: drawn AFTER a glyph covers it, and every operator that can do so is on this list. The
+#: ordering precondition is close to universal: 22,204 painting operators follow a show on
+#: 67 of 73 corpus pages. That number is deliberately not offered as reassurance OR as
+#: alarm, because it measures the precondition and not the channel -- whether any of that
+#: ink geometrically covers a glyph cannot be known without the path geometry this module
+#: refuses to own, so it is unmeasured rather than measured-as-zero.
+#:
+#: There is no unblock condition to offer, and inventing an observable-sounding one would
+#: be worse than saying so: nothing in this tree can distinguish a covered glyph from a
+#: visible one. What this module extracts is text-show geometry from a content stream,
+#: minus an enumerated set of refused invisibility constructs. It does NOT prove that a
+#: human looking at the rendered page would see the glyph, and no artifact it produces may
+#: be described as if it did. Closing this needs a rasterising or path-geometry oracle in
+#: the test lane; until one exists the limit is a scope statement, not a defect to fix.
 _IGNORED_OPERATORS: frozenset[bytes] = frozenset(
     {
         # graphics state, scalar parameters only
@@ -870,28 +1076,15 @@ _IGNORED_OPERATORS: frozenset[bytes] = frozenset(
         b"d",
         b"ri",
         b"i",
-        # path construction
-        b"m",
-        b"l",
-        b"c",
-        b"v",
-        b"y",
+        # path construction: only `h` is here. Closing a subpath adds no geometry, so it
+        # cannot turn a rectangle into something else. `re` and the curve/line
+        # constructors have their own branches -- they decide whether a clip about to be
+        # established is a rectangle this module can model or an unknown region.
         b"h",
-        b"re",
-        # path painting
-        b"S",
-        b"s",
-        b"f",
-        b"F",
-        b"f*",
-        b"B",
-        b"B*",
-        b"b",
-        b"b*",
-        b"n",
-        # clipping -- see `_walk_operations` on why a clip path is recorded, not modelled
-        b"W",
-        b"W*",
+        # path painting is NOT here: see `_PATH_PAINTING_OPERATORS`, which has its own
+        # branch in `_walk_operations` because a clip marked by `W` takes effect at one of
+        # those operators. They remain irrelevant to text POSITION; they stopped being
+        # irrelevant to text VISIBILITY.
         # colour
         b"CS",
         b"cs",
@@ -978,23 +1171,50 @@ def _num(value: Any) -> float:
 def _show_operand(value: Any) -> bytes:
     """One text-show operand, which must be a string of BYTES.
 
-    ``Tj``, ``TJ``, ``'`` and ``"`` show a string, and pypdf's content-stream parser
-    returns every string operand in the eight-paper corpus -- 60,589 inside ``TJ`` arrays
-    and 17,589 from ``Tj`` -- as a ``ByteStringObject``, which is a ``bytes`` subclass.
-    Two other things can arrive at these operators and neither is a string:
+    ``Tj``, ``TJ``, ``'`` and ``"`` show a string. The type test here is ``bytes`` exactly,
+    and everything else refuses. Two things reach these operators that are not ``bytes``,
+    and each refuses for its own reason -- neither of which is the corpus:
 
     * a ``NameObject``. It subclasses ``str``, so the obvious ``isinstance(value, bytes |
       str)`` test admits it, and ``[(01) /Nm (23)] TJ`` then publishes a fragment whose
       text is ``/Nm`` at real coordinates -- text FABRICATED out of a token that drew
       nothing. That is the failure class this lane exists to prevent, arriving through
       a type test rather than through an inference.
-    * a ``TextStringObject``, which pypdf produces when a string decodes as UTF-16 or
-      PDFDoc. It is also a ``str``, and it is worse than useless here: the decoding has
+    * a ``TextStringObject``, which pypdf produces when a string operand decodes as UTF-16
+      or PDFDoc. It is also a ``str``, and it is worse than useless here: the decoding has
       already replaced the CODE BYTES with characters, and the font's ``/Encoding`` and
       ``/Widths`` are indexed by those bytes. Its glyphs would be measured against the
       wrong table while looking perfectly well formed.
 
-    So the type test is ``bytes`` exactly, and everything else refuses.
+    The two are NOT symmetric, and the difference was measured rather than assumed:
+
+    The ``NameObject`` refusal is LIVE. A name token reaches a show operator regardless of
+    how strings are decoded, so this is the guard that does real work, and it is the one
+    that caught a real fabrication.
+
+    The ``TextStringObject`` refusal is UNREACHABLE from this module's production path, and
+    a corpus census is the wrong evidence for it -- so that census is deliberately not cited
+    here. :func:`_page_fragments` constructs its ``ContentStream`` with ``forced_encoding=
+    "bytes"``, and pypdf's ``create_string_object`` returns a ``ByteStringObject``
+    UNCONDITIONALLY under that argument, for both ``(literal)`` and ``<48EX>`` strings. The
+    eight-paper corpus is 100% ``ByteStringObject`` for that reason and no other: it is this
+    module's own argument being honoured, not a property of those eight PDFs. Measuring it
+    proves nothing, because every PDF ever written would measure the same.
+
+    What the argument would be worth without it is the opposite of reassuring. Dropped, the
+    default path decodes ``(Hello) Tj`` to a ``TextStringObject``: pypdf tries UTF-16 by BOM,
+    then UTF-16 by an embedded ``NUL``, then PDFDoc, and falls back to bytes only when all
+    three raise. Ordinary ASCII show strings decode, so ``TextStringObject`` is the DEFAULT,
+    not the exotic case, and dropping the argument would silently re-index every glyph's
+    width against a table keyed by the code bytes the decode replaced.
+
+    So this branch is kept as a CONTRACT on the call site, in the same spirit as ``_num``'s
+    boolean branch: it cannot fire today, it says so, and if the ``"bytes"`` argument is ever
+    dropped it converts that into an immediate, total, loud page refusal rather than a page
+    of plausible coordinates. Note for whoever meets it then: a ``TextStringObject`` carries
+    ``_original_bytes``, so unwrapping it would LOOK like the fix. It is not. Restoring
+    ``forced_encoding="bytes"`` is the fix; reaching into a private attribute to undo a
+    decode this module asked for is how the borrowed half grows back.
     """
     if not isinstance(value, bytes):
         raise UnsupportedContentConstruct(
@@ -1024,6 +1244,21 @@ class _TextState:
     fill_alpha: float = 1.0
     """``/ca``. Part of the graphics state, so ``q``/``Q`` save and restore it with the
     rest of this dataclass."""
+    clip: _Clip = None
+    """The clipping path in force: ``None``, an axis-aligned page-space rectangle, or
+    :data:`UNKNOWN_CLIP`. Graphics state (ISO 32000-1 8.4.2), so ``Q`` restores it with the
+    rest of this dataclass -- which is why ``q re W n ... Q`` around a figure costs nothing.
+
+    A rectangle and NOT a path, which is a deliberate line rather than a simplification. A
+    plot area is ``x y w h re W n``, so modelling that one case returns the figure pages
+    the boolean version of this guard refused; modelling anything else means owning subpath
+    accumulation, winding rules and polygon intersection, which this module does not do.
+    Everything that is not a single rectangle becomes :data:`UNKNOWN_CLIP` and refuses."""
+    clip_pending: bool = False
+    """``W`` seen, no path-painting operator yet. Refused at a show exactly like
+    :attr:`clip_active`: a stream that shows text between ``W`` and the operator that ends
+    the path is malformed for the state machine above, and the safe reading of a malformed
+    clip is that a clip is coming. Zero corpus population."""
     stroke_alpha: float = 1.0
     """``/CA``. Separate from :attr:`fill_alpha` because which of the two makes text
     invisible depends on the rendering mode, and conflating them refuses real pages."""
@@ -1410,6 +1645,20 @@ def _walk_operations(
     tm: list[float] | None = None
     tlm: list[float] | None = None
     shows: list[Any] = []
+    # The CURRENT PATH. Not graphics state, so unlike `state.clip` these are plain locals
+    # that `q` does not save and `Q` does not restore -- they are cleared at every
+    # path-ending operator instead. Note what that means precisely, because the obvious
+    # phrasing ("a path does not survive q/Q") describes a different implementation from
+    # this one: a path under construction when a `q` arrives DOES survive it here, and
+    # survives the matching `Q` too. Constructing a path across a save/restore boundary is
+    # malformed, and the safe reading of a malformed path is the one that carries its
+    # geometry forward to the clip it may still establish, rather than silently dropping
+    # it and leaving `path_rects` empty -- which `_clip_from_path` would then read as
+    # UNKNOWN, refusing. Both readings are safe; this one refuses less.
+    # `path_unknown` covers both a non-rectangular constructor and a `re` this module
+    # declined to reduce.
+    path_rects: list[tuple[float, float, float, float] | _UnknownClip] = []
+    path_unknown = False
 
     def require_text_object() -> tuple[list[float], list[float]]:
         if tm is None or tlm is None:
@@ -1436,6 +1685,17 @@ def _walk_operations(
             raise UnsupportedContentConstruct(
                 f"a text-show operator in rendering mode {state.render_mode:g}, which paints nothing"
             )
+        if state.render_mode in _CLIPPING_RENDER_MODES:
+            # Modes 4-6 paint this glyph AND add it to the clipping path, confining every
+            # later glyph on the page to the intersection. Refused at zero corpus cost.
+            raise UnsupportedContentConstruct(
+                f"a text-show operator in rendering mode {state.render_mode:g}, "
+                "which adds its glyphs to the clipping path"
+            )
+        if state.clip_pending:
+            # `W` seen, path not yet ended. Malformed for the state machine, and the safe
+            # reading of a malformed clip is that a clip is coming. Zero corpus population.
+            raise UnsupportedContentConstruct("a text-show operator between a W and the operator that ends its path")
         if _painted_invisibly(state):
             # The same hazard as mode 3, reached through the graphics state instead. Which
             # alpha counts is decided HERE and not at the `gs`, because the mode in effect
@@ -1457,6 +1717,10 @@ def _walk_operations(
             state.rise,
             _mult(_tm, ctm),
         )
+        # After the params exist, because the test is on the fragment's published EXTENT
+        # and `_pen_x_after` needs them. Before the append, because a fragment a clip does
+        # not contain must never reach the list at all.
+        _refuse_text_outside_a_clip(params, state.clip)
         shows.append(params)
         # The pen advances along the ORIGINAL text matrix, never along the one
         # `TextStateParams.__post_init__` may have rewritten. pypdf rewrites the
@@ -1581,6 +1845,29 @@ def _walk_operations(
                 _refuse_form_xobject(operands, resources.xobjects)
             elif op == b"BDC":
                 _refuse_optional_content(operands)
+            elif op == b"re":
+                path_rects.append(_rect_from_re(operands, ctm))
+            elif op in _UNMODELLED_PATH_OPERATORS:
+                path_unknown = True
+            elif op in (b"W", b"W*"):
+                # `W` only MARKS the current path; the clip is established at the operator
+                # that ends it. `W*` differs from `W` only in the winding rule, which is
+                # indistinguishable for the single rectangle this module models and
+                # irrelevant for everything else, since everything else is UNKNOWN anyway.
+                state.clip_pending = True
+            elif op in _PATH_PAINTING_OPERATORS:
+                # Where a marked clip takes effect (8.5.4). Also the reason these operators
+                # cannot simply stay in `_IGNORED_OPERATORS`: they are irrelevant to where
+                # text goes, and load-bearing for whether it can be seen.
+                if state.clip_pending:
+                    state.clip = _intersect_clips(state.clip, _clip_from_path(path_rects, path_unknown))
+                    state.clip_pending = False
+                # Cleared on EVERY path-ending operator, marked or not. Otherwise a `re`
+                # that was painted and finished stays in the list and attaches itself to a
+                # later, unrelated `W`, which would hand that clip a rectangle drawn for
+                # something else.
+                path_rects = []
+                path_unknown = False
             elif op not in _IGNORED_OPERATORS:
                 # The final `else` this walk did without. Everything above is either
                 # modelled or refused by name; without this an operator that is NEITHER --

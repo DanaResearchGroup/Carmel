@@ -103,6 +103,7 @@ _HISTORICALLY_SHIPPED_SHAS = frozenset(
         "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545",
         "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a",
         "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108",
+        "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e",
     }
 )
 
@@ -1229,7 +1230,7 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
 # this file. Independently verified once via:
 #   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
 # This is the half that moves when fragment GEOMETRY changes.
-_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "4dd477809aaf0874e427e72cf8ff5e12391455f525bd56ea385999c57eff1101"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "3f8d26ba2e3a343cd777ff865b34cbec6f13cb4dd4dcf12a5d9923d4b9b6f58c"
 
 # The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
 # historical row rather than only asserted in prose. Its own component moved when
@@ -1272,9 +1273,16 @@ _PINNED_FRAGMENT_GEOMETRY_SHA256_V4 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4b
 _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V5 = "dbd9b8a255b6339438cb4551fcb6c8d0aa3e434694f5ccf71abf921a076d9cbd"
 _PINNED_FRAGMENT_GEOMETRY_SHA256_V5 = "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a"
 
+# SUPERSEDED -- the SIXTH, which modelled no clipping path at all. It treated `W`/`W*` and
+# the path-painting operators as irrelevant on the true premise that they do not move text
+# and the false conclusion that they cannot hide it, and published a fragment for text drawn
+# wholly outside the clip in force.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V6 = "4dd477809aaf0874e427e72cf8ff5e12391455f525bd56ea385999c57eff1101"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V6 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108"
+
 # HARDCODED. The registered content_sha256 itself, verified once via:
 #   compose_component_sha({"borrowed_sha256": <borrowed>, "own_sha256": <own>})
-_PINNED_FRAGMENT_GEOMETRY_SHA256 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108"
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e"
 
 # The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
 # completeness claim of the composite identity, spelled out as data: extract_fragments runs
@@ -1653,6 +1661,7 @@ def test_the_superseded_fragment_geometry_row_is_still_resolvable() -> None:
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V4,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V5,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
     ):
         superseded = dependency_for_sha(superseded_sha)
         assert superseded.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID
@@ -1673,6 +1682,7 @@ def test_every_superseded_geometry_row_is_distinct() -> None:
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V4,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V5,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
         _PINNED_FRAGMENT_GEOMETRY_SHA256,
     )
     owns = (
@@ -1681,6 +1691,7 @@ def test_every_superseded_geometry_row_is_distinct() -> None:
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V3,
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V4,
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V5,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V6,
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256,
     )
     assert len(set(shas)) == len(shas)
@@ -1701,6 +1712,7 @@ def test_the_supersession_moved_only_the_own_component() -> None:
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V4,
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V5,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
             _PINNED_FRAGMENT_GEOMETRY_SHA256,
         )
     ]

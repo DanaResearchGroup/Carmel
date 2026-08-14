@@ -1041,9 +1041,31 @@ _FRAGMENT_GEOMETRY_SHA256_V4 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7c
 _FRAGMENT_GEOMETRY_OWN_SHA256_V5 = "dbd9b8a255b6339438cb4551fcb6c8d0aa3e434694f5ccf71abf921a076d9cbd"
 _FRAGMENT_GEOMETRY_SHA256_V5 = "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a"
 
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "4dd477809aaf0874e427e72cf8ff5e12391455f525bd56ea385999c57eff1101"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V6 = "4dd477809aaf0874e427e72cf8ff5e12391455f525bd56ea385999c57eff1101"
+_FRAGMENT_GEOMETRY_SHA256_V6 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108"
+
+# The SEVENTH entry, and the first to model a CLIPPING PATH. Until now the walker treated
+# `W`/`W*` and the path-painting operators as irrelevant, on the true premise that they do
+# not move text and the false conclusion that they cannot hide it. Text drawn wholly
+# outside the clip in force paints nothing, and V6 published a fragment for it.
+#
+# It now tracks a clip as `None`, a single axis-aligned rectangle, or UNKNOWN, and refuses
+# any show whose extent that clip does not provably contain. Everything that is not one
+# rectangle -- a curve, several subpaths under one `W`, a `re` under a sheared CTM, rotated
+# text -- becomes UNKNOWN and refuses. Rendering modes 4-6 refuse as well: they add their
+# glyphs to the clipping path, which V6 read as ordinary visible text.
+#
+# Like V5 and V6 this moves no coordinate: 78,178 fragments and 0 page failures on both
+# sides, the same numbers V4 established. It supersedes for the same reason V5 did -- what
+# changed is what the extractor REFUSES. The route there is worth recording because the
+# obvious census was wrong by a factor of seventy: clipping OPERATORS touch 50 of the
+# corpus's 75 pages, but clips actually IN FORCE over a glyph are 2 shows of 26,961 on 1
+# page, and the intermediate implementation that refused on the former cost 1,415 fragments
+# of a real figure page before the rectangle model returned them. The BORROWED component is
+# unmoved for the seventh consecutive time.
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "3f8d26ba2e3a343cd777ff865b34cbec6f13cb4dd4dcf12a5d9923d4b9b6f58c"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108"
+_FRAGMENT_GEOMETRY_SHA256 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1106,6 +1128,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V5: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V5,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V6: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V6,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1243,6 +1270,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V5,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V6,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

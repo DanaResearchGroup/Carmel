@@ -349,15 +349,192 @@ def test_invisible_text_is_refused_rather_than_published_as_drawn() -> None:
     assert "paints nothing" in _refusal("BT /F1 10 Tf 7 Tr 1 0 0 1 100 700 Tm (012) Tj ET")
 
 
-def test_a_visible_rendering_mode_is_still_published() -> None:
-    """The guard is on modes 3 and 7 alone -- stroke, fill-and-stroke and the clipping
-    variants that DO paint stay ordinary text, or the refusal would be a denylist of one
-    value pretending to be a scope boundary."""
+def test_a_painting_rendering_mode_is_still_published() -> None:
+    """Modes 0, 1 and 2 fill, stroke and do both. All three are ordinary text, or the
+    refusal would be a denylist pretending to be a scope boundary."""
     require_pypdf()
-    for mode in (0, 1, 2, 4, 5, 6):
+    for mode in (0, 1, 2):
         extraction = extract_fragments(build_page(f"BT /F1 10 Tf {mode} Tr 1 0 0 1 100 700 Tm (012) Tj ET"))
         assert not extraction.page_failures, f"mode {mode} was refused"
         assert [f.text for f in extraction.fragments] == ["012"], f"mode {mode}"
+
+
+def test_a_clipping_rendering_mode_is_refused_even_though_it_paints() -> None:
+    """Modes 4-6 paint the glyph AND add it to the clipping path (table 106).
+
+    The glyph itself is visible, so the earlier version of this test asserted all three
+    were published. What that missed is the side effect: every LATER glyph on the page is
+    confined to the intersection of the clip with these glyph outlines, and this walker
+    models neither. Zero corpus population -- ``Tr`` is never set to 4, 5 or 6 in the eight
+    papers -- so the refusal costs nothing and closes the channel by construction.
+    """
+    require_pypdf()
+    for mode in (4, 5, 6):
+        reason = _refusal(f"BT /F1 10 Tf {mode} Tr 1 0 0 1 100 700 Tm (012) Tj ET")
+        assert "adds its glyphs to the clipping path" in reason, f"mode {mode}"
+
+
+def test_text_a_rectangular_clip_does_not_contain_is_refused() -> None:
+    """``re W n`` sets a clip; a glyph outside it paints nothing and must not publish."""
+    require_pypdf()
+    reason = _refusal("q 0 0 10 10 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "does not provably contain" in reason
+
+
+def test_text_inside_a_rectangular_clip_is_published() -> None:
+    """The case the boolean version of this guard refused, and the reason it was replaced.
+
+    A plot area is ``x y w h re W n`` and its axis labels are drawn inside it. Refusing
+    every show under any clip cost 1,415 fragments -- a whole figure page -- to guard two
+    axis labels that were perfectly visible. Modelling the one shape that matters returns
+    them, and everything that is not that shape still refuses.
+    """
+    require_pypdf()
+    extraction = extract_fragments(build_page("q 50 650 200 100 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q"))
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_clip_that_cuts_the_end_off_a_run_is_refused() -> None:
+    """The reason the test is on the EXTENT and not on the origin.
+
+    The clip starts at x=100 and ends at x=104, so it contains this run's first glyph and
+    cuts away the rest. An origin test would publish an ``x_end`` past the clip edge -- a
+    coordinate for ink that was never laid down, which is worse than refusing because it
+    looks checkable.
+    """
+    require_pypdf()
+    reason = _refusal("q 100 650 4 100 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "does not provably contain" in reason
+
+
+def test_a_clip_that_cuts_below_the_baseline_is_refused() -> None:
+    """The case that killed the first version of the vertical rule.
+
+    That version anchored the box AT the baseline, on the argument that vertical clipping
+    only shaves parts of glyphs. It does not: a comma hangs below the baseline, and a clip
+    that takes it turns ``1,234`` into ``1234`` -- a number wrong by three orders of
+    magnitude, wearing text that looks clean. Below-baseline ink is evidence, so the clip
+    here (bottom edge exactly at the baseline, 700) must refuse.
+    """
+    require_pypdf()
+    reason = _refusal("q 50 700 400 60 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "does not provably contain" in reason
+
+
+def test_a_sub_point_overhang_is_not_refused() -> None:
+    """The other half of the same rule, and the reason it is a tolerance and not a policy.
+
+    The clip rectangle is exact; the glyph box is a NOMINAL em-square estimate. Demanding
+    exact containment of an estimate reports a disagreement between the estimate and
+    reality as though it were a fact about the document. A producer setting an axis label
+    flush with a plot boundary overhangs by a fraction of a point as a matter of course --
+    here 0.1 pt, about a fifth of a pixel at 300 dpi.
+    """
+    require_pypdf()
+    extraction = extract_fragments(build_page("q 50 697.9 400 60 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q"))
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_the_tolerance_cannot_absorb_a_descender() -> None:
+    """The tolerance must stay far below the smallest ink that carries meaning, or it
+    becomes the policy it replaced. A clip 1 pt above the descender's reach still refuses:
+    that is enough to take a comma, and a quarter point is not."""
+    require_pypdf()
+    reason = _refusal("q 50 699 400 60 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "does not provably contain" in reason
+
+
+def test_a_clip_that_cuts_the_top_off_the_glyph_bodies_is_refused() -> None:
+    """The band is tested at both edges. A clip whose top sits inside the nominal ascent
+    takes the tops off the glyphs, and a digit with its top removed is not a digit anyone
+    should read a number from."""
+    require_pypdf()
+    reason = _refusal("q 50 690 400 15 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "does not provably contain" in reason
+
+
+def test_a_non_rectangular_clip_refuses_rather_than_being_approximated() -> None:
+    """A clip built from lines is not a rectangle, and its bounding box is not a
+    conservative substitute -- a box is LARGER than the region, so publishing against it
+    would admit glyphs the real clip cuts away."""
+    require_pypdf()
+    reason = _refusal("q 0 0 m 500 0 l 250 750 l h W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "cannot reduce to a rectangle" in reason
+
+
+def test_two_rectangles_in_one_clip_path_are_not_read_as_an_intersection() -> None:
+    """Two ``re`` before one ``W`` are one path with two subpaths. Under the nonzero
+    winding rule that is a UNION, not an intersection; reading it as either would be a
+    guess about which region may be published in."""
+    require_pypdf()
+    reason = _refusal("q 0 0 600 780 re 50 650 200 100 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "cannot reduce to a rectangle" in reason
+
+
+def test_a_clip_rectangle_under_a_rotated_ctm_is_not_modelled() -> None:
+    """``re`` draws in USER space. Under a sheared or rotated CTM its page-space image is
+    a parallelogram, and no ``(x0, y0, x1, y1)`` describes it."""
+    require_pypdf()
+    reason = _refusal("q 0.7 0.7 -0.7 0.7 0 0 cm 0 0 600 780 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "cannot reduce to a rectangle" in reason
+
+
+def test_successive_clips_intersect() -> None:
+    """Two clips established by two separate ``W n`` sequences DO intersect -- unlike two
+    subpaths of one path. Here the second cuts the first down to a band that no longer
+    contains the text."""
+    require_pypdf()
+    reason = _refusal("q 0 0 600 780 re W n 0 0 600 100 re W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q")
+    assert "does not provably contain" in reason
+
+
+def test_a_painted_rectangle_does_not_attach_itself_to_a_later_clip() -> None:
+    """The current path is cleared at EVERY path-ending operator, marked or not.
+
+    Without that, the ``re`` painted here would still be in the list when the later ``W``
+    arrives, and the clip would be established from a rectangle drawn for something else
+    -- a clip this module believes it may publish inside, invented out of stale state.
+    """
+    require_pypdf()
+    reason = _refusal(
+        "q 0 0 600 780 re f 0 0 10 10 re 20 20 m 30 30 l W n BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET Q"
+    )
+    assert "cannot reduce to a rectangle" in reason
+
+
+def test_a_clip_discarded_by_q_before_any_text_is_not_refused() -> None:
+    """The shape that makes the corpus number small, and the reason the guard is on the
+    clip being IN FORCE rather than on ``W`` appearing.
+
+    ``q ... re W n ... Q`` clips a figure and restores the state before any text is shown.
+    That is 50 of the corpus's 75 pages. Refusing on ``W`` would have failed all of them
+    to catch the 1 page where a clip is actually in force over a glyph.
+    """
+    require_pypdf()
+    extraction = extract_fragments(build_page("q 0 0 10 10 re W n Q BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET"))
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_clip_marked_but_not_yet_in_force_still_refuses_a_show() -> None:
+    """``W`` with text before the path is ended. Malformed for the state machine, and the
+    safe reading of a malformed clip is that a clip is coming. Zero corpus population."""
+    require_pypdf()
+    reason = _refusal("0 0 10 10 re W BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET")
+    assert "between a W and the operator that ends its path" in reason
+
+
+def test_painting_a_path_without_a_pending_clip_does_not_refuse() -> None:
+    """The painting operators left ``_IGNORED_OPERATORS`` and gained a branch. That branch
+    must remain a no-op when no ``W`` preceded it, or every ruled table would fail."""
+    require_pypdf()
+    extraction = extract_fragments(
+        build_page("0 0 10 10 re f 20 20 m 30 30 l S BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET")
+    )
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
 
 
 def test_an_extgstate_that_sets_a_font_is_refused() -> None:
@@ -675,8 +852,8 @@ def test_a_name_inside_a_tj_array_is_not_published_as_text() -> None:
     ``NameObject`` subclasses ``str``, so the walker's ``isinstance(element, bytes | str)``
     test admitted it and ``[(01) /Nm (23)] TJ`` published a fragment reading ``/Nm`` at
     real page coordinates -- text no glyph drew, wearing checkable geometry. Found by
-    trying it, not by review: every one of the corpus's 60,589 ``TJ`` string elements is a
-    ``ByteStringObject``, so nothing in the evidence would ever have shown it.
+    trying it, not by review: a name token is not a string, so no amount of looking at
+    real papers' strings would ever have shown it.
     """
     require_pypdf()
     reason = _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm [(01) /Nm (23)] TJ ET")
@@ -687,6 +864,44 @@ def test_a_name_operand_to_tj_is_not_published_as_text() -> None:
     """The same hole through the single-string operator: ``/Nm Tj``."""
     require_pypdf()
     assert "not a string of bytes" in _refusal("BT /F1 10 Tf 1 0 0 1 100 700 Tm /Nm Tj ET")
+
+
+def test_show_operands_are_bytes_only_because_this_module_asks_for_bytes() -> None:
+    """Pin the coupling that makes ``_show_operand``'s second branch unreachable.
+
+    ``_page_fragments`` builds its ``ContentStream`` with ``forced_encoding="bytes"``. That
+    argument -- not anything about the papers -- is why every show operand this module ever
+    sees is a ``ByteStringObject``. Without it pypdf decodes ``(Hello)`` to a
+    ``TextStringObject`` whose characters have REPLACED the code bytes that ``/Encoding``
+    and ``/Widths`` are indexed by, so every glyph width would then be looked up under the
+    wrong key while the fragment still looked well formed.
+
+    Asserted here on both string syntaxes, because they take different parse paths in pypdf
+    (``read_string_from_stream`` and ``read_hex_string_from_stream``) and each calls
+    ``create_string_object`` separately. A pypdf change that made ``"bytes"`` advisory would
+    fail this test rather than quietly re-key the corpus.
+    """
+    require_pypdf()
+    from pypdf.generic import ByteStringObject, ContentStream, DecodedStreamObject, TextStringObject
+
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 10 Tf (Hi) Tj <4869> Tj [(ab) -200 (cd)] TJ ET")
+
+    forced = [operand for operands, _op in ContentStream(stream, None, "bytes").operations for operand in operands]
+    assert [type(o).__name__ for o in forced if isinstance(o, bytes)] == [
+        "ByteStringObject",
+        "ByteStringObject",
+    ]
+    array = next(operand for operand in forced if isinstance(operand, list))
+    assert [type(element).__name__ for element in array if not isinstance(element, int | float)] == [
+        "ByteStringObject",
+        "ByteStringObject",
+    ]
+    assert issubclass(ByteStringObject, bytes)
+
+    # And the inverse, which is what the contract protects against: the DEFAULT is decoded.
+    default = [operand for operands, _op in ContentStream(stream, None, None).operations for operand in operands]
+    assert any(isinstance(operand, TextStringObject) for operand in default)
 
 
 def test_a_user_unit_of_one_is_not_refused() -> None:
