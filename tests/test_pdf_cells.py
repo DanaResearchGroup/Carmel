@@ -314,6 +314,57 @@ class TestTheClaimIsCheckedNotTaken:
         refusal = refuse_region(_extraction(word, accent), region)
         assert refusal is None or refusal.reason is not RegionRefusalReason.INVALID_GEOMETRY
 
+    def test_a_non_member_with_a_nan_extent_refuses(self) -> None:
+        """The member check was never the whole rule. A NaN extent makes every `<` in the
+        straddle and neighbour tests quietly False, so an outsider carrying one is neither
+        recorded as a straddler nor found as the nearest neighbour: the region reads clean
+        because the checks that would have refused it could not run.
+
+        This one sits INSIDE the band and overlaps the region, so without the guard it is
+        a straddler that goes unreported.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        broken = _fragment("-", float("nan"), 103.0)
+        refusal = refuse_region(_extraction(number, broken), _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.UNCOMPARABLE_NEIGHBOUR
+
+    def test_a_non_member_with_a_nan_baseline_refuses(self) -> None:
+        """The other half, and the reason the check is scoped to the PAGE.
+
+        A NaN BASELINE fails the band test itself -- `abs(nan - y) <= BAND` is False -- so
+        this fragment never enters the band at all. A band-scoped guard would inspect only
+        the fragments that already passed the very comparison NaN defeats, and would
+        report this page as clean.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        broken = _fragment("-", 96.0, 103.0, baseline_y=float("nan"))
+        refusal = refuse_region(_extraction(number, broken), _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.UNCOMPARABLE_NEIGHBOUR
+
+    def test_a_zero_width_non_member_does_not_refuse(self) -> None:
+        """The exemption, carried across from the member rule so the two cannot drift.
+
+        A combining diacritic outside the region is still a legitimate zero-width
+        fragment, and `_is_sane_extent` admits it deliberately. Refusing here would refuse
+        every region on a page that contains an accented character anywhere.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        accent = _fragment("´", 96.0, 96.0)
+        refusal = refuse_region(_extraction(number, accent), _region(number))
+        assert refusal is None or refusal.reason is not RegionRefusalReason.UNCOMPARABLE_NEIGHBOUR
+
+    def test_a_blank_non_member_with_a_nan_extent_does_not_refuse(self) -> None:
+        """Blank fragments are excluded from the guard for the same reason the neighbour
+        scan already skips them: their geometry is never read, so it cannot mislead. A bare
+        space carrying a NaN would otherwise refuse a page that is in no way compromised.
+        """
+        number = _fragment("1.0", 103.5, 115.0)
+        blank = _fragment(" ", float("nan"), float("nan"))
+        refusal = refuse_region(_extraction(number, blank), _region(number))
+        assert refusal is None or refusal.reason is not RegionRefusalReason.UNCOMPARABLE_NEIGHBOUR
+
     def test_loss_that_cannot_be_located_refuses(self) -> None:
         """`lossy` with neither carrier is loss this module cannot place. The page-
         specific test stays precise, so this needs its own check."""

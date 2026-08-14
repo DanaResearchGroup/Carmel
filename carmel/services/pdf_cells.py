@@ -208,6 +208,30 @@ class RegionRefusalReason(StrEnum):
     the box around ``1.0`` removes it from the outsiders, so the adjacency check never
     sees it and the sign is lost with no refusal raised."""
 
+    UNCOMPARABLE_NEIGHBOUR = "uncomparable_neighbour"
+    """A NON-MEMBER fragment on this page has geometry that cannot be compared against
+    the region's: a non-finite baseline, or an extent that is non-finite or backwards.
+
+    The sibling of :attr:`INVALID_GEOMETRY`, which states this same rule and applies it
+    to the claimed box and its members only. Leaving the outsiders unchecked left the
+    hole open on the side the members do not cover, and it is silent in TWO different
+    ways at once:
+
+    * a NaN or backwards X-EXTENT survives into the band and then vanishes from every
+      comparison, because ``<`` against NaN is quietly False -- so it is neither
+      recorded as a straddler nor found as the nearest neighbour, and the region reads
+      clean because the check that would have refused it could not run;
+    * a NaN BASELINE never reaches the band at all, because the band test is itself a
+      ``<=`` that NaN fails. It is dropped one step earlier, for a different reason,
+      which is why this check is scoped to the PAGE and not to the band -- a band-scoped
+      check would inspect only the fragments that already passed the test NaN defeats.
+
+    Neither the exclusion nor the inclusion of such a fragment can be justified, exactly
+    as for :attr:`ROTATED_NEIGHBOUR`, so this halts rather than joining an independent
+    tally. **Zero corpus proposals reach it**: the 8-paper corpus holds no non-finite
+    and no backwards fragment extent. It guards the shape of the input, not an observed
+    one -- which is the same footing :attr:`INVALID_GEOMETRY` has always stood on."""
+
     STRADDLED = "straddled"
     """A fragment that is NOT a member overlaps the claimed region horizontally. The
     region's own boundary is therefore not clean: something was cut through rather than
@@ -244,6 +268,7 @@ HALTS_EVALUATION: frozenset[RegionRefusalReason] = frozenset(
         RegionRefusalReason.EMPTY,
         RegionRefusalReason.FOREIGN_MEMBER,
         RegionRefusalReason.MEMBER_OUTSIDE_REGION,
+        RegionRefusalReason.UNCOMPARABLE_NEIGHBOUR,
         RegionRefusalReason.ROTATED_NEIGHBOUR,
     }
 )
@@ -466,15 +491,29 @@ def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tu
             )
 
     member_ids = {id(member) for member in region.members}
-    band = [
+    others = [
         fragment
         for fragment in extraction.fragments
-        if fragment.page == region.page
-        and id(fragment) not in member_ids
-        and abs(fragment.baseline_y - region.baseline_y) <= BASELINE_BAND
+        if fragment.page == region.page and id(fragment) not in member_ids and fragment.text.strip()
     ]
 
-    outsiders = [fragment for fragment in band if fragment.text.strip()]
+    # Checked over the PAGE, before the band is cut, and this order is the whole point.
+    # The band test below is `abs(baseline_y - ...) <= BASELINE_BAND`, which a NaN
+    # baseline fails -- so a fragment with one is already gone by the time a band-scoped
+    # check could look at it, and such a check would only ever inspect fragments that
+    # passed the very comparison NaN defeats. Blank fragments are excluded above for the
+    # same reason the neighbour scan skips them: they are never a straddler and never a
+    # neighbour, so their geometry is not read and cannot mislead.
+    if any(
+        not math.isfinite(fragment.baseline_y) or not _is_sane_extent(fragment.x_start, fragment.x_end)
+        for fragment in others
+    ):
+        return note(
+            RegionRefusalReason.UNCOMPARABLE_NEIGHBOUR,
+            "a non-member fragment on this page has a non-finite or backwards extent",
+        )
+
+    outsiders = [fragment for fragment in others if abs(fragment.baseline_y - region.baseline_y) <= BASELINE_BAND]
 
     if any(fragment.rotated for fragment in outsiders):
         return note(
