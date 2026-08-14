@@ -22,15 +22,19 @@ import math
 import pytest
 
 from carmel.services.numeric import (
+    _AFFIX_TOKENS,
     NUMERAL_CANDIDATE_RE,
     NUMERAL_EXTENT_RE,
     REPAIR_NAMES,
+    AffixClass,
     NormalizedNumeral,
     Range,
     Scalar,
     SourceContext,
     Unresolvable,
     assess_glyph_health,
+    classify_abutting_affix,
+    classify_affix,
     enclosing_numeric_construct,
     find_numeral_extent,
     normalize_numeric_span,
@@ -626,3 +630,87 @@ class TestUnitBoundaryViolationHasNoVocabularySeam:
         # clean case -- Layers 1-2 alone have nothing to refuse here, and
         # there is no vocabulary parameter to supply at all.
         assert unit_boundary_violation("the temperature was 1023 K", 25, 26) is None
+
+
+class TestDetachedSignIsNotTheNeighboursSign:
+    """A DETACHED sign on your right refuses; the same sign ATTACHED to its digits
+    does not. This asymmetry reads as a bug -- the whole-token classification runs
+    before the ``_LEFT_REACHING`` direction filter, so ``-`` refuses where ``-3``
+    passes -- and an adversarial review round (Codex 147 F16) filed it as one. The
+    corpus says the opposite, and this class exists so the "consistency fix" trips a
+    test that carries the measurement instead of shipping.
+
+    Of the 157 sites in the 8-paper corpus where a bare numeral's nearest right-hand
+    neighbour is a whole-token ``+``/``-``/``–``/``þ``, ZERO are the next cell's
+    detached negative sign. 148 are followed by a word (reaction equations,
+    ``GRI-Mech 3.0 + Ozone mechanism``, the suspended hyphen of ``5- and 10-atm``),
+    5 sit between two numerals as an operator or a citation range, 2 have nothing
+    after them, and the 2 that hug the following numeral are a range and a sum.
+    Every one of those constructs REACHES LEFT, which is what a refusal is for.
+    Letting them through would publish 71 corpus regions whose only refusal is this
+    one -- among them the ``11`` of ``[8-13]``, as a scalar.
+
+    What makes the ``-`` of ``-3`` that number's own sign is that it is printed
+    against its digits. Detachment is not a cosmetic variation on that; it is the
+    removal of the only evidence for it.
+    """
+
+    def test_a_detached_sign_on_the_right_refuses(self) -> None:
+        for token in ("-", "+", "−", "–", "þ"):
+            assert classify_abutting_affix(token, from_end=False) is AffixClass.SIGN, (
+                f"{token!r} standing alone to the right of a value is an operator, a range "
+                "dash or a suspended hyphen -- see _LEFT_REACHING for the corpus census"
+            )
+
+    def test_an_attached_sign_on_the_right_is_still_the_neighbours_own_value(self) -> None:
+        # The case the direction filter exists for, and the reason it cannot simply be
+        # applied to the detached one as well: refusing here rejects every row that
+        # contains a negative number.
+        for token in ("-3", "+0.5", "−1.0e3"):
+            assert classify_abutting_affix(token, from_end=False) is None
+
+    def test_a_sign_on_the_left_refuses_whether_or_not_it_stands_alone(self) -> None:
+        # `from_end=True` reads the neighbour's TRAILING edge, so these are the shapes
+        # whose last glyph is the sign: a bare `-` and a `-` the typesetter left hanging
+        # off the token before it. Both are the leading sign of MY value.
+        for token in ("-", "1.0-", "±"):
+            assert classify_abutting_affix(token, from_end=True) is AffixClass.SIGN
+
+    def test_a_complete_signed_number_on_the_left_is_no_threat(self) -> None:
+        # `-3` to your LEFT ends in a digit, not in its sign: it is a finished number
+        # sitting next to you, and nothing about it reaches across.
+        assert classify_abutting_affix("-3", from_end=True) is None
+
+    def test_a_raised_attached_sign_on_the_right_is_an_exponent(self) -> None:
+        # `always_reaches` is the caller's geometry override and must survive any
+        # rearrangement of the gate order above it.
+        assert classify_abutting_affix("-3", from_end=False, always_reaches=True) is AffixClass.SIGN
+
+    def test_a_left_neighbour_agrees_with_the_standalone_classifier_on_every_token(self) -> None:
+        # from_end=True is the direction in which EVERY affix reaches, so on that side
+        # the abutting classifier must be a strict extension of `classify_affix` -- a
+        # whole-token affix, the unmapped-glyph shape, and nothing dropped between them.
+        for token in (*_AFFIX_TOKENS, "/C0", "(cid:3)", "�"):
+            assert classify_abutting_affix(token, from_end=True) is classify_affix(token)
+
+    def test_the_mirror_case_is_accepted_and_this_pins_the_hole(self) -> None:
+        """The same binary operator, ATTACHED, passes -- by design and at a known cost.
+
+        Refusing a leading sign on your right-hand neighbour would reject every row
+        containing a negative number, so the filter lets it through. That admits 13
+        corpus proposals whose right neighbour is an attached sign, and they are not all
+        negative values: 5 are page ranges in a reference list (``1810`` beside
+        ``-1818.``) and 3 are the ``+O`` of a reaction equation. Pinned rather than
+        commented so the hole is visible in the suite, and so a future rule that closes
+        it has a test to change rather than a paragraph to find.
+        """
+        for token in ("-1818.", "+O", "-40"):
+            assert classify_abutting_affix(token, from_end=False) is None
+
+    def test_an_unreadable_glyph_refuses_from_either_side(self) -> None:
+        # SIGN here is a fail-closed PROXY for "this glyph was never read", not a claim
+        # that it is a sign -- so the direction argument, which is an argument about
+        # signs, must not be applied to it in either direction.
+        for token in ("/C0", "(cid:3)", "�"):
+            assert classify_abutting_affix(token, from_end=False) is AffixClass.SIGN
+            assert classify_abutting_affix(token, from_end=True) is AffixClass.SIGN

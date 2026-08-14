@@ -290,11 +290,50 @@ def classify_affix(token: str) -> AffixClass | None:
     return _AFFIX_TOKENS.get(stripped)
 
 
-#: Which way an affix REACHES. A sign binds to the number on its right (``-1.0``), so a
-#: leading ``-`` on the token to your right belongs to that token's own value and is no
-#: threat to you. A decimal point, a multiplication glyph and a relational operator all
-#: reach both ways -- the ``.`` of ``3`` ``.14`` binds LEFT, and mistaking that for a
-#: neighbouring cell turns ``3.14`` into ``3``.
+#: Which way an ATTACHED affix REACHES. A sign binds to the number on its right
+#: (``-1.0``), so a leading ``-`` on the token to your right belongs to that token's own
+#: value and is no threat to you. A decimal point, a multiplication glyph and a relational
+#: operator all reach both ways -- the ``.`` of ``3`` ``.14`` binds LEFT, and mistaking
+#: that for a neighbouring cell turns ``3.14`` into ``3``.
+#:
+#: **This table describes an ATTACHED affix, and a DETACHED sign is a different object.**
+#: What makes the ``-`` of ``-3`` that number's own sign is that it is printed against its
+#: digits. A token that is ENTIRELY a sign is bound to nothing, and geometry cannot say
+#: which side it belongs to -- so it is refused from both, which is the fail-closed
+#: direction for a layer that only ever refuses.
+#:
+#: That refusal is worth a real recall cost, because on real pages the detached sign is
+#: usually not a sign at all. Measured over the 8-paper corpus, joined to the shipped
+#: refusal by proposal identity: **157** sites have a bare numeral whose nearest right-hand
+#: neighbour is a whole-token ``+``/``-``/``–``/``þ``; **128** of those are refused by this
+#: rule in production and the other 29 refuse earlier anyway (27 straddled, 2 rotated
+#: neighbour). Of the 157, **148** are followed by a WORD -- a reaction equation, or the
+#: suspended hyphen of ``5- and 10-atm`` -- 5 sit between two numerals as an operator or a
+#: citation range (``[8–13]``), 2 have nothing after them, and the 2 that hug the numeral
+#: after them are a range (``1-2``) and a sum (``96 + 160``) on inspection. **Zero of 157
+#: are the next cell's negative value.** Every one of those constructs reaches LEFT.
+#:
+#: Two limits on that census, both real:
+#:
+#: - It is EXTRA-PROCEDURAL. Production never asks what follows the sign; it classifies the
+#:   nearest neighbour's edge token and stops. The census justifies the refusal, it does not
+#:   describe the gate.
+#: - It says nothing about a genuinely detached sign in a table that sets its signs in
+#:   their own column, which is a real layout. Such a sign IS a sign; this module still
+#:   refuses it, and the refusal is right for the reason above -- geometry cannot attach
+#:   it -- not because the glyph stopped being a sign.
+#:
+#: The mirror case is NOT covered and is measured rather than hidden: an ATTACHED sign to
+#: your right (``+160``, ``–1818.``) passes the filter by design, because refusing it would
+#: reject every row containing a negative number. On this corpus that admits **13**
+#: proposals whose right-hand neighbour is an attached sign, of which 5 are page ranges in
+#: a reference list (``1810`` beside ``–1818.``) and 3 are the ``+O`` of a reaction
+#: equation. The same binary operator this table refuses when detached is accepted when
+#: attached, and no geometry available here separates the two.
+#:
+#: This is why :func:`classify_abutting_affix` classifies a whole-token affix BEFORE
+#: consulting this table rather than after, and why that order is a fixture rather than an
+#: oversight -- see the refusal it pins in ``tests/test_numeric.py``.
 _LEFT_REACHING = frozenset({AffixClass.DECIMAL, AffixClass.EXPONENT, AffixClass.RELATIONAL})
 
 
@@ -329,6 +368,15 @@ def classify_abutting_affix(token: str, *, from_end: bool, always_reaches: bool 
     next cell's negative value, but the same ``−3`` set 3 pt higher is your exponent,
     because a superscript binds to what precedes it. Position, not content, is what
     separates the two, and only the caller can see position -- so the caller says so.
+
+    A token that is ENTIRELY an affix is classified FIRST, and therefore never meets the
+    direction filter. That ordering looks like an inconsistency -- ``-3`` on your right is
+    let through while a bare ``-`` on your right refuses -- and it is not one: the
+    direction rule is a statement about a sign ATTACHED to its digits, and a detached sign
+    is one nothing here can attach to either side. :data:`_LEFT_REACHING` carries the
+    corpus census and the two limits on it. Restoring the "consistency" would publish 71
+    corpus regions whose only refusal is this one, among them the ``11`` of a citation
+    range ``[8–13]``.
     """
     stripped = token.strip()
     if not stripped:
