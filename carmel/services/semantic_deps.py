@@ -1365,18 +1365,23 @@ class FragmentGeometryIdentity:
         pypdf_version: The installed ``pypdf`` version string, or
             :data:`_PYPDF_VERSION_UNKNOWN` if it could not be determined.
 
-            Read through :func:`_pypdf_version` (``pypdf.__version__``), NOT through
-            ``importlib.metadata.version("pypdf")`` as ``extract_fragments`` itself does at
-            ``pdf_fragments.py:642``. Those are two different witnesses to the same fact --
-            the package's own declared string versus installed distribution metadata -- and
-            they can legitimately disagree for an editable, vendored or shadowed install,
-            which would manufacture an identity mismatch for one unchanged runtime. They
-            agree on the pinned ``6.14.2``, so this is a latent divergence, not a live one;
-            one witness is chosen here rather than left to chance. ``_pypdf_version`` is the
-            one chosen because it is total: it collapses every failure to
-            :data:`_PYPDF_VERSION_UNKNOWN`, whereas ``importlib.metadata.version`` raises
-            ``PackageNotFoundError``. Reconciling the extractor's own call site is a
-            separate change -- it alters shipped runtime behaviour, not just identity.
+            Read through :func:`_pypdf_version` (``pypdf.__version__``), which is NOT the
+            witness the engine gate uses: ``_engine()`` admits the library only after
+            ``importlib.metadata.version("pypdf")`` equals
+            :data:`_PINNED_PYPDF_VERSION`. Those are two different witnesses to the same
+            fact -- the package's own declared string versus installed distribution
+            metadata -- and they can legitimately disagree for an editable, vendored or
+            shadowed install, which would manufacture an identity mismatch for one
+            unchanged runtime. They agree on the pinned ``6.14.2``, so this is a latent
+            divergence, not a live one; one witness is chosen here rather than left to
+            chance. ``_pypdf_version`` is the one chosen because it is total: it collapses
+            every failure to :data:`_PYPDF_VERSION_UNKNOWN`, whereas
+            ``importlib.metadata.version`` raises ``PackageNotFoundError``.
+
+            ``extract_fragments`` is no longer a third reading of this: it records the
+            :data:`_PINNED_PYPDF_VERSION` constant that ``_engine()`` already proved,
+            rather than re-reading metadata. So the divergence is now between exactly two
+            call sites, the gate and this identity -- not three.
     """
 
     composite_sha256: str
