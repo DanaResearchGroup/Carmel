@@ -366,6 +366,49 @@ def test_changing_only_a_module_level_docstring_does_not_change_the_sha() -> Non
     assert perturbed_sha == original_sha
 
 
+def test_changing_a_field_doc_DOES_change_the_sha() -> None:
+    """The boundary of "docstring-insensitive", pinned as behaviour because the phrase
+    reads wider than it is and the gap has already cost a real edit.
+
+    A docstring is the FIRST statement of a body. The PEP 258 attribute doc -- a bare
+    string after `field: int` in a class body -- is an ordinary `Expr` and is hashed as
+    CODE. So documenting a field of a hashed dataclass needs a supersession while
+    documenting a function is free, which is the opposite of what a reader assumes.
+
+    Asserted in the POSITIVE direction on purpose. A test that only checked function
+    docstrings are ignored would pass just as happily if field docs were ignored too,
+    and the next reader "simplifying" `_strip_docstrings` to strip every string
+    statement would break every stored geometry identity with a green suite.
+    """
+    source = "\n".join(
+        (
+            "import dataclasses",
+            "@dataclasses.dataclass",
+            "class Thing:",
+            "    field: int",
+            '    """{doc}"""',
+        )
+    )
+    first = compute_dependency_sha(source.format(doc="what it was"), ["Thing"])
+    second = compute_dependency_sha(source.format(doc="what it became"), ["Thing"])
+    assert first != second
+
+    # And the contrast, in one test so the two can never drift apart: the class's own
+    # docstring -- same file, same class, one statement earlier -- is free.
+    with_class_doc = "\n".join(
+        (
+            "import dataclasses",
+            "@dataclasses.dataclass",
+            "class Thing:",
+            '    """{doc}"""',
+            "    field: int",
+        )
+    )
+    assert compute_dependency_sha(with_class_doc.format(doc="one"), ["Thing"]) == compute_dependency_sha(
+        with_class_doc.format(doc="two"), ["Thing"]
+    )
+
+
 def test_changing_only_a_nested_function_docstring_does_not_change_the_sha() -> None:
     """Docstring stripping must be recursive: a change to a docstring nested inside a
     closure member's own nested function/class body must also not change the sha."""

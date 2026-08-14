@@ -612,6 +612,61 @@ def _pen_x_after(show: Any) -> float:
       ~4 pt left of where pdfminer puts the first character, with every internal advance
       still exact. Different root cause, not fixed here, and not to be conflated with
       this one.
+
+    **The standing report that this should use the full matrix is false, and measuring it
+    found something else.** Scaling a text-space ``dx`` by ``a`` alone gives the x
+    component and drops the y one, which sounds like a bug and is not one here. Censused
+    over all 78,178 corpus shows, split on whether pypdf REWROTE the matrix in
+    ``TextStateParams.__post_init__``:
+
+    * 77,911 upright, ``b == c == 0``, where ``dx * a`` IS the complete projection;
+    * 267 where pypdf multiplied by ``[1, -b, -c, 1, 0, 0]`` -- not a rotation, and it
+      does not preserve length -- then recomputed ``tx`` and ``displaced_tx`` from the
+      rewritten matrix. Here the delta is scaled by a factor pypdf invented and added to
+      a number derived from the same invented matrix. A correct term added to a
+      meaningless number is not a fix;
+    * **0** with the document's own matrix and ``b != 0``, which is the only population
+      where the reported defect could fire.
+
+    What the census DID find is 2,800x larger and is not in this function. On those 267
+    shows ``x_end`` is not a page x at all: on a y-axis title in
+    ``10.1016-j.ijhydene.2013.10.164.pdf`` p11 this publishes ``x_end = 480.85`` where
+    pdfminer -- sharing no code with pypdf -- measures the ink ending at 94.63, and the
+    second label on the same page publishes 699.78 on a page 595.28 pt wide. ``x_start``
+    and ``baseline_y`` are correct; only the advance is garbage. Every such show carries
+    ``rotated=True``, and :mod:`carmel.services.pdf_cells` refuses to compare a rotated
+    fragment's horizontal extent before any test reads it, which is why this is recorded
+    rather than superseded.
+
+    **The one part of that which is measured rather than guaranteed.**
+    :attr:`TextFragment.rotated` carries pypdf's normalization flag, set only when
+    ``orient()`` returns 90, 270, or a negative-``a`` 180 -- and ``orient()`` returns 0
+    whenever ``m[3] > 1e-6``::
+
+        def orient(m: list[float]) -> int:
+            if m[3] > 1e-6:
+                return 0
+            ...
+
+    So **every angle strictly between -90 and +90 buckets to 0**, is left un-normalized,
+    and publishes ``rotated=False``. The corpus cross-tab has no such cell -- 77,911
+    upright and 267 rotated, nothing between -- so the proxy holds on every document in
+    hand, and `pdf_cells`' two rotated guards would simply not fire on a document that
+    populated it. Such a fragment fails DIFFERENTLY, which is why it is worth stating
+    separately: its ``x_end`` is correct, because the matrix is the document's own and
+    ``tx + dx*a`` is the true page x. What is lost is that ``baseline_y`` records one
+    scalar for a run that also climbs by ``dx*b``. Recorded rather than guarded, because
+    a guard for a population no document in hand contains could only ever be tested
+    against synthetic evidence.
+
+    **Where this note lives is itself a finding.** It sat on
+    :attr:`TextFragment.rotated` first, and moving it here was not editorial: a field's
+    doc string is NOT a docstring. It is an ordinary ``Expr`` statement in the class
+    body, so :func:`~carmel.services.semantic_deps.compute_dependency_sha`'s recursive
+    docstring stripping -- which only ever removes a body's FIRST statement -- does not
+    reach it, and it is hashed as code. Documenting a field therefore costs a geometry
+    supersession; documenting a function costs nothing. Verified by recomputing the own
+    component with and without this paragraph in each position.
     """
     glyphs = _glyphs_drawn(show)
     if glyphs < 2 or not show.Tc:

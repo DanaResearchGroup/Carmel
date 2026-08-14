@@ -505,6 +505,25 @@ def _normalized_dump(definition: ast.stmt) -> str:
     ``annotate_fields=True, include_attributes=False`` -- the defaults omit
     ``lineno``/``col_offset``/etc, so position information never affects the
     dump either).
+
+    **"Docstring-insensitive" is narrower than it reads, and the gap has already
+    bitten once.** A docstring is the FIRST statement of a module, class, or
+    function body, and that is exactly what :func:`_strip_docstrings` removes. The
+    PEP 258 attribute doc -- a bare string sitting after ``field: int`` in a class
+    body -- is not one. It is an ordinary ``Expr`` statement, it survives the
+    stripping, and it is hashed as code. So documenting a FIELD of a hashed
+    dataclass moves that dependency's sha and needs a supersession, while
+    documenting a function does not. Every field of
+    :class:`carmel.services.pdf_fragments.TextFragment` carries such a string, so
+    this is not a hypothetical corner: see :func:`~carmel.services.pdf_fragments._pen_x_after`,
+    which holds a paragraph that lives there rather than on the field it describes
+    for precisely this reason.
+
+    Not "fixed" by stripping those too. A field doc is positionally
+    indistinguishable from a bare string expression a caller might rely on, and
+    hashing MORE than the semantics is the safe direction for a content address:
+    it can only ever cause a spurious supersession, never a silent reuse of an
+    identity whose behaviour moved.
     """
     unparsed_source = ast.unparse(definition)
     reparsed = ast.parse(unparsed_source)
