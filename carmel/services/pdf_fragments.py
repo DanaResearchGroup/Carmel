@@ -39,6 +39,7 @@ import importlib.metadata
 import io
 import logging
 import re
+import zlib
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any
@@ -242,7 +243,7 @@ def _engine() -> tuple[Any, ...] | None:
         from pypdf._text_extraction._layout_mode._text_state_params import (
             TextStateParams,
         )
-        from pypdf.generic import ContentStream
+        from pypdf.generic import ContentStream, StreamObject
     except Exception:  # pragma: no cover - exercised via monkeypatch in tests
         logger.debug("pypdf layout-mode internals unavailable", exc_info=True)
         return None
@@ -269,6 +270,22 @@ def _engine() -> tuple[Any, ...] | None:
         if attr not in available_names:
             logger.warning("pypdf TextStateParams lacks %s; fragments unavailable", attr)
             return None
+
+    # `_decoded_content_length` reads `StreamObject._data`, the RAW still-compressed
+    # bytes, because bounding a decode needs the decode's INPUT and pypdf's public
+    # `get_data()` returns only its output -- already materialised, which is the whole
+    # defect. Probed on an INSTANCE and not on the class: pypdf sets `_data` in
+    # `__init__` with no annotation and an empty `__slots__`, so the class carries no
+    # trace of it and a `hasattr` there would refuse every healthy pypdf. Checked here
+    # rather than at the point of use for the reason the whole gate exists: a per-page
+    # AttributeError is caught as a page failure, so an engine-wide mismatch would
+    # present as "a valid document where every page happened to fail".
+    try:
+        if not hasattr(StreamObject(), "_data"):
+            raise AttributeError("_data")
+    except Exception:
+        logger.warning("pypdf StreamObject lacks _data; fragments unavailable")
+        return None
 
     # The geometry is the evidence, and no attribute check can detect a release that
     # keeps every name while changing what the numbers MEAN. pypdf is pinned exactly
@@ -377,11 +394,37 @@ MAX_PAGE_CONTENT_BYTES = 6_000_000
 _UNINSPECTABLE_PAGE_ERROR = "page-tree entry could not be inspected; kept as a possible page"
 
 
+#: The ONLY content-stream filter :func:`_decoded_content_length` will decode under a
+#: size bound, as an exact single-stage chain rather than a member of one.
+#:
+#: An allowlist and not a blocklist, because the question is not "which filters are
+#: dangerous" but "which can this module bound", and the answer has to shrink safely when
+#: a filter nobody anticipated arrives. See :func:`_decoded_content_length` for the corpus
+#: measurement of what refusing everything else costs (nothing, on 161 of 161 streams) and
+#: for what that zero does not prove.
+_ALLOWED_CONTENT_FILTER = "/FlateDecode"
+
+
 class PageContentTooLarge(Exception):
     """One page's decompressed content stream exceeds :data:`MAX_PAGE_CONTENT_BYTES`.
 
     A page failure, not an engine failure: the class name lands verbatim in the stored
     ``FragmentPageFailure.error``, so it is spelled without a leading underscore.
+    """
+
+
+class PageContentUndecodable(Exception):
+    """One page's content stream cannot be decoded under a size bound at all.
+
+    Distinct from :class:`PageContentTooLarge`, and the distinction is the point: that one
+    says the page is too big, this one says its SIZE COULD NOT BE ESTABLISHED. Conflating
+    them would report a filter this module declines to handle as if the document were
+    oversized, which is a claim about the document rather than about this module's reach.
+
+    A page failure, not an engine failure, and spelled without a leading underscore for
+    the same reason as its sibling: the class name lands verbatim in the stored
+    ``FragmentPageFailure.error``. It is per-page on purpose -- one stream with an
+    unexpected filter costs its own page and nothing else.
     """
 
 
@@ -394,8 +437,24 @@ class _EngineMismatch(Exception):
     """
 
 
-def _decoded_content_length(contents: Any) -> int:
-    """Decompressed size of a page's ``/Contents``, without retaining the bytes.
+def _declared_filters(stream: Any) -> tuple[str, ...]:
+    """The filter chain one stream declares, in application order.
+
+    ``/Filter`` is legally a single name or an array of them, and the array form is a
+    CHAIN: each stage feeds the next. Normalising both to a tuple is what lets the
+    allowlist below be a comparison against one exact value rather than a membership
+    test that would accept ``[/ASCII85Decode, /FlateDecode]`` because Flate is in it.
+    """
+    declared = stream.get("/Filter")
+    if declared is None:
+        return ()
+    if isinstance(declared, list):
+        return tuple(str(entry) for entry in declared)
+    return (str(declared),)
+
+
+def _decoded_content_length(contents: Any, limit: int) -> int:
+    """Decompressed size of a page's ``/Contents``, bounded at ``limit`` bytes.
 
     ``/Contents`` is either one stream or an array of them that concatenate into a
     single stream, and only the sum bounds the parse -- a page split into a thousand
@@ -406,12 +465,80 @@ def _decoded_content_length(contents: Any) -> int:
     pypdf internals this module names to a minimum. A part that is neither raises, and
     the caller records the page as failed -- the fail-closed direction.
 
-    This decodes, and :class:`ContentStream` will decode again immediately afterwards.
-    The duplicated CPU is accepted deliberately: the alternative is to let the parse run
-    first and measure the damage after it is done.
+    **Why this does not simply call** ``get_data()``. It used to, and measuring a length
+    that way requires materialising the whole decompressed stream first, so a
+    compression bomb allocated its full size before :data:`MAX_PAGE_CONTENT_BYTES` could
+    reject it -- the cap bounded the 33x parse amplification but not the decode. The
+    bound is applied to the decode instead, by decompressing through
+    :func:`zlib.decompressobj` with an output ceiling and refusing the moment input is
+    left over.
+
+    **Why an allowlist of exactly one filter is honest rather than a half-measure.** A
+    guard that bounded Flate and quietly fell through to ``get_data()`` for anything else
+    would read as a bound while being none, which is worse than the documented absence it
+    replaced. This one fails CLOSED: any other filter, any chain, and any
+    ``/DecodeParms`` is a page failure, recorded and visible. Measured before it was
+    written -- across the 8-paper corpus, all 73 content-bearing pages and all 161
+    streams are single-stage ``/FlateDecode`` with no ``/DecodeParms``, so the refusal
+    costs nothing on real publisher articles. It has a price nonetheless, stated rather
+    than glossed: **the refusal branch is unexercised by every document in hand**, so
+    only synthetic fixtures reach it, and a legitimate PDF using a different filter loses
+    a page. That is the fail-closed direction, and a page failure is recorded per page.
+
+    **Why bare zlib is allowed to stand in for pypdf's Flate.** It is not a
+    reimplementation of the filter stack, which is the thing this project refuses to do:
+    it is the same ``zlib`` call pypdf makes first, and pypdf's extra machinery is
+    RECOVERY for streams where that call fails. So whenever this succeeds, pypdf's decode
+    of the same bytes is the same bytes -- verified on all 161 corpus streams, byte for
+    byte, against ``get_data()`` as the oracle -- and whenever it fails, this refuses the
+    page rather than guessing. The residual is a stream pypdf could recover and this
+    cannot, which becomes a recorded page failure instead of a silent difference.
+
+    ``ContentStream`` still decodes again immediately afterwards, and that second decode
+    is now bounded by this one having passed: the duplicated CPU is accepted for the same
+    reason as before, that the alternative is to let the parse run and measure the damage
+    after it is done.
     """
     parts = contents if isinstance(contents, list) else [contents]
-    return sum(len(part.get_object().get_data()) for part in parts)
+    total = 0
+    for part in parts:
+        stream = part.get_object()
+        filters = _declared_filters(stream)
+        if filters not in ((), (_ALLOWED_CONTENT_FILTER,)):
+            raise PageContentUndecodable(
+                f"page content stream declares filters {filters!r}; only a single "
+                f"{_ALLOWED_CONTENT_FILTER} can be decoded under a size bound"
+            )
+        if stream.get("/DecodeParms"):
+            raise PageContentUndecodable(
+                "page content stream carries /DecodeParms; a predictor changes what a "
+                "byte bound bounds, so the size cannot be established"
+            )
+
+        raw = bytes(stream._data)
+        if not filters:
+            # Unfiltered: the stored bytes ARE the content, so its size is already known
+            # without decoding anything. Admitted rather than refused because there is
+            # nothing here to bound -- refusing it would be refusing the one case that
+            # cannot bomb.
+            total += len(raw)
+        else:
+            # `+ 1` past the remaining budget so that a stream landing EXACTLY on the cap
+            # is distinguishable from one that exceeds it, without decompressing the
+            # excess. `unconsumed_tail` is non-empty precisely when the ceiling stopped
+            # the decode early, which is the over-cap signal; a clean decode consumes all
+            # input and leaves it empty.
+            engine = zlib.decompressobj()
+            try:
+                decoded = engine.decompress(raw, max(limit - total, 0) + 1)
+            except zlib.error as exc:
+                raise PageContentUndecodable(f"page content stream could not be inflated: {exc}") from exc
+            if engine.unconsumed_tail:
+                raise PageContentTooLarge(f"page content stream decompresses past the {limit}-byte cap")
+            total += len(decoded)
+        if total > limit:
+            raise PageContentTooLarge(f"page content stream decompresses past the {limit}-byte cap")
+    return total
 
 
 def _glyphs_drawn(show: Any) -> int:
@@ -530,11 +657,12 @@ def _page_fragments(
     if contents is None:
         return [], False
     resolved = contents.get_object()
-    decoded_bytes = _decoded_content_length(resolved)
-    if decoded_bytes > MAX_PAGE_CONTENT_BYTES:
-        raise PageContentTooLarge(
-            f"page content stream is {decoded_bytes} decompressed bytes, over the {MAX_PAGE_CONTENT_BYTES}-byte cap"
-        )
+    # The cap is enforced INSIDE, and no second check follows it here. The measurement
+    # and the refusal used to be two steps -- measure, then compare -- and that shape is
+    # what let the decode allocate the whole stream before the comparison could run. A
+    # belt-and-braces `> MAX` here would now be unreachable, and an unreachable guard is a
+    # silent no-op that reads like protection.
+    _decoded_content_length(resolved, MAX_PAGE_CONTENT_BYTES)
     content = content_stream(resolved, page.pdf, "bytes")
     ops: Iterator[tuple[list[Any], bytes]] = iter(content.operations)
 

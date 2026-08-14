@@ -965,9 +965,20 @@ _EXTRACT_TEXT_SHA256 = "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed
 _FRAGMENT_GEOMETRY_OWN_SHA256_V1 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
 _FRAGMENT_GEOMETRY_SHA256_V1 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
 
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "96b5852b71496f062dd1d36b255f98feb952baf89fe7e4fb995b93ce00a56f5e"
+# SUPERSEDED, and kept forever -- the SECOND fragment-geometry entry, registered while
+# `_decoded_content_length` still measured a page by decoding it in full through
+# `get_data()` and comparing afterwards. Bounding that decode changes which pages become
+# failures (a stream with an unhandled filter, or one bare zlib cannot inflate, now
+# fails its page), so it moved the OWN component and therefore the composite. The
+# BORROWED component did not move -- the second time in a row the split has localized a
+# change to `pdf_fragments` and said, positively, that nothing in a module this one
+# cannot see had shifted underneath it.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V2 = "96b5852b71496f062dd1d36b255f98feb952baf89fe7e4fb995b93ce00a56f5e"
+_FRAGMENT_GEOMETRY_SHA256_V2 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b"
+
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b"
+_FRAGMENT_GEOMETRY_SHA256 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1010,6 +1021,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
             # duplication to factor out: recording it per-composite is what lets a future
             # reader see that this supersession did NOT touch the borrowed half. A shared
             # reference would express "the same today", not "the same when each shipped".
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V2: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V2,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1107,6 +1123,16 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V1,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        # The SECOND supersession. The first was worth doing because nothing depended on
+        # the sha yet; this one is the evidence that the path stayed cheap -- it is the
+        # same four edits, and the components table is what makes a stored artifact
+        # citing either superseded row still resolvable to the half that moved.
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V2,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

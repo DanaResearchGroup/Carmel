@@ -8,6 +8,9 @@ the content stream states where each glyph is placed, so ground truth is known.
 
 from __future__ import annotations
 
+import tracemalloc
+import zlib
+
 import pytest
 
 import carmel.services.pdf_fragments as pdf_fragments
@@ -47,6 +50,38 @@ def _one_page_pdf(stream: str) -> bytes:
             b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
             b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
             b"<< /Length " + str(len(body)).encode() + b" >>\nstream\n" + body + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        ]
+    )
+
+
+def _one_page_filtered_pdf(stream: str, *, filters: str, parms: str = "", raw: bytes | None = None) -> bytes:
+    """A single-page PDF whose content stream declares ``filters``.
+
+    Every other fixture here writes an UNFILTERED content stream, which reaches only the
+    branch of :func:`~carmel.services.pdf_fragments._decoded_content_length` that needs no
+    decoding at all. The bounded-decode path and its fail-closed refusals are unreachable
+    without this, and the real corpus cannot stand in for it: no paper text may enter the
+    repository, and all 161 corpus streams are the one filter that is allowed anyway.
+
+    ``raw`` overrides the compressed bytes, so a test can present a stream whose declared
+    filter and actual payload disagree.
+    """
+    body = zlib.compress(stream.encode("latin-1")) if raw is None else raw
+    return _pdf(
+        [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length "
+            + str(len(body)).encode()
+            + b" /Filter "
+            + filters.encode()
+            + (b" /DecodeParms " + parms.encode() if parms else b"")
+            + b" >>\nstream\n"
+            + body
+            + b"\nendstream",
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         ]
     )
@@ -801,15 +836,117 @@ class TestOnePageCannotCostUnboundedMemory:
 
     def test_a_page_exactly_on_the_cap_is_kept(self, monkeypatch) -> None:
         """`>` and not `>=`: a cap that refuses the value it names would make every
-        headroom figure in its docstring off by one."""
-        require_pypdf()
-        monkeypatch.setattr(pdf_fragments, "_decoded_content_length", lambda contents: 100)
-        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 100)
-        assert extract_fragments(_one_page_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET")).page_failures == ()
+        headroom figure in its docstring off by one.
 
-        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 99)
-        refused = extract_fragments(_one_page_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET"))
+        Driven through the REAL measurement rather than a stub returning 100. The boundary
+        now lives inside `_decoded_content_length`, so stubbing that function out would
+        assert on the caller's arithmetic -- which this change deleted, precisely because
+        measure-then-compare is the shape that let the decode run unbounded.
+        """
+        require_pypdf()
+        body = "BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET"
+        exact = len(body.encode("latin-1"))
+
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", exact)
+        assert extract_fragments(_one_page_pdf(body)).page_failures == ()
+
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", exact - 1)
+        refused = extract_fragments(_one_page_pdf(body))
         assert "PageContentTooLarge" in refused.page_failures[0].error
+
+    def test_a_flate_page_under_the_cap_extracts_normally(self) -> None:
+        """The allowed filter, end to end. Every other fixture in this file is unfiltered,
+        so without this the bounded-decode branch ships exercised by nothing."""
+        require_pypdf()
+        result = extract_fragments(
+            _one_page_filtered_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (ok) Tj ET", filters="/FlateDecode")
+        )
+        assert result.page_failures == ()
+        assert [fragment.text for fragment in result.fragments] == ["ok"]
+
+    def test_a_compression_bomb_is_refused_without_being_allocated(self, monkeypatch) -> None:
+        """The defect this whole change exists for, and the only test that can show it.
+
+        Refusing the page was never the hard part -- the OLD code refused it too, after
+        calling `get_data()` and materialising every byte. What has to be demonstrated is
+        that the refusal now happens WITHOUT that allocation, so the assertion is on peak
+        heap during the call and not on the exception.
+
+        64 MB of zeros compress to about 64 KB. The cap is set to 1 KB, and peak allocation
+        is required to stay under 4 MB: comfortably above the compressed input and the
+        decode ceiling, and two orders of magnitude below what the old path would have
+        allocated. A generous bound rather than a tight one, because the number that
+        matters is the ORDER, and a tight one would fail on an unrelated allocation.
+        """
+        require_pypdf()
+        bomb = zlib.compress(b"\0" * (64 * 1024 * 1024))
+        assert len(bomb) < 200_000, "the fixture must be small compressed, or it proves nothing"
+        monkeypatch.setattr(pdf_fragments, "MAX_PAGE_CONTENT_BYTES", 1024)
+
+        tracemalloc.start()
+        try:
+            result = extract_fragments(_one_page_filtered_pdf("", filters="/FlateDecode", raw=bomb))
+            _current, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        assert "PageContentTooLarge" in result.page_failures[0].error
+        assert peak < 4 * 1024 * 1024, f"peak allocation was {peak} bytes; the decode was not bounded"
+
+    def test_an_unsupported_filter_fails_the_page_closed(self) -> None:
+        """Fail CLOSED, and as its own reason. A guard that bounded Flate and fell through
+        to `get_data()` for everything else would read as a bound while being none."""
+        require_pypdf()
+        result = extract_fragments(
+            _one_page_filtered_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET", filters="/LZWDecode")
+        )
+        assert "PageContentUndecodable" in result.page_failures[0].error
+        assert result.fragments == ()
+
+    def test_a_filter_chain_containing_flate_is_still_refused(self) -> None:
+        """The allowlist compares the whole chain, not membership. `[/ASCII85Decode
+        /FlateDecode]` contains the allowed filter and is still undecodable under a bound,
+        because the outer stage has already allocated by the time the inner one runs."""
+        require_pypdf()
+        result = extract_fragments(
+            _one_page_filtered_pdf("BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET", filters="[/ASCII85Decode /FlateDecode]")
+        )
+        assert "PageContentUndecodable" in result.page_failures[0].error
+
+    def test_decode_parms_are_refused_even_with_the_allowed_filter(self) -> None:
+        """A predictor changes what a byte bound bounds: the decompressed stream is not
+        the decoded content, so a size established before the predictor runs is not the
+        size that gets parsed."""
+        require_pypdf()
+        result = extract_fragments(
+            _one_page_filtered_pdf(
+                "BT /F1 9 Tf 1 0 0 1 72 700 Tm (A) Tj ET",
+                filters="/FlateDecode",
+                parms="<< /Predictor 12 /Columns 4 >>",
+            )
+        )
+        assert "PageContentUndecodable" in result.page_failures[0].error
+
+    def test_a_corrupt_flate_stream_fails_the_page_rather_than_the_document(self) -> None:
+        """The residual this change accepts, pinned so it stays visible: pypdf's own
+        FlateDecode carries recovery machinery for damaged streams and bare zlib does not,
+        so a stream pypdf could salvage becomes a recorded page failure here. Per page,
+        named, and never a silent difference in the fragments."""
+        require_pypdf()
+        result = extract_fragments(
+            _one_page_filtered_pdf("", filters="/FlateDecode", raw=b"not a deflate stream at all")
+        )
+        assert "PageContentUndecodable" in result.page_failures[0].error
+        assert result.available is True
+        assert result.lossy is True
+
+    def test_the_two_page_failure_reasons_are_never_conflated(self) -> None:
+        """Too big and undecodable are different claims: one is about the document, the
+        other about this module's reach. Reporting an unhandled filter as an oversized
+        page would blame the PDF for a limit that lives here."""
+        assert pdf_fragments.PageContentTooLarge is not pdf_fragments.PageContentUndecodable
+        assert not issubclass(pdf_fragments.PageContentUndecodable, pdf_fragments.PageContentTooLarge)
+        assert not issubclass(pdf_fragments.PageContentTooLarge, pdf_fragments.PageContentUndecodable)
 
     def test_the_shipped_cap_admits_the_largest_real_corpus_page(self) -> None:
         """836,591 B is the largest decompressed page in the 8-paper corpus (median
