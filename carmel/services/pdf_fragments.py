@@ -639,7 +639,20 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
     if engine is None:
         return FragmentExtraction(lossy=True, available=False)
 
-    version = importlib.metadata.version("pypdf")
+    # NOT a second `importlib.metadata.version("pypdf")` call, which is what this was.
+    #
+    # `_engine()` has already returned non-None above, and it only does that after reading
+    # that exact metadata entry and refusing unless it equals _PINNED_PYPDF_VERSION. So a
+    # re-read here could only ever produce the same string -- while adding two ways to be
+    # wrong that the constant does not have. It sat OUTSIDE the `try` below, so a metadata
+    # failure raised `PackageNotFoundError` straight out of a function whose docstring
+    # promises it never raises for a malformed document; and being a second read of a
+    # mutable source, it could in principle disagree with the value the gate approved,
+    # recording on the artifact a version that was never the one admitted.
+    #
+    # Recording the gate's own constant says exactly what is true and no more: this
+    # extraction ran against the pinned pypdf, because nothing else gets this far.
+    version = _PINNED_PYPDF_VERSION
     fragments: list[TextFragment] = []
     failures: list[FragmentPageFailure] = []
     lossy = False

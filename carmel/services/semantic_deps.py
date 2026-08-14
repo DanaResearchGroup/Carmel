@@ -956,9 +956,18 @@ _EXTRACT_TEXT_SHA256 = "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed
 # so that a failing pin says WHICH half moved: geometry code, or a borrowed name's
 # behaviour in a module this one cannot see. A single composite pin would report only that
 # something, somewhere, changed.
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
+# SUPERSEDED, and kept forever -- the first fragment-geometry entry, registered while
+# `extract_fragments` still recorded its pypdf version with a second
+# `importlib.metadata.version` call. Removing that read moved the OWN component and
+# therefore the composite. The BORROWED component did not move at all, which is the
+# component split doing precisely what it exists to do: the failure localizes to
+# `pdf_fragments`, and nothing suggests a borrowed name's behaviour changed.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V1 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
+_FRAGMENT_GEOMETRY_SHA256_V1 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
+
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "96b5852b71496f062dd1d36b255f98feb952baf89fe7e4fb995b93ce00a56f5e"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
+_FRAGMENT_GEOMETRY_SHA256 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b"
 
 
 @dataclass(frozen=True, slots=True)
@@ -995,6 +1004,15 @@ class _FragmentGeometryComponents:
 #: composite raises this module's own error type rather than a bare ``KeyError``.
 _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] = MappingProxyType(
     {
+        _FRAGMENT_GEOMETRY_SHA256_V1: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V1,
+            # Identical to the current entry's, and that is the point rather than a
+            # duplication to factor out: recording it per-composite is what lets a future
+            # reader see that this supersession did NOT touch the borrowed half. A shared
+            # reference would express "the same today", not "the same when each shipped".
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
         _FRAGMENT_GEOMETRY_SHA256: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
@@ -1079,6 +1097,18 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
             content_sha256=_EXTRACT_TEXT_SHA256,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=True,
+        ),
+        # The registry's first SUPERSESSION, and the first exercise of the append-only
+        # contract it has always claimed. Kept because the row is what a stored artifact
+        # citing this sha would resolve against; dropping it would make such an artifact
+        # indistinguishable from a forged one. There are no such artifacts today -- which
+        # is exactly why superseding now is cheap, and why it was worth doing deliberately
+        # while nothing depends on it rather than discovering the path under pressure.
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V1,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
         ),
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,

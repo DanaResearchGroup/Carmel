@@ -96,6 +96,7 @@ _HISTORICALLY_SHIPPED_SHAS = frozenset(
         _PINNED_GLYPH_HEALTH_SHA256,
         "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168",
         "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb",
+        "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b",
     }
 )
 
@@ -1157,7 +1158,13 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
 #   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
 # This is the half that moves when fragment GEOMETRY changes: it is the sha that
 # distinguishes 7895e00 ("Charge character spacing once per glyph") from its parent.
-_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "96b5852b71496f062dd1d36b255f98feb952baf89fe7e4fb995b93ce00a56f5e"
+
+# The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
+# historical row rather than only asserted in prose. Its own component moved when
+# extract_fragments stopped re-reading importlib.metadata; its BORROWED component did not.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V1 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V1 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
 
 # HARDCODED. Independently verified once via:
 #   compute_dependency_sha(inspect.getsource(extract), list(FRAGMENT_GEOMETRY_BORROWED_NAMES))
@@ -1168,7 +1175,7 @@ _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7
 
 # HARDCODED. The registered content_sha256 itself, verified once via:
 #   compose_component_sha({"borrowed_sha256": <borrowed>, "own_sha256": <own>})
-_PINNED_FRAGMENT_GEOMETRY_SHA256 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b"
 
 # The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
 # completeness claim of the composite identity, spelled out as data: extract_fragments runs
@@ -1497,3 +1504,56 @@ def test_unknown_composite_cannot_be_localized() -> None:
 def test_fragment_geometry_component_record_is_read_only() -> None:
     with pytest.raises(TypeError):
         _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA[_PINNED_FRAGMENT_GEOMETRY_SHA256] = None  # type: ignore[index]
+
+
+def test_the_superseded_fragment_geometry_row_is_still_resolvable() -> None:
+    """The registry's first real supersession, checked as behaviour rather than prose.
+
+    An artifact citing the superseded composite must still resolve to a row that names the
+    right dependency and reports itself NOT current. Dropping the row would make such an
+    artifact indistinguishable from a forged one -- the exact confusion this module was
+    written to prevent.
+    """
+    superseded = dependency_for_sha(_PINNED_FRAGMENT_GEOMETRY_SHA256_V1)
+    assert superseded.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID
+    assert superseded.is_current is False
+    current = dependency_for_sha(_PINNED_FRAGMENT_GEOMETRY_SHA256)
+    assert current.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID
+    assert current.is_current is True
+    assert current_sha_for(FRAGMENT_GEOMETRY_DEPENDENCY_ID) == _PINNED_FRAGMENT_GEOMETRY_SHA256
+
+
+def test_the_supersession_moved_only_the_own_component() -> None:
+    """What the composite split buys, demonstrated on the real supersession rather than on
+    synthetic sources: the pypdf-version change was entirely inside pdf_fragments, so the
+    OWN half moved and the BORROWED half did not. A single opaque sha could not say that."""
+    old = _fragment_geometry_components(_PINNED_FRAGMENT_GEOMETRY_SHA256_V1)
+    new = _fragment_geometry_components(_PINNED_FRAGMENT_GEOMETRY_SHA256)
+    assert old.own_sha256 != new.own_sha256
+    assert old.borrowed_sha256 == new.borrowed_sha256
+    assert old.borrowed_names == new.borrowed_names
+
+
+def test_extract_fragments_records_the_pinned_pypdf_version_without_a_second_metadata_read() -> None:
+    """The recorded version must be the constant `_engine()` already validated against.
+
+    A second `importlib.metadata.version` call was both redundant -- `_engine()` refuses
+    unless that entry equals the pin, so nothing else reaches this point -- and a second
+    way to fail, sitting outside the degradation `try` where it could raise
+    PackageNotFoundError out of a function documented never to raise for a malformed
+    document.
+    """
+    source = inspect.getsource(pdf_fragments)
+    tree = ast.parse(source)
+    extract_fragments_def = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "extract_fragments"
+    )
+    metadata_calls = [
+        node
+        for node in ast.walk(extract_fragments_def)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "version"
+    ]
+    assert not metadata_calls, (
+        "extract_fragments must not re-read the pypdf version; _engine() already validated "
+        "it against _PINNED_PYPDF_VERSION and refused anything else"
+    )
