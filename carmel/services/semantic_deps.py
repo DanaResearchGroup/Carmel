@@ -108,17 +108,22 @@ __all__ = [
     "CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID",
     "GLYPH_HEALTH_DEPENDENCY_ID",
     "EXTRACT_TEXT_DEPENDENCY_ID",
+    "FRAGMENT_GEOMETRY_DEPENDENCY_ID",
+    "FRAGMENT_GEOMETRY_BORROWED_NAMES",
     "DEPENDENCIES_BY_SHA",
     "CURRENT_SHA_BY_DEPENDENCY_ID",
     "ExtractionIdentity",
+    "FragmentGeometryIdentity",
     "InputPolicy",
     "SemanticDependencyDefinition",
     "SemanticDependencyInvariantError",
     "UnknownSemanticDependencyError",
+    "compose_component_sha",
     "compute_dependency_sha",
     "current_sha_for",
     "dependency_for_sha",
     "extraction_identity",
+    "fragment_geometry_identity",
 ]
 
 GLYPH_HEALTH_DEPENDENCY_ID = "carmel.numeric.glyph_health"
@@ -166,6 +171,80 @@ bytes -- so it carries :attr:`InputPolicy.EXTERNAL_DIGEST_REQUIRED`.
 This increment ONLY registers the identity in this module; wiring it into
 :mod:`carmel.services.evidence` or any schema/producer/replay code is a
 separate, later increment (out of scope here by design).
+"""
+
+FRAGMENT_GEOMETRY_DEPENDENCY_ID = "carmel.geometry.extract_fragments"
+"""The stable ``dependency_id`` for :func:`~carmel.services.pdf_fragments.extract_fragments`.
+
+The identity for the PDF *fragment geometry* lane: which code produced a fragment's
+``x_start``/``x_end``/``baseline_y``/``font_height`` and the page number it claims.
+:data:`EXTRACT_TEXT_DEPENDENCY_ID` does NOT cover this -- it is the identity of the
+plain-text lane, a different closure in a different module.
+
+**This entry's ``content_sha256`` is a COMPOSITE**, and is the only registry row that is
+not a direct :func:`compute_dependency_sha` output. That is forced by the code, not a
+preference. ``extract_fragments`` borrows five names from
+:mod:`carmel.agents.tools.extract` via a FUNCTION-SCOPE import, and a within-module closure
+cannot reach what they DO.
+
+State that gap precisely, because it is narrower than it first looks and the narrow version
+is the one that justifies this design. The import STATEMENT is inside ``extract_fragments``'s
+own body, so it is part of the hashed dump: adding or removing a borrowed name does move the
+own-closure sha. What no within-module closure can see is the imported code's BEHAVIOUR --
+an edit inside ``_classify_pdf_page`` moves nothing in ``pdf_fragments`` at all (verified by
+perturbation, both directions). And ``_classify_pdf_page`` is what decides the page number
+every fragment claims, so a single within-module sha here would attest the geometry while
+silently omitting the provenance. The composite therefore hashes two component shas together
+(see :func:`compose_component_sha`):
+
+1. ``own_sha256`` -- ``extract_fragments``'s own within-module closure.
+2. ``borrowed_sha256`` -- the closure of EXACTLY the five borrowed names in ``extract.py``
+   (:data:`FRAGMENT_GEOMETRY_BORROWED_NAMES`), computed as its own within-module closure.
+
+Component 2 is deliberately NOT ``EXTRACT_TEXT_DEPENDENCY_ID``'s sha, even though all five
+names happen to sit inside ``extract_text``'s 40-name closure today. Reusing that sha would
+be wrong in both directions at once: OVER-attesting, because HTML/XML/abstract/references
+behaviour unrelated to geometry would re-address stored geometry; and UNDER-attesting the
+moment ``extract_text`` stops reaching one of the five while ``pdf_fragments`` still imports
+it, at which point the borrowed name would fall out of the hashed closure with no sha
+change at all. Hashing the borrowed entry points directly cannot drift that way.
+
+The third component of a COMPLETE geometry identity -- the installed ``pypdf`` version --
+is deliberately NOT in this sha, exactly as for :data:`EXTRACT_TEXT_DEPENDENCY_ID`: a
+registry row must be a fixed historical fact, and the version is a property of the runtime
+that produced an artifact, not of the code. See :class:`FragmentGeometryIdentity`, which
+carries all three parts separately.
+
+Like the two entries above, this dependency's input is a whole document's raw bytes rather
+than a sibling field of the citing record, so it carries
+:attr:`InputPolicy.EXTERNAL_DIGEST_REQUIRED`.
+
+This increment ONLY registers the identity. NOTHING consumes it: at the time of writing no
+shipped module imports :mod:`carmel.services.pdf_fragments` or
+:mod:`carmel.services.pdf_cells`, no schema field carries fragment geometry, and no stored
+artifact exists that could cite it. Registering before the first producer exists is the
+point -- an identity added after artifacts are stored can never attribute the ones already
+written. Wiring it into evidence/schemas/producers/replay is a separate, later increment.
+"""
+
+FRAGMENT_GEOMETRY_BORROWED_NAMES: tuple[str, ...] = (
+    "MAX_PDF_PAGES",
+    "_PageKind",
+    "_classify_pdf_page",
+    "_describe_page_error",
+    "_quiet_pypdf",
+)
+"""The exact names :func:`~carmel.services.pdf_fragments.extract_fragments` borrows from
+:mod:`carmel.agents.tools.extract`, and the entry points of the composite identity's
+``borrowed_sha256`` component (see :data:`FRAGMENT_GEOMETRY_DEPENDENCY_ID`).
+
+Sorted, and pinned as data rather than inlined at the one call site, because this tuple is
+the identity's completeness claim: ``borrowed_sha256`` attests exactly these names and
+nothing else, so a SIXTH borrowed name would be a real behavioural input that no component
+of the composite hashes. ``tests/test_semantic_deps.py`` guards that with
+:func:`_assert_borrowed_carmel_names`, which reads ``pdf_fragments.py``'s real source and
+fails if the set of ``carmel.*`` names it imports -- at any scope -- is not exactly this
+tuple from exactly that module.
 """
 
 
@@ -535,10 +614,23 @@ class SemanticDependencyDefinition:
             ``"carmel.numeric.context_free_span_repair"``), shared by every
             historical entry that has ever implemented it. Dotted lowercase
             segments, each starting with a letter (see :data:`_DEPENDENCY_ID_RE`).
-        content_sha256: The :func:`compute_dependency_sha` digest of the
-            EXACT code that implements this dependency as of this entry.
-            Never mutated once shipped -- see :data:`DEPENDENCIES_BY_SHA`'s
-            append-only contract.
+        content_sha256: The digest of the EXACT code that implements this
+            dependency as of this entry. Never mutated once shipped -- see
+            :data:`DEPENDENCIES_BY_SHA`'s append-only contract.
+
+            USUALLY a :func:`compute_dependency_sha` output, but NOT always,
+            and a consumer must not assume it can recompute one from a single
+            module's source. :data:`FRAGMENT_GEOMETRY_DEPENDENCY_ID` is a
+            :func:`compose_component_sha` digest over two component shas,
+            because the code it identifies spans two modules through an import
+            no within-module closure can follow. The derivation is a property
+            of the DEPENDENCY, documented on each ``dependency_id`` constant,
+            not something this field encodes -- so a future generic
+            re-validator must dispatch on ``dependency_id`` rather than assume
+            a uniform recomputation. This is a real limitation of the current
+            shape, named here rather than left to be discovered: nothing today
+            recomputes a registered sha to validate a record (validators
+            resolve the registry by lookup), so no consumer is broken by it.
         input_policy: Which :class:`InputPolicy` a re-validator must follow
             to re-run this dependency correctly.
         is_current: Whether THIS entry is the current (most recently shipped,
@@ -631,6 +723,161 @@ def _assert_no_carmel_imports(module_source: str, module_name: str) -> None:
             )
 
 
+#: Key used by :func:`_carmel_imported_names` for a RELATIVE import.
+#:
+#: A relative import's ``ast.ImportFrom`` carries ``level >= 1`` and a ``module`` that is
+#: relative to the importing package, so it can name carmel code while matching no
+#: ``carmel.*`` prefix at all: ``from ..agents.tools.extract import _helper`` parses as
+#: ``module='agents.tools.extract', level=2``. Resolving that to an absolute name requires
+#: knowing the importing module's own package, which this function is not given and which
+#: a caller could supply wrongly.
+#:
+#: So a relative import is not resolved -- it is recorded under this key and can therefore
+#: never match a named expectation, which makes any relative import in a guarded module a
+#: loud failure rather than a silent pass. Every carmel module this project guards uses
+#: absolute imports throughout; a relative one appearing in a guarded module is a change
+#: worth stopping on regardless of what it names.
+_RELATIVE_IMPORT_KEY = "<relative import>"
+
+#: Recorded as the name set for an import that binds a whole module rather than specific
+#: names -- ``import carmel.x.y`` and ``from carmel.x import *``. No finite name tuple can
+#: pin such a surface, so it can never satisfy a named expectation either.
+_WHOLE_MODULE_NAME = "*"
+
+
+def _carmel_imported_names(module_source: str) -> dict[str, set[str]]:
+    """Map ``carmel.*`` source module -> the names ``module_source`` imports from it.
+
+    Walks the WHOLE tree, not just ``tree.body``, so a function-scope import is seen --
+    which is the entire point: :func:`compute_dependency_sha` cannot see what a
+    function-scope import's target DOES, so something else has to notice that the import
+    is there at all.
+
+    Three shapes are recorded but deliberately NOT resolved, because each names code that
+    no finite name tuple can pin: a relative import (:data:`_RELATIVE_IMPORT_KEY`), a plain
+    ``import carmel.x.y``, and a star import (both :data:`_WHOLE_MODULE_NAME`). Recording
+    rather than resolving is what makes them fail a named expectation loudly.
+
+    What this CANNOT see, stated plainly because a guard that overstates itself is worse
+    than no guard: any import that is not an ``import``/``from ... import`` statement.
+    ``importlib.import_module("carmel.x")``, ``__import__``, a ``sys.modules`` lookup, a
+    callable handed in by a caller, or carmel code re-exported through a non-carmel package
+    all reach carmel behaviour invisibly here. No AST walk can close that set; it is bounded
+    by convention and review, not by this function.
+    """
+    tree = ast.parse(module_source)
+    imported: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "carmel" or alias.name.startswith("carmel."):
+                    imported.setdefault(alias.name, set()).add(_WHOLE_MODULE_NAME)
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                imported.setdefault(_RELATIVE_IMPORT_KEY, set()).update(alias.name for alias in node.names)
+            elif node.module is not None and (node.module == "carmel" or node.module.startswith("carmel.")):
+                imported.setdefault(node.module, set()).update(alias.name for alias in node.names)
+    return imported
+
+
+# The counterpart to _assert_no_carmel_imports, for a module that legitimately DOES import
+# from carmel.* and therefore cannot use that guard at all.
+#
+# _assert_no_carmel_imports states the strong invariant ("this module's behaviour is fully
+# captured by its own within-module closure") and is the right guard for numeric.py and
+# extract.py. carmel/services/pdf_fragments.py cannot satisfy it -- extract_fragments
+# borrows five names from carmel.agents.tools.extract at function scope -- so the honest
+# guard is the weaker, explicit one: the set of borrowed names is EXACTLY the set the
+# composite identity hashes as its `borrowed_sha256` component.
+#
+# Why this must exist at all, stated as the SMALLER true claim rather than the tempting
+# larger one: adding a sixth borrowed name DOES move the composite, because the import
+# statement lives in extract_fragments' hashed body (verified by perturbation -- do not
+# "simplify" this comment back to "the sha would not move"). The hazard is subtler. The
+# composite would move once, at the moment the name is added, and then
+# `borrowed_sha256` would go on attesting only the ORIGINAL five for the rest of that
+# entry's life. The sixth name's behaviour would be covered by nothing, so a later edit
+# INSIDE it would move no sha at all -- and that later edit is the one nobody would be
+# looking at. Silent under-attestation is precisely the failure mode this whole module
+# exists to prevent, so it gets a guard that fails loudly at the moment the name appears.
+#
+# Deliberately compares the FULL carmel.* import surface, not merely the function-scope
+# part: a new MODULE-LEVEL carmel import in pdf_fragments would be visible to
+# _normalized_imports as a binding, but its imported code's behaviour would still be
+# outside every closure this module hashes. Both scopes are the same hazard here.
+def _assert_borrowed_carmel_names(
+    module_source: str,
+    module_name: str,
+    expected: Mapping[str, Sequence[str]],
+) -> None:
+    actual = _carmel_imported_names(module_source)
+    expected_sets = {module: set(names) for module, names in expected.items()}
+    if actual != expected_sets:
+        rendered_actual = {module: sorted(names) for module, names in sorted(actual.items())}
+        rendered_expected = {module: sorted(names) for module, names in sorted(expected_sets.items())}
+        raise SemanticDependencyInvariantError(
+            f"{module_name}'s carmel.* import surface changed: expected {rendered_expected!r}, "
+            f"found {rendered_actual!r}. compute_dependency_sha cannot see these imports "
+            "(its closure and its import list are both module-level only), so each borrowed "
+            "name must be hashed explicitly as a component of the composite identity -- see "
+            "FRAGMENT_GEOMETRY_DEPENDENCY_ID. Adding a borrowed name without adding it to "
+            "FRAGMENT_GEOMETRY_BORROWED_NAMES (and registering the resulting NEW composite "
+            "sha) would leave that name's behaviour attested by nothing at all"
+        )
+
+
+#: Matches a well-formed lowercase hex SHA-256 digest, for :func:`compose_component_sha`'s
+#: component validation. Anchored via ``fullmatch`` at the call site.
+_HEX_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def compose_component_sha(components: Mapping[str, str]) -> str:
+    """Hash a set of NAMED component shas into one composite content address.
+
+    For an identity whose inputs cannot be captured by a single within-module closure --
+    today only :data:`FRAGMENT_GEOMETRY_DEPENDENCY_ID`, see its docstring for why.
+
+    The components are named rather than positional, and hashed through
+    :func:`~carmel.services.dataset_store.canonical_json_bytes` rather than joined into a
+    string, for the same reason :func:`compute_dependency_sha` does it: a hand-rolled
+    ``"|"``-joined shape is an anti-pattern this project already carries one instance of
+    (:func:`carmel.services.evidence._derivation_binding`) and should not gain a second.
+    Naming the components additionally means SWAPPING two component values changes the
+    composite, which a positional join of two same-length hex digests would not guarantee
+    to express as clearly.
+
+    This is deliberately NOT a general "combine any shas" helper with an ordering
+    convention a caller could get wrong: it takes a mapping, and
+    ``canonical_json_bytes`` sorts it.
+
+    Args:
+        components: Component name -> that component's 64-char hex sha256. Must be
+            non-empty; every value must be a well-formed lowercase hex digest, because a
+            composite over a malformed component would be a content address that attests
+            to nothing while looking exactly like one that does.
+
+    Returns:
+        A 64-character lowercase hex SHA-256 digest.
+
+    Raises:
+        SemanticDependencyInvariantError: If ``components`` is empty or any value is not a
+            64-character lowercase hex digest.
+    """
+    if not components:
+        raise SemanticDependencyInvariantError(
+            "compose_component_sha requires at least one component; an empty composite "
+            "would be a fixed digest that attests to nothing"
+        )
+    for name, sha in sorted(components.items()):
+        if not _HEX_SHA256_RE.fullmatch(sha):
+            raise SemanticDependencyInvariantError(
+                f"component {name!r} is not a 64-character lowercase hex sha256 ({sha!r}); "
+                "a composite over a malformed component would look like a valid content "
+                "address while attesting to nothing"
+            )
+    return hashlib.sha256(canonical_json_bytes(dict(components))).hexdigest()
+
+
 # HARDCODED, not derived from live source or any other computation at import
 # time. This is the crux of the append-only doctrine: DEPENDENCIES_BY_SHA's seeded entry
 # must be a PINNED HISTORICAL FACT ("this sha validated stored data as of this registry
@@ -686,6 +933,95 @@ _GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a27
 # never to edit this literal or the registry row that uses it.
 _EXTRACT_TEXT_SHA256 = "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168"
 
+# The two COMPONENTS of the fragment-geometry composite, and the composite itself. All
+# three are HARDCODED for exactly the same reasons as the three literals above; the whole
+# comment on _CONTEXT_FREE_SPAN_REPAIR_SHA256 applies here verbatim. Independently verified
+# once via:
+#   own      = compute_dependency_sha(
+#                  inspect.getsource(carmel.services.pdf_fragments), ["extract_fragments"]
+#              )
+#   borrowed = compute_dependency_sha(
+#                  inspect.getsource(carmel.agents.tools.extract),
+#                  list(FRAGMENT_GEOMETRY_BORROWED_NAMES),
+#              )
+#   composite = compose_component_sha(
+#                  {"borrowed_sha256": borrowed, "own_sha256": own}
+#              )
+#
+# Adding "TextFragment" as a second entry point does NOT change the own sha -- the class is
+# already pulled into extract_fragments' closure transitively -- so the single entry point
+# is not an under-specification, the same way it is not for _GLYPH_HEALTH_SHA256.
+#
+# The components are pinned SEPARATELY from the composite, not merely recomputed from it,
+# so that a failing pin says WHICH half moved: geometry code, or a borrowed name's
+# behaviour in a module this one cannot see. A single composite pin would report only that
+# something, somewhere, changed.
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
+_FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
+_FRAGMENT_GEOMETRY_SHA256 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
+
+
+@dataclass(frozen=True, slots=True)
+class _FragmentGeometryComponents:
+    """What one composite fragment-geometry sha was composed FROM.
+
+    A composite is a one-way hash: given a stored ``composite_sha256`` and nothing else,
+    there is no way to recover which halves produced it, and therefore no way to say WHICH
+    half moved when a stored artifact disagrees with current code. That localization is the
+    whole reason the identity is composite rather than opaque, so the halves have to be
+    recorded, and recorded the same way the registry records everything else: APPEND-ONLY,
+    keyed by the composite they belong to.
+
+    Module-level constants alone would not do it. They describe only what is CURRENT, so
+    the first geometry supersession would either overwrite the components of the superseded
+    row -- losing exactly the localization the composite exists to provide, for exactly the
+    old artifacts that need it most -- or leave them behind as literals no longer reachable
+    from any row.
+
+    ``borrowed_names`` is part of the record for the same reason: a future entry may borrow
+    a different set, and reading a superseded row's components against today's tuple would
+    silently mis-describe what that row attested.
+    """
+
+    own_sha256: str
+    borrowed_sha256: str
+    borrowed_names: tuple[str, ...]
+
+
+#: APPEND-ONLY, keyed by composite sha, exactly like :data:`DEPENDENCIES_BY_SHA`. Never
+#: edit an existing row: add a new one when the composite changes, so a stored artifact
+#: citing an OLD composite can still be told which half moved. Read through
+#: :func:`_fragment_geometry_components`, never subscripted directly, so an unknown
+#: composite raises this module's own error type rather than a bare ``KeyError``.
+_FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] = MappingProxyType(
+    {
+        _FRAGMENT_GEOMETRY_SHA256: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+    }
+)
+
+
+def _fragment_geometry_components(composite_sha256: str) -> _FragmentGeometryComponents:
+    """Return what ``composite_sha256`` was composed from.
+
+    Raises:
+        UnknownSemanticDependencyError: If the composite is not recorded. Deliberately the
+            same error type an unknown registered sha raises: a composite with no recorded
+            components cannot be localized, and guessing is the failure this module exists
+            to prevent.
+    """
+    try:
+        return _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA[composite_sha256]
+    except KeyError:
+        raise UnknownSemanticDependencyError(
+            f"composite sha {composite_sha256!r} has no recorded components; it cannot be "
+            "localized to a geometry half. Every composite ever shipped must keep a row in "
+            "_FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA -- append a new one, never edit an existing one"
+        ) from None
+
 
 def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
     """Return the append-only registry's initial contents.
@@ -715,6 +1051,15 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
     assess_glyph_health, because the input is out-of-payload. A stored
     assessment is therefore UNVERIFIED-BY-CONSTRUCTION until the replayer
     milestone lands. Do not describe it as verified anywhere.
+
+    The fragment-geometry entry is the only COMPOSITE row, and the only one whose
+    content_sha256 is not a direct compute_dependency_sha output -- see
+    FRAGMENT_GEOMETRY_DEPENDENCY_ID for why a single within-module closure cannot
+    honestly cover that lane. HONEST SCOPE, stated as plainly as the glyph-health
+    entry's: nothing consumes this row yet, and no artifact cites it. It attests
+    which code WOULD produce a fragment's coordinates, not that any stored
+    coordinate was produced by it. Do not describe anything as geometry-verified
+    on the strength of this entry existing.
     """
     return (
         SemanticDependencyDefinition(
@@ -732,6 +1077,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=EXTRACT_TEXT_DEPENDENCY_ID,
             content_sha256=_EXTRACT_TEXT_SHA256,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=True,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=True,
         ),
@@ -948,5 +1299,84 @@ def extraction_identity() -> ExtractionIdentity:
     """
     return ExtractionIdentity(
         code_sha256=current_sha_for(EXTRACT_TEXT_DEPENDENCY_ID),
+        pypdf_version=_pypdf_version(),
+    )
+
+
+@dataclass(frozen=True)
+class FragmentGeometryIdentity:
+    """The complete, three-part content identity for a run of
+    :func:`~carmel.services.pdf_fragments.extract_fragments`.
+
+    The fragment-geometry counterpart to :class:`ExtractionIdentity`, and a strictly
+    larger shape than it, because this lane has one more input that no AST closure can
+    reach. ``extract_fragments`` runs Carmel code from TWO modules -- its own, plus five
+    names borrowed from :mod:`carmel.agents.tools.extract` through a function-scope import
+    that :func:`compute_dependency_sha` is blind to -- and then hands the parsing to
+    ``pypdf``. Those are three genuinely independent ways the same input bytes can produce
+    different coordinates, so they are three separately inspectable fields rather than one
+    opaque string a consumer would have to parse (and could parse wrong) to recover any
+    part of.
+
+    ``composite_sha256`` is what a stored artifact would cite (it is the registered
+    ``content_sha256`` for :data:`FRAGMENT_GEOMETRY_DEPENDENCY_ID`); the two component
+    fields are carried alongside it so that a mismatch can be localized to the half that
+    moved without recomputing anything.
+
+    Attributes:
+        composite_sha256: The current registered ``content_sha256`` for
+            :data:`FRAGMENT_GEOMETRY_DEPENDENCY_ID` -- the composite over both component
+            shas below, and nothing about ``pypdf``.
+        own_sha256: The component covering ``extract_fragments``'s own within-module
+            closure in :mod:`carmel.services.pdf_fragments`.
+        borrowed_sha256: The component covering exactly
+            :data:`FRAGMENT_GEOMETRY_BORROWED_NAMES` in
+            :mod:`carmel.agents.tools.extract`.
+        pypdf_version: The installed ``pypdf`` version string, or
+            :data:`_PYPDF_VERSION_UNKNOWN` if it could not be determined.
+
+            Read through :func:`_pypdf_version` (``pypdf.__version__``), NOT through
+            ``importlib.metadata.version("pypdf")`` as ``extract_fragments`` itself does at
+            ``pdf_fragments.py:642``. Those are two different witnesses to the same fact --
+            the package's own declared string versus installed distribution metadata -- and
+            they can legitimately disagree for an editable, vendored or shadowed install,
+            which would manufacture an identity mismatch for one unchanged runtime. They
+            agree on the pinned ``6.14.2``, so this is a latent divergence, not a live one;
+            one witness is chosen here rather than left to chance. ``_pypdf_version`` is the
+            one chosen because it is total: it collapses every failure to
+            :data:`_PYPDF_VERSION_UNKNOWN`, whereas ``importlib.metadata.version`` raises
+            ``PackageNotFoundError``. Reconciling the extractor's own call site is a
+            separate change -- it alters shipped runtime behaviour, not just identity.
+    """
+
+    composite_sha256: str
+    own_sha256: str
+    borrowed_sha256: str
+    pypdf_version: str
+
+
+def fragment_geometry_identity() -> FragmentGeometryIdentity:
+    """Return the current composite identity for Carmel's fragment-geometry code.
+
+    Combines :data:`FRAGMENT_GEOMETRY_DEPENDENCY_ID`'s current registered sha with its two
+    pinned components and the installed ``pypdf`` version. No half alone is a complete
+    geometry identity; see :class:`FragmentGeometryIdentity`.
+
+    Reads the composite from the registry rather than recomputing it from live source, for
+    the same reason the seeded literals are hardcoded: the registry row is the pinned
+    historical fact. ``tests/test_semantic_deps.py`` is what re-verifies that the pins still
+    match live source on every run.
+
+    This increment ONLY exposes this helper. Wiring it into
+    :mod:`carmel.services.evidence`, or any schema/producer/replay code, is a separate,
+    later increment -- and there is nothing to wire it into yet: no shipped module consumes
+    :mod:`carmel.services.pdf_fragments` at all.
+    """
+    composite = current_sha_for(FRAGMENT_GEOMETRY_DEPENDENCY_ID)
+    components = _fragment_geometry_components(composite)
+    return FragmentGeometryIdentity(
+        composite_sha256=composite,
+        own_sha256=components.own_sha256,
+        borrowed_sha256=components.borrowed_sha256,
         pypdf_version=_pypdf_version(),
     )
