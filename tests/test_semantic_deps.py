@@ -29,6 +29,7 @@ from carmel.agents.tools import extract
 from carmel.services import numeric, pdf_fragments
 from carmel.services.semantic_deps import (
     _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA,
+    _PYPDF_VERSION_UNKNOWN,
     CURRENT_SHA_BY_DEPENDENCY_ID,
     DEPENDENCIES_BY_SHA,
     EXTRACT_TEXT_DEPENDENCY_ID,
@@ -44,6 +45,7 @@ from carmel.services.semantic_deps import (
     _assert_no_carmel_imports,
     _fragment_geometry_components,
     _module_level_definitions,
+    _pypdf_distribution_version,
     _pypdf_version,
     _transitive_closure,
     compose_component_sha,
@@ -1343,6 +1345,40 @@ def test_fragment_geometry_identity_reports_all_three_parts() -> None:
     assert identity.own_sha256 == _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256
     assert identity.borrowed_sha256 == _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256
     assert identity.pypdf_version == _pypdf_version()
+
+
+def test_the_identity_records_both_pypdf_witnesses_and_chooses_neither() -> None:
+    """`_engine()` gates on the DISTRIBUTION metadata; the identity used to report only
+    the imported module's `__version__`. Two witnesses to one fact that can disagree
+    under an editable, vendored or shadowed install -- and choosing one means a stored
+    artifact can never afterwards say whether they did, which for an IDENTITY is the
+    wrong shape. Both are recorded and nothing here compares them.
+    """
+    identity = fragment_geometry_identity()
+    assert identity.pypdf_version == _pypdf_version()
+    assert identity.pypdf_distribution_version == _pypdf_distribution_version()
+    # They agree on the pin, so the divergence is latent rather than live. Asserted so a
+    # future disagreement in a dev environment surfaces here rather than in an artifact.
+    assert identity.pypdf_version == identity.pypdf_distribution_version
+
+
+def test_neither_pypdf_witness_can_raise() -> None:
+    """Both collapse to the sentinel, including `PackageNotFoundError`, which is the
+    EXPECTED failure of the metadata one. Recording a second witness must not give the
+    identity a second way to fail -- an identity that raises is one a caller cannot
+    record at all."""
+    import importlib.metadata as metadata_module
+
+    def _absent(_name: str) -> str:
+        raise metadata_module.PackageNotFoundError("pypdf")
+
+    original = metadata_module.version
+    metadata_module.version = _absent  # type: ignore[assignment]
+    try:
+        assert _pypdf_distribution_version() == _PYPDF_VERSION_UNKNOWN
+        assert fragment_geometry_identity().pypdf_distribution_version == _PYPDF_VERSION_UNKNOWN
+    finally:
+        metadata_module.version = original  # type: ignore[assignment]
 
 
 def test_fragment_geometry_identity_is_frozen() -> None:

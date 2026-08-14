@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.metadata
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -1323,6 +1324,29 @@ def _pypdf_version() -> str:
         return _PYPDF_VERSION_UNKNOWN
 
 
+def _pypdf_distribution_version() -> str:
+    """Installed ``pypdf`` DISTRIBUTION version, from packaging metadata, never fatal.
+
+    The other witness to the same fact, and the one that actually gates the lane:
+    :func:`carmel.services.pdf_fragments._engine` admits pypdf only when this equals
+    :data:`carmel.services.pdf_fragments._PINNED_PYPDF_VERSION`. :func:`_pypdf_version`
+    asks the imported MODULE what it calls itself; this asks the installed
+    DISTRIBUTION. An editable, vendored or shadowed install can make them disagree, and
+    when they do it is the module attribute that describes the code which ran while this
+    one describes the code the gate approved.
+
+    Wrapped in the same total-function shape as its sibling, collapsing every failure --
+    including ``PackageNotFoundError``, which is the expected one -- to
+    :data:`_PYPDF_VERSION_UNKNOWN`. An identity that raises is an identity a caller
+    cannot record, and the point of recording both witnesses is defeated if fetching the
+    second one can fail the first.
+    """
+    try:
+        return importlib.metadata.version("pypdf")
+    except Exception:  # noqa: BLE001 - version discovery is best-effort, never fatal
+        return _PYPDF_VERSION_UNKNOWN
+
+
 @dataclass(frozen=True)
 class ExtractionIdentity:
     """The complete, two-part content identity for a run of
@@ -1425,14 +1449,37 @@ class FragmentGeometryIdentity:
 
             ``extract_fragments`` is no longer a third reading of this: it records the
             :data:`_PINNED_PYPDF_VERSION` constant that ``_engine()`` already proved,
-            rather than re-reading metadata. So the divergence is now between exactly two
+            rather than re-reading metadata. So the divergence is between exactly two
             call sites, the gate and this identity -- not three.
+
+            **Both witnesses are now recorded, and neither is chosen.** The paragraph
+            above used to end by picking this one, which was the wrong shape for an
+            IDENTITY: choosing between two witnesses that can disagree means the record
+            cannot afterwards say whether they did. Under a shadowed install this field
+            alone would name a version the gate never approved, and nothing stored would
+            show it. See :attr:`pypdf_distribution_version`.
+        pypdf_distribution_version: The installed pypdf DISTRIBUTION's version, from
+            packaging metadata, or :data:`_PYPDF_VERSION_UNKNOWN`.
+
+            The witness ``_engine()`` actually gates on. Recorded ALONGSIDE
+            :attr:`pypdf_version` rather than instead of it, because the two answer
+            different questions -- what the imported module calls itself, and what the
+            installed distribution declares -- and an identity's job is to record what
+            was true, not to adjudicate between its own sources.
+
+            They agree on the pinned ``6.14.2``, so this is a latent divergence and not a
+            live one. Recording both is registering an identity, not building a
+            mechanism: nothing here compares them, warns, or refuses, because no
+            consumer exists to act on a disagreement yet. When one does, the evidence it
+            needs will already be in every artifact stored from now on -- which is the
+            whole reason to do it while nothing depends on it.
     """
 
     composite_sha256: str
     own_sha256: str
     borrowed_sha256: str
     pypdf_version: str
+    pypdf_distribution_version: str
 
 
 def fragment_geometry_identity() -> FragmentGeometryIdentity:
@@ -1459,4 +1506,5 @@ def fragment_geometry_identity() -> FragmentGeometryIdentity:
         own_sha256=components.own_sha256,
         borrowed_sha256=components.borrowed_sha256,
         pypdf_version=_pypdf_version(),
+        pypdf_distribution_version=_pypdf_distribution_version(),
     )
