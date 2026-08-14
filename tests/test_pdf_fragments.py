@@ -178,6 +178,120 @@ class TestGeometryIsAbsoluteAndExact:
         assert _by_text(frags, "outside").x_start == pytest.approx(72.0)
 
 
+class TestCharacterSpacingIsChargedPerGlyph:
+    """`Tc` advances EVERY glyph, and pypdf's ``displaced_tx`` charges it once.
+
+    The assertions below are deliberately width-independent: each compares the same
+    string drawn with and without ``Tc``, so the font's glyph widths cancel and what is
+    left is the spacing law alone. Asserting an absolute ``x_end`` would pin Helvetica's
+    AFM metrics into the test and would break for a reason that has nothing to do with
+    the behaviour under test.
+
+    Measured on the real corpus, this is not a corner: 714 of 72,502 text-show
+    operations report an end coordinate wrong by more than half a point, 222 of them
+    containing a digit, worst case 149.8 pt, in all eight papers.
+    """
+
+    #: Five glyphs, one `Tc`, and the reported width difference tells them apart:
+    #: 5 x 4 = 20 pt if spacing is charged per glyph, 4 pt if it is charged per call.
+    GLYPHS = "ABCDE"
+    SPACING = 4.0
+
+    def _width(self, stream: str) -> float:
+        frag = _by_text(_fragments(stream), self.GLYPHS)
+        return frag.x_end - frag.x_start
+
+    def test_spacing_widens_the_run_once_per_glyph(self) -> None:
+        require_pypdf()
+        plain = self._width(f"BT /F1 10 Tf\n72 700 Td ({self.GLYPHS}) Tj\nET")
+        spaced = self._width(f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td ({self.GLYPHS}) Tj\nET")
+        assert spaced - plain == pytest.approx(len(self.GLYPHS) * self.SPACING)
+
+    def test_horizontal_scaling_scales_the_spacing_too(self) -> None:
+        """`Tz` is a percentage applied to the whole advance, spacing included."""
+        require_pypdf()
+        plain = self._width(f"BT /F1 10 Tf\n50 Tz\n72 700 Td ({self.GLYPHS}) Tj\nET")
+        spaced = self._width(f"BT /F1 10 Tf\n50 Tz\n{self.SPACING} Tc\n72 700 Td ({self.GLYPHS}) Tj\nET")
+        assert spaced - plain == pytest.approx(len(self.GLYPHS) * self.SPACING * 0.5)
+
+    def test_a_scaled_text_matrix_scales_the_spacing_too(self) -> None:
+        """The real corpus carries its size in the text matrix, not the `Tf` operand.
+
+        So a correction applied in text space and never mapped through the matrix would
+        pass the first test here and be wrong on nearly every real page.
+        """
+        require_pypdf()
+        plain = self._width(f"BT /F1 1 Tf\n3 0 0 3 72 700 Tm ({self.GLYPHS}) Tj\nET")
+        spaced = self._width(f"BT /F1 1 Tf\n{self.SPACING} Tc\n3 0 0 3 72 700 Tm ({self.GLYPHS}) Tj\nET")
+        assert spaced - plain == pytest.approx(len(self.GLYPHS) * self.SPACING * 3.0)
+
+    def test_a_single_glyph_is_charged_once(self) -> None:
+        """The boundary the off-by-one lives on: one glyph owes exactly one `Tc`."""
+        require_pypdf()
+        plain = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (A) Tj\nET"), "A")
+        spaced = _by_text(_fragments(f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (A) Tj\nET"), "A")
+        assert (spaced.x_end - spaced.x_start) - (plain.x_end - plain.x_start) == pytest.approx(self.SPACING)
+
+    def test_the_correction_leaves_unspaced_text_alone(self) -> None:
+        """`Tc 0` must produce byte-identical geometry to no `Tc` at all.
+
+        The guard against a fix that quietly re-derives every advance: 98% of corpus
+        shows set no character spacing, and their coordinates must not move.
+        """
+        require_pypdf()
+        without = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Hello) Tj\nET"), "Hello")
+        zeroed = _by_text(_fragments("BT /F1 10 Tf\n0 Tc\n72 700 Td (Hello) Tj\nET"), "Hello")
+        assert zeroed.x_end == without.x_end
+        assert zeroed.x_start == without.x_start
+
+    def test_a_placeholder_glyph_name_is_one_glyph_not_its_spelling(self) -> None:
+        """Two bytes that decode to ``"/C20/C21"`` owe TWO spacings, not seven.
+
+        A font whose ``/Differences`` names glyphs the standard list does not know makes
+        pypdf keep the raw name, so ONE code becomes a four-character string. Counting
+        decoded characters -- or `.text` characters, which are the same eight here --
+        would charge seven spacings where two are owed.
+
+        This is the case that decides between the three plausible glyph counts, and it
+        is not hypothetical: 152 corpus shows decode to a length their operand does not
+        have, and the 10 of those carrying character spacing are the two largest end
+        coordinate errors an earlier draft of the census reported (231 pt and 248 pt).
+        """
+        require_pypdf()
+
+        def width(spacing: str) -> float:
+            stream = f"BT /F1 10 Tf\n{spacing}72 700 Td (\x20\x21) Tj\nET".encode("latin-1")
+            pdf = _pdf(
+                [
+                    b"<< /Type /Catalog /Pages 2 0 R >>",
+                    b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                    b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+                    b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+                    b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+                    b"<< /Type /Encoding /Differences [32 /C20 /C21] >> >>",
+                ]
+            )
+            result = extract_fragments(pdf)
+            assert result.available is True and result.lossy is False
+            frag = _by_text(result.fragments, "/C20/C21")
+            # The premise of the test itself, asserted rather than assumed: if pypdf ever
+            # stops expanding the name, the interesting case is gone and this test would
+            # otherwise keep passing while measuring nothing.
+            assert len(frag.text) == 8
+            assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+            return frag.x_end - frag.x_start
+
+        assert width(f"{self.SPACING} Tc\n") - width("") == pytest.approx(2 * self.SPACING)
+
+    def test_word_spacing_is_left_where_pypdf_already_has_it_right(self) -> None:
+        """`Tw` is charged per space by pypdf already; the fix must not double it."""
+        require_pypdf()
+        plain = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (A B) Tj\nET"), "A B")
+        spaced = _by_text(_fragments("BT /F1 10 Tf\n6 Tw\n72 700 Td (A B) Tj\nET"), "A B")
+        assert (spaced.x_end - spaced.x_start) - (plain.x_end - plain.x_start) == pytest.approx(6.0)
+
+
 class TestPageNumbering:
     def test_a_phantom_page_tree_entry_does_not_shift_page_numbers(self) -> None:
         """pypdf counts a linearization dictionary as a page on real corpus papers.

@@ -292,7 +292,24 @@ def _engine() -> tuple[Any, ...] | None:
     return recurse_to_target_op, resolve_font, TextStateManager, ContentStream
 
 
-_REQUIRED_PARAM_ATTRS = ("text", "tx", "ty", "displaced_tx", "font_height", "rotated")
+_REQUIRED_PARAM_ATTRS = (
+    "text",
+    "tx",
+    "ty",
+    "displaced_tx",
+    "font_height",
+    "rotated",
+    # Read by `_pen_x_after` to charge `Tc` once per glyph. Listed here with the rest
+    # rather than probed at the point of use for the reason the docstring above gives:
+    # a per-page `AttributeError` degrades one page to lossy, which would present an
+    # engine-wide mismatch as "a valid document where every page happened to fail".
+    "value",
+    "_decoded_value",
+    "font",
+    "Tc",
+    "Tz",
+    "transform",
+)
 
 _PINNED_PYPDF_VERSION = "6.14.2"
 """Must track the ``agents`` extra's exact pin in ``pyproject.toml``."""
@@ -397,6 +414,88 @@ def _decoded_content_length(contents: Any) -> int:
     return sum(len(part.get_object().get_data()) for part in parts)
 
 
+def _glyphs_drawn(show: Any) -> int:
+    """How many glyphs one text-show operation drew -- i.e. how many ``Tc`` it owes.
+
+    Neither of the two obvious answers is right, and both are wrong in the SAME
+    direction, which is why this is its own function with its own test.
+
+    * ``len(show.text)`` counts characters after the font's ``character_map`` runs, and
+      that map may expand one code into several.
+    * ``len(show._decoded_value)`` -- the string pypdf's own width loop iterates -- is
+      not a glyph count either when the encoding is a dict. pypdf decodes those byte by
+      byte through ``font.encoding[byte]``, and an entry may be a multi-character glyph
+      NAME: a font whose ``/Differences`` names glyphs the standard list does not know
+      turns two bytes into the eight-character string ``"/C20/C21"``.
+
+    Measured on the eight-paper corpus: 152 shows decode to a different length than
+    their operand, 10 of them with ``Tc != 0`` -- and those ten are the two largest
+    errors an earlier draft of this measurement reported (231 pt and 248 pt, both of them
+    this overcount rather than the defect). Counting decoded characters there
+    would charge seven spacings where two are owed, so the correction would overshoot
+    exactly where the original defect was worst.
+
+    Note what this still cannot repair, because it is upstream and not about ``Tc``: on
+    those same placeholder runs pypdf accumulates a WIDTH per placeholder character too,
+    so their advance is unreliable whatever this returns. Re-deriving widths is not this
+    module's business. Those fragments are already published as
+    :attr:`GlyphMapping.UNMAPPED`, so the geometry that stays doubtful is geometry a
+    caller is already told not to trust.
+    """
+    value = show.value
+    if not isinstance(value, bytes):
+        return len(str(value))
+    if isinstance(show.font.encoding, str):
+        # A str encoding decodes the operand as a whole, so one decoded character is one
+        # code -- including the multi-byte codes of a composite font.
+        return len(show._decoded_value)
+    return len(value)
+
+
+def _pen_x_after(show: Any) -> float:
+    """Absolute page x of the pen once the run is drawn, with ``Tc`` charged per glyph.
+
+    pypdf's ``displaced_tx`` is the natural value for this and it is WRONG whenever
+    character spacing is in play. It comes from ``TextStateParams.word_tx()``, which
+    computes ``(font_size * total_width / 1000) + Tc + spaces * Tw`` -- one ``Tc`` for
+    the whole call. The PDF text-space advance charges ``Tc`` for every glyph shown, so
+    the reported right edge is short by ``(n - 1) * Tc``, horizontally scaled.
+
+    Measured on the eight-paper corpus before this was written: 72,502 text-show
+    operations, 12,529 of them with ``Tc != 0``, and **714 whose end coordinate is wrong
+    by more than half a point, 222 of those containing a digit**, worst case 149.8 pt --
+    a quarter of a page width, in every one of the eight papers. On one axis-label run
+    the last glyph STARTS at x=435.19 and pypdf reports the run ending at x=330.00.
+
+    The correction is applied as a delta to pypdf's own number rather than by
+    re-deriving the whole advance, deliberately: font width lookup, encoding, word
+    spacing and the ``Tz`` scale all stay in pypdf's hands, and the only arithmetic this
+    module owns is the term pypdf undercharges. Verified against pdfplumber (pdfminer,
+    sharing no code with pypdf): on the runs where both libraries return the same
+    characters, the corrected end matches pdfplumber's per-character geometry exactly.
+
+    Two things this does NOT claim:
+
+    * The pen position INCLUDES the trailing ``Tc`` after the final glyph, because that
+      is what the PDF operator does and what ``displaced_tx`` is documented to mean. It
+      is therefore past the last glyph's ink by one character space. For a containment
+      test that is the fail-closed direction -- a fragment reads WIDER than its ink, so
+      a region that does not really contain it refuses.
+    * ``x_start`` is untouched and is separately suspect: on some mid-word shows it sits
+      ~4 pt left of where pdfminer puts the first character, with every internal advance
+      still exact. Different root cause, not fixed here, and not to be conflated with
+      this one.
+    """
+    glyphs = _glyphs_drawn(show)
+    if glyphs < 2 or not show.Tc:
+        return float(show.displaced_tx)
+    undercharged = (glyphs - 1) * float(show.Tc) * (float(show.Tz) / 100.0)
+    # `transform[0]` is the same factor pypdf's own `mult()` applies to a horizontal
+    # displacement (`e' = dx * n[0] + n[4]`), so the delta lands in page space the way
+    # the value it corrects did.
+    return float(show.displaced_tx) + undercharged * float(show.transform[0])
+
+
 def _page_fragments(
     page: Any, page_number: int, engine: tuple[Any, ...], budget: int
 ) -> tuple[list[TextFragment], bool]:
@@ -497,7 +596,7 @@ def _page_fragments(
                 page=page_number,
                 text=text,
                 x_start=float(show.tx),
-                x_end=float(show.displaced_tx),
+                x_end=_pen_x_after(show),
                 baseline_y=float(show.ty),
                 font_height=float(show.font_height),
                 rotated=bool(show.rotated),
