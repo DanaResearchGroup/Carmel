@@ -111,6 +111,86 @@ _CROSSREF_NON_PAPER_TYPES = frozenset(
     }
 )
 
+#: OpenAlex record types that are not a paper, and so are not something to acquire,
+#: read or mine. The SIBLING of the Crossref set above, and separate because the two
+#: backends use different vocabularies for the same idea -- OpenAlex says ``paratext``
+#: and ``editorial`` where Crossref says ``component``, and mapping one onto the other
+#: would silently pass whatever the mapping missed.
+#:
+#: This existed for Crossref and NOT for OpenAlex, which is a fail-OPEN asymmetry in a
+#: fail-closed system: an editorial or a peer-review record entering a result set is a
+#: "paper" that can be queued for acquisition, fetched, and mined for datasets it
+#: cannot contain. Filtering at the ADAPTER is what keeps that out, because everything
+#: downstream sees a ``SearchResult`` with no record type left on it to check.
+#:
+#: The sibling census, so it is not re-derived: the search adapters are OpenAlex,
+#: Crossref, and the provider-agnostic :class:`~carmel.agents.tools.search.HttpSearchTool`.
+#: The first two are typed against a known vocabulary and both filter. The third takes an
+#: arbitrary endpoint, so this check is NOT CURRENTLY REPRESENTED for it -- not "cannot
+#: be", which hides a design option: a typed endpoint could expose a record type, and the
+#: real blocker is that :class:`~carmel.agents.tools.search.SearchResult` has no field to
+#: carry one. Until it does, a generic endpoint is a bypass by configuration, which is a
+#: reason to point it at providers whose records are papers rather than to close the gap
+#: with a guessed vocabulary.
+#: Narrow ON PURPOSE, and narrower than the first draft. Three types were removed after
+#: review, each for a reason that inverts the filter's own argument:
+#:
+#: * ``letter`` -- a Letter in a chemistry journal is a full research paper carrying data.
+#:   OpenAlex does not promise the type means correspondence, its refined types have known
+#:   low coverage, and it reclassified a large fraction of works in July 2026. Dropping it
+#:   loses real papers.
+#: * ``erratum`` and ``retraction`` -- a correction can carry the CORRECTED TABLE, which
+#:   may be the only correct copy of the number in print. Filtering it means mining the
+#:   stale original forever and never seeing the fix; that is a worse defect than the one
+#:   this filter exists to prevent. Retraction status is a real concern and is NOT solved
+#:   by dropping the notice: a retracted work is typed ``article`` and carries
+#:   ``is_retracted``, which ``SearchResult`` has nowhere to put. Tracked separately.
+#:
+#: What remains is the set whose members cannot be a research paper under any reading.
+_OPENALEX_NON_PAPER_TYPES = frozenset(
+    {
+        "editorial",
+        "grant",
+        "paratext",
+        "peer-review",
+    }
+)
+
+#: Titles that betray a peer-review artefact minted as its own work. Needed BESIDE the
+#: type set, not instead of it: a journal that deposits its review correspondence as
+#: ``article`` carries the giveaway only in the title. Anchored at the start, because
+#: "Response to reviewer" is a review artefact while a paper legitimately titled
+#: "... in response to strain" is not.
+#: Correction and retraction prefixes are deliberately ABSENT here for the same reason
+#: they are absent from the type set: a record titled "Correction to: ignition delay
+#: measurements of ..." is exactly the record that may hold the only correct table.
+_OPENALEX_NON_PAPER_TITLE_RE = re.compile(
+    r"^\s*(author response|decision letter|reviewer response|response to review)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_openalex_non_paper(work: dict[str, Any]) -> bool:
+    """Whether an OpenAlex work is a record ABOUT a paper rather than a paper.
+
+    Both directions cost something real, and the first draft of this function had the
+    balance wrong. A false NEGATIVE puts a decision letter into the acquisition queue,
+    where nothing downstream can tell it is not a paper. A false POSITIVE loses a real
+    paper outright -- and not "from one backend the others can supply", which is what an
+    earlier version of this docstring claimed: exactly ONE search tool is configured per
+    run, and the open-access resolvers are not alternative search backends, they resolve a
+    DOI that search has already produced. A record dropped here is gone.
+
+    So the checks are narrow enough that a match cannot be a research paper, rather than
+    broad enough to catch every non-paper. What gets through is a stub that wastes an
+    acquisition attempt; what a broader rule would eat is data.
+    """
+    record_type = work.get("type")
+    if isinstance(record_type, str) and record_type.lower() in _OPENALEX_NON_PAPER_TYPES:
+        return True
+    title = work.get("title") or work.get("display_name")
+    return isinstance(title, str) and bool(_OPENALEX_NON_PAPER_TITLE_RE.match(title))
+
 
 def normalize_doi(raw: Any) -> str | None:
     """Reduce any DOI spelling to a bare, lowercased ``10.xxxx/yyy``.
@@ -317,11 +397,15 @@ class OpenAlexSearchTool(_KeylessSearchTool):
             return []
 
         results: list[SearchResult] = []
+        non_papers: list[str] = []
         for work in works:
             if not isinstance(work, dict):
                 continue
             title = work.get("title") or work.get("display_name")
             if not isinstance(title, str) or not title:
+                continue
+            if _is_openalex_non_paper(work):
+                non_papers.append(title)
                 continue
             doi = normalize_doi(work.get("doi"))
             open_access = work.get("open_access")
@@ -351,6 +435,17 @@ class OpenAlexSearchTool(_KeylessSearchTool):
                     is_open_access=bool(open_access.get("is_oa")),
                     repository=repository,
                 )
+            )
+        if non_papers:
+            # A drop here is UNRECOVERABLE -- one search tool is configured per run, and
+            # a record removed at the adapter never reaches anything that could report it
+            # missing. So it is named, not merely counted: a silent `continue` in a system
+            # whose whole posture is that refusals are recorded is the wrong shape, even
+            # when the refusal is right.
+            logger.info(
+                "OpenAlex search dropped %d record(s) that are about a paper rather than a paper: %s",
+                len(non_papers),
+                "; ".join(title[:80] for title in non_papers),
             )
         return dedupe_by_doi(results)[:limit]
 

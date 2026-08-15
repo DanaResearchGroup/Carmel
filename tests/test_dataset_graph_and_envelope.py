@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import json
 import re
+import threading
 from collections.abc import Iterator
 from enum import Enum
 from types import MappingProxyType
@@ -2362,15 +2363,49 @@ class TestEmbeddedConversionTableUntrustedJsonResourceGuard:
         nests deeply enough to raise a bare RecursionError from inside
         json.loads itself -- proves the broadened `except` actually catches
         it and converts it into a ValidationError, rather than letting the
-        RecursionError propagate uncaught out of model construction."""
+        RecursionError propagate uncaught out of model construction.
+
+        Run on a thread with an EXPLICIT, small stack, because on Python 3.14
+        the overflow is measured against the real C stack rather than counted
+        against ``sys.getrecursionlimit()``: locally this payload reports
+        ``Stack overflow (used 8148 kB)`` under an 8 MB ``ulimit -s``, and on
+        a CI runner with a larger stack it PARSES, after which the model
+        refuses it one layer later for being a list rather than an object.
+        That made the test assert a property of the machine's stack limit
+        rather than a property of the guard -- green wherever the catch was
+        never reached, red only where the payload happened to fit."""
         depth = 100_000
         deeply_nested = "[" * depth + "]" * depth
         assert len(deeply_nested) <= _MAX_EMBEDDED_CANONICAL_JSON_LENGTH, (
             "test setup bug: this payload must be short enough to pass the length guard, so it "
             "actually exercises the RecursionError catch rather than the length check"
         )
-        with pytest.raises(ValidationError, match="does not parse as JSON"):
-            EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json=deeply_nested)
+
+        raised: list[BaseException] = []
+
+        def _construct() -> None:
+            try:
+                EmbeddedConversionTable(sha256=TABLE_V1.sha256, canonical_json=deeply_nested)
+            except BaseException as exc:  # noqa: BLE001 - what escapes construction IS the assertion
+                raised.append(exc)
+
+        previous = threading.stack_size()
+        # 512 kB. The payload needs ~83 bytes of C stack per nesting level, so this
+        # overflows around 6k levels and the 100k above clears it by more than an order
+        # of magnitude, without depending on the ambient `ulimit -s`.
+        threading.stack_size(512 * 1024)
+        try:
+            worker = threading.Thread(target=_construct)
+            worker.start()
+            worker.join()
+        finally:
+            threading.stack_size(previous)
+
+        assert raised, "model construction accepted a payload that must not parse"
+        assert isinstance(raised[0], ValidationError), (
+            f"a bare {type(raised[0]).__name__} escaped model construction: {raised[0]}"
+        )
+        assert "does not parse as JSON" in str(raised[0])
 
 
 class TestDatasetEnvelopeConversionTablesCoverExactly:

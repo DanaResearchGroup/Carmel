@@ -26,22 +26,34 @@ import sys
 import pytest
 
 from carmel.agents.tools import extract
-from carmel.services import numeric
+from carmel.services import numeric, pdf_fragments
 from carmel.services.semantic_deps import (
+    _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA,
+    _PYPDF_VERSION_UNKNOWN,
     CURRENT_SHA_BY_DEPENDENCY_ID,
     DEPENDENCIES_BY_SHA,
     EXTRACT_TEXT_DEPENDENCY_ID,
+    FRAGMENT_GEOMETRY_BORROWED_NAMES,
+    FRAGMENT_GEOMETRY_DEPENDENCY_ID,
     ExtractionIdentity,
+    FragmentGeometryIdentity,
     InputPolicy,
     SemanticDependencyDefinition,
     SemanticDependencyInvariantError,
     UnknownSemanticDependencyError,
+    _assert_borrowed_carmel_names,
     _assert_no_carmel_imports,
+    _fragment_geometry_components,
+    _module_level_definitions,
+    _pypdf_distribution_version,
     _pypdf_version,
+    _transitive_closure,
+    compose_component_sha,
     compute_dependency_sha,
     current_sha_for,
     dependency_for_sha,
     extraction_identity,
+    fragment_geometry_identity,
 )
 
 # HARDCODED, not derived from the live registry (never `next(iter(DEPENDENCIES_BY_SHA))`
@@ -72,7 +84,30 @@ _PINNED_GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93
 # The set of sha256 digests this registry has ever shipped, as of this test's writing.
 # Used only to assert DEPENDENCIES_BY_SHA never drops a previously-shipped entry (see
 # test_registry_is_append_only_and_never_drops_a_previously_shipped_sha below).
-_HISTORICALLY_SHIPPED_SHAS = frozenset({_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256, _PINNED_GLYPH_HEALTH_SHA256})
+#
+# MUST list EVERY shipped sha, not just the first two. It carried only the repair and
+# glyph-health digests for as long as there were four rows, which quietly left the
+# extract-text and fragment-geometry rows droppable without this tripwire firing -- an
+# append-only guard that watches half the registry is not an append-only guard. Every new
+# registry row gets its digest added here in the same commit; the literals are duplicated
+# from the pins above rather than pulled from the live registry, because a tripwire
+# computed from the thing it watches never fires on drift.
+_HISTORICALLY_SHIPPED_SHAS = frozenset(
+    {
+        _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256,
+        _PINNED_GLYPH_HEALTH_SHA256,
+        "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168",
+        "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb",
+        "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b",
+        "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e",
+        "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545",
+        "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a",
+        "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108",
+        "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e",
+        "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491",
+        "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c",
+    }
+)
 
 
 def _real_numeric_source() -> str:
@@ -339,6 +374,49 @@ def test_changing_only_a_module_level_docstring_does_not_change_the_sha() -> Non
     assert perturbed_sha == original_sha
 
 
+def test_changing_a_field_doc_DOES_change_the_sha() -> None:
+    """The boundary of "docstring-insensitive", pinned as behaviour because the phrase
+    reads wider than it is and the gap has already cost a real edit.
+
+    A docstring is the FIRST statement of a body. The PEP 258 attribute doc -- a bare
+    string after `field: int` in a class body -- is an ordinary `Expr` and is hashed as
+    CODE. So documenting a field of a hashed dataclass needs a supersession while
+    documenting a function is free, which is the opposite of what a reader assumes.
+
+    Asserted in the POSITIVE direction on purpose. A test that only checked function
+    docstrings are ignored would pass just as happily if field docs were ignored too,
+    and the next reader "simplifying" `_strip_docstrings` to strip every string
+    statement would break every stored geometry identity with a green suite.
+    """
+    source = "\n".join(
+        (
+            "import dataclasses",
+            "@dataclasses.dataclass",
+            "class Thing:",
+            "    field: int",
+            '    """{doc}"""',
+        )
+    )
+    first = compute_dependency_sha(source.format(doc="what it was"), ["Thing"])
+    second = compute_dependency_sha(source.format(doc="what it became"), ["Thing"])
+    assert first != second
+
+    # And the contrast, in one test so the two can never drift apart: the class's own
+    # docstring -- same file, same class, one statement earlier -- is free.
+    with_class_doc = "\n".join(
+        (
+            "import dataclasses",
+            "@dataclasses.dataclass",
+            "class Thing:",
+            '    """{doc}"""',
+            "    field: int",
+        )
+    )
+    assert compute_dependency_sha(with_class_doc.format(doc="one"), ["Thing"]) == compute_dependency_sha(
+        with_class_doc.format(doc="two"), ["Thing"]
+    )
+
+
 def test_changing_only_a_nested_function_docstring_does_not_change_the_sha() -> None:
     """Docstring stripping must be recursive: a change to a docstring nested inside a
     closure member's own nested function/class body must also not change the sha."""
@@ -380,6 +458,29 @@ def test_registry_is_append_only_and_never_drops_a_previously_shipped_sha() -> N
         f"DEPENDENCIES_BY_SHA is missing previously-shipped sha256(es) {sorted(missing)!r}. "
         "Removing a registry entry orphans every previously-stored dataset that was "
         "validated against it -- entries must only ever be ADDED, never removed."
+    )
+
+
+def test_every_registry_row_is_recorded_in_the_historical_set() -> None:
+    """The other direction, and the one that was missing.
+
+    `_HISTORICALLY_SHIPPED_SHAS` says in prose that every new registry row gets its digest
+    added here in the same commit, and until this test nothing checked it: a row could be
+    added and left unrecorded, and the append-only guard above would stay green forever
+    because it only looks for digests that VANISHED. A guard whose coverage depends on
+    someone remembering to extend it is exactly the guard that silently stops covering the
+    newest thing -- which is always the thing least reviewed.
+
+    This is not circular with the guard above even though the two assertions together pin
+    the set exactly. `_HISTORICALLY_SHIPPED_SHAS` is hand-written from the pinned literals
+    and never computed from the registry, so one direction still catches a dropped row and
+    the other catches an unrecorded one.
+    """
+    unrecorded = set(DEPENDENCIES_BY_SHA) - _HISTORICALLY_SHIPPED_SHAS
+    assert not unrecorded, (
+        f"registry rows {sorted(unrecorded)!r} are not listed in _HISTORICALLY_SHIPPED_SHAS. "
+        "Add the literal there in this same commit -- copied from the pin, never read back "
+        "from DEPENDENCIES_BY_SHA, or the tripwire is computed from the thing it watches."
     )
 
 
@@ -1118,3 +1219,549 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
     sha_original = compute_dependency_sha(original, ["extract_text"])
     sha_redocumented = compute_dependency_sha(redocumented, ["extract_text"])
     assert sha_original == sha_redocumented, "a docstring-only difference must not change the sha"
+
+
+# --------------------------------------------------------------------------------------
+# Fragment-geometry identity (carmel.geometry.extract_fragments)
+#
+# The only COMPOSITE registry row. Its two components are pinned SEPARATELY below, so a
+# failure names which half moved rather than only reporting that something did.
+# --------------------------------------------------------------------------------------
+
+# HARDCODED, not derived from the live registry -- same rationale as every other pin in
+# this file. Independently verified once via:
+#   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
+# This is the half that moves when fragment GEOMETRY changes.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "ab24abb65eb68fdfbc6634289124465143bdd3d2720e095b322f2bf2df89000d"
+
+# The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
+# historical row rather than only asserted in prose. Its own component moved when
+# extract_fragments stopped re-reading importlib.metadata; its BORROWED component did not.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V1 = "c93639f8dab3d79c37a1dd3d5ca4d66d9397d1c174d230fe2e10e677568ae8e3"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V1 = "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb"
+
+# The SUPERSEDED second entry. Its own component moved when `_decoded_content_length`
+# stopped measuring a page by decoding it in full; its BORROWED component did not, which
+# is now twice in a row that the split has localized the change to pdf_fragments.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V2 = "96b5852b71496f062dd1d36b255f98feb952baf89fe7e4fb995b93ce00a56f5e"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V2 = "3fc972d0394184267e85a9a9e42387423eed538758efeba3ce1fd125ef56c47b"
+
+# HARDCODED. Independently verified once via:
+#   compute_dependency_sha(inspect.getsource(extract), list(FRAGMENT_GEOMETRY_BORROWED_NAMES))
+# The half that moves when a BORROWED name's behaviour changes in extract.py -- the code
+# extract_fragments runs but compute_dependency_sha cannot see, because the import is
+# function-scope.
+_PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
+
+# The SUPERSEDED third entry. Its own component moved when the bounded decode stopped
+# accepting a TRUNCATED deflate stream as a measured one -- `unconsumed_tail` is empty for a
+# valid prefix, so only `eof` can tell "consumed all input" from "reached the end". Borrowed
+# did not move: three for three.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V3 = "e745a377714ea6a817a82977d028d6c2820091f85be7f87c4972bd70f9e41e44"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V3 = "652cdea53a2c44a9861b6896b6cb8234d86b0ac6745c3ddc135e728522e5b25e"
+
+# The SUPERSEDED fourth entry. Its own component moved when `_page_fragments` stopped
+# trusting pypdf about where a text-show operation STARTS -- the previous three moves
+# changed which pages fail, this one changes the published coordinates. Borrowed did not
+# move: four for four.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V4 = "d446c737b7d37cf50adaf4070250bc75f721f958b62680981bc89f8a5b474967"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V4 = "4ae9d68f0bcbf55bfbcaef1f7c7a2dda02b64ef4bc6bdf7cc504672d59810545"
+
+# The SUPERSEDED fifth entry. Its own component moved when `_walk_operations` stopped
+# STEPPING OVER the operators it does not name. Alone among the five, this one moved no
+# coordinate at all -- 78,178 corpus fragments and 0 page failures on both sides of it --
+# so it records a change in what the extractor REFUSES, which needs a new identity for
+# exactly the same reason a computed change does. Borrowed did not move: five for five.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V5 = "dbd9b8a255b6339438cb4551fcb6c8d0aa3e434694f5ccf71abf921a076d9cbd"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V5 = "75310c6df1677158c15e233e2da4abe72c52fcc565dbaa0f0f7ca36cb8b50f3a"
+
+# SUPERSEDED -- the SIXTH, which modelled no clipping path at all. It treated `W`/`W*` and
+# the path-painting operators as irrelevant on the true premise that they do not move text
+# and the false conclusion that they cannot hide it, and published a fragment for text drawn
+# wholly outside the clip in force.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V6 = "4dd477809aaf0874e427e72cf8ff5e12391455f525bd56ea385999c57eff1101"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V6 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254da2133ca55363108"
+
+# SUPERSEDED -- the SEVENTH, which returned one `available=False` from three sites meaning
+# three different things: pypdf absent, the capability gate refusing, and a document that
+# defeated a healthy pinned engine. An artifact carrying that flag could not say whether
+# anything had been looked at, and a mid-walk engine mismatch was indistinguishable from a
+# bad document.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V7 = "3f8d26ba2e3a343cd777ff865b34cbec6f13cb4dd4dcf12a5d9923d4b9b6f58c"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e"
+
+# HARDCODED. The registered content_sha256 itself, verified once via:
+#   compose_component_sha({"borrowed_sha256": <borrowed>, "own_sha256": <own>})
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c"
+
+# The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
+# completeness claim of the composite identity, spelled out as data: extract_fragments runs
+# these five names' code, and `borrowed_sha256` hashes exactly them.
+_EXPECTED_FRAGMENT_GEOMETRY_IMPORTS = {"carmel.agents.tools.extract": set(FRAGMENT_GEOMETRY_BORROWED_NAMES)}
+
+
+def _real_fragments_source() -> str:
+    return inspect.getsource(pdf_fragments)
+
+
+def test_fragment_geometry_own_component_sha_matches_a_hardcoded_pin() -> None:
+    computed = compute_dependency_sha(_real_fragments_source(), ["extract_fragments"])
+    assert computed == _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256, (
+        "carmel/services/pdf_fragments.py's fragment geometry (or this toolchain's "
+        "ast.dump rendering) has changed since carmel.geometry.extract_fragments was "
+        "pinned. Fix: ADD A NEW entry to DEPENDENCIES_BY_SHA in "
+        "carmel/services/semantic_deps.py for the new composite sha -- do not edit or "
+        "replace the existing pinned entry or this test's hardcoded literal."
+    )
+
+
+def test_fragment_geometry_borrowed_component_sha_matches_a_hardcoded_pin() -> None:
+    computed = compute_dependency_sha(inspect.getsource(extract), list(FRAGMENT_GEOMETRY_BORROWED_NAMES))
+    assert computed == _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256, (
+        "the behaviour of a name carmel/services/pdf_fragments.py BORROWS from "
+        "carmel/agents/tools/extract.py has changed. extract_fragments runs this code, but "
+        "compute_dependency_sha cannot see the import (it is function-scope), which is why "
+        "it is hashed as its own component. Fix: ADD A NEW registry entry for the new "
+        "composite sha -- never edit this literal in place."
+    )
+
+
+def test_fragment_geometry_registered_sha_is_the_composite_of_its_two_components() -> None:
+    """The registered content_sha256 must be exactly the composite of the two pinned
+    components -- never an independently maintained third literal that could drift away
+    from the halves it claims to summarize."""
+    composite = compose_component_sha(
+        {
+            "borrowed_sha256": _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            "own_sha256": _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256,
+        }
+    )
+    assert composite == _PINNED_FRAGMENT_GEOMETRY_SHA256
+    assert current_sha_for(FRAGMENT_GEOMETRY_DEPENDENCY_ID) == _PINNED_FRAGMENT_GEOMETRY_SHA256
+
+
+def test_fragment_geometry_borrowed_names_are_exactly_what_pdf_fragments_imports() -> None:
+    """THE completeness guard for the composite identity.
+
+    Precisely: adding a SIXTH borrowed name does move the composite, because the import
+    statement sits in extract_fragments' hashed body. The hazard is what happens after
+    that -- `borrowed_sha256` would go on attesting only the original five forever, so the
+    sixth name's behaviour would be covered by no component at all, and a later edit INSIDE
+    it would move no sha. This guard fails at the moment the name appears, which is the
+    only moment anyone is looking.
+    """
+    _assert_borrowed_carmel_names(
+        _real_fragments_source(),
+        "carmel.services.pdf_fragments",
+        _EXPECTED_FRAGMENT_GEOMETRY_IMPORTS,
+    )
+
+
+def test_borrowed_names_guard_fires_on_an_added_name() -> None:
+    source = "def f():\n    from carmel.agents.tools.extract import MAX_PDF_PAGES, _classify_pdf_page\n"
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_borrowed_carmel_names(
+            source,
+            "carmel.example.mod",
+            {"carmel.agents.tools.extract": {"MAX_PDF_PAGES"}},
+        )
+    assert "_classify_pdf_page" in str(excinfo.value)
+
+
+def test_borrowed_names_guard_fires_on_a_new_source_module() -> None:
+    source = "def f():\n    from carmel.services.numeric import AffixClass\n"
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_borrowed_carmel_names(source, "carmel.example.mod", {})
+    assert "carmel.services.numeric" in str(excinfo.value)
+
+
+def test_borrowed_names_guard_records_a_plain_package_import_as_unpinnable() -> None:
+    """`import carmel.x.y` binds the whole module, whose surface no finite name tuple can
+    pin, so it is recorded as "*" and can never satisfy a named expectation."""
+    source = "def f():\n    import carmel.services.numeric\n"
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_borrowed_carmel_names(
+            source,
+            "carmel.example.mod",
+            {"carmel.services.numeric": {"AffixClass"}},
+        )
+    assert "'*'" in str(excinfo.value)
+
+
+def test_pdf_fragments_cannot_use_the_no_carmel_imports_guard() -> None:
+    """The strong guard is the WRONG one for this module, and that is a property worth
+    pinning rather than a fact to remember.
+
+    _assert_no_carmel_imports states "this module's behaviour is fully captured by its own
+    within-module closure". pdf_fragments.py cannot satisfy it, which is exactly why the
+    composite identity and the weaker named-borrowings guard exist. If this test ever
+    starts FAILING -- i.e. the strong guard begins to pass -- the borrowed component has
+    become vacuous and the composite should be revisited, not left in place.
+    """
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_no_carmel_imports(_real_fragments_source(), "carmel.services.pdf_fragments")
+    assert "carmel.agents.tools.extract" in str(excinfo.value)
+
+
+def test_fragment_geometry_identity_reports_all_three_parts() -> None:
+    identity = fragment_geometry_identity()
+    assert isinstance(identity, FragmentGeometryIdentity)
+    assert identity.composite_sha256 == _PINNED_FRAGMENT_GEOMETRY_SHA256
+    assert identity.own_sha256 == _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256
+    assert identity.borrowed_sha256 == _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256
+    assert identity.pypdf_version == _pypdf_version()
+
+
+def test_the_identity_records_both_pypdf_witnesses_and_chooses_neither() -> None:
+    """`_engine()` gates on the DISTRIBUTION metadata; the identity used to report only
+    the imported module's `__version__`. Two witnesses to one fact that can disagree
+    under an editable, vendored or shadowed install -- and choosing one means a stored
+    artifact can never afterwards say whether they did, which for an IDENTITY is the
+    wrong shape. Both are recorded and nothing here compares them.
+    """
+    identity = fragment_geometry_identity()
+    assert identity.pypdf_version == _pypdf_version()
+    assert identity.pypdf_distribution_version == _pypdf_distribution_version()
+    # They agree on the pin, so the divergence is latent rather than live. Asserted so a
+    # future disagreement in a dev environment surfaces here rather than in an artifact.
+    assert identity.pypdf_version == identity.pypdf_distribution_version
+
+
+def test_neither_pypdf_witness_can_raise() -> None:
+    """Both collapse to the sentinel, including `PackageNotFoundError`, which is the
+    EXPECTED failure of the metadata one. Recording a second witness must not give the
+    identity a second way to fail -- an identity that raises is one a caller cannot
+    record at all."""
+    import importlib.metadata as metadata_module
+
+    def _absent(_name: str) -> str:
+        raise metadata_module.PackageNotFoundError("pypdf")
+
+    original = metadata_module.version
+    metadata_module.version = _absent  # type: ignore[assignment]
+    try:
+        assert _pypdf_distribution_version() == _PYPDF_VERSION_UNKNOWN
+        assert fragment_geometry_identity().pypdf_distribution_version == _PYPDF_VERSION_UNKNOWN
+    finally:
+        metadata_module.version = original  # type: ignore[assignment]
+
+
+def test_fragment_geometry_identity_is_frozen() -> None:
+    identity = fragment_geometry_identity()
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        identity.own_sha256 = "x"  # type: ignore[misc]
+
+
+def test_fragment_geometry_sha_differs_from_the_extract_text_sha() -> None:
+    """The geometry lane and the text lane must never share a content address: they are
+    different code producing different artifacts, and a shared sha would make a stored
+    geometry claim indistinguishable from a stored text claim."""
+    assert _PINNED_FRAGMENT_GEOMETRY_SHA256 != _PINNED_EXTRACT_TEXT_SHA256
+    assert _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256 != _PINNED_EXTRACT_TEXT_SHA256
+
+
+def test_borrowed_component_is_not_the_extract_text_closure() -> None:
+    """The borrowed component hashes EXACTLY the five borrowed names, never extract_text's
+    40-name closure that happens to contain them today.
+
+    Reusing the extract_text sha would over-attest (unrelated HTML/XML behaviour would
+    re-address stored geometry) and could later under-attest (if extract_text stopped
+    reaching one of the five while pdf_fragments still imported it, the name would leave
+    the hashed closure with no sha change at all). Both are silent-corruption directions.
+    """
+    borrowed_closure_sha = compute_dependency_sha(inspect.getsource(extract), list(FRAGMENT_GEOMETRY_BORROWED_NAMES))
+    extract_text_sha = compute_dependency_sha(inspect.getsource(extract), ["extract_text"])
+    assert borrowed_closure_sha != extract_text_sha
+    # The containment that makes the reuse tempting is real -- pin it, so that if it ever
+    # stops holding, the reason this component is computed separately is on the record.
+    tree = ast.parse(inspect.getsource(extract))
+    definitions = _module_level_definitions(tree)
+    extract_text_closure = _transitive_closure(["extract_text"], definitions)
+    assert set(FRAGMENT_GEOMETRY_BORROWED_NAMES) <= set(extract_text_closure)
+
+
+def test_compose_component_sha_is_order_independent_but_name_sensitive() -> None:
+    a = "a" * 64
+    b = "b" * 64
+    assert compose_component_sha({"own_sha256": a, "borrowed_sha256": b}) == compose_component_sha(
+        {"borrowed_sha256": b, "own_sha256": a}
+    )
+    # Swapping which component each value belongs to MUST change the composite: the two
+    # halves are not interchangeable, and a positional join could not express that.
+    assert compose_component_sha({"own_sha256": a, "borrowed_sha256": b}) != compose_component_sha(
+        {"own_sha256": b, "borrowed_sha256": a}
+    )
+
+
+def test_compose_component_sha_refuses_an_empty_or_malformed_component() -> None:
+    with pytest.raises(SemanticDependencyInvariantError):
+        compose_component_sha({})
+    with pytest.raises(SemanticDependencyInvariantError):
+        compose_component_sha({"own_sha256": "not-a-sha"})
+    with pytest.raises(SemanticDependencyInvariantError):
+        compose_component_sha({"own_sha256": "A" * 64})  # uppercase is not canonical
+    with pytest.raises(SemanticDependencyInvariantError):
+        compose_component_sha({"own_sha256": "a" * 63})
+    with pytest.raises(SemanticDependencyInvariantError):
+        compose_component_sha({"own_sha256": "a" * 65})
+
+
+# A pair of fabricated modules shaped like the real borrower/lender relationship: a
+# geometry function that imports a helper at FUNCTION scope, and the module that defines
+# that helper. Synthetic rather than the real sources, so the test states the structural
+# property and cannot be broken by unrelated edits to pdf_fragments.py or extract.py.
+_SYNTHETIC_BORROWER = '''
+GUTTER = 18.0
+
+
+def _pen_advance(width, spacing, glyphs):
+    """Fabricated advance math standing in for the real geometry."""
+    return width + spacing * glyphs
+
+
+def extract_fragments(data):
+    """Fabricated fragment extraction that borrows a helper at function scope."""
+    from carmel.agents.tools.extract import _classify_page
+
+    return [(_classify_page(page), _pen_advance(1.0, {spacing}, 2)) for page in data]
+'''
+
+_SYNTHETIC_LENDER = '''
+def _classify_page(page):
+    """Fabricated page classifier -- the borrowed behaviour."""
+    return "real" if page.get("Type") == "Page" else {verdict}
+'''
+
+
+def test_the_two_components_are_complementary_not_redundant() -> None:
+    """The property that justifies the composite existing at all.
+
+    An edit to the BORROWED code must move the borrowed component and leave the own
+    component untouched -- that invisibility is exactly the gap a single within-module sha
+    leaves, and exactly what the second component closes. Verified in both directions so
+    that neither component can be dropped later on the theory that the other covers it.
+    """
+    borrower = _SYNTHETIC_BORROWER.format(spacing="0.5")
+    lender_before = _SYNTHETIC_LENDER.format(verdict='"phantom"')
+    lender_after = _SYNTHETIC_LENDER.format(verdict='"linearization-dict"')
+    assert lender_before != lender_after, "the two synthetic lender sources must differ textually"
+
+    own_before = compute_dependency_sha(borrower, ["extract_fragments"])
+    borrowed_before = compute_dependency_sha(lender_before, ["_classify_page"])
+    borrowed_after = compute_dependency_sha(lender_after, ["_classify_page"])
+
+    # The borrowed edit is invisible to the borrower's own closure ...
+    assert compute_dependency_sha(borrower, ["extract_fragments"]) == own_before
+    # ... and visible to the borrowed component, which is the whole point.
+    assert borrowed_before != borrowed_after
+    assert compose_component_sha(
+        {"borrowed_sha256": borrowed_before, "own_sha256": own_before}
+    ) != compose_component_sha({"borrowed_sha256": borrowed_after, "own_sha256": own_before})
+
+
+def test_own_component_moves_on_a_geometry_edit() -> None:
+    """The converse direction: a change to the borrower's own geometry math must move the
+    own component (and therefore the composite), with the borrowed half held fixed."""
+    before = compute_dependency_sha(_SYNTHETIC_BORROWER.format(spacing="0.5"), ["extract_fragments"])
+    after = compute_dependency_sha(_SYNTHETIC_BORROWER.format(spacing="0.75"), ["extract_fragments"])
+    assert before != after
+
+
+def test_own_component_moves_when_a_borrowed_name_is_added() -> None:
+    """A function-scope import IS inside the hashed body, so adding a borrowed name moves
+    the own component.
+
+    Pinned deliberately, because the tempting shorthand -- "compute_dependency_sha cannot
+    see a function-scope import" -- is FALSE and would misdescribe why
+    _assert_borrowed_carmel_names is needed. It is needed because `borrowed_sha256` would
+    keep attesting the old name set afterwards, not because the addition itself is
+    invisible.
+    """
+    one = _SYNTHETIC_BORROWER.format(spacing="0.5")
+    two = one.replace(
+        "from carmel.agents.tools.extract import _classify_page",
+        "from carmel.agents.tools.extract import _classify_page, _describe_error",
+    )
+    assert one != two, "the two synthetic borrower sources must differ textually"
+    assert compute_dependency_sha(one, ["extract_fragments"]) != compute_dependency_sha(two, ["extract_fragments"])
+
+
+def test_borrowed_names_guard_fires_on_a_relative_import() -> None:
+    """A relative import names carmel code while matching no `carmel.*` prefix.
+
+    `from ..agents.tools.extract import _helper` parses as
+    `ImportFrom(module='agents.tools.extract', level=2)`. Before this was handled, the
+    guard returned an empty mapping for it and PASSED -- so a sixth borrowed helper added
+    relatively would have been attested by nothing while the guard reported the import
+    surface unchanged. Not resolved to an absolute name (that would need the importing
+    module's own package, which the guard is not given); recorded under a key that can
+    never match a named expectation, so it always fails loudly.
+    """
+    source = "def f():\n    from ..agents.tools.extract import _new_helper\n"
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_borrowed_carmel_names(
+            source,
+            "carmel.services.pdf_fragments",
+            _EXPECTED_FRAGMENT_GEOMETRY_IMPORTS,
+        )
+    assert "_new_helper" in str(excinfo.value)
+
+
+def test_borrowed_names_guard_fires_on_a_star_import() -> None:
+    source = "def f():\n    from carmel.agents.tools.extract import *\n"
+    with pytest.raises(SemanticDependencyInvariantError) as excinfo:
+        _assert_borrowed_carmel_names(
+            source,
+            "carmel.example.mod",
+            {"carmel.agents.tools.extract": set(FRAGMENT_GEOMETRY_BORROWED_NAMES)},
+        )
+    assert "'*'" in str(excinfo.value)
+
+
+def test_fragment_geometry_components_are_recorded_append_only_by_composite() -> None:
+    """A composite is a one-way hash, so the halves it was built from must be RECORDED --
+    keyed by the composite, never held as current-only constants that the first
+    supersession would overwrite."""
+    components = _fragment_geometry_components(_PINNED_FRAGMENT_GEOMETRY_SHA256)
+    assert components.own_sha256 == _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256
+    assert components.borrowed_sha256 == _PINNED_FRAGMENT_GEOMETRY_BORROWED_SHA256
+    assert components.borrowed_names == FRAGMENT_GEOMETRY_BORROWED_NAMES
+    # Recomposing the recorded halves must reproduce the key they are filed under.
+    assert (
+        compose_component_sha(
+            {
+                "borrowed_sha256": components.borrowed_sha256,
+                "own_sha256": components.own_sha256,
+            }
+        )
+        == _PINNED_FRAGMENT_GEOMETRY_SHA256
+    )
+
+
+def test_every_registered_composite_has_recorded_components() -> None:
+    """The component record must never fall behind the registry: a shipped composite with
+    no recorded halves cannot be localized, which is the one thing the composite shape
+    exists to make possible."""
+    for sha, definition in DEPENDENCIES_BY_SHA.items():
+        if definition.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID:
+            assert _fragment_geometry_components(sha) is not None
+
+
+def test_unknown_composite_cannot_be_localized() -> None:
+    with pytest.raises(UnknownSemanticDependencyError):
+        _fragment_geometry_components("f" * 64)
+
+
+def test_fragment_geometry_component_record_is_read_only() -> None:
+    with pytest.raises(TypeError):
+        _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA[_PINNED_FRAGMENT_GEOMETRY_SHA256] = None  # type: ignore[index]
+
+
+def test_the_superseded_fragment_geometry_row_is_still_resolvable() -> None:
+    """The registry's first real supersession, checked as behaviour rather than prose.
+
+    An artifact citing the superseded composite must still resolve to a row that names the
+    right dependency and reports itself NOT current. Dropping the row would make such an
+    artifact indistinguishable from a forged one -- the exact confusion this module was
+    written to prevent.
+    """
+    for superseded_sha in (
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V1,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V2,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V4,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V5,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V7,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V8,
+    ):
+        superseded = dependency_for_sha(superseded_sha)
+        assert superseded.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID
+        assert superseded.is_current is False
+    current = dependency_for_sha(_PINNED_FRAGMENT_GEOMETRY_SHA256)
+    assert current.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID
+    assert current.is_current is True
+    assert current_sha_for(FRAGMENT_GEOMETRY_DEPENDENCY_ID) == _PINNED_FRAGMENT_GEOMETRY_SHA256
+
+
+def test_every_superseded_geometry_row_is_distinct() -> None:
+    """Two supersessions is where an append-only table starts being able to lie: a copied
+    literal, or a `_V2` that never got its own value, would leave two rows claiming the
+    same content address and the second would silently shadow the first."""
+    shas = (
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V1,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V2,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V4,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V5,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V7,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V8,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256,
+    )
+    owns = (
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V1,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V2,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V3,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V4,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V5,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V6,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V7,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V8,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256,
+    )
+    assert len(set(shas)) == len(shas)
+    assert len(set(owns)) == len(owns)
+
+
+def test_the_supersession_moved_only_the_own_component() -> None:
+    """What the composite split buys, demonstrated on the real supersessions rather than on
+    synthetic sources: both changes were entirely inside pdf_fragments, so the OWN half
+    moved each time and the BORROWED half never did. A single opaque sha could not say
+    that, and saying it three times over is what turns one observation into the property the
+    split was built to provide."""
+    generations = [
+        _fragment_geometry_components(sha)
+        for sha in (
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V1,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V2,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V3,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V4,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V5,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V7,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V8,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256,
+        )
+    ]
+    for old, new in zip(generations[:-1], generations[1:], strict=True):
+        assert old.own_sha256 != new.own_sha256
+        assert old.borrowed_sha256 == new.borrowed_sha256
+        assert old.borrowed_names == new.borrowed_names
+
+
+def test_extract_fragments_records_the_pinned_pypdf_version_without_a_second_metadata_read() -> None:
+    """The recorded version must be the constant `_engine()` already validated against.
+
+    A second `importlib.metadata.version` call was both redundant -- `_engine()` refuses
+    unless that entry equals the pin, so nothing else reaches this point -- and a second
+    way to fail, sitting outside the degradation `try` where it could raise
+    PackageNotFoundError out of a function documented never to raise for a malformed
+    document.
+    """
+    source = inspect.getsource(pdf_fragments)
+    tree = ast.parse(source)
+    extract_fragments_def = next(
+        node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "extract_fragments"
+    )
+    metadata_calls = [
+        node
+        for node in ast.walk(extract_fragments_def)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "version"
+    ]
+    assert not metadata_calls, (
+        "extract_fragments must not re-read the pypdf version; _engine() already validated "
+        "it against _PINNED_PYPDF_VERSION and refused anything else"
+    )

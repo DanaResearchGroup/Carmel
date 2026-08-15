@@ -2805,6 +2805,25 @@ def _raise(exc: type[BaseException]) -> Callable[..., None]:
     return _killpg
 
 
+def _no_proc(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point ``PROC_ROOT`` at a directory that does not exist, so NO pid is readable.
+
+    The two tests below assert the ``/proc``-is-unreadable fallback, and both used to
+    name the literal pid ``4242`` and rely on it being dead. It is not dead, it is
+    USUALLY dead: on this developer's host ``/proc/4242`` is a live ``teamviewerd``, so
+    ``process_group_command`` read a real argv and the fallback under test never ran --
+    a test that passes everywhere the fallback is untested and fails only where a real
+    process happens to sit on the pid.
+
+    Searching the host for a pid with no ``/proc`` entry fixes the symptom and keeps the
+    disease: the kernel may allocate that pid between the search and the use. Removing
+    ``/proc`` from the test instead makes unreadability a PROPERTY OF THE FIXTURE rather
+    than a hope about the host, which is the pattern
+    ``test_a_group_we_cannot_read_is_never_reported_stopped`` already uses.
+    """
+    monkeypatch.setattr(carmel.services.processes, "PROC_ROOT", tmp_path / "no-such-proc")
+
+
 def _forbid_signals(pgid: int) -> Callable[..., None]:
     """Return a killpg replacement that denies real signals to *pgid*."""
     real = os.killpg
@@ -2902,7 +2921,8 @@ class TestSupervisorLock:
         assert active is not None
         assert active.process_group_id == 4242
 
-    def test_the_launched_process_group_is_recorded(self, tmp_path: Path) -> None:
+    def test_the_launched_process_group_is_recorded(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        _no_proc(monkeypatch, tmp_path)
         with supervise_run(tmp_path, "act-1") as supervision:
             supervision.record_process_group(4242, ["conda", "run", "-n", "t3_env"])
             active = load_active_run(tmp_path)
@@ -2930,8 +2950,11 @@ class TestSupervisorLock:
             assert active.leader_starttime is not None
             os.killpg(tree.pgid, signal.SIGKILL)
 
-    def test_recording_falls_back_to_the_launched_argv_when_proc_is_unreadable(self, tmp_path: Path) -> None:
+    def test_recording_falls_back_to_the_launched_argv_when_proc_is_unreadable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """A pgid whose ``/proc`` cannot be read keeps the passed argv as a label."""
+        _no_proc(monkeypatch, tmp_path)
         with supervise_run(tmp_path, "act-1") as supervision:
             supervision.record_process_group(4242, ["conda", "run"])
             active = load_active_run(tmp_path)

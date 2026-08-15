@@ -209,6 +209,197 @@ REPAIR_NAMES: frozenset[str] = frozenset(
 )
 
 
+class AffixClass(StrEnum):
+    """What kind of numeral-modifying affix a standalone token is.
+
+    Lives HERE, beside the grammar whose literals it is built from, because this module
+    already owns the sign/repair/mojibake vocabulary
+    (:data:`_CORE_VALUE_RE`, :data:`REPAIR_NAMES`). A second copy grown in a geometry
+    module would drift from the parser that actually decides what a numeral means --
+    the same collision :class:`carmel.services.pdf_fragments.GlyphMapping` was renamed
+    to avoid.
+    """
+
+    SIGN = "sign"
+    DECIMAL = "decimal"
+    EXPONENT = "exponent"
+    RELATIONAL = "relational"
+
+
+#: The EXPLICIT affix vocabulary: tokens that cannot stand as a value on their own AND
+#: silently change the meaning of a numeral they abut.
+#:
+#: Explicit rather than "anything that cannot stand alone", because that broader rule
+#: was MEASURED against the real corpus and is far too aggressive: reference brackets
+#: (``[23]``) and lone footnote letters are legitimate standalone table cells, and
+#: including them takes a neighbour-refusal rule from 3.50% of proposals to 22.5%.
+#:
+#: Bare ``10`` is deliberately ABSENT despite being half of every ``x 10^n``
+#: construct. ``10`` standing alone is an ordinary value, and a column of round
+#: numbers is not suspicious; the multiplication glyph that makes it an exponent is
+#: itself in :attr:`AffixClass.EXPONENT`, so the construct is caught by its operator
+#: instead of by its operand.
+#:
+#: EXPONENT holds only TRUE multiplication glyphs, not their ASCII lookalikes, and the
+#: corpus is unambiguous about why. As standalone tokens, ``e`` occurs 1781 times,
+#: ``x`` 115, ``X`` 52 and ``*`` 9 -- and they are word-split fragments ("e" out of
+#: running prose, "x" out of "experimental"/"expanding"), the mole-fraction LABEL
+#: (``X`` is followed by the broken-``=`` mojibake 5 times), and a footnote marker
+#: ("*Corresponding author"). None is a multiplication sign. ``×`` and ``·`` occur
+#: standalone 0 and 1 times respectively, so including them guards the real construct
+#: at essentially zero measured cost.
+#:
+#: A superscript exponent (the ``-3`` of ``10^-3``) is NOT covered here at all: it sits
+#: off the baseline, so it falls outside a caller's vertical band rather than being
+#: classified. That is a stated limit of the band, not a gap in this vocabulary.
+#:
+#: The mojibake entries are the SAME broken-``ToUnicode`` shapes
+#: :func:`_normalize_single_value` repairs -- thorn for ``+`` (hence SIGN) and ``1/4``
+#: for ``=`` (hence RELATIONAL, not SIGN: it is a broken relational operator, and the
+#: refusal an operator reads should name what the glyph really was).
+_AFFIX_TOKENS: dict[str, AffixClass] = {
+    **dict.fromkeys(["-", "+", "−", "–", "±", "∓", "þ"], AffixClass.SIGN),
+    **dict.fromkeys([".", ","], AffixClass.DECIMAL),
+    **dict.fromkeys(["×", "·"], AffixClass.EXPONENT),
+    **dict.fromkeys(
+        ["=", "<", ">", "≤", "≥", "~", "≈", "≃", "≅", "¼"],
+        AffixClass.RELATIONAL,
+    ),
+}
+
+#: A glyph that had no usable ``ToUnicode`` mapping. Such a token is classed SIGN
+#: because that is the damage it does: the corpus's detached minus signs arrive as
+#: ``/C0``, and reading one as absent inverts the number's sign silently. Kept
+#: deliberately narrow on both sides for the reason
+#: :data:`carmel.services.pdf_fragments._UNMAPPED_MARKER_RE` gives -- an unanchored
+#: ``/C\d+`` flags ``/C2H4`` and every ``H2/CO`` species list in a combustion corpus.
+_UNMAPPED_AFFIX_RE = re.compile(r"^(?:\(cid:\d+\)|/[cC]\d+|�)$")
+
+
+def classify_affix(token: str) -> AffixClass | None:
+    """Classify a STANDALONE token as a numeral-modifying affix, or ``None``.
+
+    ``None`` means only "not a member of the explicit affix vocabulary". It is NOT a
+    claim that the token is a safe value, and no caller may treat it as one.
+    """
+    stripped = token.strip()
+    if not stripped:
+        return None
+    if _UNMAPPED_AFFIX_RE.match(stripped):
+        return AffixClass.SIGN
+    return _AFFIX_TOKENS.get(stripped)
+
+
+#: Which way an ATTACHED affix REACHES. A sign binds to the number on its right
+#: (``-1.0``), so a leading ``-`` on the token to your right belongs to that token's own
+#: value and is no threat to you. A decimal point, a multiplication glyph and a relational
+#: operator all reach both ways -- the ``.`` of ``3`` ``.14`` binds LEFT, and mistaking
+#: that for a neighbouring cell turns ``3.14`` into ``3``.
+#:
+#: **This table describes an ATTACHED affix, and a DETACHED sign is a different object.**
+#: What makes the ``-`` of ``-3`` that number's own sign is that it is printed against its
+#: digits. A token that is ENTIRELY a sign is bound to nothing, and geometry cannot say
+#: which side it belongs to -- so it is refused from both, which is the fail-closed
+#: direction for a layer that only ever refuses.
+#:
+#: That refusal is worth a real recall cost, because on real pages the detached sign is
+#: usually not a sign at all. Measured over the 8-paper corpus, joined to the shipped
+#: refusal by proposal identity: **157** sites have a bare numeral whose nearest right-hand
+#: neighbour is a whole-token ``+``/``-``/``–``/``þ``; **128** of those are refused by this
+#: rule in production and the other 29 refuse earlier anyway (27 straddled, 2 rotated
+#: neighbour). Of the 157, **148** are followed by a WORD -- a reaction equation, or the
+#: suspended hyphen of ``5- and 10-atm`` -- 5 sit between two numerals as an operator or a
+#: citation range (``[8–13]``), 2 have nothing after them, and the 2 that hug the numeral
+#: after them are a range (``1-2``) and a sum (``96 + 160``) on inspection. **Zero of 157
+#: are the next cell's negative value.** Every one of those constructs reaches LEFT.
+#:
+#: Two limits on that census, both real:
+#:
+#: - It is EXTRA-PROCEDURAL. Production never asks what follows the sign; it classifies the
+#:   nearest neighbour's edge token and stops. The census justifies the refusal, it does not
+#:   describe the gate.
+#: - It says nothing about a genuinely detached sign in a table that sets its signs in
+#:   their own column, which is a real layout. Such a sign IS a sign; this module still
+#:   refuses it, and the refusal is right for the reason above -- geometry cannot attach
+#:   it -- not because the glyph stopped being a sign.
+#:
+#: The mirror case is NOT covered and is measured rather than hidden: an ATTACHED sign to
+#: your right (``+160``, ``–1818.``) passes the filter by design, because refusing it would
+#: reject every row containing a negative number. On this corpus that admits **13**
+#: proposals whose right-hand neighbour is an attached sign, of which 5 are page ranges in
+#: a reference list (``1810`` beside ``–1818.``) and 3 are the ``+O`` of a reaction
+#: equation. The same binary operator this table refuses when detached is accepted when
+#: attached, and no geometry available here separates the two.
+#:
+#: This is why :func:`classify_abutting_affix` classifies a whole-token affix BEFORE
+#: consulting this table rather than after, and why that order is a fixture rather than an
+#: oversight -- see the refusal it pins in ``tests/test_numeric.py``.
+_LEFT_REACHING = frozenset({AffixClass.DECIMAL, AffixClass.EXPONENT, AffixClass.RELATIONAL})
+
+
+def _touches_a_digit(token: str, *, from_end: bool) -> bool:
+    """Whether the character just INSIDE the abutting edge is a digit.
+
+    ``"3."`` from the end -> True (a value split across its point). ``"Fig."`` -> False
+    (a sentence). ``"."`` alone -> False here, but that case never reaches this
+    function: a token that is entirely an affix is classified before it.
+    """
+    inner = token[-2:-1] if from_end else token[1:2]
+    return inner.isdigit()
+
+
+def classify_abutting_affix(token: str, *, from_end: bool, always_reaches: bool = False) -> AffixClass | None:
+    """Classify the affix at the EDGE of ``token`` that touches the value beside it.
+
+    :func:`classify_affix` only sees a token that is *entirely* an affix, which misses
+    the shapes real typesetting produces: a value split as ``3`` / ``.14``, or an
+    exponent set as ``×10`` or ``×10−3`` with no space. Those are ordinary printed
+    scientific notation, not adversarial input, and treating them as unrelated
+    neighbouring cells silently drops a decimal fraction or a factor of a thousand.
+
+    ``from_end`` selects which edge abuts the value: ``True`` for a token on the LEFT
+    (its trailing edge touches you), ``False`` for one on the RIGHT (its leading edge
+    does). The direction is not cosmetic -- see :data:`_LEFT_REACHING`. A leading sign
+    on your right-hand neighbour is that neighbour's own sign, and refusing on it would
+    reject every row containing a negative number.
+
+    ``always_reaches`` overrides that directional filter, and exists for exactly one
+    caller: a RAISED neighbour. ``−3`` sitting on the baseline to your right is the
+    next cell's negative value, but the same ``−3`` set 3 pt higher is your exponent,
+    because a superscript binds to what precedes it. Position, not content, is what
+    separates the two, and only the caller can see position -- so the caller says so.
+
+    A token that is ENTIRELY an affix is classified FIRST, and therefore never meets the
+    direction filter. That ordering looks like an inconsistency -- ``-3`` on your right is
+    let through while a bare ``-`` on your right refuses -- and it is not one: the
+    direction rule is a statement about a sign ATTACHED to its digits, and a detached sign
+    is one nothing here can attach to either side. :data:`_LEFT_REACHING` carries the
+    corpus census and the two limits on it. Restoring the "consistency" would publish 71
+    corpus regions whose only refusal is this one, among them the ``11`` of a citation
+    range ``[8–13]``.
+    """
+    stripped = token.strip()
+    if not stripped:
+        return None
+    whole = classify_affix(stripped)
+    if whole is not None:
+        return whole
+    affix = _AFFIX_TOKENS.get(stripped[-1] if from_end else stripped[0])
+    if affix is None:
+        return None
+    if not from_end and not always_reaches and affix not in _LEFT_REACHING:
+        return None
+    if affix is AffixClass.DECIMAL and not _touches_a_digit(stripped, from_end=from_end):
+        # A decimal point sits BETWEEN digits. A period ending `Fig.`, `Table.` or
+        # `et al.` is English punctuation, and treating it as a decimal makes this
+        # function refuse on prose: it is the difference between 118 and 491 left-hand
+        # refusals over the corpus, and none of the extra 373 is a number split across
+        # its point. Requiring a digit on the inside keeps the refusals about numeral
+        # semantics rather than about abbreviation style.
+        return None
+    return affix
+
+
 #: THE single shared GRAMMAR BODY, codebase-wide, for where a numeral "candidate"
 #: begins in free-running text -- factored out so two independent trailing-boundary
 #: choices (see :data:`NUMERAL_CANDIDATE_RE` and :data:`NUMERAL_EXTENT_RE` below)
