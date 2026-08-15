@@ -20,6 +20,8 @@ from carmel.services.pdf_cells import (
     region_refusals,
 )
 from carmel.services.pdf_fragments import (
+    _ENGINE_RAN,
+    FragmentAvailability,
     FragmentExtraction,
     FragmentPageFailure,
     GlyphMapping,
@@ -502,12 +504,34 @@ class TestTheRegionItself:
 class TestPartialEvidenceFailsTowardRefusal:
     """The reason `refuse_region` takes the whole extraction, not one page."""
 
-    def test_an_unavailable_extraction_refuses(self) -> None:
+    def test_every_unavailable_state_refuses_with_the_same_reason(self) -> None:
+        """One region-level reason for all four, and the region is refused under each.
+
+        The states differ in WHOSE FAULT the missing evidence is, which is a property
+        of the document and identical for every region in it. Splitting the per-region
+        enum along a per-document axis would grow a corpus tally without telling it
+        anything about a region -- so the distinction stays on the extraction, and this
+        test is what stops a later reader from putting it here.
+        """
         number = _fragment("1.0", 103.5, 115.0)
-        extraction = FragmentExtraction(fragments=(number,), available=False, lossy=True)
-        refusal = refuse_region(extraction, _region(number))
-        assert refusal is not None
-        assert refusal.reason is RegionRefusalReason.EXTRACTION_UNAVAILABLE
+        for status in FragmentAvailability:
+            if status is FragmentAvailability.AVAILABLE:
+                continue
+            # The REGION still claims this fragment as a member while the EXTRACTION
+            # carries nothing -- which is the interesting shape, not a workaround for
+            # the invariant that forbids the other one. It is precisely a producer
+            # asserting members that no available extraction backs.
+            extraction = FragmentExtraction(
+                status=status,
+                lossy=True,
+                pypdf_version="6.14.2" if status in _ENGINE_RAN else "",
+            )
+            refusal = refuse_region(extraction, _region(number))
+            assert refusal is not None
+            assert refusal.reason is RegionRefusalReason.EXTRACTION_UNAVAILABLE
+            # Named for a human reading one refusal. NOT a carrier: anything needing
+            # the distinction structurally reads `extraction.status`, which it holds.
+            assert status.value in refusal.detail
 
     def test_a_failure_on_this_page_refuses(self) -> None:
         """The dangerous neighbour that would have refused this region may simply never

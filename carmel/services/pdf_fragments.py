@@ -46,6 +46,7 @@ from enum import StrEnum
 from typing import Any
 
 __all__ = [
+    "FragmentAvailability",
     "FragmentExtraction",
     "FragmentPageFailure",
     "GlyphMapping",
@@ -175,6 +176,93 @@ class FragmentPageFailure:
     ``_describe_page_error`` so the redaction rules stay in one place."""
 
 
+class FragmentAvailability(StrEnum):
+    """Whether this lane produced anything, and if not, WHOSE FAULT that is.
+
+    Four ways to have no fragments, and they are not one event. This was a single
+    ``available: bool`` returned from three different sites, which is the
+    UNVERIFIABLE-vs-FAILED conflation this codebase forbids, committed in production:
+    an uninstalled pypdf, a refusing capability gate, and a document that defeated a
+    healthy pinned engine all arrived as the same ``False``. The first two say nothing
+    whatsoever about the document, because nothing ever looked at it; the third is a
+    statement ABOUT the document.
+
+    The members are named for the OWNER of the problem, because that is the axis the
+    boolean destroyed and the one an operator needs -- and where ownership cannot
+    honestly be established, the member says so rather than guessing (see
+    ``READER_WALK_FAILED``). It is deliberately not an axis of severity: every
+    non-``AVAILABLE`` member refuses exactly as much as every other, and nothing here
+    is a licence to claim anything. See ``region_refusals``, which treats all four
+    identically on purpose.
+    """
+
+    AVAILABLE = "available"
+    """The pinned engine ran this document to completion. Says nothing about how MUCH
+    was obtained -- ``lossy``, ``truncated`` and ``page_failures`` answer that, and an
+    AVAILABLE extraction can still be badly incomplete."""
+
+    ENGINE_ABSENT = "engine_absent"
+    """pypdf is not installed, so nothing was read. Not an alarm: pypdf is an optional
+    extra and CI's base job runs this way by design. Says NOTHING about the document,
+    which is the whole reason it must not read like a document verdict.
+
+    Reported ONLY for a ``ModuleNotFoundError`` naming ``pypdf`` itself. An installed
+    pypdf whose own import fails -- a missing transitive dependency, a crash at import
+    time, a package that no longer exports ``PdfReader`` -- is an alarm wearing the
+    same ``ImportError`` coat, and reporting it as "the optional extra is not
+    installed" would have been the original defect committed a second time. Those go
+    to ``ENGINE_REFUSED``; the three shapes were measured, not assumed."""
+
+    ENGINE_REFUSED = "engine_refused"
+    """pypdf is installed and cannot be used: either :func:`_engine` rejected it at the
+    front door -- moved internals, a changed ``TextStateParams`` shape or field order,
+    a missing ``StreamObject._data``, a version that is unknown or not the pin -- or
+    the package is present and broken enough that importing it failed. Nothing was
+    read, so this too says NOTHING about the document. The deployment owns it.
+
+    Which of those fired is NOT carried here; it is in a log line, and logs are
+    ephemeral. Distinguishing them needs ``_engine`` to return a refusal rather than
+    ``None``, which is a separate change. Until then an operator reading this state
+    cannot tell "bump the pin" from "the internals moved" without the logs."""
+
+    ENGINE_CONTRADICTED_GATE = "engine_contradicted_gate"
+    """:func:`_engine` passed, and the engine then broke the same contract mid-walk
+    (see :class:`_EngineMismatch`). A SEPARATE member from ``ENGINE_REFUSED`` rather
+    than a sub-reason of it, because the owner differs: that one says fix your
+    install, this one says the front-door gate is incomplete and Carmel must widen it.
+    Collapsing the two would send someone to reinstall a correctly-installed pypdf."""
+
+    READER_WALK_FAILED = "reader_walk_failed"
+    """The pinned engine was in hand and reading this document raised for some other
+    reason -- including in ``PdfReader``'s own CONSTRUCTION, which is inside the same
+    guard, so "walk" here covers everything from opening the bytes onward and not only
+    the per-page loop.
+
+    Deliberately NOT called ``DOCUMENT_UNREADABLE``, which is what it is in the common
+    case. That name would assert an ownership the ``except Exception`` cannot
+    establish: the same clause catches ``MemoryError``, ``RecursionError``, a bug in
+    this module, a failure inside ``_quiet_pypdf``'s enter/exit, and a failure while
+    FORMATTING a page error. A ``MemoryError`` is also potentially transient, so even
+    "re-running will not help" -- true of a corrupt document -- would be overclaiming.
+    The name says what was observed: reading failed. ``KeyboardInterrupt`` and
+    ``SystemExit`` derive from ``BaseException`` and are not caught at all, which is
+    correct: an interrupt is not an extraction outcome."""
+
+
+#: The states in which pypdf was actually reached and run, and therefore exactly the
+#: states whose ``pypdf_version`` is set. Named rather than inlined because it is the
+#: same fact in two places -- the invariant below and the return sites of
+#: :func:`extract_fragments` -- and the two silently disagreeing is the shape of bug the
+#: invariant exists to catch.
+_ENGINE_RAN = frozenset(
+    {
+        FragmentAvailability.AVAILABLE,
+        FragmentAvailability.ENGINE_CONTRADICTED_GATE,
+        FragmentAvailability.READER_WALK_FAILED,
+    }
+)
+
+
 @dataclass(frozen=True)
 class FragmentExtraction:
     """The result of one whole-document extraction."""
@@ -185,14 +273,20 @@ class FragmentExtraction:
     could not be inspected, or the document was truncated. Mirrors
     ``ExtractedText.lossy``, and like it, fails toward admitting loss."""
 
-    available: bool = True
-    """False when pypdf is absent, the capability check refused, or the engine proved
-    incompatible partway through. Distinct from ``lossy``: ``available=False`` means
-    NOTHING here can be relied on and no claim about this document may be made, while
-    ``lossy=True`` means what IS here is real but incomplete. Conflating them is the
-    specific error this pair exists to prevent -- an engine-wide incompatibility that
-    returned zero fragments while reporting ``available=True`` would read exactly like
-    a legitimately empty document."""
+    status: FragmentAvailability = FragmentAvailability.AVAILABLE
+    """Whether this lane produced anything, and whose fault it is when it did not.
+
+    Distinct from ``lossy``: anything but ``AVAILABLE`` means NOTHING here can be
+    relied on and no claim about this document may be made, while ``lossy=True`` means
+    what IS here is real but incomplete. Conflating them is the specific error this
+    pair exists to prevent -- an engine-wide incompatibility that returned zero
+    fragments while reporting itself available would read exactly like a legitimately
+    empty document.
+
+    ONE field rather than a boolean beside a reason. Two fields would be two facts
+    where there is one, and would need an invariant enforced to keep them agreeing;
+    a state that cannot be inconsistent needs no enforcement. ``available`` below is
+    derived from it, so every existing consumer is untouched."""
 
     page_failures: tuple[FragmentPageFailure, ...] = ()
     truncated: bool = False
@@ -210,7 +304,65 @@ class FragmentExtraction:
     semantics, CTM composition, page-rotation normalisation or ``TJ`` displacement
     could keep every attribute name intact -- passing :func:`_engine` -- while
     silently returning DIFFERENT numbers. No capability check can catch that, so the
-    version travels with the result and the pin is asserted at runtime."""
+    version travels with the result and the pin is asserted at runtime.
+
+    Empty exactly when nothing was read: ``ENGINE_ABSENT`` and ``ENGINE_REFUSED``. It
+    is therefore a PARTIAL discriminator between the states above, and must never be
+    used as one -- it cannot separate those two from each other, it cannot separate
+    ``ENGINE_CONTRADICTED_GATE`` from ``READER_WALK_FAILED``, and it discriminates at
+    all only by accident. Setting ``version`` before the walk instead of after is an
+    obviously-correct-looking edit that would silently erase what discrimination it
+    does have, with no test failing. ``status`` is the carrier."""
+
+    @property
+    def available(self) -> bool:
+        """True only for :attr:`FragmentAvailability.AVAILABLE`.
+
+        Kept as a derived property, not a field, so it cannot disagree with
+        ``status``. It is the coarse question -- "may I use any of this?" -- and it is
+        the right question for a consumer that would treat all four failures the same
+        way, which every consumer in the tree does today."""
+        return self.status is FragmentAvailability.AVAILABLE
+
+    def __post_init__(self) -> None:
+        """Make the combinations this class's own prose forbids unconstructible.
+
+        An internal consistency check on a construction path this module controls, not
+        a security boundary -- ``pickle`` and ``object.__setattr__`` bypass it, and
+        neither is a threat model here. Every rule below was written as a docstring
+        first and enforced second, which is the wrong order: prose that the type does
+        not enforce is a convention, and the suite had already grown a fixture that
+        broke one of these while the docstring said it could not happen.
+
+        ``status`` is type-checked because it is a :class:`StrEnum`: a raw
+        ``"engine_absent"`` compares EQUAL to the member and is NOT it, so a consumer
+        matching with ``is`` -- as this module tells them to -- would silently skip a
+        state that reads correctly in every log line and repr.
+        """
+        if not isinstance(self.status, FragmentAvailability):
+            raise TypeError(f"status must be a FragmentAvailability, not {type(self.status).__name__}")
+        # `page_failures` and `truncated` are the two things that LOCATE loss, so either
+        # of them present while the document-level flag says complete is a contradiction
+        # inside one object.
+        if (self.page_failures or self.truncated) and not self.lossy:
+            raise ValueError("recorded page failures or truncation must set lossy")
+        if self.status is not FragmentAvailability.AVAILABLE:
+            if not self.lossy:
+                raise ValueError(f"{self.status} must admit loss: an unavailable extraction is never complete")
+            if self.fragments or self.page_failures or self.truncated:
+                # "NOTHING here can be relied on" has to mean nothing is HERE. An
+                # unavailable result carrying fragments invites a consumer to use them,
+                # and one carrying page failures claims to know which pages failed in a
+                # walk whose whole point is that it established nothing.
+                raise ValueError(f"{self.status} carries evidence it cannot vouch for")
+        if bool(self.pypdf_version) is not (self.status in _ENGINE_RAN):
+            # The version means "the engine that ran was this one". Recording it where
+            # nothing ran claims an extraction happened; omitting it where something did
+            # loses which engine to blame. Enforced for AVAILABLE too, at the cost of a
+            # bare FragmentExtraction() no longer constructing -- which is correct: an
+            # available extraction that never ran an engine is a fiction, and it was
+            # only ever convenient as a fixture.
+            raise ValueError(f"{self.status} must record the pypdf version exactly when the engine ran")
 
 
 def _engine() -> tuple[Any, ...] | None:
@@ -2020,8 +2172,24 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
     """
     try:
         from pypdf import PdfReader
+    except ModuleNotFoundError as exc:
+        # ONLY a module that is genuinely not there is ENGINE_ABSENT, and the name has
+        # to be checked: an installed pypdf missing a transitive dependency raises this
+        # same class naming THAT dependency, and calling it "the optional extra is not
+        # installed" would repeat the original defect one layer down. Measured, not
+        # assumed -- absent module and a poisoned `sys.modules` entry both raise
+        # ModuleNotFoundError(name="pypdf"), a missing transitive dep raises it naming
+        # the dep, and an import-time crash or a missing `PdfReader` does not raise
+        # this class at all.
+        if exc.name != "pypdf":
+            logger.warning("pypdf is installed but its import failed: %s", exc)
+            return FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_REFUSED)
+        return FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_ABSENT)
     except Exception:
-        return FragmentExtraction(lossy=True, available=False)
+        # Present and broken: a crash at import time, or a package that no longer
+        # exports `PdfReader`. An alarm, not a supported configuration.
+        logger.warning("pypdf is installed and could not be imported; fragments unavailable", exc_info=True)
+        return FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_REFUSED)
 
     from carmel.agents.tools.extract import (
         MAX_PDF_PAGES,
@@ -2033,7 +2201,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
 
     engine = _engine()
     if engine is None:
-        return FragmentExtraction(lossy=True, available=False)
+        return FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_REFUSED)
 
     # NOT a second `importlib.metadata.version("pypdf")` call, which is what this was.
     #
@@ -2086,7 +2254,10 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     )
                 except _EngineMismatch:
                     # Not a page failure. The engine is wrong, so nothing extracted
-                    # from this document can be relied on.
+                    # from this document can be relied on. Lands in the dedicated
+                    # clause below as ENGINE_CONTRADICTED_GATE, never as a document
+                    # verdict: reaching here means `_engine` approved an engine that
+                    # then broke the same contract, so the defect is in the gate.
                     raise
                 except Exception as exc:
                     logger.debug("fragment extraction failed on page %d", page_number, exc_info=True)
@@ -2111,13 +2282,24 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     truncated = True
                     lossy = True
                     break
+    except _EngineMismatch:
+        # ORDER IS CONTRACT. `_EngineMismatch` is an `Exception` subclass, so swapping
+        # these two clauses does not fail to compile and does not fail a test that only
+        # checks `available` -- it silently refiles "the front-door gate is incomplete"
+        # as "this document is a bit odd", which is the one misattribution this whole
+        # taxonomy exists to prevent. Pinned by
+        # `test_the_engine_clause_must_be_caught_before_the_general_one`.
+        logger.warning("pypdf contradicted the capability gate mid-walk; fragments unavailable")
+        return FragmentExtraction(
+            lossy=True, status=FragmentAvailability.ENGINE_CONTRADICTED_GATE, pypdf_version=version
+        )
     except Exception:
-        return FragmentExtraction(lossy=True, available=False, pypdf_version=version)
+        return FragmentExtraction(lossy=True, status=FragmentAvailability.READER_WALK_FAILED, pypdf_version=version)
 
     return FragmentExtraction(
         fragments=tuple(fragments),
         lossy=lossy,
-        available=True,
+        status=FragmentAvailability.AVAILABLE,
         page_failures=tuple(failures),
         truncated=truncated,
         pypdf_version=version,

@@ -154,8 +154,14 @@ class RegionRefusalReason(StrEnum):
 
     EXTRACTION_UNAVAILABLE = "extraction_unavailable"
     """The fragment lane produced nothing usable -- pypdf absent, the capability check
-    refused, or the engine proved incompatible. NOTHING about this document may be
-    claimed, so the region cannot be vouched for regardless of its geometry."""
+    refused, the engine contradicted that check mid-walk, or the reader walk failed.
+    NOTHING about this document may be claimed, so the region cannot be vouched for
+    regardless of its geometry.
+
+    Which of those four it was lives on
+    :class:`carmel.services.pdf_fragments.FragmentAvailability`, deliberately not
+    here: it is a property of the DOCUMENT, uniform across every region in it, and a
+    per-region enum is the wrong place to keep a per-document fact."""
 
     PAGE_INCOMPLETE = "page_incomplete"
     """This region's page failed, could not be inspected, or the document was truncated
@@ -413,9 +419,17 @@ def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tu
         return tuple(found.values())
 
     if not extraction.available:
+        # ONE reason for all four unavailability states, on purpose. The region-level
+        # answer is identically "nothing about this document was established", and a
+        # per-DOCUMENT fault does not belong in a per-REGION census: splitting it here
+        # would multiply the categories a corpus tally has to carry while saying
+        # nothing about any region. The state is named in the detail for whoever reads
+        # one refusal, and the detail is NOT the carrier -- anything that needs the
+        # distinction structurally reads `extraction.status`, which every caller
+        # already holds, because it passed the extraction in.
         return note(
             RegionRefusalReason.EXTRACTION_UNAVAILABLE,
-            "the fragment lane is unavailable for this document",
+            f"the fragment lane is unavailable for this document ({extraction.status})",
         )
 
     # `lossy` without either carrier is loss this module cannot LOCATE, so it cannot

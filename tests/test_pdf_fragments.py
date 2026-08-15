@@ -16,6 +16,7 @@ import pytest
 import carmel.services.pdf_fragments as pdf_fragments
 from carmel.services.pdf_fragments import (
     MAX_PAGE_CONTENT_BYTES,
+    FragmentAvailability,
     FragmentExtraction,
     GlyphMapping,
     extract_fragments,
@@ -494,7 +495,7 @@ class TestFailsClosed:
 
         monkeypatch.setitem(sys.modules, "pypdf", None)
         result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
-        assert result == FragmentExtraction(fragments=(), lossy=True, available=False)
+        assert result == FragmentExtraction(fragments=(), lossy=True, status=FragmentAvailability.ENGINE_ABSENT)
 
     def test_the_module_imports_without_pypdf(self, monkeypatch) -> None:
         import importlib
@@ -597,6 +598,260 @@ class TestAnEngineMismatchIsNotAPageFailure:
         assert mod._engine() is None
         result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (x) Tj\nET"))
         assert result.available is False
+
+
+class TestUnavailabilityIsNotOneEvent:
+    """Four ways to have no fragments, and the boolean said they were one.
+
+    Every assertion here is about WHICH state, never about whether the region refuses:
+    all four refuse identically and always will, so a test that only checked refusal
+    would pass under any classification at all -- including the wrong one. That is the
+    vacuity this class is written to avoid.
+    """
+
+    _PDF = "BT /F1 10 Tf\n72 700 Td (x) Tj\nET"
+
+    def test_an_absent_engine_says_nothing_about_the_document(self, monkeypatch) -> None:
+        import sys
+
+        monkeypatch.setitem(sys.modules, "pypdf", None)
+        result = extract_fragments(_one_page_pdf(self._PDF))
+        assert result.status is FragmentAvailability.ENGINE_ABSENT
+        assert result.available is False
+        # Nothing ran, so there is no version to record. A version here would claim an
+        # extraction happened.
+        assert result.pypdf_version == ""
+
+    def test_a_refused_engine_is_not_an_absent_one(self, monkeypatch) -> None:
+        """pypdf IS installed and its geometry cannot be trusted -- an alarm, where an
+        absent pypdf is a supported configuration. The old boolean read them the same,
+        so a broken pin looked exactly like a base-job install."""
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        monkeypatch.setattr(mod, "_engine", lambda: None)
+        result = extract_fragments(_one_page_pdf(self._PDF))
+        assert result.status is FragmentAvailability.ENGINE_REFUSED
+        assert result.pypdf_version == ""
+
+    def test_the_gate_being_contradicted_mid_walk_is_carmels_defect(self, monkeypatch) -> None:
+        """`_engine` approved this engine and the engine then broke the same contract.
+
+        Reported as its own state rather than folded into ENGINE_REFUSED because the
+        owner differs: ENGINE_REFUSED says repair your install, this says the gate is
+        incomplete. Folded together, it would send someone to reinstall a pypdf that
+        is installed correctly.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        def _mismatch(page, page_number, engine, budget):
+            raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
+
+        monkeypatch.setattr(mod, "_page_fragments", _mismatch)
+        result = extract_fragments(_one_page_pdf(self._PDF))
+        assert result.status is FragmentAvailability.ENGINE_CONTRADICTED_GATE
+        assert result.page_failures == ()
+
+    def test_a_failed_walk_does_not_claim_to_know_whose_fault_it_was(self) -> None:
+        """Garbage bytes are the common case, and the name still refuses to say so.
+
+        `DOCUMENT_UNREADABLE` was the first name for this state and it asserts an
+        ownership the `except Exception` cannot establish -- the same clause catches
+        MemoryError, RecursionError and a bug in this module.
+
+        Needs the engine, and that is the point rather than a fixture detail: with no
+        pypdf these same bytes return ENGINE_ABSENT, because the walk is never reached.
+        The state means "the walk ran and failed", so a run that cannot walk cannot
+        produce it. Without the guard this asserted a property of the ENVIRONMENT.
+        """
+        require_pypdf()
+        result = extract_fragments(b"not a pdf at all")
+        assert result.status is FragmentAvailability.READER_WALK_FAILED
+
+    def test_the_engine_clause_must_be_caught_before_the_general_one(self, monkeypatch) -> None:
+        """Branch ORDER, pinned as the contract it is.
+
+        `_EngineMismatch` is an `Exception` subclass -- asserted here because that is
+        precisely WHY the order matters. Swapping the two clauses compiles, runs, and
+        keeps `available` False, silently refiling "the gate is incomplete" as "this
+        document is odd". Nothing else in the suite notices.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        assert issubclass(mod._EngineMismatch, Exception)
+
+        def _mismatch(page, page_number, engine, budget):
+            raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
+
+        monkeypatch.setattr(mod, "_page_fragments", _mismatch)
+        result = extract_fragments(_one_page_pdf(self._PDF))
+        assert result.status is not FragmentAvailability.READER_WALK_FAILED
+
+    def test_the_recorded_version_cannot_tell_the_two_engine_faults_apart(self, monkeypatch) -> None:
+        """The discriminator that half-existed, pinned as insufficient.
+
+        A previous session's note held that the malformed path could be told apart by
+        `pypdf_version` being set. Both of these carry the pin, and they are different
+        faults with different owners -- so anything reading the version as the
+        discriminator files an incomplete gate as a bad document.
+        """
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        def _mismatch(page, page_number, engine, budget):
+            raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
+
+        monkeypatch.setattr(mod, "_page_fragments", _mismatch)
+        contradicted = extract_fragments(_one_page_pdf(self._PDF))
+        monkeypatch.undo()
+        walk_failed = extract_fragments(b"not a pdf at all")
+
+        assert contradicted.pypdf_version == walk_failed.pypdf_version != ""
+        assert contradicted.status is not walk_failed.status
+
+    def test_every_state_is_reachable_from_a_real_trigger(self, monkeypatch) -> None:
+        """A census of the enum against the code that produces it.
+
+        A member nothing can return is a category an operator will wait forever to
+        see, and a member that quietly stops being produced is worse. This fails in
+        both directions.
+
+        What it does NOT prove, stated because an exhaustiveness check reads like a
+        correctness check: that any state is the RIGHT one for its trigger. Three of
+        the five triggers are monkeypatches, so this is a reachability claim about the
+        enum, not a claim about classification. The classification is pinned one test
+        at a time above, which is where a wrong answer actually gets caught.
+        """
+        require_pypdf()
+        import sys
+
+        import carmel.services.pdf_fragments as mod
+
+        def _mismatch(page, page_number, engine, budget):
+            raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
+
+        produced = {extract_fragments(_one_page_pdf(self._PDF)).status}
+        produced.add(extract_fragments(b"not a pdf at all").status)
+        with monkeypatch.context() as patch:
+            patch.setitem(sys.modules, "pypdf", None)
+            produced.add(extract_fragments(_one_page_pdf(self._PDF)).status)
+        with monkeypatch.context() as patch:
+            patch.setattr(mod, "_engine", lambda: None)
+            produced.add(extract_fragments(_one_page_pdf(self._PDF)).status)
+        with monkeypatch.context() as patch:
+            patch.setattr(mod, "_page_fragments", _mismatch)
+            produced.add(extract_fragments(_one_page_pdf(self._PDF)).status)
+
+        assert produced == set(FragmentAvailability)
+
+    def test_an_installed_pypdf_that_will_not_import_is_an_alarm_not_an_absence(self, monkeypatch) -> None:
+        """The original defect, one layer down, caught before it shipped.
+
+        `except Exception` around the import called every failure ENGINE_ABSENT -- a
+        SUPPORTED configuration -- including an installed pypdf whose own import
+        raises. Three shapes, each measured rather than assumed: a missing transitive
+        dependency (ModuleNotFoundError naming the DEP), a crash at import time
+        (whatever the package raises), and a package that no longer exports
+        `PdfReader` (ImportError, not ModuleNotFoundError).
+        """
+        import sys
+
+        for exc in (
+            ModuleNotFoundError("No module named 'some_dep'", name="some_dep"),
+            RuntimeError("boom at import time"),
+            ImportError("cannot import name 'PdfReader'", name="pypdf"),
+        ):
+
+            class _Blocker:
+                def __init__(self, error: BaseException) -> None:
+                    self.error = error
+
+                def find_spec(self, fullname, path=None, target=None):
+                    if fullname == "pypdf":
+                        raise self.error
+                    return None
+
+            with monkeypatch.context() as patch:
+                patch.delitem(sys.modules, "pypdf", raising=False)
+                patch.setattr(sys, "meta_path", [_Blocker(exc), *sys.meta_path])
+                result = extract_fragments(_one_page_pdf(self._PDF))
+            assert result.status is FragmentAvailability.ENGINE_REFUSED, exc
+
+    def test_available_is_derived_and_cannot_disagree(self) -> None:
+        """The reason this is one field and not two."""
+        for status in FragmentAvailability:
+            unavailable = status is not FragmentAvailability.AVAILABLE
+            extraction = FragmentExtraction(
+                lossy=unavailable,
+                status=status,
+                pypdf_version="6.14.2" if status in pdf_fragments._ENGINE_RAN else "",
+            )
+            assert extraction.available is (status is FragmentAvailability.AVAILABLE)
+
+    def test_a_status_that_is_merely_equal_to_a_member_is_refused(self) -> None:
+        """`FragmentAvailability` is a StrEnum, so `"engine_absent"` compares EQUAL to
+        the member and is not it. A consumer matching with `is` -- which this module
+        tells them to do -- would skip a state whose every log line reads correctly."""
+        with pytest.raises(TypeError, match="must be a FragmentAvailability"):
+            FragmentExtraction(lossy=True, status="engine_absent")  # type: ignore[arg-type]
+
+    def test_an_unavailable_extraction_may_not_carry_evidence(self) -> None:
+        """ "Nothing here can be relied on" has to mean nothing is here.
+
+        The suite itself had grown a fixture handing a fragment to an unavailable
+        extraction while the docstring said that could not happen -- prose the type did
+        not enforce is a convention, not an invariant.
+        """
+        fragment = pdf_fragments.TextFragment(
+            page=1,
+            text="1.0",
+            x_start=100.0,
+            x_end=110.0,
+            baseline_y=500.0,
+            font_height=10.0,
+            rotated=False,
+            glyph_mapping=GlyphMapping.MAPPED,
+        )
+        for kwargs in (
+            {"fragments": (fragment,)},
+            {"page_failures": (pdf_fragments.FragmentPageFailure(page=1, error="x"),)},
+            {"truncated": True},
+        ):
+            with pytest.raises(ValueError, match="carries evidence it cannot vouch for"):
+                FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_ABSENT, **kwargs)
+
+    def test_an_unavailable_extraction_that_claims_completeness_is_a_construction_error(self) -> None:
+        for status in FragmentAvailability:
+            if status is FragmentAvailability.AVAILABLE:
+                continue
+            with pytest.raises(ValueError, match="must admit loss"):
+                FragmentExtraction(status=status)
+
+    def test_located_loss_must_set_the_document_flag(self) -> None:
+        """`page_failures` and `truncated` are what LOCATE loss, so either of them
+        beside `lossy=False` is one object contradicting itself."""
+        with pytest.raises(ValueError, match="must set lossy"):
+            FragmentExtraction(truncated=True, pypdf_version="6.14.2")
+
+    def test_the_version_is_recorded_exactly_when_the_engine_ran(self) -> None:
+        """Enforced in both directions, including for AVAILABLE.
+
+        The cost is that a bare `FragmentExtraction()` no longer constructs, and that
+        is correct rather than a casualty: an available extraction that never ran an
+        engine is a fiction that was only ever convenient as a fixture.
+        """
+        with pytest.raises(ValueError, match="must record the pypdf version"):
+            FragmentExtraction()
+        for status in FragmentAvailability:
+            wrong = "6.14.2" if status not in pdf_fragments._ENGINE_RAN else ""
+            with pytest.raises(ValueError, match="must record the pypdf version"):
+                FragmentExtraction(lossy=True, status=status, pypdf_version=wrong)
+
+    def test_an_available_extraction_may_be_complete(self) -> None:
+        """The control: no invariant above may fire on the happy path."""
+        assert FragmentExtraction(pypdf_version="6.14.2").available is True
 
 
 class TestLossRecordsWhatWasLost:

@@ -1063,9 +1063,26 @@ _FRAGMENT_GEOMETRY_SHA256_V6 = "6789f2a10e8f58f56f5e5969187525f1ca33f740d8015254
 # page, and the intermediate implementation that refused on the former cost 1,415 fragments
 # of a real figure page before the rectangle model returned them. The BORROWED component is
 # unmoved for the seventh consecutive time.
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "3f8d26ba2e3a343cd777ff865b34cbec6f13cb4dd4dcf12a5d9923d4b9b6f58c"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V7 = "3f8d26ba2e3a343cd777ff865b34cbec6f13cb4dd4dcf12a5d9923d4b9b6f58c"
+_FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e"
+
+# The EIGHTH entry, and the first that supersedes for a change in what the result SAYS rather
+# than in what the walker reads. V7 returned a single `available=False` from three sites that
+# meant three different things -- pypdf absent, the capability gate refusing, and a document
+# that defeated a healthy pinned engine -- so an artifact carrying that flag could not say
+# whether anything had been LOOKED at. It now returns a `FragmentAvailability`, and a mid-walk
+# `_EngineMismatch` is classified as the gate being incomplete rather than as a bad document,
+# which V7 could not express at all.
+#
+# Like V5, V6 and V7 it moves no coordinate, and this was MEASURED rather than reasoned from
+# the diff: 78,178 fragments and 0 page failures over the eight-paper corpus, all eight
+# AVAILABLE -- the same numbers V4 established, for the eighth consecutive entry. Every new
+# state is unreached by this corpus, which is what a corpus of intact documents should say and
+# is why the taxonomy is pinned by construction in tests rather than by census. The BORROWED
+# component is unmoved for the eighth consecutive time.
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_SHA256 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e"
+_FRAGMENT_GEOMETRY_SHA256 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1133,6 +1150,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V6: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V6,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V7: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V7,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1276,6 +1298,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V6,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V7,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),
