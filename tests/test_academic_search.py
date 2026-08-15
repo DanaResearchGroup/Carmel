@@ -178,6 +178,86 @@ class TestOpenAlexSearchTool:
         assert results[0].is_open_access is True
         assert results[0].url == "https://doi.org/10.1016/j.proci.2020.06.197"
 
+    def test_a_record_about_a_paper_is_not_returned_as_a_paper(self, ledger: BudgetLedger) -> None:
+        """Crossref filtered non-paper record types and OpenAlex did not, which is a
+        fail-OPEN asymmetry: an editorial or a decision letter entering a result set
+        becomes a "paper" that can be queued for acquisition, fetched, and mined for
+        datasets it cannot contain. Nothing downstream can catch it -- a SearchResult
+        carries no record type -- so the adapter is the only place this can be refused.
+
+        Both discriminators are exercised, because a journal that deposits its review
+        correspondence as ``article`` betrays it only in the title.
+        """
+        payload = {
+            "results": [
+                {"title": "Editorial: combustion chemistry today", "type": "editorial"},
+                {"title": "Author response: shock tube ignition delay", "type": "article"},
+                {"title": "Decision letter: laminar flame speeds of ammonia", "type": "article"},
+                {"title": "Peer review of a kinetic model", "type": "peer-review"},
+                {
+                    "title": "Ignition delay times of methane in response to strain",
+                    "type": "article",
+                    "doi": "https://doi.org/10.1016/j.combustflame.2015.11.011",
+                },
+            ]
+        }
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
+
+        results = tool.search("ignition delay")
+
+        # The last one is the control, and it is the one that matters: "in response to"
+        # appears mid-title, so a substring test would have eaten a real paper.
+        assert [result.title for result in results] == ["Ignition delay times of methane in response to strain"]
+
+    def test_the_filter_does_not_eat_a_paper_that_merely_looks_like_an_artefact(self, ledger: BudgetLedger) -> None:
+        """The false-POSITIVE surface, which the first draft of this filter got wrong.
+
+        A drop here is unrecoverable: exactly one search tool is configured per run, and a
+        record removed at the adapter never reaches anything that could notice it missing.
+        Each of these was in the first draft's denylist and each is a real paper or the
+        only correct copy of one:
+
+        * a journal ``Letter`` is a full research paper with data, and OpenAlex does not
+          promise that type means correspondence;
+        * an erratum or a correction can carry the CORRECTED TABLE -- filtering it means
+          mining the stale original forever and never seeing the fix;
+        * a retraction notice is how you learn the data is withdrawn.
+        """
+        payload = {
+            "results": [
+                {
+                    "title": "Rate constants for OH + C2H6 from 800 to 1300 K",
+                    "type": "letter",
+                    "doi": "https://doi.org/10.1016/j.cplett.2014.01.001",
+                },
+                {
+                    "title": "Erratum: laminar burning velocities of ammonia/hydrogen blends",
+                    "type": "erratum",
+                    "doi": "https://doi.org/10.1016/j.combustflame.2019.02.002",
+                },
+                {
+                    "title": "Correction to: ignition delay measurements behind reflected shocks",
+                    "type": "article",
+                    "doi": "https://doi.org/10.1021/acs.energyfuels.2020.03.003",
+                },
+                {
+                    "title": "Corrigendum to a jet-stirred reactor speciation study",
+                    "type": "article",
+                    "doi": "https://doi.org/10.1016/j.proci.2018.04.004",
+                },
+                {
+                    "title": "Retraction of a kinetic mechanism for syngas oxidation",
+                    "type": "retraction",
+                    "doi": "https://doi.org/10.1016/j.fuel.2017.05.005",
+                },
+            ]
+        }
+        tool = OpenAlexSearchTool(external_provider_consent=True, ledger=ledger, opener=_opener_for(payload))
+
+        results = tool.search("ignition delay")
+
+        assert len(results) == len(payload["results"])
+
     def test_abstract_inverted_index_is_reconstructed_in_word_order(self, ledger: BudgetLedger) -> None:
         payload = {
             "results": [
