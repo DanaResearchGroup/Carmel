@@ -105,8 +105,16 @@ jobs:
       - name: Install dependencies
         run: make install-dev
 
-      - name: Run tests with coverage
-        run: pytest --cov --cov-branch --cov-report=term-missing --cov-report=xml
+      # No coverage FLOOR here, on purpose: this job installs no `agents` extra, so
+      # every pypdf/pydantic-ai/rdkit-dependent module is unreachable by construction
+      # and its statements count as misses. `pdf_fragments.py` alone runs at 17% (430
+      # of 568 statements), which is ~3.1% of the 13749-statement total -- more than
+      # the whole shortfall that was failing this job at 87.15% against a floor of 90.
+      # The number measured what was INSTALLED, not what was tested. The floor lives
+      # in the `agents` job below, where the whole codebase is actually executable;
+      # this job still runs every test and still fails on any real failure.
+      - name: Run tests with coverage (no floor — see the agents job)
+        run: pytest --cov --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=0
 
       # Builds a wheel, installs it into a clean venv, and exercises it from a
       # neutral working directory. An editable install run from the repo root
@@ -172,8 +180,13 @@ jobs:
       - name: Type check (agents extra installed)
         run: make typecheck
 
-      - name: Run tests with coverage (agents extra installed)
-        run: pytest --cov --cov-branch --cov-report=term-missing --junitxml=agents-report.xml
+      # This job carries the coverage FLOOR for the whole repo, because it is the only
+      # one where every module is reachable: `pyproject.toml`'s `fail_under = 90`
+      # applies here and is explicitly disabled in the base job above. Stated on the
+      # command line as well as inherited, so that lowering the shared config cannot
+      # quietly lower the gate that is actually enforced.
+      - name: Run tests with coverage (agents extra installed — carries the 90% floor)
+        run: pytest --cov --cov-branch --cov-report=term-missing --cov-fail-under=90 --junitxml=agents-report.xml
 
       # The whole point of this job is that the agents-path tests actually RUN
       # rather than skip — mirroring the "must not skip" gates in tools.yml for
