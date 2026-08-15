@@ -211,7 +211,15 @@ class FragmentAvailability(StrEnum):
     time, a package that no longer exports ``PdfReader`` -- is an alarm wearing the
     same ``ImportError`` coat, and reporting it as "the optional extra is not
     installed" would have been the original defect committed a second time. Those go
-    to ``ENGINE_REFUSED``; the three shapes were measured, not assumed."""
+    to ``ENGINE_REFUSED``; the three shapes were measured, not assumed.
+
+    ONE case is knowingly misreported and cannot be told apart here: a poisoned
+    ``sys.modules["pypdf"] = None`` raises ``ModuleNotFoundError(name="pypdf")``, the
+    same class and name as a genuine absence, because the interpreter itself treats it
+    as absence. That is environment corruption wearing the supported configuration.
+    Separating it means inspecting ``sys.modules`` before importing, which is a stranger
+    thing for production code to do than the misclassification is worth -- but it IS a
+    misclassification, and saying so is cheaper than a reader rediscovering it."""
 
     ENGINE_REFUSED = "engine_refused"
     """pypdf is installed and cannot be used: either :func:`_engine` rejected it at the
@@ -355,6 +363,13 @@ class FragmentExtraction:
                 # and one carrying page failures claims to know which pages failed in a
                 # walk whose whole point is that it established nothing.
                 raise ValueError(f"{self.status} carries evidence it cannot vouch for")
+        if self.pypdf_version not in ("", _PINNED_PYPDF_VERSION):
+            # Presence alone was not enough, and the gap was real: `pypdf_version="bogus"`
+            # satisfied a boolean check while the field's entire meaning is "the PINNED
+            # engine ran". Nothing else can legitimately appear -- `_engine` refuses every
+            # other version before a walk can begin -- so any other value is a
+            # construction error rather than a record of something that happened.
+            raise ValueError(f"pypdf_version must be {_PINNED_PYPDF_VERSION!r} or empty, not {self.pypdf_version!r}")
         if bool(self.pypdf_version) is not (self.status in _ENGINE_RAN):
             # The version means "the engine that ran was this one". Recording it where
             # nothing ran claims an extraction happened; omitting it where something did

@@ -844,6 +844,11 @@ class TestUnavailabilityIsNotOneEvent:
         """
         with pytest.raises(ValueError, match="must record the pypdf version"):
             FragmentExtraction()
+        # PRESENCE is not the invariant. The field means "the PINNED engine ran", and
+        # `_engine` refuses every other version before a walk can start, so any other
+        # value is a construction error and not a record of something that happened.
+        with pytest.raises(ValueError, match="pypdf_version must be"):
+            FragmentExtraction(pypdf_version="bogus")
         for status in FragmentAvailability:
             wrong = "6.14.2" if status not in pdf_fragments._ENGINE_RAN else ""
             with pytest.raises(ValueError, match="must record the pypdf version"):
