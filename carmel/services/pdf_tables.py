@@ -45,6 +45,7 @@ an independent replay can recompute it and refuse when it does not reproduce.
 from __future__ import annotations
 
 import math
+import statistics
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -167,6 +168,41 @@ class InventoryRefusalReason(StrEnum):
     caption that anchors the box and the box itself. A table whose first row genuinely
     sits far below its caption is refused too; that is the trade, and it fails toward
     refusal."""
+
+    ORPHANED_BAND_BELOW_THE_BOX = "orphaned_band_below_the_box"
+    """A band within one row pitch below ``y_bottom`` has a fragment inside a derived column.
+
+    The bottom-edge twin of the reason above, and it was measured, not imagined: raising
+    ``y_bottom`` on the real target deleted the phi row and returned a COMPLETE five-row
+    inventory with no refusal. Worse, the target's own pre-registered footprint turned out
+    to be truncated this way -- ``T (deg C)`` and ``P (atm)`` are rows of that table, and
+    the box stopped 0.9 pt above them.
+
+    The look-below is bounded by the table's OWN median row pitch, so no constant is
+    introduced; the bound is derived from the same rows it is protecting. Any single mapped
+    fragment CONTAINED in a derived column is enough, rather than a band that occupies
+    several: a cut row that lives in one column (an affix-split cell) would otherwise pass,
+    and that was one of the measured attacks. The cost is that prose starting at the left
+    margin under a table can refuse a complete table -- the same trade the reason above
+    makes, in the same direction."""
+
+    TRUNCATED_COLUMN_BESIDE_THE_BOX = "truncated_column_beside_the_box"
+    """Fragments excluded by ``x_start``/``x_end`` line up into a column across several rows.
+
+    Shrinking ``x_end`` on the real target deleted an entire fuel mixture and returned a
+    COMPLETE seven-row, TWO-column inventory with no refusal: a consumer would read a
+    two-mixture study as a one-mixture study.
+
+    Distance cannot catch it. The honest box already has the page's other prose column
+    26.2 pt to its right, and the dropped column's fragments sit at 22.6-26.6 pt -- two
+    populations that OVERLAP, so any threshold classifies one as the other. What separates
+    them is ALIGNMENT: prose is one row's running text at increasing x, while a dropped
+    column is many rows sharing one ``x_start``. So the test is a structural count -- an
+    x-cluster of excluded fragments that draws from more than one derived row -- and it
+    reuses :data:`COLUMN_VALLEY_PT` for the clustering rather than adding a constant.
+
+    A single-row overflow is indistinguishable from prose under this rule and does NOT
+    refuse. That is a known residual hole, not a closed one."""
 
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
     """A row's own occupied blocks outnumber the columns derived across all rows.
@@ -368,7 +404,16 @@ def _caption_anchored(extraction: FragmentExtraction, footprint: ClaimedFootprin
     ]
     if not band:
         return False
-    printed = "".join(f.text for f in sorted(band, key=lambda f: f.x_start))
+    # `caption_x_start` is checked against the DOCUMENT here, not merely bounds-checked.
+    # `_footprint_refusal` only asks that it fall inside the claimed box -- a test between
+    # two caller-supplied numbers the document never sees. Measured consequence: shrinking
+    # `x_start` to drop the label column refused, but only because the stale
+    # `caption_x_start` now fell outside the new box. A caller who moved both would have
+    # passed. That is a coincidence, not a guard.
+    ordered = sorted(band, key=lambda f: f.x_start)
+    if not math.isclose(ordered[0].x_start, footprint.caption_x_start, abs_tol=_BAND_TOLERANCE_PT):
+        return False
+    printed = "".join(f.text for f in ordered)
     claimed = footprint.caption_text
     return "".join(printed.split()) == "".join(claimed.split())
 
@@ -543,6 +588,107 @@ def _column_bounds(
     return [(a, b) for a, b in blocks]
 
 
+def _row_pitch(rows: list[InventoryRow], members: list[TextFragment]) -> float:
+    """How far apart this table's own rows are, in points.
+
+    Derived from the table being protected rather than declared as a constant, so the
+    look-below in :func:`_orphan_below_refusal` is bounded by the thing it is bounding.
+    The MEDIAN, not the mean: the header-to-first-row gap is routinely larger than the
+    body pitch (13.2 pt against 10.0 pt on the real target) and would drag a mean upward,
+    widening the window into the prose beneath.
+
+    With fewer than two rows there is no pitch to measure, and the tallest member's
+    rendered height stands in -- still derived from this table, and the closest thing to a
+    line height the substrate offers.
+    """
+    baselines = [row.baseline_y for row in rows]
+    gaps = [above - below for above, below in zip(baselines, baselines[1:], strict=False)]
+    if gaps:
+        return statistics.median(gaps)
+    return max((f.font_height for f in members), default=0.0)
+
+
+def _orphan_below_refusal(
+    extraction: FragmentExtraction,
+    footprint: ClaimedFootprint,
+    bounds: list[tuple[float, float]],
+    pitch: float,
+) -> InventoryRefusal | None:
+    """Refuse when the box's bottom edge cut a row off, the way the top edge is guarded.
+
+    CONTAINMENT in a derived column is the test, not proximity: prose runs across the
+    gutters this table's columns are separated by, so a running-text fragment does not fit
+    inside one; a cut table row's cell does, because the column was derived from that very
+    alignment. Unmapped fragments are skipped -- they carry markers rather than text, so
+    they are not a row (the real target's is a raised zero-width degree sign), and one
+    inside the box refuses under :attr:`InventoryRefusalReason.UNMAPPED_MEMBER` anyway.
+    """
+    if pitch <= 0:
+        return None
+    cut = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page
+        and f.text.strip()
+        and f.glyph_mapping is GlyphMapping.MAPPED
+        and footprint.y_bottom - pitch <= f.baseline_y < footprint.y_bottom
+        and any(left <= f.x_start and f.x_end <= right for left, right in bounds)
+    ]
+    if not cut:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX,
+        f"{len(cut)} fragment(s) within {pitch:.1f} pt below the box sit inside a derived column",
+    )
+
+
+def _truncated_column_refusal(
+    extraction: FragmentExtraction,
+    footprint: ClaimedFootprint,
+    rows: list[InventoryRow],
+) -> InventoryRefusal | None:
+    """Refuse when fragments the box's sides excluded align into a column across rows.
+
+    Clustered on ``x_start`` at :data:`COLUMN_VALLEY_PT` -- the same width that separates
+    two columns INSIDE the box, used here to decide whether two excluded fragments belong
+    to the same excluded column. A cluster drawing from more than one derived row is a
+    column the box cut off; a cluster from one row cannot be told from that row's own
+    overflow, or from the page's other prose column, and does not refuse.
+    """
+    bands: dict[float, int] = {}
+    for row in rows:
+        for baseline in (row.baseline_y, *row.merged_baselines):
+            bands[baseline] = row.ordinal
+    excluded: list[tuple[float, int]] = []
+    for f in extraction.fragments:
+        if f.page != footprint.page or not f.text.strip() or f.rotated:
+            continue
+        if not (f.x_end <= footprint.x_start or f.x_start >= footprint.x_end):
+            continue
+        for baseline, ordinal in bands.items():
+            if math.isclose(f.baseline_y, baseline, abs_tol=_BAND_TOLERANCE_PT):
+                excluded.append((f.x_start, ordinal))
+                break
+
+    cluster: list[tuple[float, int]] = []
+    for x_start, ordinal in sorted(excluded):
+        if cluster and x_start - cluster[-1][0] >= COLUMN_VALLEY_PT:
+            if len({o for _, o in cluster}) > 1:
+                return InventoryRefusal(
+                    InventoryRefusalReason.TRUNCATED_COLUMN_BESIDE_THE_BOX,
+                    f"{len(cluster)} fragment(s) beside the box align across "
+                    f"{len({o for _, o in cluster})} of its rows",
+                )
+            cluster = []
+        cluster.append((x_start, ordinal))
+    if len({o for _, o in cluster}) > 1:
+        return InventoryRefusal(
+            InventoryRefusalReason.TRUNCATED_COLUMN_BESIDE_THE_BOX,
+            f"{len(cluster)} fragment(s) beside the box align across {len({o for _, o in cluster})} of its rows",
+        )
+    return None
+
+
 def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint) -> CellInventory:
     """Derive the grid inside ``footprint``, or refuse.
 
@@ -696,6 +842,19 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
             )
         )
         cells.extend(row_cells)
+
+    # The EDGE guards run last because they are the only checks that need the derivation
+    # they are checking: a dropped column is only visible once the rows exist to align it
+    # against, and the look-below is bounded by the pitch of the rows that were kept. Both
+    # close the same hole the top edge's orphan check closes, on the sides the box was
+    # otherwise free to shrink -- measured: shrinking `x_end` deleted a whole fuel mixture
+    # and raising `y_bottom` deleted the phi row, each returning a COMPLETE inventory.
+    truncated = _truncated_column_refusal(extraction, footprint, rows)
+    if truncated is not None:
+        return refused(truncated)
+    cut_below = _orphan_below_refusal(extraction, footprint, bounds, _row_pitch(rows, inside))
+    if cut_below is not None:
+        return refused(cut_below)
 
     return CellInventory(
         footprint=footprint,

@@ -136,7 +136,36 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
         ),
         (extraction_of(CAPTION), footprint(y_top=60.0, y_bottom=10.0)),
         (extraction_of(*wide_row), footprint()),
+        (extraction_of(*simple_grid(), *cut_off_row()), footprint()),
+        (extraction_of(*simple_grid(), *dropped_column()), footprint(x_end=200.0)),
     ]
+
+
+def cut_off_row() -> tuple[TextFragment, ...]:
+    """A third row printed below the box's bottom edge, aligned to its derived columns.
+
+    What raising ``y_bottom`` looks like from outside the box -- and what the real target
+    turned out to be hiding: ``T (deg C)`` and ``P (atm)`` are rows of that table, and its
+    pre-registered footprint stopped just above them.
+    """
+    return (
+        frag("T", 53.0, 57.0, 58.5),
+        frag("25", 122.0, 134.0, 58.5),
+        frag("25", 227.0, 239.0, 58.5),
+    )
+
+
+def dropped_column() -> tuple[TextFragment, ...]:
+    """A fourth column, at one x, on BOTH of ``simple_grid``'s row baselines.
+
+    Alignment across rows is the whole signal: one fragment here would be indistinguishable
+    from the page's other prose column, which on the real target sits 26.2 pt from the
+    honest box while the dropped column sits 22.6-26.6 pt away.
+    """
+    return (
+        frag("gamma", 320.0, 350.0, 134.5),
+        frag("0.4", 320.0, 344.0, 71.5),
+    )
 
 
 class TestTheGridComesFromGeometry:
@@ -604,6 +633,94 @@ class TestTheFootprintIsAClaimAndTheAnchorIsWhatPinsIt:
 
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.FOOTPRINT_INSANE]
+
+
+class TestEveryEdgeOfTheBoxIsFalsifiable:
+    """The box may not be shrunk on any side without the shrink being detectable.
+
+    Before these guards existed, exactly ONE of the four edges was watched. Measured on
+    the real target: shrinking ``x_end`` deleted an entire fuel mixture and raising
+    ``y_bottom`` deleted the phi row, and BOTH returned a complete inventory with no
+    refusal and every surviving cell correctly grounded -- the silent-corruption shape
+    this module exists to prevent, in the module built to prevent it.
+    """
+
+    def test_a_row_cut_off_below_the_box_refuses(self) -> None:
+        inventory = build_inventory(extraction_of(*simple_grid(), *cut_off_row()), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX]
+
+    def test_a_cut_row_in_a_single_column_still_refuses(self) -> None:
+        """One fragment is enough; a cut row need not span the table.
+
+        The permissive alternative -- requiring the band below to occupy two or more
+        derived columns -- was measured against the real target and MISSED the attack that
+        raised ``y_bottom`` past an affix-split cell living entirely in one column.
+        """
+        inventory = build_inventory(extraction_of(*simple_grid(), frag("lonely", 122.0, 140.0, 58.5)), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX]
+
+    def test_prose_far_below_the_box_does_not_refuse(self) -> None:
+        """The look-below is bounded by the table's OWN median row pitch.
+
+        ``simple_grid`` has one gap of 63 pt, so a band 100 pt below the bottom edge is
+        outside the window even though it sits squarely inside a derived column. Without
+        the bound the guard would refuse every table with anything printed beneath it.
+        """
+        inventory = build_inventory(extraction_of(*simple_grid(), frag("body text", 122.0, 140.0, -35.0)), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.rows) == 2
+
+    def test_an_unmapped_marker_below_the_box_is_not_a_cut_row(self) -> None:
+        """It carries markers rather than text, so it cannot be a row.
+
+        The real target's is a raised, zero-width degree sign -- the ``deg`` of
+        ``T (deg C)`` -- which did not map. Treating it as a cut row would refuse on the
+        wrong reason; one INSIDE the box already refuses under ``UNMAPPED_MEMBER``.
+        """
+        marker = frag("/C14", 61.8, 61.8, 58.5, glyph_mapping=GlyphMapping.UNMAPPED)
+        inventory = build_inventory(extraction_of(*simple_grid(), marker), footprint())
+
+        assert inventory.refusals == ()
+
+    def test_a_column_dropped_by_the_side_of_the_box_refuses(self) -> None:
+        inventory = build_inventory(extraction_of(*simple_grid(), *dropped_column()), footprint(x_end=200.0))
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.TRUNCATED_COLUMN_BESIDE_THE_BOX]
+
+    def test_one_row_worth_of_prose_beside_the_box_does_not_refuse(self) -> None:
+        """Alignment across rows is the signal, and distance cannot stand in for it.
+
+        On the real target the page's other prose column sits 26.2 pt from the honest box
+        while the dropped column sits 22.6-26.6 pt away: the two populations OVERLAP, so a
+        threshold classifies one as the other. Prose contributes many fragments on ONE
+        baseline; a dropped column contributes few on MANY.
+        """
+        prose = tuple(
+            frag(word, 320.0 + 40.0 * i, 350.0 + 40.0 * i, 134.5)
+            for i, word in enumerate(("Many", "studies", "have", "been", "conducted"))
+        )
+        inventory = build_inventory(extraction_of(*simple_grid(), *prose), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.column_bounds) == 3
+
+    def test_a_moved_caption_start_refuses_even_when_the_text_matches(self) -> None:
+        """``caption_x_start`` is checked against the document, not against the box.
+
+        It used to be verified only by the footprint's own sanity check -- that it falls
+        inside the claimed box -- which compares two caller-supplied numbers the document
+        never sees. Measured: shrinking ``x_start`` refused only because the stale
+        ``caption_x_start`` fell outside the new box, so a caller who moved both would
+        have passed. That is a coincidence, not a guard.
+        """
+        inventory = build_inventory(extraction_of(*simple_grid()), footprint(caption_x_start=60.0))
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.CAPTION_ANCHOR_ABSENT]
 
 
 class TestTheDocumentLevelRefusals:
