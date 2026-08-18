@@ -31,8 +31,15 @@ an independent replay can recompute it and refuse when it does not reproduce.
   inserted, substituted or dropped. A ToUnicode map that renders phi as ``f`` is carried
   verbatim.
 * It emits no partial inventory. A refused inventory holds no cells and no rows, and
-  :class:`CellInventory` makes the alternative unconstructible rather than merely
-  discouraged.
+  :class:`CellInventory` makes that ONE combination unconstructible. It does not make
+  every malformed inventory unconstructible -- a direct caller can still build one whose
+  cells cite columns it does not carry -- and saying otherwise would be the overstatement
+  this file elsewhere warns about. What is enforced is stated on
+  :meth:`CellInventory.__post_init__`; the rest is `build_inventory`'s to uphold.
+* **The row anchor does no work yet.** It is derived and stored, and nothing recomputes
+  it, compares it, or ties it to a ``TableCellLocator``. It is the input a future replay
+  path needs, not a check that runs today, and until that path exists the ordinal-drift
+  defence rests entirely on the footprint refusals above.
 """
 
 from __future__ import annotations
@@ -100,6 +107,16 @@ AFFIX_HEIGHT_RATIO = 0.75
 #: wrong row count, where a silent tie-break would ship one.
 AFFIX_PARENT_MARGIN = 0.5
 
+#: How far two baselines may differ and still be the same printed line, in points.
+#:
+#: A real caption's fragments do NOT share one exact baseline: the target table's seven
+#: caption fragments differ by fractions of a point. Anything that asks "is this fragment
+#: on that line" must therefore use a tolerance, and it must be the SAME tolerance
+#: everywhere -- the caption-anchor test and the orphaned-band test disagreeing by a
+#: hundredth of a point is how a correct caption becomes seven orphaned bands, which is
+#: exactly what the first run against the real document produced.
+_BAND_TOLERANCE_PT = 0.5
+
 
 class InventoryRefusalReason(StrEnum):
     """Why no inventory can be derived for a claimed footprint.
@@ -139,6 +156,35 @@ class InventoryRefusalReason(StrEnum):
     """A candidate affix band is horizontally interior to BOTH its neighbours, so the
     band it belongs to cannot be derived. Picking by proximity would change the cell's
     text and the row count at once, and nothing downstream would look wrong."""
+
+    ORPHANED_BAND_ABOVE_THE_BOX = "orphaned_band_above_the_box"
+    """A band sits between the caption and the box's top edge, inside its x-window.
+
+    This is the ordinal-drift attack made detectable. A caller who lowers ``y_top`` by one
+    band keeps a correct caption, keeps every value correctly grounded, and shifts every
+    row ordinal by one -- and no check on the locator, the envelope or the values can see
+    it. What CAN see it is that the excluded band is still there, orphaned between the
+    caption that anchors the box and the box itself. A table whose first row genuinely
+    sits far below its caption is refused too; that is the trade, and it fails toward
+    refusal."""
+
+    COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
+    """A row's own occupied blocks outnumber the columns derived across all rows.
+
+    Columns come from ALIGNED emptiness -- an x-strip empty in EVERY row -- so a single
+    row spanning the table's width erases every boundary beneath it. Measured on a
+    fixture: a spanning header collapsed three columns into one, merged three separate
+    cells into ``xyz`` at ``col=0``, and reported ``complete``. The inconsistency is
+    cheap to see (some row alone resolves more blocks than the union does) and refusing
+    on it is the only honest answer, because the column structure genuinely is not
+    derivable from aligned emptiness once a row spans."""
+
+    ROTATED_OR_INSANE_FRAGMENT = "rotated_or_insane_fragment"
+    """A fragment inside the box is rotated, or its extent is non-finite or backwards.
+
+    Rotated text has no meaningful baseline band or x-interval in this module's model, and
+    a backwards extent poisons every column derivation silently. ``pdf_cells`` guards this
+    class explicitly; this module must not be the softer door into the same data."""
 
     UNATTACHABLE_AFFIX_BAND = "unattachable_affix_band"
     """A candidate affix band is interior to NEITHER neighbour.
@@ -242,6 +288,15 @@ class CellInventory:
         return not self.refusals
 
     def __post_init__(self) -> None:
+        """Enforce the ONE combination whose prose would otherwise be a convention.
+
+        Scope, stated so it is not read as more: this forbids a refusal sitting beside a
+        derivation. It does NOT validate that cells cite existing rows and columns, that
+        ordinals are dense, that members are non-empty, or that an anchor matches its
+        row's leftmost cell. Those hold because :func:`build_inventory` constructs them
+        that way, and a direct caller can still violate every one -- which is a real gap,
+        recorded here rather than papered over by a docstring that claims otherwise.
+        """
         if self.refusals and (self.cells or self.rows or self.column_bounds):
             raise ValueError(
                 "a refused inventory carries no derivation: a partial grid is exactly what a "
@@ -269,6 +324,22 @@ def _footprint_refusal(footprint: ClaimedFootprint) -> InventoryRefusal | None:
         return InventoryRefusal(InventoryRefusalReason.FOOTPRINT_INSANE, "x extent is not positive")
     if footprint.y_top <= footprint.y_bottom:
         return InventoryRefusal(InventoryRefusalReason.FOOTPRINT_INSANE, "y extent is not positive")
+    if footprint.y_top >= footprint.caption_baseline_y:
+        # The box would contain its own caption, which then becomes row 0 and shifts every
+        # ordinal beneath it. Measured on a fixture before this check existed: `y_top`
+        # raised above the caption produced three rows whose row 0 was the caption text,
+        # with no refusal anywhere. The docstring said the caption sits at or above the
+        # top edge; nothing enforced it, and prose the type does not enforce is a
+        # convention.
+        return InventoryRefusal(
+            InventoryRefusalReason.FOOTPRINT_INSANE,
+            "the box contains its own caption, which would become row 0",
+        )
+    if not (footprint.x_start <= footprint.caption_x_start <= footprint.x_end):
+        return InventoryRefusal(
+            InventoryRefusalReason.FOOTPRINT_INSANE,
+            "the claimed caption does not start inside the claimed box",
+        )
     return None
 
 
@@ -291,7 +362,7 @@ def _caption_anchored(extraction: FragmentExtraction, footprint: ClaimedFootprin
         f
         for f in extraction.fragments
         if f.page == footprint.page
-        and math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=0.5)
+        and math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=_BAND_TOLERANCE_PT)
         and f.x_start >= footprint.x_start
         and f.x_end <= footprint.x_end
     ]
@@ -351,13 +422,26 @@ def _bands(fragments: list[TextFragment]) -> list[tuple[float, list[TextFragment
     return [(max(f.baseline_y for f in cluster), cluster) for cluster in reversed(clusters)]
 
 
-def _is_interior_to(band: list[TextFragment], other: list[TextFragment]) -> bool:
-    """Whether every fragment of ``band`` sits horizontally inside ``other``'s extent."""
+def _is_adjacent_to(band: list[TextFragment], other: list[TextFragment]) -> bool:
+    """Whether ``band`` overlaps or abuts ``other``'s horizontal extent.
+
+    OVERLAP, not containment, and the difference was a live silent corruption. A
+    trailing subscript -- the ``2`` of ``CO2`` at a cell's right edge -- extends past its
+    parent's rightmost base glyph, so a containment test excludes its true parent and
+    leaves whichever neighbour happens to be wider. Measured on a fixture: the ``2`` folded
+    into an unrelated row 13 pt away and appended its text to that row's anchor, with no
+    refusal. Adjacency admits both neighbours as candidates and lets the vertical margin
+    decide, which is the only axis that actually separates them.
+
+    Abutment is allowed up to :data:`COLUMN_VALLEY_PT`, the width at which an x-gap stops
+    being intra-cell and becomes a column boundary; beyond it the band is in a different
+    column and is not this row's affix at all.
+    """
     if not other:
         return False
-    left = min(f.x_start for f in other)
-    right = max(f.x_end for f in other)
-    return all(f.x_start >= left and f.x_end <= right for f in band)
+    left = min(f.x_start for f in other) - COLUMN_VALLEY_PT
+    right = max(f.x_end for f in other) + COLUMN_VALLEY_PT
+    return all(f.x_end >= left and f.x_start <= right for f in band)
 
 
 def _looks_like_affix(band: list[TextFragment], neighbour: list[TextFragment]) -> bool:
@@ -386,26 +470,26 @@ def _merge_affix_bands(
         above = bands[index - 1][1] if index > 0 else []
         below = bands[index + 1][1] if index + 1 < len(bands) else []
         affix_shaped = _looks_like_affix(band, above) or _looks_like_affix(band, below)
-        fits_above = _looks_like_affix(band, above) and _is_interior_to(band, above)
-        fits_below = _looks_like_affix(band, below) and _is_interior_to(band, below)
+        fits_above = _looks_like_affix(band, above) and _is_adjacent_to(band, above)
+        fits_below = _looks_like_affix(band, below) and _is_adjacent_to(band, below)
         if fits_above and fits_below:
-            # A table's columns are ALIGNED by construction, so a subscript sits inside
-            # the x-extent of the row above AND the row below and abuts the same glyph in
-            # each. Horizontal interiority cannot separate them; vertical distance can,
-            # but only when one candidate is clearly nearer -- see AFFIX_PARENT_MARGIN.
+            # A table's columns are ALIGNED by construction, so a subscript is adjacent to
+            # the row above AND the row below and abuts the same glyph in each. Horizontal
+            # geometry cannot separate them; vertical distance can, but only when one
+            # candidate is clearly nearer -- see AFFIX_PARENT_MARGIN.
             gap_above = abs(bands[index - 1][0] - y)
             gap_below = abs(y - bands[index + 1][0])
             near, far = min(gap_above, gap_below), max(gap_above, gap_below)
             if far <= 0 or near > AFFIX_PARENT_MARGIN * far:
                 return [], InventoryRefusal(
                     InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND,
-                    f"a band at y={y} is interior to both neighbours and no nearer to either",
+                    f"a band at y={y} is adjacent to both neighbours and no nearer to either",
                 )
             fits_above, fits_below = gap_above < gap_below, gap_below < gap_above
         if affix_shaped and not (fits_above or fits_below):
             return [], InventoryRefusal(
                 InventoryRefusalReason.UNATTACHABLE_AFFIX_BAND,
-                f"an affix-shaped band at y={y} is interior to neither neighbouring band",
+                f"an affix-shaped band at y={y} is adjacent to neither neighbouring band",
             )
         parents.append(index - 1 if fits_above else index + 1 if fits_below else None)
 
@@ -494,6 +578,18 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                 f"page {footprint.page} was not completely extracted",
             )
         )
+    if extraction.lossy:
+        # UNLOCATABLE loss: the extraction admits something was lost but names no page and
+        # no truncation, so this footprint cannot be excluded from it. `region_refusals`
+        # already refuses this shape, and a module that reads the same fragments must not
+        # be the softer door -- a grid derived from a document that quietly lost a band is
+        # a grid with a wrong row count and no way to know it.
+        return refused(
+            InventoryRefusal(
+                InventoryRefusalReason.PAGE_INCOMPLETE,
+                "the extraction is lossy without naming a page, so this box cannot be excluded",
+            )
+        )
     insane = _footprint_refusal(footprint)
     if insane is not None:
         return refused(insane)
@@ -505,7 +601,39 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
             )
         )
 
+    orphaned = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page
+        and footprint.y_top < f.baseline_y < footprint.caption_baseline_y
+        # The caption's OWN fragments are not orphans. A real caption's fragments do not
+        # share one exact baseline -- the target's seven differ by fractions of a point --
+        # so a strict comparison against the claimed baseline classifies most of the
+        # caption as a band the caller cut off the top. Same tolerance as
+        # `_caption_anchored`, because it must be the same band.
+        and not math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=_BAND_TOLERANCE_PT)
+        and f.x_end >= footprint.x_start
+        and f.x_start <= footprint.x_end
+    ]
+    if orphaned:
+        return refused(
+            InventoryRefusal(
+                InventoryRefusalReason.ORPHANED_BAND_ABOVE_THE_BOX,
+                f"{len(orphaned)} fragment(s) sit between the caption and the box's top edge",
+            )
+        )
+
     inside = _in_footprint(extraction, footprint)
+    insane_fragments = [
+        f for f in inside if f.rotated or not _is_finite(f.x_start, f.x_end, f.baseline_y) or f.x_end < f.x_start
+    ]
+    if insane_fragments:
+        return refused(
+            InventoryRefusal(
+                InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
+                f"{len(insane_fragments)} fragment(s) inside the box are rotated or have a bad extent",
+            )
+        )
     unmapped = [f for f in inside if f.glyph_mapping is not GlyphMapping.MAPPED]
     if unmapped:
         return refused(
@@ -521,6 +649,15 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     if ambiguous is not None:
         return refused(ambiguous)
     bounds = _column_bounds(rows_raw)
+    for baseline_y, members, _ in rows_raw:
+        own = _column_bounds([(baseline_y, members, [])])
+        if len(own) > len(bounds):
+            return refused(
+                InventoryRefusal(
+                    InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED,
+                    f"the row at y={baseline_y} resolves {len(own)} blocks where the table resolves {len(bounds)}",
+                )
+            )
 
     rows: list[InventoryRow] = []
     cells: list[InventoryCell] = []

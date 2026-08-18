@@ -44,6 +44,7 @@ def frag(
     page: int = 1,
     font_height: float = BODY_HEIGHT,
     glyph_mapping: GlyphMapping = GlyphMapping.MAPPED,
+    rotated: bool = False,
 ) -> TextFragment:
     return TextFragment(
         page=page,
@@ -52,7 +53,7 @@ def frag(
         x_end=x_end,
         baseline_y=baseline_y,
         font_height=font_height,
-        rotated=False,
+        rotated=rotated,
         glyph_mapping=glyph_mapping,
     )
 
@@ -91,6 +92,51 @@ def simple_grid() -> tuple[TextFragment, ...]:
         frag("0.6", 122.0, 146.0, 71.5),
         frag("0.5", 227.0, 251.0, 71.5),
     )
+
+
+def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint]]:
+    """One scenario per refusal reason, run for real by the reachability census."""
+    wide_row = (
+        CAPTION,
+        frag("a wide spanning header", 53.0, 280.0, 134.5),
+        frag("x", 53.0, 60.0, 121.0),
+        frag("y", 122.0, 130.0, 121.0),
+        frag("z", 227.0, 240.0, 121.0),
+    )
+    equidistant_affix = (
+        CAPTION,
+        frag("O", 122.0, 127.0, 115.0),
+        frag("2", 127.0, 130.0, 110.0, font_height=AFFIX_HEIGHT),
+        frag("O", 122.0, 127.0, 105.0),
+    )
+    return [
+        (FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_ABSENT), footprint()),
+        (extraction_of(*simple_grid(), lossy=True, truncated=True), footprint()),
+        (extraction_of(*simple_grid()), footprint(x_end=50.0)),
+        (extraction_of(*simple_grid()), footprint(caption_baseline_y=1000.0, y_top=999.0)),
+        (extraction_of(*simple_grid()), footprint(y_top=140.0)),
+        (extraction_of(*equidistant_affix), footprint()),
+        (
+            extraction_of(
+                CAPTION,
+                frag("Aaa", 53.0, 70.0, 120.0),
+                frag("2", 250.0, 253.0, 110.0, font_height=AFFIX_HEIGHT),
+                frag("Bbb", 53.0, 70.0, 100.0),
+            ),
+            footprint(),
+        ),
+        (extraction_of(*simple_grid()), footprint(y_top=130.0)),
+        (
+            extraction_of(*simple_grid(), frag("sideways", 100.0, 110.0, 100.0, rotated=True)),
+            footprint(),
+        ),
+        (
+            extraction_of(CAPTION, frag("/C0 1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNMAPPED)),
+            footprint(),
+        ),
+        (extraction_of(CAPTION), footprint(y_top=60.0, y_bottom=10.0)),
+        (extraction_of(*wide_row), footprint()),
+    ]
 
 
 class TestTheGridComesFromGeometry:
@@ -295,6 +341,39 @@ class TestTheAffixMergeIsRecordedOrRefused:
 
         inventory = build_inventory(extraction_of(*fragments), footprint())
 
+        assert inventory.refusals == ()
+        assert [(r.ordinal, r.anchor_text, r.merged_baselines) for r in inventory.rows] == [(0, "CO2", (133.2,))]
+
+    def test_a_trailing_subscript_is_not_stolen_by_a_wider_row_below(self) -> None:
+        """The measured silent corruption that replaced containment with adjacency: with
+        a wide row below, containment excluded the true parent, folded the `2` into that
+        unrelated row 13 pt away, appended it to that row's anchor -- `wide2` -- and
+        refused nothing."""
+        fragments = (
+            CAPTION,
+            frag("CO", 123.0, 137.0, 134.5),
+            frag("2", 137.0, 140.0, 133.2, font_height=AFFIX_HEIGHT),
+            frag("wide", 53.0, 280.0, 120.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        assert [(r.ordinal, r.anchor_text) for r in inventory.rows] == [(0, "CO2"), (1, "wide")]
+
+    def test_an_affix_band_adjacent_to_neither_neighbour_refuses(self) -> None:
+        """A DIFFERENT fault from AMBIGUOUS_AFFIX_BAND, named separately: there the
+        parent is over-determined, here it is absent. A small-font band alone in a column
+        belongs to no row, and becoming a row of its own renumbers everything beneath."""
+        fragments = (
+            CAPTION,
+            frag("Aaa", 53.0, 70.0, 120.0),
+            frag("2", 250.0, 253.0, 110.0, font_height=AFFIX_HEIGHT),
+            frag("Bbb", 53.0, 70.0, 100.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNATTACHABLE_AFFIX_BAND]
 
@@ -463,12 +542,53 @@ class TestTheFootprintIsAClaimAndTheAnchorIsWhatPinsIt:
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.CAPTION_ANCHOR_ABSENT]
 
     def test_a_footprint_holding_no_fragments_refuses(self) -> None:
-        inventory = build_inventory(
-            extraction_of(CAPTION), footprint(y_top=60.0, y_bottom=10.0, caption_baseline_y=55.0)
-        )
+        inventory = build_inventory(extraction_of(CAPTION), footprint(y_top=60.0, y_bottom=10.0))
 
         assert inventory.cells == ()
-        assert InventoryRefusalReason.CAPTION_ANCHOR_ABSENT in [r.reason for r in inventory.refusals]
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.EMPTY]
+
+    def test_the_box_may_not_contain_its_own_caption(self) -> None:
+        """Measured before this check existed: raising `y_top` above the caption made the
+        caption row 0 and shifted every ordinal beneath it, with no refusal anywhere.
+        The docstring said the caption sits above the top edge; nothing enforced it."""
+        inventory = build_inventory(extraction_of(*simple_grid()), footprint(y_top=200.0))
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.FOOTPRINT_INSANE]
+
+    def test_a_band_orphaned_between_the_caption_and_the_box_refuses(self) -> None:
+        """The ordinal-drift attack, made detectable. A caller who lowers `y_top` by one
+        band keeps a correct caption and correctly-grounded values while shifting every
+        row ordinal by one. Nothing on the locator can see that; the orphaned band can."""
+        inventory = build_inventory(extraction_of(*simple_grid()), footprint(y_top=130.0))
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_ABOVE_THE_BOX]
+
+    def test_a_spanning_row_refuses_rather_than_collapsing_the_columns(self) -> None:
+        """Columns come from ALIGNED emptiness -- an x-strip empty in EVERY row -- so one
+        row spanning the width erases every boundary beneath it. Measured: three columns
+        collapsed into one, three cells merged into `xyz` at col=0, `complete` True."""
+        fragments = (
+            CAPTION,
+            frag("a wide spanning header", 53.0, 280.0, 134.5),
+            frag("x", 53.0, 60.0, 121.0),
+            frag("y", 122.0, 130.0, 121.0),
+            frag("z", 227.0, 240.0, 121.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+
+    def test_a_rotated_fragment_inside_the_box_refuses(self) -> None:
+        inventory = build_inventory(
+            extraction_of(*simple_grid(), frag("sideways", 100.0, 110.0, 100.0, rotated=True)),
+            footprint(),
+        )
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
     @pytest.mark.parametrize(
         "overrides",
@@ -542,16 +662,14 @@ class TestFailClosedIsStructural:
 
     def test_every_refusal_reason_is_reachable(self) -> None:
         """A member no code path can emit is a claim about coverage that is not true.
-        Each reason must be produced by at least one test above; this census asserts
-        the enum has not grown one that nothing produces."""
+
+        The previous version of this test hard-coded the member list into a set and
+        compared it to the enum, so it asserted only that the enum equals itself: it
+        would have passed with every code path deleted. A census that cannot fail is
+        worse than no census, because it reports coverage nobody has. This one RUNS each
+        scenario and collects what the module actually emitted."""
         produced = {
-            InventoryRefusalReason.EXTRACTION_UNAVAILABLE,
-            InventoryRefusalReason.PAGE_INCOMPLETE,
-            InventoryRefusalReason.FOOTPRINT_INSANE,
-            InventoryRefusalReason.CAPTION_ANCHOR_ABSENT,
-            InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND,
-            InventoryRefusalReason.UNATTACHABLE_AFFIX_BAND,
-            InventoryRefusalReason.UNMAPPED_MEMBER,
-            InventoryRefusalReason.EMPTY,
+            r.reason for extraction, fp in _EVERY_REFUSAL_SCENARIO() for r in build_inventory(extraction, fp).refusals
         }
-        assert produced == set(InventoryRefusalReason)
+
+        assert produced == set(InventoryRefusalReason), f"unreachable: {set(InventoryRefusalReason) - produced}"
