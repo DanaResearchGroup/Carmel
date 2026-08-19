@@ -588,20 +588,25 @@ def _column_bounds(
     return [(a, b) for a, b in blocks]
 
 
-def _row_pitch(rows: list[InventoryRow], members: list[TextFragment]) -> float:
-    """How far apart this table's own rows are, in points.
+def _row_pitch(rows: list[InventoryRow], members: list[TextFragment], footprint: ClaimedFootprint) -> float:
+    """How far apart this table's own printed lines are, in points.
 
     Derived from the table being protected rather than declared as a constant, so the
     look-below in :func:`_orphan_below_refusal` is bounded by the thing it is bounding.
-    The MEDIAN, not the mean: the header-to-first-row gap is routinely larger than the
-    body pitch (13.2 pt against 10.0 pt on the real target) and would drag a mean upward,
+    The MEDIAN, not the mean: a mean is dragged upward by the caption-to-first-row gap,
     widening the window into the prose beneath.
 
-    With fewer than two rows there is no pitch to measure, and the tallest member's
-    rendered height stands in -- still derived from this table, and the closest thing to a
-    line height the substrate offers.
+    **The caption's baseline is folded in**, which is what makes a ONE-ROW table defensible.
+    Row gaps alone give no pitch at all below two rows, and the fallback that stood here --
+    the tallest member's rendered height -- was measured to be far too small: a synthetic
+    one-row box failed to notice a row cut off 80 pt beneath it, silently, in the permissive
+    direction. The caption is a printed line of the same table at a known position, so the
+    gap to the first row is a real line spacing rather than a stand-in. It is systematically
+    the LARGEST gap (14.3 pt against a 10.0 pt body pitch on the real target), and including
+    it can only widen the window, which is the safe direction. On that table the median is
+    10.0 pt either way, so the measured case is unchanged.
     """
-    baselines = [row.baseline_y for row in rows]
+    baselines = [footprint.caption_baseline_y, *(row.baseline_y for row in rows)]
     gaps = [above - below for above, below in zip(baselines, baselines[1:], strict=False)]
     if gaps:
         return statistics.median(gaps)
@@ -852,7 +857,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     truncated = _truncated_column_refusal(extraction, footprint, rows)
     if truncated is not None:
         return refused(truncated)
-    cut_below = _orphan_below_refusal(extraction, footprint, bounds, _row_pitch(rows, inside))
+    cut_below = _orphan_below_refusal(extraction, footprint, bounds, _row_pitch(rows, inside, footprint))
     if cut_below is not None:
         return refused(cut_below)
 
