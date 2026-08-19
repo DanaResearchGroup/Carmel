@@ -41,6 +41,7 @@ from carmel.schemas.datasets import (
     GroundedCategoricalClaim,
     GroundedScalarClaim,
     MeasuredValue,
+    MemberSheetKey,
     QuantityKind,
     SemanticDependencyUse,
     SourceGraph,
@@ -133,6 +134,24 @@ def _table_ref(node_id: str = "paper", row: int = 0, col: int = 1, raw_sha256: s
             row=row,
             col=col,
             pdf_table_inventory_sha256=inventory_for(raw_sha256).inventory_sha256,
+        ),
+    )
+
+
+def _sheet_ref(node_id: str, row: int = 0, col: int = 1) -> SourceRef:
+    """A table-cell ref into a workbook SHEET, which cites no inventory.
+
+    The shape an SI member's table cell has to take: V8 refuses a
+    CAPTION-labelled SI cell both ways, because an SI member may be a PDF or a
+    word-processor document and nothing in the envelope can establish which.
+    """
+    return SourceRef(
+        node_id=node_id,
+        locator=TableCellLocator(
+            table_key=MemberSheetKey(sheet_name="Sheet1"),
+            row=row,
+            col=col,
+            pdf_table_inventory_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         ),
     )
 
@@ -630,8 +649,8 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
                 _scalar_claim(
                     label_ref=_table_ref("paper"),
                     value=_measured_value(
-                        value_ref=_table_ref("si", raw_sha256=SHA_B),
-                        unit_ref=_table_ref("si", col=2, raw_sha256=SHA_B),
+                        value_ref=_sheet_ref("si"),
+                        unit_ref=_sheet_ref("si", col=2),
                     ),
                 ),
             ),

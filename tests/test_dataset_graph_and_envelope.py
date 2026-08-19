@@ -352,6 +352,9 @@ def _table_ref(node_id: str, row: int = 0, col: int = 1, raw_sha256: str = SHA_A
     ``raw_sha256`` must match the TARGET NODE's own sha256: V8 requires the
     cited inventory to have been derived from the document the locator points
     at, so a fixture that changes the node has to change this too.
+
+    Only legal against a ``PAPER_PDF`` node. For an SI member use
+    :func:`_sheet_ref`, which V8 accepts.
     """
     return SourceRef(
         node_id=node_id,
@@ -360,6 +363,25 @@ def _table_ref(node_id: str, row: int = 0, col: int = 1, raw_sha256: str = SHA_A
             row=row,
             col=col,
             pdf_table_inventory_sha256=inventory_for(raw_sha256).inventory_sha256,
+        ),
+    )
+
+
+def _sheet_ref(node_id: str, row: int = 0, col: int = 1) -> SourceRef:
+    """A table-cell ref into a workbook SHEET, which cites no inventory.
+
+    The shape an SI member's table cell has to take: a sheet has no PDF
+    fragment geometry structurally, and V8 refuses a CAPTION-labelled SI cell
+    both ways -- absent would record a claim nothing checked, present would
+    assert the member is a PDF on an author-controlled digest.
+    """
+    return SourceRef(
+        node_id=node_id,
+        locator=TableCellLocator(
+            table_key=MemberSheetKey(sheet_name="Sheet1"),
+            row=row,
+            col=col,
+            pdf_table_inventory_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         ),
     )
 
@@ -2055,15 +2077,17 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
 
     def test_table_cell_locator_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
         for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
+            # The table KEY and the citation are varied per node kind so this test keeps
+            # measuring locator-kind/node-kind compatibility (V3) and nothing else. V8 is
+            # what forces the variation: only a PDF cell may cite an inventory, an XML cell
+            # may not, and an SI cell may not be caption-labelled at all.
+            si = kind is SourceNodeKind.SI_MEMBER
             locator = TableCellLocator(
-                table_key=CaptionLabelKey(label="Table 1"),
+                table_key=MemberSheetKey(sheet_name="Sheet1") if si else CaptionLabelKey(label="Table 1"),
                 row=0,
                 col=0,
-                # V7, not V3: a PDF (or caption-labelled SI) cell must cite its
-                # inventory, an XML cell must not. Varied here so this test keeps
-                # measuring locator-kind/node-kind compatibility and nothing else.
                 pdf_table_inventory_sha256=(
-                    _NO_INVENTORY if kind is SourceNodeKind.JATS_XML else inventory_for(SHA_A).inventory_sha256
+                    inventory_for(SHA_A).inventory_sha256 if kind is SourceNodeKind.PAPER_PDF else _NO_INVENTORY
                 ),
             )
             _envelope_with_value_ref_locator(locator, kind)
@@ -2164,8 +2188,8 @@ class TestDatasetEnvelopeTableKeyKindCompatibility:
         assert TableKeyKind.MEMBER_SHEET.value in msg
         assert SourceNodeKind.PAPER_PDF.value in msg
 
-    def test_caption_label_key_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
-        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
+    def test_caption_label_key_accepted_against_paper_pdf_and_jats_xml(self) -> None:
+        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML):
             locator = TableCellLocator(
                 table_key=CaptionLabelKey(label="Table 1"),
                 row=0,
@@ -2175,6 +2199,27 @@ class TestDatasetEnvelopeTableKeyKindCompatibility:
                 ),
             )
             _envelope_with_value_ref_locator(locator, kind)
+
+    def test_caption_label_key_against_si_member_passes_this_rule_and_fails_v8(self) -> None:
+        """SI_MEMBER is absent from the list above, and the reason matters:
+        V3 still PERMITS a caption-label key there -- the envelope refuses it
+        for a different reason entirely, which is what this asserts.
+
+        A test that merely showed "rejected" would pass just as well if V3 had
+        silently started rejecting it, hiding the fact that the two rules
+        disagree about this case on purpose.
+        """
+        locator = TableCellLocator(
+            table_key=CaptionLabelKey(label="Table 1"),
+            row=0,
+            col=0,
+            pdf_table_inventory_sha256=inventory_for(SHA_B).inventory_sha256,
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_value_ref_locator(locator, SourceNodeKind.SI_MEMBER)
+        msg = str(excinfo.value)
+        assert "this schema cannot tell which" in msg
+        assert "table_key kind" not in msg, "V3 must still permit this pairing -- V8 is what refuses it"
 
     def test_member_sheet_key_accepted_against_si_member_node(self) -> None:
         locator = TableCellLocator(
@@ -2208,7 +2253,7 @@ class TestFunctionalRealisticEnvelope:
 
         h2 = _component(
             "H2",
-            value_ref=_table_ref("si", raw_sha256=SHA_B, row=0, col=0),
+            value_ref=_sheet_ref("si", row=0, col=0),
             unit_ref=_table_ref("paper", row=0, col=0),
         )
         n2 = _component(

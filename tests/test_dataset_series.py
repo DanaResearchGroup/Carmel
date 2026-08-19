@@ -180,6 +180,10 @@ def _jats_graph(node_id: str = "jats") -> SourceGraph:
 #: fragment geometry, so its only legal citation is Absent(NOT_APPLICABLE).
 _RAW_SHA_BY_NODE_ID: dict[str, str] = {"paper": SHA_A, "si": SHA_B, "fig": SHA_B}
 
+#: Fixture node ids that are SI_MEMBER nodes. A table cell in one of these has to be a
+#: workbook SHEET cell -- see :func:`_table_ref`.
+_SI_MEMBER_NODE_IDS = frozenset({"si"})
+
 
 def _table_ref(
     node_id: str, row: int = 0, col: int = 1, label: str = "Table 1", raw_sha256: str | None = None
@@ -188,7 +192,23 @@ def _table_ref(
 
     Pass ``raw_sha256`` only to cite a DIFFERENT document than the node's own --
     which V8 rejects, and which some tests exist to prove it rejects.
+
+    A ref into an SI MEMBER comes back as a workbook SHEET cell citing nothing,
+    unless the caller forced a ``raw_sha256`` in order to test a rejection. V8
+    refuses a CAPTION-labelled SI cell whichever way it answers the citation:
+    absent would record a claim nothing checked, and present would assert the
+    member is a PDF on the strength of an author-controlled digest.
     """
+    if node_id in _SI_MEMBER_NODE_IDS and raw_sha256 is None:
+        return SourceRef(
+            node_id=node_id,
+            locator=TableCellLocator(
+                row=row,
+                col=col,
+                table_key=MemberSheetKey(kind=TableKeyKind.MEMBER_SHEET, sheet_name="Sheet1"),
+                pdf_table_inventory_sha256=_NO_INVENTORY,
+            ),
+        )
     sha = raw_sha256 if raw_sha256 is not None else _RAW_SHA_BY_NODE_ID.get(node_id)
     citation = _NO_INVENTORY if sha is None else inventory_for(sha).inventory_sha256
     return SourceRef(

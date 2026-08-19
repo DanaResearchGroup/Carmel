@@ -25,6 +25,7 @@ from carmel.services import pdf_tables
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.pdf_fragments import extract_fragments
 from carmel.services.pdf_table_record import (
+    INVENTORY_PAYLOAD_KEYS,
     INVENTORY_PAYLOAD_VERSION,
     InventoryVerificationStatus,
     compute_inventory_sha,
@@ -297,6 +298,23 @@ class TestIdentityIsReportedWithoutBlockingTheRecomputation:
         """It is computed from source, so it cannot be forgotten the way a version int can."""
         assert len(inventory_code_sha256()) == 64
         assert inventory_code_sha256() == inventory_code_sha256()
+
+
+class TestTheDeclaredShapeIsTheShapeActuallyWritten:
+    """``INVENTORY_PAYLOAD_KEYS`` is what a reader holding no document uses to
+    tell a replayable record from bytes that could never be verified at all --
+    :class:`~carmel.schemas.datasets.EmbeddedTableInventory` refuses anything
+    whose top-level keys are not exactly this set.
+
+    That makes it a hand-maintained mirror of :func:`inventory_record_payload`,
+    which is a thing that drifts. If it drifts wider, unreplayable records get
+    embedded; if it drifts narrower, every honest record is refused. Neither
+    shows up anywhere else, because both sides would still agree with
+    themselves.
+    """
+
+    def test_a_real_record_has_exactly_the_declared_keys(self, record: dict) -> None:
+        assert set(record) == set(INVENTORY_PAYLOAD_KEYS)
 
 
 class TestTheStoredFormIsCanonicalAndExact:

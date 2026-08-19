@@ -51,6 +51,7 @@ from carmel.services.pdf_tables import (
 from carmel.services.semantic_deps import compute_dependency_sha, fragment_geometry_identity
 
 __all__ = [
+    "INVENTORY_PAYLOAD_KEYS",
     "INVENTORY_PAYLOAD_VERSION",
     "InventoryVerification",
     "InventoryVerificationStatus",
@@ -92,6 +93,37 @@ _INVENTORY_ENTRY_POINTS: tuple[str, ...] = (
 #: They remain part of the content ADDRESS: a record written under different code is a
 #: different record, even when it says the same thing.
 _IDENTITY_FIELDS: frozenset[str] = frozenset({"inventory_code_sha256", "fragment_geometry_sha256", "pypdf_version"})
+
+#: Exactly the top-level keys a version-``INVENTORY_PAYLOAD_VERSION`` record has -- no more,
+#: no fewer.
+#:
+#: EXACT rather than "at least these", because the address is over the canonical bytes and
+#: :func:`verify_inventory_record` compares them against a freshly built payload. A record
+#: carrying an extra key can therefore never reproduce (the recomputed payload will not have
+#: it), and a record missing ``footprint`` can never be verified AT ALL --
+#: :func:`verify_inventory_record` returns ``PAYLOAD_UNREADABLE`` before it ever looks at the
+#: document. So this set is precisely the condition "these bytes could conceivably be
+#: refuted by the PDF they name", which is the weakest honest thing a reader can check
+#: without holding the document. A reader that holds only the record -- notably
+#: :class:`~carmel.schemas.datasets.EmbeddedTableInventory` -- has no stronger check
+#: available, and accepting a record that is unverifiable BY CONSTRUCTION would persist a
+#: citation nothing can ever confirm or deny.
+#:
+#: Pinned against a real built payload by ``test_pdf_table_record``, so the two cannot drift.
+INVENTORY_PAYLOAD_KEYS: frozenset[str] = frozenset(
+    {
+        "cells",
+        "column_bounds",
+        "footprint",
+        "fragment_geometry_sha256",
+        "inventory_code_sha256",
+        "payload_version",
+        "pypdf_version",
+        "raw_sha256",
+        "refusals",
+        "rows",
+    }
+)
 
 
 class InventoryIdentityUnavailable(RuntimeError):

@@ -7,12 +7,14 @@ makes them load-bearing rather than decorative.
 The guards under test, and the failure each closes:
 
 * **V8** -- a ``PAPER_PDF`` table cell with no citation, a non-PDF cell WITH
-  one, an undecidable SI member, a citation to an inventory the envelope does
+  one, an SI member EITHER way, a citation to an inventory the envelope does
   not embed, a citation to a grid derived from a different document, and a
   citation to a cell that grid never derived.
 * **T1** (on :class:`EmbeddedTableInventory`) -- bytes that are not canonical,
   that do not hash to the address they claim, that name a different document,
-  that carry a refusal, or that never say whether they refused.
+  that carry a refusal, that never say whether they refused, that are not the
+  SHAPE of a record of their declared version, or whose cell ordinals are not
+  integers.
 * **T4/T5** -- an embedded record nothing cites, a duplicate, a bad order.
 
 Fixtures are SYNTHETIC throughout: no paper text enters this repo, and these
@@ -47,8 +49,9 @@ from carmel.schemas.datasets import (
     UnextractedReason,
 )
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.pdf_table_record import INVENTORY_PAYLOAD_KEYS
 from carmel.services.units import QuantityKind
-from tests.table_inventory_fixtures import inventory_payload, make_embedded_inventory
+from tests.table_inventory_fixtures import embed, inventory_payload, make_embedded_inventory
 
 PAPER_SHA = "a" * 64
 SI_SHA = "b" * 64
@@ -75,7 +78,7 @@ def _node(node_id: str, kind: SourceNodeKind, sha256: str, parent_node_id: str |
     )
 
 
-def _graph_for(node_id: str) -> SourceGraph:
+def _nodes_for(node_id: str) -> tuple[SourceNode, ...]:
     """Exactly the targeted node, plus any ancestor it structurally needs.
 
     Scoped rather than "one node of every kind": V2 refuses a graph holding a
@@ -84,12 +87,27 @@ def _graph_for(node_id: str) -> SourceGraph:
     """
     paper = _node("paper", SourceNodeKind.PAPER_PDF, PAPER_SHA)
     if node_id == "paper":
-        return SourceGraph(nodes=(paper,))
+        return (paper,)
+    if node_id == "other":
+        return (_node("other", SourceNodeKind.PAPER_PDF, OTHER_SHA),)
     if node_id == "si":
         # `paper` stays: an SI member needs its parent, and an unreferenced
         # ANCESTOR of a targeted node is explicitly not decorative.
-        return SourceGraph(nodes=(paper, _node("si", SourceNodeKind.SI_MEMBER, SI_SHA, parent_node_id="paper")))
-    return SourceGraph(nodes=(_node("jats", SourceNodeKind.JATS_XML, XML_SHA),))
+        return (paper, _node("si", SourceNodeKind.SI_MEMBER, SI_SHA, parent_node_id="paper"))
+    return (_node("jats", SourceNodeKind.JATS_XML, XML_SHA),)
+
+
+def _graph_for(node_id: str) -> SourceGraph:
+    return SourceGraph(nodes=_nodes_for(node_id))
+
+
+def _graph_for_ids(node_ids: tuple[str, ...]) -> SourceGraph:
+    """The union of what each targeted node needs, deduplicated by ``node_id``."""
+    merged: dict[str, SourceNode] = {}
+    for node_id in node_ids:
+        for node in _nodes_for(node_id):
+            merged[node.node_id] = node
+    return SourceGraph(nodes=tuple(merged.values()))
 
 
 def _cell_ref(node_id: str, citation: object, *, sheet: bool = False, row: int = 0, col: int = 0) -> SourceRef:
@@ -104,32 +122,43 @@ def _cell_ref(node_id: str, citation: object, *, sheet: bool = False, row: int =
     )
 
 
-def _envelope(ref: SourceRef, inventories: tuple[EmbeddedTableInventory, ...]) -> ConditionSetEnvelope:
-    """The smallest envelope that can carry one table-cell ref.
+def _envelope_with_refs(
+    refs: tuple[SourceRef, SourceRef], inventories: tuple[EmbeddedTableInventory, ...]
+) -> ConditionSetEnvelope:
+    """The smallest envelope that can carry TWO distinct table-cell refs.
 
     A refusals-only condition set: it embeds no conversion table (nothing here
-    is a MeasuredValue), so the only thing under test is the citation.
+    is a MeasuredValue), so the only thing under test is the citation. The two
+    refs go to different slots so both are reachable by ``iter_source_refs``,
+    which is what lets a test cite two inventories at once.
     """
+    subject_ref, statement_ref = refs
     return ConditionSetEnvelope(
-        source_graph=_graph_for(ref.node_id),
+        source_graph=_graph_for_ids((subject_ref.node_id, statement_ref.node_id)),
         conversion_tables=(),
         table_inventories=inventories,
-        subject=DeviceClassDeclaration(label_raw="shock tube", label_ref=ref),
+        subject=DeviceClassDeclaration(label_raw="shock tube", label_ref=subject_ref),
         attribution=ConditionAttribution.OWN_EXPERIMENT,
-        attribution_ref=ref,
+        attribution_ref=subject_ref,
         scalar_claims=(),
         categorical_claims=(),
         unextracted=(
             UnextractedConditionStatement(
                 statement_id="phi",
                 label_raw="equivalence ratio",
-                label_ref=ref,
-                statement_ref=ref,
+                label_ref=statement_ref,
+                statement_ref=statement_ref,
                 reason=UnextractedReason.VALUE_RANGE,
                 quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
             ),
         ),
     )
+
+
+def _envelope(ref: SourceRef, inventories: tuple[EmbeddedTableInventory, ...]) -> ConditionSetEnvelope:
+    """The smallest envelope that can carry one table-cell ref, used everywhere
+    a single ref is the whole point."""
+    return _envelope_with_refs((ref, ref), inventories)
 
 
 class TestAPdfTableCellMustNameItsGrid:
@@ -212,16 +241,27 @@ class TestAnUndecidableSiMemberFailsClosed:
             _envelope(_cell_ref("si", _NOT_APPLICABLE), ())
         assert "this schema cannot tell which" in str(excinfo.value)
 
-    def test_but_a_present_citation_self_certifies(self) -> None:
-        """Accepted, because it PROVES rather than asserts what the member is.
+    def test_and_a_present_citation_does_not_certify_it_either(self) -> None:
+        """The refutation of this rule's first draft, kept as a test.
 
-        The embedded record's ``raw_sha256`` must equal this node's own
-        ``sha256``, and only a PDF yields a cell inventory -- so the envelope
-        establishes the member is a PDF instead of taking anyone's word.
+        That draft ACCEPTED a present citation here, reasoning that it
+        self-certifies: the embedded record's ``raw_sha256`` must equal this
+        node's ``sha256``, and only a PDF yields an inventory, so the envelope
+        was said to PROVE the member is a PDF. It proves nothing of the kind.
+        ``EmbeddedTableInventory`` never re-derives the grid from the document,
+        so the payload -- ``raw_sha256`` included -- is entirely author-
+        controlled: the record built below asserts a grid over ``SI_SHA``
+        without any PDF having been parsed, which is exactly what an author
+        misfiling a ``.docx`` would produce.
+
+        Matching digests prove the author NAMED this node, never that a parser
+        ran on it.
         """
         inventory = make_embedded_inventory(raw_sha256=SI_SHA, cells=((0, 0),))
-        envelope = _envelope(_cell_ref("si", inventory.inventory_sha256), (inventory,))
-        assert envelope.table_inventories[0].raw_sha256 == envelope.source_graph.node("si").sha256
+        assert inventory.raw_sha256 == SI_SHA  # coherent, embedded, correctly addressed -- and still not proof
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope(_cell_ref("si", inventory.inventory_sha256), (inventory,))
+        assert "asserts the member is a PDF rather than establishing it" in str(excinfo.value)
 
 
 class TestACitationMustResolveToTheRightGridOfTheRightDocument:
@@ -269,37 +309,44 @@ class TestARefusedDerivationDefinesNoGrid:
             )
         assert "defines no grid a table cell could be located in" in str(excinfo.value)
 
-    def test_a_record_that_never_says_whether_it_refused_is_refused(self) -> None:
-        """``refusal_reasons_of({})`` returns ``()``, so a payload that merely
-        OMITS the key would otherwise read as refusal-free. "Does not say" and
-        "says none" are different facts and only the second clears a citation.
+    @pytest.mark.parametrize("refusals", [0, "", {}, "caption_anchor_absent"], ids=repr)
+    def test_a_record_that_never_says_whether_it_refused_is_refused(self, refusals: object) -> None:
+        """``refusal_reasons_of`` reads ``payload.get("refusals") or ()``, so
+        every FALSY non-list here reads as refusal-free without a single refusal
+        having been ruled out. "Does not say" and "says none" are different
+        facts and only the second clears a citation.
         """
-        payload = {"cells": [{"row": 0, "col": 0}], "payload_version": 1, "raw_sha256": PAPER_SHA}
-        canonical = canonical_json_bytes(payload).decode("utf-8")
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["refusals"] = refusals
         with pytest.raises(ValidationError) as excinfo:
-            EmbeddedTableInventory(
-                inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-                raw_sha256=PAPER_SHA,
-                canonical_json=canonical,
-            )
+            embed(payload, raw_sha256=PAPER_SHA)
         assert "silence is not a refusal-free claim" in str(excinfo.value)
 
-    def test_unreadable_refusals_raise_a_validation_error_not_a_type_error(self) -> None:
-        """``refusal_reasons_of`` raises a bare ``TypeError`` on ``["x"]``.
+    @pytest.mark.parametrize(
+        ("refusals", "escapes_as"),
+        [(["x"], "TypeError"), ([{}], "KeyError"), ([{"reason": "not_a_reason"}], "ValueError")],
+        ids=["str-entry", "empty-dict-entry", "unknown-reason"],
+    )
+    def test_unreadable_refusals_raise_a_validation_error_not_a_bare_exception(
+        self, refusals: list[object], escapes_as: str
+    ) -> None:
+        """``refusal_reasons_of`` reaches ``entry["reason"]`` unguarded, and each
+        of these makes that indexing fail a DIFFERENT way.
 
-        Uncaught, that escapes as a ``TypeError`` rather than a
-        ``ValidationError`` and crashes a caller that correctly catches only the
-        latter -- from untrusted, stored bytes.
+        Uncaught, any of them escapes as its own exception type rather than a
+        ``ValidationError``, crashing a caller that correctly catches only the
+        latter -- from untrusted, stored bytes. Parametrized because the first
+        version of this guard caught two of the three: the helper promises
+        nothing about which it raises, so the test has to enumerate rather than
+        trust the one shape that was noticed first.
         """
-        payload = {"cells": [], "payload_version": 1, "raw_sha256": PAPER_SHA, "refusals": ["x"]}
-        canonical = canonical_json_bytes(payload).decode("utf-8")
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["refusals"] = refusals
         with pytest.raises(ValidationError) as excinfo:
-            EmbeddedTableInventory(
-                inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-                raw_sha256=PAPER_SHA,
-                canonical_json=canonical,
-            )
-        assert "cannot be read, so it cannot be shown refusal-free" in str(excinfo.value)
+            embed(payload, raw_sha256=PAPER_SHA)
+        message = str(excinfo.value)
+        assert "cannot be read, so it cannot be shown refusal-free" in message
+        assert escapes_as in message, "the message should name what actually went wrong inside the helper"
 
 
 class TestTheEmbeddedBytesMustBeWhatTheyClaim:
@@ -386,6 +433,117 @@ class TestTheEmbeddedCollectionIsExactAndOrdered:
         with pytest.raises(ValidationError) as excinfo:
             _envelope(_cell_ref("jats", _NOT_APPLICABLE), (spare,))
         assert "unearned provenance" in str(excinfo.value)
+
+    def test_a_descending_collection_is_refused(self) -> None:
+        """T5 itself, which nothing here previously reached: every other fixture
+        sorts, so disabling T5 could have survived this whole file.
+
+        Two inventories, both cited, embedded in the one order T5 forbids -- so
+        exactly one legal, and therefore exactly one addressable, representation
+        of the same content exists.
+
+        Both are grids in the SAME document, which is what a paper with two
+        tables really looks like; an envelope may not span two root artifacts,
+        so two documents is not an option here anyway.
+        """
+        first = make_embedded_inventory(raw_sha256=PAPER_SHA, cells=((0, 0),), marker="Table 1")
+        second = make_embedded_inventory(raw_sha256=PAPER_SHA, cells=((0, 0),), marker="Table 2")
+        ascending = tuple(sorted((first, second), key=lambda i: i.inventory_sha256))
+        refs = (_cell_ref("paper", first.inventory_sha256), _cell_ref("paper", second.inventory_sha256))
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_refs(refs, tuple(reversed(ascending)))
+        assert "must be sorted ascending by inventory_sha256" in str(excinfo.value)
+
+
+class TestARecordThatCouldNeverBeReplayedIsRefused:
+    """T1 cannot prove a grid is real -- only ``verify_inventory_record``, holding
+    the document, can. What it CAN prove is that the record is not unverifiable by
+    construction, which is the last thing a reader holding no document can check.
+    """
+
+    def test_a_stray_top_level_key_is_refused(self) -> None:
+        """The address is over the canonical bytes, and the verifier compares them
+        against a freshly built payload -- which will not carry this key. So a
+        record with one can never report REPRODUCED, whatever the document says.
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["annotation"] = "a note someone added"
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "could never be replayed against the document it names" in str(excinfo.value)
+        assert "'annotation'" in str(excinfo.value), "the message must name the offending key"
+
+    @pytest.mark.parametrize("dropped", sorted(INVENTORY_PAYLOAD_KEYS - {"payload_version", "raw_sha256"}))
+    def test_a_record_missing_any_key_of_its_declared_version_is_refused(self, dropped: str) -> None:
+        """``footprint`` is the one that bites -- ``verify_inventory_record``
+        returns PAYLOAD_UNREADABLE before it ever looks at the document -- but the
+        rule is the whole key set, so every key is checked here rather than the
+        one that motivated it.
+
+        ``payload_version`` and ``raw_sha256`` are excluded only because their own
+        earlier checks fire first and report something more specific.
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        del payload[dropped]
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "could never be replayed against the document it names" in str(excinfo.value)
+        assert repr(dropped) in str(excinfo.value)
+
+    def test_the_fixture_payload_has_exactly_a_real_records_shape(self) -> None:
+        """The fixtures' claim to stand in for a record, stated as an assertion.
+
+        Without this, a future key added to the real payload would leave every
+        fixture here quietly testing a shape nothing produces.
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        assert set(payload) == set(INVENTORY_PAYLOAD_KEYS)
+
+
+class TestACellOrdinalMustBeAnOrdinal:
+    @pytest.mark.parametrize(
+        ("row", "col"),
+        [(True, False), (0, True), ("0", "0"), (None, 0)],
+        ids=["bool-bool", "bool-col", "str-str", "null-row"],
+    )
+    def test_a_non_integer_ordinal_is_refused(self, row: object, col: object) -> None:
+        """``(True, False)`` is the one with teeth. JSON has no integer type
+        distinct from bool and Python's ``True == 1``, so an unchecked payload
+        answers ``has_cell(row=1, col=0)`` with YES for a grid holding only
+        ``{"row": true, "col": false}`` -- a citation resolving against a cell
+        that does not exist.
+
+        A float ordinal is absent from this list because it cannot be built at
+        all: ``canonical_json_bytes`` refuses floats outright, so no stored
+        record can ever carry one.
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["cells"] = [
+            {"col": col, "member_digests": [], "row": row, "text": "x", "x_end": "0x0.0p+0", "x_start": "0x0.0p+0"}
+        ]
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "which is not an integer ordinal" in str(excinfo.value)
+
+    def test_the_bool_grid_would_otherwise_have_satisfied_a_real_citation(self) -> None:
+        """The defect this closes, demonstrated rather than asserted: the forged
+        grid and the cell a locator asks for are equal under ``==`` and unequal
+        under the schema."""
+        forged = [{"row": True, "col": False}]
+        assert any(cell["row"] == 1 and cell["col"] == 0 for cell in forged), "Python equality alone accepts it"
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["cells"] = [
+            dict(cell, member_digests=[], text="x", x_end="0x0.0p+0", x_start="0x0.0p+0") for cell in forged
+        ]
+        with pytest.raises(ValidationError):
+            embed(payload, raw_sha256=PAPER_SHA)
+
+    def test_cells_that_are_not_a_list_are_refused(self) -> None:
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["cells"] = {"row": 0, "col": 0}
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "not a list, so it describes no grid" in str(excinfo.value)
 
 
 class TestTheCitationIsIdentityBearing:
