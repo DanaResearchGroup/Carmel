@@ -56,7 +56,9 @@ __all__ = [
     "InventoryVerificationStatus",
     "compute_inventory_sha",
     "inventory_code_sha256",
+    "inventory_record_bytes",
     "inventory_record_payload",
+    "refusal_reasons_of",
     "verify_inventory_record",
 ]
 
@@ -307,9 +309,22 @@ def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> di
     }
 
 
+def inventory_record_bytes(payload: Mapping[str, Any]) -> bytes:
+    """The exact byte form of this record: what a store writes, and what its address is over.
+
+    Exists so those two are one definition rather than two that happen to agree.
+    :mod:`carmel.services.pdf_table_store` needs the bytes AND the address; had it
+    canonicalized on its own, a later change to what "canonical" means here would
+    move the stored bytes while :func:`compute_inventory_sha` kept computing the
+    old address, and the divergence would surface as every record failing to hash
+    to its own name -- corruption's signature, from a refactor.
+    """
+    return canonical_json_bytes(dict(payload))
+
+
 def compute_inventory_sha(payload: Mapping[str, Any]) -> str:
     """This record's content address: the sha256 of its canonical JSON bytes."""
-    return hashlib.sha256(canonical_json_bytes(dict(payload))).hexdigest()
+    return hashlib.sha256(inventory_record_bytes(payload)).hexdigest()
 
 
 def _footprint_from(stored: Mapping[str, Any]) -> ClaimedFootprint:
