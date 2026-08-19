@@ -131,6 +131,12 @@ def _needs_pypdf() -> None:
 
 @pytest.fixture(scope="module")
 def record() -> dict:
+    # The gate is repeated here, and the repetition is required rather than defensive: this
+    # fixture is MODULE-scoped, and pytest sets a higher-scoped fixture up BEFORE the
+    # function-scoped autouse gate above, so without this it raises before anything can skip.
+    # CI's pypdf-free base job caught it; the local suite was green, which is the whole reason
+    # that job exists.
+    require_pypdf()
     extraction = extract_fragments(GRID)
     inventory = build_inventory(extraction, FOOTPRINT)
     assert inventory.refusals == (), f"fixture does not derive: {inventory.refusals}"
