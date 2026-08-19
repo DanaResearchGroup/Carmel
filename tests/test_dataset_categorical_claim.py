@@ -33,6 +33,9 @@ from carmel.schemas.datasets import (
     iter_source_refs,
 )
 
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
+
 
 def _frame() -> CoordinateFrame:
     return CoordinateFrame(
@@ -56,7 +59,9 @@ def _bbox_ref(node_id: str = "n1") -> SourceRef:
 def _table_ref(node_id: str = "n1", row: int = 0, col: int = 1) -> SourceRef:
     return SourceRef(
         node_id=node_id,
-        locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=row, col=col),
+        locator=TableCellLocator(
+            table_key=CaptionLabelKey(label="Table 1"), row=row, col=col, pdf_table_inventory_sha256=_NO_INVENTORY
+        ),
     )
 
 

@@ -101,6 +101,10 @@ from carmel.services.semantic_deps import (
 )
 from carmel.services.units import TABLE_V1, QuantityKind
 from tests.pypdf_gate import require_pypdf
+from tests.table_inventory_fixtures import inventory_for
+
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
 
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
@@ -255,7 +259,7 @@ def _tabular_envelope_from_artifact(
     Deliberately a TEST fixture and not a resurrected producer. It emits what
     the runtime cannot: ``TABULAR`` series whose values cite a ``TABLE_CELL``
     that no table parser exists to find. That is exactly why it may not live in
-    ``carmel/`` -- shipping it would re-open the route V7 closed, one import
+    ``carmel/`` -- shipping it would re-open the route V8 closed, one import
     away.
 
     Units and axis labels ARE still grounded as real char spans against the
@@ -311,6 +315,9 @@ def _tabular_envelope_from_artifact(
                     row=index,
                     col=1,
                     table_key=CaptionLabelKey(kind=TableKeyKind.CAPTION_LABEL, label="Table 1"),
+                    # The node's document is the stored artifact, so the citation has to
+                    # be built over its real digest -- V8 requires the two to agree.
+                    pdf_table_inventory_sha256=inventory_for(sha256).inventory_sha256,
                 ),
             ),
             unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=unit_locator),
@@ -340,6 +347,7 @@ def _tabular_envelope_from_artifact(
         composition=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         series=(series,),
         conversion_tables=(_ACTIVE.embedded,),
+        table_inventories=(inventory_for(sha256),),
     )
 
 

@@ -58,11 +58,16 @@ from carmel.schemas.datasets import (
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1
+from tests.table_inventory_fixtures import cover_for, inventory_for
 from tests.test_dataset_graph_and_envelope import (
     _embedded_second_table,
     _registered_second_table,
     _second_conversion_table,
 )
+
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
+
 
 SHA_A = "a" * 64
 SHA_B = "b" * 64
@@ -118,10 +123,17 @@ def _bbox_ref(node_id: str = "paper") -> SourceRef:
     )
 
 
-def _table_ref(node_id: str = "paper", row: int = 0, col: int = 1) -> SourceRef:
+def _table_ref(node_id: str = "paper", row: int = 0, col: int = 1, raw_sha256: str = SHA_A) -> SourceRef:
+    """``raw_sha256`` must be the TARGET NODE's own sha256 -- V8 requires the
+    cited inventory to have come from the document the locator points at."""
     return SourceRef(
         node_id=node_id,
-        locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=row, col=col),
+        locator=TableCellLocator(
+            table_key=CaptionLabelKey(label="Table 1"),
+            row=row,
+            col=col,
+            pdf_table_inventory_sha256=inventory_for(raw_sha256).inventory_sha256,
+        ),
     )
 
 
@@ -230,6 +242,13 @@ def _envelope(**kwargs: object) -> ConditionSetEnvelope:
         "unextracted": (_refusal(),),
     }
     defaults.update(kwargs)
+    # Derived from the refs the envelope ACTUALLY holds -- including any a caller
+    # passed in through **kwargs -- so a fixture cannot drift out of T4's exact
+    # cover by overriding a claim and forgetting a separate list.
+    defaults.setdefault(
+        "table_inventories",
+        cover_for(*(value for key, value in defaults.items() if key != "source_graph")),
+    )
     return ConditionSetEnvelope(**defaults)  # type: ignore[arg-type]
 
 
@@ -610,7 +629,10 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             scalar_claims=(
                 _scalar_claim(
                     label_ref=_table_ref("paper"),
-                    value=_measured_value(value_ref=_table_ref("si"), unit_ref=_table_ref("si", col=2)),
+                    value=_measured_value(
+                        value_ref=_table_ref("si", raw_sha256=SHA_B),
+                        unit_ref=_table_ref("si", col=2, raw_sha256=SHA_B),
+                    ),
                 ),
             ),
         )

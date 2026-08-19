@@ -492,6 +492,12 @@ def produce_condition_set_from_artifact(
         # refusal-only condition set is a legitimate result, and it may not
         # carry provenance for a conversion it never performed.
         conversion_tables=(_ACTIVE.embedded,) if scalar_claims else (),
+        # Empty, and structurally so: this producer emits only CHAR_SPAN locators, so
+        # nothing it builds can cite a table inventory, and T4 refuses an embedded
+        # record nothing cites as unearned provenance for the same reason as
+        # conversion_tables above. The table-cell producer does not exist yet; when it
+        # does, THIS field is what it must fill -- never a store lookup at replay time.
+        table_inventories=(),
         subject=resolved_subject,
         attribution=attribution,
         attribution_ref=_ref(text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence),
