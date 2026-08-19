@@ -83,6 +83,28 @@ _INVENTORY_ENTRY_POINTS: tuple[str, ...] = (
 )
 
 
+#: Fields that identify the CODE and ENGINE a record was written by, rather than what the
+#: derivation produced. Compared exhaustively by :func:`_identity_drift` and excluded from the
+#: byte comparison, so that a record whose grid still reproduces under changed code reports
+#: ``REPRODUCED`` with the drift named instead of an indistinguishable ``MISMATCHED``.
+#: They remain part of the content ADDRESS: a record written under different code is a
+#: different record, even when it says the same thing.
+_IDENTITY_FIELDS: frozenset[str] = frozenset({"inventory_code_sha256", "fragment_geometry_sha256", "pypdf_version"})
+
+
+class InventoryIdentityUnavailable(RuntimeError):
+    """Raised when this machine cannot compute the identity of its own derivation code.
+
+    A ``RuntimeError`` subclass rather than a new hierarchy, so a caller that does not care
+    still catches it with the handlers it already has.
+    """
+
+
+def _derivation_only(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The payload minus the identity fields: what the derivation actually produced."""
+    return {key: value for key, value in payload.items() if key not in _IDENTITY_FIELDS}
+
+
 class InventoryVerificationStatus(StrEnum):
     """The outcome of checking a stored inventory record against a document.
 
@@ -117,6 +139,14 @@ class InventoryVerificationStatus(StrEnum):
     ENGINE_UNAVAILABLE = "engine_unavailable"
     """The fragment lane could not read the document at all, so no recomputation happened.
     A property of this machine, not of the record."""
+
+    IDENTITY_UNAVAILABLE = "identity_unavailable"
+    """This machine cannot say what its own derivation code IS, so no comparison is honest.
+
+    Reachable on a real deployment: a ``.pyc``-only or zipped install has no source for
+    :func:`inspect.getsource` to read. Its own status rather than a sentinel identity,
+    because a sentinel would make two records written under two DIFFERENT unknown versions
+    compare equal -- the conflation the identity exists to prevent."""
 
 
 @dataclass(frozen=True)
@@ -160,11 +190,33 @@ def inventory_code_sha256() -> str:
     written", which the live computation answers exactly and which no one can forget to
     update. If a history of inventory derivations is ever needed, that is the moment to
     register it, not before.
+
+    Raises:
+        InventoryIdentityUnavailable: If the derivation's source cannot be read. That is a
+            real deployment (a ``.pyc``-only or zipped install, a source-stripped package),
+            and it must NOT degrade to a sentinel: two records written under two different
+            unknown versions would then compare equal, which is the silent conflation this
+            identity exists to prevent. It raises, and the verifier reports it as its own
+            status rather than as a difference in the grid.
     """
-    return compute_dependency_sha(inspect.getsource(pdf_tables), _INVENTORY_ENTRY_POINTS)
+    try:
+        source = inspect.getsource(pdf_tables)
+    except (OSError, TypeError) as exc:
+        raise InventoryIdentityUnavailable(
+            f"cannot read the source of {pdf_tables.__name__} to identify the derivation: {exc}"
+        ) from exc
+    return compute_dependency_sha(source, _INVENTORY_ENTRY_POINTS)
 
 
 def _pt(value: float) -> str:
+    """Serialize one coordinate exactly.
+
+    Non-finite values are refused rather than serialized. ``float("nan").hex()`` is the
+    perfectly valid string ``'nan'``, so without this a ``CellInventory`` built directly with
+    a ``nan`` coordinate would round-trip into the store looking like a measurement.
+    """
+    if value != value or value in (float("inf"), float("-inf")):
+        raise ValueError(f"refusing to record a non-finite coordinate: {value!r}")
     return value.hex()
 
 
@@ -202,7 +254,16 @@ def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> di
     ``pypdf_version`` is identity rather than diagnostics because the geometry IS the
     evidence: an engine that changed baseline semantics or CTM composition could keep every
     attribute name intact while returning different numbers.
+
+    Raises:
+        ValueError: If ``raw_sha256`` is not a well-formed sha256 digest. It is the record's
+            only link to the document and nothing downstream re-derives it, so a typo or a
+            truncated digest would mint a record that can never match any bytes -- and would
+            report ``SOURCE_MISMATCH`` forever, blaming the caller's file for the record's
+            own defect.
     """
+    if len(raw_sha256) != 64 or any(c not in "0123456789abcdef" for c in raw_sha256):
+        raise ValueError(f"raw_sha256 must be 64 lowercase hex characters, got {raw_sha256!r}")
     footprint = inventory.footprint
     return {
         "column_bounds": [[_pt(left), _pt(right)] for left, right in inventory.column_bounds],
@@ -314,7 +375,10 @@ def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> Inventor
         )
 
     extraction = extract_fragments(data)
-    moved = _identity_drift(payload, extraction.pypdf_version)
+    try:
+        moved = _identity_drift(payload, extraction.pypdf_version)
+    except InventoryIdentityUnavailable as exc:
+        return InventoryVerification(InventoryVerificationStatus.IDENTITY_UNAVAILABLE, detail=str(exc))
     if not extraction.available:
         return InventoryVerification(
             InventoryVerificationStatus.ENGINE_UNAVAILABLE,
@@ -322,13 +386,28 @@ def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> Inventor
             detail=f"fragment lane reported {extraction.status.value}",
         )
 
-    recomputed = inventory_record_payload(build_inventory(extraction, footprint), raw_sha256=actual_sha)
-    if canonical_json_bytes(recomputed) == canonical_json_bytes(dict(payload)):
+    try:
+        recomputed = inventory_record_payload(build_inventory(extraction, footprint), raw_sha256=actual_sha)
+        stored_bytes = canonical_json_bytes(_derivation_only(payload))
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        return InventoryVerification(
+            InventoryVerificationStatus.PAYLOAD_UNREADABLE,
+            identity_moved=moved,
+            detail=f"payload is not comparable: {exc}",
+        )
+
+    # The IDENTITY fields are excluded from this comparison, and the exclusion is the point
+    # rather than a loophole: `_identity_drift` compares them exhaustively and its result is
+    # reported on every outcome. Leaving them in made REPRODUCED-with-a-moved-identity
+    # UNREACHABLE -- any drift changed the bytes, so the answer was always MISMATCHED, and
+    # this module's docstring promised a result its code could not produce. Caught by review,
+    # not by a test: the test had codified the contradiction instead of exposing it.
+    if canonical_json_bytes(_derivation_only(recomputed)) == stored_bytes:
         return InventoryVerification(InventoryVerificationStatus.REPRODUCED, identity_moved=moved)
     return InventoryVerification(
         InventoryVerificationStatus.MISMATCHED,
         identity_moved=moved,
-        detail=_first_difference(payload, recomputed),
+        detail=_first_difference(_derivation_only(payload), _derivation_only(recomputed)),
     )
 
 

@@ -13,11 +13,15 @@ stubbed extraction would test the comparison and skip the part that can actually
 from __future__ import annotations
 
 import hashlib
+import inspect
 import zlib
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import replace
 
 import pytest
 
+from carmel.services import pdf_tables
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.pdf_fragments import extract_fragments
 from carmel.services.pdf_table_record import (
@@ -87,6 +91,29 @@ FOOTPRINT = ClaimedFootprint(
     caption_x_start=53.0,
     caption_baseline_y=700.0,
 )
+
+
+@contextmanager
+def monkeypatched_unreadable_source() -> Iterator[None]:
+    """Make :func:`inspect.getsource` fail the way a ``.pyc``-only install makes it fail.
+
+    A real deployment shape, not a contrived one: source-stripped and zipped installs have no
+    ``.py`` for ``inspect`` to read. The status must be its own, because degrading to a
+    sentinel identity would let two records written under two DIFFERENT unknown versions
+    compare equal.
+    """
+    original = inspect.getsource
+
+    def refusing(obj: object) -> str:
+        if obj is pdf_tables:
+            raise OSError("could not get source code")
+        return original(obj)  # type: ignore[arg-type]
+
+    inspect.getsource = refusing  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        inspect.getsource = original  # type: ignore[assignment]
 
 
 @pytest.fixture(autouse=True)
@@ -207,6 +234,8 @@ class TestEachWayOfNotReachingAVerdictStaysDistinct:
                 ({**record, "raw_sha256": hashlib.sha256(garbage).hexdigest()}, garbage),
             )
         }
+        with monkeypatched_unreadable_source():
+            produced.add(verify_inventory_record(record, GRID).status)
 
         assert produced == set(InventoryVerificationStatus), (
             f"unreachable: {set(InventoryVerificationStatus) - produced}"
@@ -226,9 +255,37 @@ class TestIdentityIsReportedWithoutBlockingTheRecomputation:
         result = verify_inventory_record(stale, GRID)
 
         assert result.identity_moved == ("inventory_code",)
-        # The GRID still derives identically, so the only difference is the field itself.
+        assert result.status is InventoryVerificationStatus.REPRODUCED
+        assert result.reproduced
+
+    def test_reproduced_under_drift_is_not_the_same_answer_as_reproduced(self, record: dict) -> None:
+        """A caller that needs "same grid AND same code" must be able to tell them apart.
+
+        This is the pairing that was UNREACHABLE before review: with the identity fields left
+        inside the byte comparison, any drift forced MISMATCHED, so the module's own promise
+        that REPRODUCED-with-drift is a stronger result than refusing to look could never be
+        kept. The earlier version of this test asserted the contradiction instead of catching
+        it.
+        """
+        clean = verify_inventory_record(record, GRID)
+        drifted = verify_inventory_record({**record, "inventory_code_sha256": "0" * 64}, GRID)
+
+        assert clean.reproduced and drifted.reproduced
+        assert clean.identity_moved == ()
+        assert drifted.identity_moved == ("inventory_code",)
+
+    def test_a_moved_identity_does_not_hide_a_moved_grid(self, record: dict) -> None:
+        """Excluding identity from the comparison must not exclude anything else."""
+        both = {
+            **record,
+            "inventory_code_sha256": "0" * 64,
+            "rows": [{**record["rows"][0], "ordinal": 7}, *record["rows"][1:]],
+        }
+
+        result = verify_inventory_record(both, GRID)
+
         assert result.status is InventoryVerificationStatus.MISMATCHED
-        assert "inventory_code_sha256" in result.detail
+        assert result.identity_moved == ("inventory_code",)
 
     def test_the_code_identity_tracks_the_derivation_and_its_measured_constants(self) -> None:
         """It is computed from source, so it cannot be forgotten the way a version int can."""
@@ -258,6 +315,31 @@ class TestTheStoredFormIsCanonicalAndExact:
         moved = {**record, "footprint": {**record["footprint"], "x_end": (291.0).hex()}}
 
         assert compute_inventory_sha(moved) != compute_inventory_sha(record)
+
+    def test_a_malformed_raw_sha_is_refused_at_write_time(self) -> None:
+        """It is the record's only link to the document and nothing re-derives it.
+
+        A truncated or mistyped digest would mint a record that can never match any bytes,
+        and every later check would report SOURCE_MISMATCH -- blaming the caller's file for
+        the record's own defect.
+        """
+        inventory = build_inventory(extract_fragments(GRID), FOOTPRINT)
+
+        for bad in ("", "abc", "A" * 64, "g" * 64, hashlib.sha256(GRID).hexdigest().upper()):
+            with pytest.raises(ValueError, match="raw_sha256"):
+                inventory_record_payload(inventory, raw_sha256=bad)
+
+    def test_a_non_finite_coordinate_is_refused_rather_than_stored(self) -> None:
+        """``float("nan").hex()`` is the valid string ``'nan'``.
+
+        Without an explicit guard a nan coordinate round-trips into the store looking like a
+        measurement, since the canonical layer only rejects float OBJECTS, not float-shaped
+        strings this module produces.
+        """
+        inventory = build_inventory(extract_fragments(GRID), replace(FOOTPRINT, x_end=float("inf")))
+
+        with pytest.raises(ValueError, match="non-finite"):
+            inventory_record_payload(inventory, raw_sha256=hashlib.sha256(GRID).hexdigest())
 
     def test_cell_members_are_pinned_beyond_their_rendered_text(self, record: dict) -> None:
         """Text and an x-extent alone would not pin composition.
