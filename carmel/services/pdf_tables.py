@@ -204,6 +204,23 @@ class InventoryRefusalReason(StrEnum):
     A single-row overflow is indistinguishable from prose under this rule and does NOT
     refuse. That is a known residual hole, not a closed one."""
 
+    AMBIGUOUS_ROW_BESIDE_THE_BOX = "ambiguous_row_beside_the_box"
+    """A fragment the box excluded is on the baseline of TWO derived rows at once.
+
+    The sibling of :attr:`AMBIGUOUS_AFFIX_BAND`, at the other edge and for the same reason:
+    the reason above decides whether an excluded fragment belongs to row *n*, and when two
+    rows both claim it, picking one is a row-membership assertion with no evidence behind
+    it. That matters because the truncated-column test counts DISTINCT ordinals -- awarding
+    an ambiguous fragment to the row that already owns its neighbour collapses a two-row
+    cluster to one and the refusal above silently does not fire.
+
+    Rows are separated by more than :data:`_BAND_TOLERANCE_PT`, so this needs two rows
+    between one and two tolerances apart with the fragment between them. Measured over the
+    eight-paper corpus, 422 of 6886 adjacent band pairs (6.1%) sit inside that window, the
+    closest 0.5027 pt apart, and 371 excluded fragments landed on two rows at once
+    (probes/m1_band_ambiguity.py). It is ordinary two-column journal typesetting, not an
+    exotic shape."""
+
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
     """A row's own occupied blocks outnumber the columns derived across all rows.
 
@@ -651,6 +668,7 @@ def _truncated_column_refusal(
     extraction: FragmentExtraction,
     footprint: ClaimedFootprint,
     rows: list[InventoryRow],
+    rows_raw: list[tuple[float, list[TextFragment], list[float]]],
 ) -> InventoryRefusal | None:
     """Refuse when fragments the box's sides excluded align into a column across rows.
 
@@ -659,21 +677,56 @@ def _truncated_column_refusal(
     to the same excluded column. A cluster drawing from more than one derived row is a
     column the box cut off; a cluster from one row cannot be told from that row's own
     overflow, or from the page's other prose column, and does not refuse.
+
+    **Which row an excluded fragment belongs to is decided against the row's whole baseline
+    extent, and ambiguity refuses.** Both halves of that replaced a fail-open, and both are
+    about the same thing -- this guard counts DISTINCT ordinals, so anything that quietly
+    loses an ordinal turns a two-row cluster into a one-row cluster and suppresses the
+    refusal:
+
+    - The match used to be against ``row.baseline_y`` alone, but that is
+      ``max(member baselines)``, and single linkage only bounds the gap between CONSECUTIVE
+      members -- a row can span more than :data:`_BAND_TOLERANCE_PT` in total. An excluded
+      fragment on the LOW end of such a row is further than the tolerance from the row's
+      representative and matched NOTHING, vanishing from the guard. Measured on the corpus:
+      14 of 6959 bands span more than the tolerance, the widest 1.1178 pt, and 1164 excluded
+      fragments sat on a row's real membership while matching no representative
+      (probes/m1_band_span.py). Comparing against ``[min, max]`` widened by the tolerance
+      asks the question the guard actually means -- is this fragment on that printed line.
+    - The first match then won, by ``dict`` insertion order, which is descending baseline --
+      so an ambiguous fragment silently went to the row ABOVE. See
+      :attr:`InventoryRefusalReason.AMBIGUOUS_ROW_BESIDE_THE_BOX` for the measurement.
+
+    ``rows_raw`` is passed rather than read off :class:`InventoryRow` because the extent is
+    a property of the members, and putting it on the row would enlarge the stored record for
+    a fact every replay recomputes anyway: :func:`verify_inventory_record` re-derives through
+    :func:`build_inventory`, so the payload never needs to carry it.
     """
-    bands: dict[float, int] = {}
+    extents: list[tuple[int, float, float]] = []
     for row in rows:
-        for baseline in (row.baseline_y, *row.merged_baselines):
-            bands[baseline] = row.ordinal
+        # `ordinal` IS the index into `rows_raw` -- `build_inventory` enumerates it there --
+        # and a raw band that yielded no cell is simply absent from `rows`, never renumbered.
+        baselines = [member.baseline_y for member in rows_raw[row.ordinal][1]]
+        extents.append((row.ordinal, min(baselines), max(baselines)))
+
     excluded: list[tuple[float, int]] = []
     for f in extraction.fragments:
         if f.page != footprint.page or not f.text.strip() or f.rotated:
             continue
         if not (f.x_end <= footprint.x_start or f.x_start >= footprint.x_end):
             continue
-        for baseline, ordinal in bands.items():
-            if math.isclose(f.baseline_y, baseline, abs_tol=_BAND_TOLERANCE_PT):
-                excluded.append((f.x_start, ordinal))
-                break
+        matched = [
+            ordinal
+            for ordinal, low, high in extents
+            if low - _BAND_TOLERANCE_PT <= f.baseline_y <= high + _BAND_TOLERANCE_PT
+        ]
+        if len(matched) > 1:
+            return InventoryRefusal(
+                InventoryRefusalReason.AMBIGUOUS_ROW_BESIDE_THE_BOX,
+                f"a fragment beside the box at y={f.baseline_y} is on the baseline of rows {matched}",
+            )
+        if matched:
+            excluded.append((f.x_start, matched[0]))
 
     cluster: list[tuple[float, int]] = []
     for x_start, ordinal in sorted(excluded):
@@ -854,7 +907,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     # close the same hole the top edge's orphan check closes, on the sides the box was
     # otherwise free to shrink -- measured: shrinking `x_end` deleted a whole fuel mixture
     # and raising `y_bottom` deleted the phi row, each returning a COMPLETE inventory.
-    truncated = _truncated_column_refusal(extraction, footprint, rows)
+    truncated = _truncated_column_refusal(extraction, footprint, rows, rows_raw)
     if truncated is not None:
         return refused(truncated)
     cut_below = _orphan_below_refusal(extraction, footprint, bounds, _row_pitch(rows, inside, footprint))

@@ -138,6 +138,10 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
         (extraction_of(*wide_row), footprint()),
         (extraction_of(*simple_grid(), *cut_off_row()), footprint()),
         (extraction_of(*simple_grid(), *dropped_column()), footprint(x_end=200.0)),
+        (
+            extraction_of(*two_rows_within_two_tolerances(), frag("?", 320.0, 330.0, 119.65)),
+            footprint(),
+        ),
     ]
 
 
@@ -165,6 +169,42 @@ def dropped_column() -> tuple[TextFragment, ...]:
     return (
         frag("gamma", 320.0, 350.0, 134.5),
         frag("0.4", 320.0, 344.0, 71.5),
+    )
+
+
+def two_rows_within_two_tolerances() -> tuple[TextFragment, ...]:
+    """Two rows 0.7 pt apart -- further apart than the band tolerance, closer than twice it.
+
+    That window is what makes a fragment beside the box ambiguous: the rows are separate
+    bands, and one baseline between them is within tolerance of BOTH. 422 of the corpus's
+    6886 adjacent band pairs sit in it (probes/m1-band-ambiguity.md), so it is ordinary
+    typesetting rather than a contrived gap.
+    """
+    return (
+        CAPTION,
+        frag("Aaa", 53.0, 70.0, 120.0),
+        frag("111", 122.0, 146.0, 120.0),
+        frag("Bbb", 53.0, 70.0, 119.3),
+        frag("222", 122.0, 146.0, 119.3),
+    )
+
+
+def a_row_wider_than_the_tolerance() -> tuple[TextFragment, ...]:
+    """A row whose members CHAIN across 0.8 pt, so ``max()`` does not represent its low end.
+
+    Single linkage bounds the gap between CONSECUTIVE members, not the cluster's total
+    span, so 120.0 -> 120.4 -> 120.8 is one row whose representative sits 0.8 pt above its
+    lowest member. 14 of the corpus's 6959 bands are this shape, the widest spanning
+    1.1178 pt (probes/m1_band_span.py).
+    """
+    return (
+        CAPTION,
+        frag("Aaa", 53.0, 70.0, 120.0),
+        frag("bbb", 122.0, 146.0, 120.4),
+        frag("ccc", 227.0, 250.0, 120.8),
+        frag("Ddd", 53.0, 70.0, 100.0),
+        frag("eee", 122.0, 146.0, 100.0),
+        frag("fff", 227.0, 250.0, 100.0),
     )
 
 
@@ -708,6 +748,63 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
 
         assert inventory.refusals == ()
         assert len(inventory.column_bounds) == 3
+
+    def test_a_fragment_beside_the_box_on_two_row_baselines_refuses(self) -> None:
+        """Ambiguity is refused, not resolved by whichever row was built first.
+
+        The guard counts DISTINCT ordinals, so awarding an ambiguous fragment to one of
+        its two candidate rows is not a tie-break -- it is the difference between a
+        two-row cluster (refuse) and a one-row cluster (accept). Nearest-wins would only
+        make that guess deterministic; the module already refuses the same shape one edge
+        over, at ``AMBIGUOUS_AFFIX_BAND``.
+        """
+        beside = frag("?", 320.0, 330.0, 119.65)
+        inventory = build_inventory(extraction_of(*two_rows_within_two_tolerances(), beside), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.AMBIGUOUS_ROW_BESIDE_THE_BOX]
+
+    def test_a_fragment_beside_the_box_on_one_row_only_still_does_not_refuse(self) -> None:
+        """The ambiguity guard must not swallow the ordinary case it sits in front of.
+
+        Same two close rows, but the excluded fragment is squarely on one of them, so
+        there is nothing to be ambiguous about and a single-row cluster still reads as
+        prose rather than as a dropped column.
+        """
+        beside = frag("?", 320.0, 330.0, 120.0)
+        inventory = build_inventory(extraction_of(*two_rows_within_two_tolerances(), beside), footprint())
+
+        assert inventory.refusals == ()
+
+    def test_a_column_beside_a_row_wider_than_the_tolerance_still_refuses(self) -> None:
+        """A row is matched by its whole baseline extent, not by its ``max()`` alone.
+
+        The excluded fragment sits on the LOW end of a row that chains across 0.8 pt, so
+        it is 0.75 pt from that row's representative -- outside the tolerance. Matching
+        against the representative dropped it, the cluster fell to one ordinal, and the
+        dropped column beside the box went unrefused. 1164 corpus fragments are in that
+        position across the sampled cuts (probes/m1_band_span.py).
+        """
+        dropped = (
+            frag("gamma", 320.0, 350.0, 120.05),
+            frag("0.4", 320.0, 344.0, 100.0),
+        )
+        inventory = build_inventory(extraction_of(*a_row_wider_than_the_tolerance(), *dropped), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.TRUNCATED_COLUMN_BESIDE_THE_BOX]
+
+    def test_a_wide_row_is_still_one_row(self) -> None:
+        """The premise of the test above: the chain really is a single derived row.
+
+        If single linkage had split it, the fragment would match the lower half and the
+        refusal would fire for a reason that has nothing to do with the extent.
+        """
+        inventory = build_inventory(extraction_of(*a_row_wider_than_the_tolerance()), footprint())
+
+        assert inventory.refusals == ()
+        assert [r.ordinal for r in inventory.rows] == [0, 1]
+        assert inventory.rows[0].baseline_y == 120.8
 
     def test_a_moved_caption_start_refuses_even_when_the_text_matches(self) -> None:
         """``caption_x_start`` is checked against the document, not against the box.
