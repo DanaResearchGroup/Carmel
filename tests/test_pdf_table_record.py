@@ -328,6 +328,18 @@ class TestTheDeclaredShapeIsTheShapeActuallyWritten:
         """
         assert footprint_unreadable_reason(record) is None
 
+    def test_a_real_record_names_each_coordinate_once(self, record: dict) -> None:
+        """The third pin, for the rule the schema now enforces on embedded records.
+
+        ``EmbeddedTableInventory`` refuses a repeated ``(row, col)`` because a
+        membership bit cannot express "present, but the record disagrees with
+        itself about what is here". That rule is only safe if the builder never
+        emits one -- otherwise the schema would refuse honest records, and neither
+        side would notice, because each would still agree with itself.
+        """
+        coordinates = [(cell["row"], cell["col"]) for cell in record["cells"]]
+        assert len(set(coordinates)) == len(coordinates)
+
 
 class TestTheStoredFormIsCanonicalAndExact:
     def test_geometry_round_trips_bit_for_bit(self, record: dict) -> None:

@@ -4147,11 +4147,32 @@ class EmbeddedTableInventory(BaseModel):
                         f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): "
                         f"cells[{position}][{axis!r}] is {ordinal!r}, which is not an integer ordinal"
                     )
-            index.add((cell["row"], cell["col"]))
-        # Built HERE, in the loop that just proved every ordinal is an integer, so the
-        # index and the validation cannot be looking at different bytes. `has_cell` then
-        # answers from it instead of re-parsing: a validator's work done once, rather than
-        # once per lookup.
+            position_key = (cell["row"], cell["col"])
+            if position_key in index:
+                # A coordinate that appears twice is not a grid. The two entries can carry
+                # DIFFERENT text -- reproduced: a record saying (0, 0) is both `Fuel` and
+                # `9999` was accepted, and `has_cell` answered `True`, because a set
+                # membership bit cannot express "present, but the record does not agree
+                # with itself about what is here". A citation resolving to that coordinate
+                # would then be checkable and meaningless at once, which is precisely the
+                # pair this schema exists to keep apart. Every other collection here
+                # already refuses duplicates (`Series.points`, `Series.axes`,
+                # `Composition.components`); `cells` was the one that did not.
+                #
+                # ALL duplicates are refused, not just disagreeing ones: `build_inventory`
+                # emits one cell per (row, col) by construction, so a repeat is never
+                # something a real derivation produced, and "agrees with itself" is a
+                # weaker property to have to define than "appears once".
+                raise ValueError(
+                    f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): cells[{position}] "
+                    f"repeats the coordinate (row={cell['row']}, col={cell['col']}), so the record does not "
+                    "define one value at that position"
+                )
+            index.add(position_key)
+        # Built HERE, in the loop that just proved every ordinal is an integer and unique,
+        # so the index and the validation cannot be looking at different bytes. `has_cell`
+        # then answers from it instead of re-parsing: a validator's work done once, rather
+        # than once per lookup.
         self._cell_index = frozenset(index)
         return self
 

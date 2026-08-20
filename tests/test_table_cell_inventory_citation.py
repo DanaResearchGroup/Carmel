@@ -584,6 +584,58 @@ class TestTheCellIndexIsDerivedAndSurvivesAReload:
             assert inventory.has_cell(row=row, col=col)
 
 
+class TestOneCoordinateHoldsOneCell:
+    """A repeated ``(row, col)`` is not a grid, and a membership bit cannot say so.
+
+    ``has_cell`` answers from a ``frozenset``, so a record claiming a coordinate
+    twice with DIFFERENT text collapses to the same ``True`` a well-formed record
+    gives. The citation then resolves and means nothing -- checkable and
+    meaningless at once, which is the pair this schema exists to keep apart.
+    """
+
+    def test_a_repeated_coordinate_is_refused(self) -> None:
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0), (0, 1)))
+        clone = dict(payload["cells"][0])
+        clone["text"] = "9999"
+        payload["cells"].append(clone)
+
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "repeats the coordinate (row=0, col=0)" in str(excinfo.value)
+
+    def test_an_exactly_repeated_coordinate_is_refused_too(self) -> None:
+        """Not only the disagreeing case.
+
+        ``build_inventory`` emits one cell per coordinate by construction, so a
+        repeat is never something a real derivation produced -- and "appears
+        once" is a cheaper property to hold than "agrees with itself".
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0), (0, 1)))
+        payload["cells"].append(dict(payload["cells"][0]))
+
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "repeats the coordinate (row=0, col=0)" in str(excinfo.value)
+
+    def test_the_duplicate_grid_would_otherwise_have_answered_a_citation(self) -> None:
+        """The defect this closes, demonstrated rather than asserted.
+
+        Without the guard the two entries are indistinguishable to every reader
+        the record has: the index holds one member, ``has_cell`` says yes, and
+        nothing anywhere states which of the two texts sits at (0, 0).
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0), (0, 1)))
+        clone = dict(payload["cells"][0])
+        clone["text"] = "9999"
+        payload["cells"].append(clone)
+
+        coordinates = [(cell["row"], cell["col"]) for cell in payload["cells"]]
+        texts = {cell["text"] for cell in payload["cells"] if (cell["row"], cell["col"]) == (0, 0)}
+        assert coordinates.count((0, 0)) == 2
+        assert texts == {"r0c0", "9999"}
+        assert len(set(coordinates)) < len(coordinates)
+
+
 class TestACellOrdinalMustBeAnOrdinal:
     @pytest.mark.parametrize(
         ("row", "col"),
