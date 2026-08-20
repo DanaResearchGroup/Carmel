@@ -93,7 +93,12 @@ from carmel.services.numeric import (
     Unresolvable,
     normalize_numeric_span,
 )
-from carmel.services.pdf_table_record import INVENTORY_PAYLOAD_KEYS, INVENTORY_PAYLOAD_VERSION, refusal_reasons_of
+from carmel.services.pdf_table_record import (
+    INVENTORY_PAYLOAD_KEYS,
+    INVENTORY_PAYLOAD_VERSION,
+    footprint_unreadable_reason,
+    refusal_reasons_of,
+)
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     GLYPH_HEALTH_DEPENDENCY_ID,
@@ -4039,6 +4044,23 @@ class EmbeddedTableInventory(BaseModel):
                 f"the shape of a version-{INVENTORY_PAYLOAD_VERSION} inventory (unexpected keys "
                 f"{unexpected!r}, missing keys {missing!r}), so it could never be replayed against the "
                 "document it names"
+            )
+        unreadable = footprint_unreadable_reason(parsed)
+        if unreadable is not None:
+            # The key-set check above proves the 'footprint' key is PRESENT. Presence was
+            # only ever a proxy for the property that matters: that the verifier can read
+            # the box back out and re-derive against it. `footprint={}`, a footprint that
+            # is a list, a page that is a string, a coordinate that is not float.fromhex
+            # readable -- each satisfies the key set and each makes the record permanently
+            # unfalsifiable, since verify_inventory_record can only answer
+            # PAYLOAD_UNREADABLE. That is a THIRD outcome, not a failure to reproduce, and
+            # a citation nothing can ever confirm or deny is exactly what this schema
+            # exists to make impossible. Asked of the record module, which performs the
+            # same read, so the schema never carries its own idea of what a footprint is.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's "
+                f"footprint cannot be read back, so replay could only ever answer "
+                f"PAYLOAD_UNREADABLE and the citation could never be checked: {unreadable}"
             )
         declared_raw = parsed.get("raw_sha256")
         if declared_raw != self.raw_sha256:

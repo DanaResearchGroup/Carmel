@@ -13,8 +13,8 @@ The guards under test, and the failure each closes:
 * **T1** (on :class:`EmbeddedTableInventory`) -- bytes that are not canonical,
   that do not hash to the address they claim, that name a different document,
   that carry a refusal, that never say whether they refused, that are not the
-  SHAPE of a record of their declared version, or whose cell ordinals are not
-  integers.
+  SHAPE of a record of their declared version, whose footprint cannot be read
+  back, or whose cell ordinals are not integers.
 * **T4/T5** -- an embedded record nothing cites, a duplicate, a bad order.
 
 Fixtures are SYNTHETIC throughout: no paper text enters this repo, and these
@@ -49,7 +49,12 @@ from carmel.schemas.datasets import (
     UnextractedReason,
 )
 from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.pdf_table_record import INVENTORY_PAYLOAD_KEYS
+from carmel.services.pdf_table_record import (
+    INVENTORY_PAYLOAD_KEYS,
+    InventoryVerificationStatus,
+    footprint_unreadable_reason,
+    verify_inventory_record,
+)
 from carmel.services.units import QuantityKind
 from tests.table_inventory_fixtures import embed, inventory_payload, make_embedded_inventory
 
@@ -498,6 +503,50 @@ class TestARecordThatCouldNeverBeReplayedIsRefused:
         """
         payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
         assert set(payload) == set(INVENTORY_PAYLOAD_KEYS)
+
+
+class TestAFootprintThatCannotBeReadBackIsRefused:
+    """The key set proves ``footprint`` is PRESENT; presence was only ever a proxy.
+
+    Each payload here satisfies the key set in full and still leaves
+    ``verify_inventory_record`` with nothing to say but PAYLOAD_UNREADABLE -- which
+    is a THIRD outcome, distinct from a derivation that failed to reproduce. A
+    citation whose record can only ever return it is unfalsifiable by construction.
+    """
+
+    @pytest.mark.parametrize(
+        ("mutate", "why"),
+        [
+            (lambda fp: {}, "an empty mapping keeps the key and drops every field"),
+            (lambda fp: [], "a footprint that is not a mapping at all"),
+            (lambda fp: {**fp, "x_start": "not-a-float"}, "a coordinate float.fromhex cannot read"),
+            (lambda fp: {**fp, "page": "zero"}, "a page ordinal that is a word"),
+            (lambda fp: {k: v for k, v in fp.items() if k != "caption_baseline_y"}, "one field missing"),
+        ],
+        ids=["empty-mapping", "not-a-mapping", "unreadable-coordinate", "page-is-a-string", "field-missing"],
+    )
+    def test_an_unreadable_footprint_is_refused(self, mutate: object, why: str) -> None:
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["footprint"] = mutate(payload["footprint"])  # type: ignore[operator]
+        assert set(payload) == set(INVENTORY_PAYLOAD_KEYS), f"{why}: the key set must still pass"
+        with pytest.raises(ValidationError) as excinfo:
+            embed(payload, raw_sha256=PAPER_SHA)
+        assert "could never be checked" in str(excinfo.value)
+
+    def test_the_refusal_is_the_verdict_replay_would_have_reached(self) -> None:
+        """Not a rule of the schema's own invention: the same payload, handed to
+        the verifier, really does come back PAYLOAD_UNREADABLE. Without this the
+        two could drift into disagreeing about which records are checkable.
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        payload["footprint"] = {}
+        verification = verify_inventory_record(payload, b"%PDF-1.4 whatever bytes")
+        assert verification.status is InventoryVerificationStatus.PAYLOAD_UNREADABLE
+
+    def test_the_fixtures_own_footprint_reads(self) -> None:
+        """The negative tests above prove nothing if the baseline never read."""
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0),))
+        assert footprint_unreadable_reason(payload) is None
 
 
 class TestACellOrdinalMustBeAnOrdinal:

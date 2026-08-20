@@ -56,6 +56,7 @@ __all__ = [
     "InventoryVerification",
     "InventoryVerificationStatus",
     "compute_inventory_sha",
+    "footprint_unreadable_reason",
     "inventory_code_sha256",
     "inventory_record_bytes",
     "inventory_record_payload",
@@ -359,6 +360,13 @@ def compute_inventory_sha(payload: Mapping[str, Any]) -> str:
     return hashlib.sha256(inventory_record_bytes(payload)).hexdigest()
 
 
+#: How reading a stored footprint can fail. Named once because two callers depend on the
+#: SAME answer -- the verifier, which reports PAYLOAD_UNREADABLE, and
+#: :func:`footprint_unreadable_reason`, which lets a schema refuse the record before it is
+#: ever cited. A tuple written out twice is two tuples that agree until one is edited.
+_FOOTPRINT_UNREADABLE = (KeyError, TypeError, ValueError)
+
+
 def _footprint_from(stored: Mapping[str, Any]) -> ClaimedFootprint:
     return ClaimedFootprint(
         page=int(stored["page"]),
@@ -370,6 +378,28 @@ def _footprint_from(stored: Mapping[str, Any]) -> ClaimedFootprint:
         caption_x_start=float.fromhex(stored["caption_x_start"]),
         caption_baseline_y=float.fromhex(stored["caption_baseline_y"]),
     )
+
+
+def footprint_unreadable_reason(payload: Mapping[str, Any]) -> str | None:
+    """Why replay could not read this record's footprint, or ``None`` if it can.
+
+    Performs the SAME read :func:`verify_inventory_record` performs -- it calls
+    ``_footprint_from``, not a second description of what a footprint must contain --
+    so a caller can find out before storing or citing a record whether replay will
+    be able to say anything about it at all.
+
+    The distinction this exists to protect: a record whose footprint cannot be read
+    is not one that FAILS to reproduce, it is one that can never be put to the
+    question. ``verify_inventory_record`` reports that as ``PAYLOAD_UNREADABLE``,
+    which is honest but arrives far too late if the record has meanwhile been
+    embedded in an envelope as a citation. Presence of the ``footprint`` key is not
+    the property anyone wants; readability is, and only this can check it.
+    """
+    try:
+        _footprint_from(payload["footprint"])
+    except _FOOTPRINT_UNREADABLE as exc:
+        return repr(exc)
+    return None
 
 
 def _identity_drift(payload: Mapping[str, Any], pypdf_version: str) -> tuple[str, ...]:
@@ -406,7 +436,7 @@ def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> Inventor
         stored_footprint = payload["footprint"]
         version = payload["payload_version"]
         footprint = _footprint_from(stored_footprint)
-    except (KeyError, TypeError, ValueError) as exc:
+    except _FOOTPRINT_UNREADABLE as exc:
         return InventoryVerification(InventoryVerificationStatus.PAYLOAD_UNREADABLE, detail=f"malformed payload: {exc}")
     if version != INVENTORY_PAYLOAD_VERSION:
         return InventoryVerification(

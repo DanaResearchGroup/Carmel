@@ -29,6 +29,7 @@ from carmel.services.pdf_table_record import (
     INVENTORY_PAYLOAD_VERSION,
     InventoryVerificationStatus,
     compute_inventory_sha,
+    footprint_unreadable_reason,
     inventory_code_sha256,
     inventory_record_payload,
     refusal_reasons_of,
@@ -315,6 +316,17 @@ class TestTheDeclaredShapeIsTheShapeActuallyWritten:
 
     def test_a_real_record_has_exactly_the_declared_keys(self, record: dict) -> None:
         assert set(record) == set(INVENTORY_PAYLOAD_KEYS)
+
+    def test_a_real_records_footprint_reads_back(self, record: dict) -> None:
+        """The same pin, for the other half of "replayable".
+
+        ``footprint_unreadable_reason`` is what the schema asks before letting a
+        record be cited. If the builder ever renamed a footprint field or changed
+        how a coordinate is serialized, every honest record would start being
+        refused as unverifiable by construction -- and nothing else would catch
+        it, because the verifier and the builder would still agree with each other.
+        """
+        assert footprint_unreadable_reason(record) is None
 
 
 class TestTheStoredFormIsCanonicalAndExact:
