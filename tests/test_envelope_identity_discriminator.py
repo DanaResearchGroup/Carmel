@@ -200,6 +200,10 @@ class TestDatasetNodeOrderDoesNotAffectIdentity:
             composition=baseline.composition,
             series=baseline.series,
             conversion_tables=baseline.conversion_tables,
+            # Copied from the baseline for the same reason as conversion_tables: this
+            # test varies node ORDER and nothing else, so every other field must be
+            # the baseline's own.
+            table_inventories=baseline.table_inventories,
         )
 
         assert canonical_json_bytes(permuted.identity_payload()) == canonical_json_bytes(baseline.identity_payload()), (

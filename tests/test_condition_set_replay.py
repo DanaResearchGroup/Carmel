@@ -86,11 +86,16 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1, QuantityKind
+from tests.table_inventory_fixtures import cover_for, inventory_for
 from tests.test_dataset_replay import (
     MAX_BYTES,
     _store_genuine_extraction_record,
     _tabular_envelope_from_artifact,
 )
+
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
+
 
 # Synthetic prose. Each grounded quote below appears EXACTLY ONCE, so an
 # offset computed with ``str.index`` is unambiguous and a span that drifts
@@ -220,6 +225,12 @@ def _embedded_table_v1() -> EmbeddedConversionTable:
     )
 
 
+#: The document _verifying_graph's node actually holds -- it stores exactly
+#: ``_TEXT``'s bytes, so a table cell against that node must cite an inventory
+#: derived from this digest (V8 requires the two to agree).
+_ROOT_RAW_SHA = hashlib.sha256(_TEXT.encode("utf-8")).hexdigest()
+
+
 def _verifying_graph(tmp_path: Path) -> SourceGraph:
     """A one-node graph whose node actually re-verifies against ``tmp_path``.
 
@@ -305,6 +316,12 @@ def _minimal_condition_set(tmp_path: Path, **kwargs: object) -> ConditionSetEnve
         "unextracted": (),
     }
     defaults.update(kwargs)
+    # Exact cover derived from the refs the envelope actually holds, including any
+    # a caller passed through **kwargs -- see tests.table_inventory_fixtures.cover_for.
+    defaults.setdefault(
+        "table_inventories",
+        cover_for(*(value for key, value in defaults.items() if key != "source_graph")),
+    )
     return ConditionSetEnvelope(**defaults)  # type: ignore[arg-type]
 
 
@@ -577,7 +594,12 @@ class TestSupportThatCouldNotEvenBeLocated:
             # schema's locator/node-kind rule rather than the replayer.
             attribution_ref=SourceRef(
                 node_id="paper",
-                locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=1),
+                locator=TableCellLocator(
+                    table_key=CaptionLabelKey(label="Table 1"),
+                    row=0,
+                    col=1,
+                    pdf_table_inventory_sha256=inventory_for(_ROOT_RAW_SHA).inventory_sha256,
+                ),
             ),
         )
 
@@ -901,7 +923,12 @@ class TestNothingCheckedIsNeverQuietlyClean:
     def test_an_envelope_with_no_char_span_pairs_reports_why(self, tmp_path: Path) -> None:
         table = SourceRef(
             node_id="paper",
-            locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=1),
+            locator=TableCellLocator(
+                table_key=CaptionLabelKey(label="Table 1"),
+                row=0,
+                col=1,
+                pdf_table_inventory_sha256=inventory_for(_ROOT_RAW_SHA).inventory_sha256,
+            ),
         )
         envelope = _minimal_condition_set(
             tmp_path,

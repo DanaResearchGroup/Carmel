@@ -68,6 +68,7 @@ frozen=True was meant to close.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -76,7 +77,16 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
@@ -91,6 +101,12 @@ from carmel.services.numeric import (
     SourceContext,
     Unresolvable,
     normalize_numeric_span,
+)
+from carmel.services.pdf_table_record import (
+    INVENTORY_PAYLOAD_KEYS,
+    INVENTORY_PAYLOAD_VERSION,
+    footprint_unreadable_reason,
+    refusal_reasons_of,
 )
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
@@ -125,6 +141,7 @@ __all__ = [
     "DatasetEnvelopeParseError",
     "DeviceClassDeclaration",
     "EmbeddedConversionTable",
+    "EmbeddedTableInventory",
     "ExtractedTextVerification",
     "ExtractionBinding",
     "GlyphHealthAssessment",
@@ -1201,9 +1218,12 @@ class TableCellLocator(BaseModel):
     global-uniqueness claim across the dataset's whole source graph, and it
     is not itself an independent locator: two different nodes may each
     legitimately hold a "Table 2". A content-addressed digest of the actual
-    table REGION (as opposed to this caption/sheet-name key) is deliberately
-    deferred to M-C/M1: it is circular to require now, before any extractor
-    exists that defines what bytes constitute "the region" to hash.
+    table REGION was deliberately deferred here "to M-C/M1: it is circular to
+    require now, before any extractor exists that defines what bytes
+    constitute 'the region' to hash". That extractor now exists
+    (:mod:`carmel.services.pdf_tables` derives a grid,
+    :mod:`carmel.services.pdf_table_record` addresses it), so the deferral is
+    closed by ``pdf_table_inventory_sha256`` below.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -1214,6 +1234,49 @@ class TableCellLocator(BaseModel):
     """0-indexed row; a negative row locates no real table cell."""
     col: int = Field(ge=0)
     """0-indexed column; a negative col locates no real table cell."""
+    pdf_table_inventory_sha256: Maybe[str]
+    """The content address of the PDF cell inventory that DEFINES the grid
+    ``row``/``col`` index into -- i.e. the ``inventory_sha256`` computed by
+    :func:`carmel.services.pdf_table_record.compute_inventory_sha`.
+
+    Without it, one document holding several tables leaves nothing able to
+    say WHICH derived grid justified a cell, and a replayer would have to
+    rescan and guess a footprint. ``table_key`` cannot stand in: it is a
+    printed caption label, and its own docstring disclaims uniqueness.
+
+    NAMED ``pdf_``-specifically on purpose. A ``TableCellLocator`` may also
+    target ``JATS_XML`` and ``SI_MEMBER`` nodes (see
+    :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS`), whose cells have no PDF
+    fragment geometry at all; a general name would invite laundering an XML
+    or workbook citation through a field that only ever means "a grid derived
+    from PDF text fragments".
+
+    ``Maybe``-typed with NO default, for the same "no unreasoned absence"
+    reasoning as :class:`SourceNode`'s ``origin``/``extraction``: whether a
+    cell can cite an inventory is a structural fact about its target, and
+    every locator must state which case it is in. WHICH absences are legal is
+    NOT a property of this field -- a locator does not know its own node --
+    so it is enforced at envelope level by
+    :func:`_validate_table_cell_inventory_citation`, which permits exactly
+    one ``AbsenceReason`` and refuses ``Absent`` entirely for a PDF node.
+
+    Deliberately NOT keyed on ``SourceNode.extraction``: the fragment lane
+    (``pdf_fragments.extract_fragments(data: bytes)``) reads RAW BYTES and
+    needs no extraction record, so a PDF node whose text extraction is
+    ``Absent`` can still have an inventory. Treating a missing extraction as
+    "no inventory applies" would make exactly that node the bypass."""
+
+    @field_validator("pdf_table_inventory_sha256")
+    @classmethod
+    def _validate_inventory_sha256_shape(cls, value: Maybe[str]) -> Maybe[str]:
+        # fullmatch, never match: `$` also matches just BEFORE a trailing newline, so
+        # match would let "a" * 64 + "\n" through -- same reasoning as
+        # EmbeddedConversionTable._validate_sha256_shape.
+        if isinstance(value, str) and not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"TableCellLocator.pdf_table_inventory_sha256 {value!r} is not 64 lowercase hex characters"
+            )
+        return value
 
 
 class XPathLocator(BaseModel):
@@ -2858,7 +2921,7 @@ class Coordinate(BaseModel):
     outline: this runtime can only locate a value with a
     :class:`CharSpanLocator` into extracted running text, and
     :meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`
-    (V7) refuses a char span as the source of a series value, which a
+    (V8) refuses a char span as the source of a series value, which a
     ``Coordinate`` always is. What makes a ``Coordinate`` specifically
     dormant rather than merely unused: even though its own field shape
     (a required, never-absent :class:`MeasuredValue`) is exactly right for a
@@ -3010,7 +3073,7 @@ class Series(BaseModel):
     outline: this runtime can only locate a value with a
     :class:`CharSpanLocator` into extracted running text, and
     :meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`
-    (V7) rejects a char span as the source of a series VALUE. A ``Series``
+    (V8) rejects a char span as the source of a series VALUE. A ``Series``
     is precisely the aggregate that makes that structural claim -- it
     asserts a fixed axis schema and a set of points that instantiate it, and
     running text carries no row structure from which that pairing could be
@@ -3836,6 +3899,296 @@ class EmbeddedConversionTable(BaseModel):
         return self
 
 
+class EmbeddedTableInventory(BaseModel):
+    """One PDF cell inventory's own canonical record JSON, embedded VERBATIM
+    in an envelope so a consumer holding only the envelope's bytes can see the
+    grid a :class:`TableCellLocator` indexes into -- without the evidence
+    store, and without re-deriving anything.
+
+    Same rationale and same ``str``-not-``dict`` decision as
+    :class:`EmbeddedConversionTable` (see its docstring: ``frozen=True`` is a
+    claim about attribute REASSIGNMENT, and a ``dict`` field could be mutated
+    in place after validation with nothing here to notice).
+
+    **The store is a CACHE, never replay's source of truth.** A replayer reads
+    the record from HERE and re-derives against the document's raw bytes; if
+    it read the store instead, an envelope's meaning would depend on a
+    directory that may have been pruned, repopulated, or never written on the
+    machine doing the replay.
+
+    SCOPE OF WHAT VALIDATION HERE PROVES -- read before trusting an inventory.
+    T1 below is materially WEAKER than :class:`EmbeddedConversionTable`'s T1,
+    and the difference is not an oversight. A conversion table can be
+    RECONSTRUCTED (``ConversionTable.from_identity_payload`` re-runs every
+    ``__post_init__`` invariant), so its embedded bytes are checked against
+    the type's own rules. There is no equivalent reconstruction for an
+    inventory: nothing rebuilds a ``CellInventory`` from a payload, because
+    the only thing that could establish a grid is DERIVING it from the PDF
+    again. So T1 proves canonical self-coherence, self-addressing, and
+    REPLAY-READABILITY -- these bytes are the canonical rendering, they hash to
+    the address they claim, they name the document they claim, they carry no
+    refusal, they have exactly the top-level shape of a record of their
+    declared ``payload_version``, and their cell ordinals are integers -- and
+    NOTHING about whether the grid corresponds to any real table. A fabricated
+    payload asserting a plausible 4x3 grid over a document that has none passes
+    every check in this class.
+
+    Read that limit as strictly as it is written. In particular ``raw_sha256``
+    matching a node's ``sha256`` proves the author NAMED that document, never
+    that a PDF parser ever ran on it -- the entire payload is author-controlled.
+    An earlier version of :func:`_validate_table_cell_inventory_citation`
+    admitted SI members on exactly that mistaken inference; see its docstring.
+
+    What T1 DOES buy beyond self-consistency is that the record is not
+    unverifiable by construction: a payload with a stray key can never
+    reproduce, and one without ``footprint`` cannot be read by the verifier at
+    all, so both would be citations no future replay could confirm or deny.
+    Rejecting them is the last thing a reader holding no document can check.
+
+    What closes the remaining gap is
+    :func:`carmel.services.pdf_table_record.verify_inventory_record`, which
+    re-derives from the raw PDF bytes. Schema validation deliberately does NOT
+    call it, read ``raw.bin``, or touch the store: a schema that performs I/O
+    makes an envelope's validity depend on the filesystem it is validated on.
+    An ``EmbeddedTableInventory`` that has never been through that verifier is
+    a well-formed CITATION, not evidence that the grid is real.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inventory_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the address a
+    :attr:`TableCellLocator.pdf_table_inventory_sha256` cites, and the sha256
+    of ``canonical_json``'s bytes (T1)."""
+
+    raw_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the document these bytes were derived
+    from. Declared HERE, redundantly with the payload's own ``raw_sha256``
+    (T1 requires them equal), so the envelope-level join to
+    :attr:`SourceNode.sha256` can be made without parsing JSON in the
+    validator that performs it."""
+
+    canonical_json: str = Field(min_length=1, max_length=_MAX_EMBEDDED_CANONICAL_JSON_LENGTH)
+    """The inventory record's canonical JSON, verbatim, as a str.
+
+    Bounded by ``_MAX_EMBEDDED_CANONICAL_JSON_LENGTH`` for the same
+    resource-exhaustion reason as :attr:`EmbeddedConversionTable.canonical_json`
+    -- and it binds harder here, because an inventory record carries one entry
+    per CELL. A record too large to embed is a rejected envelope, never a
+    reason to embed a projection instead: a projection does not hash to
+    ``inventory_sha256``, so it could not be the artifact being cited."""
+
+    _cell_index: frozenset[tuple[int, int]] = PrivateAttr(default=frozenset())
+    """Every ``(row, col)`` the record's grid contains, built by T1.
+
+    Private and derived, never an input: it is not a field, so it takes no part
+    in serialization, in equality, or in the address. The default is empty
+    rather than None because the only way to hold an instance whose T1 did not
+    run is to have bypassed construction entirely -- and an empty index answers
+    every ``has_cell`` with False, which is the fail-closed direction."""
+
+    @field_validator("inventory_sha256", "raw_sha256")
+    @classmethod
+    def _validate_sha256_shape(cls, value: str, info: ValidationInfo) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"EmbeddedTableInventory.{info.field_name} {value!r} is not 64 lowercase hex characters")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_canonical_json_coheres(self) -> EmbeddedTableInventory:
+        """T1: ``canonical_json`` must be the canonical rendering of a record
+        that addresses to ``inventory_sha256``, names ``raw_sha256``, is of a
+        payload version this code can read, and carries no refusal.
+
+        Five steps, each with its own marker phrase so a test can tell which
+        one fired. See the class docstring for what these five do NOT prove.
+        """
+        try:
+            parsed = json.loads(self.canonical_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            # Same broadened except, for the same reason, as
+            # EmbeddedConversionTable's: canonical_json is untrusted input from a stored
+            # file, and a short-but-deeply-nested payload blows the interpreter's own
+            # stack from inside json.loads before this validator can react.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json does "
+                f"not parse as JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json is not "
+                f"a JSON object, it decodes to {type(parsed).__name__}"
+            )
+        recanonicalized = canonical_json_bytes(parsed)
+        if recanonicalized != self.canonical_json.encode("utf-8"):
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json is not "
+                "the canonical rendering of what it decodes to -- re-serializing through "
+                "canonical_json_bytes produced different bytes"
+            )
+        # The address is over the canonical bytes, exactly as compute_inventory_sha
+        # defines it (sha256 of inventory_record_bytes). Recomputed from the
+        # RE-canonicalized bytes, which the check above has already pinned equal to the
+        # stored ones -- so this cannot be satisfied by honestly hashing arbitrary bytes
+        # against themselves in some other rendering.
+        actual = hashlib.sha256(recanonicalized).hexdigest()
+        if actual != self.inventory_sha256:
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json's bytes "
+                f"hash to {actual!r}, so this record does not live at the address it claims"
+            )
+        version = parsed.get("payload_version")
+        if version != INVENTORY_PAYLOAD_VERSION:
+            # A reader that does not know a shape must not guess at it -- the same rule
+            # the record's own INVENTORY_PAYLOAD_VERSION comment states. "I cannot read
+            # this" and "this does not reproduce" are different facts.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): payload_version "
+                f"{version!r} is not the readable version {INVENTORY_PAYLOAD_VERSION!r}"
+            )
+        # Having pinned the version, the shape that version names is knowable EXACTLY. A
+        # record with an extra key can never reproduce (verify_inventory_record rebuilds the
+        # payload and compares canonical bytes, and the rebuilt one will not carry it); a
+        # record without `footprint` cannot even be READ by the verifier, which returns
+        # PAYLOAD_UNREADABLE before it looks at the document at all. Either way the citation
+        # would be unverifiable BY CONSTRUCTION -- a claim nothing can ever confirm or deny,
+        # which is precisely what this schema exists to make impossible.
+        keys = set(parsed)
+        if keys != set(INVENTORY_PAYLOAD_KEYS):
+            unexpected = sorted(keys - INVENTORY_PAYLOAD_KEYS)
+            missing = sorted(INVENTORY_PAYLOAD_KEYS - keys)
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record is not "
+                f"the shape of a version-{INVENTORY_PAYLOAD_VERSION} inventory (unexpected keys "
+                f"{unexpected!r}, missing keys {missing!r}), so it could never be replayed against the "
+                "document it names"
+            )
+        unreadable = footprint_unreadable_reason(parsed)
+        if unreadable is not None:
+            # The key-set check above proves the 'footprint' key is PRESENT. Presence was
+            # only ever a proxy for the property that matters: that the verifier can read
+            # the box back out and re-derive against it. `footprint={}`, a footprint that
+            # is a list, a page that is a string, a coordinate that is not float.fromhex
+            # readable -- each satisfies the key set and each makes the record permanently
+            # unfalsifiable, since verify_inventory_record can only answer
+            # PAYLOAD_UNREADABLE. That is a THIRD outcome, not a failure to reproduce, and
+            # a citation nothing can ever confirm or deny is exactly what this schema
+            # exists to make impossible. Asked of the record module, which performs the
+            # same read, so the schema never carries its own idea of what a footprint is.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's "
+                f"footprint cannot be read back, so replay could only ever answer "
+                f"PAYLOAD_UNREADABLE and the citation could never be checked: {unreadable}"
+            )
+        declared_raw = parsed.get("raw_sha256")
+        if declared_raw != self.raw_sha256:
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record names "
+                f"document {declared_raw!r}, not the declared raw_sha256 {self.raw_sha256!r}"
+            )
+        if not isinstance(parsed["refusals"], list):
+            # refusal_reasons_of reads `payload.get("refusals") or ()`, so ANY falsy non-list
+            # -- 0, "", {} -- reads as refusal-free without a single refusal ever having been
+            # ruled out. The key-set check above already guarantees the key EXISTS; this is
+            # about its type. "This record does not say" and "this record says none" are
+            # different facts, and only the second can clear a citation.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's "
+                f"'refusals' is {type(parsed['refusals']).__name__}, not a list, so it never states whether "
+                "the derivation refused -- silence is not a refusal-free claim"
+            )
+        try:
+            refusals = refusal_reasons_of(parsed)
+        except (ValueError, TypeError, KeyError) as exc:
+            # canonical_json is untrusted, and refusal_reasons_of reaches entry["reason"]
+            # unguarded: it raises a BARE TypeError on refusals=["x"] and a BARE KeyError on
+            # refusals=[{}]. Either would leave this validator as that exception rather than
+            # a pydantic ValidationError, crashing a caller that correctly catches only
+            # ValidationError. Every way that indexing can fail is caught here, because the
+            # helper makes no promise about which it raises.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's "
+                f"'refusals' cannot be read, so it cannot be shown refusal-free: {exc!r}"
+            ) from exc
+        if refusals:
+            # An inventory that refused is a legitimate record to STORE -- it is the
+            # honest outcome for most real tables -- but it is by construction not a
+            # grid, so it can never justify a cell. Embedding one is only ever a
+            # citation (T2 makes embedded and cited the same set), so refusing it here
+            # closes the case structurally rather than leaving it to a caller.
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record carries "
+                f"refusal(s) {sorted(reason.value for reason in refusals)!r}, and a refused derivation "
+                "defines no grid a table cell could be located in"
+            )
+        # The ordinals a citation is checked against must be ORDINALS. JSON has no integer
+        # type distinct from bool, and Python's `True == 1`, so an unchecked payload can
+        # satisfy a lookup for (1, 0) with `{"row": true, "col": false}` -- a grid that
+        # contains a cell it does not contain. Checked once here rather than in has_cell so
+        # the guarantee belongs to the stored bytes, not to whoever happens to read them.
+        cells = parsed["cells"]
+        if not isinstance(cells, list):
+            raise ValueError(
+                f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's 'cells' "
+                f"is {type(cells).__name__}, not a list, so it describes no grid"
+            )
+        index: set[tuple[int, int]] = set()
+        for position, cell in enumerate(cells):
+            if not isinstance(cell, dict):
+                raise ValueError(
+                    f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): cells[{position}] "
+                    f"is {type(cell).__name__}, not an object"
+                )
+            for axis in ("row", "col"):
+                ordinal = cell.get(axis)
+                # `isinstance(True, int)` is True, so bool must be excluded explicitly.
+                if not isinstance(ordinal, int) or isinstance(ordinal, bool):
+                    raise ValueError(
+                        f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                        f"cells[{position}][{axis!r}] is {ordinal!r}, which is not an integer ordinal"
+                    )
+            position_key = (cell["row"], cell["col"])
+            if position_key in index:
+                # A coordinate that appears twice is not a grid. The two entries can carry
+                # DIFFERENT text -- reproduced: a record saying (0, 0) is both `Fuel` and
+                # `9999` was accepted, and `has_cell` answered `True`, because a set
+                # membership bit cannot express "present, but the record does not agree
+                # with itself about what is here". A citation resolving to that coordinate
+                # would then be checkable and meaningless at once, which is precisely the
+                # pair this schema exists to keep apart. Every other collection here
+                # already refuses duplicates (`Series.points`, `Series.axes`,
+                # `Composition.components`); `cells` was the one that did not.
+                #
+                # ALL duplicates are refused, not just disagreeing ones: `build_inventory`
+                # emits one cell per (row, col) by construction, so a repeat is never
+                # something a real derivation produced, and "agrees with itself" is a
+                # weaker property to have to define than "appears once".
+                raise ValueError(
+                    f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): cells[{position}] "
+                    f"repeats the coordinate (row={cell['row']}, col={cell['col']}), so the record does not "
+                    "define one value at that position"
+                )
+            index.add(position_key)
+        # Built HERE, in the loop that just proved every ordinal is an integer and unique,
+        # so the index and the validation cannot be looking at different bytes. `has_cell`
+        # then answers from it instead of re-parsing: a validator's work done once, rather
+        # than once per lookup.
+        self._cell_index = frozenset(index)
+        return self
+
+    def has_cell(self, *, row: int, col: int) -> bool:
+        """Whether this record's grid actually contains ``(row, col)``.
+
+        Answers from the index T1 built while validating the same bytes, so a
+        bool masquerading as an ordinal cannot satisfy a lookup and the cost
+        does not grow with the number of refs consulting the record. An envelope
+        may cite one inventory from many refs, and the payload is an entire
+        table's grid -- re-parsing it per lookup made the check quadratic in
+        exactly the input an attacker chooses.
+        """
+        return (row, col) in self._cell_index
+
+
 def _check_source_form_for_ref(
     *, source_form: SourceForm, ref: SourceRef, node_kind: SourceNodeKind, where: str
 ) -> None:
@@ -4098,6 +4451,12 @@ def _source_locator_identity_payload(
             "table_key": _table_key_identity_payload(locator.table_key),
             "row": locator.row,
             "col": locator.col,
+            # Projected, not omitted: two locators differing ONLY in which inventory they
+            # cite are different claims about which grid justified the cell, and omitting
+            # the field here would collapse them onto one content address in a write-once
+            # store. _project_maybe renders Absent through the same `__absent__` marker
+            # _rehydrate_identity_payload already round-trips.
+            "pdf_table_inventory_sha256": _project_maybe(locator.pdf_table_inventory_sha256),
         }
     if isinstance(locator, XPathLocator):
         return {"kind": locator.kind.value, "xpath": locator.xpath}
@@ -4304,6 +4663,14 @@ def _series_identity_payload(series: Series) -> dict[str, Any]:
 
 def _embedded_conversion_table_identity_payload(table: EmbeddedConversionTable) -> dict[str, Any]:
     return {"sha256": table.sha256, "canonical_json": table.canonical_json}
+
+
+def _embedded_table_inventory_identity_payload(inventory: EmbeddedTableInventory) -> dict[str, Any]:
+    return {
+        "inventory_sha256": inventory.inventory_sha256,
+        "raw_sha256": inventory.raw_sha256,
+        "canonical_json": inventory.canonical_json,
+    }
 
 
 def _grounded_scalar_claim_identity_payload(claim: GroundedScalarClaim) -> dict[str, Any]:
@@ -4624,6 +4991,9 @@ class _SourceGraphEnvelope(Protocol):
     @property
     def conversion_tables(self) -> tuple[EmbeddedConversionTable, ...]: ...
 
+    @property
+    def table_inventories(self) -> tuple[EmbeddedTableInventory, ...]: ...
+
 
 # SHARED-PROVENANCE-VALIDATORS: the seven helpers below implement provenance logic that reads
 # only `source_graph`, `conversion_tables`, and whatever `iter_source_refs`/`iter_measured_values`
@@ -4820,6 +5190,225 @@ def _validate_char_span_requires_extraction(envelope: _SourceGraphEnvelope) -> N
             )
 
 
+def _validate_table_cell_inventory_citation(envelope: _SourceGraphEnvelope) -> None:
+    """V8: every ``TABLE_CELL`` locator must state whether a PDF cell
+    inventory defines the grid it indexes into -- and a PDF one must cite an
+    inventory this envelope actually embeds, which actually contains the cell.
+
+    Runs AFTER V1, so every ``ref.node_id`` already resolves.
+
+    **Why the rule is keyed on node kind and table-key kind, and on nothing
+    else.** The obvious discriminator -- ``SourceNode.extraction.extractor``
+    beginning ``"pdf:"`` -- is WRONG twice over, and both ways were measured
+    rather than reasoned:
+
+    * ``pdf_fragments.extract_fragments(data: bytes)`` reads RAW BYTES. A PDF
+      node whose text extraction is :class:`Absent` can still have a perfectly
+      good inventory, so a rule keyed on ``extraction`` would classify exactly
+      that node as "no inventory applies" -- turning the missing-extraction
+      case into the bypass for the whole field.
+    * ``"pdf:unavailable"`` also starts with ``"pdf:"`` and is emitted
+      precisely when pypdf did NOT run (see
+      ``extraction_record._PYPDF_DEPENDENT_EXTRACTORS``, which documents the
+      same trap for its own purposes).
+
+    Text-extraction provenance is simply not the authority on table-inventory
+    provenance.
+
+    The four cases, all fail-closed:
+
+    * ``PAPER_PDF``: the citation MUST be present. **No** ``AbsenceReason`` is
+      legal -- particularly not ``NOT_EXTRACTED_YET``, which is precisely the
+      escape hatch that would make this field decorative.
+    * ``JATS_XML``: MUST be ``Absent(NOT_APPLICABLE)``. XML table cells have
+      no PDF fragment geometry, and no other absence reason is true.
+    * ``SI_MEMBER`` + :class:`MemberSheetKey`: MUST be
+      ``Absent(NOT_APPLICABLE)``. A workbook SHEET has no fragment geometry,
+      structurally.
+    * ``SI_MEMBER`` + :class:`CaptionLabelKey`: REFUSED BOTH WAYS. An SI member
+      may be a PDF (whose cells CAN have an inventory) or a ``.docx`` (whose
+      cells cannot), and :class:`SourceNodeKind` cannot tell them apart -- the
+      gap :func:`_validate_locator_kind_matches_node_kind` already documents as
+      "``SI_MEMBER`` too broad". Absent is refused because ``NOT_APPLICABLE``
+      would persist a claim nothing checked; present is refused because
+      nothing here can check it either.
+
+      This case was first written to ACCEPT a present citation, on the argument
+      that it SELF-CERTIFIES: the checks below require the embedded record's
+      ``raw_sha256`` to equal this node's ``sha256``, and only a PDF yields an
+      inventory, so the envelope was said to PROVE the member is a PDF. That
+      argument is false, and the refutation is worth keeping because it is easy
+      to re-derive: :class:`EmbeddedTableInventory` never re-derives the grid
+      from the document's bytes -- see its "SCOPE OF WHAT VALIDATION HERE
+      PROVES" -- so the whole payload, ``raw_sha256`` included, is author-
+      controlled. Anyone can assert a grid over a ``.docx``'s digest. Matching
+      digests prove only that the author NAMED this node, never that a PDF
+      parser ever ran on it. Only :func:`~carmel.services.pdf_table_record.
+      verify_inventory_record`, holding the real bytes, can establish that.
+
+    Widening the last case later -- once a node can state its own media type --
+    only ever ACCEPTS more, so it needs no migration of anything already
+    written. That is what makes refusing the reversible choice here: a false
+    ``NOT_APPLICABLE``, or a citation admitted on a guarantee no code provides,
+    would both persist claims nothing checked.
+    """
+    embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
+    for path, ref in iter_source_refs(envelope):
+        locator = ref.locator
+        if not isinstance(locator, TableCellLocator):
+            continue
+        node = envelope.source_graph.node(ref.node_id)
+        citation = locator.pdf_table_inventory_sha256
+        undecidable = node.kind is SourceNodeKind.SI_MEMBER and locator.table_key.kind is TableKeyKind.CAPTION_LABEL
+        requires_citation = node.kind is SourceNodeKind.PAPER_PDF
+
+        if isinstance(citation, Absent):
+            if requires_citation:
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a table cell in PAPER_PDF node {node.node_id!r} but its "
+                    f"pdf_table_inventory_sha256 is Absent ({citation.reason.value!r}) -- a PDF table cell "
+                    "must cite the inventory that defines its grid, and no absence reason is legal here"
+                )
+            if undecidable:
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a caption-labelled table cell in SI_MEMBER node "
+                    f"{node.node_id!r} with pdf_table_inventory_sha256 Absent ({citation.reason.value!r}) -- "
+                    "an SI member may be a PDF or a word-processor document and this schema cannot tell "
+                    "which, so absence here would record a claim nothing checked"
+                )
+            if citation.reason is not AbsenceReason.NOT_APPLICABLE:
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a table cell in {node.kind.value!r} node "
+                    f"{node.node_id!r} with pdf_table_inventory_sha256 Absent "
+                    f"({citation.reason.value!r}) -- the only true absence for a cell that has no PDF "
+                    f"fragment geometry is {AbsenceReason.NOT_APPLICABLE.value!r}"
+                )
+            continue
+
+        if undecidable:
+            # Checked BEFORE the generic non-PDF rejection so the message names the real
+            # reason: this node MIGHT have fragment geometry, and that is exactly the
+            # problem -- nothing in this envelope can establish whether it does.
+            raise ValueError(
+                f"SourceRef at {path!r} locates a caption-labelled table cell in SI_MEMBER node "
+                f"{node.node_id!r} and cites pdf_table_inventory_sha256={citation!r}, but an SI member may "
+                "be a PDF or a word-processor document and this schema cannot tell which -- an embedded "
+                "record's raw_sha256 is author-controlled, so citing one asserts the member is a PDF "
+                "rather than establishing it"
+            )
+
+        if not requires_citation:
+            # Checked BEFORE the cover check below, deliberately: an XML or workbook cell
+            # citing a real, embedded PDF inventory would otherwise contribute to the cited
+            # set and sail through exact cover, laundering a PDF grid into a node that has
+            # none.
+            raise ValueError(
+                f"SourceRef at {path!r} locates a table cell in {node.kind.value!r} node {node.node_id!r} "
+                f"and cites pdf_table_inventory_sha256={citation!r}, but a cell in that node has no PDF "
+                "fragment geometry a cell inventory could ever describe"
+            )
+
+        inventory = embedded_by_sha.get(citation)
+        if inventory is None:
+            raise ValueError(
+                f"SourceRef at {path!r} cites pdf_table_inventory_sha256={citation!r}, which this envelope "
+                "does not embed -- a citation resolvable only against an evidence store makes the "
+                "envelope's meaning depend on the machine replaying it"
+            )
+        if inventory.raw_sha256 != node.sha256:
+            raise ValueError(
+                f"SourceRef at {path!r} cites inventory {citation!r}, whose record was derived from "
+                f"document {inventory.raw_sha256!r}, but its node {node.node_id!r} has "
+                f"sha256={node.sha256!r} -- the grid describes a different document than the one the "
+                "locator targets"
+            )
+        if not inventory.has_cell(row=locator.row, col=locator.col):
+            raise ValueError(
+                f"SourceRef at {path!r} locates row={locator.row}, col={locator.col} in inventory "
+                f"{citation!r}, whose grid has no such cell -- a citation that resolves to a real "
+                "inventory of the right document can still name a cell that grid never derived"
+            )
+
+
+def _validate_table_inventories_cover_cited_inventories(envelope: _SourceGraphEnvelope) -> None:
+    """T4: ``table_inventories`` must cover EXACTLY the inventories cited by
+    the ``TABLE_CELL`` locators reachable in this envelope -- no fewer, no
+    more.
+
+    The "no fewer" half is enforced per-ref by V8 above (which reports WHICH
+    ref dangles, information a set difference cannot give); this states the
+    same requirement over the whole envelope and adds the "no more" half. An
+    embedded inventory nothing cites is unearned provenance -- the same
+    failure class T2 closes for conversion tables and V2 for graph nodes.
+
+    The cited set is computed from locators whose citation is PRESENT, so this
+    rule ALONE says less than it appears to: an envelope whose PDF locators all
+    carry ``Absent`` contributes an empty cited set and passes exact cover
+    against an empty embedded set while citing nothing at all. V8 is what makes
+    that envelope illegal.
+
+    Declaration order (V8 first) is therefore about the DIAGNOSTIC, not the
+    verdict -- measured, not assumed: pydantic runs ``mode="after"`` model
+    validators in declaration order, and inverting these two leaves every test
+    in ``test_table_cell_inventory_citation`` green. Both validators are pure
+    and neither mutates the model, so an envelope T4 accepts vacuously is still
+    rejected by V8 whichever runs first. What order buys is that an envelope
+    violating both reports the missing citation rather than a confusing cover
+    complaint. Do not weaken either rule on the theory that the other one
+    ordered before it makes the check redundant.
+    """
+    cited = {
+        ref.locator.pdf_table_inventory_sha256
+        for _, ref in iter_source_refs(envelope)
+        if isinstance(ref.locator, TableCellLocator) and isinstance(ref.locator.pdf_table_inventory_sha256, str)
+    }
+    embedded = {inventory.inventory_sha256 for inventory in envelope.table_inventories}
+    missing = cited - embedded
+    if missing:
+        raise ValueError(
+            f"table_inventories is missing inventory(ies) {sorted(missing)!r} cited by a TableCellLocator "
+            "-- every cited inventory must be embedded"
+        )
+    decorative = embedded - cited
+    if decorative:
+        raise ValueError(
+            f"table_inventories embeds decorative inventory(ies) {sorted(decorative)!r} that no "
+            "TableCellLocator cites -- an embedded record nothing needs is unearned provenance"
+        )
+
+
+def _validate_table_inventories_no_duplicate_sha256(envelope: _SourceGraphEnvelope) -> None:
+    """DUPLICATE-TABLE-INVENTORY-SHA256-GUARD: ``table_inventories`` must not
+    embed the same ``inventory_sha256`` twice.
+
+    Exactly the gap the conversion-table duplicate guard closes, for exactly
+    the same reason: T4 compares SETS, so ``(I1, I1)`` has the same embedded
+    set as ``(I1,)``, and T5's adjacent-pair sort check accepts two equal,
+    already-sorted entries. Two envelopes with the same logical content and
+    different bytes address differently -- an address-uniqueness bug.
+    """
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for inventory in envelope.table_inventories:
+        if inventory.inventory_sha256 in seen:
+            duplicates.add(inventory.inventory_sha256)
+        seen.add(inventory.inventory_sha256)
+    if duplicates:
+        raise ValueError(
+            f"table_inventories embeds duplicate inventory_sha256(s) {sorted(duplicates)!r} -- each cited "
+            "inventory must be embedded exactly once"
+        )
+
+
+def _validate_table_inventories_sorted(envelope: _SourceGraphEnvelope) -> None:
+    """T5: ``table_inventories`` must be sorted ascending by
+    ``inventory_sha256``, so exactly one legal ordering -- and therefore
+    exactly one addressable representation -- exists. Same idiom as T3."""
+    expected = tuple(sorted(envelope.table_inventories, key=lambda inventory: inventory.inventory_sha256))
+    if envelope.table_inventories != expected:
+        raise ValueError("table_inventories must be sorted ascending by inventory_sha256")
+
+
 class DatasetEnvelope(BaseModel):
     """The top-level payload for one literature-extracted dataset: a source
     graph plus the extracted content that cites it.
@@ -4913,6 +5502,17 @@ class DatasetEnvelope(BaseModel):
     the set actually cited (T2, below) and that it has one canonical order
     (T3, below).
     """
+    table_inventories: tuple[EmbeddedTableInventory, ...]
+    """Every PDF cell inventory cited (by
+    :attr:`TableCellLocator.pdf_table_inventory_sha256`) by any
+    :class:`SourceRef` reachable in this envelope, embedded verbatim -- see
+    :class:`EmbeddedTableInventory`, and V8/T4/T5 for the invariants.
+
+    Present on THIS envelope as well as on :class:`ConditionSetEnvelope`
+    because a :class:`Series` point can cite a table cell too (V4 in fact
+    REQUIRES it: ``source_form=TABULAR`` demands a ``TABLE_CELL`` locator).
+    Embedding on the condition-set side alone would leave this class as the
+    bypass surface for the whole citation rule."""
 
     @model_validator(mode="after")
     def _validate_conversion_tables_cover_cited_tables(self) -> DatasetEnvelope:
@@ -4999,6 +5599,33 @@ class DatasetEnvelope(BaseModel):
     def _validate_char_span_requires_extraction(self) -> DatasetEnvelope:
         """V6: see :func:`_validate_char_span_requires_extraction`."""
         _validate_char_span_requires_extraction(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_cell_inventory_citation(self) -> DatasetEnvelope:
+        """V8: see :func:`_validate_table_cell_inventory_citation`. Declared
+        BEFORE T4 below so that an envelope violating both reports the missing
+        citation, which is the actionable half -- see T4's docstring for why
+        that is a diagnostic preference and not a soundness requirement."""
+        _validate_table_cell_inventory_citation(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_inventories_cover_cited_inventories(self) -> DatasetEnvelope:
+        """T4: see :func:`_validate_table_inventories_cover_cited_inventories`."""
+        _validate_table_inventories_cover_cited_inventories(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_inventories_no_duplicate_sha256(self) -> DatasetEnvelope:
+        """See :func:`_validate_table_inventories_no_duplicate_sha256`."""
+        _validate_table_inventories_no_duplicate_sha256(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_inventories_sorted(self) -> DatasetEnvelope:
+        """T5: see :func:`_validate_table_inventories_sorted`."""
+        _validate_table_inventories_sorted(self)
         return self
 
     @model_validator(mode="after")
@@ -5225,6 +5852,9 @@ class DatasetEnvelope(BaseModel):
             "conversion_tables": [
                 _embedded_conversion_table_identity_payload(table) for table in self.conversion_tables
             ],
+            "table_inventories": [
+                _embedded_table_inventory_identity_payload(inventory) for inventory in self.table_inventories
+            ],
         }
 
     @classmethod
@@ -5395,6 +6025,11 @@ class ConditionSetEnvelope(BaseModel):
     envelope holds no :class:`MeasuredValue` at all (e.g. a refusals-only
     condition set), because an embedded table nothing cites is unearned
     provenance (T2)."""
+    table_inventories: tuple[EmbeddedTableInventory, ...]
+    """Every PDF cell inventory cited by any :class:`TableCellLocator`
+    reachable in this envelope, embedded verbatim -- same contract and same
+    V8/T4/T5 validators as :attr:`DatasetEnvelope.table_inventories`. Empty
+    exactly when no reachable locator cites one."""
     subject: DeviceClassDeclaration | UnresolvedSubject
     """The required subject SUM -- see the class docstring for why this is
     a sum and why the declaration arm is class-level. Projected TAGGED (see
@@ -5502,6 +6137,32 @@ class ConditionSetEnvelope(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_table_cell_inventory_citation(self) -> ConditionSetEnvelope:
+        """V8: see :func:`_validate_table_cell_inventory_citation`. Declared
+        BEFORE T4 for the diagnostic reason T4's docstring gives -- not because
+        the verdict depends on the order."""
+        _validate_table_cell_inventory_citation(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_inventories_cover_cited_inventories(self) -> ConditionSetEnvelope:
+        """T4: see :func:`_validate_table_inventories_cover_cited_inventories`."""
+        _validate_table_inventories_cover_cited_inventories(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_inventories_no_duplicate_sha256(self) -> ConditionSetEnvelope:
+        """See :func:`_validate_table_inventories_no_duplicate_sha256`."""
+        _validate_table_inventories_no_duplicate_sha256(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_inventories_sorted(self) -> ConditionSetEnvelope:
+        """T5: see :func:`_validate_table_inventories_sorted`."""
+        _validate_table_inventories_sorted(self)
+        return self
+
+    @model_validator(mode="after")
     def _validate_holds_at_least_one_record(self) -> ConditionSetEnvelope:
         """C1: at least one entry across ``scalar_claims`` +
         ``categorical_claims`` + ``unextracted`` COMBINED -- refusals COUNT.
@@ -5599,6 +6260,9 @@ class ConditionSetEnvelope(BaseModel):
             "source_graph": _source_graph_identity_payload(self.source_graph),
             "conversion_tables": [
                 _embedded_conversion_table_identity_payload(table) for table in self.conversion_tables
+            ],
+            "table_inventories": [
+                _embedded_table_inventory_identity_payload(inventory) for inventory in self.table_inventories
             ],
             "subject": _condition_subject_identity_payload(self.subject),
             "attribution": self.attribution.value,

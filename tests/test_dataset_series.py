@@ -60,7 +60,11 @@ from carmel.schemas.datasets import (
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1
+from tests.table_inventory_fixtures import cover_for, inventory_for
 from tests.test_dataset_graph_and_envelope import _extraction_binding, _glyph_health_assessment
+
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
 
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
@@ -170,13 +174,50 @@ def _jats_graph(node_id: str = "jats") -> SourceGraph:
     return SourceGraph(nodes=(_node(node_id, SourceNodeKind.JATS_XML, SHA_C),))
 
 
-def _table_ref(node_id: str, row: int = 0, col: int = 1, label: str = "Table 1") -> SourceRef:
+#: Which document each fixture node id holds, so a table ref can cite the inventory
+#: for the node it actually targets (V8 requires the two to agree) without every
+#: call site threading a sha. "jats" is absent deliberately: an XML cell has no PDF
+#: fragment geometry, so its only legal citation is Absent(NOT_APPLICABLE).
+_RAW_SHA_BY_NODE_ID: dict[str, str] = {"paper": SHA_A, "si": SHA_B, "fig": SHA_B}
+
+#: Fixture node ids that are SI_MEMBER nodes. A table cell in one of these has to be a
+#: workbook SHEET cell -- see :func:`_table_ref`.
+_SI_MEMBER_NODE_IDS = frozenset({"si"})
+
+
+def _table_ref(
+    node_id: str, row: int = 0, col: int = 1, label: str = "Table 1", raw_sha256: str | None = None
+) -> SourceRef:
+    """A table-cell ref citing the inventory of the document ``node_id`` holds.
+
+    Pass ``raw_sha256`` only to cite a DIFFERENT document than the node's own --
+    which V8 rejects, and which some tests exist to prove it rejects.
+
+    A ref into an SI MEMBER comes back as a workbook SHEET cell citing nothing,
+    unless the caller forced a ``raw_sha256`` in order to test a rejection. V8
+    refuses a CAPTION-labelled SI cell whichever way it answers the citation:
+    absent would record a claim nothing checked, and present would assert the
+    member is a PDF on the strength of an author-controlled digest.
+    """
+    if node_id in _SI_MEMBER_NODE_IDS and raw_sha256 is None:
+        return SourceRef(
+            node_id=node_id,
+            locator=TableCellLocator(
+                row=row,
+                col=col,
+                table_key=MemberSheetKey(kind=TableKeyKind.MEMBER_SHEET, sheet_name="Sheet1"),
+                pdf_table_inventory_sha256=_NO_INVENTORY,
+            ),
+        )
+    sha = raw_sha256 if raw_sha256 is not None else _RAW_SHA_BY_NODE_ID.get(node_id)
+    citation = _NO_INVENTORY if sha is None else inventory_for(sha).inventory_sha256
     return SourceRef(
         node_id=node_id,
         locator=TableCellLocator(
             row=row,
             col=col,
             table_key=CaptionLabelKey(kind=TableKeyKind.CAPTION_LABEL, label=label),
+            pdf_table_inventory_sha256=citation,
         ),
     )
 
@@ -346,13 +387,19 @@ def _uncertainty(
 # ---------------------------------------------------------------------------
 
 
-def _axis(axis_id: str, role: AxisRole, quantity_kind: QuantityKind, node_id: str = "paper") -> AxisDeclaration:
+def _axis(
+    axis_id: str,
+    role: AxisRole,
+    quantity_kind: QuantityKind,
+    node_id: str = "paper",
+    raw_sha256: str | None = None,
+) -> AxisDeclaration:
     return AxisDeclaration(
         axis_id=axis_id,
         role=role,
         quantity_kind=quantity_kind,
         label_raw=axis_id,
-        label_ref=_table_ref(node_id, row=90, col=90),
+        label_ref=_table_ref(node_id, row=90, col=90, raw_sha256=raw_sha256),
     )
 
 
@@ -426,6 +473,7 @@ def _envelope_with_series(
         composition=composition,
         series=series,
         conversion_tables=(_embedded_table_v1(),),
+        table_inventories=cover_for(series, composition),
     )
 
 
@@ -1208,17 +1256,23 @@ class TestACharSpanCannotGroundASeriesValue:
 class TestTableCellLocatorTableKey:
     def test_table_cell_locator_requires_table_key(self) -> None:
         with pytest.raises(ValidationError):
-            TableCellLocator(row=0, col=1)  # type: ignore[call-arg]
+            TableCellLocator(row=0, col=1, pdf_table_inventory_sha256=_NO_INVENTORY)  # type: ignore[call-arg]
 
     def test_caption_label_key_accepted(self) -> None:
         locator = TableCellLocator(
-            row=0, col=1, table_key=CaptionLabelKey(kind=TableKeyKind.CAPTION_LABEL, label="Table 2")
+            row=0,
+            col=1,
+            table_key=CaptionLabelKey(kind=TableKeyKind.CAPTION_LABEL, label="Table 2"),
+            pdf_table_inventory_sha256=_NO_INVENTORY,
         )
         assert isinstance(locator.table_key, CaptionLabelKey)
 
     def test_member_sheet_key_accepted(self) -> None:
         locator = TableCellLocator(
-            row=0, col=1, table_key=MemberSheetKey(kind=TableKeyKind.MEMBER_SHEET, sheet_name="Sheet1")
+            row=0,
+            col=1,
+            table_key=MemberSheetKey(kind=TableKeyKind.MEMBER_SHEET, sheet_name="Sheet1"),
+            pdf_table_inventory_sha256=_NO_INVENTORY,
         )
         assert isinstance(locator.table_key, MemberSheetKey)
 
@@ -1422,6 +1476,7 @@ class TestFunctionalRealisticSeries:
             composition=_NO_COMPOSITION,
             series=(series,),
             conversion_tables=(_embedded_table_v1(),),
+            table_inventories=cover_for((series,)),
         )
 
     def test_constructs(self) -> None:

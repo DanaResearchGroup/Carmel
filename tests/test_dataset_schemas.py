@@ -60,6 +60,9 @@ from carmel.services.semantic_deps import (
 )
 from carmel.services.units import TABLE_V1
 
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
+
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
     """Mirror ``SourceNode``'s iff-rule: a node carries a verification record
@@ -212,7 +215,10 @@ def _bbox_ref(node_id: str = "n1") -> SourceRef:
 
 def _table_ref(node_id: str = "n1", row: int = 0, col: int = 1) -> SourceRef:
     return SourceRef(
-        node_id=node_id, locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=row, col=col)
+        node_id=node_id,
+        locator=TableCellLocator(
+            table_key=CaptionLabelKey(label="Table 1"), row=row, col=col, pdf_table_inventory_sha256=_NO_INVENTORY
+        ),
     )
 
 
@@ -777,11 +783,15 @@ class TestSourceGraph:
     def test_table_cell_locator_rejects_negative_row(self) -> None:
         """A negative row locates no real table cell."""
         with pytest.raises(ValidationError):
-            TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=-1, col=0)
+            TableCellLocator(
+                table_key=CaptionLabelKey(label="Table 1"), row=-1, col=0, pdf_table_inventory_sha256=_NO_INVENTORY
+            )
 
     def test_table_cell_locator_rejects_negative_col(self) -> None:
         with pytest.raises(ValidationError):
-            TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=-1)
+            TableCellLocator(
+                table_key=CaptionLabelKey(label="Table 1"), row=0, col=-1, pdf_table_inventory_sha256=_NO_INVENTORY
+            )
 
     def test_xpath_locator_ref_round_trips(self) -> None:
         ref = SourceRef(node_id="n1", locator=XPathLocator(xpath="//table/row[1]/cell[2]"))

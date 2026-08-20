@@ -84,6 +84,10 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1, ConversionTable, IdentityRule
+from tests.table_inventory_fixtures import cited_inventories, cover_for, inventory_for
+
+_NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a table cell with no PDF fragment geometry (V8)."""
 
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
@@ -342,9 +346,43 @@ def _bbox_ref(node_id: str) -> SourceRef:
     return SourceRef(node_id=node_id, locator=BBoxLocator(bbox=_bbox()))
 
 
-def _table_ref(node_id: str, row: int = 0, col: int = 1) -> SourceRef:
+def _table_ref(node_id: str, row: int = 0, col: int = 1, raw_sha256: str = SHA_A) -> SourceRef:
+    """A table-cell ref citing the standard inventory over ``raw_sha256``.
+
+    ``raw_sha256`` must match the TARGET NODE's own sha256: V8 requires the
+    cited inventory to have been derived from the document the locator points
+    at, so a fixture that changes the node has to change this too.
+
+    Only legal against a ``PAPER_PDF`` node. For an SI member use
+    :func:`_sheet_ref`, which V8 accepts.
+    """
     return SourceRef(
-        node_id=node_id, locator=TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=row, col=col)
+        node_id=node_id,
+        locator=TableCellLocator(
+            table_key=CaptionLabelKey(label="Table 1"),
+            row=row,
+            col=col,
+            pdf_table_inventory_sha256=inventory_for(raw_sha256).inventory_sha256,
+        ),
+    )
+
+
+def _sheet_ref(node_id: str, row: int = 0, col: int = 1) -> SourceRef:
+    """A table-cell ref into a workbook SHEET, which cites no inventory.
+
+    The shape an SI member's table cell has to take: a sheet has no PDF
+    fragment geometry structurally, and V8 refuses a CAPTION-labelled SI cell
+    both ways -- absent would record a claim nothing checked, present would
+    assert the member is a PDF on an author-controlled digest.
+    """
+    return SourceRef(
+        node_id=node_id,
+        locator=TableCellLocator(
+            table_key=MemberSheetKey(sheet_name="Sheet1"),
+            row=row,
+            col=col,
+            pdf_table_inventory_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        ),
     )
 
 
@@ -455,7 +493,7 @@ def _envelope_with_value_ref_locator(
     graph, node_id = _graph_and_node_of_kind(node_kind, extraction=extraction)
     amount = _mole_fraction_amount(
         value_ref=SourceRef(node_id=node_id, locator=locator),  # type: ignore[arg-type]
-        unit_ref=_table_ref("unit-root"),
+        unit_ref=_table_ref("unit-root", raw_sha256=SHA_D),
     )
     composition = Composition(
         raw_name="mix",
@@ -467,8 +505,9 @@ def _envelope_with_value_ref_locator(
     return DatasetEnvelope(
         source_graph=graph,
         composition=composition,
-        series=(_fully_populated_series("unit-root"),),
+        series=(_fully_populated_series("unit-root", raw_sha256=SHA_D),),
         conversion_tables=(_embedded_table_v1(),),
+        table_inventories=cover_for(composition, (_fully_populated_series("unit-root", raw_sha256=SHA_D),)),
     )
 
 
@@ -483,7 +522,9 @@ it must pass the same unit/quantity_kind conversion-table check (including
 the table's own normalized spelling) as any other value."""
 
 
-def _uncertainty(value_ref: SourceRef, unit_ref: SourceRef, quantity_kind: QuantityKind) -> Uncertainty:
+def _uncertainty(
+    value_ref: SourceRef, unit_ref: SourceRef, quantity_kind: QuantityKind, raw_sha256: str = SHA_A
+) -> Uncertainty:
     """A fully-populated Uncertainty (kind/basis/scale/upper/lower all
     present, both bounds referenced) -- used by the ref-walk drift meta-test
     so every series.*.uncertainty.{upper,lower}.{value_ref,unit_ref} location
@@ -500,8 +541,8 @@ def _uncertainty(value_ref: SourceRef, unit_ref: SourceRef, quantity_kind: Quant
             conversion_table_sha256=TABLE_V1.sha256,
             repairs=(),
             repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
-            value_ref=_table_ref(value_ref.node_id, row=row, col=0),
-            unit_ref=_table_ref(unit_ref.node_id, row=row, col=1),
+            value_ref=_table_ref(value_ref.node_id, row=row, col=0, raw_sha256=raw_sha256),
+            unit_ref=_table_ref(unit_ref.node_id, row=row, col=1, raw_sha256=raw_sha256),
         )
 
     return Uncertainty(
@@ -513,7 +554,7 @@ def _uncertainty(value_ref: SourceRef, unit_ref: SourceRef, quantity_kind: Quant
     )
 
 
-def _fully_populated_series(node_id: str = "paper") -> Series:
+def _fully_populated_series(node_id: str = "paper", raw_sha256: str = SHA_A) -> Series:
     """A Series with every SourceRef-bearing field actually populated:
     one coordinate axis, one observation axis, one constant axis, a
     constant covering that axis (with a fully-populated uncertainty), and
@@ -526,21 +567,21 @@ def _fully_populated_series(node_id: str = "paper") -> Series:
         role=AxisRole.COORDINATE,
         quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
         label_raw="phi",
-        label_ref=_table_ref(node_id, row=10, col=0),
+        label_ref=_table_ref(node_id, row=10, col=0, raw_sha256=raw_sha256),
     )
     sl_axis = AxisDeclaration(
         axis_id="sl",
         role=AxisRole.OBSERVATION,
         quantity_kind=QuantityKind.VELOCITY,
         label_raw="S_L (cm/s)",
-        label_ref=_table_ref(node_id, row=10, col=1),
+        label_ref=_table_ref(node_id, row=10, col=1, raw_sha256=raw_sha256),
     )
     const_axis = AxisDeclaration(
         axis_id="temperature",
         role=AxisRole.CONSTANT,
         quantity_kind=QuantityKind.TEMPERATURE,
         label_raw="T (K)",
-        label_ref=_table_ref(node_id, row=10, col=2),
+        label_ref=_table_ref(node_id, row=10, col=2, raw_sha256=raw_sha256),
     )
 
     const_value = MeasuredValue(
@@ -552,26 +593,32 @@ def _fully_populated_series(node_id: str = "paper") -> Series:
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
         repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
-        value_ref=_table_ref(node_id, row=11, col=0),
-        unit_ref=_table_ref(node_id, row=11, col=1),
+        value_ref=_table_ref(node_id, row=11, col=0, raw_sha256=raw_sha256),
+        unit_ref=_table_ref(node_id, row=11, col=1, raw_sha256=raw_sha256),
     )
     constant = Coordinate(
         axis_id="temperature",
         value=const_value,
         uncertainty=_uncertainty(
-            value_ref=_table_ref(node_id), unit_ref=_table_ref(node_id), quantity_kind=QuantityKind.TEMPERATURE
+            value_ref=_table_ref(node_id, raw_sha256=raw_sha256),
+            unit_ref=_table_ref(node_id, raw_sha256=raw_sha256),
+            raw_sha256=raw_sha256,
+            quantity_kind=QuantityKind.TEMPERATURE,
         ),
     )
 
     phi_value = _equivalence_ratio_amount(
-        value_ref=_table_ref(node_id, row=20, col=0),
-        unit_ref=_table_ref(node_id, row=20, col=1),
+        value_ref=_table_ref(node_id, row=20, col=0, raw_sha256=raw_sha256),
+        unit_ref=_table_ref(node_id, row=20, col=1, raw_sha256=raw_sha256),
     )
     coordinate = Coordinate(
         axis_id="phi",
         value=phi_value,
         uncertainty=_uncertainty(
-            value_ref=_table_ref(node_id), unit_ref=_table_ref(node_id), quantity_kind=QuantityKind.EQUIVALENCE_RATIO
+            value_ref=_table_ref(node_id, raw_sha256=raw_sha256),
+            unit_ref=_table_ref(node_id, raw_sha256=raw_sha256),
+            raw_sha256=raw_sha256,
+            quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
         ),
     )
 
@@ -584,24 +631,27 @@ def _fully_populated_series(node_id: str = "paper") -> Series:
         conversion_table_sha256=TABLE_V1.sha256,
         repairs=(),
         repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
-        value_ref=_table_ref(node_id, row=21, col=0),
-        unit_ref=_table_ref(node_id, row=21, col=1),
+        value_ref=_table_ref(node_id, row=21, col=0, raw_sha256=raw_sha256),
+        unit_ref=_table_ref(node_id, row=21, col=1, raw_sha256=raw_sha256),
     )
     observation = Observation(
         axis_id="sl",
         value=sl_value,
         uncertainty=_uncertainty(
-            value_ref=_table_ref(node_id), unit_ref=_table_ref(node_id), quantity_kind=QuantityKind.VELOCITY
+            value_ref=_table_ref(node_id, raw_sha256=raw_sha256),
+            unit_ref=_table_ref(node_id, raw_sha256=raw_sha256),
+            raw_sha256=raw_sha256,
+            quantity_kind=QuantityKind.VELOCITY,
         ),
     )
 
     point_eq_ratio = _equivalence_ratio_amount(
-        value_ref=_table_ref(node_id, row=30, col=0),
-        unit_ref=_table_ref(node_id, row=30, col=1),
+        value_ref=_table_ref(node_id, row=30, col=0, raw_sha256=raw_sha256),
+        unit_ref=_table_ref(node_id, row=30, col=1, raw_sha256=raw_sha256),
     )
     point_component_amount = _mole_fraction_amount(
-        value_ref=_table_ref(node_id, row=31, col=0),
-        unit_ref=_table_ref(node_id, row=31, col=1),
+        value_ref=_table_ref(node_id, row=31, col=0, raw_sha256=raw_sha256),
+        unit_ref=_table_ref(node_id, row=31, col=1, raw_sha256=raw_sha256),
     )
     point_composition = Composition(
         raw_name="4% H2 in N2",
@@ -669,6 +719,7 @@ def _fully_populated_envelope(
         composition=composition,
         series=(_fully_populated_series("paper"),),
         conversion_tables=conversion_tables if conversion_tables is not None else (_embedded_table_v1(),),
+        table_inventories=cover_for(composition, (_fully_populated_series("paper"),)),
     )
 
 
@@ -805,6 +856,7 @@ def _envelope_citing_two_tables(conversion_tables: tuple[EmbeddedConversionTable
         composition=composition,
         series=(_fully_populated_series("paper"),),
         conversion_tables=conversion_tables,
+        table_inventories=cited_inventories(SHA_A),
     )
 
 
@@ -1657,6 +1709,7 @@ class TestDatasetEnvelopeRefsResolve:
                 composition=composition,
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
+                table_inventories=cited_inventories(SHA_A),
             )
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
@@ -1681,6 +1734,7 @@ class TestDatasetEnvelopeRefsResolve:
                 composition=composition,
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
+                table_inventories=cited_inventories(SHA_A),
             )
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
@@ -1699,6 +1753,7 @@ class TestDatasetEnvelopeRefsResolve:
                 composition=composition,
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
+                table_inventories=cited_inventories(SHA_A),
             )
         msg = str(excinfo.value)
         assert "ghost" in msg
@@ -1718,6 +1773,7 @@ class TestDatasetEnvelopeRefsResolve:
                 composition=composition,
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
+                table_inventories=cited_inventories(SHA_A),
             )
         msg = str(excinfo.value)
         assert "ghost" in msg
@@ -1744,6 +1800,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 composition=composition,
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
+                table_inventories=cited_inventories(SHA_A),
             )
 
     def test_unreferenced_ancestor_of_a_referenced_node_is_allowed(self) -> None:
@@ -1820,6 +1877,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             composition=composition,
             series=(series_referencing_crop_only,),
             conversion_tables=(_embedded_table_v1(),),
+            table_inventories=(),
         )
         assert envelope.source_graph.node("paper").parent_node_id is None
 
@@ -1854,6 +1912,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 composition=Absent(reason=AbsenceReason.NOT_APPLICABLE),
                 series=(),
                 conversion_tables=(),
+                table_inventories=cited_inventories(SHA_A),
             )
 
 
@@ -1921,6 +1980,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
                 composition=Absent(reason=AbsenceReason.NOT_APPLICABLE),
                 series=(series,),
                 conversion_tables=(_embedded_table_v1(),),
+                table_inventories=cited_inventories(SHA_A),
             )
         msg = str(excinfo.value)
         assert "spans multiple root artifacts" in msg
@@ -1983,6 +2043,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
             composition=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             series=(series,),
             conversion_tables=(_embedded_table_v1(),),
+            table_inventories=cited_inventories(SHA_A),
         )
         assert len(envelope.series) == 1
 
@@ -2005,7 +2066,10 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
     def test_table_cell_locator_rejected_against_figure_crop_node(self) -> None:
         with pytest.raises(ValidationError) as excinfo:
             _envelope_with_value_ref_locator(
-                TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=0), SourceNodeKind.FIGURE_CROP
+                TableCellLocator(
+                    table_key=CaptionLabelKey(label="Table 1"), row=0, col=0, pdf_table_inventory_sha256=_NO_INVENTORY
+                ),
+                SourceNodeKind.FIGURE_CROP,
             )
         msg = str(excinfo.value).lower()
         assert "table_cell" in msg
@@ -2013,7 +2077,19 @@ class TestDatasetEnvelopeLocatorKindCompatibility:
 
     def test_table_cell_locator_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
         for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
-            locator = TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=0)
+            # The table KEY and the citation are varied per node kind so this test keeps
+            # measuring locator-kind/node-kind compatibility (V3) and nothing else. V8 is
+            # what forces the variation: only a PDF cell may cite an inventory, an XML cell
+            # may not, and an SI cell may not be caption-labelled at all.
+            si = kind is SourceNodeKind.SI_MEMBER
+            locator = TableCellLocator(
+                table_key=MemberSheetKey(sheet_name="Sheet1") if si else CaptionLabelKey(label="Table 1"),
+                row=0,
+                col=0,
+                pdf_table_inventory_sha256=(
+                    inventory_for(SHA_A).inventory_sha256 if kind is SourceNodeKind.PAPER_PDF else _NO_INVENTORY
+                ),
+            )
             _envelope_with_value_ref_locator(locator, kind)
 
     def test_bbox_locator_rejected_against_jats_xml_node(self) -> None:
@@ -2099,20 +2175,56 @@ class TestDatasetEnvelopeTableKeyKindCompatibility:
 
         with pytest.raises(ValidationError) as excinfo:
             _envelope_with_value_ref_locator(
-                TableCellLocator(table_key=MemberSheetKey(sheet_name="Sheet1"), row=0, col=0), SourceNodeKind.PAPER_PDF
+                TableCellLocator(
+                    table_key=MemberSheetKey(sheet_name="Sheet1"),
+                    row=0,
+                    col=0,
+                    pdf_table_inventory_sha256=_NO_INVENTORY,
+                ),
+                SourceNodeKind.PAPER_PDF,
             )
         msg = str(excinfo.value)
         assert "table_key kind" in msg
         assert TableKeyKind.MEMBER_SHEET.value in msg
         assert SourceNodeKind.PAPER_PDF.value in msg
 
-    def test_caption_label_key_accepted_against_paper_pdf_jats_xml_and_si_member(self) -> None:
-        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER):
-            locator = TableCellLocator(table_key=CaptionLabelKey(label="Table 1"), row=0, col=0)
+    def test_caption_label_key_accepted_against_paper_pdf_and_jats_xml(self) -> None:
+        for kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML):
+            locator = TableCellLocator(
+                table_key=CaptionLabelKey(label="Table 1"),
+                row=0,
+                col=0,
+                pdf_table_inventory_sha256=(
+                    _NO_INVENTORY if kind is SourceNodeKind.JATS_XML else inventory_for(SHA_A).inventory_sha256
+                ),
+            )
             _envelope_with_value_ref_locator(locator, kind)
 
+    def test_caption_label_key_against_si_member_passes_this_rule_and_fails_v8(self) -> None:
+        """SI_MEMBER is absent from the list above, and the reason matters:
+        V3 still PERMITS a caption-label key there -- the envelope refuses it
+        for a different reason entirely, which is what this asserts.
+
+        A test that merely showed "rejected" would pass just as well if V3 had
+        silently started rejecting it, hiding the fact that the two rules
+        disagree about this case on purpose.
+        """
+        locator = TableCellLocator(
+            table_key=CaptionLabelKey(label="Table 1"),
+            row=0,
+            col=0,
+            pdf_table_inventory_sha256=inventory_for(SHA_B).inventory_sha256,
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope_with_value_ref_locator(locator, SourceNodeKind.SI_MEMBER)
+        msg = str(excinfo.value)
+        assert "this schema cannot tell which" in msg
+        assert "table_key kind" not in msg, "V3 must still permit this pairing -- V8 is what refuses it"
+
     def test_member_sheet_key_accepted_against_si_member_node(self) -> None:
-        locator = TableCellLocator(table_key=MemberSheetKey(sheet_name="Sheet1"), row=0, col=0)
+        locator = TableCellLocator(
+            table_key=MemberSheetKey(sheet_name="Sheet1"), row=0, col=0, pdf_table_inventory_sha256=_NO_INVENTORY
+        )
         _envelope_with_value_ref_locator(locator, SourceNodeKind.SI_MEMBER)
 
 
@@ -2141,7 +2253,7 @@ class TestFunctionalRealisticEnvelope:
 
         h2 = _component(
             "H2",
-            value_ref=_table_ref("si", row=0, col=0),
+            value_ref=_sheet_ref("si", row=0, col=0),
             unit_ref=_table_ref("paper", row=0, col=0),
         )
         n2 = _component(
@@ -2166,6 +2278,7 @@ class TestFunctionalRealisticEnvelope:
             composition=composition,
             series=(_fully_populated_series("paper"),),
             conversion_tables=(_embedded_table_v1(),),
+            table_inventories=cover_for(composition, (_fully_populated_series("paper"),)),
         )
 
     def test_constructs(self) -> None:
