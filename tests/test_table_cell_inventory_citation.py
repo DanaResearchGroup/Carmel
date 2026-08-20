@@ -549,6 +549,41 @@ class TestAFootprintThatCannotBeReadBackIsRefused:
         assert footprint_unreadable_reason(payload) is None
 
 
+class TestTheCellIndexIsDerivedAndSurvivesAReload:
+    """``has_cell`` answers from an index T1 builds, not from a re-parse.
+
+    That is a cache, and a cache is a second copy of the truth. These pin the two
+    ways it could go wrong: silently becoming part of the record's identity, or
+    not being there at all after an envelope comes back from storage.
+    """
+
+    def test_the_index_takes_no_part_in_the_record(self) -> None:
+        """A derived index that reached the dump would reach the address."""
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0), (1, 2)))
+        inventory = embed(payload, raw_sha256=PAPER_SHA)
+        assert "_cell_index" not in inventory.model_dump()
+        assert set(inventory.model_dump()) == {"inventory_sha256", "raw_sha256", "canonical_json"}
+
+    def test_a_reloaded_record_still_knows_its_grid(self) -> None:
+        """Storage round-trips envelopes; an index that did not come back would
+        answer False for every cell and refuse citations that are perfectly good.
+        """
+        payload = inventory_payload(raw_sha256=PAPER_SHA, cells=((0, 0), (1, 2)))
+        inventory = embed(payload, raw_sha256=PAPER_SHA)
+        reloaded = EmbeddedTableInventory.model_validate(inventory.model_dump())
+        assert reloaded.has_cell(row=1, col=2)
+        assert not reloaded.has_cell(row=9, col=9)
+
+    def test_the_index_agrees_with_the_stored_cells(self) -> None:
+        """The cache and the bytes it was built from, compared directly."""
+        cells = ((0, 0), (1, 2), (31, 3), (91, 90))
+        inventory = embed(inventory_payload(raw_sha256=PAPER_SHA, cells=cells), raw_sha256=PAPER_SHA)
+        stored = {(cell["row"], cell["col"]) for cell in json.loads(inventory.canonical_json)["cells"]}
+        assert stored == {(row, col) for row, col in cells}
+        for row, col in stored:
+            assert inventory.has_cell(row=row, col=col)
+
+
 class TestACellOrdinalMustBeAnOrdinal:
     @pytest.mark.parametrize(
         ("row", "col"),

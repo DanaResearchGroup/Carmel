@@ -77,7 +77,16 @@ from decimal import Decimal
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
@@ -3969,6 +3978,15 @@ class EmbeddedTableInventory(BaseModel):
     reason to embed a projection instead: a projection does not hash to
     ``inventory_sha256``, so it could not be the artifact being cited."""
 
+    _cell_index: frozenset[tuple[int, int]] = PrivateAttr(default=frozenset())
+    """Every ``(row, col)`` the record's grid contains, built by T1.
+
+    Private and derived, never an input: it is not a field, so it takes no part
+    in serialization, in equality, or in the address. The default is empty
+    rather than None because the only way to hold an instance whose T1 did not
+    run is to have bypassed construction entirely -- and an empty index answers
+    every ``has_cell`` with False, which is the fail-closed direction."""
+
     @field_validator("inventory_sha256", "raw_sha256")
     @classmethod
     def _validate_sha256_shape(cls, value: str, info: ValidationInfo) -> str:
@@ -4114,6 +4132,7 @@ class EmbeddedTableInventory(BaseModel):
                 f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's 'cells' "
                 f"is {type(cells).__name__}, not a list, so it describes no grid"
             )
+        index: set[tuple[int, int]] = set()
         for position, cell in enumerate(cells):
             if not isinstance(cell, dict):
                 raise ValueError(
@@ -4128,18 +4147,25 @@ class EmbeddedTableInventory(BaseModel):
                         f"EmbeddedTableInventory(inventory_sha256={self.inventory_sha256!r}): "
                         f"cells[{position}][{axis!r}] is {ordinal!r}, which is not an integer ordinal"
                     )
+            index.add((cell["row"], cell["col"]))
+        # Built HERE, in the loop that just proved every ordinal is an integer, so the
+        # index and the validation cannot be looking at different bytes. `has_cell` then
+        # answers from it instead of re-parsing: a validator's work done once, rather than
+        # once per lookup.
+        self._cell_index = frozenset(index)
         return self
 
     def has_cell(self, *, row: int, col: int) -> bool:
         """Whether this record's grid actually contains ``(row, col)``.
 
-        Reads the parsed payload rather than any reconstructed object; T1 has
-        already pinned that ``canonical_json`` parses to a dict whose ``cells``
-        is a list of objects with integer ``row``/``col``, so the equality
-        below cannot be satisfied by a bool masquerading as an ordinal.
+        Answers from the index T1 built while validating the same bytes, so a
+        bool masquerading as an ordinal cannot satisfy a lookup and the cost
+        does not grow with the number of refs consulting the record. An envelope
+        may cite one inventory from many refs, and the payload is an entire
+        table's grid -- re-parsing it per lookup made the check quadratic in
+        exactly the input an attacker chooses.
         """
-        cells = json.loads(self.canonical_json)["cells"]
-        return any(cell["row"] == row and cell["col"] == col for cell in cells)
+        return (row, col) in self._cell_index
 
 
 def _check_source_form_for_ref(
