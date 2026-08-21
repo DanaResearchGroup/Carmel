@@ -84,11 +84,36 @@ COLUMN_VALLEY_PT = 6.0
 #: shape test, not a size test -- ``font_height`` is the RENDERED height, so it survives
 #: the ``Tf /F1 1`` trap that makes ``font_size`` a constant 1.0 across the corpus.
 #:
-#: Being wrong in the permissive direction here is far worse than being wrong in the
-#: strict direction: merging a genuinely short ROW renumbers everything beneath it
-#: silently, while failing to merge an affix produces a visibly wrong row count. Hence
-#: 0.75 rather than something closer to 1.0, and hence :attr:`InventoryRefusalReason.
-#: AMBIGUOUS_AFFIX_BAND` rather than a proximity tie-break.
+#: **The asymmetry that chose this VALUE is refuted, so 0.75 is currently unjustified
+#: rather than justified.** The argument was that being wrong permissively is far worse
+#: than being wrong strictly, because merging a genuinely short ROW renumbers everything
+#: beneath it silently while failing to merge an affix only produces a visibly wrong row
+#: count. The second half is false, and with it the asymmetry.
+#:
+#: Measured at this tip on ``10.1115-1.4007737`` p4 Table 1, banding the box
+#: ``x 311.0-555.0``, ``y 520.0-740.0``: the subscript band at ``y=729.52`` has
+#: ``font_height`` 5.60 and its true parent at ``y=730.43`` has 5.33, so
+#: ``5.60 <= 0.75 * 5.33 = 4.00`` is False and the real parent is REJECTED -- the strict
+#: direction, behaving as designed. The orphaned subscript then satisfies the data row
+#: 15.98 pt below (``font_height`` 8.00, ``5.60 <= 6.00``) and folds into that instead.
+#: The merge returns 23 rows and NO refusal, and the phi=0.5 row reads
+#: ``'0.5L;u67.2L7.110.6'``: the laminar flame speed is inventoried as ``L;u67.2``
+#: where the page prints 67.2 cm/s. So the strict direction does not surface as a wrong
+#: row count -- it silently corrupts a cell's TEXT, which is the same failure class the
+#: permissive direction was feared for. Rejecting the true parent is precisely what frees
+#: the affix to adopt a wrong one.
+#:
+#: Scope of that measurement, stated because it is easy to over-read: the corrupted row is
+#: real in the derivation, but no caller receives it as COMPLETE on this table at this tip.
+#: 256 boxes swept over that region return 144 ``column_structure_unresolved``, 64
+#: ``footprint_insane``, 48 ``orphaned_band_above_the_box`` and ZERO complete inventories --
+#: an unrelated later check happens to catch this one, which is not the same as the affix
+#: logic being safe.
+#:
+#: Choosing the value is therefore reopened and tracked separately; do not change it here,
+#: because the corpus it would be measured against is under work in flight. What survives
+#: unaffected is :attr:`InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND` rather than a
+#: proximity tie-break: that is a decision about arbitrariness, not about this number.
 AFFIX_HEIGHT_RATIO = 0.75
 
 #: How much closer one neighbour must be than the other before the affix band's parent is
@@ -522,13 +547,28 @@ def _has_comparable_geometry(fragment: TextFragment) -> bool:
     An earlier version of this docstring claimed the enumeration was exhaustive -- four
     floats, ``page`` compared only for equality, therefore no fifth patch possible. That
     conflates exhaustiveness over FIELDS with exhaustiveness over ways a number can mislead
-    this module, and it is refuted by construction: :func:`_looks_like_affix` is a RATIO with
-    no upper bound, so when a header is merely TALLER than the row beneath it, that row reads
-    as affix-shaped against the header and is folded INTO it -- the header is the parent and
-    the ordinary row beneath is what disappears. ``font_height`` 8.0 gives three rows; 10.7
-    gives two, the first anchored ``HeadBbb``; and no value involved is non-finite, negative
-    or backwards. :func:`_has_comparable_geometry` cannot reach that and must not be widened
-    to try: a magnitude ratio unbounded above is a different fault with a different repair,
+    this module, and it is refuted by construction: :func:`_looks_like_affix` compares a band
+    against a NEIGHBOUR's height, so a header tall enough relative to the row beneath it makes
+    that row read as affix-shaped and fold INTO it -- the header is the parent and the
+    ordinary row beneath is what disappears. ``font_height`` 8.0 gives three rows; 10.7 gives
+    two, the first anchored ``HeadBbb``; and no value involved is non-finite, negative or
+    backwards.
+
+    Two things this paragraph asserted about that predicate were wrong, and both are corrected
+    here rather than softened. It is NOT "a ratio with no upper bound": the test is
+    ``band <= AFFIX_HEIGHT_RATIO * parent`` with ``parent > 0``, which bounds the band/parent
+    ratio at 0.75 by construction. Measured page-wide over the eight-paper corpus at this tip
+    (73 pages banded, 43 refusing inside the merge and contributing nothing): 457 accepted
+    folds, maximum ratio 0.699989, none above 0.75, and none with a parent SHORTER than the
+    band. Nor does the fold need a header "merely TALLER" than the row -- it needs the header
+    at least ``1 / 0.75`` = 4/3 the row's height. The 10.7-over-8.0 example survives only
+    because 10.7 / 8.0 = 1.3375, a quarter of one percent inside the boundary; 10.0 over 8.0
+    is 1.25 and does not fold, since ``8.0 <= 7.5`` is false. The construction is reproducible
+    and it has NO instance in the eight papers, so read it as a demonstrated possibility, not
+    as something the corpus witnesses.
+
+    :func:`_has_comparable_geometry` cannot reach that and must not be widened to try: a
+    height RELATION between neighbouring bands is a different fault with a different repair,
     tracked as **I-005** in the campaign ledger. What this predicate covers is comparability,
     completely; what it does not cover is every other way a finite number can be wrong.
 
@@ -888,10 +928,20 @@ def _rotated_band_sharer_refusal(
     ``SHOCK_TUBE_CAPTION_INSIDE``    680.0    :attr:`COLUMN_STRUCTURE_UNRESOLVED` -- REACHES
     ===========================  ==========  =======================================
 
-    So two reach, and band-scoped both pass: the probe reports 4/4. Substituting a
-    WINDOW-scoped variant here instead gives **3/4** -- ``SHOCK_TUBE_CAPTION_INSIDE`` flips
-    from :attr:`COLUMN_STRUCTURE_UNRESOLVED` to a rotated refusal raised on a page
-    watermark, a correct finding replaced by a false one.
+    So two reach, and band-scoped both pass: probe 50 reports 4/4 on THIS branch with the
+    branch expectation set. Substituting a WINDOW-scoped variant here instead gives **3/4**
+    -- ``SHOCK_TUBE_CAPTION_INSIDE`` flips from :attr:`COLUMN_STRUCTURE_UNRESOLVED` to a
+    rotated refusal raised on a page watermark, a correct finding replaced by a false one.
+
+    Every probe count here is scoped to a checkout, because a bare "4/4" is not a fact about
+    the corpus. Measured against ``official/main`` ``499835c``, three of the four footprints
+    return exactly what they return here; ``WHOLE_TABLE`` returns
+    :attr:`InventoryRefusalReason.UNMAPPED_MEMBER` there and
+    :attr:`InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE` here, which is this
+    ticket in one line -- the cut fragment used to be invisible and the box was blamed for
+    an unmapped glyph instead. The probe file as registered cannot be RUN against that commit
+    at all: its expectation set names a member ``499835c`` does not define, so it dies at
+    import rather than reporting a score.
 
     Which of the two the hoist actually added is the sharper point. ``TRUNCATED`` reached
     at both orderings, because the look-below guard has always run after this line.

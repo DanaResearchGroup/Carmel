@@ -281,10 +281,18 @@ def _fragment_digest(fragment: TextFragment) -> str:
 def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> dict[str, Any]:
     """The full stored form of one inventory, ready for :func:`canonical_json_bytes`.
 
-    Every field here is identity: there is no diagnostics half. A timestamp or a hostname
-    would have to be excluded from the address and would then be a field the verifier does
-    not check, which is a place for a wrong value to live unnoticed. Nothing needed one, so
-    nothing was added.
+    There IS a diagnostics half, and it has exactly one member: a refusal's ``detail``.
+    :func:`_comparable` strips it from every refusal entry before comparison, so the prose is
+    STORED but not COMPARED, and rewording it cannot invalidate a stored record. Every other
+    field here is identity.
+
+    The general worry that split raises is real -- an excluded field is a field the verifier
+    does not check, which is a place for a wrong value to live unnoticed -- and ``detail`` is
+    the one kind of field it does not apply to. It is derived from the same refusal whose
+    ``reason`` IS compared, and the reason is what a consumer branches on, so a wrong
+    ``detail`` cannot make a wrong record verify: the finding it describes is pinned beside
+    it. A timestamp or a hostname would fail that test, being derived from nothing that is
+    compared, and still has no place here.
 
     ``pypdf_version`` is identity rather than diagnostics because the geometry IS the
     evidence: an engine that changed baseline semantics or CTM composition could keep every

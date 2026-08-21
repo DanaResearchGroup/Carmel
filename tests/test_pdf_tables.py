@@ -965,9 +965,12 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         ``Downloaded from http://asmedig...`` watermark on ``10.1115-1.4007737`` p5 at
         ``y=746.99``, ``x_start=588.99`` where the box ends at 555.0 on a 612 pt page, so it
         sits in the right margin 34 pt clear of the box. Measured at the shipped order of
-        checks: a window-scoped variant substituted at this call site takes probe 50 from
-        4/4 to 3/4, refusing that footprint on the watermark and replacing the
-        ``column_structure_unresolved`` it correctly reports.
+        checks, on THIS branch with the branch expectation set: a window-scoped variant
+        substituted at this call site takes probe 50 from 4/4 to 3/4, refusing that footprint
+        on the watermark and replacing the ``column_structure_unresolved`` it correctly
+        reports. A probe score is scoped to a checkout -- against ``official/main``
+        ``499835c`` this file's expectation set cannot run at all, because it names a refusal
+        reason that commit does not define.
 
         The fixture carries that watermark's geometry faithfully, INCLUDING its offset from
         the nearest line: 1.92 pt, the real measured gap, which is outside this module's
