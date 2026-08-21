@@ -247,10 +247,40 @@ class InventoryRefusalReason(StrEnum):
       That reason asks whether the band below the box is a ROW, and a marker is not one;
       this one asks whether the edge cut something, and a marker is something. One inside
       the box refuses under :attr:`UNMAPPED_MEMBER`, so a bisected one must not pass.
-    * Rotated fragments ARE skipped, for the reason ``pdf_cells`` gives: a rotated extent
-      does not bound anything horizontally, so recording one as a straddler would invent a
-      finding from a meaningless number. One inside the box already refuses under
-      :attr:`ROTATED_OR_INSANE_FRAGMENT`."""
+    * Rotated fragments ARE skipped -- and here this lane DIVERGES from ``pdf_cells``,
+      which blocks on a rotated band-sharer (``RegionRefusalReason.ROTATED_NEIGHBOUR``,
+      a member of its ``HALTS_EVALUATION`` set) precisely because it cannot tell. The
+      divergence is deliberate and is recorded below rather than left for a reader to
+      discover as an inconsistency.
+
+    Why the two lanes answer the same question differently:
+
+    * **"On the band" means different things.** ``pdf_cells``'s band is +/-0.5 pt around
+      ONE baseline, so a rotated fragment in it really does share the cell's printed line.
+      This lane's window is the whole box, 80-100 pt tall on the four registered corpus
+      footprints, which is a horizontal slab of the page rather than a line.
+    * **Measured, blocking would be wrong here.** Across the eight-paper corpus 267 of
+      78178 fragments are rotated, and exactly ONE falls in a registered footprint's
+      y-window: a ``Downloaded from http...`` watermark on ``10.1115-1.4007737`` p5, whose
+      ``x_start`` is 34 pt clear of the box's right edge on the other side of the page.
+      Blocking would flip 1 of the 4 registered expectations, and the thing it caught would
+      be page furniture (probes/i004_bad_geometry_census.py).
+    * **The extent cannot narrow the block either.** For 23 of 257 rotated fragments (8.9%)
+      ``x_end`` lies OUTSIDE the page box, overhanging by up to 753.8 pt on a 595.3 pt page:
+      it is ``x_start`` plus the advance widths laid along the rotated axis, never projected
+      onto x. So "block only the rotated fragments whose extent overlaps the box" would rest
+      on the very number the rule declares meaningless.
+
+    The cost is stated rather than hidden, exactly as ``pdf_cells`` states its own: **a tally
+    of this reason is a LOWER BOUND**, short by the rotated fragments an edge cuts. The hole
+    is bounded on one side -- a rotated fragment INSIDE the box still refuses under
+    :attr:`ROTATED_OR_INSANE_FRAGMENT` -- and what escapes is only one the edge bisects.
+
+    One measurement points at the repair without making the claim: ``x_start`` was inside the
+    page box for 257 of 257 rotated fragments, so it looks like a true text origin where
+    ``x_end`` is not a bound. An origin-based straddle rule might therefore close this hole.
+    That is a different claim with a different measurement behind it, and it is not made
+    here."""
 
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
     """A row's own occupied blocks outnumber the columns derived across all rows.
@@ -264,11 +294,24 @@ class InventoryRefusalReason(StrEnum):
     derivable from aligned emptiness once a row spans."""
 
     ROTATED_OR_INSANE_FRAGMENT = "rotated_or_insane_fragment"
-    """A fragment inside the box is rotated, or its extent is non-finite or backwards.
+    """This module cannot read a fragment's geometry, so it declines to read the box.
+
+    Two call sites, one fault -- geometry that cannot be compared -- at two scopes:
+
+    * a fragment INSIDE the box is rotated, or its extent is non-finite or backwards;
+    * ANY fragment on the box's page has a non-finite or backwards extent, whether or not
+      the box contains it.
 
     Rotated text has no meaningful baseline band or x-interval in this module's model, and
     a backwards extent poisons every column derivation silently. ``pdf_cells`` guards this
-    class explicitly; this module must not be the softer door into the same data."""
+    class explicitly; this module must not be the softer door into the same data.
+
+    The second scope deliberately reuses this member rather than adding a sibling for
+    "uncomparable OUTSIDER", because the inside/outside partition such a sibling would rest
+    on is not knowable for exactly these fragments: a NaN extent is excluded from the box by
+    :func:`_in_footprint` only because ``<`` against NaN is quietly False, not because the
+    box does not contain it. Splitting a reason along a boundary the fault itself destroys
+    would be a distinction the record cannot support."""
 
     UNATTACHABLE_AFFIX_BAND = "unattachable_affix_band"
     """A candidate affix band is interior to NEITHER neighbour.
@@ -477,6 +520,45 @@ def _in_footprint(extraction: FragmentExtraction, footprint: ClaimedFootprint) -
     ]
 
 
+def _uncomparable_geometry_refusal(
+    extraction: FragmentExtraction, footprint: ClaimedFootprint
+) -> InventoryRefusal | None:
+    """Refuse when any fragment on the box's page has geometry that cannot be compared.
+
+    Non-finite or backwards extents fail open in the most complete way there is: every
+    ``<`` against NaN is quietly False, so such a fragment is not a member (:func:`_in_footprint`
+    excludes it), not a straddler (:func:`_straddle_refusal`'s edge tests are both False), not
+    an orphan above or below, and not part of any excluded-column cluster. It vanishes exactly
+    as the straddler did, one comparison over -- and unlike the straddler it leaves no
+    trace anywhere, because there is no comparison it could have satisfied.
+
+    Scoped to the PAGE, not the box's y-window, and that is the whole point: a NaN
+    ``baseline_y`` fails ``y_bottom <= baseline_y <= y_top`` too, so a window-scoped check
+    would read only the fragments that already survived the test NaN defeats. ``pdf_cells``
+    reaches the same conclusion for the same reason at ``UNCOMPARABLE_NEIGHBOUR``.
+
+    Blank fragments are NOT skipped here, unlike in :func:`_straddle_refusal`. That function
+    asks whether the edge cut TEXT, and a bare space text-show operation loses nothing when
+    it goes; this one asks whether the page's geometry can be read at all, and an unreadable
+    number is unreadable whether or not a glyph was drawn with it.
+
+    Measured: 0 of 78178 fragments across the eight-paper corpus have a non-finite or
+    backwards extent, so this costs nothing observed. Like ``INVALID_GEOMETRY`` in the
+    single-cell lane, it guards the SHAPE of the input rather than an observed instance.
+    """
+    unreadable = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page and (not _is_finite(f.x_start, f.x_end, f.baseline_y) or f.x_end < f.x_start)
+    ]
+    if not unreadable:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
+        f"{len(unreadable)} fragment(s) on the box's page have a non-finite or backwards extent",
+    )
+
+
 def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprint) -> InventoryRefusal | None:
     """Refuse when a side edge falls INSIDE a fragment sitting on one of the box's bands.
 
@@ -488,6 +570,11 @@ def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprin
     ``x_start < edge < x_end`` is strict on both sides, so a cell that begins exactly on
     ``x_start`` or ends exactly on ``x_end`` touches the boundary without being cut by it
     and stays a member -- membership is inclusive of the edge, and this must not narrow it.
+
+    Reaches here only once :func:`_uncomparable_geometry_refusal` has passed, so both edge
+    tests are comparisons between real numbers. Rotated fragments are skipped and this lane
+    knowingly differs from ``pdf_cells`` in doing so; the reason's own docstring carries the
+    divergence, the measurement behind it, and the residual hole it leaves.
     """
     cut = [
         f
@@ -864,6 +951,15 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                 "the claimed caption text is not printed at the claimed baseline",
             )
         )
+
+    # Comparable geometry is the precondition of every check below, so it is established
+    # before the first of them rather than in the middle. Page-scoped, for the reason
+    # `pdf_cells` gives at UNCOMPARABLE_NEIGHBOUR: a NaN BASELINE never reaches the box's
+    # y-window at all, so a window-scoped check would inspect only the fragments that
+    # already passed the test NaN defeats.
+    uncomparable = _uncomparable_geometry_refusal(extraction, footprint)
+    if uncomparable is not None:
+        return refused(uncomparable)
 
     orphaned = [
         f

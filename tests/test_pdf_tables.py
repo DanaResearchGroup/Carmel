@@ -926,11 +926,15 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
     def test_a_rotated_straddler_is_not_recorded_as_one(self) -> None:
         """A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally.
 
-        ``pdf_cells`` states that rule for its own straddle test and
-        ``_truncated_column_refusal`` already skips rotated fragments for it; calling one a
-        straddler here would be inventing a finding out of a meaningless number. It is not
-        a hole in the box either -- a rotated fragment INSIDE it refuses under
-        ``ROTATED_OR_INSANE_FRAGMENT``, which this asserts rather than assumes.
+        Calling one a straddler would invent a finding out of a meaningless number:
+        measured over the corpus, 23 of 257 rotated fragments report an ``x_end`` outside
+        the page box, one of them 753.8 pt past a 595.3 pt page. It is not a hole in the box
+        either -- a rotated fragment INSIDE it refuses under ``ROTATED_OR_INSANE_FRAGMENT``,
+        which this asserts rather than assumes.
+
+        This lane knowingly differs from ``pdf_cells``, which blocks on a rotated
+        band-sharer. ``test_the_rotated_divergence_from_the_single_cell_lane_is_deliberate``
+        pins the case that decided it.
         """
         spun = frag("91", 130.7, 322.5, 91.0, rotated=True)
 
@@ -942,6 +946,29 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         rotated_member = build_inventory(extraction_of(*a_row_the_edge_can_cut(), inside), footprint())
 
         assert [r.reason for r in rotated_member.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_the_rotated_divergence_from_the_single_cell_lane_is_deliberate(self) -> None:
+        """The measured case that decided it: a page watermark, not part of any table.
+
+        ``pdf_cells`` blocks on a rotated fragment sharing its region's band, and this lane
+        does not. The difference is what "the band" means. Its band is +/-0.5 pt around one
+        baseline; this box is 80 pt tall, so "in the window" sweeps in whatever else the
+        page prints at that height. Across the corpus exactly one rotated fragment lands in
+        a registered footprint's y-window and it is a ``Downloaded from http...`` watermark
+        whose ``x_start`` is 34 pt clear of the box, on the other side of the page.
+
+        The geometry below is that watermark's, rebased onto this fixture's box: rotated,
+        inside the y-window, starting well beyond ``x_end``, and reporting a width far wider
+        than any page. Blocking rotated fragments in the window would refuse this table on
+        it. That is the false refusal this divergence buys out of, and the day someone
+        decides the trade the other way, this test is what they have to argue with.
+        """
+        watermark = frag("Downloaded from http://x/", 324.0, 1008.0, 91.0, rotated=True)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), watermark), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.rows) == 3
 
     def test_an_unmapped_straddler_still_refuses(self) -> None:
         """Deliberately unlike ``ORPHANED_BAND_BELOW_THE_BOX``, which skips unmapped ones.
@@ -989,6 +1016,121 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         inventory = build_inventory(extraction_of(*simple_grid()), footprint(caption_x_start=60.0))
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.CAPTION_ANCHOR_ABSENT]
+
+
+class TestGeometryThatCannotBeComparedRefuses:
+    """The straddler's defect class, one comparison over.
+
+    A fragment whose extents are ``NaN``, infinite or backwards makes EVERY comparison in
+    this module quietly False. It is not a member, because ``_in_footprint``'s test fails;
+    not a straddler, because both edge tests fail; not an orphan above or below; and not
+    part of any excluded-column cluster. Where the ``'91'`` fragment at least satisfied one
+    test in one direction, this one satisfies nothing at all and so leaves no trace
+    anywhere. Zero corpus fragments are in this shape (0 of 78178) -- it guards the shape of
+    the input, not an observed instance, which is the footing ``INVALID_GEOMETRY`` has
+    always stood on in the single-cell lane.
+    """
+
+    @pytest.mark.parametrize(
+        ("x_start", "x_end", "baseline_y", "what"),
+        [
+            (300.0, float("nan"), 91.0, "a NaN right extent, beside the box"),
+            (float("nan"), 320.0, 91.0, "a NaN left extent, beside the box"),
+            (float("inf"), float("inf"), 91.0, "an infinite extent"),
+            # Backwards AND left of `x_start`, which is the only way a backwards extent
+            # escapes: `x_start >= box.x_start and x_end <= box.x_end` is satisfied by most
+            # of them by accident, so the members-only check catches those already. This
+            # one fails the first half and falls straight through the gap.
+            (40.0, 30.0, 91.0, "a backwards extent that also fails the containment test"),
+            (300.0, 320.0, float("nan"), "a NaN baseline, which reaches no band at all"),
+        ],
+        ids=["nan-x-end", "nan-x-start", "infinite", "backwards", "nan-baseline"],
+    )
+    def test_an_outsider_this_module_cannot_compare_refuses(
+        self, x_start: float, x_end: float, baseline_y: float, what: str
+    ) -> None:
+        unreadable = frag("?", x_start, x_end, baseline_y)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), unreadable), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT], what
+
+    def test_the_nan_baseline_case_is_why_the_check_is_page_scoped(self) -> None:
+        """A window-scoped check would read only what survived the test NaN defeats.
+
+        ``y_bottom <= baseline_y <= y_top`` is itself a comparison NaN fails, so a fragment
+        with a NaN baseline is dropped one step BEFORE any x test runs -- and a check scoped
+        to the box's own bands would therefore never see it. The premise is asserted here
+        rather than trusted: the fragment is confirmed absent from the window before the
+        refusal that catches it anyway is asserted.
+        """
+        unreadable = frag("?", 300.0, 320.0, float("nan"))
+        fp = footprint()
+
+        assert not (fp.y_bottom <= unreadable.baseline_y <= fp.y_top), "the premise: NaN fails the window test"
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), unreadable), fp)
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_the_unreadable_outsider_used_to_be_invisible_and_this_pins_that(self) -> None:
+        """The same pin the straddler has, for the fragment that leaves even less behind.
+
+        Before the guard these were the SAME inventory: a document carrying a fragment no
+        comparison in this module can evaluate, and a document that never printed it. Both
+        reported COMPLETE with three clean rows. The first half is what the module still
+        does with the fragment absent, which is correct; the second is the difference the
+        guard makes.
+        """
+        without = build_inventory(extraction_of(*a_row_the_edge_can_cut()), footprint())
+
+        assert without.refusals == ()
+        assert len(without.rows) == 3
+
+        unreadable = build_inventory(
+            extraction_of(*a_row_the_edge_can_cut(), frag("?", 300.0, float("nan"), 91.0)), footprint()
+        )
+
+        assert unreadable.complete is False
+        assert [r.reason for r in unreadable.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_a_blank_unreadable_fragment_still_refuses(self) -> None:
+        """Deliberately unlike the straddle guard, which skips blanks.
+
+        That one asks whether the edge cut TEXT, and a bare space text-show operation loses
+        nothing when it goes. This one asks whether the page's geometry can be read at all,
+        and an unreadable number is unreadable whether or not a glyph was drawn with it.
+        """
+        blank = frag("   ", 300.0, float("nan"), 91.0)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), blank), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_an_unreadable_fragment_on_another_page_does_not_refuse(self) -> None:
+        """Page-scoped, not document-scoped. A broken glyph run on page 9 says nothing about
+        whether the box on page 1 has a clean boundary, and refusing on it would make one
+        malformed figure caption anywhere in a paper condemn every table in it."""
+        elsewhere = frag("?", 300.0, float("nan"), 91.0, page=2)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), elsewhere), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.rows) == 3
+
+    def test_it_is_settled_before_the_straddle_check(self) -> None:
+        """Order matters when a page carries both faults, and NaN is the one that decides.
+
+        A straddler's edge test is a comparison, so it is only meaningful once the page's
+        geometry is known to be comparable. With both present the reason must be the
+        geometry -- the straddle finding is not more specific, it is less well-founded.
+        """
+        fragments = (*a_row_the_edge_can_cut(), RIGHT_EDGE_STRADDLER, frag("?", 300.0, float("nan"), 91.0))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
 
 class TestTheDocumentLevelRefusals:
