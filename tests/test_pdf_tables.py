@@ -142,6 +142,7 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
             extraction_of(*two_rows_within_two_tolerances(), frag("?", 320.0, 330.0, 119.65)),
             footprint(),
         ),
+        (extraction_of(*a_row_the_edge_can_cut(), RIGHT_EDGE_STRADDLER), footprint()),
     ]
 
 
@@ -169,6 +170,32 @@ def dropped_column() -> tuple[TextFragment, ...]:
     return (
         frag("gamma", 320.0, 350.0, 134.5),
         frag("0.4", 320.0, 344.0, 71.5),
+    )
+
+
+#: A value the box's RIGHT edge falls inside: too wide to be a member, and overlapping the
+#: box rather than sitting beside it, so neither the containment test nor the
+#: truncated-column guard ever sees it.
+#:
+#: Mirrors what the real target carries on its pressure row -- one fragment at
+#: ``x=130.73-322.47`` where the claimed box ends at 290 -- without carrying the paper's text.
+RIGHT_EDGE_STRADDLER = frag("91", 130.7, 322.5, 91.0)
+
+#: The same shape at the other side, so the guard cannot be accidentally one-sided.
+LEFT_EDGE_STRADDLER = frag("91", 41.0, 128.0, 91.0)
+
+
+def a_row_the_edge_can_cut() -> tuple[TextFragment, ...]:
+    """``simple_grid`` plus a third band, between its two, for a straddler to sit on.
+
+    Its own three fragments are wholly inside the box, so the band is a clean row on its
+    own: whatever the straddler tests then show is the straddler's doing, not this row's.
+    """
+    return (
+        *simple_grid(),
+        frag("P", 53.0, 60.0, 91.0),
+        frag("1", 122.0, 128.0, 91.0),
+        frag("8", 227.0, 233.0, 91.0),
     )
 
 
@@ -805,6 +832,150 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         assert inventory.refusals == ()
         assert [r.ordinal for r in inventory.rows] == [0, 1]
         assert inventory.rows[0].baseline_y == 120.8
+
+    def test_a_fragment_the_right_edge_cuts_through_refuses(self) -> None:
+        """Neither existing side test could see it, and that was the whole gap.
+
+        ``_in_footprint`` admits a fragment only when it is WHOLLY inside, so a straddler
+        is not a member; ``_truncated_column_refusal`` reads only fragments wholly BESIDE
+        the box, so it skips exactly the ones that overlap it. Between the two, the
+        fragment was deleted and nothing recorded that it had been there.
+        """
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), RIGHT_EDGE_STRADDLER), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_a_fragment_the_left_edge_cuts_through_refuses(self) -> None:
+        """The same shape at the other side. A guard that watched one edge only would be
+        the one-edge state this whole class exists to have ended."""
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), LEFT_EDGE_STRADDLER), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_the_dropped_straddler_used_to_be_invisible_and_this_pins_that(self) -> None:
+        """The corruption the guard replaced, pinned so a regression cannot restore it.
+
+        Before the guard these were the SAME inventory: a document whose middle value the
+        box's edge cuts through, and a document that never printed that value at all. Both
+        reported COMPLETE, with a row that had quietly lost part of itself and every
+        surviving cell correctly grounded. On the real target that turned the pressure row
+        into ``1e`` beside ``e8`` and refused nothing.
+
+        The first half of this test is what the module still does with the value ABSENT --
+        which is correct, because there is then nothing to notice. The second half is the
+        difference the guard makes, and keeping them in one test is deliberate: they are
+        the same input to a reader, and a regression that let them agree again would have
+        to make this test fail rather than merely leave a stale sibling passing.
+        """
+        without = build_inventory(extraction_of(*a_row_the_edge_can_cut()), footprint())
+
+        assert without.refusals == ()
+        assert [(c.row, c.col, c.text) for c in without.cells if c.row == 1] == [
+            (1, 0, "P"),
+            (1, 1, "1"),
+            (1, 2, "8"),
+        ]
+
+        cut = build_inventory(extraction_of(*a_row_the_edge_can_cut(), RIGHT_EDGE_STRADDLER), footprint())
+
+        assert cut.complete is False
+        assert [r.reason for r in cut.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_a_fragment_reaching_exactly_to_an_edge_is_still_admitted(self) -> None:
+        """Membership is inclusive of the edge, and the guard must not quietly narrow it.
+
+        A cell that starts exactly on ``x_start`` or ends exactly on ``x_end`` touches the
+        boundary without being cut by it, so it is a member. That is the case that
+        separates "the edge falls INSIDE this fragment" from "the fragment stops at the
+        edge", and a ``<`` written as ``<=`` would refuse every table drawn to its own
+        content's extent.
+        """
+        fragments = (
+            *simple_grid(),
+            frag("P", 50.0, 70.0, 91.0),
+            frag("1", 122.0, 128.0, 91.0),
+            frag("8", 223.0, 290.0, 91.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        assert [(c.row, c.col, c.text) for c in inventory.cells if c.row == 1] == [
+            (1, 0, "P"),
+            (1, 1, "1"),
+            (1, 2, "8"),
+        ]
+
+    def test_a_straddler_on_no_band_of_the_box_does_not_refuse(self) -> None:
+        """The guard is scoped to the box's own y-window, exactly as membership is.
+
+        A wide fragment far below the table overlaps the box's x-range on a line the box
+        never claimed, and refusing on it would refuse every table with a full-width
+        paragraph beneath it. What makes a straddler a straddler is that it would have
+        been a member but for the x test.
+        """
+        below = frag("a wide line of running text", 41.0, 322.5, -35.0)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), below), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.rows) == 3
+
+    def test_a_rotated_straddler_is_not_recorded_as_one(self) -> None:
+        """A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally.
+
+        ``pdf_cells`` states that rule for its own straddle test and
+        ``_truncated_column_refusal`` already skips rotated fragments for it; calling one a
+        straddler here would be inventing a finding out of a meaningless number. It is not
+        a hole in the box either -- a rotated fragment INSIDE it refuses under
+        ``ROTATED_OR_INSANE_FRAGMENT``, which this asserts rather than assumes.
+        """
+        spun = frag("91", 130.7, 322.5, 91.0, rotated=True)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), spun), footprint())
+
+        assert inventory.refusals == ()
+
+        inside = frag("91", 130.7, 180.0, 91.0, rotated=True)
+        rotated_member = build_inventory(extraction_of(*a_row_the_edge_can_cut(), inside), footprint())
+
+        assert [r.reason for r in rotated_member.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_an_unmapped_straddler_still_refuses(self) -> None:
+        """Deliberately unlike ``ORPHANED_BAND_BELOW_THE_BOX``, which skips unmapped ones.
+
+        That reason asks whether the band below the box is a ROW, and a marker is not one.
+        This one asks whether the edge cut something, and a marker is something -- an
+        unmapped fragment inside the box refuses under ``UNMAPPED_MEMBER``, so letting the
+        same fragment through because the edge happened to bisect it would make the box's
+        boundary the softer door into the same data.
+        """
+        marker = frag("/C14", 130.7, 322.5, 91.0, glyph_mapping=GlyphMapping.UNMAPPED)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), marker), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_the_straddle_refusal_does_not_depend_on_the_glyph_state(self) -> None:
+        """The reason a caller reads must not turn on whether some OTHER fragment mapped.
+
+        On the real target the whole-table footprint carries both faults at once: an
+        unmapped degree sign inside the box, and a value the right edge cuts through. If
+        the unmapped check ran first, repairing the glyph -- or meeting a document that
+        never had one -- would silently take the straddler's refusal away again. So the
+        boundary is settled before the contents are read, and the same input refuses
+        identically with the marker present and absent.
+        """
+        marker = frag("/C14", 61.8, 61.8, 91.0, glyph_mapping=GlyphMapping.UNMAPPED)
+        fragments = (*a_row_the_edge_can_cut(), RIGHT_EDGE_STRADDLER)
+
+        with_marker = build_inventory(extraction_of(*fragments, marker), footprint())
+        without_marker = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in with_marker.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+        assert [r.reason for r in without_marker.refusals] == [r.reason for r in with_marker.refusals]
 
     def test_a_moved_caption_start_refuses_even_when_the_text_matches(self) -> None:
         """``caption_x_start`` is checked against the document, not against the box.

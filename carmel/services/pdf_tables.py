@@ -221,6 +221,37 @@ class InventoryRefusalReason(StrEnum):
     (probes/m1_band_ambiguity.py). It is ordinary two-column journal typesetting, not an
     exotic shape."""
 
+    STRADDLING_FRAGMENT_AT_THE_BOX_EDGE = "straddling_fragment_at_the_box_edge"
+    """A fragment on one of the box's own bands is cut by its left or right edge.
+
+    The sibling of :attr:`~carmel.services.pdf_cells.RegionRefusalReason.STRADDLED`, which
+    states the same rule one layer down: something was cut through rather than included or
+    excluded, so the claimed boundary is not clean and nothing derived inside it can be
+    trusted. The concept is deliberately the single-cell lane's rather than a new one --
+    this is the same fault at a different scale.
+
+    It closes a gap where two tests each assumed the other covered the case.
+    :func:`_in_footprint` admits a fragment only when it is WHOLLY inside, so a straddler
+    is never a member and never reaches banding, columns, cells, the unmapped check or the
+    rotation check. :func:`_truncated_column_refusal` reads only fragments wholly BESIDE the
+    box, skipping by construction the ones that overlap it. The straddler therefore left no
+    trace in either direction. Measured on the real target with its one unmapped page-4
+    glyph forced to mapped: the whole-table footprint returned a COMPLETE nine-row,
+    three-column inventory with no refusal, and the pressure row read ``1e`` beside ``e8``
+    -- the value between them was a single fragment ending 32.5 pt past the box's right
+    edge, silently deleted.
+
+    Two boundaries of the rule, both chosen for the direction they fail in:
+
+    * Unmapped fragments are NOT skipped, unlike in :attr:`ORPHANED_BAND_BELOW_THE_BOX`.
+      That reason asks whether the band below the box is a ROW, and a marker is not one;
+      this one asks whether the edge cut something, and a marker is something. One inside
+      the box refuses under :attr:`UNMAPPED_MEMBER`, so a bisected one must not pass.
+    * Rotated fragments ARE skipped, for the reason ``pdf_cells`` gives: a rotated extent
+      does not bound anything horizontally, so recording one as a straddler would invent a
+      finding from a meaningless number. One inside the box already refuses under
+      :attr:`ROTATED_OR_INSANE_FRAGMENT`."""
+
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
     """A row's own occupied blocks outnumber the columns derived across all rows.
 
@@ -444,6 +475,35 @@ def _in_footprint(extraction: FragmentExtraction, footprint: ClaimedFootprint) -
         and f.x_end <= footprint.x_end
         and footprint.y_bottom <= f.baseline_y <= footprint.y_top
     ]
+
+
+def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprint) -> InventoryRefusal | None:
+    """Refuse when a side edge falls INSIDE a fragment sitting on one of the box's bands.
+
+    The y-window is :func:`_in_footprint`'s, exactly, and that pairing is the definition:
+    a straddler is a fragment that would have been a member but for the x test. Scoping it
+    to the page instead would refuse every table with a full-width paragraph beneath it,
+    which is a line the box never claimed and never lost.
+
+    ``x_start < edge < x_end`` is strict on both sides, so a cell that begins exactly on
+    ``x_start`` or ends exactly on ``x_end`` touches the boundary without being cut by it
+    and stays a member -- membership is inclusive of the edge, and this must not narrow it.
+    """
+    cut = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page
+        and f.text.strip()
+        and not f.rotated
+        and footprint.y_bottom <= f.baseline_y <= footprint.y_top
+        and (f.x_start < footprint.x_start < f.x_end or f.x_start < footprint.x_end < f.x_end)
+    ]
+    if not cut:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE,
+        f"{len(cut)} fragment(s) on the box's own bands are cut by its side edge",
+    )
 
 
 def _bands(fragments: list[TextFragment]) -> list[tuple[float, list[TextFragment]]]:
@@ -826,6 +886,17 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                 f"{len(orphaned)} fragment(s) sit between the caption and the box's top edge",
             )
         )
+
+    # The SIDE edges are settled here, before the box's contents are read, because a
+    # boundary that cuts through a fragment makes the membership set itself untrustworthy
+    # -- the same footing the orphan check above stands on, and unlike the edge guards at
+    # the bottom of this function, which genuinely need the derivation they check. Running
+    # it after `unmapped` instead would make the reason a caller reads depend on whether
+    # some OTHER fragment mapped: on the real target the whole-table footprint carries both
+    # faults, and repairing the glyph would have taken the straddler's refusal away again.
+    straddling = _straddle_refusal(extraction, footprint)
+    if straddling is not None:
+        return refused(straddling)
 
     inside = _in_footprint(extraction, footprint)
     insane_fragments = [
