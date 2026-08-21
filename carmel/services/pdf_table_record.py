@@ -281,10 +281,18 @@ def _fragment_digest(fragment: TextFragment) -> str:
 def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> dict[str, Any]:
     """The full stored form of one inventory, ready for :func:`canonical_json_bytes`.
 
-    Every field here is identity: there is no diagnostics half. A timestamp or a hostname
-    would have to be excluded from the address and would then be a field the verifier does
-    not check, which is a place for a wrong value to live unnoticed. Nothing needed one, so
-    nothing was added.
+    There IS a diagnostics half, and it has exactly one member: a refusal's ``detail``.
+    :func:`_comparable` strips it from every refusal entry before comparison, so the prose is
+    STORED but not COMPARED, and rewording it cannot invalidate a stored record. Every other
+    field here is identity.
+
+    The general worry that split raises is real -- an excluded field is a field the verifier
+    does not check, which is a place for a wrong value to live unnoticed -- and ``detail`` is
+    the one kind of field it does not apply to. It is derived from the same refusal whose
+    ``reason`` IS compared, and the reason is what a consumer branches on, so a wrong
+    ``detail`` cannot make a wrong record verify: the finding it describes is pinned beside
+    it. A timestamp or a hostname would fail that test, being derived from nothing that is
+    compared, and still has no place here.
 
     ``pypdf_version`` is identity rather than diagnostics because the geometry IS the
     evidence: an engine that changed baseline semantics or CTM composition could keep every
@@ -402,6 +410,47 @@ def footprint_unreadable_reason(payload: Mapping[str, Any]) -> str | None:
     return None
 
 
+#: Keys inside a refusal entry that are DIAGNOSTIC PROSE, not derivation identity.
+#:
+#: A refusal's ``reason`` is a structural finding: it names which check refused, it is an
+#: enum a consumer switches on, and a change to it is a change to what the derivation
+#: concluded. Its ``detail`` is a sentence for a human -- a count, a coordinate, a
+#: rephrasing -- and nothing reads it programmatically.
+#:
+#: They were compared together, which made every reworded diagnostic a false ``MISMATCHED``:
+#: a record stored before the wording changed reports that its derivation no longer
+#: reproduces, with nothing about the document, the footprint or the finding altered. That
+#: is worse than a missing check, because ``MISMATCHED`` is the status that says "this record
+#: is not evidence", and spending it on a copy-edit teaches a consumer to discount it.
+#:
+#: **This is not a payload-shape change and does not bump**
+#: :data:`INVENTORY_PAYLOAD_VERSION`. ``detail`` is still written, still stored, and still
+#: read back by anything holding the record; :data:`INVENTORY_PAYLOAD_KEYS` is untouched.
+#: What changed is only which stored bytes are asked to reproduce. The version stamps the
+#: SHAPE of a record, and conflating "a sentence was reworded" with "these bytes have a new
+#: shape" would spend the one signal that tells a reader they cannot parse the record at all.
+_REFUSAL_DIAGNOSTIC_FIELDS: frozenset[str] = frozenset({"detail"})
+
+
+def _comparable(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """The derivation as it is COMPARED: identity fields out, refusal prose out.
+
+    The sibling of :func:`_derivation_only`, and deliberately a separate function rather than
+    a widening of it: that one answers "what did the derivation produce", which a reader
+    wants in full, while this one answers "what must reproduce", which is strictly less.
+    """
+    derivation = _derivation_only(payload)
+    refusals = derivation.get("refusals")
+    if isinstance(refusals, list):
+        derivation["refusals"] = [
+            {key: value for key, value in entry.items() if key not in _REFUSAL_DIAGNOSTIC_FIELDS}
+            if isinstance(entry, Mapping)
+            else entry
+            for entry in refusals
+        ]
+    return derivation
+
+
 def _identity_drift(payload: Mapping[str, Any], pypdf_version: str) -> tuple[str, ...]:
     moved: list[str] = []
     if payload.get("inventory_code_sha256") != inventory_code_sha256():
@@ -465,7 +514,7 @@ def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> Inventor
 
     try:
         recomputed = inventory_record_payload(build_inventory(extraction, footprint), raw_sha256=actual_sha)
-        stored_bytes = canonical_json_bytes(_derivation_only(payload))
+        stored_bytes = canonical_json_bytes(_comparable(payload))
     except (AttributeError, KeyError, TypeError, ValueError) as exc:
         return InventoryVerification(
             InventoryVerificationStatus.PAYLOAD_UNREADABLE,
@@ -473,18 +522,20 @@ def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> Inventor
             detail=f"payload is not comparable: {exc}",
         )
 
-    # The IDENTITY fields are excluded from this comparison, and the exclusion is the point
-    # rather than a loophole: `_identity_drift` compares them exhaustively and its result is
-    # reported on every outcome. Leaving them in made REPRODUCED-with-a-moved-identity
-    # UNREACHABLE -- any drift changed the bytes, so the answer was always MISMATCHED, and
-    # this module's docstring promised a result its code could not produce. Caught by review,
-    # not by a test: the test had codified the contradiction instead of exposing it.
-    if canonical_json_bytes(_derivation_only(recomputed)) == stored_bytes:
+    # Two exclusions, and both are the point rather than a loophole. The IDENTITY fields go
+    # because `_identity_drift` compares them exhaustively and reports its result on every
+    # outcome; leaving them in made REPRODUCED-with-a-moved-identity UNREACHABLE, so this
+    # module's docstring promised a result its code could not produce. Refusal `detail` goes
+    # because it is prose: see `_REFUSAL_DIAGNOSTIC_FIELDS`. Both were caught by review
+    # rather than by a test, and in the first case the test had codified the contradiction
+    # instead of exposing it -- which is why each exclusion now has a test that fails if the
+    # excluded field creeps back into the compared bytes.
+    if canonical_json_bytes(_comparable(recomputed)) == stored_bytes:
         return InventoryVerification(InventoryVerificationStatus.REPRODUCED, identity_moved=moved)
     return InventoryVerification(
         InventoryVerificationStatus.MISMATCHED,
         identity_moved=moved,
-        detail=_first_difference(_derivation_only(payload), _derivation_only(recomputed)),
+        detail=_first_difference(_comparable(payload), _comparable(recomputed)),
     )
 
 
