@@ -95,6 +95,14 @@ from carmel.services.extraction_record import (
     _build_identity_payload,
     compute_extraction_sha,
 )
+from carmel.services.figure_digitization_record import (
+    DIGITIZATION_PAYLOAD_KEYS,
+    DIGITIZATION_PAYLOAD_VERSION,
+    UNREADABLE_PAYLOAD,
+    FigureCoverage,
+    FigureDigitization,
+    MarkerCensus,
+)
 from carmel.services.numeric import (
     REPAIR_NAMES,
     GlyphHealth,
@@ -141,6 +149,7 @@ __all__ = [
     "DatasetEnvelopeParseError",
     "DeviceClassDeclaration",
     "EmbeddedConversionTable",
+    "EmbeddedFigureDigitization",
     "EmbeddedTableInventory",
     "ExtractedTextVerification",
     "ExtractionBinding",
@@ -4187,6 +4196,370 @@ class EmbeddedTableInventory(BaseModel):
         exactly the input an attacker chooses.
         """
         return (row, col) in self._cell_index
+
+
+class EmbeddedFigureDigitization(BaseModel):
+    """One figure digitization's own canonical record JSON, embedded VERBATIM so a consumer
+    holding only these bytes can see how COMPLETE the digitized series actually is -- without
+    the evidence store, and without inferring partialness from a point count.
+
+    This is the figure lane's counterpart to :class:`EmbeddedTableInventory`, and it exists for
+    a reason that lane does not have. A :class:`Series` recovered from a plot reports
+    ``len(points)`` and nothing else about its own completeness, so a series that lost a marker
+    -- straddling an axis boundary, occluded at a curve crossing, unplaceable against the axes
+    -- reads exactly like one that lost none. The record these bytes carry states the
+    difference instead: see :mod:`carmel.services.figure_digitization_record`.
+
+    **Two orthogonal facts, and the reader gets both separately.**
+    :attr:`coverage` answers "is anything missing"; :attr:`auditable` answers "could the
+    instrument have told". :attr:`FigureCoverage.UNCHECKABLE` is what "no way to know" reads as,
+    and it is deliberately NOT the same value as "nothing missing" -- collapsing them would put
+    an unaudited series and a verified-whole one behind one indistinguishable answer, which is
+    the failure the record was written to end.
+
+    Same ``str``-not-``dict`` decision, and the same rationale, as
+    :class:`EmbeddedConversionTable` and :class:`EmbeddedTableInventory` (see the former's
+    docstring: ``frozen=True`` is a claim about attribute REASSIGNMENT, and a ``dict`` field
+    could be mutated in place after validation with nothing here to notice).
+
+    SCOPE OF WHAT VALIDATION HERE PROVES -- read before trusting a digitization. T1 (see
+    :meth:`_reconstruct`) is STRONGER than :class:`EmbeddedTableInventory`'s, and weaker than it
+    looks. Stronger, because a digitization record CAN be reconstructed:
+    :meth:`~carmel.services.figure_digitization_record.FigureDigitization.from_payload` re-runs
+    every construction invariant, so these embedded bytes are checked against the type's own
+    rules the way :class:`EmbeddedConversionTable`'s are and the way an inventory's can never
+    be. In particular a payload claiming ``coverage="complete"`` while carrying an omission, or
+    one whose census does not balance against its recovered points, is refused HERE, on the
+    bytes, with no producer involved -- and refused on every ACCESSOR READ as well as at
+    construction, because both call :meth:`_reconstruct` and there is no cheaper read-time path
+    that could accept what construction rejects. That equality is not decoration: it is what
+    makes "this class cannot state partialness incoherently" a property of reading one rather
+    than only of building one.
+
+    Weaker than it looks, because everything it proves is INTERNAL. Nothing in this class -- and
+    nothing anywhere in this repository yet -- re-derives markers from the crop's pixels. So a
+    valid record establishes that its coverage claim is consistent with its own ledger and its
+    own census, and establishes NOTHING about whether a detector ever ran, whether ``detected``
+    is the figure's true marker count, or whether the ledger names every marker that was
+    dropped. A fabricated payload asserting a plausible 12-marker census over a figure that has
+    none passes every check in this class, exactly as
+    :class:`EmbeddedTableInventory`'s docstring warns for its own fabrications. Read
+    ``raw_sha256`` matching a node's ``sha256`` as proof the author NAMED that document, never
+    that any image was ever looked at.
+
+    Weaker in a second, separate way: ``digitization_sha256`` ADDRESSES THE CLAIM AND NOT THE
+    DIGITIZATION. The payload it hashes carries a recovered COUNT and no recovered coordinate,
+    so two different digitizations of one figure agreeing on series id, crop, region, coverage,
+    census and ledger share an address while holding different points. Two citations at one
+    address mean two producers said the same thing about coverage; they never mean the same data
+    was recovered. See :mod:`carmel.services.figure_digitization_record` for what would have to
+    be folded in to make it identify the digitization, and why none of it can be yet.
+
+    NOT AN ENVELOPE FIELD, deliberately. **Nothing cites one of these today.** There is no
+    ``figure_digitizations`` field on :class:`DatasetEnvelope`, no exact-cover validator, no
+    duplicate-``digitization_sha256`` guard, no sort rule, and no locator kind carrying a
+    ``digitization_sha256``. This class is defined, tested and referenced by no other type in
+    this file.
+
+    Wiring that up is blocked on ``FIGURE_CROP`` crop addressing, and the blocker is CORRECTNESS
+    rather than scheduling: until a crop node can say which figure of which page it is, an
+    envelope citing this record would resolve ``figure_crop_node_id`` to a node that cannot
+    identify its own subject, so the citation would be well-formed and unusable.
+
+    Four checks that a PRODUCER will owe, and that nothing in this class can perform because they
+    span two objects that never meet inside it -- the record and the ``Series`` it describes:
+
+    - ``record.series_id == series.series_id`` -- the record is about THAT series.
+    - ``record.recovered == len(series.points)`` -- the count the census balances against (D9) is
+      the count the series actually has. Without this, D9 balances a number nothing else uses.
+    - ``record.figure_crop_node_id`` resolves to a :class:`SourceNode` of kind
+      ``FIGURE_CROP`` -- not to a page, a table or an SI member.
+    - ``record.figure_crop_sha256`` equals that node's ``sha256`` -- the two halves of the crop's
+      identity agree, so the record names one crop rather than one crop's id and another's bytes.
+
+    What those limits leave is still the thing this ticket needed: partialness that the stored
+    evidence STATES and cannot state incoherently, rather than partialness a reader infers from
+    a number that looks the same either way.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    digitization_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- this record's content address, and the sha256 of
+    ``canonical_json``'s bytes (T1). The same addressing rule as
+    :attr:`EmbeddedTableInventory.inventory_sha256`, computed by
+    :func:`~carmel.services.figure_digitization_record.compute_digitization_sha`."""
+
+    raw_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the document the figure crop came from. Declared HERE,
+    redundantly with the payload's own ``raw_sha256`` (T1 requires them equal), for the same
+    reason :attr:`EmbeddedTableInventory.raw_sha256` is: so an envelope-level join to
+    :attr:`SourceNode.sha256` can be made without parsing JSON in the validator doing it."""
+
+    canonical_json: str = Field(min_length=1, max_length=_MAX_EMBEDDED_CANONICAL_JSON_LENGTH)
+    """The digitization record's canonical JSON, verbatim, as a str.
+
+    Bounded by ``_MAX_EMBEDDED_CANONICAL_JSON_LENGTH`` for the same resource-exhaustion reason
+    as :attr:`EmbeddedTableInventory.canonical_json`, and it binds more loosely here: the
+    payload holds one entry per OMITTED marker, not one per cell, and a figure with a
+    megabyte's worth of omissions is not a figure anyone digitized. A record too large to embed
+    is a rejected envelope, never a reason to embed a projection instead -- a projection does
+    not hash to ``digitization_sha256``, so it could not be the artifact being cited."""
+
+    # THIS CLASS HOLDS NO PRIVATE STATE AT ALL, and that is load-bearing rather than incidental.
+    # Two earlier revisions cached something here -- first a digest of the public fields, then
+    # the reconstructed record -- and each became the attack surface, because every route that
+    # can write a public field past `frozen=True` (`object.__setattr__`, a `__dict__` write,
+    # `model_construct`) can write a private one in the next line. There is nothing here to
+    # write. `_validated_record` re-derives the record from `canonical_json` on every read, by
+    # calling the same `_reconstruct` that construction calls.
+    #
+    # It costs more than caching did, and the cost is the point rather than a regrettable
+    # side effect. Measured on this machine against the final code, on a 94.8 KB payload
+    # carrying 700 omissions: see `_reconstruct`. The cache it replaced was measured too, and
+    # was a net LOSS at every size -- so nothing was traded away for this.
+
+    @field_validator("digitization_sha256", "raw_sha256")
+    @classmethod
+    def _validate_sha256_shape(cls, value: str, info: ValidationInfo) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"EmbeddedFigureDigitization.{info.field_name} {value!r} is not 64 lowercase hex characters"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_canonical_json_coheres(self) -> EmbeddedFigureDigitization:
+        """T1, at construction: refuse a citation that is not well formed.
+
+        The work is in :meth:`_reconstruct`, which the accessors run again on every read. This
+        wrapper exists only so pydantic reports a malformed citation as a ``ValidationError`` at
+        the point of construction.
+        """
+        self._reconstruct()
+        return self
+
+    def _reconstruct(self) -> FigureDigitization:
+        """T1: validate these bytes end to end and return the record they describe.
+
+        THE ONLY DEFINITION OF "ACCEPTED" IN THIS CLASS, and that is the point rather than a
+        stylistic preference. Construction runs it, and so does every accessor read, so there is
+        no subset of it that a read could pass while construction would refuse. An earlier
+        revision had the read path check a hand-picked three facts -- address, document digest,
+        and the cached record re-serializing to the bytes -- and that trio, while individually
+        sound, never re-ran D1-D9. Since :class:`FigureDigitization` is a frozen DATACLASS,
+        ``object.__new__`` skips its ``__post_init__`` exactly as ``object.__setattr__`` skips
+        pydantic's ``frozen=True``: a record built that way with ``coverage=COMPLETE`` and a
+        non-empty ledger, paired with bytes and an address minted to match it, satisfied all
+        three and reported ``COMPLETE`` with ``omission_count=1`` -- a state
+        :meth:`FigureDigitization.from_payload` refuses on the identical bytes. Coherence is not
+        validity, so the read path stops asking for coherence and asks for the whole thing.
+
+        Six steps, each with its own marker phrase so a test can tell which one fired.
+        Re-serialization (step 3) and reconstruction (step 6) are BOTH required and neither
+        replaces the other: step 6 establishes that the payload is a VALID record, step 3 that
+        these bytes are its CANONICAL rendering. Dropping step 3 would admit non-canonical but
+        valid bytes carrying an honestly recomputed address -- one logical record with as many
+        addresses as it has renderings, which defeats addressing itself. Dropping step 6 is the
+        bug described above.
+
+        See the class docstring for what all six together do NOT prove.
+
+        WHAT IT COSTS, measured on this machine against this code. A read is one full T1: parse,
+        re-canonicalize, hash, reconstruct. At 0.6 KB (one omission) that is ~24 us; at 94.8 KB
+        (700 omissions), ~2558 us, of which roughly 1400 us is the parse-and-reconstruct and
+        1150 us the re-canonicalization that pins step 3. The hand-picked trio this replaced cost
+        ~1495 us at the same size, so reads are about 1.7x slower and the class is correct
+        instead of merely coherent. That trade is not close, and it is cheaper than it looks: the
+        trio was itself a net LOSS against no cache at all, so nothing fast was given up.
+
+        Do NOT memoize this to win the 1.7x back. Any memo is private state, and private state is
+        writable by every route that writes a public field -- which is how both previous
+        revisions were broken. If reads ever become hot, the fix is for the CALLER to hold the
+        returned :class:`FigureDigitization`, which is frozen and validated, not for this class
+        to hold something an attacker can rewrite.
+
+        Raises:
+            ValueError: If these bytes are not a well-formed citation of a valid record. Raised
+                rather than returned so construction and read share one failure mode.
+        """
+        try:
+            parsed = json.loads(self.canonical_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            # Same broadened except, for the same reason, as EmbeddedTableInventory's:
+            # canonical_json is untrusted input from a stored file, and a short-but-deeply-nested
+            # payload blows the interpreter's own stack from inside json.loads before this
+            # validator can react.
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
+                f"canonical_json does not parse as JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
+                f"canonical_json is not a JSON object, it decodes to {type(parsed).__name__}"
+            )
+        recanonicalized = canonical_json_bytes(parsed)
+        if recanonicalized != self.canonical_json.encode("utf-8"):
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
+                "canonical_json is not the canonical rendering of what it decodes to -- re-serializing "
+                "through canonical_json_bytes produced different bytes"
+            )
+        # The address is over the canonical bytes, exactly as compute_digitization_sha defines
+        # it. Recomputed from the RE-canonicalized bytes, which the check above has already
+        # pinned equal to the stored ones -- so this cannot be satisfied by honestly hashing
+        # arbitrary bytes against themselves in some other rendering.
+        actual = hashlib.sha256(recanonicalized).hexdigest()
+        if actual != self.digitization_sha256:
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
+                f"canonical_json's bytes hash to {actual!r}, so this record does not live at the address "
+                "it claims"
+            )
+        # Version and key set are checked by `from_payload` too, but are checked HERE as well so
+        # the failure a reader sees names the version it could not read rather than surfacing as
+        # a missing key three frames down. A reader that does not know a shape must not guess at
+        # it -- "I cannot read this" and "this is incoherent" are different facts.
+        version = parsed.get("payload_version")
+        if version != DIGITIZATION_PAYLOAD_VERSION:
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
+                f"payload_version {version!r} is not the readable version {DIGITIZATION_PAYLOAD_VERSION!r}"
+            )
+        keys = set(parsed)
+        if keys != set(DIGITIZATION_PAYLOAD_KEYS):
+            unexpected = sorted(keys - DIGITIZATION_PAYLOAD_KEYS)
+            missing = sorted(DIGITIZATION_PAYLOAD_KEYS - keys)
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): the record "
+                f"is not the shape of a version-{DIGITIZATION_PAYLOAD_VERSION} digitization (unexpected "
+                f"keys {unexpected!r}, missing keys {missing!r})"
+            )
+        declared_raw = parsed.get("raw_sha256")
+        if declared_raw != self.raw_sha256:
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): the record "
+                f"names document {declared_raw!r}, not the declared raw_sha256 {self.raw_sha256!r}"
+            )
+        # The reconstruction, and the reason this class's T1 is stronger than
+        # EmbeddedTableInventory's. `from_payload` re-runs D1-D9, so a record claiming a
+        # complete series while carrying an omission -- or one whose census does not balance
+        # against its recovered points -- is refused on the BYTES, with no producer in the loop
+        # and no document required. Asked of the record module rather than re-described here, so
+        # the schema never carries its own second idea of what a coherent digitization is.
+        try:
+            return FigureDigitization.from_payload(parsed)
+        except UNREADABLE_PAYLOAD as exc:
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): the record "
+                f"does not reconstruct, so its coverage claim is not one anything could act on: {exc!r}"
+            ) from exc
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> EmbeddedFigureDigitization:
+        """Copy this citation, re-running T1 whenever a field changes.
+
+        Pydantic's ``model_copy(update=...)`` deliberately runs NO validation and copies private
+        attributes verbatim, which on an addressed model is a hole rather than a convenience:
+        ``model_copy(update={"canonical_json": "{}"})`` produced an object reporting the
+        ORIGINAL's ``coverage``, carrying different bytes, and declaring a
+        ``digitization_sha256`` that hashed neither. Everything downstream that trusts the
+        address would then have been verifying a stale answer and reporting success.
+
+        So a copy that changes anything is rebuilt through full validation. It does NOT
+        recompute the address to match new bytes: silently re-deriving ``digitization_sha256``
+        would turn this method into a way to mint a valid citation for arbitrary content, which
+        is a worse hole than the one being closed. Change the bytes and the address together and
+        the copy validates; change one alone and T1 refuses it, loudly, at the copy.
+
+        ``deep`` is accepted for signature compatibility and has no effect: every field is an
+        immutable ``str``, and the private cache is rebuilt rather than copied.
+        """
+        if not update:
+            return super().model_copy(deep=deep)
+        merged = {**self.model_dump(), **dict(update)}
+        return type(self)(**merged)
+
+    def _validated_record(self) -> FigureDigitization:
+        """Re-run :meth:`_reconstruct` and answer from what it returns, or refuse loudly.
+
+        NOTHING IS REMEMBERED AND NOTHING IS TRUSTED. There is no cached record and no stored
+        provenance; the record is derived afresh from ``canonical_json`` on every read, and
+        derived by the SAME code that construction runs. Two earlier revisions failed here in
+        two different ways, and both failures were the same shape -- a read-time check that was
+        cheaper than construction's:
+
+        - A private digest of the public fields, compared per read. Forgeable in one line,
+          because any route that could write ``digitization_sha256`` past ``frozen=True`` could
+          recompute the digest immediately after. A guard an attacker recomputes is not a guard.
+        - A hand-picked trio -- address, document digest, and a cached record re-serializing to
+          the bytes -- which never re-ran D1-D9. ``FigureDigitization`` is a frozen DATACLASS, so
+          ``object.__new__`` skips ``__post_init__``; a record minted that way claiming
+          ``COMPLETE`` over a non-empty ledger, with bytes and an address generated to match,
+          satisfied every one of the three.
+
+        The lesson both times was that a subset of the constructor's checks is not a weaker
+        version of it, it is a different and wrong predicate. So the read path stopped picking a
+        subset. Whatever construction refuses, a read refuses, because it is the same call.
+
+        WHAT THIS DOES AND DOES NOT REFUSE. It refuses any state that construction would refuse,
+        which is the strongest claim this class can make about itself, and it cannot be talked
+        out of it by writing to any attribute, private or public -- there is nothing left to
+        write that it does not re-derive. FOUR residues, named rather than rounded up:
+
+        1. The check runs when an ACCESSOR is called. A caller reading ``.canonical_json`` or
+           ``.digitization_sha256`` as plain attributes gets whatever is there, by not asking.
+        2. Validity is not truth. A hand-built, fully valid citation is a well-formed CLAIM that
+           nothing has checked against a figure -- see the class docstring.
+        3. A SUBCLASS overriding :attr:`coverage`, :attr:`auditable`, :attr:`omission_count` or
+           this method answers whatever it likes. Python has no way to prevent that, and this
+           class does not pretend to.
+        4. The answer is a snapshot. A caller that stores ``coverage`` in a local holds a value
+           that a later mutation of the object will not invalidate; only the next read re-checks.
+
+        Raising beats returning a default. Every question this class answers is a question about
+        MISSING DATA, and a default answer to that question is the one shape of wrong answer that
+        reads as reassuring.
+        """
+        try:
+            return self._reconstruct()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}) no longer "
+                f"validates, so nothing about it can be answered: {exc}"
+            ) from exc
+
+    @property
+    def coverage(self) -> FigureCoverage:
+        """Is anything missing from this series -- COMPLETE, PARTIAL, or UNCHECKABLE.
+
+        The coverage axis ALONE. ``UNCHECKABLE`` is not a middling amount of coverage; it is the
+        statement that the question was not answerable, and a caller that reads it as a
+        near-``COMPLETE`` has performed exactly the collapse :attr:`auditable` exists to
+        prevent.
+        """
+        return self._validated_record().coverage
+
+    @property
+    def auditable(self) -> bool:
+        """Could the instrument have told that something was missing?
+
+        The auditability axis ALONE, independent of :attr:`coverage`. True means a marker census
+        exists for this series' plot region, so a completeness claim has something to be
+        measured against. It says nothing about whether anything WAS missing.
+        """
+        return isinstance(self._validated_record().census, MarkerCensus)
+
+    @property
+    def omission_count(self) -> int:
+        """How many markers this series is recorded as having lost.
+
+        Zero is a completeness claim only when :attr:`auditable` is True. Under an unavailable
+        census it means the ledger names nothing, which is not the same as nothing having been
+        dropped -- and that pair is precisely why this is a count beside a flag rather than a
+        single number a reader could interpret alone.
+        """
+        return len(self._validated_record().omissions)
 
 
 def _check_source_form_for_ref(
