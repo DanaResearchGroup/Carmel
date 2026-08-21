@@ -80,6 +80,10 @@ def _node(node_id: str, kind: SourceNodeKind, sha256: str, parent_node_id: str |
         extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        # No fixture here is a FIGURE_CROP (a crop has no tabular structure, so
+        # no TableCellLocator may target one), and I7 accepts only
+        # NOT_APPLICABLE on every other kind.
+        crop_region=_NOT_APPLICABLE,
     )
 
 

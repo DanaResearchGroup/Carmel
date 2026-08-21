@@ -79,6 +79,9 @@ _CURRENT_REPAIR_DEPENDENCY = SemanticDependencyUse(
     input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
 )
 
+_NO_CROP_REGION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""SourceNode.crop_region on a kind that is not a FIGURE_CROP -- no fixture
+here is one, and NOT_APPLICABLE is the only reason I7 accepts there."""
 _NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_UNCERTAINTY = Absent(reason=AbsenceReason.NOT_REPORTED_HERE)
@@ -98,6 +101,7 @@ def _node(node_id: str = "paper", parent_node_id: str | None = None) -> SourceNo
         extraction=_NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH,
         verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        crop_region=_NO_CROP_REGION,
     )
 
 
@@ -493,6 +497,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            crop_region=_NO_CROP_REGION,
         )
         claim = _scalar_claim(
             label_ref=_table_ref("paper_a"),
@@ -533,6 +538,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            crop_region=_NO_CROP_REGION,
         )
         with pytest.raises(ValidationError, match="root artifact"):
             _envelope(
@@ -577,6 +583,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            crop_region=_NO_CROP_REGION,
         )
         with pytest.raises(ValidationError, match="root artifact"):
             _envelope(
@@ -619,6 +626,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            crop_region=_NO_CROP_REGION,
         )
         with pytest.raises(ValidationError, match="root artifact"):
             _envelope(
@@ -715,6 +723,7 @@ class TestSharedProvenanceValidatorsAreWiredThroughThisClass:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            crop_region=_NO_CROP_REGION,
         )
         with pytest.raises(ValidationError, match="decorative provenance"):
             _envelope(source_graph=_graph(_node(), orphan))

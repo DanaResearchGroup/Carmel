@@ -125,6 +125,35 @@ def store_typed_envelope[E: AddressableEnvelope](spec: TypedEnvelopeSpec[E], roo
        them". It validates the PAYLOAD, not the object, because the payload is
        what gets written.
 
+       Which bounds what it can see: a VIOLATION this check would have caught
+       is only caught if the projection EMITS the field that violates it. One
+       field makes the boundary concrete. ``SourceNode.crop_region`` is
+       projected CONDITIONALLY (see
+       ``carmel.schemas.datasets._CONDITIONALLY_PROJECTED_FIELDS``), and the
+       condition is read off the field's VALUE rather than off the node's
+       ``kind`` (``_addresses_a_crop_region``) -- which is what keeps this
+       refusal working for the case. A ``PAPER_PDF`` carrying a real ``BBox``
+       is illegal under I7, so it is reachable only through
+       ``model_construct`` or ``object.__setattr__``: precisely the
+       validator-skipped object named above. It still projects that region,
+       so the payload still fails to parse and the write is still refused.
+       Keyed on ``kind`` instead, the projection would drop the stray region,
+       the tampered node would address byte-identically to a clean one, and
+       this check would pass -- nothing untrue in the store (those bytes
+       faithfully describe a legal envelope), but a producer bug gone
+       unremarked.
+
+       Only the half of that tamper which puts a REGION where none belongs,
+       though: the same ``PAPER_PDF`` tampered to hold
+       ``Absent(reason=NOT_EXTRACTED_YET)`` -- equally illegal under I7 --
+       projects nothing either way, parses back as
+       ``Absent(NOT_APPLICABLE)``, and stores at the clean envelope's own
+       address, silently. Safe only because I7 admits exactly one reason
+       there today, so the value the parse invents is the only one a legal
+       node could have held. A field that ever becomes conditional on
+       something other than its own value narrows this check by that much,
+       silently, and belongs in this paragraph.
+
     No part of the store's contract (canonical JSON, content addressing, atomic
     write-once semantics) is bypassed or weakened here.
     """
