@@ -693,7 +693,13 @@ class TestTheAuditabilityAxisHasExactlyTwoStates:
                 digitization(coverage=FigureCoverage.UNCHECKABLE, census=foreign, omissions=())
 
     def test_the_refusal_is_not_reachable_only_through_the_auditable_branch(self) -> None:
-        """The same refusal under a COMPLETE claim, so it is not the early return doing it."""
+        """The same refusal under a COMPLETE claim, so it is not the early return doing it.
+
+        Not covered: the full set of callers that reach this census-type refusal. One
+        non-auditable path is shown -- a COMPLETE claim with census=None -- which is enough to
+        establish the refusal is not ONLY reachable through the auditable branch, but is not an
+        enumeration of every path to it.
+        """
         with pytest.raises(ValueError, match="census must be a MarkerCensus or a CensusUnavailable"):
             digitization(coverage=FigureCoverage.COMPLETE, census=None, omissions=())
 

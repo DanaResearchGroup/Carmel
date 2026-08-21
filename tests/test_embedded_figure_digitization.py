@@ -1235,18 +1235,30 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
 #: Test-name tokens that quantify over a space rather than describe one case.
 #:
 #: Matched as whole ``_``-separated tokens, never as substrings, so ``actually`` does not read as
-#: ``all`` and ``company`` does not read as ``any``. ``not`` is deliberately absent: it negates a
-#: specific case rather than quantifying over many. ``no`` IS present despite several descriptive
-#: uses, because the one test this rule most needed to catch was called
-#: ``test_no_mutation_escapes_the_documented_refusals`` -- the false positives it brings are
-#: resolved by renaming the test to say what it means, which is the rule working rather than
-#: misfiring.
+#: ``all`` and ``company`` does not read as ``any``.
+#:
+#: Two tokens are deliberately ABSENT, each for a value-collision rather than an oversight, and
+#: each named here so their absence is a decision on the record:
+#:
+#: - ``not`` negates a specific case rather than quantifying over many.
+#: - ``none`` collides with the Python value ``None``: ``reports_none`` is a return value, not a
+#:   quantifier, and forcing a scope marker onto it is the ritual boilerplate this rule exists to
+#:   avoid. The quantifier sense ("none of the routes") is written with ``no`` -- which IS a
+#:   token -- so a genuine universal is still caught; only the value spelling is let through.
+#:   ``test_named_synonyms_the_vocabulary_must_not_miss`` pins both halves of that.
+#:
+#: ``only`` and ``arbitrary`` were added after review named the vocabulary as an attack surface:
+#: "reachable only through X" is a no-other-route claim, and "arbitrary bytes" is "any bytes".
+#: ``no`` earns its keep despite descriptive uses -- the one test this rule most needed to catch
+#: was ``test_no_mutation_escapes_the_documented_refusals`` -- and every false positive it brings
+#: is answered by a rename that makes the name more precise.
 UNIVERSAL_TOKENS = frozenset(
     {
         "all",
         "always",
         "any",
         "anything",
+        "arbitrary",
         "cannot",
         "each",
         "every",
@@ -1255,6 +1267,7 @@ UNIVERSAL_TOKENS = frozenset(
         "never",
         "no",
         "nothing",
+        "only",
         "whatever",
     }
 )
@@ -1289,6 +1302,45 @@ def _universal_tokens(name: str) -> set[str]:
     return set(name.split("_")) & UNIVERSAL_TOKENS
 
 
+def _policed_defs(tree: ast.AST) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Every ``test_`` function in ``tree``, of EITHER def form and at ANY nesting.
+
+    ``ast.walk`` recurses, so a method inside a class inside a function is reached the same as a
+    top-level function -- and both ``def`` and ``async def`` are matched, because an
+    ``async def test_every_...`` is exactly the kind of thing a naive ``FunctionDef``-only walk
+    lets slip past the rule it was written to enforce.
+    """
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith("test_")
+    ]
+
+
+def _scope_violation(name: str, docstring: str | None) -> str | None:
+    """Why a universal-named test fails to account for its scope, or ``None`` if it complies.
+
+    Pure over ``(name, docstring)`` on purpose: it is the whole rule, so the whole rule can be
+    exercised on SYNTHETIC inputs -- an async name, a synonym the vocabulary must not miss, a
+    header with nothing behind it -- without each having to exist as a real test first. The
+    file-walk test and the synthetic-input tests both go through this one function.
+    """
+    tokens = _universal_tokens(name)
+    if not tokens:
+        return None
+    label = f"[{','.join(sorted(tokens))}]"
+    if not docstring:
+        return f"{label} universal name, no docstring at all"
+    present = [marker for marker in SCOPE_MARKERS if _marker_content(docstring, marker) is not None]
+    if not present:
+        return f"{label} no '{SCOPE_MARKERS[0]}' or '{SCOPE_MARKERS[1]}' section"
+    for marker in present:
+        content = _marker_content(docstring, marker) or ""
+        if len(content) < MIN_MARKER_CONTENT:
+            return f"{label} '{marker}' has {len(content)} chars behind it, which names nothing"
+    return None
+
+
 class TestEveryUniversalTestNameAccountsForItsScope:
     """The lint that closes the class this ticket produced seven instances of.
 
@@ -1317,25 +1369,26 @@ class TestEveryUniversalTestNameAccountsForItsScope:
 
     Exhaustive over: the ``test_``-prefixed functions of the two modules named in
     ``POLICED_MODULES``, read from source via AST, so a test cannot escape by not being
-    imported. Both modules are walked whole, including this class.
+    imported. Both ``def`` forms and every nesting level are walked (see :func:`_policed_defs`),
+    so an ``async def`` or a method nested in a class does not slip the rule.
 
     Not covered: whether the claim a marker makes is TRUE. This lint checks that a claim was
     made and has content behind it; it cannot check that an ``Exhaustive over:`` really is
-    exhaustive, nor that a ``Not covered:`` names every uncovered route. It also does not police
-    the rest of the repository's tests, nor universals that appear only in a docstring rather
-    than in a name, nor class names. What it converts is the cheapest half of the review finding
-    -- the half that recurred seven times -- into something that fails before review sees it.
+    exhaustive, nor that a ``Not covered:`` names every uncovered route, nor that a marker's
+    prose is more than filler long enough to clear the length floor. It also does not police the
+    rest of the repository's tests, universals that live only in a ``parametrize`` id rather than
+    a def name, or universals phrased around the vocabulary ("in either direction"). What it
+    converts is the cheapest half of the review finding -- the half that recurred seven times --
+    into something that fails before review sees it.
     """
 
     @staticmethod
-    def _test_functions() -> list[tuple[str, ast.FunctionDef]]:
+    def _test_functions() -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
         here = pathlib.Path(__file__).parent
-        found: list[tuple[str, ast.FunctionDef]] = []
+        found: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
         for name in POLICED_MODULES:
             tree = ast.parse((here / name).read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
-                    found.append((name, node))
+            found.extend((name, node) for node in _policed_defs(tree))
         return found
 
     def test_the_lint_has_something_to_police(self) -> None:
@@ -1350,34 +1403,75 @@ class TestEveryUniversalTestNameAccountsForItsScope:
         assert len(universal) > 10, f"only {len(universal)} universal names matched; check the vocabulary"
 
     def test_every_universal_named_test_states_its_scope(self) -> None:
-        """The rule itself.
+        """The rule itself, applied to the real tree.
 
-        Exhaustive over: every ``test_`` function in the policed modules whose name contains a
-        universal token. Each is checked for exactly one marker with real content behind it.
+        Exhaustive over: every ``test_`` function in the policed modules, of either def form,
+        checked through :func:`_scope_violation`.
 
-        Not covered: the truth of what the marker says, and universals expressed without one of
-        the vocabulary's tokens ("in either direction", "under any circumstances"). A name can
-        still over-promise in words this list does not hold; what it can no longer do is
-        over-promise in the seven words that actually recurred.
+        Not covered: the truth of what a marker says, and universals expressed without one of the
+        vocabulary's tokens. A name can still over-promise in words this list does not hold; what
+        it can no longer do is over-promise in the words that recurred, plus the synonyms review
+        named -- see :meth:`test_named_synonyms_the_vocabulary_must_not_miss`.
         """
-        violations: list[str] = []
-        for module, node in self._test_functions():
-            tokens = _universal_tokens(node.name)
-            if not tokens:
-                continue
-            where = f"{module}::{node.name} [{','.join(sorted(tokens))}]"
-            docstring = ast.get_docstring(node)
-            if not docstring:
-                violations.append(f"{where}: universal name, no docstring at all")
-                continue
-
-            present = [marker for marker in SCOPE_MARKERS if _marker_content(docstring, marker) is not None]
-            if not present:
-                violations.append(f"{where}: no '{SCOPE_MARKERS[0]}' or '{SCOPE_MARKERS[1]}' section")
-                continue
-            for marker in present:
-                content = _marker_content(docstring, marker) or ""
-                if len(content) < MIN_MARKER_CONTENT:
-                    violations.append(f"{where}: '{marker}' has {len(content)} chars behind it, which names nothing")
-
+        violations = [
+            f"{module}::{node.name} {problem}"
+            for module, node in self._test_functions()
+            if (problem := _scope_violation(node.name, ast.get_docstring(node)))
+        ]
         assert not violations, "universal test names that do not account for themselves:\n  " + "\n  ".join(violations)
+
+    def test_the_walk_sees_async_and_nested_and_parametrized_defs(self) -> None:
+        """The def-forms a universal could hide in, proven found rather than assumed.
+
+        Exhaustive over: the three shapes a naive top-level ``FunctionDef``-only walk would miss
+        -- an ``async def``, a method nested in a class, and a parametrized function whose
+        universal lives in the def name untouched by the decorator.
+
+        Not covered: a universal that lives only in a ``parametrize`` id, which is a different
+        claim surface this rule does not reach into.
+        """
+        source = textwrap.dedent(
+            """
+            import pytest
+
+            class TestNested:
+                @pytest.mark.parametrize("case", [1, 2])
+                def test_every_case_is_parametrized(self, case): ...
+
+                async def test_no_route_is_async(self): ...
+
+            def test_all_top_level(): ...
+            """
+        )
+        names = {node.name for node in _policed_defs(ast.parse(source))}
+        assert names == {"test_every_case_is_parametrized", "test_no_route_is_async", "test_all_top_level"}
+
+    def test_named_synonyms_the_vocabulary_must_not_miss(self) -> None:
+        """The synonyms review named as likely gaps, each given the verdict it should get.
+
+        Exhaustive over: the tokens named in review -- never, always, each, arbitrary, plus
+        ``only`` and the everyday ``any``/``every``/``all``/``no`` -- each fed as a bare unmarked
+        universal name and required to be a violation.
+
+        Not covered: synonyms nobody has named yet. A vocabulary is only as complete as the last
+        token added, which is why this test is written to be extended rather than to close the
+        question. ``none`` is the one deliberate exclusion, asserted below.
+        """
+        for token in ("never", "always", "each", "arbitrary", "only", "any", "every", "all", "no", "cannot"):
+            assert _scope_violation(f"test_{token}_route_escapes", None) is not None, token
+
+        # ``none`` the value is let through; the ``none`` quantifier is written ``no`` and caught.
+        assert _scope_violation("test_a_readable_record_reports_none", None) is None
+        assert _scope_violation("test_no_route_reports_none", None) is not None
+
+    def test_a_marker_header_with_nothing_behind_it_is_not_enough(self) -> None:
+        """A header is a promise to name something; an empty header names nothing.
+
+        Exhaustive over: the two markers, each given a header with sub-threshold content.
+
+        Not covered: content long enough to clear the floor but vacuous. Length is a blunt proxy
+        for "names something", and only a reviewer catches a sentence that is long and empty.
+        """
+        for marker in SCOPE_MARKERS:
+            docstring = f"A summary line.\n\n        {marker} -"
+            assert _scope_violation("test_every_route_escapes", docstring) is not None
