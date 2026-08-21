@@ -28,6 +28,9 @@ from carmel.services.pdf_tables import (
     InventoryCell,
     InventoryRefusal,
     InventoryRefusalReason,
+    _bands,
+    _column_bounds,
+    _merge_affix_bands,
     build_inventory,
 )
 
@@ -961,9 +964,10 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         tall is a slab of the page. Exactly one rotated corpus fragment falls in one -- a
         ``Downloaded from http://asmedig...`` watermark on ``10.1115-1.4007737`` p5 at
         ``y=746.99``, ``x_start=588.99`` where the box ends at 555.0 on a 612 pt page, so it
-        sits in the right margin 34 pt clear of the box. A window block would refuse that
-        footprint on page furniture and mask the ``column_structure_unresolved`` it
-        correctly reports.
+        sits in the right margin 34 pt clear of the box. Measured at the shipped order of
+        checks: a window-scoped variant substituted at this call site takes probe 50 from
+        4/4 to 3/4, refusing that footprint on the watermark and replacing the
+        ``column_structure_unresolved`` it correctly reports.
 
         The fixture carries that watermark's geometry faithfully, INCLUDING its offset from
         the nearest line: 1.92 pt, the real measured gap, which is outside this module's
@@ -1039,52 +1043,61 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         upright = RIGHT_EDGE_STRADDLER
         spun = frag("91", 130.7, 322.5, 91.0, rotated=True)
 
-        for fragment, expected in (
-            (upright, InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE),
-            (spun, InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT),
+        # The DETAIL is asserted, not only the reason. `ROTATED_OR_INSANE_FRAGMENT` is
+        # shared by three checks -- the page-scoped geometry gate, the rotated-member check
+        # and the band-sharer -- so the enum alone would pass if the wrong one fired.
+        for fragment, expected, detail in (
+            (upright, InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE, "cut by its side edge"),
+            (spun, InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT, "share a printed line of the table"),
         ):
             with_marker = build_inventory(extraction_of(*a_row_the_edge_can_cut(), fragment, marker), footprint())
             without = build_inventory(extraction_of(*a_row_the_edge_can_cut(), fragment), footprint())
 
-            assert [r.reason for r in with_marker.refusals] == [expected]
-            assert [r.reason for r in without.refusals] == [expected]
+            assert [(r.reason, detail in r.detail) for r in with_marker.refusals] == [(expected, True)]
+            assert [(r.reason, detail in r.detail) for r in without.refusals] == [(expected, True)]
 
     def test_the_row_derivation_reads_no_glyph(self) -> None:
-        """The premise the hoist rests on, asserted rather than trusted.
+        """The premise the hoist rests on, asserted rather than trusted -- and asserted
+        against the DERIVATION HELPERS rather than through ``build_inventory``.
 
-        Rows may be derived before glyphs are known readable only if the derivation does
-        not consult them. Corrupting every member's text and glyph state, while leaving all
-        four geometry floats alone, must therefore produce the same rows, the same folded
-        baselines and the same ordinals -- only the cell TEXT may differ, which is why cell
-        construction stayed below the unmapped check.
+        That indirection is the point. The claim is that ``_bands`` and
+        ``_merge_affix_bands`` consult no glyph, so rows may be derived before glyphs are
+        known readable. Driving it through ``build_inventory`` cannot show that: an UNMAPPED
+        member refuses before rows exist, so the only corruption that survives the front
+        door is a text change with ``glyph_mapping`` left MAPPED -- which is a weaker claim
+        than the one the hoist needs. Calling the helpers directly is where UNMAPPED is
+        survivable, so that is where the real corruption is applied.
         """
-        readable = (
-            CAPTION,
+        readable = [
             frag("CO", 122.0, 134.0, 120.0),
             frag("2", 134.0, 137.0, 116.0, font_height=AFFIX_HEIGHT),
             frag("Bbb", 53.0, 70.0, 100.0),
             frag("222", 122.0, 146.0, 100.0),
-        )
-        # The CAPTION keeps its text. It is the box's anchor, checked against the document
-        # by `_caption_anchored`, so corrupting it refuses for a reason unrelated to this
-        # question -- which is itself a small proof that the anchor check reads text and the
-        # derivation below it does not.
-        scrambled = (
-            CAPTION,
-            *(
-                frag("?" * len(f.text), f.x_start, f.x_end, f.baseline_y, font_height=f.font_height)
-                for f in readable[1:]
-            ),
-        )
-
-        first = build_inventory(extraction_of(*readable), footprint())
-        second = build_inventory(extraction_of(*scrambled), footprint())
-
-        assert first.refusals == () and second.refusals == ()
-        assert [(r.ordinal, r.baseline_y, r.merged_baselines) for r in first.rows] == [
-            (r.ordinal, r.baseline_y, r.merged_baselines) for r in second.rows
         ]
-        assert [r.anchor_text for r in first.rows] != [r.anchor_text for r in second.rows], "the text DID change"
+        corrupted = [
+            frag(
+                "?" * len(f.text),
+                f.x_start,
+                f.x_end,
+                f.baseline_y,
+                font_height=f.font_height,
+                glyph_mapping=GlyphMapping.UNMAPPED,
+            )
+            for f in readable
+        ]
+
+        first, clean_ambiguity = _merge_affix_bands(_bands(readable))
+        second, corrupt_ambiguity = _merge_affix_bands(_bands(corrupted))
+
+        assert clean_ambiguity is None and corrupt_ambiguity is None
+        assert [(y, folded) for y, _, folded in first] == [(y, folded) for y, _, folded in second]
+        assert [[(f.x_start, f.x_end, f.baseline_y) for f in members] for _, members, _ in first] == [
+            [(f.x_start, f.x_end, f.baseline_y) for f in members] for _, members, _ in second
+        ]
+        assert _column_bounds(first) == _column_bounds(second)
+        assert [[f.text for f in members] for _, members, _ in first] != [
+            [f.text for f in members] for _, members, _ in second
+        ], "the text and glyph state DID change"
 
     def test_the_straddle_refusal_does_not_depend_on_the_glyph_state(self) -> None:
         """The reason a caller reads must not turn on whether some OTHER fragment mapped.
@@ -1250,14 +1263,15 @@ class TestGeometryThatCannotBeComparedRefuses:
     @pytest.mark.parametrize("field", ["x_start", "x_end", "baseline_y", "font_height"])
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
     def test_every_geometry_float_is_covered_by_the_one_invariant(self, field: str, bad: float) -> None:
-        """The point of centralising the predicate: the next adjacent case is caught by
-        construction, not by the next review.
+        """Every float this module compares, against the one predicate.
 
-        ``TextFragment`` carries exactly four floats that this module compares --
-        ``x_start``, ``x_end``, ``baseline_y``, ``font_height`` -- and ``page`` only for
-        equality. So this parametrisation is EXHAUSTIVE over the fields, which is the claim
-        that makes "there is no fifth patch" checkable rather than asserted. Four separate
-        patches got us here; this is what replaces the fifth.
+        ``TextFragment`` carries exactly four -- ``x_start``, ``x_end``, ``baseline_y``,
+        ``font_height`` -- and ``page`` only for equality, so this is exhaustive over the
+        FIELDS. It is deliberately not claimed to be exhaustive over the FAULT: an earlier
+        version of this docstring said no fifth patch was possible, and
+        ``_looks_like_affix``'s unbounded height ratio refutes that with four finite,
+        positive, well-ordered numbers. Comparability is what is closed here, completely;
+        magnitude is a separate fault, tracked separately.
         """
         geometry = {"x_start": 300.0, "x_end": 320.0, "baseline_y": 91.0, "font_height": BODY_HEIGHT}
         geometry[field] = bad
@@ -1269,6 +1283,40 @@ class TestGeometryThatCannotBeComparedRefuses:
 
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_a_negative_font_height_refuses(self) -> None:
+        """Kept beside the zero case rather than folded into it.
+
+        The invariant covers it -- ``font_height > 0`` is one comparison -- but a negative
+        height is a distinct nonsense value with a distinct effect (it makes a band
+        affix-shaped against every neighbour AND passes ``reference <= 0`` on the other
+        side), and 0 of 78178 corpus fragments carry one. A test that names the value is
+        what stops it silently leaving the predicate.
+        """
+        marker = frag("2", 134.0, 137.0, 116.0, font_height=-5.0)
+
+        inventory = build_inventory(extraction_of(CAPTION, frag("CO", 122.0, 134.0, 120.0), marker), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_unreadable_geometry_is_named_before_the_caption_anchor_is_blamed(self) -> None:
+        """The caption anchor is a geometric comparison too, so it sits behind the gate.
+
+        ``_caption_anchored`` matches the claimed baseline with ``math.isclose``, which a
+        NaN defeats. Ahead of the gate, a caption fragment with an unreadable baseline
+        reported ``CAPTION_ANCHOR_ABSENT`` -- true in that the anchor was not found, but it
+        names the caller's caption fields as the fault when the document's geometry is what
+        cannot be read. Same reason-attribution class as the straddle and rotated
+        placements, so the same answer.
+        """
+        broken_caption = frag(CAPTION.text, CAPTION.x_start, 196.0, float("nan"))
+        fragments = (broken_caption, *simple_grid()[1:])
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+        assert "comparable geometry" in inventory.refusals[0].detail
 
     def test_a_zero_width_fragment_stays_legal(self) -> None:
         """The boundary the invariant deliberately does NOT close.

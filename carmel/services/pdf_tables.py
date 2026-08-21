@@ -516,12 +516,22 @@ def _has_comparable_geometry(fragment: TextFragment) -> bool:
     case, then ``font_height``'s ZERO case was found and patched separately, each time by a
     reviewer rather than by the module, and each time the same shape: a value that makes a
     comparison quietly False, a fragment that satisfies no test in either direction, and a
-    COMPLETE inventory with a row lost or invented. The field enumeration is now exhaustive
-    -- :class:`~carmel.services.pdf_fragments.TextFragment` carries exactly these four floats,
-    and ``page`` is only ever compared for equality -- so a fifth patch is not possible, and
-    the way to keep it that way is one predicate rather than five clauses.
+    COMPLETE inventory with a row lost or invented.
 
-    Two boundaries chosen deliberately:
+    **This closes a FAULT, not a surface, and the difference was itself got wrong here once.**
+    An earlier version of this docstring claimed the enumeration was exhaustive -- four
+    floats, ``page`` compared only for equality, therefore no fifth patch possible. That
+    conflates exhaustiveness over FIELDS with exhaustiveness over ways a number can mislead
+    this module, and it is refuted by construction: :func:`_looks_like_affix` is a RATIO with
+    no upper bound, so a header merely taller than the row beneath it is folded into that row
+    and the row is lost -- ``font_height`` 8.0 gives three rows, 10.7 gives two with the
+    anchor reading ``HeadBbb``, and no value involved is non-finite, negative or backwards.
+    :func:`_has_comparable_geometry` cannot reach that and must not be widened to try: a
+    magnitude ratio unbounded above is a different fault with a different repair, tracked
+    separately. What this predicate covers is comparability, completely; what it does not
+    cover is every other way a finite number can be wrong.
+
+    Three boundaries chosen deliberately:
 
     * **Zero WIDTH stays legal.** ``x_start == x_end`` is a real fragment, not a broken one:
       the corpus's ``/C14`` degree sign is exactly that, at ``x=61.7952-61.7952``. Refusing
@@ -863,17 +873,25 @@ def _rotated_band_sharer_refusal(
     baseline a row carries counts, its own and the affix baselines folded into it, because a
     subscript's line is a printed line too and the merge is what would otherwise hide it.
 
-    **The scope is argued STRUCTURALLY, and the corpus cannot decide it.** Say that plainly,
-    because the earlier version of this docstring claimed a measurement it did not have.
-    Only one of the four registered footprints reaches this call site at all -- the other
-    three refuse earlier -- and at that one this function returns ``None``. Substituting a
-    WINDOW-scoped variant at the same call site and re-running the probe also gives 4/4, and
-    the claim that a window block would mask that footprint's
-    :attr:`COLUMN_STRUCTURE_UNRESOLVED` was simply false: that reason fires well before this
-    line is reached. So "0 of 4 expectations flip" is true and nearly vacuous, and it is not
-    what decides the scope.
+    **The scope is argued structurally AND the corpus discriminates -- measured at THIS
+    ordering, which is the only ordering the numbers mean anything at.** Two of the four
+    registered footprints reach this call site (the whole-table box on
+    ``10.1016-j.ijhydene.2013.10.164`` p4, and the caption-inside box on
+    ``10.1115-1.4007737`` p5); band-scoped, both pass and the probe reports 4/4.
+    Substituting a WINDOW-scoped variant here instead gives **3/4**: the p5 footprint flips
+    from :attr:`COLUMN_STRUCTURE_UNRESOLVED` to a rotated refusal raised on a page
+    watermark, which is the correct finding replaced by a false one.
 
-    What decides it is what a LINE is in this module. Row identity here is
+    That number is ordering-dependent and has already inverted once, which is worth knowing
+    before citing it. While this check sat BELOW the column-structure test, a window-scoped
+    variant also gave 4/4 -- only one footprint reached it, and nothing could be masked
+    because the better refusal had already fired. Hoisting the check above the unmapped
+    gate moved it above the column-structure test too, and the masking it can now do became
+    real. **Any measurement quoted here must be re-taken against the shipped order of
+    checks; this paragraph has been wrong in both directions for exactly that reason.**
+
+    What decides the scope independently of that is what a LINE is in this module. Row
+    identity here is
     :data:`_BAND_TOLERANCE_PT` via :func:`_bands` -- the same constant that decides two
     fragments are one row -- so the question "does this rotated fragment share a printed
     line" has exactly one available answer, and it is not the footprint's y-window. The
@@ -886,10 +904,15 @@ def _rotated_band_sharer_refusal(
     ``BASELINE_BAND = 4.0`` pt against this one's 0.5, and each lane uses the constant that
     defines a line in it. The difference is not a corner case -- of 266 non-blank rotated
     corpus fragments, **61 sit within 0.5 pt of a printed baseline and 227 within 4.0 pt**,
-    so the two rules disagree about roughly 166 fragments. The single ``Downloaded from
-    http://asmedig...`` watermark in a registered window, 1.92 pt from the nearest printed
-    baseline, is one of them and is a fact about four hand-drawn footprints rather than
-    about the corpus (probes/i004_bad_geometry_census.py).
+    so the two rules disagree about roughly 166 fragments -- the ``Downloaded from
+    http://asmedig...`` watermark, 1.92 pt from the nearest printed baseline, is one of many
+    rather than a curiosity (probes/i004_bad_geometry_census.py).
+
+    Two denominators appear above and neither is a typo: 266 counts non-blank rotated
+    fragments corpus-wide, while the extent measurement uses 257, which is the same
+    population minus 10 fragments on pages whose mediabox is unreadable. Those are excluded
+    rather than measured against a guessed page width, since the guess would be what decided
+    whether an extent counts as off-page.
     """
     printed_baselines = [y for baseline_y, _, folded in rows_raw for y in (baseline_y, *folded)]
     sharers = [
@@ -1041,6 +1064,21 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     insane = _footprint_refusal(footprint)
     if insane is not None:
         return refused(insane)
+    # Comparable geometry is the precondition of every check below, so it is established
+    # before the FIRST of them -- including the caption anchor, which is itself a geometric
+    # comparison (`math.isclose` against the claimed baseline). Behind this gate, a caption
+    # fragment with a NaN baseline reported CAPTION_ANCHOR_ABSENT: true, in that the anchor
+    # was not found, but the reason names the wrong fault and points a reader at the
+    # footprint's caption fields when the document's geometry is what is unreadable. That is
+    # the same reason-attribution class as the straddle and rotated placements.
+    #
+    # Page-scoped, for the reason `pdf_cells` gives at UNCOMPARABLE_NEIGHBOUR: a NaN BASELINE
+    # never reaches the box's y-window at all, so a window-scoped check would inspect only
+    # the fragments that already passed the test NaN defeats.
+    uncomparable = _uncomparable_geometry_refusal(extraction, footprint)
+    if uncomparable is not None:
+        return refused(uncomparable)
+
     if not _caption_anchored(extraction, footprint):
         return refused(
             InventoryRefusal(
@@ -1048,15 +1086,6 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                 "the claimed caption text is not printed at the claimed baseline",
             )
         )
-
-    # Comparable geometry is the precondition of every check below, so it is established
-    # before the first of them rather than in the middle. Page-scoped, for the reason
-    # `pdf_cells` gives at UNCOMPARABLE_NEIGHBOUR: a NaN BASELINE never reaches the box's
-    # y-window at all, so a window-scoped check would inspect only the fragments that
-    # already passed the test NaN defeats.
-    uncomparable = _uncomparable_geometry_refusal(extraction, footprint)
-    if uncomparable is not None:
-        return refused(uncomparable)
 
     orphaned = [
         f
