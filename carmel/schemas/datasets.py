@@ -4377,8 +4377,20 @@ class EmbeddedFigureDigitization(BaseModel):
         neither replaces the other: reconstruction establishes that the payload is a VALID
         record, re-serialization that these bytes are its CANONICAL rendering. Dropping the
         latter would admit non-canonical but valid bytes carrying an honestly recomputed address
-        -- one logical record with as many addresses as it has renderings, which defeats
+        -- one logical record with as many addresses as it has JSON renderings, which defeats
         addressing itself. Dropping the former is the bug described above.
+
+        That is a claim about renderings and no more: the check pins the JSON, not the SPELLING
+        of the values inside it. Two payloads differing only in the case of one hex-float
+        coordinate (``0x1.03b3333333333p+9`` against ``0X1.03B3333333333P+9``) are each the
+        canonical JSON of themselves, each accepted at its own honestly computed address, and
+        :meth:`FigureDigitization.from_payload` returns EQUAL records from both -- one logical
+        record, two addresses, which is exactly what this paragraph says cannot happen. It
+        cannot happen in practice because
+        :func:`~carmel.services.figure_digitization_record._pt` emits ``float.hex()``, which is
+        one spelling per value, so no producer can reach the second address. The axis is closed
+        by the PRODUCER, not by this schema, and a future writer of coordinates has to keep it
+        that way. Pinned by ``test_the_address_pins_the_rendering_not_the_spelling``.
 
         See the class docstring for what all of them together do NOT prove.
 
@@ -4387,9 +4399,11 @@ class EmbeddedFigureDigitization(BaseModel):
         (700 omissions), ~2558 us, of which roughly 1400 us is the parse-and-reconstruct and
         1150 us the re-canonicalization that pins the canonical-rendering refusal. The
         hand-picked trio this replaced cost
-        ~1495 us at the same size, so reads really are about 1.7x slower than what shipped in
-        ``fd925be``, where a cache hit genuinely was the faster path. Something fast WAS given
-        up; it was given up because it was also wrong, admitting records
+        ~1495 us at the same size, so reads really are about 1.7x slower than the revision
+        described above -- the one that cached the reconstructed record and re-checked only
+        address, document digest, and re-serialization. On a cache hit that revision genuinely
+        was the faster path. Something fast WAS given up; it was given up because it was also
+        wrong, admitting records
         :meth:`FigureDigitization.from_payload` refuses on the identical bytes. (The trio was a
         net loss against holding no cache at all, which is why nothing here is worth
         reintroducing -- but that is a different comparison from the one this paragraph makes,

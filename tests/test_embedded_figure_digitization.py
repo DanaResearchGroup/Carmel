@@ -17,11 +17,13 @@ complete a digitized series is, and cannot be handed an incoherent answer. That 
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import inspect
 import json
 import pickle
 import sys
+import textwrap
 from typing import Any
 
 import pytest
@@ -31,6 +33,7 @@ from carmel.schemas.datasets import DatasetEnvelope, EmbeddedFigureDigitization
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.figure_digitization_record import (
     DIGITIZATION_PAYLOAD_VERSION,
+    UNREADABLE_PAYLOAD,
     CensusUnavailable,
     CensusUnavailableReason,
     FigureCoverage,
@@ -367,8 +370,10 @@ class TestTheAddressCannotSilentlyStopMatchingTheBytes:
         crime the read punishes; it is simply not a way to be believed. Both directions are
         asserted here, since only asserting the refusal is what let the wrong name stand.
 
-        This is also a deliberate behaviour change from ``fd925be``, where a sentinel over the
-        private cache refused EVERY ``model_construct`` object on sight. That sentinel was
+        This is also a deliberate behaviour change from the cached revision of this class, where
+        a sentinel over the private cache refused EVERY ``model_construct`` object on sight
+        (``self.__pydantic_private__`` being ``None`` was read as "this object skipped
+        validation"). That sentinel was
         unsound anyway -- ``model_construct`` does not reliably leave ``None`` there, and under
         ``pytest --cov=carmel.schemas.datasets`` it left the ``ModelPrivateAttr`` DESCRIPTOR, so
         the check missed. There is no sentinel now because there is no cache. The coverage
@@ -505,9 +510,15 @@ class TestTheGuardCannotBeRecomputedByWhoeverBypassedIt:
         See :meth:`test_a_memo_hidden_outside_pydantics_private_bag_is_still_seen` for that
         counterexample, built rather than argued.
 
+        Round three -- this one -- fixed a third axis: TIME. The assertion ran against an
+        instance that had never been read, so a memo populated LAZILY inside
+        :meth:`EmbeddedFigureDigitization._validated_record` passed it while the exploit was
+        live. The object is now read before it is inspected, and read repeatedly, because "holds
+        no state" is a claim about an instance in use rather than an instance just built.
+
         What this now promises, exactly: no state outside the three declared fields, in any of
-        the three places INSTANCE state can live. Two things it does not reach, named here
-        rather than left for a sixth round to find:
+        the three places INSTANCE state can live, before or after any number of reads. Two
+        things it does not reach, named here rather than left for a later round to find:
 
         - Residue 3 of :meth:`EmbeddedFigureDigitization._validated_record` -- a subclass that
           overrides an accessor outright answers whatever it likes, and no assertion about
@@ -519,7 +530,13 @@ class TestTheGuardCannotBeRecomputedByWhoeverBypassedIt:
           was derived from.
         """
         embedded = embed(digitization_record_payload(record()))
-        assert self._forgeable_state(embedded) == {}
+        assert self._forgeable_state(embedded) == {}, "state before the first read"
+
+        for _ in range(3):
+            _ = embedded.coverage
+            _ = embedded.auditable
+            _ = embedded.omission_count
+            assert self._forgeable_state(embedded) == {}, "a read left something behind"
 
     def test_a_memo_hidden_outside_pydantics_private_bag_is_still_seen(self) -> None:
         """The counterexample that made the previous docstring false, kept as the guard's proof.
@@ -693,6 +710,38 @@ class TestAReadRefusesEveryInvalidRecord:
             with pytest.raises(RuntimeError, match="does not reconstruct"):
                 getattr(embedded, accessor)
 
+    def test_the_address_pins_the_rendering_not_the_spelling(self) -> None:
+        """The limit of the canonical-rendering refusal, constructed rather than asserted away.
+
+        Hex floats have two spellings per value, and ``canonical_json_bytes`` has no opinion
+        about which one a string holds. So two payloads differing only in the CASE of one
+        coordinate are each canonical JSON of themselves, each accepted at its own honest
+        address, while ``from_payload`` returns equal records from both: one logical record at
+        two addresses, which is what the refusal is justified as preventing.
+
+        Not a live defect, because ``_pt`` emits ``float.hex()`` -- one spelling per value -- so
+        no producer reaches the second address. That is the point of pinning it here: the axis
+        is closed by the producer, and this fails if a future writer of coordinates stops
+        closing it.
+        """
+        lower = digitization_record_payload(record())
+        upper = digitization_record_payload(record())
+        spelling = upper["omissions"][0]["x"]
+        assert spelling != spelling.upper(), "the fixture needs a coordinate with two spellings"
+        upper["omissions"][0]["x"] = spelling.upper()
+
+        lower_bytes = digitization_record_bytes(lower)
+        upper_bytes = digitization_record_bytes(upper)
+        assert lower_bytes != upper_bytes
+        assert hashlib.sha256(lower_bytes).hexdigest() != hashlib.sha256(upper_bytes).hexdigest()
+
+        # Same record, two addresses, both accepted.
+        assert FigureDigitization.from_payload(lower) == FigureDigitization.from_payload(upper)
+        assert embed(lower).coverage is embed(upper).coverage is FigureCoverage.PARTIAL
+
+        # And the producer is what keeps that unreachable.
+        assert digitization_record_payload(record())["omissions"][0]["x"] == spelling
+
     def test_a_census_that_does_not_balance_is_refused_on_read(self) -> None:
         """D9, by the same route."""
         smuggled = self._unchecked_record(census=MarkerCensus(detected=11), recovered=10, omissions=())
@@ -705,7 +754,11 @@ class TestAReadRefusesEveryInvalidRecord:
 
         These bytes are valid JSON of a valid record, and the address honestly hashes them -- so
         reconstruction alone would accept. What it would accept is one logical record with as
-        many addresses as it has renderings, which is addressing defeated.
+        many addresses as it has JSON renderings, which is addressing defeated.
+
+        Renderings, precisely -- not spellings. See
+        :meth:`test_the_address_pins_the_rendering_not_the_spelling` for the axis this check
+        does not close and who does close it.
         """
         spaced = json.dumps(digitization_record_payload(record()), sort_keys=True, indent=1).encode("utf-8")
         embedded = self._install(spaced)
@@ -888,8 +941,14 @@ class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
 
     @staticmethod
     def _paths(node: Any, prefix: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
-        """Every path into a payload, interior containers included."""
-        found = [prefix] if prefix else []
+        """Every path into a payload: the ROOT, interior containers, and leaves.
+
+        The empty path was excluded here (``[prefix] if prefix else []``), which meant every
+        mutation was written INTO a parent container and the payload itself was never replaced.
+        That is exactly the input ``from_payload``'s ``AttributeError`` needed, so the sweep
+        could not have found the escape a commit message credited it with finding.
+        """
+        found = [prefix]
         if isinstance(node, dict):
             for key, value in node.items():
                 found.extend(TestTheRefusalSurfaceHasNoUndocumentedEscapes._paths(value, (*prefix, key)))
@@ -899,7 +958,9 @@ class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
         return found
 
     @staticmethod
-    def _mutated(payload: dict[str, Any], path: tuple[Any, ...], value: Any) -> dict[str, Any]:
+    def _mutated(payload: dict[str, Any], path: tuple[Any, ...], value: Any) -> Any:
+        if not path:
+            return value
         clone = json.loads(json.dumps(payload))
         node = clone
         for step in path[:-1]:
@@ -908,7 +969,7 @@ class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
         return clone
 
     @staticmethod
-    def _render(payload: dict[str, Any]) -> bytes | None:
+    def _render(payload: Any) -> bytes | None:
         """The bytes a store could hold for this payload, canonical where that is possible.
 
         Falls back to plain ``json.dumps`` for payloads ``canonical_json_bytes`` refuses -- those
@@ -928,12 +989,25 @@ class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
     def test_no_mutation_escapes_the_documented_refusals(self) -> None:
         base = digitization_record_payload(record())
         paths = self._paths(base)
-        assert paths, "the sweep must actually have somewhere to mutate"
+        assert () in paths, "the root must be substitutable, or the sweep cannot reach from_payload"
 
         checked = 0
         for path in paths:
             for value in self.HOSTILE:
                 mutated = self._mutated(base, path, value)
+
+                # from_payload FIRST, and with the raw mutated object rather than a re-decode:
+                # it is a public entry point in its own right, and the only one a root
+                # substitution reaches -- `_reconstruct` refuses a non-object before it ever
+                # gets there, which is why sweeping the embedded class alone missed the
+                # AttributeError this call now covers.
+                try:
+                    FigureDigitization.from_payload(mutated)
+                except UNREADABLE_PAYLOAD:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - the whole point is to catch the undocumented
+                    pytest.fail(f"from_payload raised {type(exc).__name__} at {path} = {value!r}: {exc}")
+
                 rendered = self._render(mutated)
                 if rendered is None:
                     continue
@@ -959,7 +1033,11 @@ class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
                     except Exception as exc:  # noqa: BLE001
                         pytest.fail(f".{accessor} raised {type(exc).__name__} at {path} = {value!r}: {exc}")
 
-        assert checked > 300, f"the sweep degenerated to {checked} inputs"
+        # Pinned exactly, not as a floor: a "> 300" bound let the shipped sweep be described as
+        # 575 mutations when it ran 414, and nothing in the suite disagreed. If a path or a
+        # hostile value is added, this number changes and says so.
+        assert len(paths) == 24
+        assert checked == 432, f"the sweep ran {checked} inputs, not the number this test claims"
 
     def test_the_overflowing_coordinate_really_does_overflow(self) -> None:
         """The premise behind the sweep's most interesting input, asserted not assumed."""
@@ -988,8 +1066,34 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
     """Claims that were false, pinned so they cannot drift back."""
 
     @staticmethod
-    def _reconstruct_source() -> str:
-        return inspect.getsource(EmbeddedFigureDigitization._reconstruct)
+    def _raised_messages() -> list[str]:
+        """The message each ``raise`` in ``_reconstruct``'s BODY builds, docstring excluded.
+
+        Read off the AST rather than off the source text, for two reasons that both bit the
+        previous version of these tests. ``inspect.getsource`` includes the docstring, so
+        ``phrase in source`` was the docstring quoting itself -- an assertion that could not
+        fail, under a failure message describing a check it did not perform. And a text search
+        for ``"raise ValueError("`` counts only refusals spelled exactly that way, so any other
+        spelling was invisible to the count that turned out to be carrying the whole guard.
+
+        An ``ast.Raise`` node's exception expression is walked whole, so an f-string's literal
+        chunks are collected along with plain literals and joined in source order.
+        """
+        source = textwrap.dedent(inspect.getsource(EmbeddedFigureDigitization._reconstruct))
+        function = ast.parse(source).body[0]
+        assert isinstance(function, ast.FunctionDef)
+
+        messages: list[str] = []
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Raise) or node.exc is None:
+                continue
+            literals = [
+                part.value
+                for part in ast.walk(node.exc)
+                if isinstance(part, ast.Constant) and isinstance(part.value, str)
+            ]
+            messages.append("".join(literals))
+        return messages
 
     #: The marker phrases ``_reconstruct``'s docstring lists, in source order.
     REFUSALS = (
@@ -1004,28 +1108,38 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
         "does not reconstruct",
     )
 
-    def test_every_refusal_the_docstring_lists_exists_in_the_code(self) -> None:
+    def test_the_docstring_lists_a_refusal_the_code_actually_raises(self) -> None:
+        """One listed phrase per raise, and one raise per listed phrase.
+
+        A bijection rather than two containment checks, because containment is what let a
+        code-only rename pass: renaming a message in the body while leaving the docstring alone
+        kept the raise COUNT at nine and the docstring self-consistent, so the whole suite went
+        green over a docstring listing a refusal the code no longer raised. Under a bijection
+        that renamed raise matches no listed phrase and this fails.
+        """
         doc = EmbeddedFigureDigitization._reconstruct.__doc__
         assert doc is not None
-        source = self._reconstruct_source()
-        for phrase in self.REFUSALS:
-            assert f"``{phrase}``" in doc, f"{phrase!r} is listed nowhere in the docstring"
-            assert phrase in source, f"the docstring lists {phrase!r} and the code does not raise it"
+        messages = self._raised_messages()
 
-    def test_the_docstring_lists_every_refusal_the_code_raises(self) -> None:
-        """The direction that actually drifted -- twice.
-
-        The docstring said "six steps" when there were eight distinct marker phrases, and would
-        have said eight after a ninth was added. It no longer states a count at all; this asserts
-        the list is complete against the source, so adding a ``raise`` without listing it fails
-        here rather than in a review three rounds later.
-        """
-        source = self._reconstruct_source()
-        raises = source.count("raise ValueError(")
-        assert raises == len(self.REFUSALS), (
-            f"_reconstruct raises ValueError {raises} times and its docstring lists "
+        assert len(messages) == len(self.REFUSALS), (
+            f"_reconstruct raises {len(messages)} times and its docstring lists "
             f"{len(self.REFUSALS)} refusals -- one of them is out of date"
         )
+
+        for phrase in self.REFUSALS:
+            assert f"``{phrase}``" in doc, f"{phrase!r} is listed nowhere in the docstring"
+            matched = [message for message in messages if phrase in message]
+            assert len(matched) == 1, (
+                f"the docstring lists {phrase!r} and {len(matched)} of the raises in the BODY "
+                f"build a message containing it"
+            )
+
+        for message in messages:
+            matched_phrases = [phrase for phrase in self.REFUSALS if phrase in message]
+            assert len(matched_phrases) == 1, (
+                f"a raise building {message[:70]!r} matches {len(matched_phrases)} listed "
+                f"refusals -- the docstring and the code have drifted apart"
+            )
 
     def test_the_class_does_not_anchor_its_dormancy_to_series(self) -> None:
         """`Series` is a REQUIRED DatasetEnvelope field with min_length=1 and is projected into
