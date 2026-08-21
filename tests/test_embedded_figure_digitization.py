@@ -18,8 +18,10 @@ complete a digitized series is, and cannot be handed an incoherent answer. That 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import pickle
+import sys
 from typing import Any
 
 import pytest
@@ -81,6 +83,22 @@ def embed(payload: dict[str, Any], **overrides: Any) -> EmbeddedFigureDigitizati
     }
     fields.update(overrides)
     return EmbeddedFigureDigitization(**fields)
+
+
+OVERFLOWING_HEX = "0x1p+99999"
+"""A hex float naming a magnitude no ``float`` can hold.
+
+``float.fromhex`` raises ``OverflowError`` on it -- NOT ``ValueError`` -- which is how it escaped
+the documented refusal surface at every entry point until
+:data:`~carmel.services.figure_digitization_record.UNREADABLE_PAYLOAD` grew the type.
+"""
+
+
+def _bytes_with_overflowing_coordinate() -> bytes:
+    """Canonical bytes of an otherwise-valid payload whose x coordinate overflows on read."""
+    payload = digitization_record_payload(record())
+    payload["omissions"][0]["x"] = OVERFLOWING_HEX
+    return digitization_record_bytes(payload)
 
 
 class TestAConsumerHoldingOnlyTheEnvelopeBytes:
@@ -340,20 +358,36 @@ class TestTheAddressCannotSilentlyStopMatchingTheBytes:
         assert embedded.model_copy().coverage is FigureCoverage.PARTIAL
         assert embedded.model_copy(deep=True).coverage is FigureCoverage.PARTIAL
 
-    def test_model_construct_answers_nothing(self) -> None:
-        """`model_construct` skips construction validation, and the read runs it anyway.
+    def test_model_construct_is_judged_on_its_bytes_like_everything_else(self) -> None:
+        """`model_construct` skips construction validation, and the read validates regardless.
 
-        Previously this depended on a sentinel over the private cache, which was unsound:
-        ``model_construct`` does not reliably leave ``None`` there, and under
+        The name was ``test_model_construct_answers_nothing``, and that was a universal the code
+        refutes: an object built this way from a COHERENT triple answers, correctly, because the
+        read re-derives from the bytes and those bytes are fine. Skipping the validator is not a
+        crime the read punishes; it is simply not a way to be believed. Both directions are
+        asserted here, since only asserting the refusal is what let the wrong name stand.
+
+        This is also a deliberate behaviour change from ``fd925be``, where a sentinel over the
+        private cache refused EVERY ``model_construct`` object on sight. That sentinel was
+        unsound anyway -- ``model_construct`` does not reliably leave ``None`` there, and under
         ``pytest --cov=carmel.schemas.datasets`` it left the ``ModelPrivateAttr`` DESCRIPTOR, so
-        the check missed. There is no sentinel now because there is no cache -- the read simply
-        validates. The coverage invocation stays in the verifier regardless.
+        the check missed. There is no sentinel now because there is no cache. The coverage
+        invocation stays in the verifier regardless.
         """
-        built = EmbeddedFigureDigitization.model_construct(
+        incoherent = EmbeddedFigureDigitization.model_construct(
             digitization_sha256="c" * 64, raw_sha256=RAW_SHA, canonical_json="{}"
         )
         with pytest.raises(RuntimeError, match="no longer validates"):
-            _ = built.coverage
+            _ = incoherent.coverage
+
+        honest = embed(digitization_record_payload(record()))
+        coherent = EmbeddedFigureDigitization.model_construct(
+            digitization_sha256=honest.digitization_sha256,
+            raw_sha256=honest.raw_sha256,
+            canonical_json=honest.canonical_json,
+        )
+        assert coherent.coverage is FigureCoverage.PARTIAL
+        assert coherent.omission_count == 1
 
     def test_writing_past_frozen_leaves_the_bytes_disowned(self) -> None:
         """`object.__setattr__` writes straight past `frozen=True` and cannot be prevented --
@@ -365,7 +399,7 @@ class TestTheAddressCannotSilentlyStopMatchingTheBytes:
                 getattr(embedded, accessor)
 
     def test_the_refusal_carries_the_reason_t1_gave(self) -> None:
-        """The wrapper must not swallow which of T1's six steps fired."""
+        """The wrapper must not swallow which of T1's refusals fired."""
         embedded = embed(digitization_record_payload(record()))
         object.__setattr__(embedded, "canonical_json", "{}")
         with pytest.raises(RuntimeError, match="is not the canonical rendering of what it decodes to"):
@@ -440,25 +474,88 @@ class TestTheGuardCannotBeRecomputedByWhoeverBypassedIt:
 
     @staticmethod
     def _forgeable_state(embedded: EmbeddedFigureDigitization) -> dict[str, object]:
-        """Everything private an attacker can reach, so a test can try to repair all of it."""
+        """Everything an attacker can reach that is NOT one of the three declared fields.
+
+        Three storage locations, because a memo can live in any of them and the guard is worth
+        only as much as the narrowest one it checks: declared private attributes
+        (``__pydantic_private__``), undeclared instance state (``__dict__`` beyond the fields),
+        and pydantic's extras bag.
+        """
+        declared = set(EmbeddedFigureDigitization.model_fields)
+        found: dict[str, object] = {}
         private = getattr(embedded, "__pydantic_private__", None)
-        return dict(private) if private else {}
+        if private:
+            found.update(private)
+        found.update({k: v for k, v in vars(embedded).items() if k not in declared})
+        extra = getattr(embedded, "__pydantic_extra__", None)
+        if extra:
+            found.update(extra)
+        return found
 
-    def test_the_class_holds_no_private_state_at_all(self) -> None:
-        """The structural fix, asserted NAME-AGNOSTICALLY.
+    def test_the_class_holds_nothing_beyond_its_three_declared_fields(self) -> None:
+        """The structural fix, asserted on BOTH axes an earlier version got wrong.
 
-        An earlier version of this test named the two attributes it knew about, under a docstring
+        Round one of this test named the two attributes it knew about, under a docstring
         promising that a future edit reintroducing "such an attribute" would fail here. It would
-        not: an attribute called ``_field_digest`` passed both assertions. A guard whose claim is
-        broader than its construction is the exact defect this whole ticket is about, and it had
-        got into the test meant to catch it.
+        not: an attribute called ``_field_digest`` passed both assertions. Round two fixed the
+        NAMING axis with set equality and left the docstring promising "whatever it is called" --
+        still false, now on the STORAGE axis, because ``_forgeable_state`` read
+        ``__pydantic_private__`` alone. Memoizing into ``self.__dict__["_memo"]`` is the natural
+        way to cache on a pydantic model without declaring a ``PrivateAttr``, and it passed.
+        See :meth:`test_a_memo_hidden_outside_pydantics_private_bag_is_still_seen` for that
+        counterexample, built rather than argued.
 
-        Set equality is what makes the promise true. It is empty because
-        :class:`EmbeddedFigureDigitization` now derives everything on read; if a cache is ever
-        reintroduced, whatever it is called, this fails before the exploit is written.
+        What this now promises, exactly: no state outside the three declared fields, in any of
+        the three places INSTANCE state can live. Two things it does not reach, named here
+        rather than left for a sixth round to find:
+
+        - Residue 3 of :meth:`EmbeddedFigureDigitization._validated_record` -- a subclass that
+          overrides an accessor outright answers whatever it likes, and no assertion about
+          storage can reach that.
+        - A memo held OFF the instance, in a module-level or class-level map keyed by ``id`` or
+          by ``digitization_sha256``. Nothing here would see it. What makes that unattractive
+          rather than merely unguarded is that it is no cheaper than the memo this class already
+          refuses to keep, and it inherits the same defect: an answer that outlives the bytes it
+          was derived from.
         """
         embedded = embed(digitization_record_payload(record()))
         assert self._forgeable_state(embedded) == {}
+
+    def test_a_memo_hidden_outside_pydantics_private_bag_is_still_seen(self) -> None:
+        """The counterexample that made the previous docstring false, kept as the guard's proof.
+
+        A subclass caching into ``__dict__`` reports ``COMPLETE`` over bytes that say ``PARTIAL``
+        -- exactly the stale-answer bug this class was rewritten to end -- while the old
+        ``__pydantic_private__``-only guard reported nothing to see.
+        """
+
+        class MemoizingSubclass(EmbeddedFigureDigitization):
+            @property
+            def coverage(self) -> FigureCoverage:
+                memo = self.__dict__.get("_memo")
+                if memo is None:
+                    memo = self._reconstruct()
+                    self.__dict__["_memo"] = memo
+                return memo.coverage
+
+        honest = embed(digitization_record_payload(record()))
+        poisoned = MemoizingSubclass(
+            digitization_sha256=honest.digitization_sha256,
+            raw_sha256=honest.raw_sha256,
+            canonical_json=honest.canonical_json,
+        )
+        assert poisoned.coverage is FigureCoverage.PARTIAL
+
+        # A perfectly valid record that simply is not the one these bytes carry: the memo does
+        # not even have to be malformed for the answer to be a lie.
+        poisoned.__dict__["_memo"] = record(
+            coverage=FigureCoverage.COMPLETE, census=MarkerCensus(detected=10), omissions=()
+        )
+        assert poisoned.coverage is FigureCoverage.COMPLETE, "the exploit must actually work"
+
+        # The old guard saw nothing. The current one sees the memo, which is the whole point.
+        assert dict(getattr(poisoned, "__pydantic_private__", None) or {}) == {}
+        assert "_memo" in self._forgeable_state(poisoned)
 
     def test_rewriting_the_address_and_repairing_every_private_attribute_still_refuses(self) -> None:
         embedded = embed(digitization_record_payload(record()))
@@ -516,7 +613,7 @@ class TestTheGuardCannotBeRecomputedByWhoeverBypassedIt:
         assert revived.omission_count == 1
 
 
-class TestAReadRefusesEverythingConstructionRefuses:
+class TestAReadRefusesEveryInvalidRecord:
     """The read path re-runs T1 entire, so no subset of it can admit an invalid record.
 
     ``FigureDigitization`` is a frozen DATACLASS, and ``object.__new__`` skips ``__post_init__``
@@ -527,6 +624,11 @@ class TestAReadRefusesEverythingConstructionRefuses:
     :meth:`FigureDigitization.from_payload` refuses those identical bytes.
 
     Coherence is not validity. These tests are what hold the two together.
+
+    The class was called ``TestAReadRefusesEverythingConstructionRefuses``, which is one word too
+    wide: construction also applies this class's FIELD constraints, and a read does not re-apply
+    them. ``test_construction_applies_a_size_bound_the_read_does_not`` is that exception. What is
+    true without qualification is the name above -- no invalid RECORD survives a read.
     """
 
     @staticmethod
@@ -620,27 +722,62 @@ class TestAReadRefusesEverythingConstructionRefuses:
         assert embedded.coverage is FigureCoverage.PARTIAL
         assert embedded.omission_count == 1
 
-    def test_construction_and_read_agree_on_every_smuggled_record(self) -> None:
-        """The invariant behind all of the above, asserted as an equivalence.
+    def test_construction_and_read_agree_on_whether_bytes_are_a_valid_record(self) -> None:
+        """The invariant behind all of the above, asserted as the equivalence that HOLDS.
 
-        For each payload: whatever ``from_payload`` does, the accessor does. A read that accepted
-        what construction refuses is the bug this class had; a read that refused what
-        construction accepts would be a new one.
+        The pairing here used to be ``from_payload`` against the accessor, under the name
+        "...on every smuggled record", and that equivalence is false: ``from_payload`` is one of
+        T1's refusals, not all of them.
+        :meth:`test_non_canonical_bytes_with_an_honest_address_are_refused_on_read` in this class
+        is a live counterexample -- ``from_payload`` accepts those bytes and the read refuses
+        them, correctly. The old test passed only because its four hand-picked payloads all
+        happened to be canonical.
+
+        The property that does hold: on the question of whether these bytes are a valid record,
+        canonically rendered, at the address they claim, construction and read are the SAME CALL
+        and cannot diverge. The name is scoped to that question because the equivalence is not
+        unconditional -- see
+        :meth:`test_construction_applies_a_size_bound_the_read_does_not`, which is the exception,
+        constructed rather than promised away.
         """
-        candidates = (
-            self._unchecked_record(),
-            self._unchecked_record(census=MarkerCensus(detected=11), recovered=10, omissions=()),
-            self._unchecked_record(coverage=FigureCoverage.PARTIAL, census=MarkerCensus(detected=11)),
-            record(),
+        cases: tuple[tuple[str, bytes], ...] = (
+            ("valid", digitization_record_bytes(digitization_record_payload(record()))),
+            ("d8 violated", digitization_record_bytes(digitization_record_payload(self._unchecked_record()))),
+            (
+                "d9 violated",
+                digitization_record_bytes(
+                    digitization_record_payload(
+                        self._unchecked_record(census=MarkerCensus(detected=11), recovered=10, omissions=())
+                    )
+                ),
+            ),
+            (
+                "d7 violated",
+                digitization_record_bytes(
+                    digitization_record_payload(
+                        self._unchecked_record(coverage=FigureCoverage.PARTIAL, census=MarkerCensus(detected=11))
+                    )
+                ),
+            ),
+            # Valid record, honest address, non-canonical rendering: from_payload accepts these
+            # and T1 does not. This is the case the old pairing could not have caught.
+            ("non-canonical", json.dumps(digitization_record_payload(record()), sort_keys=True, indent=1).encode()),
+            ("not an object", b"[]"),
+            ("not json", b"{"),
+            ("coordinate overflows a float", _bytes_with_overflowing_coordinate()),
         )
-        for candidate in candidates:
-            canonical = digitization_record_bytes(digitization_record_payload(candidate))
+        for label, canonical in cases:
+            address = hashlib.sha256(canonical).hexdigest()
             try:
-                FigureDigitization.from_payload(json.loads(canonical))
-            except ValueError:
-                constructor_accepts = False
+                EmbeddedFigureDigitization(
+                    digitization_sha256=address,
+                    raw_sha256=RAW_SHA,
+                    canonical_json=canonical.decode("utf-8"),
+                )
+            except ValidationError:
+                construction_accepts = False
             else:
-                constructor_accepts = True
+                construction_accepts = True
 
             embedded = self._install(canonical)
             try:
@@ -650,14 +787,245 @@ class TestAReadRefusesEverythingConstructionRefuses:
             else:
                 read_accepts = True
 
-            assert constructor_accepts == read_accepts, (
-                f"construction and read disagree about {candidate.series_id!r}: "
-                f"from_payload accepts={constructor_accepts}, accessor accepts={read_accepts}"
+            assert construction_accepts == read_accepts, (
+                f"construction and read disagree about {label}: "
+                f"construction accepts={construction_accepts}, accessor accepts={read_accepts}"
             )
+
+    def test_construction_applies_a_size_bound_the_read_does_not(self) -> None:
+        """The one place construction and read part company, asserted so it stays known.
+
+        ``canonical_json`` has a ``max_length``; the read re-derives the record and never
+        re-checks the field constraints. So a VALID record whose canonical bytes exceed the
+        bound is refused at construction and answered on read. Safe in the direction that
+        matters -- the bound guards what may ENTER an envelope, and an object holding such bytes
+        did not enter one -- but it is the reason this class's equivalence is scoped to validity
+        rather than claimed for every triple of field values.
+        """
+        omissions = tuple(
+            MarkerOmission(
+                marker_id=f"m{index:06d}",
+                reason=MarkerOmissionReason.OCCLUDED,
+                x=200.0 + (index % 100) * 0.01,
+                y=300.0,
+                detail="d" * 40,
+            )
+            for index in range(9000)
+        )
+        oversized = record(census=MarkerCensus(detected=10 + len(omissions)), omissions=omissions)
+        canonical = digitization_record_bytes(digitization_record_payload(oversized))
+        assert len(canonical) > 1_048_576, "the fixture must actually exceed the embed bound"
+
+        with pytest.raises(ValidationError, match="at most"):
+            EmbeddedFigureDigitization(
+                digitization_sha256=hashlib.sha256(canonical).hexdigest(),
+                raw_sha256=RAW_SHA,
+                canonical_json=canonical.decode("utf-8"),
+            )
+        assert self._install(canonical).coverage is FigureCoverage.PARTIAL
+
+    def test_bytes_too_deeply_nested_to_re_serialize_are_refused_not_raised(self) -> None:
+        """``json.loads`` uses a C scanner and ``canonical_json_bytes`` recurses in Python, so
+        bytes can parse and then exhaust the stack one call later.
+
+        At the default recursion limit the re-canonicalization survived every depth tried; this
+        reproduces it by lowering the limit, which is the same situation a deep call chain
+        creates. The guard exists because the stack left at that call belongs to the CALLER, not
+        to the bytes.
+        """
+        depth = 400
+        parsed = json.loads(("[" * depth) + ("]" * depth))
+        nested = json.dumps({"payload_version": DIGITIZATION_PAYLOAD_VERSION, "x": parsed}).encode("utf-8")
+        embedded = self._install(nested)
+
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(200)
+        try:
+            with pytest.raises(RuntimeError, match="nested too deeply to re-serialize"):
+                _ = embedded.coverage
+        finally:
+            sys.setrecursionlimit(limit)
+
+
+class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
+    """A failing read raises ``RuntimeError``; a failing construction raises ``ValidationError``.
+
+    That was false until this round, and false in a way that reading the code had not caught:
+    making the read path re-run the whole reconstruction (``0861d52``) imported
+    ``from_payload``'s refusal surface wholesale, and that surface leaked ``OverflowError`` out
+    of ``float.fromhex``. A caller doing ``except RuntimeError`` around an accessor -- which is
+    what the docstring tells them to do -- would have crashed on a stored coordinate.
+
+    WHAT THE SWEEP COVERS, stated because "no undocumented escapes" is a claim about all inputs
+    and this is a search, not a proof: one hostile VALUE substituted at a time, at every path of
+    a well-formed payload, including interior containers. It therefore does not reach multi-field
+    corruption, nesting depth (see
+    :meth:`TestAReadRefusesEveryInvalidRecord.test_bytes_too_deeply_nested_to_re_serialize_are_refused_not_raised`),
+    payload size, or an interpreter out of stack or memory. It found ``OverflowError`` at four
+    entry points, which is the kind of thing it is for.
+    """
+
+    HOSTILE: tuple[Any, ...] = (
+        None,
+        True,
+        0,
+        -1,
+        10**400,
+        1.5,
+        float("nan"),
+        "",
+        OVERFLOWING_HEX,
+        "-" + OVERFLOWING_HEX,
+        "0x1p-99999",
+        "nan",
+        "inf",
+        "not a float",
+        [],
+        {},
+        "\ud800",
+        "\x00",
+    )
+
+    @staticmethod
+    def _paths(node: Any, prefix: tuple[Any, ...] = ()) -> list[tuple[Any, ...]]:
+        """Every path into a payload, interior containers included."""
+        found = [prefix] if prefix else []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                found.extend(TestTheRefusalSurfaceHasNoUndocumentedEscapes._paths(value, (*prefix, key)))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                found.extend(TestTheRefusalSurfaceHasNoUndocumentedEscapes._paths(value, (*prefix, index)))
+        return found
+
+    @staticmethod
+    def _mutated(payload: dict[str, Any], path: tuple[Any, ...], value: Any) -> dict[str, Any]:
+        clone = json.loads(json.dumps(payload))
+        node = clone
+        for step in path[:-1]:
+            node = node[step]
+        node[path[-1]] = value
+        return clone
+
+    @staticmethod
+    def _render(payload: dict[str, Any]) -> bytes | None:
+        """The bytes a store could hold for this payload, canonical where that is possible.
+
+        Falls back to plain ``json.dumps`` for payloads ``canonical_json_bytes`` refuses -- those
+        still reach a reader as bytes on disk, so they are exactly the inputs the read path has
+        to refuse rather than crash on. Returns ``None`` only for payloads no JSON encoder can
+        render, which no store could hold either.
+        """
+        try:
+            return canonical_json_bytes(payload)
+        except ValueError:
+            pass
+        try:
+            return json.dumps(payload, sort_keys=True).encode("utf-8")
+        except TypeError, ValueError:
+            return None
+
+    def test_no_mutation_escapes_the_documented_refusals(self) -> None:
+        base = digitization_record_payload(record())
+        paths = self._paths(base)
+        assert paths, "the sweep must actually have somewhere to mutate"
+
+        checked = 0
+        for path in paths:
+            for value in self.HOSTILE:
+                mutated = self._mutated(base, path, value)
+                rendered = self._render(mutated)
+                if rendered is None:
+                    continue
+                checked += 1
+                address = hashlib.sha256(rendered).hexdigest()
+                try:
+                    EmbeddedFigureDigitization(
+                        digitization_sha256=address,
+                        raw_sha256=RAW_SHA,
+                        canonical_json=rendered.decode("utf-8"),
+                    )
+                except ValidationError:
+                    pass
+                except Exception as exc:  # noqa: BLE001 - the whole point is to catch the undocumented
+                    pytest.fail(f"construction raised {type(exc).__name__} at {path} = {value!r}: {exc}")
+
+                embedded = TestAReadRefusesEveryInvalidRecord._install(rendered)
+                for accessor in ("coverage", "auditable", "omission_count"):
+                    try:
+                        getattr(embedded, accessor)
+                    except RuntimeError:
+                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        pytest.fail(f".{accessor} raised {type(exc).__name__} at {path} = {value!r}: {exc}")
+
+        assert checked > 300, f"the sweep degenerated to {checked} inputs"
+
+    def test_the_overflowing_coordinate_really_does_overflow(self) -> None:
+        """The premise behind the sweep's most interesting input, asserted not assumed."""
+        with pytest.raises(OverflowError):
+            float.fromhex(OVERFLOWING_HEX)
+
+    def test_a_coordinate_too_large_for_a_float_is_refused_on_construction(self) -> None:
+        canonical = _bytes_with_overflowing_coordinate()
+        with pytest.raises(ValidationError, match="does not reconstruct"):
+            EmbeddedFigureDigitization(
+                digitization_sha256=hashlib.sha256(canonical).hexdigest(),
+                raw_sha256=RAW_SHA,
+                canonical_json=canonical.decode("utf-8"),
+            )
+
+    def test_a_coordinate_too_large_for_a_float_is_refused_on_read(self) -> None:
+        """The exposure that is NEW in ``0861d52``: before the read re-ran the reconstruction,
+        this input could not reach an accessor at all."""
+        embedded = TestAReadRefusesEveryInvalidRecord._install(_bytes_with_overflowing_coordinate())
+        for accessor in ("coverage", "auditable", "omission_count"):
+            with pytest.raises(RuntimeError, match="does not reconstruct"):
+                getattr(embedded, accessor)
 
 
 class TestTheDocstringSaysWhatIsActuallyTrue:
-    """Two claims that were false, pinned so they cannot drift back."""
+    """Claims that were false, pinned so they cannot drift back."""
+
+    @staticmethod
+    def _reconstruct_source() -> str:
+        return inspect.getsource(EmbeddedFigureDigitization._reconstruct)
+
+    #: The marker phrases ``_reconstruct``'s docstring lists, in source order.
+    REFUSALS = (
+        "does not parse as JSON",
+        "is not a JSON object",
+        "nested too deeply to re-serialize",
+        "is not the canonical rendering",
+        "does not live at the address it claims",
+        "is not the readable version",
+        "is not the shape of a version-",
+        "not the declared raw_sha256",
+        "does not reconstruct",
+    )
+
+    def test_every_refusal_the_docstring_lists_exists_in_the_code(self) -> None:
+        doc = EmbeddedFigureDigitization._reconstruct.__doc__
+        assert doc is not None
+        source = self._reconstruct_source()
+        for phrase in self.REFUSALS:
+            assert f"``{phrase}``" in doc, f"{phrase!r} is listed nowhere in the docstring"
+            assert phrase in source, f"the docstring lists {phrase!r} and the code does not raise it"
+
+    def test_the_docstring_lists_every_refusal_the_code_raises(self) -> None:
+        """The direction that actually drifted -- twice.
+
+        The docstring said "six steps" when there were eight distinct marker phrases, and would
+        have said eight after a ninth was added. It no longer states a count at all; this asserts
+        the list is complete against the source, so adding a ``raise`` without listing it fails
+        here rather than in a review three rounds later.
+        """
+        source = self._reconstruct_source()
+        raises = source.count("raise ValueError(")
+        assert raises == len(self.REFUSALS), (
+            f"_reconstruct raises ValueError {raises} times and its docstring lists "
+            f"{len(self.REFUSALS)} refusals -- one of them is out of date"
+        )
 
     def test_the_class_does_not_anchor_its_dormancy_to_series(self) -> None:
         """`Series` is a REQUIRED DatasetEnvelope field with min_length=1 and is projected into

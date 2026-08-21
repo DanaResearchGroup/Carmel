@@ -193,7 +193,20 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 #: indexes and calls into an untrusted mapping -- a missing nested key raises the first and
 #: ``float.fromhex(None)`` the second -- and either escaping as itself would crash a caller that
 #: correctly catches only ``ValueError``.
-UNREADABLE_PAYLOAD: tuple[type[Exception], ...] = (KeyError, TypeError, ValueError)
+#:
+#: ``OverflowError`` is in it because ``float.fromhex`` has a THIRD failure mode, and it is not a
+#: ``ValueError``: ``float.fromhex("0x1p+99999")`` names a finite number too large to be one, and
+#: raises ``OverflowError`` rather than refusing the string. A stored coordinate is exactly where
+#: that input arrives from, so it escaped every caller here -- including, once the read path
+#: started re-running the whole reconstruction, every accessor of
+#: :class:`carmel.schemas.datasets.EmbeddedFigureDigitization`. Named specifically rather than as
+#: its ``ArithmeticError`` base: a ``ZeroDivisionError`` raised in here would be a bug in this
+#: module, and catching it as "unreadable payload" would report that bug as bad data. Keeping the
+#: tuple narrow is safe only because a test sweeps this surface for escapes rather than trusting
+#: the list to be complete -- see
+#: ``tests/test_embedded_figure_digitization.py::TestTheRefusalSurfaceHasNoUndocumentedEscapes``,
+#: which states what that sweep does and does not reach.
+UNREADABLE_PAYLOAD: tuple[type[Exception], ...] = (KeyError, OverflowError, TypeError, ValueError)
 
 #: Discriminator values for the two arms of :data:`MarkerCount` in the stored payload.
 #:
@@ -825,10 +838,22 @@ class FigureDigitization:
                 :data:`DIGITIZATION_PAYLOAD_VERSION` record, or if the record it describes
                 violates any construction invariant. Both are ``ValueError`` because both mean
                 the same thing to a caller: these bytes are not a record.
-            TypeError: If a field holds a type the reconstruction cannot use at all. Callers
-                that treat any unreadable payload alike should use
-                :func:`payload_unreadable_reason`, which catches both.
+            TypeError: If a field holds a type the reconstruction cannot use at all.
+            OverflowError: If a stored coordinate is a hex float naming a magnitude no ``float``
+                can hold -- ``float.fromhex`` raises this instead of refusing the string.
+            KeyError: If a nested object is missing a key this reconstruction indexes.
+
+        Callers that treat any unreadable payload alike should use
+        :func:`payload_unreadable_reason`, which catches all four; the tuple it catches is
+        :data:`UNREADABLE_PAYLOAD`, and a test sweeps this function for types missing from it.
         """
+        if not isinstance(payload, Mapping):
+            # The annotation says Mapping and an untrusted payload does not read annotations: a
+            # decoded JSON list reaching here raised AttributeError off `payload.get`, which is
+            # outside UNREADABLE_PAYLOAD and so crashed the caller that asked this function
+            # whether the payload was readable. Refused the same way a non-object `plot_region`
+            # is, and for the same reason.
+            raise ValueError(f"a digitization record payload is {type(payload).__name__}, not an object")
         version = payload.get("payload_version")
         if version != DIGITIZATION_PAYLOAD_VERSION:
             raise ValueError(

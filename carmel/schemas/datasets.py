@@ -4232,9 +4232,11 @@ class EmbeddedFigureDigitization(BaseModel):
     one whose census does not balance against its recovered points, is refused HERE, on the
     bytes, with no producer involved -- and refused on every ACCESSOR READ as well as at
     construction, because both call :meth:`_reconstruct` and there is no cheaper read-time path
-    that could accept what construction rejects. That equality is not decoration: it is what
-    makes "this class cannot state partialness incoherently" a property of reading one rather
-    than only of building one.
+    that could accept a record construction rejects as INVALID. (Construction applies this
+    class's field constraints on top of that, which a read does not re-apply; see
+    :meth:`_validated_record` for the one asymmetry that creates and why it is in the safe
+    direction.) That equality is not decoration: it is what makes "this class cannot state
+    partialness incoherently" a property of reading one rather than only of building one.
 
     Weaker than it looks, because everything it proves is INTERNAL. Nothing in this class -- and
     nothing anywhere in this repository yet -- re-derives markers from the crop's pixels. So a
@@ -4314,10 +4316,10 @@ class EmbeddedFigureDigitization(BaseModel):
     # write. `_validated_record` re-derives the record from `canonical_json` on every read, by
     # calling the same `_reconstruct` that construction calls.
     #
-    # It costs more than caching did, and the cost is the point rather than a regrettable
-    # side effect. Measured on this machine against the final code, on a 94.8 KB payload
-    # carrying 700 omissions: see `_reconstruct`. The cache it replaced was measured too, and
-    # was a net LOSS at every size -- so nothing was traded away for this.
+    # It costs more than caching did, and that cost was paid deliberately. Measured on this
+    # machine against the final code, on a 94.8 KB payload carrying 700 omissions: see
+    # `_reconstruct` for the figures. Reads really are slower than the revision this replaced,
+    # and the reason to accept that is correctness, not a rounding error in the benchmark.
 
     @field_validator("digitization_sha256", "raw_sha256")
     @classmethod
@@ -4355,23 +4357,43 @@ class EmbeddedFigureDigitization(BaseModel):
         :meth:`FigureDigitization.from_payload` refuses on the identical bytes. Coherence is not
         validity, so the read path stops asking for coherence and asks for the whole thing.
 
-        Six steps, each with its own marker phrase so a test can tell which one fired.
-        Re-serialization (step 3) and reconstruction (step 6) are BOTH required and neither
-        replaces the other: step 6 establishes that the payload is a VALID record, step 3 that
-        these bytes are its CANONICAL rendering. Dropping step 3 would admit non-canonical but
-        valid bytes carrying an honestly recomputed address -- one logical record with as many
-        addresses as it has renderings, which defeats addressing itself. Dropping step 6 is the
-        bug described above.
+        Each refusal carries its own marker phrase, so a test can tell which one fired:
 
-        See the class docstring for what all six together do NOT prove.
+        - ``does not parse as JSON``
+        - ``is not a JSON object``
+        - ``nested too deeply to re-serialize``
+        - ``is not the canonical rendering``
+        - ``does not live at the address it claims``
+        - ``is not the readable version``
+        - ``is not the shape of a version-``
+        - ``not the declared raw_sha256``
+        - ``does not reconstruct``
+
+        Listed rather than counted on purpose: this paragraph twice said a NUMBER of steps that
+        the code had since moved past, and ``TestTheDocstringSaysWhatIsActuallyTrue`` now checks
+        the list against the source instead of trusting the prose to have been updated.
+
+        The canonical-rendering refusal and the reconstruction refusal are BOTH required and
+        neither replaces the other: reconstruction establishes that the payload is a VALID
+        record, re-serialization that these bytes are its CANONICAL rendering. Dropping the
+        latter would admit non-canonical but valid bytes carrying an honestly recomputed address
+        -- one logical record with as many addresses as it has renderings, which defeats
+        addressing itself. Dropping the former is the bug described above.
+
+        See the class docstring for what all of them together do NOT prove.
 
         WHAT IT COSTS, measured on this machine against this code. A read is one full T1: parse,
         re-canonicalize, hash, reconstruct. At 0.6 KB (one omission) that is ~24 us; at 94.8 KB
         (700 omissions), ~2558 us, of which roughly 1400 us is the parse-and-reconstruct and
-        1150 us the re-canonicalization that pins step 3. The hand-picked trio this replaced cost
-        ~1495 us at the same size, so reads are about 1.7x slower and the class is correct
-        instead of merely coherent. That trade is not close, and it is cheaper than it looks: the
-        trio was itself a net LOSS against no cache at all, so nothing fast was given up.
+        1150 us the re-canonicalization that pins the canonical-rendering refusal. The
+        hand-picked trio this replaced cost
+        ~1495 us at the same size, so reads really are about 1.7x slower than what shipped in
+        ``fd925be``, where a cache hit genuinely was the faster path. Something fast WAS given
+        up; it was given up because it was also wrong, admitting records
+        :meth:`FigureDigitization.from_payload` refuses on the identical bytes. (The trio was a
+        net loss against holding no cache at all, which is why nothing here is worth
+        reintroducing -- but that is a different comparison from the one this paragraph makes,
+        and it does not make the 1.7x free.)
 
         Do NOT memoize this to win the 1.7x back. Any memo is private state, and private state is
         writable by every route that writes a public field -- which is how both previous
@@ -4399,7 +4421,21 @@ class EmbeddedFigureDigitization(BaseModel):
                 f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
                 f"canonical_json is not a JSON object, it decodes to {type(parsed).__name__}"
             )
-        recanonicalized = canonical_json_bytes(parsed)
+        try:
+            recanonicalized = canonical_json_bytes(parsed)
+        except RecursionError as exc:
+            # The same threat as the broadened except above, one call later and easy to miss:
+            # `json.loads` uses a C scanner while `canonical_json_bytes` recurses in Python, so a
+            # payload nested deeply enough to exhaust the interpreter HERE can still have parsed
+            # cleanly. Reproduced under a lowered recursion limit; at the default limit the
+            # re-canonicalization survived every depth tried. Guarded regardless, because the
+            # stack available at this call is a property of the CALLER's depth, not of the bytes,
+            # and an unguarded RecursionError leaves an accessor raising something no caller is
+            # told to catch.
+            raise ValueError(
+                f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
+                f"canonical_json is nested too deeply to re-serialize: {exc}"
+            ) from exc
         if recanonicalized != self.canonical_json.encode("utf-8"):
             raise ValueError(
                 f"EmbeddedFigureDigitization(digitization_sha256={self.digitization_sha256!r}): "
@@ -4472,8 +4508,8 @@ class EmbeddedFigureDigitization(BaseModel):
         is a worse hole than the one being closed. Change the bytes and the address together and
         the copy validates; change one alone and T1 refuses it, loudly, at the copy.
 
-        ``deep`` is accepted for signature compatibility and has no effect: every field is an
-        immutable ``str``, and the private cache is rebuilt rather than copied.
+        ``deep`` is accepted for signature compatibility and has no effect: all three fields are
+        immutable ``str``, and there is no other state to copy shallowly or otherwise.
         """
         if not update:
             return super().model_copy(deep=deep)
@@ -4500,12 +4536,13 @@ class EmbeddedFigureDigitization(BaseModel):
 
         The lesson both times was that a subset of the constructor's checks is not a weaker
         version of it, it is a different and wrong predicate. So the read path stopped picking a
-        subset. Whatever construction refuses, a read refuses, because it is the same call.
+        subset. Whatever construction refuses as an invalid RECORD, a read refuses, because it
+        is the same call -- and only that, see the asymmetry below.
 
-        WHAT THIS DOES AND DOES NOT REFUSE. It refuses any state that construction would refuse,
-        which is the strongest claim this class can make about itself, and it cannot be talked
-        out of it by writing to any attribute, private or public -- there is nothing left to
-        write that it does not re-derive. FOUR residues, named rather than rounded up:
+        WHAT THIS DOES AND DOES NOT REFUSE. It refuses every record construction would refuse as
+        invalid, which is the strongest claim this class can make about itself, and it cannot be
+        talked out of it by writing to any attribute, private or public -- there is nothing left
+        to write that it does not re-derive. FOUR residues, named rather than rounded up:
 
         1. The check runs when an ACCESSOR is called. A caller reading ``.canonical_json`` or
            ``.digitization_sha256`` as plain attributes gets whatever is there, by not asking.
@@ -4516,6 +4553,30 @@ class EmbeddedFigureDigitization(BaseModel):
            class does not pretend to.
         4. The answer is a snapshot. A caller that stores ``coverage`` in a local holds a value
            that a later mutation of the object will not invalidate; only the next read re-checks.
+
+        HOW A READ REFUSES, which is part of the same promise and was briefly not true. A read
+        that refuses raises ``RuntimeError``, so ``except RuntimeError`` around an accessor is
+        the guard a caller wants. That held only once
+        :data:`~carmel.services.figure_digitization_record.UNREADABLE_PAYLOAD` grew
+        ``OverflowError``: making the read path re-run the whole reconstruction imported that
+        function's refusal surface wholesale, and a stored coordinate reading ``"0x1p+99999"``
+        came back out of an accessor as a raw ``OverflowError``, past the ``except ValueError``
+        below. The surface is now swept by a test rather than read off the code, because reading
+        the code is how it was got wrong. What the sweep does NOT reach, and what no ``except``
+        clause here can promise, is the interpreter running out of stack or memory partway
+        through -- ``RecursionError`` is caught at the two places these bytes are walked, and a
+        ``MemoryError`` on a payload large enough to cause one is not a refusal, it is the
+        process failing.
+
+        ONE ASYMMETRY WITH CONSTRUCTION, deliberate and in the safe direction. Construction also
+        applies this class's FIELD constraints -- digest shape, and ``canonical_json``'s
+        ``max_length`` -- which a read does not re-apply. So bytes over
+        ``_MAX_EMBEDDED_CANONICAL_JSON_LENGTH`` carrying a perfectly valid record are refused at
+        construction and answered on read. That is not a hole: the size bound is a
+        resource-exhaustion guard on what may ENTER an envelope, not a claim about validity, and
+        an object holding such bytes cannot have entered one. On the axis that matters -- is this
+        a valid record, canonically rendered, at the address it claims -- construction and read
+        are the same call and cannot diverge.
 
         Raising beats returning a default. Every question this class answers is a question about
         MISSING DATA, and a default answer to that question is the one shape of wrong answer that

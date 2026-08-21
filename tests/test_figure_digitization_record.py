@@ -31,6 +31,7 @@ from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.figure_digitization_record import (
     DIGITIZATION_PAYLOAD_KEYS,
     DIGITIZATION_PAYLOAD_VERSION,
+    UNREADABLE_PAYLOAD,
     CensusUnavailable,
     CensusUnavailableReason,
     FigureCoverage,
@@ -429,6 +430,38 @@ class TestReadingAnUntrustedPayload:
         with pytest.raises(ValueError, match="we_did_not_like_it"):
             FigureDigitization.from_payload(payload)
 
+    def test_a_payload_that_is_not_an_object_at_all_is_refused(self) -> None:
+        """The annotation says ``Mapping`` and a payload off disk does not read annotations.
+
+        A decoded JSON list reaching here raised ``AttributeError`` off ``payload.get`` -- a type
+        outside :data:`UNREADABLE_PAYLOAD`, so it escaped the very function a caller uses to ask
+        whether a payload can be read at all.
+        """
+        for hostile in (None, [], "a record", 3):
+            with pytest.raises(ValueError, match="not an object"):
+                FigureDigitization.from_payload(hostile)  # type: ignore[arg-type]
+
+    def test_a_coordinate_too_large_for_a_float_is_refused_rather_than_overflowing(self) -> None:
+        """``float.fromhex`` has a third failure mode, and it is not a ``ValueError``.
+
+        ``OverflowError`` escaped every caller of this function -- and, once the read path began
+        re-running the reconstruction, every accessor of
+        :class:`carmel.schemas.datasets.EmbeddedFigureDigitization` -- until it was named in
+        :data:`UNREADABLE_PAYLOAD`. Asserted against that tuple rather than the literal type,
+        because the tuple is what callers catch.
+        """
+        assert OverflowError in UNREADABLE_PAYLOAD
+        for path in (("plot_region", "x_end"), ("plot_region", "y_top")):
+            payload = digitization_record_payload(digitization())
+            payload[path[0]][path[1]] = "0x1p+99999"
+            with pytest.raises(UNREADABLE_PAYLOAD):
+                FigureDigitization.from_payload(payload)
+
+        payload = digitization_record_payload(digitization())
+        payload["omissions"][0]["x"] = "0x1p+99999"
+        with pytest.raises(UNREADABLE_PAYLOAD):
+            FigureDigitization.from_payload(payload)
+
 
 class TestPayloadUnreadableReason:
     """The pre-flight a citing layer runs before a record is embedded."""
@@ -457,8 +490,21 @@ class TestPayloadUnreadableReason:
         payload["plot_region"]["y_top"] = None
         assert payload_unreadable_reason(payload) is not None
 
+    def test_it_catches_an_overflow_error_rather_than_letting_it_escape(self) -> None:
+        """The third ``float.fromhex`` failure mode, which is not a ``ValueError`` and so was
+        not caught by a tuple that named only three types."""
+        payload = digitization_record_payload(digitization())
+        payload["plot_region"]["x_end"] = "0x1p+99999"
+        reason = payload_unreadable_reason(payload)
+        assert reason is not None
+        assert "OverflowError" in reason
+
     def test_a_payload_of_the_wrong_shape_entirely_reports_a_reason(self) -> None:
         assert payload_unreadable_reason({}) is not None
+
+    def test_a_payload_that_is_not_an_object_reports_a_reason_rather_than_crashing(self) -> None:
+        for hostile in (None, [], "a record"):
+            assert payload_unreadable_reason(hostile) is not None  # type: ignore[arg-type]
 
 
 class TestIdentityAndLedgerHygiene:
