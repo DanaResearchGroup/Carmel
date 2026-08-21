@@ -964,6 +964,46 @@ class SourceNode(BaseModel):
     absent otherwise. A node with no extracted text has no verification story
     this system can honestly state, and inventing one would be exactly the
     unearned provenance the surrounding validators exist to prevent."""
+    crop_region: Maybe[BBox]
+    """WHERE, on the page it was cut from, a ``FIGURE_CROP`` sits -- the
+    crop's own addressing identity. Required for a ``FIGURE_CROP``, forbidden
+    for every other kind (I7, below).
+
+    A ``FIGURE_CROP`` previously had no way to say WHICH figure it was.
+    ``node_id`` is a label a producer picks, not an address; a crop carries no
+    extracted text by construction (I6); so the only field left to tell two
+    crops apart was ``sha256`` -- which a producer holding no crop bytes of
+    its own would borrow from the parent PDF. Two crops of two DIFFERENT
+    figures in one paper were then identical in every field
+    :class:`SourceGraph`'s I5 duplicate rule inspects, and the second was
+    refused as an exact repeat of the first: the graph could not represent
+    two figures from one paper at all. This field is the identity that tells
+    them apart, and I8 forbids the borrowed ``sha256`` that made them
+    collide. I5's ``(kind, sha256, parent_node_id)`` triple is deliberately
+    UNTOUCHED by all of this -- the fix is that a crop now has an identity of
+    its own, not that duplicate detection was loosened to admit two crops
+    that don't.
+
+    A whole :class:`BBox` rather than a page number plus four coordinates,
+    because a ``BBox`` carries the :class:`CoordinateFrame` that makes
+    coordinates mean anything at all: ``cropbox``/``mediabox``, ``rotation``,
+    the render ``dpi`` and ``render_settings``, and -- as the page's identity
+    -- ``render_fingerprint``. A page NUMBER is deliberately NOT recorded
+    here, and must not be added: :class:`CoordinateFrame`'s docstring rules
+    one out as a provenance key outright, because this corpus's own
+    extractors silently drop pages, so a number produced by one tool does not
+    reliably address the same physical page as that number from another.
+
+    THE COORDINATES ARE IN THE PARENT'S FRAME, never the crop's own. A
+    :class:`BBoxLocator` targeting a ``FIGURE_CROP`` node addresses a region
+    WITHIN that crop's render (see
+    :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS`); this field addresses the
+    crop itself within the page it was cut from. Two different rectangles in
+    two different frames -- never interchangeable.
+
+    ``Maybe``-typed with no default, for the same "no unreasoned absence"
+    reasoning as ``origin``/``extraction``/``glyph_health`` above. WHICH
+    absences are legal is decided by I7, not by this field."""
 
     @model_validator(mode="after")
     def _validate_verification_binds_to_extraction(self) -> SourceNode:
@@ -1085,12 +1125,15 @@ class SourceNode(BaseModel):
         auditor, should conclude from them) rather than decoration, the
         wrong one is a real defect, not a cosmetic one.
 
-        This also closes a sha256-sharing hole: a crop is allowed to share
-        its parent PAPER_PDF's ``sha256`` (see ``SourceGraph``'s I5 duplicate
-        -triple rule), so a crop that carried a PRESENT ``ExtractionBinding``
-        could name that same parent's extraction address -- claiming the
-        parent's extracted text as its own, when no locator on a crop can
-        legitimately slice any of it.
+        This also closes a sha256-sharing hole. A crop USED to be allowed to
+        share its parent PAPER_PDF's ``sha256`` -- ``SourceGraph``'s I8 now
+        forbids exactly that -- and a crop that carried a PRESENT
+        ``ExtractionBinding`` could then name that same parent's extraction
+        address, claiming the parent's extracted text as its own when no
+        locator on a crop can legitimately slice any of it. This validator
+        remains the guard for that claim on its own terms: it holds at NODE
+        level, without needing a parent in scope, and it forbids a crop
+        naming ANY extraction address, not merely an ancestor's.
 
         ``glyph_health`` is folded into the same requirement for the same
         reason: it assesses the quality of extracted OCR'd text, and a crop
@@ -1127,6 +1170,59 @@ class SourceNode(BaseModel):
                 f"node {self.node_id!r} has kind={self.kind.value!r}, which has no extracted text for a "
                 "verification record to describe -- verification must be "
                 f"Absent(reason=AbsenceReason.NOT_APPLICABLE), not {self.verification!r}"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_crop_region_addresses_a_figure_crop(self) -> SourceNode:
+        """I7: a ``FIGURE_CROP`` must carry a concrete ``crop_region``; every
+        other kind must carry ``Absent(reason=NOT_APPLICABLE)``.
+
+        An UNADDRESSABLE CROP IS REFUSED, not admitted with a note. A crop
+        that cannot say which figure it is has no identity of its own -- it
+        is distinguishable from its siblings only by a ``node_id`` its own
+        producer chose -- and every consumer downstream of it (a
+        ``DIGITIZED`` value citing it as the thing its number was read off, a
+        replayer resolving it, a human auditing that citation) would have
+        nothing to check the claim against. No :class:`AbsenceReason`
+        rescues that: an image region ALWAYS has a location on the page it
+        was cut from, so ``NOT_APPLICABLE`` would be false; and
+        ``NOT_EXTRACTED_YET``/``UNKNOWN`` promise an address that arrives
+        later, for a node already being cited as provenance now. Absence is
+        therefore rejected outright here rather than narrowed to one legal
+        reason the way I6 narrows a crop's extraction.
+
+        The other direction mirrors ``_validate_origin_only_for_si_member``:
+        only a crop was ever cut out of a page, so any other kind claiming a
+        crop region describes a relationship that cannot exist. Its absence
+        reason is pinned to ``NOT_APPLICABLE`` for the same reason I6 pins a
+        crop's: these reasons are recorded evidence about what a later run
+        should conclude, and "this PAPER_PDF has no crop region YET" is a
+        false promise rather than a cosmetic slip.
+        """
+        if self.kind == SourceNodeKind.FIGURE_CROP:
+            if isinstance(self.crop_region, Absent):
+                raise ValueError(
+                    f"node {self.node_id!r} has kind={self.kind.value!r} but cannot address itself: "
+                    f"crop_region is {self.crop_region!r}. A crop with no region names no figure -- "
+                    "it is distinguishable from another crop of the same paper only by a node_id its "
+                    "own producer chose -- so nothing downstream could ever check a value digitized "
+                    "off it against the figure it claims to come from; no AbsenceReason makes that "
+                    "honest, because an image region always has a location on the page it was cut from"
+                )
+            return self
+        if not isinstance(self.crop_region, Absent):
+            raise ValueError(
+                f"node {self.node_id!r} has kind={self.kind.value!r}, which was not cut out of a page "
+                "and so cannot carry a crop_region -- only a FIGURE_CROP can; crop_region must be "
+                f"Absent(reason=AbsenceReason.NOT_APPLICABLE) here, not {self.crop_region!r}"
+            )
+        if self.crop_region.reason != AbsenceReason.NOT_APPLICABLE:
+            raise ValueError(
+                f"node {self.node_id!r} has kind={self.kind.value!r}, which was not cut out of a page, "
+                f"so crop_region must be Absent(reason={AbsenceReason.NOT_APPLICABLE.value!r}) -- "
+                f"reason {self.crop_region.reason.value!r} would promise an address that could arrive "
+                "later, and for a node that is not a crop none ever can"
             )
         return self
 
@@ -1615,8 +1711,12 @@ class SourceGraph(BaseModel):
         # I5: no two nodes may be exact duplicates of each other -- same
         # kind, same bytes, same parent. The same bytes appearing under a
         # genuinely different role (a different kind, or a different parent)
-        # stays legal: e.g. a PAPER_PDF root and a FIGURE_CROP taken from
-        # that same PDF share a sha256 but are not duplicates of each other.
+        # stays legal: e.g. a PAPER_PDF root and an SI_MEMBER child that is a
+        # byte-identical copy of that same paper share a sha256 but are not
+        # duplicates of each other. (This example used to be a PAPER_PDF and a
+        # FIGURE_CROP taken from it; I8 below now refuses that pairing outright
+        # -- not because I5 changed, but because a crop borrowing its parent's
+        # bytes was never an honest identity in the first place.)
         # This triple deliberately does NOT include `origin`: two
         # byte-identical SI_MEMBER files belonging to the same paper are now
         # DISTINGUISHABLE from each other via `origin` (different archives,
@@ -1834,10 +1934,117 @@ class SourceGraph(BaseModel):
                 continue
             verification_by_address[address] = (node.node_id, node.verification)
 
-        seen_triples: set[tuple[SourceNodeKind, str, str | None]] = set()
+        # I8: a FIGURE_CROP may not carry the sha256 of any node in its own
+        # ancestor chain. A crop is a strict sub-region of the thing it was cut
+        # from, so its bytes are never that thing's bytes; a crop naming them
+        # is not addressing itself at all, it is pointing at the whole parent
+        # and calling the result an identity. That borrowed sha256 used to be
+        # explicitly legal here, and it is what made two crops of two DIFFERENT
+        # figures in one paper collide under the duplicate rule below: with
+        # kind, sha256 and parent_node_id all identical, the second crop was
+        # refused as an exact repeat of the first. Closing it is what lets
+        # `SourceNode.crop_region` (I7) be a real identity rather than
+        # decoration -- and it leaves the duplicate triple below untouched.
+        #
+        # The WHOLE ancestor chain, not just the immediate parent: a crop under
+        # an SI member that names the root paper's bytes makes the same false
+        # claim one level further up. I2 and I3 above already guarantee every
+        # parent_node_id resolves and the chain terminates, so this walk cannot
+        # loop or KeyError.
+        #
+        # THE ORDER OF THESE CHECKS IS LOAD-BEARING, for the same reason it is
+        # between I5b and I5c. Two crops that both borrow their parent's sha256
+        # satisfy this invariant AND the duplicate rule at once, and the
+        # duplicate diagnosis ("an exact repeat adds nothing") is precisely
+        # wrong for them: nothing here is redundant, and the reader sent
+        # looking for a superfluous node will not find one -- what is actually
+        # wrong is that NEITHER crop has an identity of its own. This must
+        # therefore run first, and a regression test pins that message.
+        for node in self.nodes:
+            if node.kind != SourceNodeKind.FIGURE_CROP:
+                continue
+            ancestor_id = node.parent_node_id
+            while ancestor_id is not None:
+                ancestor = nodes_by_id[ancestor_id]
+                if ancestor.sha256 == node.sha256:
+                    raise ValueError(
+                        f"node {node.node_id!r} has kind={node.kind.value!r} but borrows "
+                        f"sha256={node.sha256!r} from its ancestor {ancestor_id!r} "
+                        f"(kind={ancestor.kind.value!r}); a crop is a sub-region of what it was cut "
+                        "from, so it never holds that whole artifact's bytes -- a crop naming them "
+                        "has no identity of its own, and two crops doing it are indistinguishable "
+                        "from each other by anything but the node_id their producer chose"
+                    )
+                ancestor_id = ancestor.parent_node_id
+
+        # I9: two FIGURE_CROP nodes under the SAME parent may not name the same
+        # crop_region. One rectangle, measured against one render of one page,
+        # is one figure -- so two nodes claiming it are two names for a single
+        # thing, and if their sha256 values differ they are additionally two
+        # different sets of bytes each claiming to BE that thing, a
+        # contradiction no consumer can arbitrate. Keyed on the parent because
+        # the region is expressed in the PARENT's frame (see
+        # `SourceNode.crop_region`): the same coordinates under a different
+        # parent address a different document's page.
+        #
+        # Placed here, before the duplicate rule, for the same ordering reason
+        # as I8 above: two crops naming one region are a specific, actionable
+        # collision, and "an exact repeat adds nothing" would describe neither
+        # what happened nor what to do about it.
+        crop_region_by_parent: dict[tuple[str, BBox], str] = {}
+        for node in self.nodes:
+            if node.kind != SourceNodeKind.FIGURE_CROP or isinstance(node.crop_region, Absent):
+                # A crop with an Absent region cannot reach here (I7 rejects it
+                # at node level), and a non-crop cannot carry one at all; the
+                # guard is what makes that structural fact explicit to a reader
+                # rather than an assumption this loop silently depends on.
+                continue
+            assert node.parent_node_id is not None  # I4 above: a crop always has a parent
+            key = (node.parent_node_id, node.crop_region)
+            if key in crop_region_by_parent:
+                raise ValueError(
+                    f"node {node.node_id!r} and node {crop_region_by_parent[key]!r} are both "
+                    f"FIGURE_CROPs of parent {node.parent_node_id!r} and name the same crop_region "
+                    "(same rectangle, same CoordinateFrame); one rectangle on one render of one page "
+                    "is one figure, so these are two names for a single figure -- and where their "
+                    "sha256 values differ, two different sets of bytes each claiming to be it"
+                )
+            crop_region_by_parent[key] = node.node_id
+
+        # Keyed by the same triple as ever, and admitting exactly the same
+        # graphs; the dict (rather than a set) only remembers WHICH earlier node
+        # collided, so the message below can name it and, for the one case
+        # I7/I8/I9 made expressible, say what was actually detected.
+        first_by_triple: dict[tuple[SourceNodeKind, str, str | None], SourceNode] = {}
         for node in self.nodes:
             triple = (node.kind, node.sha256, node.parent_node_id)
-            if triple in seen_triples:
+            earlier = first_by_triple.get(triple)
+            if earlier is not None:
+                # Two FIGURE_CROPs of one parent with identical bytes but
+                # DIFFERENT regions are not an exact repeat -- they name two
+                # different figures that happen to render to the same pixels (a
+                # repeated inset, a duplicated axis panel). The triple cannot
+                # see that difference, and widening it to include crop_region
+                # would weaken duplicate detection for every node kind to admit
+                # a rare case, so the graph still refuses them -- but it must
+                # refuse them for the reason that is true, not by claiming a
+                # redundancy that is not there. (The equal-region case never
+                # reaches here: I9 above refuses it first, with its own
+                # message.)
+                if (
+                    node.kind == SourceNodeKind.FIGURE_CROP
+                    and earlier.kind == SourceNodeKind.FIGURE_CROP
+                    and node.crop_region != earlier.crop_region
+                ):
+                    raise ValueError(
+                        f"node {node.node_id!r} and node {earlier.node_id!r} are both FIGURE_CROPs of "
+                        f"parent {node.parent_node_id!r} carrying the SAME sha256={node.sha256!r} while "
+                        "naming DIFFERENT crop_regions -- two figures that render to identical bytes. "
+                        "They are not an exact repeat of each other, but node identity here is "
+                        "(kind, sha256, parent_node_id), which cannot tell them apart, so this graph "
+                        "cannot hold both: give each crop the bytes of its own region, or keep one node "
+                        "and cite the region through a BBoxLocator instead"
+                    )
                 raise ValueError(
                     f"node {node.node_id!r} duplicates an earlier node exactly: another node already "
                     f"has kind={node.kind.value!r}, sha256={node.sha256!r}, "
@@ -1845,7 +2052,7 @@ class SourceGraph(BaseModel):
                     "role (a different kind or a different parent) remains legal, but an exact repeat "
                     "adds nothing"
                 )
-            seen_triples.add(triple)
+            first_by_triple[triple] = node
 
         return self
 
@@ -4522,8 +4729,44 @@ def _source_verification_identity_payload(verification: SourceVerification) -> d
     }
 
 
+def _addresses_a_crop_region(node: SourceNode) -> bool:
+    """Whether ``node``'s projection carries a ``crop_region`` key -- the one
+    predicate behind :data:`_CONDITIONALLY_PROJECTED_FIELDS`, and the single
+    place the PROJECTION side of that decision is made. The parse side makes
+    the mirror decision separately and off ``kind``, because it has no value
+    to read; see :func:`_restore_unprojected_crop_regions` and the pair named
+    in the registry's own docstring.
+
+    Asks the VALUE, not the kind, and that is the whole point. "Only a
+    FIGURE_CROP may hold a region" is I7's rule (see
+    :meth:`SourceNode._validate_crop_region_addresses_a_figure_crop`), and
+    restating it here as ``node.kind == FIGURE_CROP`` would make a second,
+    hand-maintained copy of it: a kind that is later allowed to carry a region
+    would have to be remembered in two places, and forgetting the second one
+    silently computes an address with the region left out. Reading the value
+    instead makes this a CONSEQUENCE of I7 rather than a duplicate of it --
+    whatever I7 decides may hold a region, this projects.
+
+    It also keeps a producer-bug detector that a kind-derived predicate loses.
+    A node carrying a region it has no right to -- a ``PAPER_PDF`` with a real
+    ``BBox``, reachable only by skipping validation via ``model_construct`` or
+    ``object.__setattr__`` -- projects that region here, so its payload no
+    longer parses (I7 refuses it on the way back in) and
+    ``store_typed_envelope`` refuses the write. Keyed on kind, the same
+    tampered node would project byte-identically to a clean one, and the write
+    would go through unremarked. Neither shape puts anything untrue in the
+    store, but only this one still notices.
+
+    Both callers on the PROJECTION side -- the projection itself and the
+    registry the completeness walker reads -- go through this function, so
+    they cannot disagree about which nodes carry the key. The PARSE side
+    cannot join them: see the caveat at the top of this docstring.
+    """
+    return not isinstance(node.crop_region, Absent)
+
+
 def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "node_id": node.node_id,
         "kind": node.kind.value,
         "sha256": node.sha256,
@@ -4538,6 +4781,30 @@ def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
         # supposed to authenticate it.
         "verification": _project_maybe(node.verification, _source_verification_identity_payload),
     }
+    # The one CONDITIONAL key in either projection (registered as such in
+    # _CONDITIONALLY_PROJECTED_FIELDS): emitted when this node actually holds a
+    # region, omitted when it does not.
+    #
+    # A node holding one is a FIGURE_CROP -- but that is I7's conclusion, read
+    # off the value here rather than restated as a second copy of I7's kind
+    # rule. See :func:`_addresses_a_crop_region` for why the difference matters.
+    #
+    # For a crop the region is identity-bearing: it is what tells two figures of
+    # one paper apart when their bytes cannot (two byte-identical images at two
+    # page locations), so an envelope citing Figure 3 must not address like one
+    # citing Figure 7. On every other kind I7 admits exactly ONE value --
+    # Absent(NOT_APPLICABLE) -- so emitting it there would fold a CONSTANT into
+    # the address: zero distinguishing bits, at the price of re-addressing every
+    # envelope in every store, including the ones holding no crop at all.
+    #
+    # Omission is not a shortcut for an unaddressed field: the inverse
+    # (_restore_unprojected_crop_regions) puts the marker back before
+    # validation, the completeness walker requires the key present for an
+    # instance the predicate includes and ABSENT for one it excludes, and the
+    # round trip is byte-exact for every node kind.
+    if _addresses_a_crop_region(node):
+        payload["crop_region"] = _project_maybe(node.crop_region, _bbox_identity_payload)
+    return payload
 
 
 def _source_graph_identity_payload(graph: SourceGraph) -> dict[str, Any]:
@@ -4856,6 +5123,75 @@ the completeness meta-test as a loud failure -- entering it here is the
 escape hatch for a field that is genuinely not addressable (e.g. a derived
 ``@property``), not a shortcut for "forgot to project it". Do not add an
 entry to make the meta-test pass; add the projection instead.
+
+A field that is addressed for SOME instances and genuinely inapplicable for
+others belongs in :data:`_CONDITIONALLY_PROJECTED_FIELDS` below, NOT here:
+registering it here would claim it is never addressed, which for the
+instances that do carry it is a lie in the opposite direction.
+"""
+
+
+_CONDITIONALLY_PROJECTED_FIELDS: Mapping[tuple[str, str], tuple[Callable[[Any], bool], str]] = {
+    ("SourceNode", "crop_region"): (
+        _addresses_a_crop_region,
+        "Identity-bearing for a node that holds a region -- a FIGURE_CROP, by "
+        "I7 -- and structurally inapplicable to every other kind. I7 admits "
+        "exactly one value on a non-crop node, Absent(NOT_APPLICABLE), so "
+        "projecting it there would fold a CONSTANT into the content address: "
+        "no envelope becomes distinguishable from any other, while every "
+        "stored envelope re-addresses, including ones holding no crop at all. "
+        "On a crop it is the opposite: the region separates two figures of one "
+        "paper whose bytes cannot separate them, so omitting it there would "
+        "let an envelope citing one figure address like an envelope citing "
+        "another.",
+    ),
+}
+"""``(model_name, field_name) -> (is_projected_for, reason)`` registry of
+fields the projection emits for SOME instances of a model and omits for
+others, keyed the same way as :data:`_UNADDRESSED_FIELDS`.
+
+``is_projected_for`` takes the MODEL INSTANCE and answers whether this field
+must appear in that instance's projection. The completeness meta-test uses it
+in both directions FOR THIS FIELD -- required present when the predicate
+holds, required ABSENT when it does not -- so a change that starts emitting a
+registered key unconditionally is caught as loudly as one that stops emitting
+it altogether.
+
+That is the limit of what the walk can see, and the limit matters. The walk
+is driven by ``model_fields``: it visits each FIELD and asks whether the
+projection carries it. A projected key that no field backs at all -- a
+phantom, a typo'd name, a key some helper adds on its own -- is invisible to
+it, in this registry or out of it. The authored byte pins are what catch
+that, which is exactly how one was caught during review of this change: the
+completeness walk stayed green and the pins did not.
+
+Every conditional key needs an INVERSE, because ``from_identity_payload``
+hands its payload straight to pydantic and these fields are required with no
+default: see :func:`_restore_unprojected_crop_regions`, which restores the
+one entry here. A conditional projection without an inverse is a payload
+that projects cleanly and cannot be parsed back.
+
+THE TWO SIDES ARE NOT ONE PIECE OF CODE, and for this entry they are not
+even written against the same thing. The projection side asks the VALUE
+(:func:`_addresses_a_crop_region`); the inverse asks the payload's ``kind``,
+because it runs before validation, on bytes where the value it would consult
+is exactly what was omitted. So these are the two places that must move
+together when I7 changes which kinds may hold a region:
+
+1. :func:`_addresses_a_crop_region` -- the projection-side predicate, and
+   the registry entry above that reads it.
+2. :func:`_restore_unprojected_crop_regions` -- the parse-side guard,
+   keyed on ``kind``.
+
+Left un-unified deliberately, with the cost measured rather than assumed:
+if the two disagree, a node whose region should have been restored is left
+without one and pydantic reports ``Field required`` where I7 would have said
+"cannot address itself" -- an error-message downgrade on an already-refused
+payload, never a wrong address, because the projection side alone decides
+what gets addressed. (An inverse that restored the marker UNCONDITIONALLY
+would need no ``kind`` test at all and would upgrade that message rather
+than downgrade it; it is a behaviour change, so it is recorded as future
+work rather than smuggled in beside a docstring fix.)
 """
 
 
@@ -4880,11 +5216,33 @@ _CONDITION_SET_ENVELOPE_TYPE = "condition_set"
 """``envelope_type`` value emitted by
 :meth:`ConditionSetEnvelope.identity_payload`."""
 
-_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 1
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 2
 """The one envelope-projection version this module can parse. A payload
 carrying any other version was projected by code this module has never
 seen, so parsing it here could only produce a silently reinterpreted
-envelope."""
+envelope.
+
+Version history:
+
+1. The projection before :attr:`SourceNode.crop_region` existed.
+2. ``crop_region`` projected for a node that HOLDS a region -- which, by
+   I7, is a ``FIGURE_CROP`` -- and omitted for one that does not. See
+   :func:`_addresses_a_crop_region` for why the condition is written
+   against the value rather than the kind, and
+   :data:`_CONDITIONALLY_PROJECTED_FIELDS` for the registry entry.
+
+A version-1 payload is REFUSED here, never migrated. Refusing is the whole
+reason this key exists: a payload written under a projection this code has
+never seen must fail with ONE message naming the version mismatch, rather
+than reaching pydantic and producing a pile of field-level errors that name
+a symptom (``crop_region Field required``, once per node, plus whatever
+cascades behind it) instead of the cause. Inferring the missing field
+instead -- ``NOT_APPLICABLE`` for the non-crop nodes, and a guess for the
+crops -- would contradict that contract outright: it would silently
+re-address stored envelopes under a schema their bytes never claimed.
+Accepting version 1 again is therefore a deliberate migration decision
+carrying its own explicit inverse, never a default that arrives by
+omission."""
 
 
 def _check_identity_payload_discriminator(
@@ -4964,6 +5322,65 @@ def _strip_identity_payload_discriminator(rehydrated: dict[str, Any]) -> dict[st
         for key, value in rehydrated.items()
         if key not in (_ENVELOPE_TYPE_KEY, _IDENTITY_PAYLOAD_VERSION_KEY)
     }
+
+
+def _restore_unprojected_crop_regions(rehydrated: dict[str, Any]) -> dict[str, Any]:
+    """Put back the ``crop_region`` marker that
+    :func:`_source_node_identity_payload` omits for a node holding no region
+    -- the explicit inverse of the one entry in
+    :data:`_CONDITIONALLY_PROJECTED_FIELDS`, run by both
+    ``from_identity_payload`` classmethods between rehydration and
+    ``model_validate``.
+
+    THIS GUARD IS KEYED ON ``kind``, and that is a second, hand-maintained
+    statement of I7's rule -- the projection side derives its condition from
+    the field's VALUE (see :func:`_addresses_a_crop_region`), and this side
+    cannot: it runs on a payload dict before validation, where the value it
+    would consult is precisely the thing that is missing. ``kind`` is the
+    only signal in those bytes. The pair is named in
+    :data:`_CONDITIONALLY_PROJECTED_FIELDS`'s docstring as the two places
+    that must move together, with the cost of their drifting: an
+    error-message downgrade, never a wrong address.
+
+    Needed because ``SourceNode.crop_region`` is required with NO default:
+    a payload that legitimately omits the key would otherwise fail
+    validation with ``Field required``, so the projection would be
+    unparseable by its own inverse. Restoring it here rather than giving
+    the field a pydantic default is the point -- a default would also
+    accept a payload that omits the key on a CROP, silently manufacturing
+    an address for a figure nobody located, whereas this restores exactly
+    what the projection dropped and nothing else.
+
+    NOT_APPLICABLE is a restoration, not an inference: I7 admits that one
+    value and no other on a non-crop node, so the marker is fully
+    determined by the ``kind`` the payload itself carries. A node whose
+    payload says ``kind="figure_crop"`` is deliberately left alone -- if it
+    is missing its region, that is a malformed payload, and I7's "cannot
+    address itself" (or pydantic's ``Field required``, if the key is
+    missing entirely) is the honest answer. Anything not shaped like a node
+    list is also left untouched, so a malformed payload still fails where
+    it would have failed, with its own error rather than one from here.
+
+    A node that DOES carry the key on a non-crop kind is likewise left
+    alone: it validates only if it holds Absent(NOT_APPLICABLE), and then
+    fails the caller's byte-for-byte round-trip check, because
+    re-projecting drops the key again. That is correct -- the projection
+    shape is canonical, and a payload in a different shape addresses
+    nothing this projector would ever have written.
+    """
+    graph = rehydrated.get("source_graph")
+    if not isinstance(graph, dict):
+        return rehydrated
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        return rehydrated
+    restored = [
+        {**node, "crop_region": Absent(reason=AbsenceReason.NOT_APPLICABLE)}
+        if isinstance(node, dict) and "crop_region" not in node and node.get("kind") != SourceNodeKind.FIGURE_CROP.value
+        else node
+        for node in nodes
+    ]
+    return {**rehydrated, "source_graph": {**graph, "nodes": restored}}
 
 
 class _SourceGraphEnvelope(Protocol):
@@ -5875,7 +6292,13 @@ class DatasetEnvelope(BaseModel):
            other dicts, lists, scalars -- is left structurally alone,
            because pydantic itself already knows how to turn an enum's
            ``.value`` string back into the enum and a list back into a
-           tuple.
+           tuple. This stage also restores the one CONDITIONAL key the
+           projection omits -- ``crop_region``, dropped for a node holding
+           no region, which by I7 is any node that is not a ``FIGURE_CROP``
+           (see :func:`_restore_unprojected_crop_regions` and
+           :data:`_CONDITIONALLY_PROJECTED_FIELDS`) -- which is what makes
+           that omission a projection SHAPE rather than a field this
+           parser cannot recover.
         2. **Validate, then prove the parse.** The rehydrated structure is
            handed to ``cls.model_validate``, and the *resulting* envelope
            is immediately re-projected via its own ``identity_payload()``
@@ -5954,7 +6377,9 @@ class DatasetEnvelope(BaseModel):
         _check_identity_payload_discriminator(
             payload, expected_envelope_type=_DATASET_ENVELOPE_TYPE, class_name=cls.__name__
         )
-        rehydrated = _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+        rehydrated = _restore_unprojected_crop_regions(
+            _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+        )
         try:
             parsed = cls.model_validate(rehydrated)
         except ValidationError as exc:
@@ -6297,7 +6722,14 @@ class ConditionSetEnvelope(BaseModel):
 
         Like its ``DatasetEnvelope`` counterpart, this inverse is exact on
         IDENTITY and lossy on ``_UNADDRESSED_FIELDS`` (today:
-        ``ArchiveOrigin.member_display_path`` only).
+        ``ArchiveOrigin.member_display_path`` only), and it restores the one
+        CONDITIONAL key the projection omits -- ``crop_region``, dropped for
+        a node holding no region, which by I7 is any node that is not a
+        ``FIGURE_CROP``; see :func:`_restore_unprojected_crop_regions`. Both
+        envelope classes
+        share one source graph projection, so both need that same inverse;
+        omitting it here would make a condition set holding no crop
+        unparseable by its own projector.
 
         Raises:
             DatasetEnvelopeParseError: the payload is missing its
@@ -6314,7 +6746,9 @@ class ConditionSetEnvelope(BaseModel):
         _check_identity_payload_discriminator(
             payload, expected_envelope_type=_CONDITION_SET_ENVELOPE_TYPE, class_name=cls.__name__
         )
-        rehydrated = _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+        rehydrated = _restore_unprojected_crop_regions(
+            _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+        )
         if isinstance(rehydrated, dict) and "subject" in rehydrated:
             rehydrated = {**rehydrated, "subject": _rehydrate_condition_subject(rehydrated["subject"])}
         try:

@@ -152,6 +152,12 @@ _NO_GLYPH_HEALTH default; every other kind (SI_MEMBER, JATS_XML, PAPER_PDF)
 keeps the originals unchanged, since extraction genuinely just hasn't
 happened yet for those."""
 
+_NO_CROP_REGION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""Module-level singleton default for SourceNode.crop_region on any kind that
+is not a FIGURE_CROP, matching _NO_ORIGIN's reasoning. NOT_APPLICABLE is the
+only reason I7 accepts there: nothing but a crop was ever cut out of a page,
+so "no region yet" would be a false promise rather than a cosmetic slip."""
+
 _NO_PYPDF_VERSION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """Module-level singleton default for ExtractionBinding.pypdf_version on a
 non-pypdf extractor, matching _NO_ORIGIN's reasoning. Reason is
@@ -259,6 +265,23 @@ def _bbox(**kwargs: object) -> BBox:
     return BBox(**defaults)  # type: ignore[arg-type]
 
 
+def _crop_region(node_id: str) -> BBox:
+    """The default ``crop_region`` for a FIGURE_CROP built by ``_node()``:
+    a rectangle on a page whose ``render_fingerprint`` is derived from the
+    node id.
+
+    Derived from the node id rather than shared, because SourceGraph's I9
+    refuses two crops under one parent that name the SAME region -- a single
+    shared default would make every multi-crop fixture in this file collide on
+    an invariant it was never meant to exercise. Keying the FINGERPRINT (not
+    the coordinates) off the node id keeps distinctness exact rather than
+    probabilistic: two distinct ids can never accidentally collide. A test
+    that means to place two crops on ONE page passes explicit regions sharing
+    one frame instead -- see ``TestFigureCropAddressing``.
+    """
+    return _bbox(frame=_frame(render_fingerprint=f"fp-{node_id}"))
+
+
 def _node(
     node_id: str = "n1",
     kind: SourceNodeKind = SourceNodeKind.PAPER_PDF,
@@ -267,6 +290,7 @@ def _node(
     origin: ArchiveOrigin | Absent = _NO_ORIGIN,
     extraction: ExtractionBinding | Absent = _NO_EXTRACTION,
     glyph_health: GlyphHealthAssessment | Absent = _NO_GLYPH_HEALTH,
+    crop_region: BBox | Absent | None = None,
 ) -> SourceNode:
     # A FIGURE_CROP that would otherwise get the plain "not extracted yet"
     # defaults must get the crop-specific NOT_APPLICABLE ones instead --
@@ -279,6 +303,13 @@ def _node(
             extraction = _NO_EXTRACTION_CROP
         if glyph_health is _NO_GLYPH_HEALTH:
             glyph_health = _NO_GLYPH_HEALTH_CROP
+    # `None` here means "this caller has no opinion", NOT a value: I7 requires
+    # a crop to carry a region and every other kind to carry
+    # Absent(NOT_APPLICABLE), so the default is derived from `kind` rather
+    # than stated at 40-odd call sites. A caller that DOES have an opinion
+    # (including "this crop has no region at all") passes it explicitly.
+    if crop_region is None:
+        crop_region = _crop_region(node_id) if kind == SourceNodeKind.FIGURE_CROP else _NO_CROP_REGION
     return SourceNode(
         node_id=node_id,
         kind=kind,
@@ -288,6 +319,7 @@ def _node(
         extraction=extraction,
         glyph_health=glyph_health,
         verification=_verification_for(extraction),
+        crop_region=crop_region,
     )
 
 
@@ -1216,13 +1248,23 @@ class TestSourceGraphDuplicateNodes:
             SourceGraph(nodes=(a, b))
 
     def test_same_bytes_as_a_different_kind_in_a_different_role_is_allowed(self) -> None:
-        """Same sha256, but one is the PAPER_PDF root and the other is a
-        FIGURE_CROP child of it -- different kind AND different parent, so
-        this is not a decorative duplicate."""
+        """Same sha256, but one is the PAPER_PDF root and the other is an
+        SI_MEMBER child of it (a supplementary copy of the paper itself) --
+        different kind AND different parent, so this is not a decorative
+        duplicate.
+
+        This case used to be written with a FIGURE_CROP borrowing its parent
+        PDF's sha256, which I8 now refuses outright: a crop is a sub-region,
+        so it never has the whole parent's bytes, and borrowing them is what
+        made two crops of two different figures collide here in the first
+        place (see ``TestFigureCropAddressing``). I5's exemption is unchanged
+        and still needs a fixture -- an SI_MEMBER that is byte-identical to
+        the paper it accompanies is the same "same bytes, genuinely different
+        role" shape, with no borrowed identity in it."""
         paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
-        crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_A, parent_node_id="paper")
-        graph = SourceGraph(nodes=(paper, crop))
-        assert graph.node("crop").sha256 == graph.node("paper").sha256
+        si = _node("si", SourceNodeKind.SI_MEMBER, SHA_A, parent_node_id="paper")
+        graph = SourceGraph(nodes=(paper, si))
+        assert graph.node("si").sha256 == graph.node("paper").sha256
 
     def test_same_bytes_under_the_same_kind_but_different_parent_is_allowed(self) -> None:
         paper1 = _node("paper1", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
@@ -1231,6 +1273,248 @@ class TestSourceGraphDuplicateNodes:
         si_under_jats1 = _node("si-j1", SourceNodeKind.SI_MEMBER, SHA_C, parent_node_id="jats1")
         graph = SourceGraph(nodes=(paper1, jats1, si_under_paper1, si_under_jats1))
         assert graph.node("si-p1").sha256 == graph.node("si-j1").sha256
+
+
+class TestFigureCropAddressing:
+    """I7/I8/I9: a FIGURE_CROP addresses the figure it was cut from.
+
+    The three invariants are one story told in three places. I7 (node-level)
+    requires the address and forbids it on every other kind; I8 forbids the
+    borrowed ancestor sha256 that used to stand in for a crop's identity; I9
+    refuses two crops that name the same figure. Together they are what makes
+    two crops of two different figures in one paper representable at all --
+    without touching I5's (kind, sha256, parent_node_id) duplicate triple,
+    which is exactly as strict as it was.
+    """
+
+    def test_two_crops_from_one_paper_validate(self) -> None:
+        """Two figures printed on ONE rendered page -- one shared
+        CoordinateFrame, two different rectangles, each crop holding its own
+        bytes -- keep their regions, and I9 does not collapse two rectangles
+        on one page into one figure.
+
+        NOT a demonstration that this graph was previously impossible: it was
+        not. Strip the crop_region kwargs and this same graph validates at
+        499835c (checked, not assumed) -- distinct sha256 values were always
+        enough for I5's triple. What was impossible is the case a producer
+        with no crop bytes actually hit: two crops that both borrowed the
+        parent's sha256, which I8 now refuses outright and
+        `test_borrowed_identity_is_reported_before_the_duplicate_rule` covers.
+
+        And two crops of one paper are still NOT representable when their
+        bytes are identical -- the repeated-inset case -- because I5 keys on
+        (kind, sha256, parent_node_id) and widening that triple is out of
+        scope by design. The refusal, and the reason it now gives, are pinned
+        by `test_identical_bytes_at_different_regions_are_refused_as_
+        indistinguishable` below. What this test earns is narrower than "two
+        figures from one paper now work": the regions survive validation, they
+        stay distinct, and they share one page frame."""
+        page = _frame(render_fingerprint="fp-page-3")
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        fig1 = _node(
+            "fig1",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_B,
+            parent_node_id="paper",
+            crop_region=_bbox(frame=page, x0="72", y0="500", x1="300", y1="700"),
+        )
+        fig2 = _node(
+            "fig2",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_C,
+            parent_node_id="paper",
+            crop_region=_bbox(frame=page, x0="72", y0="120", x1="300", y1="320"),
+        )
+        graph = SourceGraph(nodes=(paper, fig1, fig2))
+        assert graph.node("fig1").crop_region != graph.node("fig2").crop_region
+        assert graph.node("fig1").crop_region.frame == graph.node("fig2").crop_region.frame  # type: ignore[union-attr]
+
+    @pytest.mark.parametrize("reason", list(AbsenceReason))
+    def test_crop_without_a_region_is_refused(self, reason: AbsenceReason) -> None:
+        """I7: no AbsenceReason rescues an unaddressable crop. Parametrized
+        over EVERY member -- `list(AbsenceReason)`, not a hand-picked few --
+        precisely because the temptation this test guards against is someone
+        later carving out one reason as a migration door: a subset would leave
+        exactly the unchecked members through which that door gets cut, and
+        `list(...)` cannot fall behind a member added tomorrow either. An
+        image region always has a location on the page it was cut from, so
+        every one of these is a false claim about a node already being cited
+        as provenance."""
+        with pytest.raises(ValidationError) as excinfo:
+            _node(
+                "fig",
+                SourceNodeKind.FIGURE_CROP,
+                SHA_B,
+                parent_node_id="paper",
+                crop_region=Absent(reason=reason),
+            )
+        assert "cannot address itself" in str(excinfo.value)
+
+    @pytest.mark.parametrize("kind", [SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER])
+    def test_non_crop_kind_carrying_a_region_is_refused(self, kind: SourceNodeKind) -> None:
+        """I7's mirror direction, exactly as origin's is: nothing but a crop
+        was ever cut out of a page."""
+        with pytest.raises(ValidationError) as excinfo:
+            _node("n", kind, SHA_A, parent_node_id=None, crop_region=_crop_region("n"))
+        assert "which was not cut out of a page" in str(excinfo.value)
+
+    def test_non_crop_kind_absence_must_be_not_applicable(self) -> None:
+        """NOT_EXTRACTED_YET on a PAPER_PDF's crop_region promises an address
+        that could arrive later; for a node that is not a crop, none ever
+        can."""
+        with pytest.raises(ValidationError) as excinfo:
+            _node(
+                "paper",
+                SourceNodeKind.PAPER_PDF,
+                SHA_A,
+                crop_region=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+            )
+        assert "not_applicable" in str(excinfo.value)
+
+    def test_crop_borrowing_its_parents_sha256_is_refused(self) -> None:
+        """I8: a crop is a sub-region of what it was cut from, so its bytes
+        are never the parent document's bytes."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_A, parent_node_id="paper")
+        with pytest.raises(ValidationError) as excinfo:
+            SourceGraph(nodes=(paper, crop))
+        message = str(excinfo.value)
+        assert "borrows" in message
+        assert "'paper'" in message
+
+    def test_crop_borrowing_a_grandparents_sha256_is_refused(self) -> None:
+        """The whole ancestor chain, not just the immediate parent: a crop
+        under an SI member that names the ROOT paper's bytes is making the
+        same false claim one level further up."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        si = _node("si", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
+        crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_A, parent_node_id="si")
+        with pytest.raises(ValidationError) as excinfo:
+            SourceGraph(nodes=(paper, si, crop))
+        assert "borrows" in str(excinfo.value)
+
+    def test_crop_sharing_bytes_with_a_non_ancestor_is_allowed(self) -> None:
+        """I8 is about BORROWED IDENTITY, not about byte-sharing in general:
+        a crop and some unrelated node elsewhere in the graph holding the
+        same bytes is not a crop claiming to be its own parent."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        si = _node("si", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
+        crop = _node("crop", SourceNodeKind.FIGURE_CROP, SHA_B, parent_node_id="paper")
+        graph = SourceGraph(nodes=(paper, si, crop))
+        assert graph.node("crop").sha256 == graph.node("si").sha256
+
+    def test_borrowed_identity_is_reported_before_the_duplicate_rule(self) -> None:
+        """ORDER IS LOAD-BEARING. Two crops that both borrow the parent's
+        sha256 satisfy I8 AND I5 at once, and I5's "an exact repeat adds
+        nothing" is the wrong diagnosis for them: nothing is redundant here,
+        neither crop has an identity of its own. If this starts reporting a
+        duplicate, the two blocks have been reordered."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        fig1 = _node("fig1", SourceNodeKind.FIGURE_CROP, SHA_A, parent_node_id="paper")
+        fig2 = _node("fig2", SourceNodeKind.FIGURE_CROP, SHA_A, parent_node_id="paper")
+        with pytest.raises(ValidationError) as excinfo:
+            SourceGraph(nodes=(paper, fig1, fig2))
+        message = str(excinfo.value)
+        assert "borrows" in message
+        assert "duplicates an earlier node exactly" not in message
+
+    def test_identical_bytes_at_different_regions_are_refused_as_indistinguishable(self) -> None:
+        """The case I7/I8/I9 made expressible and I5 must describe honestly.
+
+        Two crops of one paper whose images render to identical bytes -- a
+        repeated inset, a duplicated axis panel -- at two DIFFERENT places on
+        the page. They are not an exact repeat of each other: they name two
+        different figures. But node identity here is
+        (kind, sha256, parent_node_id), which cannot see the difference, and
+        widening that triple to notice it is a hard non-goal, so the graph
+        still refuses them. What must not survive is the OLD explanation --
+        "an exact repeat adds nothing" -- which sends the reader hunting for a
+        redundant node that does not exist."""
+        page = _frame(render_fingerprint="fp-page-3")
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        fig1 = _node(
+            "fig1",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_B,
+            parent_node_id="paper",
+            crop_region=_bbox(frame=page, x0="72", y0="500", x1="300", y1="700"),
+        )
+        fig2 = _node(
+            "fig2",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_B,
+            parent_node_id="paper",
+            crop_region=_bbox(frame=page, x0="72", y0="120", x1="300", y1="320"),
+        )
+        with pytest.raises(ValidationError) as excinfo:
+            SourceGraph(nodes=(paper, fig1, fig2))
+        message = str(excinfo.value)
+        assert "naming DIFFERENT crop_regions" in message
+        assert "'fig1'" in message and "'fig2'" in message
+        assert "duplicates an earlier node exactly" not in message, message
+        assert "an exact repeat adds nothing" not in message, message
+
+    def test_a_true_exact_repeat_still_says_exact_repeat(self) -> None:
+        """The other side of the branch above: two non-crop nodes identical in
+        kind, bytes and parent ARE a decorative repeat, and I5's original
+        message is the right one for them. Pins that the crop-specific wording
+        did not swallow the general case."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        si1 = _node("si1", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
+        si2 = _node("si2", SourceNodeKind.SI_MEMBER, SHA_B, parent_node_id="paper")
+        with pytest.raises(ValidationError, match="an exact repeat adds nothing"):
+            SourceGraph(nodes=(paper, si1, si2))
+
+    def test_two_crops_naming_the_same_region_under_one_parent_are_refused(self) -> None:
+        """I9: one rectangle on one rendered page is one figure, so two nodes
+        claiming it -- here with different bytes each -- is a contradiction no
+        consumer can arbitrate."""
+        page = _frame(render_fingerprint="fp-page-3")
+        region = _bbox(frame=page, x0="72", y0="500", x1="300", y1="700")
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        fig1 = _node("fig1", SourceNodeKind.FIGURE_CROP, SHA_B, parent_node_id="paper", crop_region=region)
+        fig2 = _node("fig2", SourceNodeKind.FIGURE_CROP, SHA_C, parent_node_id="paper", crop_region=region)
+        with pytest.raises(ValidationError) as excinfo:
+            SourceGraph(nodes=(paper, fig1, fig2))
+        message = str(excinfo.value)
+        assert "name the same crop_region" in message
+        assert "'fig1'" in message and "'fig2'" in message
+
+    def test_same_region_under_different_parents_is_allowed(self) -> None:
+        """The same rectangle on two DIFFERENT documents' pages is two
+        figures, not one: I9 keys on the parent, not on the region alone.
+        (The frames here differ too, which is the honest depiction -- two
+        documents never share a render_fingerprint -- but the parent is what
+        the invariant actually keys on.)"""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        jats = _node("jats", SourceNodeKind.JATS_XML, SHA_B, parent_node_id=None)
+        region = _bbox(frame=_frame(render_fingerprint="fp-shared"))
+        fig1 = _node("fig1", SourceNodeKind.FIGURE_CROP, SHA_C, parent_node_id="paper", crop_region=region)
+        fig2 = _node("fig2", SourceNodeKind.FIGURE_CROP, SHA_D, parent_node_id="jats", crop_region=region)
+        graph = SourceGraph(nodes=(paper, jats, fig1, fig2))
+        assert graph.node("fig1").crop_region == graph.node("fig2").crop_region
+
+    def test_two_crops_differing_only_in_render_frame_are_distinguishable(self) -> None:
+        """The frame is part of the address, not decoration: the same
+        rectangle measured against two different page renders addresses two
+        different figures, and I9 must not collapse them."""
+        paper = _node("paper", SourceNodeKind.PAPER_PDF, SHA_A, parent_node_id=None)
+        fig1 = _node(
+            "fig1",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_B,
+            parent_node_id="paper",
+            crop_region=_bbox(frame=_frame(render_fingerprint="fp-page-2")),
+        )
+        fig2 = _node(
+            "fig2",
+            SourceNodeKind.FIGURE_CROP,
+            SHA_C,
+            parent_node_id="paper",
+            crop_region=_bbox(frame=_frame(render_fingerprint="fp-page-9")),
+        )
+        graph = SourceGraph(nodes=(paper, fig1, fig2))
+        assert len(graph.nodes) == 3
 
 
 class TestSourceGraphConflictingGlyphHealth:
@@ -1415,15 +1699,21 @@ class TestSourceGraphConflictingExtractionBinding:
             parent_node_id=None,
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
+        # An SI_MEMBER, not a FIGURE_CROP: I8 refuses a crop that borrows an
+        # ancestor's sha256 outright, and this test is about I5c's silence rule,
+        # not about crop addressing. A byte-identical SI copy of the paper is
+        # the same "same bytes, one side silent" shape with no borrowed
+        # identity in it -- see `_sha_sharing_node_with_extraction`, which
+        # reaches for SI_MEMBER for the neighbouring reason.
+        si = _node(
+            "si",
+            SourceNodeKind.SI_MEMBER,
             SHA_A,
             parent_node_id="paper",
             # extraction left as the default _NO_EXTRACTION (Absent).
         )
-        graph = SourceGraph(nodes=(paper, crop))
-        assert graph.node("crop").sha256 == graph.node("paper").sha256
+        graph = SourceGraph(nodes=(paper, si))
+        assert graph.node("si").sha256 == graph.node("paper").sha256
 
     def test_disagreeing_on_both_extraction_and_health_reports_extraction_conflict(self) -> None:
         """ORDER is the whole point of this test, mirroring
@@ -1623,15 +1913,19 @@ class TestSourceGraphExtractionAddressCoherence:
             parent_node_id=None,
             extraction=_extraction_binding(extracted_text_sha256=SHA_B),
         )
-        crop = _node(
-            "crop",
-            SourceNodeKind.FIGURE_CROP,
+        # An SI_MEMBER rather than a FIGURE_CROP, for the same reason as in
+        # `test_same_bytes_one_extraction_absent_is_allowed` above: I8 refuses a
+        # crop borrowing an ancestor's sha256, and the rule under test here is
+        # I5d's, not crop addressing.
+        si = _node(
+            "si",
+            SourceNodeKind.SI_MEMBER,
             SHA_A,
             parent_node_id="paper",
             # extraction left as the default _NO_EXTRACTION (Absent).
         )
-        graph = SourceGraph(nodes=(paper, crop))
-        assert graph.node("crop").sha256 == graph.node("paper").sha256
+        graph = SourceGraph(nodes=(paper, si))
+        assert graph.node("si").sha256 == graph.node("paper").sha256
 
 
 class TestSourceGraphLookupAPI:

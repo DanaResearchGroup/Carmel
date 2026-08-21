@@ -64,12 +64,12 @@ class TestDiscriminatorIsProjected:
     def test_dataset_payload_carries_its_own_type_and_version(self) -> None:
         payload = _maximal_envelope().identity_payload()
         assert payload["envelope_type"] == "dataset"
-        assert payload["identity_payload_version"] == 1
+        assert payload["identity_payload_version"] == 2
 
     def test_condition_set_payload_carries_its_own_type_and_version(self) -> None:
         payload = _maximal_condition_set_envelope().identity_payload()
         assert payload["envelope_type"] == "condition_set"
-        assert payload["identity_payload_version"] == 1
+        assert payload["identity_payload_version"] == 2
 
 
 # --------------------------------------------------------------------------
@@ -160,9 +160,48 @@ class TestMissingOrUnsupportedDiscriminatorIsRefused:
     @pytest.mark.parametrize(("envelope_class", "build"), _PARSERS)
     def test_a_payload_with_an_unsupported_version_is_refused(self, envelope_class, build) -> None:
         payload = copy.deepcopy(build().identity_payload())
-        payload["identity_payload_version"] = 2
-        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 1"):
+        payload["identity_payload_version"] = 3
+        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 2"):
             envelope_class.from_identity_payload(payload)
+
+    @pytest.mark.parametrize(("envelope_class", "build"), _PARSERS)
+    def test_a_version_1_payload_is_refused_by_the_gate_not_by_pydantic(self, envelope_class, build) -> None:
+        """The regression this version bump exists for.
+
+        Version 1 is the projection from before ``SourceNode.crop_region``
+        existed, so a genuine v1 payload carries that key on no node --
+        reconstructed here by stripping it, rather than described in prose.
+        Left at version 1, the gate waved such a payload straight through to
+        pydantic, which answered with one ``Field required`` per node (five
+        errors on the maximal dataset fixture, counting the tuple-length
+        cascade behind them): every one a symptom, none of them naming the
+        actual problem, which is that these bytes were written under a
+        projection this parser has never seen.
+
+        The assertions are therefore about WHERE the refusal happened, not
+        merely that one did. ``failed validation`` in the message would mean
+        the payload reached ``model_validate``; ``crop_region`` in it would
+        mean the refusal still describes a field rather than a schema
+        version.
+        """
+        payload = copy.deepcopy(build().identity_payload())
+        payload["identity_payload_version"] = 1
+        for node in payload["source_graph"]["nodes"]:
+            node.pop("crop_region", None)
+
+        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 2") as excinfo:
+            envelope_class.from_identity_payload(payload)
+
+        message = str(excinfo.value)
+        assert "identity_payload_version=1" in message, "the refusal must name the version actually found"
+        assert "failed validation" not in message, (
+            "a version-1 payload reached model_validate -- the version mismatch was laundered into "
+            "field-level errors, which is exactly what the version key exists to prevent"
+        )
+        assert "crop_region" not in message, (
+            "the refusal names a field rather than the schema version, so an operator is sent to fix a "
+            "symptom instead of being told these bytes predate this projection"
+        )
 
     @pytest.mark.parametrize(("envelope_class", "build"), _PARSERS)
     def test_a_boolean_true_version_is_refused_despite_equaling_one(self, envelope_class, build) -> None:
@@ -172,7 +211,7 @@ class TestMissingOrUnsupportedDiscriminatorIsRefused:
         to refuse for an unrelated-sounding reason."""
         payload = copy.deepcopy(build().identity_payload())
         payload["identity_payload_version"] = True
-        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 1"):
+        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 2"):
             envelope_class.from_identity_payload(payload)
 
 
