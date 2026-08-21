@@ -1062,11 +1062,13 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
 
         That indirection is the point. The claim is that ``_bands`` and
         ``_merge_affix_bands`` consult no glyph, so rows may be derived before glyphs are
-        known readable. Driving it through ``build_inventory`` cannot show that: an UNMAPPED
-        member refuses before rows exist, so the only corruption that survives the front
-        door is a text change with ``glyph_mapping`` left MAPPED -- which is a weaker claim
-        than the one the hoist needs. Calling the helpers directly is where UNMAPPED is
-        survivable, so that is where the real corruption is applied.
+        known readable. Driving it through ``build_inventory`` cannot show that: the rows ARE
+        derived first now -- that is what the hoist did -- but an UNMAPPED member then
+        refuses, and a refused inventory carries no rows, so there is nothing left to compare.
+        The only corruption that survives the front door is a text change with
+        ``glyph_mapping`` left MAPPED, which is a weaker claim than the one the hoist needs.
+        Calling the helpers directly is where UNMAPPED is survivable, so that is where the
+        real corruption is applied.
         """
         readable = [
             frag("CO", 122.0, 134.0, 120.0),
@@ -1288,10 +1290,11 @@ class TestGeometryThatCannotBeComparedRefuses:
         """Kept beside the zero case rather than folded into it.
 
         The invariant covers it -- ``font_height > 0`` is one comparison -- but a negative
-        height is a distinct nonsense value with a distinct effect (it makes a band
-        affix-shaped against every neighbour AND passes ``reference <= 0`` on the other
-        side), and 0 of 78178 corpus fragments carry one. A test that names the value is
-        what stops it silently leaving the predicate.
+        height is a distinct nonsense value with a distinct effect: measured, a negative band
+        reads as affix-shaped against any positive neighbour, so it can always be swallowed,
+        while ``reference <= 0`` stops it ever being a parent, so it can never swallow. It is
+        a fragment that can only ever disappear. 0 of 78178 corpus fragments carry one, and a
+        test that names the value is what stops it silently leaving the predicate.
         """
         marker = frag("2", 134.0, 137.0, 116.0, font_height=-5.0)
 

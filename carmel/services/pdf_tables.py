@@ -523,13 +523,14 @@ def _has_comparable_geometry(fragment: TextFragment) -> bool:
     floats, ``page`` compared only for equality, therefore no fifth patch possible. That
     conflates exhaustiveness over FIELDS with exhaustiveness over ways a number can mislead
     this module, and it is refuted by construction: :func:`_looks_like_affix` is a RATIO with
-    no upper bound, so a header merely taller than the row beneath it is folded into that row
-    and the row is lost -- ``font_height`` 8.0 gives three rows, 10.7 gives two with the
-    anchor reading ``HeadBbb``, and no value involved is non-finite, negative or backwards.
-    :func:`_has_comparable_geometry` cannot reach that and must not be widened to try: a
-    magnitude ratio unbounded above is a different fault with a different repair, tracked
-    separately. What this predicate covers is comparability, completely; what it does not
-    cover is every other way a finite number can be wrong.
+    no upper bound, so when a header is merely TALLER than the row beneath it, that row reads
+    as affix-shaped against the header and is folded INTO it -- the header is the parent and
+    the ordinary row beneath is what disappears. ``font_height`` 8.0 gives three rows; 10.7
+    gives two, the first anchored ``HeadBbb``; and no value involved is non-finite, negative
+    or backwards. :func:`_has_comparable_geometry` cannot reach that and must not be widened
+    to try: a magnitude ratio unbounded above is a different fault with a different repair,
+    tracked as **I-005** in the campaign ledger. What this predicate covers is comparability,
+    completely; what it does not cover is every other way a finite number can be wrong.
 
     Three boundaries chosen deliberately:
 
@@ -874,21 +875,37 @@ def _rotated_band_sharer_refusal(
     subscript's line is a printed line too and the merge is what would otherwise hide it.
 
     **The scope is argued structurally AND the corpus discriminates -- measured at THIS
-    ordering, which is the only ordering the numbers mean anything at.** Two of the four
-    registered footprints reach this call site (the whole-table box on
-    ``10.1016-j.ijhydene.2013.10.164`` p4, and the caption-inside box on
-    ``10.1115-1.4007737`` p5); band-scoped, both pass and the probe reports 4/4.
-    Substituting a WINDOW-scoped variant here instead gives **3/4**: the p5 footprint flips
-    from :attr:`COLUMN_STRUCTURE_UNRESOLVED` to a rotated refusal raised on a page
-    watermark, which is the correct finding replaced by a false one.
+    ordering, which is the only ordering the numbers mean anything at.** Of probe 50's four
+    registered footprints, which check each one refuses at decides whether it ever reaches
+    this line at all:
 
-    That number is ordering-dependent and has already inverted once, which is worth knowing
-    before citing it. While this check sat BELOW the column-structure test, a window-scoped
-    variant also gave 4/4 -- only one footprint reached it, and nothing could be masked
-    because the better refusal had already fired. Hoisting the check above the unmapped
-    gate moved it above the column-structure test too, and the masking it can now do became
-    real. **Any measurement quoted here must be re-taken against the shipped order of
-    checks; this paragraph has been wrong in both directions for exactly that reason.**
+    ===========================  ==========  =======================================
+    footprint                    y_bottom    refuses at
+    ===========================  ==========  =======================================
+    ``WHOLE_TABLE`` (p4)              45.0    :func:`_straddle_refusal` -- never reaches
+    ``TRUNCATED`` (p4)                65.0    the look-below guard -- REACHES
+    ``SHOCK_TUBE_CAPTION_ONLY``      680.0    the orphan-above guard -- never reaches
+    ``SHOCK_TUBE_CAPTION_INSIDE``    680.0    :attr:`COLUMN_STRUCTURE_UNRESOLVED` -- REACHES
+    ===========================  ==========  =======================================
+
+    So two reach, and band-scoped both pass: the probe reports 4/4. Substituting a
+    WINDOW-scoped variant here instead gives **3/4** -- ``SHOCK_TUBE_CAPTION_INSIDE`` flips
+    from :attr:`COLUMN_STRUCTURE_UNRESOLVED` to a rotated refusal raised on a page
+    watermark, a correct finding replaced by a false one.
+
+    Which of the two the hoist actually added is the sharper point. ``TRUNCATED`` reached
+    at both orderings, because the look-below guard has always run after this line.
+    ``SHOCK_TUBE_CAPTION_INSIDE`` reached only once this check moved above the
+    column-structure test -- and it is precisely the footprint that flips. The hoist did not
+    merely change a count; it put the one discriminating footprint in front of this
+    function.
+
+    That is also why a window variant measured 4/4 while this check sat below
+    column-structure: nothing could be masked there, because the better refusal had already
+    fired. **Any measurement quoted in this docstring must be re-taken against the shipped
+    order of checks. This paragraph has carried a wrong statement three times -- the masking
+    claim, then its retraction, then the identity of the p4 footprint -- and each time the
+    numbers beside it were right, which is what made the wrong sentence read as measured.**
 
     What decides the scope independently of that is what a LINE is in this module. Row
     identity here is
@@ -908,11 +925,13 @@ def _rotated_band_sharer_refusal(
     http://asmedig...`` watermark, 1.92 pt from the nearest printed baseline, is one of many
     rather than a curiosity (probes/i004_bad_geometry_census.py).
 
-    Two denominators appear above and neither is a typo: 266 counts non-blank rotated
-    fragments corpus-wide, while the extent measurement uses 257, which is the same
-    population minus 10 fragments on pages whose mediabox is unreadable. Those are excluded
-    rather than measured against a guessed page width, since the guess would be what decided
-    whether an extent counts as off-page.
+    Two denominators appear above and neither is a typo, but they are NOT one filter apart.
+    The corpus holds 267 rotated fragments; 266 are non-blank, which is the base for the
+    band counts; 257 sit on a page whose mediabox is readable, which is the base for the
+    extent measurement, since the other 10 would otherwise be checked against a guessed page
+    width and the guess would be what decided whether an extent counts as off-page. The two
+    filters are independent and the intersection is 256, so neither figure is reachable from
+    the other by subtracting one number.
     """
     printed_baselines = [y for baseline_y, _, folded in rows_raw for y in (baseline_y, *folded)]
     sharers = [
