@@ -923,52 +923,88 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         assert inventory.refusals == ()
         assert len(inventory.rows) == 3
 
-    def test_a_rotated_straddler_is_not_recorded_as_one(self) -> None:
-        """A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally.
+    def test_a_rotated_fragment_the_edge_cuts_refuses_on_its_band_not_its_extent(self) -> None:
+        """It is not recorded as a straddler, and it does not get away either.
 
-        Calling one a straddler would invent a finding out of a meaningless number:
-        measured over the corpus, 23 of 257 rotated fragments report an ``x_end`` outside
-        the page box, one of them 753.8 pt past a 595.3 pt page. It is not a hole in the box
-        either -- a rotated fragment INSIDE it refuses under ``ROTATED_OR_INSANE_FRAGMENT``,
-        which this asserts rather than assumes.
+        A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally -- 23 of 257
+        rotated corpus fragments report an ``x_end`` outside their own page's mediabox, one
+        753.8 pt past a 595.3 pt page -- so the straddle test cannot read it, and neither
+        can the truncated-column or look-below guards, which all skip it. What is left is
+        its BAND, which needs no x: this one sits on the ``P``/``1``/``8`` row's baseline,
+        so it shares a printed line of the table and that is enough.
 
-        This lane knowingly differs from ``pdf_cells``, which blocks on a rotated
-        band-sharer. ``test_the_rotated_divergence_from_the_single_cell_lane_is_deliberate``
-        pins the case that decided it.
+        The reason is ``ROTATED_OR_INSANE_FRAGMENT`` rather than the straddle reason
+        deliberately. The finding is "this module cannot read that fragment", which is true;
+        "the edge cut it" would be a claim about a number the module has just declared
+        meaningless.
         """
         spun = frag("91", 130.7, 322.5, 91.0, rotated=True)
 
         inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), spun), footprint())
 
-        assert inventory.refusals == ()
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
+    def test_a_rotated_fragment_inside_the_box_refuses_earlier(self) -> None:
+        """Same reason, different gate, and this one runs before any derivation."""
         inside = frag("91", 130.7, 180.0, 91.0, rotated=True)
-        rotated_member = build_inventory(extraction_of(*a_row_the_edge_can_cut(), inside), footprint())
 
-        assert [r.reason for r in rotated_member.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), inside), footprint())
 
-    def test_the_rotated_divergence_from_the_single_cell_lane_is_deliberate(self) -> None:
-        """The measured case that decided it: a page watermark, not part of any table.
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
-        ``pdf_cells`` blocks on a rotated fragment sharing its region's band, and this lane
-        does not. The difference is what "the band" means. Its band is +/-0.5 pt around one
-        baseline; this box is 80 pt tall, so "in the window" sweeps in whatever else the
-        page prints at that height. Across the corpus exactly one rotated fragment lands in
-        a registered footprint's y-window and it is a ``Downloaded from http...`` watermark
-        whose ``x_start`` is 34 pt clear of the box, on the other side of the page.
+    def test_a_rotated_fragment_on_no_printed_line_does_not_refuse(self) -> None:
+        """The measured case that set the scope: a page watermark, not part of any table.
 
-        The geometry below is that watermark's, rebased onto this fixture's box: rotated,
-        inside the y-window, starting well beyond ``x_end``, and reporting a width far wider
-        than any page. Blocking rotated fragments in the window would refuse this table on
-        it. That is the false refusal this divergence buys out of, and the day someone
-        decides the trade the other way, this test is what they have to argue with.
+        The block is scoped to the table's printed LINES, not to the box's y-window. The
+        four registered corpus footprints are 80, 100, 55 and 75 pt tall, and a window that
+        tall is a slab of the page. Exactly one rotated corpus fragment falls in one -- a
+        ``Downloaded from http://asmedig...`` watermark on ``10.1115-1.4007737`` p5 at
+        ``y=746.99``, ``x_start=588.99`` where the box ends at 555.0 on a 612 pt page, so it
+        sits in the right margin 34 pt clear of the box. A window block would refuse that
+        footprint on page furniture and mask the ``column_structure_unresolved`` it
+        correctly reports.
+
+        The fixture carries that watermark's geometry faithfully, INCLUDING its offset from
+        the nearest line: 1.92 pt, the real measured gap, which is outside this module's
+        0.5 pt band and inside ``pdf_cells``'s 4.0 pt one. So this is also the fragment on
+        which the two lanes' outcomes differ, which is why it is pinned rather than
+        described.
         """
-        watermark = frag("Downloaded from http://x/", 324.0, 1008.0, 91.0, rotated=True)
+        watermark = frag("Downloaded from http://x/", 324.0, 1008.0, 92.92, rotated=True)
+        nearest = min(abs(92.92 - y) for y in (134.5, 91.0, 71.5))
+
+        assert nearest == pytest.approx(1.92), "the premise: the real watermark's offset from its nearest line"
 
         inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), watermark), footprint())
 
         assert inventory.refusals == ()
         assert len(inventory.rows) == 3
+
+    def test_a_rotated_fragment_on_a_FOLDED_affix_line_refuses(self) -> None:
+        """A subscript's baseline is a printed line too, and the merge is what hid it.
+
+        Rows are matched by every baseline they carry -- their own and the affix baselines
+        folded into them. Matching the merged representative alone would leave a rotated
+        fragment sitting on the ``2`` of ``CO2`` unguarded, on a line the page really
+        printed, for no reason other than that this module tidied the band away.
+        """
+        fragments = (
+            CAPTION,
+            frag("CO", 122.0, 134.0, 120.0),
+            frag("2", 134.0, 137.0, 116.0, font_height=AFFIX_HEIGHT),
+            frag("Bbb", 53.0, 70.0, 100.0),
+            frag("222", 122.0, 146.0, 100.0),
+        )
+        merged = build_inventory(extraction_of(*fragments), footprint())
+
+        assert merged.refusals == ()
+        assert [r.anchor_text for r in merged.rows] == ["CO2", "Bbb"], "the premise: 116.0 was folded away"
+
+        on_the_folded_line = frag("spun", 320.0, 900.0, 116.0, rotated=True)
+        inventory = build_inventory(extraction_of(*fragments, on_the_folded_line), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
     def test_an_unmapped_straddler_still_refuses(self) -> None:
         """Deliberately unlike ``ORPHANED_BAND_BELOW_THE_BOX``, which skips unmapped ones.
@@ -1037,14 +1073,16 @@ class TestGeometryThatCannotBeComparedRefuses:
             (300.0, float("nan"), 91.0, "a NaN right extent, beside the box"),
             (float("nan"), 320.0, 91.0, "a NaN left extent, beside the box"),
             (float("inf"), float("inf"), 91.0, "an infinite extent"),
-            # Backwards AND left of `x_start`, which is the only way a backwards extent
-            # escapes: `x_start >= box.x_start and x_end <= box.x_end` is satisfied by most
-            # of them by accident, so the members-only check catches those already. This
-            # one fails the first half and falls straight through the gap.
-            (40.0, 30.0, 91.0, "a backwards extent that also fails the containment test"),
+            # A backwards extent satisfies `x_start >= box.x_start and x_end <= box.x_end`
+            # by accident more often than not, and those the members-only check caught
+            # already. These two fail it, one on each half, and fell straight through the
+            # gap before this gate: `40 -> 30` is left of `x_start`, `300 -> 295` runs past
+            # `x_end`.
+            (40.0, 30.0, 91.0, "a backwards extent left of the box"),
+            (300.0, 295.0, 91.0, "a backwards extent past the box's right edge"),
             (300.0, 320.0, float("nan"), "a NaN baseline, which reaches no band at all"),
         ],
-        ids=["nan-x-end", "nan-x-start", "infinite", "backwards", "nan-baseline"],
+        ids=["nan-x-end", "nan-x-start", "infinite", "backwards-left", "backwards-right", "nan-baseline"],
     )
     def test_an_outsider_this_module_cannot_compare_refuses(
         self, x_start: float, x_end: float, baseline_y: float, what: str
@@ -1094,6 +1132,48 @@ class TestGeometryThatCannotBeComparedRefuses:
 
         assert unreadable.complete is False
         assert [r.reason for r in unreadable.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_an_unreadable_font_height_fabricates_a_row_and_must_refuse(self) -> None:
+        """The same defect class one FIELD over, and this one invents a row rather than
+        losing one.
+
+        ``font_height`` never bounds the box, so it looks unrelated to a boundary gate. But
+        it feeds the ``<=`` in ``_looks_like_affix``, and a NaN there makes the comparison
+        quietly False: the subscript band is not affix-shaped, so it is not folded into its
+        parent and becomes a ROW of its own. Every row beneath it renumbers, the cell text
+        loses its subscript, and the inventory reports COMPLETE.
+
+        Both halves are asserted, because the fabrication is the point: with a real height
+        the band folds to two rows anchored ``CO2``; with NaN the old code returned three
+        rows, ``CO``, and a spurious ``2``.
+        """
+        readable = (
+            CAPTION,
+            frag("CO", 122.0, 134.0, 120.0),
+            frag("2", 134.0, 137.0, 116.0, font_height=AFFIX_HEIGHT),
+            frag("Bbb", 53.0, 70.0, 100.0),
+            frag("222", 122.0, 146.0, 100.0),
+        )
+        folded = build_inventory(extraction_of(*readable), footprint())
+
+        assert folded.refusals == ()
+        assert [r.anchor_text for r in folded.rows] == ["CO2", "Bbb"]
+
+        unreadable = (*readable[:2], frag("2", 134.0, 137.0, 116.0, font_height=float("nan")), *readable[3:])
+        inventory = build_inventory(extraction_of(*unreadable), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_a_negative_font_height_refuses_on_the_same_footing(self) -> None:
+        """Unobserved rather than impossible -- 0 of 78178 corpus fragments carry one -- and
+        nonsense feeding a magnitude comparison, exactly like a backwards extent. Refusing
+        it costs nothing measured and closes the direction the NaN case came from."""
+        marker = frag("2", 134.0, 137.0, 116.0, font_height=-5.0)
+
+        inventory = build_inventory(extraction_of(CAPTION, frag("CO", 122.0, 134.0, 120.0), marker), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
     def test_a_blank_unreadable_fragment_still_refuses(self) -> None:
         """Deliberately unlike the straddle guard, which skips blanks.

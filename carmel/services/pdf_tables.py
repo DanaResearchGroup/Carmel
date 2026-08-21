@@ -247,40 +247,19 @@ class InventoryRefusalReason(StrEnum):
       That reason asks whether the band below the box is a ROW, and a marker is not one;
       this one asks whether the edge cut something, and a marker is something. One inside
       the box refuses under :attr:`UNMAPPED_MEMBER`, so a bisected one must not pass.
-    * Rotated fragments ARE skipped -- and here this lane DIVERGES from ``pdf_cells``,
-      which blocks on a rotated band-sharer (``RegionRefusalReason.ROTATED_NEIGHBOUR``,
-      a member of its ``HALTS_EVALUATION`` set) precisely because it cannot tell. The
-      divergence is deliberate and is recorded below rather than left for a reader to
-      discover as an inconsistency.
+    * Rotated fragments are skipped HERE, and caught elsewhere. Their ``x_start``/``x_end``
+      do not bound them horizontally -- 23 of 257 rotated corpus fragments report an
+      ``x_end`` outside their own page's mediabox, one 753.8 pt past a 595.3 pt page -- so
+      an edge test on one would be a finding invented from a meaningless number. Asking the
+      question without x is what :func:`_rotated_band_sharer_refusal` does, after derivation
+      and scoped to the table's printed lines; that function carries the scoping argument,
+      the measurement, and the one disclosed difference from ``pdf_cells``. A rotated
+      fragment INSIDE the box refuses earlier still, under
+      :attr:`ROTATED_OR_INSANE_FRAGMENT`.
 
-    Why the two lanes answer the same question differently:
-
-    * **"On the band" means different things.** ``pdf_cells``'s band is +/-0.5 pt around
-      ONE baseline, so a rotated fragment in it really does share the cell's printed line.
-      This lane's window is the whole box, 80-100 pt tall on the four registered corpus
-      footprints, which is a horizontal slab of the page rather than a line.
-    * **Measured, blocking would be wrong here.** Across the eight-paper corpus 267 of
-      78178 fragments are rotated, and exactly ONE falls in a registered footprint's
-      y-window: a ``Downloaded from http...`` watermark on ``10.1115-1.4007737`` p5, whose
-      ``x_start`` is 34 pt clear of the box's right edge on the other side of the page.
-      Blocking would flip 1 of the 4 registered expectations, and the thing it caught would
-      be page furniture (probes/i004_bad_geometry_census.py).
-    * **The extent cannot narrow the block either.** For 23 of 257 rotated fragments (8.9%)
-      ``x_end`` lies OUTSIDE the page box, overhanging by up to 753.8 pt on a 595.3 pt page:
-      it is ``x_start`` plus the advance widths laid along the rotated axis, never projected
-      onto x. So "block only the rotated fragments whose extent overlaps the box" would rest
-      on the very number the rule declares meaningless.
-
-    The cost is stated rather than hidden, exactly as ``pdf_cells`` states its own: **a tally
-    of this reason is a LOWER BOUND**, short by the rotated fragments an edge cuts. The hole
-    is bounded on one side -- a rotated fragment INSIDE the box still refuses under
-    :attr:`ROTATED_OR_INSANE_FRAGMENT` -- and what escapes is only one the edge bisects.
-
-    One measurement points at the repair without making the claim: ``x_start`` was inside the
-    page box for 257 of 257 rotated fragments, so it looks like a true text origin where
-    ``x_end`` is not a bound. An origin-based straddle rule might therefore close this hole.
-    That is a different claim with a different measurement behind it, and it is not made
-    here."""
+    So a tally of THIS reason is a lower bound, short by the rotated fragments an edge cuts
+    -- but they are no longer unguarded, and the reason they end up under is the honest one:
+    this module cannot read their geometry."""
 
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
     """A row's own occupied blocks outnumber the columns derived across all rows.
@@ -296,17 +275,22 @@ class InventoryRefusalReason(StrEnum):
     ROTATED_OR_INSANE_FRAGMENT = "rotated_or_insane_fragment"
     """This module cannot read a fragment's geometry, so it declines to read the box.
 
-    Two call sites, one fault -- geometry that cannot be compared -- at two scopes:
+    Three call sites, one fault -- geometry that cannot be compared -- at three scopes:
 
-    * a fragment INSIDE the box is rotated, or its extent is non-finite or backwards;
-    * ANY fragment on the box's page has a non-finite or backwards extent, whether or not
-      the box contains it.
+    * ANY fragment on the box's page has a non-finite or backwards extent, or a non-finite
+      or negative ``font_height``, whether or not the box contains it
+      (:func:`_uncomparable_geometry_refusal`);
+    * a fragment INSIDE the box is rotated (rotation ONLY -- the bad-extent clauses that
+      used to sit here are gone, not merely quiet: the page-scoped gate applies the same
+      predicate to a superset of these fragments and so reaches every one of them first);
+    * a rotated fragment shares a printed line of the derived table
+      (:func:`_rotated_band_sharer_refusal`).
 
-    Rotated text has no meaningful baseline band or x-interval in this module's model, and
-    a backwards extent poisons every column derivation silently. ``pdf_cells`` guards this
-    class explicitly; this module must not be the softer door into the same data.
+    Rotated text has no meaningful x-interval in this module's model, and a backwards extent
+    poisons every column derivation silently. ``pdf_cells`` guards this class explicitly;
+    this module must not be the softer door into the same data.
 
-    The second scope deliberately reuses this member rather than adding a sibling for
+    All three deliberately reuse this member rather than splitting off a sibling for
     "uncomparable OUTSIDER", because the inside/outside partition such a sibling would rest
     on is not knowable for exactly these fragments: a NaN extent is excluded from the box by
     :func:`_in_footprint` only because ``<`` against NaN is quietly False, not because the
@@ -532,30 +516,50 @@ def _uncomparable_geometry_refusal(
     as the straddler did, one comparison over -- and unlike the straddler it leaves no
     trace anywhere, because there is no comparison it could have satisfied.
 
+    ``font_height`` is guarded here for the same reason and NOT because it bounds the box:
+    it feeds the ``<=`` in :func:`_looks_like_affix`, and a NaN there makes a subscript band
+    fail the affix test, so it is not folded into its parent and becomes a ROW. Demonstrated
+    on a two-row fixture: with ``font_height=5.0`` the band folds and the anchor reads
+    ``CO2``; with ``font_height=NaN`` the same document returns COMPLETE with THREE rows, a
+    cell reading ``CO`` and a fabricated row ``2``, and no refusal anywhere. A fabricated row
+    inside a complete inventory is the ordinal-drift shape this module exists to prevent.
+    A negative height is refused on the same footing as a backwards extent -- nonsense
+    feeding a magnitude comparison -- and is unobserved rather than impossible.
+
     Scoped to the PAGE, not the box's y-window, and that is the whole point: a NaN
     ``baseline_y`` fails ``y_bottom <= baseline_y <= y_top`` too, so a window-scoped check
     would read only the fragments that already survived the test NaN defeats. ``pdf_cells``
     reaches the same conclusion for the same reason at ``UNCOMPARABLE_NEIGHBOUR``.
 
-    Blank fragments are NOT skipped here, unlike in :func:`_straddle_refusal`. That function
-    asks whether the edge cut TEXT, and a bare space text-show operation loses nothing when
-    it goes; this one asks whether the page's geometry can be read at all, and an unreadable
-    number is unreadable whether or not a glyph was drawn with it.
+    Blank fragments are NOT skipped here, and that diverges from BOTH neighbours: this
+    lane's own :func:`_straddle_refusal` skips them, and ``pdf_cells`` drops them from
+    ``others`` before its ``UNCOMPARABLE_NEIGHBOUR`` test, so its equivalent never sees a
+    blank one either. Those two ask whether something was CUT or who the nearest neighbour
+    IS, and a bare space text-show operation is neither. This one asks whether the page's
+    geometry can be read at all, and an unreadable number is unreadable whether or not a
+    glyph was drawn with it. So the conclusion ``pdf_cells`` shares is the PAGE scoping and
+    its reason; the blank rule is this lane's own.
 
     Measured: 0 of 78178 fragments across the eight-paper corpus have a non-finite or
-    backwards extent, so this costs nothing observed. Like ``INVALID_GEOMETRY`` in the
-    single-cell lane, it guards the SHAPE of the input rather than an observed instance.
+    backwards extent, and 0 have a non-finite, negative or zero ``font_height``, so this
+    costs nothing observed. Like ``INVALID_GEOMETRY`` in the single-cell lane, it guards
+    the SHAPE of the input rather than an observed instance.
     """
     unreadable = [
         f
         for f in extraction.fragments
-        if f.page == footprint.page and (not _is_finite(f.x_start, f.x_end, f.baseline_y) or f.x_end < f.x_start)
+        if f.page == footprint.page
+        and (
+            not _is_finite(f.x_start, f.x_end, f.baseline_y, f.font_height)
+            or f.x_end < f.x_start
+            or f.font_height < 0.0
+        )
     ]
     if not unreadable:
         return None
     return InventoryRefusal(
         InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
-        f"{len(unreadable)} fragment(s) on the box's page have a non-finite or backwards extent",
+        f"{len(unreadable)} fragment(s) on the box's page have an unreadable extent or height",
     )
 
 
@@ -572,9 +576,9 @@ def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprin
     and stays a member -- membership is inclusive of the edge, and this must not narrow it.
 
     Reaches here only once :func:`_uncomparable_geometry_refusal` has passed, so both edge
-    tests are comparisons between real numbers. Rotated fragments are skipped and this lane
-    knowingly differs from ``pdf_cells`` in doing so; the reason's own docstring carries the
-    divergence, the measurement behind it, and the residual hole it leaves.
+    tests are comparisons between real numbers. Rotated fragments are skipped because their
+    extent is not one; :func:`_rotated_band_sharer_refusal` asks after them later, without
+    reading x.
     """
     cut = [
         f
@@ -811,6 +815,68 @@ def _orphan_below_refusal(
     )
 
 
+def _rotated_band_sharer_refusal(
+    extraction: FragmentExtraction,
+    footprint: ClaimedFootprint,
+    rows_raw: list[tuple[float, list[TextFragment], list[float]]],
+) -> InventoryRefusal | None:
+    """Refuse when a rotated fragment shares a printed line of the derived table.
+
+    A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally -- measured, 23
+    of 257 rotated corpus fragments report an ``x_end`` outside their own page's mediabox,
+    one 753.8 pt past a 595.3 pt page, because it is ``x_start`` plus advance widths laid
+    along the ROTATED axis and never projected onto x. So it can be neither ruled out as a
+    straddler nor recorded as one, and every guard that reads x -- :func:`_straddle_refusal`,
+    :func:`_truncated_column_refusal`, :func:`_orphan_below_refusal` -- skips it. That is
+    correct individually and, left alone, adds up to a hole: on one of the table's own
+    printed lines, a rotated fragment vanishes the way the straddler did.
+
+    So the question is asked where x is not needed. Scoped to the BAND, matching
+    ``RegionRefusalReason.ROTATED_NEIGHBOUR`` in the single-cell lane rather than diverging
+    from it, and placed after derivation because the bands are what it is scoped to --
+    :func:`_truncated_column_refusal` already asks a rotated-fragment question from here.
+
+    Matched against every printed baseline the table has, the row's own and the affix
+    baselines folded into it, because a subscript's line is a printed line too and the
+    merge is what hid it.
+
+    **The scope is the whole decision.** Blocking every rotated fragment in the box's
+    Y-WINDOW instead was measured and is wrong: the four registered corpus footprints are
+    80, 100, 55 and 75 pt tall, and a window that tall is a slab of the page rather than a
+    line. Exactly one rotated corpus fragment falls in one -- a ``Downloaded from
+    http://asmedig...`` watermark on ``10.1115-1.4007737`` p5 at ``y=746.99``,
+    ``x_start=588.99`` where the box's right edge is 555.0 and the page is 612 wide, so it
+    is in the right margin, 34 pt clear of the box. A window block refuses that footprint on
+    page furniture and masks the ``column_structure_unresolved`` it correctly reports; a
+    band block does not touch it, because it sits 1.92 pt from the nearest printed baseline
+    and 3.28 pt from the nearest merged row. Band-scoped, the cost is **0 of the 4
+    registered expectations** (probes/i004_bad_geometry_census.py).
+
+    One disclosed difference from ``pdf_cells``, of tolerance and not of rule: its band is
+    ``BASELINE_BAND = 4.0`` pt and this one is :data:`_BAND_TOLERANCE_PT` = 0.5 pt, so at
+    4.0 pt that same watermark WOULD block there. Each lane uses the constant that defines
+    what a line means in it -- 0.5 pt is what separates two rows here, and widening it to
+    4.0 would merge distinct rows before it ever changed this check. The outcomes therefore
+    differ on that one fragment, and this is where it is written down rather than left to be
+    found.
+    """
+    printed_baselines = [y for baseline_y, _, folded in rows_raw for y in (baseline_y, *folded)]
+    sharers = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page
+        and f.rotated
+        and f.text.strip()
+        and any(abs(f.baseline_y - y) <= _BAND_TOLERANCE_PT for y in printed_baselines)
+    ]
+    if not sharers:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
+        f"{len(sharers)} rotated fragment(s) share a printed line of the table",
+    )
+
+
 def _truncated_column_refusal(
     extraction: FragmentExtraction,
     footprint: ClaimedFootprint,
@@ -995,14 +1061,15 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
         return refused(straddling)
 
     inside = _in_footprint(extraction, footprint)
-    insane_fragments = [
-        f for f in inside if f.rotated or not _is_finite(f.x_start, f.x_end, f.baseline_y) or f.x_end < f.x_start
-    ]
-    if insane_fragments:
+    # Rotation ONLY. The non-finite and backwards clauses that used to stand here were dead
+    # the moment the page-scoped gate went in above: it applies the same predicate to a
+    # superset of these fragments, so nothing could reach here carrying one.
+    rotated_members = [f for f in inside if f.rotated]
+    if rotated_members:
         return refused(
             InventoryRefusal(
                 InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
-                f"{len(insane_fragments)} fragment(s) inside the box are rotated or have a bad extent",
+                f"{len(rotated_members)} fragment(s) inside the box are rotated",
             )
         )
     unmapped = [f for f in inside if f.glyph_mapping is not GlyphMapping.MAPPED]
@@ -1074,6 +1141,12 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     # close the same hole the top edge's orphan check closes, on the sides the box was
     # otherwise free to shrink -- measured: shrinking `x_end` deleted a whole fuel mixture
     # and raising `y_bottom` deleted the phi row, each returning a COMPLETE inventory.
+    # First of the three, because the other two SKIP rotated fragments and are only sound
+    # while nothing rotated shares a row's line. That reliance was implicit; this makes it
+    # a check.
+    rotated_sharer = _rotated_band_sharer_refusal(extraction, footprint, rows_raw)
+    if rotated_sharer is not None:
+        return refused(rotated_sharer)
     truncated = _truncated_column_refusal(extraction, footprint, rows, rows_raw)
     if truncated is not None:
         return refused(truncated)
