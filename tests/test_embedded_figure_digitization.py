@@ -21,6 +21,7 @@ import ast
 import hashlib
 import inspect
 import json
+import pathlib
 import pickle
 import sys
 import textwrap
@@ -108,6 +109,15 @@ class TestAConsumerHoldingOnlyTheEnvelopeBytes:
     """The two axes, read off an embedded citation and nothing else."""
 
     def test_a_partial_series_reads_as_partial_and_auditable(self) -> None:
+        """Repair the private state the bypass could reach, and the read still refuses.
+
+        Exhaustive over: whatever _forgeable_state reports for this object, walked rather than
+        named, so the test does not go stale when the set of reachable state changes. On the
+        current class that set is empty, which is the point: there is nothing left to repair.
+
+        Not covered: the repair being USEFUL. This asserts a refusal survives it, not that any
+        attacker would attempt it.
+        """
         embedded = embed(digitization_record_payload(record()))
         assert embedded.coverage is FigureCoverage.PARTIAL
         assert embedded.auditable is True
@@ -138,7 +148,15 @@ class TestAConsumerHoldingOnlyTheEnvelopeBytes:
         assert embedded.omission_count == 0
 
     def test_whole_and_unaudited_never_read_alike(self) -> None:
-        """Both have an empty ledger and the same recovered count; every axis separates them."""
+        """Both have an empty ledger and the same recovered count; every axis separates them.
+
+        Exhaustive over: the three accessors -- coverage, auditable, omission_count -- checked
+        as a set, so a fourth added without a case here would not be covered.
+
+        Not covered: all pairs of records. One whole record and one unaudited one are compared,
+        chosen because they agree on the ledger and the recovered count, which is the pair that
+        used to be indistinguishable.
+        """
         whole = embed(
             digitization_record_payload(
                 record(coverage=FigureCoverage.COMPLETE, census=MarkerCensus(detected=10), omissions=())
@@ -294,6 +312,12 @@ class TestTheReconstructionIsNotOptional:
         object report the SWAPPED record's coverage. Now nothing reads it, so installing one --
         even a valid record saying something else entirely -- is inert. This asserts the absence
         of the attack surface rather than a defence against it.
+
+        Exhaustive over: nothing -- one installed attribute, one read.
+
+        Not covered: names other than the one used here, and installing several at once. Those
+        are swept by TestTheGuardCannotBeRecomputedByWhoeverBypassedIt, which walks whatever
+        _forgeable_state reports rather than a name this test picked.
         """
         embedded = embed(digitization_record_payload(record()))
         lying = record(coverage=FigureCoverage.COMPLETE, census=MarkerCensus(detected=10), omissions=())
@@ -361,7 +385,7 @@ class TestTheAddressCannotSilentlyStopMatchingTheBytes:
         assert embedded.model_copy().coverage is FigureCoverage.PARTIAL
         assert embedded.model_copy(deep=True).coverage is FigureCoverage.PARTIAL
 
-    def test_model_construct_is_judged_on_its_bytes_like_everything_else(self) -> None:
+    def test_model_construct_is_judged_on_its_bytes(self) -> None:
         """`model_construct` skips construction validation, and the read validates regardless.
 
         The name was ``test_model_construct_answers_nothing``, and that was a universal the code
@@ -411,7 +435,14 @@ class TestTheAddressCannotSilentlyStopMatchingTheBytes:
             _ = embedded.coverage
 
     def test_a_stale_answer_is_never_returned_in_place_of_a_refusal(self) -> None:
-        """The property all of the above exists for: no bypass yields the OLD coverage."""
+        """The property all of the above exists for: no bypass yields the OLD coverage.
+
+        Exhaustive over: nothing. One object is soured and read once.
+
+        Not covered: every way to sour it. The claim that no route yields a stale answer rests
+        on the read deriving from the bytes each time, which
+        test_the_class_holds_nothing_beyond_its_three_declared_fields is what actually pins.
+        """
         embedded = embed(
             digitization_record_payload(
                 record(coverage=FigureCoverage.COMPLETE, census=MarkerCensus(detected=10), omissions=())
@@ -449,6 +480,12 @@ class TestTheAddressCannotSilentlyStopMatchingTheBytes:
         one attribute at a time and never composes two, and the composed attacks are the ones
         that used to survive. Those live in
         :class:`TestTheGuardCannotBeRecomputedByWhoeverBypassedIt` below.
+
+        Exhaustive over: all three declared fields, each rewritten alone.
+
+        Not covered: tampers that change two fields together -- rewriting the bytes and the
+        address to match is a coherent citation of different content, and is refused for a
+        different reason by test_model_copy_will_not_mint_a_valid_citation_for_new_content.
         """
         routes = (
             ("digitization_sha256", "0" * 64),
@@ -528,6 +565,13 @@ class TestTheGuardCannotBeRecomputedByWhoeverBypassedIt:
           rather than merely unguarded is that it is no cheaper than the memo this class already
           refuses to keep, and it inherits the same defect: an answer that outlives the bytes it
           was derived from.
+
+        Exhaustive over: the three places instance state can live -- __pydantic_private__,
+        __dict__ beyond the declared fields, and __pydantic_extra__ -- before any read and after
+        each of three reads.
+
+        Not covered: the two routes named above -- an accessor overridden by a subclass, and a
+        memo held off the instance in a module-level or class-level map.
         """
         embedded = embed(digitization_record_payload(record()))
         assert self._forgeable_state(embedded) == {}, "state before the first read"
@@ -575,6 +619,15 @@ class TestTheGuardCannotBeRecomputedByWhoeverBypassedIt:
         assert "_memo" in self._forgeable_state(poisoned)
 
     def test_rewriting_the_address_and_repairing_every_private_attribute_still_refuses(self) -> None:
+        """Repair the private state the bypass could reach, and the read still refuses.
+
+        Exhaustive over: whatever _forgeable_state reports for this object, walked rather than
+        named, so the test does not go stale when the set of reachable state changes. On the
+        current class that set is empty, which is the point: there is nothing left to repair.
+
+        Not covered: the repair being USEFUL. This asserts a refusal survives it, not that any
+        attacker would attempt it.
+        """
         embedded = embed(digitization_record_payload(record()))
         object.__setattr__(embedded, "digitization_sha256", "0" * 64)
         for name in self._forgeable_state(embedded):
@@ -987,6 +1040,15 @@ class TestTheRefusalSurfaceHasNoUndocumentedEscapes:
             return None
 
     def test_no_mutation_escapes_the_documented_refusals(self) -> None:
+        """One hostile value at a time, at every path, against all four entry points.
+
+        Exhaustive over: 24 paths x 18 hostile values = 432 single-value mutations, both counts
+        pinned by assertion so the sweep cannot silently shrink.
+
+        Not covered: multi-field corruption, nesting depth, payload size, and an interpreter out
+        of stack or memory. See this class's docstring, which names each and where it is
+        covered instead.
+        """
         base = digitization_record_payload(record())
         paths = self._paths(base)
         assert () in paths, "the root must be substitutable, or the sweep cannot reach from_payload"
@@ -1168,3 +1230,154 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
             "equals that node's ``sha256``",
         ):
             assert check in doc, f"the producer check {check!r} is documented nowhere"
+
+
+#: Test-name tokens that quantify over a space rather than describe one case.
+#:
+#: Matched as whole ``_``-separated tokens, never as substrings, so ``actually`` does not read as
+#: ``all`` and ``company`` does not read as ``any``. ``not`` is deliberately absent: it negates a
+#: specific case rather than quantifying over many. ``no`` IS present despite several descriptive
+#: uses, because the one test this rule most needed to catch was called
+#: ``test_no_mutation_escapes_the_documented_refusals`` -- the false positives it brings are
+#: resolved by renaming the test to say what it means, which is the rule working rather than
+#: misfiring.
+UNIVERSAL_TOKENS = frozenset(
+    {
+        "all",
+        "always",
+        "any",
+        "anything",
+        "cannot",
+        "each",
+        "every",
+        "everything",
+        "exhaustive",
+        "never",
+        "no",
+        "nothing",
+        "whatever",
+    }
+)
+
+#: The two ways a universal-named test may account for its name. One or the other, never neither.
+SCOPE_MARKERS = ("Exhaustive over:", "Not covered:")
+
+#: How much text a marker must be followed by. A header alone is the boilerplate this rule exists
+#: to avoid, and ``Not covered: -`` is a header alone with extra steps.
+MIN_MARKER_CONTENT = 25
+
+POLICED_MODULES = ("test_figure_digitization_record.py", "test_embedded_figure_digitization.py")
+
+
+def _marker_content(docstring: str, marker: str) -> str | None:
+    """The prose following ``marker``, to the next blank line, or ``None`` if it is absent."""
+    lines = docstring.splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(marker):
+            continue
+        collected = [stripped[len(marker) :].strip()]
+        for following in lines[index + 1 :]:
+            if not following.strip():
+                break
+            collected.append(following.strip())
+        return " ".join(part for part in collected if part)
+    return None
+
+
+def _universal_tokens(name: str) -> set[str]:
+    return set(name.split("_")) & UNIVERSAL_TOKENS
+
+
+class TestEveryUniversalTestNameAccountsForItsScope:
+    """The lint that closes the class this ticket produced seven instances of.
+
+    Seven times a test's NAME promised a universal its body did not test -- on the naming axis,
+    the storage axis, the time axis, the from_payload-versus-read axis, the every-triple axis,
+    the docstring-quoting-itself axis, and the sweep-coverage axis. Seven correct one-off fixes
+    did not stop an eighth, because each fixed an instance and left the class open. This is the
+    class, expressed as a rule a machine applies on every run.
+
+    THE RULE. A test whose name contains a universal quantifier must, in its OWN docstring,
+    carry at least one of two markers:
+
+    - ``Exhaustive over:`` -- the space is closed and the body walks all of it. Name the space,
+      so a reader can check the walk against it (an enum's members, four edges, three states).
+    - ``Not covered:`` -- the space is open and the body samples it. Name what is outside, so
+      the gap is a written claim somebody can falsify rather than an absence nobody sees.
+
+    BOTH are allowed together, and that is not a loophole. The first draft of this rule demanded
+    exactly one, and the first test it was applied to -- this one -- refuted it: a body can walk
+    a closed set exhaustively along one dimension while leaving another open, and forcing a
+    choice would push an author to delete the honest caveat. What is forbidden is neither.
+
+    A test that wants neither renames itself to the narrower thing it actually tests. There is
+    no exemption list, deliberately: an exemption list is where a lint goes to die, and every
+    false positive this raises is answered by a rename that makes the name more precise.
+
+    Exhaustive over: the ``test_``-prefixed functions of the two modules named in
+    ``POLICED_MODULES``, read from source via AST, so a test cannot escape by not being
+    imported. Both modules are walked whole, including this class.
+
+    Not covered: whether the claim a marker makes is TRUE. This lint checks that a claim was
+    made and has content behind it; it cannot check that an ``Exhaustive over:`` really is
+    exhaustive, nor that a ``Not covered:`` names every uncovered route. It also does not police
+    the rest of the repository's tests, nor universals that appear only in a docstring rather
+    than in a name, nor class names. What it converts is the cheapest half of the review finding
+    -- the half that recurred seven times -- into something that fails before review sees it.
+    """
+
+    @staticmethod
+    def _test_functions() -> list[tuple[str, ast.FunctionDef]]:
+        here = pathlib.Path(__file__).parent
+        found: list[tuple[str, ast.FunctionDef]] = []
+        for name in POLICED_MODULES:
+            tree = ast.parse((here / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
+                    found.append((name, node))
+        return found
+
+    def test_the_lint_has_something_to_police(self) -> None:
+        """A rule that matches nothing passes forever and protects nothing.
+
+        Exhaustive over: the two policed modules. Pinned as a floor rather than a count, since
+        tests are added often and the point here is only that the walk is not empty.
+        """
+        functions = self._test_functions()
+        assert len(functions) > 100, f"the walk found {len(functions)} tests, so it is not walking"
+        universal = [node.name for _, node in functions if _universal_tokens(node.name)]
+        assert len(universal) > 10, f"only {len(universal)} universal names matched; check the vocabulary"
+
+    def test_every_universal_named_test_states_its_scope(self) -> None:
+        """The rule itself.
+
+        Exhaustive over: every ``test_`` function in the policed modules whose name contains a
+        universal token. Each is checked for exactly one marker with real content behind it.
+
+        Not covered: the truth of what the marker says, and universals expressed without one of
+        the vocabulary's tokens ("in either direction", "under any circumstances"). A name can
+        still over-promise in words this list does not hold; what it can no longer do is
+        over-promise in the seven words that actually recurred.
+        """
+        violations: list[str] = []
+        for module, node in self._test_functions():
+            tokens = _universal_tokens(node.name)
+            if not tokens:
+                continue
+            where = f"{module}::{node.name} [{','.join(sorted(tokens))}]"
+            docstring = ast.get_docstring(node)
+            if not docstring:
+                violations.append(f"{where}: universal name, no docstring at all")
+                continue
+
+            present = [marker for marker in SCOPE_MARKERS if _marker_content(docstring, marker) is not None]
+            if not present:
+                violations.append(f"{where}: no '{SCOPE_MARKERS[0]}' or '{SCOPE_MARKERS[1]}' section")
+                continue
+            for marker in present:
+                content = _marker_content(docstring, marker) or ""
+                if len(content) < MIN_MARKER_CONTENT:
+                    violations.append(f"{where}: '{marker}' has {len(content)} chars behind it, which names nothing")
+
+        assert not violations, "universal test names that do not account for themselves:\n  " + "\n  ".join(violations)

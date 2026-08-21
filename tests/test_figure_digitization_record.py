@@ -123,7 +123,7 @@ class TestAReaderHoldingOnlyTheRecord:
     def _as_a_reader_would_hold_it(record: FigureDigitization) -> dict[str, Any]:
         return json.loads(digitization_record_bytes(digitization_record_payload(record)).decode("utf-8"))  # type: ignore[no-any-return]
 
-    def test_complete_is_nothing_missing_and_the_instrument_could_tell(self) -> None:
+    def test_complete_reads_as_an_empty_ledger_beside_a_census(self) -> None:
         payload = self._as_a_reader_would_hold_it(complete())
         assert coverage_of(payload) is FigureCoverage.COMPLETE
         assert is_auditable(payload) is True
@@ -138,7 +138,7 @@ class TestAReaderHoldingOnlyTheRecord:
             MarkerOmissionReason.OCCLUDED,
         )
 
-    def test_uncheckable_is_no_way_to_know(self) -> None:
+    def test_uncheckable_reads_as_a_question_that_was_unanswerable(self) -> None:
         payload = self._as_a_reader_would_hold_it(uncheckable())
         assert coverage_of(payload) is FigureCoverage.UNCHECKABLE
         assert is_auditable(payload) is False
@@ -184,7 +184,14 @@ class TestAReaderHoldingOnlyTheRecord:
         assert omission_reasons_of(payload) == (MarkerOmissionReason.AXIS_BOUNDARY_STRADDLE,)
 
     def test_an_unreadable_payload_never_answers_that_the_series_is_fine(self) -> None:
-        """Every reader raises rather than defaulting. A default here reads as reassurance."""
+        """Every reader raises rather than defaulting. A default here reads as reassurance.
+
+        Exhaustive over: the four module-level readers -- coverage_of, census_of, is_auditable,
+        omission_reasons_of. Adding a fifth without adding it here leaves it unchecked.
+
+        Not covered: one unreadable payload shape, an unknown payload_version. Malformed
+        payloads of other shapes are covered by TestReadingAnUntrustedPayload.
+        """
         for reader in (coverage_of, census_of, is_auditable, omission_reasons_of):
             with pytest.raises(ValueError):
                 reader({"payload_version": 99})
@@ -201,7 +208,7 @@ class TestACompleteClaimCannotCarryAnOmission:
         with pytest.raises(ValueError, match=r"\['m07', 'm11'\]"):
             digitization(coverage=FigureCoverage.COMPLETE, census=MarkerCensus(detected=12))
 
-    def test_it_cannot_be_smuggled_in_through_a_stored_payload(self) -> None:
+    def test_the_same_refusal_applies_to_a_payload_parsed_off_disk(self) -> None:
         """The same refusal on bytes that arrived from outside the process.
 
         A record built in memory and one parsed off disk are held to the SAME invariants --
@@ -239,7 +246,7 @@ class TestTheCensusMustBalance:
         assert record.census == MarkerCensus(detected=12)
         assert record.recovered + len(record.omissions) == 12
 
-    def test_no_balance_is_struck_when_there_is_no_total(self) -> None:
+    def test_the_balance_is_not_struck_without_a_total(self) -> None:
         """With no census there is no arithmetic to do, and none is invented."""
         record = uncheckable(recovered=3, omissions=(STRADDLER, OCCLUDED))
         assert record.recovered == 3
@@ -262,6 +269,11 @@ class TestCoverageAndAuditabilityArePinnedToEachOther:
             digitization(coverage=FigureCoverage.UNCHECKABLE)
 
     def test_every_census_unavailable_reason_reaches_uncheckable(self) -> None:
+        """The auditability axis pins coverage, whichever reason the census is missing for.
+
+        Exhaustive over: every member of CensusUnavailableReason, walked from the enum itself
+        rather than listed, so a new reason is covered the moment it is declared.
+        """
         for reason in CensusUnavailableReason:
             record = uncheckable(census=CensusUnavailable(reason=reason))
             assert record.coverage is FigureCoverage.UNCHECKABLE
@@ -307,6 +319,14 @@ class TestTheStoredFormIsCanonicalAndSelfAddressing:
         assert compute_digitization_sha(reloaded) == address
 
     def test_the_round_trip_preserves_both_axes_for_all_three_states(self, tmp_path: Path) -> None:
+        """Store and reload, and both axes survive.
+
+        Exhaustive over: the three FigureCoverage states, each written to a real file and read
+        back through json rather than compared in memory.
+
+        Not covered: the omission LEDGER's survival, which
+        test_geometry_survives_the_trip_bit_for_bit pins separately.
+        """
         for name, record in (("complete", complete()), ("partial", digitization()), ("uncheckable", uncheckable())):
             payload = digitization_record_payload(record)
             path = tmp_path / f"{name}.json"
@@ -342,6 +362,12 @@ class TestTheStoredFormIsCanonicalAndSelfAddressing:
         ``nan`` on their own, because every comparison against one is False, but they refuse it
         as "spans no height" -- which sends a reader looking for a box that was never the
         problem. Asserting on the message is what holds that apart.
+
+        Exhaustive over: the three non-finite float values -- nan, inf and -inf -- across both
+        types that hold a coordinate, PlotRegion and MarkerOmission.
+
+        Not covered: values that are finite but absurd. A coordinate of 1e300 inside a plot
+        region is refused by D6b's containment, not by finiteness, and is tested there.
         """
         for bad in (float("nan"), float("inf"), float("-inf")):
             with pytest.raises(ValueError, match=r"MarkerOmission\('m07'\).x: refusing to record a non-finite"):
@@ -387,7 +413,7 @@ class TestReadingAnUntrustedPayload:
         with pytest.raises(ValueError, match="an untagged census cannot be read"):
             FigureDigitization.from_payload(payload)
 
-    def test_a_census_that_is_not_an_object_states_no_auditability(self) -> None:
+    def test_a_census_that_is_not_an_object_is_refused(self) -> None:
         payload = digitization_record_payload(digitization())
         payload["census"] = 12
         with pytest.raises(ValueError, match="'census' is int, not an object"):
@@ -406,7 +432,7 @@ class TestReadingAnUntrustedPayload:
         with pytest.raises(ValueError, match="series_id is NoneType, not a string"):
             FigureDigitization.from_payload(payload)
 
-    def test_an_omissions_list_that_is_not_a_list_itemises_nothing(self) -> None:
+    def test_an_omissions_list_that_is_not_a_list_is_refused(self) -> None:
         payload = digitization_record_payload(digitization())
         payload["omissions"] = {"m07": "straddle"}
         with pytest.raises(ValueError, match="'omissions' is dict, not a list"):
@@ -430,7 +456,7 @@ class TestReadingAnUntrustedPayload:
         with pytest.raises(ValueError, match="we_did_not_like_it"):
             FigureDigitization.from_payload(payload)
 
-    def test_a_payload_that_is_not_an_object_at_all_is_refused(self) -> None:
+    def test_a_payload_that_is_not_an_object_is_refused(self) -> None:
         """The annotation says ``Mapping`` and a payload off disk does not read annotations.
 
         A decoded JSON list reaching here raised ``AttributeError`` off ``payload.get`` -- a type
@@ -534,7 +560,7 @@ class TestIdentityAndLedgerHygiene:
         assert payload["figure_crop_node_id"] == "crop-fig3"
         assert payload["figure_crop_sha256"] == CROP_SHA
 
-    def test_a_record_that_recovered_nothing_is_not_a_record_about_a_series(self) -> None:
+    def test_a_record_that_recovered_zero_points_is_refused(self) -> None:
         with pytest.raises(ValueError, match="a digitization that recovered nothing is a refusal"):
             digitization(coverage=FigureCoverage.COMPLETE, census=MarkerCensus(detected=0), omissions=(), recovered=0)
 
@@ -619,7 +645,7 @@ class TestWhatCanBeBuiltIsWhatCanBeReadBack:
                 recovered=1,
             )
 
-    def test_every_field_that_constructs_also_serializes(self) -> None:
+    def test_a_constructed_record_serializes_and_reads_back_equal(self) -> None:
         """The property the guards exist for, asserted directly.
 
         A record that constructs must serialize, and what it serializes must read back. Before
@@ -686,10 +712,20 @@ class TestEveryLedgerEntryIsALoss:
     """
 
     def test_no_reason_describes_a_marker_that_was_never_a_candidate(self) -> None:
+        """The absent reason code, asserted as absent.
+
+        Exhaustive over: every member of MarkerOmissionReason, checked by value as well as by
+        attribute, so reintroducing OUTSIDE_PLOT_REGION under either spelling fails here.
+        """
         assert not hasattr(MarkerOmissionReason, "OUTSIDE_PLOT_REGION")
         assert "outside_plot_region" not in {reason.value for reason in MarkerOmissionReason}
 
     def test_every_surviving_reason_names_a_marker_this_series_should_have_had(self) -> None:
+        """Each reason left is a LOSS: a marker that belonged in this series and is not in it.
+
+        Exhaustive over: the whole enum by set equality, so a reason added without a loss
+        meaning fails here rather than passing quietly into the ledger's vocabulary.
+        """
         assert {reason.value for reason in MarkerOmissionReason} == {
             "axis_boundary_straddle",
             "occluded",
@@ -699,7 +735,14 @@ class TestEveryLedgerEntryIsALoss:
 
     def test_a_lossless_digitization_can_never_be_forced_to_report_partial(self) -> None:
         """For every reason there is, an entry carrying it means a marker really is missing --
-        so `recovered` is strictly below the census total and PARTIAL is the true answer."""
+        so `recovered` is strictly below the census total and PARTIAL is the true answer.
+
+        Exhaustive over: every member of MarkerOmissionReason, each placed in a one-entry ledger.
+
+        Not covered: ledgers mixing several reasons, and ledgers longer than one. D8 keys off
+        emptiness alone, so length cannot change the answer -- but that is an argument, and this
+        test does not check it.
+        """
         for reason in MarkerOmissionReason:
             record = digitization(
                 census=MarkerCensus(detected=11),
@@ -739,7 +782,11 @@ class TestANonCandidateMarkHasNowhereToBeSmuggled:
             )
 
     def test_no_reason_code_provides_a_way_around_it(self) -> None:
-        """The workaround, tried with every label a producer could reach for."""
+        """The workaround, tried with every label a producer could reach for.
+
+        Exhaustive over: every member of MarkerOmissionReason, each tried at an out-of-region
+        coordinate. There is no reason code that buys an exemption from D6b.
+        """
         for reason in MarkerOmissionReason:
             with pytest.raises(ValueError, match="outside the plot region"):
                 digitization(
@@ -749,7 +796,13 @@ class TestANonCandidateMarkHasNowhereToBeSmuggled:
                 )
 
     def test_each_edge_of_the_region_is_guarded(self) -> None:
-        """A single-axis escape would leave three quarters of the plane reachable."""
+        """A single-axis escape would leave three quarters of the plane reachable.
+
+        Exhaustive over: the four edges, one case just outside each.
+
+        Not covered: the four corners, where both axes are outside at once. A corner fails the
+        same conjunction these do, and no case here has both axes outside.
+        """
         for x, y in ((71.9, 300.0), (520.1, 300.0), (300.0, 99.9), (300.0, 640.1)):
             with pytest.raises(ValueError, match="outside the plot region"):
                 digitization(
@@ -796,6 +849,11 @@ class TestTheAddressNamesTheClaimNotTheDigitization:
         hashed and the recovered points are represented by a bare count -- and
         ``test_the_payload_carries_a_count_and_not_one_recovered_coordinate`` below is what makes
         the collision structural rather than a fixture coincidence.
+
+        Exhaustive over: nothing -- two records are compared, not a space.
+
+        Not covered: that ALL agreeing pairs collide. What makes the collision structural rather
+        than particular to this pair is the payload's key set, pinned by the test named above.
         """
         first = digitization(census=MarkerCensus(detected=11), recovered=10, omissions=(STRADDLER,))
         moved_omission = digitization(
