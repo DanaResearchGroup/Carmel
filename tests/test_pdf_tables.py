@@ -1021,6 +1021,71 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
 
+    def test_the_boundary_reason_survives_an_unmapped_member_for_BOTH_twins(self) -> None:
+        """One document, one class of fault, two orientations, and no glyph in the answer.
+
+        The upright straddler earned this guarantee by being settled before the box's
+        contents are read. Its rotated twin has to be asked AFTER the rows exist, so for a
+        while it did not have it: with an unmapped member inside the box, an upright
+        fragment the edge cut reported ``straddling_fragment_at_the_box_edge`` while a
+        rotated one on a row's own printed line reported ``unmapped_member`` -- the same
+        document answering differently depending on a glyph neither fragment involves.
+
+        The repair is that the row derivation reads geometry only, so it can be hoisted
+        above the unmapped check; ``test_the_row_derivation_reads_no_glyph`` pins that
+        premise separately, because this test is worthless if it is not true.
+        """
+        marker = frag("/C14", 61.8, 61.8, 91.0, glyph_mapping=GlyphMapping.UNMAPPED)
+        upright = RIGHT_EDGE_STRADDLER
+        spun = frag("91", 130.7, 322.5, 91.0, rotated=True)
+
+        for fragment, expected in (
+            (upright, InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE),
+            (spun, InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT),
+        ):
+            with_marker = build_inventory(extraction_of(*a_row_the_edge_can_cut(), fragment, marker), footprint())
+            without = build_inventory(extraction_of(*a_row_the_edge_can_cut(), fragment), footprint())
+
+            assert [r.reason for r in with_marker.refusals] == [expected]
+            assert [r.reason for r in without.refusals] == [expected]
+
+    def test_the_row_derivation_reads_no_glyph(self) -> None:
+        """The premise the hoist rests on, asserted rather than trusted.
+
+        Rows may be derived before glyphs are known readable only if the derivation does
+        not consult them. Corrupting every member's text and glyph state, while leaving all
+        four geometry floats alone, must therefore produce the same rows, the same folded
+        baselines and the same ordinals -- only the cell TEXT may differ, which is why cell
+        construction stayed below the unmapped check.
+        """
+        readable = (
+            CAPTION,
+            frag("CO", 122.0, 134.0, 120.0),
+            frag("2", 134.0, 137.0, 116.0, font_height=AFFIX_HEIGHT),
+            frag("Bbb", 53.0, 70.0, 100.0),
+            frag("222", 122.0, 146.0, 100.0),
+        )
+        # The CAPTION keeps its text. It is the box's anchor, checked against the document
+        # by `_caption_anchored`, so corrupting it refuses for a reason unrelated to this
+        # question -- which is itself a small proof that the anchor check reads text and the
+        # derivation below it does not.
+        scrambled = (
+            CAPTION,
+            *(
+                frag("?" * len(f.text), f.x_start, f.x_end, f.baseline_y, font_height=f.font_height)
+                for f in readable[1:]
+            ),
+        )
+
+        first = build_inventory(extraction_of(*readable), footprint())
+        second = build_inventory(extraction_of(*scrambled), footprint())
+
+        assert first.refusals == () and second.refusals == ()
+        assert [(r.ordinal, r.baseline_y, r.merged_baselines) for r in first.rows] == [
+            (r.ordinal, r.baseline_y, r.merged_baselines) for r in second.rows
+        ]
+        assert [r.anchor_text for r in first.rows] != [r.anchor_text for r in second.rows], "the text DID change"
+
     def test_the_straddle_refusal_does_not_depend_on_the_glyph_state(self) -> None:
         """The reason a caller reads must not turn on whether some OTHER fragment mapped.
 
@@ -1165,15 +1230,60 @@ class TestGeometryThatCannotBeComparedRefuses:
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
-    def test_a_negative_font_height_refuses_on_the_same_footing(self) -> None:
-        """Unobserved rather than impossible -- 0 of 78178 corpus fragments carry one -- and
-        nonsense feeding a magnitude comparison, exactly like a backwards extent. Refusing
-        it costs nothing measured and closes the direction the NaN case came from."""
-        marker = frag("2", 134.0, 137.0, 116.0, font_height=-5.0)
+    def test_a_zero_font_height_loses_a_whole_row_and_must_refuse(self) -> None:
+        """The fourth of these, and the one that finally changed the shape of the fix.
 
-        inventory = build_inventory(extraction_of(CAPTION, frag("CO", 122.0, 134.0, 120.0), marker), footprint())
+        ``_looks_like_affix`` guards ``reference <= 0`` for the NEIGHBOUR but not for the
+        band, so a band of zero-height fragments is affix-shaped against everything and is
+        folded away. Two ordinary rows, the second at ``font_height=0.0``: the old code
+        returned COMPLETE with ONE row anchored ``AaaBbb`` -- a whole row swallowed by the
+        one above it, every surviving cell correctly grounded, no refusal. A row LOST rather
+        than fabricated, which is the same silence from the other direction.
+        """
+        rows = (CAPTION, frag("Aaa", 53.0, 70.0, 120.0), frag("Bbb", 53.0, 70.0, 100.0, font_height=0.0))
 
+        inventory = build_inventory(extraction_of(*rows), footprint())
+
+        assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    @pytest.mark.parametrize("field", ["x_start", "x_end", "baseline_y", "font_height"])
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_every_geometry_float_is_covered_by_the_one_invariant(self, field: str, bad: float) -> None:
+        """The point of centralising the predicate: the next adjacent case is caught by
+        construction, not by the next review.
+
+        ``TextFragment`` carries exactly four floats that this module compares --
+        ``x_start``, ``x_end``, ``baseline_y``, ``font_height`` -- and ``page`` only for
+        equality. So this parametrisation is EXHAUSTIVE over the fields, which is the claim
+        that makes "there is no fifth patch" checkable rather than asserted. Four separate
+        patches got us here; this is what replaces the fifth.
+        """
+        geometry = {"x_start": 300.0, "x_end": 320.0, "baseline_y": 91.0, "font_height": BODY_HEIGHT}
+        geometry[field] = bad
+        broken = frag(
+            "?", geometry["x_start"], geometry["x_end"], geometry["baseline_y"], font_height=geometry["font_height"]
+        )
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), broken), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+    def test_a_zero_width_fragment_stays_legal(self) -> None:
+        """The boundary the invariant deliberately does NOT close.
+
+        ``x_start == x_end`` is a real fragment: the corpus's ``/C14`` degree sign is exactly
+        that, at ``x=61.7952-61.7952``. Refusing zero WIDTH would refuse a document over a
+        mark the page really carries, which is why the predicate says ``x_start <= x_end``
+        and ``font_height > 0`` rather than treating the two axes alike.
+        """
+        degree_sign = frag("o", 61.8, 61.8, 91.0)
+
+        inventory = build_inventory(extraction_of(*a_row_the_edge_can_cut(), degree_sign), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.rows) == 3
 
     def test_a_blank_unreadable_fragment_still_refuses(self) -> None:
         """Deliberately unlike the straddle guard, which skips blanks.
