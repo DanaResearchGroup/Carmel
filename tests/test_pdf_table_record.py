@@ -190,7 +190,7 @@ class TestTheRecordIsAClaimTheDocumentCanRefute:
         assert verify_inventory_record(payload, GRID).reproduced
 
 
-class TestARefusalsProseIsDiagnosticsAndItsReasonIsTheFinding:
+class TestRefusalProseIsDiagnosticsAndTheReasonIsTheFinding:
     """``detail`` sat inside the compared bytes, so rewording one broke stored records.
 
     A record written before a diagnostic was rephrased came back MISMATCHED -- the status
