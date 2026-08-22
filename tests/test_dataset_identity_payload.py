@@ -17,6 +17,7 @@ contract of one method -- rather than the schema's construction invariants.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import re
 from enum import Enum
@@ -43,6 +44,7 @@ from carmel.schemas.datasets import (
     CoordinateFrame,
     DataPoint,
     DatasetEnvelope,
+    DatasetEnvelopeParseError,
     EmbeddedConversionTable,
     ExtractedTextVerification,
     ExtractionBinding,
@@ -136,6 +138,10 @@ _CURRENT_REPAIR_DEPENDENCY = SemanticDependencyUse(
 sharing one instance across every fixture that doesn't need a
 deliberately-wrong or superseded dependency record is safe."""
 
+_NO_CROP_REGION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""SourceNode.crop_region for every kind that is not a FIGURE_CROP: nothing
+but a crop was cut out of a page, so NOT_APPLICABLE is the only reason
+SourceNode's I7 invariant accepts there."""
 _NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_EXTRACTION_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
@@ -255,6 +261,27 @@ def _embedded_table_v1() -> EmbeddedConversionTable:
 # --------------------------------------------------------------------------
 
 
+def _maximal_bbox() -> BBox:
+    """A bbox whose frame has every optional sub-field PRESENT, so
+    ``_walk_completeness`` reaches them.
+
+    Shared by the crop node's own ``crop_region`` and by the ``BBoxLocator``
+    that targets that crop. They are the same rectangle here only because the
+    fixture is minimal: a ``crop_region`` is measured against the PARENT's
+    page frame, while a ``BBoxLocator`` on a crop addresses a region within
+    the crop's own render (see ``SourceNode.crop_region``)."""
+    frame = CoordinateFrame(
+        render_fingerprint="fp-1",
+        cropbox=("0", "0", "612", "792"),
+        mediabox=("0", "0", "612", "792"),
+        rotation=0,
+        units="pt",
+        dpi="300",
+        render_settings="antialias=on",
+    )
+    return BBox(frame=frame, x0="10", y0="20", x1="30", y1="40")
+
+
 def _maximal_graph() -> tuple[SourceGraph, SourceRef, SourceRef, SourceRef, SourceRef, SourceRef]:
     paper = SourceNode(
         node_id="paper",
@@ -265,6 +292,7 @@ def _maximal_graph() -> tuple[SourceGraph, SourceRef, SourceRef, SourceRef, Sour
         extraction=_PAPER_EXTRACTION,
         glyph_health=_PAPER_GLYPH_HEALTH,
         verification=_verification_for(_PAPER_EXTRACTION),
+        crop_region=_NO_CROP_REGION,
     )
     jats = SourceNode(
         node_id="jats",
@@ -275,6 +303,7 @@ def _maximal_graph() -> tuple[SourceGraph, SourceRef, SourceRef, SourceRef, Sour
         extraction=_NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH,
         verification=_verification_for(_NO_EXTRACTION),
+        crop_region=_NO_CROP_REGION,
     )
     si = SourceNode(
         node_id="si",
@@ -285,6 +314,7 @@ def _maximal_graph() -> tuple[SourceGraph, SourceRef, SourceRef, SourceRef, Sour
         extraction=_NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH,
         verification=_verification_for(_NO_EXTRACTION),
+        crop_region=_NO_CROP_REGION,
     )
     crop = SourceNode(
         node_id="crop",
@@ -295,6 +325,11 @@ def _maximal_graph() -> tuple[SourceGraph, SourceRef, SourceRef, SourceRef, Sour
         extraction=_NO_EXTRACTION_CROP,
         glyph_health=_NO_GLYPH_HEALTH_CROP,
         verification=_verification_for(_NO_EXTRACTION_CROP),
+        # Concrete, with every optional sub-field of its frame present: I7
+        # requires a crop to address itself, and this is the MAXIMAL fixture,
+        # so an under-populated frame would leave `_walk_completeness`
+        # short-circuiting on fields it exists to visit.
+        crop_region=_maximal_bbox(),
     )
     # Node order is ascending by node_id ON PURPOSE: the projection sorts
     # nodes by node_id (order in `SourceGraph.nodes` is set-like and carries
@@ -304,17 +339,7 @@ def _maximal_graph() -> tuple[SourceGraph, SourceRef, SourceRef, SourceRef, Sour
     # covered by the dedicated order-invariance tests, not by this fixture.
     graph = SourceGraph(nodes=(crop, jats, paper, si))
 
-    frame = CoordinateFrame(
-        render_fingerprint="fp-1",
-        cropbox=("0", "0", "612", "792"),
-        mediabox=("0", "0", "612", "792"),
-        rotation=0,
-        units="pt",
-        dpi="300",
-        render_settings="antialias=on",
-    )
-    bbox = BBox(frame=frame, x0="10", y0="20", x1="30", y1="40")
-    bbox_ref = SourceRef(node_id="crop", locator=BBoxLocator(bbox=bbox))
+    bbox_ref = SourceRef(node_id="crop", locator=BBoxLocator(bbox=_maximal_bbox()))
     table_ref_caption = SourceRef(
         node_id="paper",
         locator=TableCellLocator(
@@ -507,6 +532,7 @@ def _minimal_envelope_with_composition(composition: Composition | Absent) -> Dat
         extraction=_NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH,
         verification=_verification_for(_NO_EXTRACTION),
+        crop_region=_NO_CROP_REGION,
     )
     graph = SourceGraph(nodes=(paper,))
     ref = SourceRef(
@@ -573,7 +599,10 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
         # Import here (not at module scope) so a missing `_UNADDRESSED_FIELDS`
         # produces one clear failure at collection time via the outer test's
         # own import, not a confusing NameError deep in recursion.
-        from carmel.schemas.datasets import _UNADDRESSED_FIELDS  # type: ignore[attr-defined]
+        from carmel.schemas.datasets import (  # type: ignore[attr-defined]
+            _CONDITIONALLY_PROJECTED_FIELDS,
+            _UNADDRESSED_FIELDS,
+        )
 
         model_name = type(value).__name__
         assert isinstance(projected, dict), (
@@ -585,6 +614,31 @@ def _walk_completeness(value: object, projected: object, path: str) -> None:
                 assert _UNADDRESSED_FIELDS[key], (
                     f"{path}.{name}: registered in _UNADDRESSED_FIELDS with an empty reason"
                 )
+                continue
+            if key in _CONDITIONALLY_PROJECTED_FIELDS:
+                # A field projected for SOME instances of this model and omitted
+                # for others. Checked in BOTH directions, deliberately: "must be
+                # present when the predicate holds" alone would let a future
+                # change start emitting the key unconditionally -- silently
+                # re-addressing every envelope that does not carry the field --
+                # while this meta-test stayed green. That is the same class of
+                # failure the registry exists to catch, pointing the other way.
+                is_projected_for, reason = _CONDITIONALLY_PROJECTED_FIELDS[key]
+                assert reason, f"{path}.{name}: registered in _CONDITIONALLY_PROJECTED_FIELDS with an empty reason"
+                if not is_projected_for(value):
+                    assert name not in projected, (
+                        f"{path}.{name}: field {name!r} of {model_name} is projected for an instance "
+                        "its _CONDITIONALLY_PROJECTED_FIELDS predicate excludes -- either the predicate "
+                        "or the projection is wrong, and an unconditional key re-addresses every "
+                        "envelope that carries no meaningful value for it"
+                    )
+                    continue
+                assert name in projected, (
+                    f"{path}.{name}: field {name!r} of {model_name} is missing from identity_payload()'s "
+                    "output for an instance its _CONDITIONALLY_PROJECTED_FIELDS predicate INCLUDES -- "
+                    "for this instance the field is identity-bearing and must be projected"
+                )
+                _walk_completeness(getattr(value, name), projected[name], f"{path}.{name}")
                 continue
             assert name in projected, (
                 f"{path}.{name}: field {name!r} of {model_name} is missing from identity_payload()'s output "
@@ -699,6 +753,52 @@ class TestCompletenessWalkerIsNotVacuous:
         finally:
             datasets_module._UNADDRESSED_FIELDS = original  # type: ignore[attr-defined]
 
+    def test_walker_fails_when_a_conditional_field_is_dropped_for_an_instance_that_needs_it(self) -> None:
+        """A FIGURE_CROP's ``crop_region`` IS its identity, so a projection
+        that omits it must fail the walk. Fed a hand-made projection rather
+        than a real one -- nothing under carmel/ is edited -- so this pins the
+        walker's behaviour, not today's projector's."""
+        from carmel.schemas.datasets import _source_node_identity_payload  # type: ignore[attr-defined]
+
+        crop = _maximal_graph()[0].node("crop")
+        projected = {k: v for k, v in _source_node_identity_payload(crop).items() if k != "crop_region"}
+
+        with pytest.raises(AssertionError, match="predicate INCLUDES"):
+            _walk_completeness(crop, projected, "root")
+
+    def test_walker_fails_when_a_conditional_field_is_projected_for_an_instance_that_excludes_it(self) -> None:
+        """The other direction, which is the one a well-meaning change breaks:
+        emitting ``crop_region`` for a PAPER_PDF folds a constant into the
+        address and re-addresses every crop-free envelope in every store. The
+        walker must refuse that as loudly as it refuses an omission."""
+        from carmel.schemas.datasets import _source_node_identity_payload  # type: ignore[attr-defined]
+
+        paper = _maximal_graph()[0].node("paper")
+        projected = {
+            **_source_node_identity_payload(paper),
+            "crop_region": {"__absent__": True, "reason": "not_applicable", "note": None},
+        }
+
+        with pytest.raises(AssertionError, match="predicate excludes"):
+            _walk_completeness(paper, projected, "root")
+
+    def test_walker_fails_when_a_conditional_field_is_registered_with_an_empty_reason(self) -> None:
+        import carmel.schemas.datasets as datasets_module
+
+        crop = _maximal_graph()[0].node("crop")
+        projected = datasets_module._source_node_identity_payload(crop)  # type: ignore[attr-defined]
+
+        original = dict(datasets_module._CONDITIONALLY_PROJECTED_FIELDS)  # type: ignore[attr-defined]
+        try:
+            datasets_module._CONDITIONALLY_PROJECTED_FIELDS = {  # type: ignore[attr-defined]
+                **original,
+                ("SourceNode", "crop_region"): (lambda node: True, ""),
+            }
+            with pytest.raises(AssertionError, match="empty reason"):
+                _walk_completeness(crop, projected, "root")
+        finally:
+            datasets_module._CONDITIONALLY_PROJECTED_FIELDS = original  # type: ignore[attr-defined]
+
     def test_walker_fails_when_a_dataclass_fields_field_is_absent_from_the_projection_and_unregistered(
         self,
     ) -> None:
@@ -805,6 +905,159 @@ class TestProjectionCompleteness:
             "test's expected set deliberately (with a reason), don't just let it drift"
         )
 
+    def test_conditionally_projected_registry_has_exactly_the_known_kind_conditional_field(self) -> None:
+        """Same discipline as the registry test above, aimed at the other
+        escape hatch: a KIND-CONDITIONAL key is a licence to omit a field from
+        some addresses, so the set of them must stay small and deliberate. One
+        entry today -- ``SourceNode.crop_region``, identity-bearing for a
+        FIGURE_CROP and structurally inapplicable to every other kind."""
+        from carmel.schemas.datasets import _CONDITIONALLY_PROJECTED_FIELDS  # type: ignore[attr-defined]
+
+        assert set(_CONDITIONALLY_PROJECTED_FIELDS) == {("SourceNode", "crop_region")}, (
+            "the registry must contain exactly the known, justified kind-conditional field(s); "
+            f"got {set(_CONDITIONALLY_PROJECTED_FIELDS)!r} -- every entry here needs an explicit "
+            "inverse in from_identity_payload(), so adding one is a deliberate decision, not drift"
+        )
+
+
+class TestCropRegionIsProjectedOnlyForCrops:
+    """``crop_region`` is emitted for a FIGURE_CROP and for no other kind.
+
+    The point is what does NOT get folded into the content address: I7 admits
+    exactly one value on a non-crop node, so projecting it there would put a
+    CONSTANT in every envelope's address -- no envelope distinguished from any
+    other, every stored envelope re-addressed, including the ones holding no
+    crop at all.
+    """
+
+    def test_the_crop_node_projects_its_region(self) -> None:
+        from carmel.schemas.datasets import _bbox_identity_payload  # type: ignore[attr-defined]
+
+        payload = _maximal_envelope().identity_payload()
+        crop = next(n for n in payload["source_graph"]["nodes"] if n["kind"] == "figure_crop")
+        assert crop["crop_region"] == _bbox_identity_payload(_maximal_bbox())
+
+    @pytest.mark.parametrize("kind", ["paper_pdf", "jats_xml", "si_member"])
+    def test_a_non_crop_node_does_not_project_the_key_at_all(self, kind: str) -> None:
+        payload = _maximal_envelope().identity_payload()
+        node = next(n for n in payload["source_graph"]["nodes"] if n["kind"] == kind)
+        assert "crop_region" not in node, (
+            f"a {kind} node projected crop_region -- I7 admits only Absent(NOT_APPLICABLE) there, so "
+            "this key carries no distinguishing bits and re-addresses every envelope that has one"
+        )
+
+    def test_the_fixture_covers_every_node_kind(self) -> None:
+        """Guards the two tests above from passing vacuously: if a kind ever
+        drops out of the maximal fixture, the parametrization silently stops
+        checking it."""
+        payload = _maximal_envelope().identity_payload()
+        assert {n["kind"] for n in payload["source_graph"]["nodes"]} == {kind.value for kind in SourceNodeKind}
+
+    def test_the_round_trip_is_byte_exact_for_every_node_kind(self) -> None:
+        """The omission is a projection SHAPE, not a lost field: the inverse
+        restores the marker for every non-crop node before validation, so the
+        parse comes back byte-identical -- with all four kinds in one graph."""
+        envelope = _maximal_envelope()
+        payload = envelope.identity_payload()
+
+        parsed = DatasetEnvelope.from_identity_payload(payload)
+
+        assert canonical_json_bytes(parsed.identity_payload()) == canonical_json_bytes(payload)
+        for node in parsed.source_graph.nodes:
+            if node.kind == SourceNodeKind.FIGURE_CROP:
+                assert node.crop_region == _maximal_bbox()
+            else:
+                assert node.crop_region == Absent(reason=AbsenceReason.NOT_APPLICABLE), (
+                    f"{node.kind.value} node came back with {node.crop_region!r} -- the inverse must "
+                    "restore exactly the one value I7 admits, not invent another"
+                )
+
+    def test_a_payload_carrying_the_key_on_a_non_crop_node_is_refused(self) -> None:
+        """The projection shape is canonical. A payload that adds the key back
+        on a PAPER_PDF validates (Absent(NOT_APPLICABLE) is legal on the model)
+        but does not re-project to itself, and the round-trip comparison is
+        what catches it -- so a second byte-shape for one envelope can never
+        enter the store beside the first."""
+        payload = copy.deepcopy(_maximal_envelope().identity_payload())
+        for node in payload["source_graph"]["nodes"]:
+            if node["kind"] == "paper_pdf":
+                node["crop_region"] = {"__absent__": True, "reason": "not_applicable", "note": None}
+
+        with pytest.raises(DatasetEnvelopeParseError, match="does not byte-match the input payload"):
+            DatasetEnvelope.from_identity_payload(payload)
+
+    def test_a_crop_payload_missing_its_region_is_refused(self) -> None:
+        """The inverse restores the marker for non-crop nodes ONLY. A crop with
+        no region in its bytes is a malformed payload, and inferring one would
+        manufacture an address for a figure nobody located."""
+        payload = copy.deepcopy(_maximal_envelope().identity_payload())
+        for node in payload["source_graph"]["nodes"]:
+            if node["kind"] == "figure_crop":
+                del node["crop_region"]
+
+        with pytest.raises(DatasetEnvelopeParseError, match="crop_region"):
+            DatasetEnvelope.from_identity_payload(payload)
+
+    @pytest.mark.parametrize(
+        ("mutate", "shape", "names"),
+        [
+            (
+                lambda p: p.__setitem__("source_graph", "not a graph"),
+                "source_graph is not a dict",
+                "source_graph",
+            ),
+            (
+                lambda p: p["source_graph"].__setitem__("nodes", "not a list"),
+                "nodes is not a list",
+                "source_graph.nodes",
+            ),
+            (
+                lambda p: [n.pop("kind") for n in p["source_graph"]["nodes"]],
+                "a node carries no kind at all",
+                "source_graph.nodes.0.kind",
+            ),
+            (
+                lambda p: [n.__setitem__("kind", "hologram") for n in p["source_graph"]["nodes"]],
+                "a node's kind is not a SourceNodeKind",
+                "source_graph.nodes.0.kind",
+            ),
+        ],
+        ids=["graph-not-a-dict", "nodes-not-a-list", "node-without-a-kind", "node-with-an-unknown-kind"],
+    )
+    def test_a_malformed_payload_still_fails_where_it_would_have_failed(self, mutate, shape: str, names: str) -> None:
+        """The inverse must not MASK a malformed payload. It walks a shape it
+        did not produce, so it guards before indexing -- and those guards have
+        to hand the payload onward untouched, letting it fail on its own
+        error, rather than swallowing the malformation or raising some new one
+        from inside a restoration step nobody asked about.
+
+        Two SHAPE cases and two VALUE cases, because the two fail differently.
+        The shape guards return early and touch nothing. A node whose ``kind``
+        is missing or is a string no ``SourceNodeKind`` matches gets past those
+        guards and DOES have the marker added to it -- the restoration reads
+        ``kind`` and finds nothing that says ``figure_crop``. That addition is
+        harmless (the node fails on ``kind`` regardless) but it is only
+        harmless as long as the resulting error still names the field that was
+        actually malformed and not the key this step introduced. Each case
+        therefore carries the path it must name, and both halves are asserted:
+        the right field named, and ``crop_region`` absent. Asserting only the
+        absence would leave "and it still names ``kind``" as a claim in this
+        docstring that nothing checks."""
+        payload = copy.deepcopy(_maximal_envelope().identity_payload())
+        mutate(payload)
+
+        with pytest.raises(DatasetEnvelopeParseError, match="failed validation") as excinfo:
+            DatasetEnvelope.from_identity_payload(payload)
+
+        message = str(excinfo.value)
+        assert names in message, (
+            f"the {shape} case must be reported against {names!r}, the field that is actually malformed; got: {message}"
+        )
+        assert "crop_region" not in message, (
+            f"the {shape} case was reported as a crop_region problem -- the restoration step "
+            "rewrote a payload it should have passed through untouched"
+        )
+
 
 def _minimal_envelope_with_member_display_path(member_display_path: str | None) -> DatasetEnvelope:
     """The smallest legal envelope containing an SI_MEMBER node with a
@@ -821,6 +1074,7 @@ def _minimal_envelope_with_member_display_path(member_display_path: str | None) 
         extraction=_NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH,
         verification=_verification_for(_NO_EXTRACTION),
+        crop_region=_NO_CROP_REGION,
     )
     si = SourceNode(
         node_id="si",
@@ -831,6 +1085,7 @@ def _minimal_envelope_with_member_display_path(member_display_path: str | None) 
         extraction=_NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH,
         verification=_verification_for(_NO_EXTRACTION),
+        crop_region=_NO_CROP_REGION,
     )
     graph = SourceGraph(nodes=(paper, si))
     ref = SourceRef(
@@ -943,6 +1198,7 @@ def _minimal_envelope_with_glyph_health(health: GlyphHealth) -> DatasetEnvelope:
         extraction=extraction,
         glyph_health=glyph_health,
         verification=_verification_for(extraction),
+        crop_region=_NO_CROP_REGION,
     )
     graph = SourceGraph(nodes=(paper,))
     ref = SourceRef(
@@ -1087,6 +1343,7 @@ def _minimal_envelope_with_extraction(extraction: ExtractionBinding) -> DatasetE
         extraction=extraction,
         glyph_health=glyph_health,
         verification=_verification_for(extraction),
+        crop_region=_NO_CROP_REGION,
     )
     graph = SourceGraph(nodes=(paper,))
     ref = SourceRef(
@@ -1456,7 +1713,39 @@ class TestExtractionIdentityFieldsAreIdentityBearing:
 # `composition`/`series`, both of which compare EQUAL to the old golden once that
 # one field is stripped. No TABLE_CELL locator has ever been emitted by production
 # code, so this address move has nothing to migrate.
-_GOLDEN_CANONICAL_BYTES = b'{"composition":{"basis":"mole_fraction","components":[{"amount":{"canonical_decimal_value":"0.04","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"mole_fraction","raw_text":"0.04","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"role":"fuel","species_raw_name":"H2"}],"equivalence_ratio":{"canonical_decimal_value":"1.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"1.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}},"raw_name":"4% H2 in N2","resolution":"resolved_components"},"conversion_tables":[{"canonical_json":"{\\"aliases\\":[{\\"normalized\\":\\"C\\",\\"quantity\\":\\"temperature\\",\\"raw\\":\\"\xc2\xb0C\\"},{\\"normalized\\":\\"C\\",\\"quantity\\":\\"temperature\\",\\"raw\\":\\"degC\\"},{\\"normalized\\":\\"C\\",\\"quantity\\":\\"temperature\\",\\"raw\\":\\"deg C\\"},{\\"normalized\\":\\"cm/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"cm s^-1\\"},{\\"normalized\\":\\"cm/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"cm s-1\\"},{\\"normalized\\":\\"cm/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"cm/sec\\"},{\\"normalized\\":\\"m/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"m s^-1\\"},{\\"normalized\\":\\"cm3\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"cm^3\\"},{\\"normalized\\":\\"cm3\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"cc\\"},{\\"normalized\\":\\"L\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"l\\"},{\\"normalized\\":\\"L\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"liter\\"},{\\"normalized\\":\\"L\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"litre\\"},{\\"normalized\\":\\"us\\",\\"quantity\\":\\"time\\",\\"raw\\":\\"\xc2\xb5s\\"},{\\"normalized\\":\\"us\\",\\"quantity\\":\\"time\\",\\"raw\\":\\"\xce\xbcs\\"},{\\"normalized\\":\\"%\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"percent\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"dimensionless\\"},{\\"normalized\\":\\"ppm\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"ppmv\\"},{\\"normalized\\":\\"%\\",\\"quantity\\":\\"mass_fraction\\",\\"raw\\":\\"percent\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mass_fraction\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mass_fraction\\",\\"raw\\":\\"dimensionless\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"equivalence_ratio\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"equivalence_ratio\\",\\"raw\\":\\"dimensionless\\"},{\\"normalized\\":\\"%\\",\\"quantity\\":\\"relative_uncertainty\\",\\"raw\\":\\"percent\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"relative_uncertainty\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"relative_uncertainty\\",\\"raw\\":\\"dimensionless\\"}],\\"base_units\\":[[\\"length\\",\\"m\\"],[\\"velocity\\",\\"m/s\\"],[\\"temperature\\",\\"K\\"],[\\"pressure\\",\\"Pa\\"],[\\"time\\",\\"s\\"],[\\"volume\\",\\"m3\\"],[\\"strain_rate\\",\\"1/s\\"],[\\"mole_fraction\\",\\"1\\"],[\\"mass_fraction\\",\\"1\\"],[\\"equivalence_ratio\\",\\"1\\"],[\\"relative_uncertainty\\",\\"1\\"]],\\"rules\\":[{\\"kind\\":\\"identity\\",\\"quantity\\":\\"length\\",\\"unit\\":\\"m\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"velocity\\",\\"unit\\":\\"m/s\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"temperature\\",\\"unit\\":\\"K\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"pressure\\",\\"unit\\":\\"Pa\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"time\\",\\"unit\\":\\"s\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"volume\\",\\"unit\\":\\"m3\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"strain_rate\\",\\"unit\\":\\"1/s\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"mole_fraction\\",\\"unit\\":\\"1\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"mass_fraction\\",\\"unit\\":\\"1\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"equivalence_ratio\\",\\"unit\\":\\"1\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"relative_uncertainty\\",\\"unit\\":\\"1\\"},{\\"from_unit\\":\\"cm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"length\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"m\\"},{\\"from_unit\\":\\"mm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"length\\",\\"scale\\":\\"0.001\\",\\"to_unit\\":\\"m\\"},{\\"from_unit\\":\\"cm/s\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"velocity\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"m/s\\"},{\\"from_unit\\":\\"C\\",\\"kind\\":\\"affine\\",\\"offset\\":\\"273.15\\",\\"quantity\\":\\"temperature\\",\\"scale\\":\\"1\\",\\"to_unit\\":\\"K\\"},{\\"from_unit\\":\\"atm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"101325\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"bar\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"100000\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"kPa\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"1000\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"MPa\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"1000000\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"ms\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"time\\",\\"scale\\":\\"0.001\\",\\"to_unit\\":\\"s\\"},{\\"from_unit\\":\\"us\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"time\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"s\\"},{\\"from_unit\\":\\"cm3\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"volume\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"m3\\"},{\\"from_unit\\":\\"L\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"volume\\",\\"scale\\":\\"0.001\\",\\"to_unit\\":\\"m3\\"},{\\"from_unit\\":\\"%\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mole_fraction\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"%\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mass_fraction\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"%\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"relative_uncertainty\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"ppm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mole_fraction\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"ppm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mass_fraction\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"1\\"}],\\"table_id\\":\\"carmel-unit-conversions\\",\\"version\\":1}\\n","sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122"}],"envelope_type":"dataset","identity_payload_version":1,"series":[{"axes":[{"axis_id":"phi","label_raw":"phi","label_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"},"quantity_kind":"equivalence_ratio","role":"coordinate"},{"axis_id":"sl","label_raw":"S_L","label_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"quantity_kind":"velocity","role":"observation"},{"axis_id":"temperature","label_raw":"T","label_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"quantity_kind":"temperature","role":"constant"}],"constants":[{"axis_id":"temperature","uncertainty":{"basis":"absolute","kind":"std_dev","lower":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"temperature","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"K","unit_raw":"K","unit_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"scale":"linear","upper":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"temperature","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"K","unit_raw":"K","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}},"value":{"canonical_decimal_value":"298","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"temperature","raw_text":"298","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"K","unit_raw":"K","unit_ref":{"locator":{"end":20,"kind":"char_span","start":10,"text_space":"extracted_text"},"node_id":"paper"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}}],"points":[{"composition":{"basis":"mole_fraction","components":[{"amount":{"canonical_decimal_value":"0.04","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"mole_fraction","raw_text":"0.04","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"role":"fuel","species_raw_name":"H2"}],"equivalence_ratio":{"canonical_decimal_value":"1.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"1.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}},"raw_name":"4% H2 in N2","resolution":"resolved_components"},"coordinates":[{"axis_id":"phi","uncertainty":{"basis":"absolute","kind":"std_dev","lower":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"}},"scale":"linear","upper":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}}},"value":{"canonical_decimal_value":"1.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"1.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}}}],"observations":[{"axis_id":"sl","uncertainty":{"basis":"absolute","kind":"std_dev","lower":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"scale":"linear","upper":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}},"value":{"canonical_decimal_value":"35.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"35.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}}],"point_id":"p1"}],"series_id":"s1","source_form":"tabular","value_origin":"experimental"},{"axes":[{"axis_id":"phi2","label_raw":"phi2","label_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"quantity_kind":"equivalence_ratio","role":"coordinate"},{"axis_id":"sl2","label_raw":"sl2","label_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"quantity_kind":"velocity","role":"observation"}],"constants":[],"points":[{"composition":{"__absent__":true,"note":null,"reason":"not_applicable"},"coordinates":[{"axis_id":"phi2","uncertainty":{"__absent__":true,"note":null,"reason":"not_reported_here"},"value":{"canonical_decimal_value":"2.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"2.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"value_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"}}}],"observations":[{"axis_id":"sl2","uncertainty":{"__absent__":true,"note":null,"reason":"not_reported_here"},"value":{"canonical_decimal_value":"10.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"10.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"value_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"}}}],"point_id":"q1"}],"series_id":"s2","source_form":"textual","value_origin":"simulation"}],"source_graph":{"nodes":[{"extraction":{"__absent__":true,"note":null,"reason":"not_applicable"},"glyph_health":{"__absent__":true,"note":null,"reason":"not_applicable"},"kind":"figure_crop","node_id":"crop","origin":{"__absent__":true,"note":null,"reason":"not_applicable"},"parent_node_id":"paper","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification":{"__absent__":true,"note":null,"reason":"not_applicable"}},{"extraction":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"glyph_health":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"kind":"jats_xml","node_id":"jats","origin":{"__absent__":true,"note":null,"reason":"not_applicable"},"parent_node_id":null,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","verification":{"__absent__":true,"note":null,"reason":"not_extracted_yet"}},{"extraction":{"extracted_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","extracted_text_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","extraction_sha256":"5291844e7bedab416755e826cbdf2b34283de1753c7ef2a0fcae20f0dc5c2529","extractor":"pdf:pypdf","extractor_code_sha256":"1111111111111111111111111111111111111111111111111111111111111111","identity_payload_version":"2","parent_raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pypdf_version":"9.9.9-synthetic"},"glyph_health":{"assessor":{"content_sha256":"af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a","dependency_id":"carmel.numeric.glyph_health","input_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"health":{"has_ascii6_uncertainty_marker":false,"has_equals_ambiguity_marker":false,"has_slash_c0_minus_marker":false,"has_thorn_plus_marker":false,"suspects_dash_corruption":false}},"kind":"paper_pdf","node_id":"paper","origin":{"__absent__":true,"note":null,"reason":"not_applicable"},"parent_node_id":null,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verification":{"extracted_text":"extraction_record_digest_authenticated","raw_artifact":"raw_sha256_digest_authenticated","root_sidecar":"root_sidecar_digest_authenticated"}},{"extraction":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"glyph_health":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"kind":"si_member","node_id":"si","origin":{"archive_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"parent_node_id":"paper","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verification":{"__absent__":true,"note":null,"reason":"not_extracted_yet"}}]},"table_inventories":[{"canonical_json":"{\\"cells\\":[{\\"col\\":0,\\"member_digests\\":[\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\"],\\"row\\":0,\\"text\\":\\"r0c0\\",\\"x_end\\":\\"0x1.2000000000000p+3\\",\\"x_start\\":\\"0x0.0p+0\\"},{\\"col\\":1,\\"member_digests\\":[\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\"],\\"row\\":0,\\"text\\":\\"r0c1\\",\\"x_end\\":\\"0x1.3000000000000p+4\\",\\"x_start\\":\\"0x1.4000000000000p+3\\"}],\\"column_bounds\\":[[\\"0x0.0p+0\\",\\"0x1.f400000000000p+8\\"]],\\"footprint\\":{\\"caption_baseline_y\\":\\"0x1.5e00000000000p+9\\",\\"caption_text\\":\\"Table 1. A fixture, not a table.\\",\\"caption_x_start\\":\\"0x1.2000000000000p+6\\",\\"page\\":0,\\"x_end\\":\\"0x1.f400000000000p+8\\",\\"x_start\\":\\"0x1.2000000000000p+6\\",\\"y_bottom\\":\\"0x1.9000000000000p+7\\",\\"y_top\\":\\"0x1.5900000000000p+9\\"},\\"fragment_geometry_sha256\\":\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\",\\"inventory_code_sha256\\":\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\",\\"payload_version\\":1,\\"pypdf_version\\":\\"0.0.0-fixture\\",\\"raw_sha256\\":\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\",\\"refusals\\":[],\\"rows\\":[{\\"anchor_text\\":\\"row 0\\",\\"anchor_x_start\\":\\"0x1.2000000000000p+6\\",\\"baseline_y\\":\\"0x1.2c00000000000p+9\\",\\"merged_baselines\\":[],\\"ordinal\\":0}]}\\n","inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}\n'  # noqa: E501
+#
+# FIFTEENTH regeneration, 2026-08-21: SourceNode gained `crop_region`, a
+# FIGURE_CROP's addressing identity (I7/I8/I9 -- see carmel/schemas/datasets.py),
+# and every node projects it. Verified by diffing the recomputed payload against
+# the prior golden key-by-key: no top-level key was added or removed, the node id
+# set is unchanged, and each of the four nodes differs by EXACTLY the one new
+# `crop_region` key -- a concrete bbox on 'crop', an Absent(not_applicable) marker
+# on 'paper', 'jats' and 'si' -- with nothing else added, removed or changed. This
+# IS an address move and it is BREAKING for anything already stored under the old
+# projection; the only production emitter of a SourceGraph today
+# (`carmel/services/dataset_producer.py`) writes a single PAPER_PDF root and no
+# crop at all, so nothing this repository produces is orphaned by it.
+#
+# SIXTEENTH regeneration, 2026-08-21, superseding the fifteenth WITHIN the same
+# branch after review, on two counts. (a) `identity_payload_version` 1 -> 2: the
+# fifteenth changed the projection schema for every node while leaving the version
+# key at 1, so a pre-change and a post-change payload were two different schemas
+# both stamped 1 -- the discriminator waved the old one through and pydantic
+# answered with `crop_region Field required` once per node instead of one message
+# naming the mismatch. (b) `crop_region` is now emitted for a FIGURE_CROP ONLY: on
+# any other kind I7 admits exactly one value, so the key was a constant carrying no
+# distinguishing bits, bought at the price of re-addressing every envelope in every
+# store including crop-free ones.
+#
+# Diffed key-by-key twice. Against the fifteenth pin: `identity_payload_version`
+# 1 -> 2, and `crop_region` removed from 'paper'/'jats'/'si' with the 'crop' node
+# byte-identical -- nothing else added, removed or changed. Against the ORIGINAL
+# pre-branch pin at 499835c: the version bump, plus exactly one key added on the
+# 'crop' node -- every other node projects byte-identically to what it did before
+# this branch existed. That is the shape the change should always have had.
+# Still BREAKING (the version key alone re-addresses everything, deliberately and
+# visibly), and still nothing stored to orphan.
+_GOLDEN_CANONICAL_BYTES = b'{"composition":{"basis":"mole_fraction","components":[{"amount":{"canonical_decimal_value":"0.04","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"mole_fraction","raw_text":"0.04","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"role":"fuel","species_raw_name":"H2"}],"equivalence_ratio":{"canonical_decimal_value":"1.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"1.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}},"raw_name":"4% H2 in N2","resolution":"resolved_components"},"conversion_tables":[{"canonical_json":"{\\"aliases\\":[{\\"normalized\\":\\"C\\",\\"quantity\\":\\"temperature\\",\\"raw\\":\\"\xc2\xb0C\\"},{\\"normalized\\":\\"C\\",\\"quantity\\":\\"temperature\\",\\"raw\\":\\"degC\\"},{\\"normalized\\":\\"C\\",\\"quantity\\":\\"temperature\\",\\"raw\\":\\"deg C\\"},{\\"normalized\\":\\"cm/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"cm s^-1\\"},{\\"normalized\\":\\"cm/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"cm s-1\\"},{\\"normalized\\":\\"cm/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"cm/sec\\"},{\\"normalized\\":\\"m/s\\",\\"quantity\\":\\"velocity\\",\\"raw\\":\\"m s^-1\\"},{\\"normalized\\":\\"cm3\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"cm^3\\"},{\\"normalized\\":\\"cm3\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"cc\\"},{\\"normalized\\":\\"L\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"l\\"},{\\"normalized\\":\\"L\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"liter\\"},{\\"normalized\\":\\"L\\",\\"quantity\\":\\"volume\\",\\"raw\\":\\"litre\\"},{\\"normalized\\":\\"us\\",\\"quantity\\":\\"time\\",\\"raw\\":\\"\xc2\xb5s\\"},{\\"normalized\\":\\"us\\",\\"quantity\\":\\"time\\",\\"raw\\":\\"\xce\xbcs\\"},{\\"normalized\\":\\"%\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"percent\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"dimensionless\\"},{\\"normalized\\":\\"ppm\\",\\"quantity\\":\\"mole_fraction\\",\\"raw\\":\\"ppmv\\"},{\\"normalized\\":\\"%\\",\\"quantity\\":\\"mass_fraction\\",\\"raw\\":\\"percent\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mass_fraction\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"mass_fraction\\",\\"raw\\":\\"dimensionless\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"equivalence_ratio\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"equivalence_ratio\\",\\"raw\\":\\"dimensionless\\"},{\\"normalized\\":\\"%\\",\\"quantity\\":\\"relative_uncertainty\\",\\"raw\\":\\"percent\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"relative_uncertainty\\",\\"raw\\":\\"-\\"},{\\"normalized\\":\\"1\\",\\"quantity\\":\\"relative_uncertainty\\",\\"raw\\":\\"dimensionless\\"}],\\"base_units\\":[[\\"length\\",\\"m\\"],[\\"velocity\\",\\"m/s\\"],[\\"temperature\\",\\"K\\"],[\\"pressure\\",\\"Pa\\"],[\\"time\\",\\"s\\"],[\\"volume\\",\\"m3\\"],[\\"strain_rate\\",\\"1/s\\"],[\\"mole_fraction\\",\\"1\\"],[\\"mass_fraction\\",\\"1\\"],[\\"equivalence_ratio\\",\\"1\\"],[\\"relative_uncertainty\\",\\"1\\"]],\\"rules\\":[{\\"kind\\":\\"identity\\",\\"quantity\\":\\"length\\",\\"unit\\":\\"m\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"velocity\\",\\"unit\\":\\"m/s\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"temperature\\",\\"unit\\":\\"K\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"pressure\\",\\"unit\\":\\"Pa\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"time\\",\\"unit\\":\\"s\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"volume\\",\\"unit\\":\\"m3\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"strain_rate\\",\\"unit\\":\\"1/s\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"mole_fraction\\",\\"unit\\":\\"1\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"mass_fraction\\",\\"unit\\":\\"1\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"equivalence_ratio\\",\\"unit\\":\\"1\\"},{\\"kind\\":\\"identity\\",\\"quantity\\":\\"relative_uncertainty\\",\\"unit\\":\\"1\\"},{\\"from_unit\\":\\"cm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"length\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"m\\"},{\\"from_unit\\":\\"mm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"length\\",\\"scale\\":\\"0.001\\",\\"to_unit\\":\\"m\\"},{\\"from_unit\\":\\"cm/s\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"velocity\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"m/s\\"},{\\"from_unit\\":\\"C\\",\\"kind\\":\\"affine\\",\\"offset\\":\\"273.15\\",\\"quantity\\":\\"temperature\\",\\"scale\\":\\"1\\",\\"to_unit\\":\\"K\\"},{\\"from_unit\\":\\"atm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"101325\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"bar\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"100000\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"kPa\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"1000\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"MPa\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"pressure\\",\\"scale\\":\\"1000000\\",\\"to_unit\\":\\"Pa\\"},{\\"from_unit\\":\\"ms\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"time\\",\\"scale\\":\\"0.001\\",\\"to_unit\\":\\"s\\"},{\\"from_unit\\":\\"us\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"time\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"s\\"},{\\"from_unit\\":\\"cm3\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"volume\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"m3\\"},{\\"from_unit\\":\\"L\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"volume\\",\\"scale\\":\\"0.001\\",\\"to_unit\\":\\"m3\\"},{\\"from_unit\\":\\"%\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mole_fraction\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"%\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mass_fraction\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"%\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"relative_uncertainty\\",\\"scale\\":\\"0.01\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"ppm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mole_fraction\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"1\\"},{\\"from_unit\\":\\"ppm\\",\\"kind\\":\\"scale\\",\\"quantity\\":\\"mass_fraction\\",\\"scale\\":\\"0.000001\\",\\"to_unit\\":\\"1\\"}],\\"table_id\\":\\"carmel-unit-conversions\\",\\"version\\":1}\\n","sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122"}],"envelope_type":"dataset","identity_payload_version":2,"series":[{"axes":[{"axis_id":"phi","label_raw":"phi","label_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"},"quantity_kind":"equivalence_ratio","role":"coordinate"},{"axis_id":"sl","label_raw":"S_L","label_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"quantity_kind":"velocity","role":"observation"},{"axis_id":"temperature","label_raw":"T","label_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"quantity_kind":"temperature","role":"constant"}],"constants":[{"axis_id":"temperature","uncertainty":{"basis":"absolute","kind":"std_dev","lower":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"temperature","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"K","unit_raw":"K","unit_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"scale":"linear","upper":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"temperature","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"K","unit_raw":"K","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}},"value":{"canonical_decimal_value":"298","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"temperature","raw_text":"298","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"K","unit_raw":"K","unit_ref":{"locator":{"end":20,"kind":"char_span","start":10,"text_space":"extracted_text"},"node_id":"paper"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}}],"points":[{"composition":{"basis":"mole_fraction","components":[{"amount":{"canonical_decimal_value":"0.04","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"mole_fraction","raw_text":"0.04","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"role":"fuel","species_raw_name":"H2"}],"equivalence_ratio":{"canonical_decimal_value":"1.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"1.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}},"raw_name":"4% H2 in N2","resolution":"resolved_components"},"coordinates":[{"axis_id":"phi","uncertainty":{"basis":"absolute","kind":"std_dev","lower":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"}},"scale":"linear","upper":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}}},"value":{"canonical_decimal_value":"1.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"1.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"bbox":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"kind":"bbox"},"node_id":"crop"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}}}],"observations":[{"axis_id":"sl","uncertainty":{"basis":"absolute","kind":"std_dev","lower":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"},"value_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"}},"scale":"linear","upper":{"canonical_decimal_value":"0.1","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"0.1","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}},"value":{"canonical_decimal_value":"35.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"35.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"col":2,"kind":"table_cell","pdf_table_inventory_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"},"row":1,"table_key":{"kind":"member_sheet","sheet_name":"Sheet1"}},"node_id":"si"},"value_ref":{"locator":{"col":1,"kind":"table_cell","pdf_table_inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","row":0,"table_key":{"kind":"caption_label","label":"Table 1"}},"node_id":"paper"}}}],"point_id":"p1"}],"series_id":"s1","source_form":"tabular","value_origin":"experimental"},{"axes":[{"axis_id":"phi2","label_raw":"phi2","label_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"quantity_kind":"equivalence_ratio","role":"coordinate"},{"axis_id":"sl2","label_raw":"sl2","label_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"quantity_kind":"velocity","role":"observation"}],"constants":[],"points":[{"composition":{"__absent__":true,"note":null,"reason":"not_applicable"},"coordinates":[{"axis_id":"phi2","uncertainty":{"__absent__":true,"note":null,"reason":"not_reported_here"},"value":{"canonical_decimal_value":"2.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"equivalence_ratio","raw_text":"2.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"1","unit_raw":"-","unit_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"value_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"}}}],"observations":[{"axis_id":"sl2","uncertainty":{"__absent__":true,"note":null,"reason":"not_reported_here"},"value":{"canonical_decimal_value":"10.0","conversion_table_sha256":"1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122","quantity_kind":"velocity","raw_text":"10.0","repair_dependency":{"content_sha256":"b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb","dependency_id":"carmel.numeric.context_free_span_repair","input_sha256":{"__absent__":true,"note":null,"reason":"not_applicable"}},"repairs":[],"unit_normalized":"cm/s","unit_raw":"cm/s","unit_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"},"value_ref":{"locator":{"kind":"xpath","xpath":"//table/row[1]/cell[1]"},"node_id":"jats"}}}],"point_id":"q1"}],"series_id":"s2","source_form":"textual","value_origin":"simulation"}],"source_graph":{"nodes":[{"crop_region":{"frame":{"cropbox":["0","0","612","792"],"dpi":"300","mediabox":["0","0","612","792"],"render_fingerprint":"fp-1","render_settings":"antialias=on","rotation":0,"units":"pt"},"x0":"10","x1":"30","y0":"20","y1":"40"},"extraction":{"__absent__":true,"note":null,"reason":"not_applicable"},"glyph_health":{"__absent__":true,"note":null,"reason":"not_applicable"},"kind":"figure_crop","node_id":"crop","origin":{"__absent__":true,"note":null,"reason":"not_applicable"},"parent_node_id":"paper","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","verification":{"__absent__":true,"note":null,"reason":"not_applicable"}},{"extraction":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"glyph_health":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"kind":"jats_xml","node_id":"jats","origin":{"__absent__":true,"note":null,"reason":"not_applicable"},"parent_node_id":null,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","verification":{"__absent__":true,"note":null,"reason":"not_extracted_yet"}},{"extraction":{"extracted_sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","extracted_text_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","extraction_sha256":"5291844e7bedab416755e826cbdf2b34283de1753c7ef2a0fcae20f0dc5c2529","extractor":"pdf:pypdf","extractor_code_sha256":"1111111111111111111111111111111111111111111111111111111111111111","identity_payload_version":"2","parent_raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pypdf_version":"9.9.9-synthetic"},"glyph_health":{"assessor":{"content_sha256":"af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93c4e1a270ba4ab5a","dependency_id":"carmel.numeric.glyph_health","input_sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},"health":{"has_ascii6_uncertainty_marker":false,"has_equals_ambiguity_marker":false,"has_slash_c0_minus_marker":false,"has_thorn_plus_marker":false,"suspects_dash_corruption":false}},"kind":"paper_pdf","node_id":"paper","origin":{"__absent__":true,"note":null,"reason":"not_applicable"},"parent_node_id":null,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","verification":{"extracted_text":"extraction_record_digest_authenticated","raw_artifact":"raw_sha256_digest_authenticated","root_sidecar":"root_sidecar_digest_authenticated"}},{"extraction":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"glyph_health":{"__absent__":true,"note":null,"reason":"not_extracted_yet"},"kind":"si_member","node_id":"si","origin":{"archive_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"parent_node_id":"paper","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verification":{"__absent__":true,"note":null,"reason":"not_extracted_yet"}}]},"table_inventories":[{"canonical_json":"{\\"cells\\":[{\\"col\\":0,\\"member_digests\\":[\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\"],\\"row\\":0,\\"text\\":\\"r0c0\\",\\"x_end\\":\\"0x1.2000000000000p+3\\",\\"x_start\\":\\"0x0.0p+0\\"},{\\"col\\":1,\\"member_digests\\":[\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\"],\\"row\\":0,\\"text\\":\\"r0c1\\",\\"x_end\\":\\"0x1.3000000000000p+4\\",\\"x_start\\":\\"0x1.4000000000000p+3\\"}],\\"column_bounds\\":[[\\"0x0.0p+0\\",\\"0x1.f400000000000p+8\\"]],\\"footprint\\":{\\"caption_baseline_y\\":\\"0x1.5e00000000000p+9\\",\\"caption_text\\":\\"Table 1. A fixture, not a table.\\",\\"caption_x_start\\":\\"0x1.2000000000000p+6\\",\\"page\\":0,\\"x_end\\":\\"0x1.f400000000000p+8\\",\\"x_start\\":\\"0x1.2000000000000p+6\\",\\"y_bottom\\":\\"0x1.9000000000000p+7\\",\\"y_top\\":\\"0x1.5900000000000p+9\\"},\\"fragment_geometry_sha256\\":\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\",\\"inventory_code_sha256\\":\\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\\",\\"payload_version\\":1,\\"pypdf_version\\":\\"0.0.0-fixture\\",\\"raw_sha256\\":\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\",\\"refusals\\":[],\\"rows\\":[{\\"anchor_text\\":\\"row 0\\",\\"anchor_x_start\\":\\"0x1.2000000000000p+6\\",\\"baseline_y\\":\\"0x1.2c00000000000p+9\\",\\"merged_baselines\\":[],\\"ordinal\\":0}]}\\n","inventory_sha256":"dc43aedbaeba2837ab1faa6c934fbb8610026e2c306d3015ef20c95dca8a48cc","raw_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}\n'  # noqa: E501
 
 
 class TestGoldenCanonicalBytes:

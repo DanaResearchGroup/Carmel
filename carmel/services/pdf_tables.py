@@ -84,11 +84,36 @@ COLUMN_VALLEY_PT = 6.0
 #: shape test, not a size test -- ``font_height`` is the RENDERED height, so it survives
 #: the ``Tf /F1 1`` trap that makes ``font_size`` a constant 1.0 across the corpus.
 #:
-#: Being wrong in the permissive direction here is far worse than being wrong in the
-#: strict direction: merging a genuinely short ROW renumbers everything beneath it
-#: silently, while failing to merge an affix produces a visibly wrong row count. Hence
-#: 0.75 rather than something closer to 1.0, and hence :attr:`InventoryRefusalReason.
-#: AMBIGUOUS_AFFIX_BAND` rather than a proximity tie-break.
+#: **The asymmetry that chose this VALUE is refuted, so 0.75 is currently unjustified
+#: rather than justified.** The argument was that being wrong permissively is far worse
+#: than being wrong strictly, because merging a genuinely short ROW renumbers everything
+#: beneath it silently while failing to merge an affix only produces a visibly wrong row
+#: count. The second half is false, and with it the asymmetry.
+#:
+#: Measured at this tip on ``10.1115-1.4007737`` p4 Table 1, banding the box
+#: ``x 311.0-555.0``, ``y 520.0-740.0``: the subscript band at ``y=729.52`` has
+#: ``font_height`` 5.60 and its true parent at ``y=730.43`` has 5.33, so
+#: ``5.60 <= 0.75 * 5.33 = 4.00`` is False and the real parent is REJECTED -- the strict
+#: direction, behaving as designed. The orphaned subscript then satisfies the data row
+#: 15.98 pt below (``font_height`` 8.00, ``5.60 <= 6.00``) and folds into that instead.
+#: The merge returns 23 rows and NO refusal, and the phi=0.5 row reads
+#: ``'0.5L;u67.2L7.110.6'``: the laminar flame speed is inventoried as ``L;u67.2``
+#: where the page prints 67.2 cm/s. So the strict direction does not surface as a wrong
+#: row count -- it silently corrupts a cell's TEXT, which is the same failure class the
+#: permissive direction was feared for. Rejecting the true parent is precisely what frees
+#: the affix to adopt a wrong one.
+#:
+#: Scope of that measurement, stated because it is easy to over-read: the corrupted row is
+#: real in the derivation, but no caller receives it as COMPLETE on this table at this tip.
+#: 256 boxes swept over that region return 144 ``column_structure_unresolved``, 64
+#: ``footprint_insane``, 48 ``orphaned_band_above_the_box`` and ZERO complete inventories --
+#: an unrelated later check happens to catch this one, which is not the same as the affix
+#: logic being safe.
+#:
+#: Choosing the value is therefore reopened and tracked separately; do not change it here,
+#: because the corpus it would be measured against is under work in flight. What survives
+#: unaffected is :attr:`InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND` rather than a
+#: proximity tie-break: that is a decision about arbitrariness, not about this number.
 AFFIX_HEIGHT_RATIO = 0.75
 
 #: How much closer one neighbour must be than the other before the affix band's parent is
@@ -221,6 +246,46 @@ class InventoryRefusalReason(StrEnum):
     (probes/m1_band_ambiguity.py). It is ordinary two-column journal typesetting, not an
     exotic shape."""
 
+    STRADDLING_FRAGMENT_AT_THE_BOX_EDGE = "straddling_fragment_at_the_box_edge"
+    """A fragment on one of the box's own bands is cut by its left or right edge.
+
+    The sibling of :attr:`~carmel.services.pdf_cells.RegionRefusalReason.STRADDLED`, which
+    states the same rule one layer down: something was cut through rather than included or
+    excluded, so the claimed boundary is not clean and nothing derived inside it can be
+    trusted. The concept is deliberately the single-cell lane's rather than a new one --
+    this is the same fault at a different scale.
+
+    It closes a gap where two tests each assumed the other covered the case.
+    :func:`_in_footprint` admits a fragment only when it is WHOLLY inside, so a straddler
+    is never a member and never reaches banding, columns, cells, the unmapped check or the
+    rotation check. :func:`_truncated_column_refusal` reads only fragments wholly BESIDE the
+    box, skipping by construction the ones that overlap it. The straddler therefore left no
+    trace in either direction. Measured on the real target with its one unmapped page-4
+    glyph forced to mapped: the whole-table footprint returned a COMPLETE nine-row,
+    three-column inventory with no refusal, and the pressure row read ``1e`` beside ``e8``
+    -- the value between them was a single fragment ending 32.5 pt past the box's right
+    edge, silently deleted.
+
+    Two boundaries of the rule, both chosen for the direction they fail in:
+
+    * Unmapped fragments are NOT skipped, unlike in :attr:`ORPHANED_BAND_BELOW_THE_BOX`.
+      That reason asks whether the band below the box is a ROW, and a marker is not one;
+      this one asks whether the edge cut something, and a marker is something. One inside
+      the box refuses under :attr:`UNMAPPED_MEMBER`, so a bisected one must not pass.
+    * Rotated fragments are skipped HERE, and caught elsewhere. Their ``x_start``/``x_end``
+      do not bound them horizontally -- 23 of 257 rotated corpus fragments report an
+      ``x_end`` outside their own page's mediabox, one 753.8 pt past a 595.3 pt page -- so
+      an edge test on one would be a finding invented from a meaningless number. Asking the
+      question without x is what :func:`_rotated_band_sharer_refusal` does, after derivation
+      and scoped to the table's printed lines; that function carries the scoping argument,
+      the measurement, and the one disclosed difference from ``pdf_cells``. A rotated
+      fragment INSIDE the box refuses earlier still, under
+      :attr:`ROTATED_OR_INSANE_FRAGMENT`.
+
+    So a tally of THIS reason is a lower bound, short by the rotated fragments an edge cuts
+    -- but they are no longer unguarded, and the reason they end up under is the honest one:
+    this module cannot read their geometry."""
+
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
     """A row's own occupied blocks outnumber the columns derived across all rows.
 
@@ -233,11 +298,29 @@ class InventoryRefusalReason(StrEnum):
     derivable from aligned emptiness once a row spans."""
 
     ROTATED_OR_INSANE_FRAGMENT = "rotated_or_insane_fragment"
-    """A fragment inside the box is rotated, or its extent is non-finite or backwards.
+    """This module cannot read a fragment's geometry, so it declines to read the box.
 
-    Rotated text has no meaningful baseline band or x-interval in this module's model, and
-    a backwards extent poisons every column derivation silently. ``pdf_cells`` guards this
-    class explicitly; this module must not be the softer door into the same data."""
+    Three call sites, one fault -- geometry that cannot be compared -- at three scopes:
+
+    * ANY fragment on the box's page has a non-finite or backwards extent, or a non-finite
+      or negative ``font_height``, whether or not the box contains it
+      (:func:`_uncomparable_geometry_refusal`);
+    * a fragment INSIDE the box is rotated (rotation ONLY -- the bad-extent clauses that
+      used to sit here are gone, not merely quiet: the page-scoped gate applies the same
+      predicate to a superset of these fragments and so reaches every one of them first);
+    * a rotated fragment shares a printed line of the derived table
+      (:func:`_rotated_band_sharer_refusal`).
+
+    Rotated text has no meaningful x-interval in this module's model, and a backwards extent
+    poisons every column derivation silently. ``pdf_cells`` guards this class explicitly;
+    this module must not be the softer door into the same data.
+
+    All three deliberately reuse this member rather than splitting off a sibling for
+    "uncomparable OUTSIDER", because the inside/outside partition such a sibling would rest
+    on is not knowable for exactly these fragments: a NaN extent is excluded from the box by
+    :func:`_in_footprint` only because ``<`` against NaN is quietly False, not because the
+    box does not contain it. Splitting a reason along a boundary the fault itself destroys
+    would be a distinction the record cannot support."""
 
     UNATTACHABLE_AFFIX_BAND = "unattachable_affix_band"
     """A candidate affix band is interior to NEITHER neighbour.
@@ -444,6 +527,153 @@ def _in_footprint(extraction: FragmentExtraction, footprint: ClaimedFootprint) -
         and f.x_end <= footprint.x_end
         and footprint.y_bottom <= f.baseline_y <= footprint.y_top
     ]
+
+
+def _has_comparable_geometry(fragment: TextFragment) -> bool:
+    """The ONE invariant every table comparison in this module rests on.
+
+    A fragment must carry finite, comparable table geometry -- finite ``x_start``,
+    ``x_end``, ``baseline_y`` and ``font_height``; ``x_start <= x_end``; a strictly positive
+    ``font_height`` -- before any footprint comparison or row derivation reads it.
+
+    This exists as one predicate because the alternative was tried four times and failed four
+    times. Each of ``x_start``/``x_end``, then ``baseline_y``, then ``font_height``'s NaN
+    case, then ``font_height``'s ZERO case was found and patched separately, each time by a
+    reviewer rather than by the module, and each time the same shape: a value that makes a
+    comparison quietly False, a fragment that satisfies no test in either direction, and a
+    COMPLETE inventory with a row lost or invented.
+
+    **This closes a FAULT, not a surface, and the difference was itself got wrong here once.**
+    An earlier version of this docstring claimed the enumeration was exhaustive -- four
+    floats, ``page`` compared only for equality, therefore no fifth patch possible. That
+    conflates exhaustiveness over FIELDS with exhaustiveness over ways a number can mislead
+    this module, and it is refuted by construction: :func:`_looks_like_affix` compares a band
+    against a NEIGHBOUR's height, so a header tall enough relative to the row beneath it makes
+    that row read as affix-shaped and fold INTO it -- the header is the parent and the
+    ordinary row beneath is what disappears. ``font_height`` 8.0 gives three rows; 10.7 gives
+    two, the first anchored ``HeadBbb``; and no value involved is non-finite, negative or
+    backwards.
+
+    Two things this paragraph asserted about that predicate were wrong, and both are corrected
+    here rather than softened. It is NOT "a ratio with no upper bound": the test is
+    ``band <= AFFIX_HEIGHT_RATIO * parent`` with ``parent > 0``, which bounds the band/parent
+    ratio at 0.75 by construction. Measured page-wide over the eight-paper corpus at this tip
+    (73 pages banded, 43 refusing inside the merge and contributing nothing): 457 accepted
+    folds, maximum ratio 0.699989, none above 0.75, and none with a parent SHORTER than the
+    band. Nor does the fold need a header "merely TALLER" than the row -- it needs the header
+    at least ``1 / 0.75`` = 4/3 the row's height. The 10.7-over-8.0 example survives only
+    because 10.7 / 8.0 = 1.3375, a quarter of one percent inside the boundary; 10.0 over 8.0
+    is 1.25 and does not fold, since ``8.0 <= 7.5`` is false. The construction is reproducible
+    and it has NO instance in the eight papers, so read it as a demonstrated possibility, not
+    as something the corpus witnesses.
+
+    :func:`_has_comparable_geometry` cannot reach that and must not be widened to try: a
+    height RELATION between neighbouring bands is a different fault with a different repair,
+    tracked as **I-005** in the campaign ledger. What this predicate covers is comparability,
+    completely; what it does not cover is every other way a finite number can be wrong.
+
+    Three boundaries chosen deliberately:
+
+    * **Zero WIDTH stays legal.** ``x_start == x_end`` is a real fragment, not a broken one:
+      the corpus's ``/C14`` degree sign is exactly that, at ``x=61.7952-61.7952``. Refusing
+      it here would refuse a document over a mark the page really carries.
+    * **Zero HEIGHT does not.** It feeds a magnitude comparison rather than bounding
+      anything: :func:`_looks_like_affix` guards ``reference <= 0`` for the NEIGHBOUR but not
+      for the band, so a band of zero-height fragments is affix-shaped against every
+      neighbour and is folded away. Demonstrated on two ordinary rows, the second at
+      ``font_height=0.0``: COMPLETE, ONE row, anchor ``AaaBbb`` -- a whole row swallowed by
+      the row above it, with every surviving cell correctly grounded.
+    * **Rotation is NOT here.** A rotated fragment's numbers are finite and comparable; they
+      simply do not mean what this module needs them to mean, which is a different fault
+      with a different scope -- see :func:`_rotated_band_sharer_refusal`.
+    """
+    return (
+        _is_finite(fragment.x_start, fragment.x_end, fragment.baseline_y, fragment.font_height)
+        and fragment.x_start <= fragment.x_end
+        and fragment.font_height > 0.0
+    )
+
+
+def _uncomparable_geometry_refusal(
+    extraction: FragmentExtraction, footprint: ClaimedFootprint
+) -> InventoryRefusal | None:
+    """Refuse when any fragment on the box's page has geometry that cannot be compared.
+
+    Non-finite or backwards extents fail open in the most complete way there is: every
+    ``<`` against NaN is quietly False, so such a fragment is not a member (:func:`_in_footprint`
+    excludes it), not a straddler (:func:`_straddle_refusal`'s edge tests are both False), not
+    an orphan above or below, and not part of any excluded-column cluster. It vanishes exactly
+    as the straddler did, one comparison over -- and unlike the straddler it leaves no
+    trace anywhere, because there is no comparison it could have satisfied.
+
+    The predicate is :func:`_has_comparable_geometry`, and the reason it is a named
+    invariant rather than a list of clauses is written there. ``font_height`` is in it and
+    does NOT bound the box: it feeds the ``<=`` in :func:`_looks_like_affix`, where a NaN
+    fabricates a row (COMPLETE, THREE rows, a cell reading ``CO`` and a spurious ``2``) and a
+    zero loses one (COMPLETE, ONE row, anchor ``AaaBbb``). Both were reproduced against the
+    code that shipped without the guard.
+
+    Scoped to the PAGE, not the box's y-window, and that is the whole point: a NaN
+    ``baseline_y`` fails ``y_bottom <= baseline_y <= y_top`` too, so a window-scoped check
+    would read only the fragments that already survived the test NaN defeats. ``pdf_cells``
+    reaches the same conclusion for the same reason at ``UNCOMPARABLE_NEIGHBOUR``.
+
+    Blank fragments are NOT skipped here, and that diverges from BOTH neighbours: this
+    lane's own :func:`_straddle_refusal` skips them, and ``pdf_cells`` drops them from
+    ``others`` before its ``UNCOMPARABLE_NEIGHBOUR`` test, so its equivalent never sees a
+    blank one either. Those two ask whether something was CUT or who the nearest neighbour
+    IS, and a bare space text-show operation is neither. This one asks whether the page's
+    geometry can be read at all, and an unreadable number is unreadable whether or not a
+    glyph was drawn with it. So the conclusion ``pdf_cells`` shares is the PAGE scoping and
+    its reason; the blank rule is this lane's own.
+
+    Measured: 0 of 78178 fragments across the eight-paper corpus fail
+    :func:`_has_comparable_geometry` -- none has a non-finite or backwards extent, and none
+    a non-finite, negative or zero ``font_height`` -- so this costs nothing observed. Like
+    ``INVALID_GEOMETRY`` in the single-cell lane, it guards the SHAPE of the input rather
+    than an observed instance.
+    """
+    unreadable = [f for f in extraction.fragments if f.page == footprint.page and not _has_comparable_geometry(f)]
+    if not unreadable:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
+        f"{len(unreadable)} fragment(s) on the box's page do not carry comparable geometry",
+    )
+
+
+def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprint) -> InventoryRefusal | None:
+    """Refuse when a side edge falls INSIDE a fragment sitting on one of the box's bands.
+
+    The y-window is :func:`_in_footprint`'s, exactly, and that pairing is the definition:
+    a straddler is a fragment that would have been a member but for the x test. Scoping it
+    to the page instead would refuse every table with a full-width paragraph beneath it,
+    which is a line the box never claimed and never lost.
+
+    ``x_start < edge < x_end`` is strict on both sides, so a cell that begins exactly on
+    ``x_start`` or ends exactly on ``x_end`` touches the boundary without being cut by it
+    and stays a member -- membership is inclusive of the edge, and this must not narrow it.
+
+    Reaches here only once :func:`_uncomparable_geometry_refusal` has passed, so both edge
+    tests are comparisons between real numbers. Rotated fragments are skipped because their
+    extent is not one; :func:`_rotated_band_sharer_refusal` asks after them later, without
+    reading x.
+    """
+    cut = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page
+        and f.text.strip()
+        and not f.rotated
+        and footprint.y_bottom <= f.baseline_y <= footprint.y_top
+        and (f.x_start < footprint.x_start < f.x_end or f.x_start < footprint.x_end < f.x_end)
+    ]
+    if not cut:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE,
+        f"{len(cut)} fragment(s) on the box's own bands are cut by its side edge",
+    )
 
 
 def _bands(fragments: list[TextFragment]) -> list[tuple[float, list[TextFragment]]]:
@@ -664,6 +894,112 @@ def _orphan_below_refusal(
     )
 
 
+def _rotated_band_sharer_refusal(
+    extraction: FragmentExtraction,
+    footprint: ClaimedFootprint,
+    rows_raw: list[tuple[float, list[TextFragment], list[float]]],
+) -> InventoryRefusal | None:
+    """Refuse when a rotated fragment shares a printed line of the derived table.
+
+    A rotated fragment's ``x_start``/``x_end`` do not bound it horizontally -- measured, 23
+    of 257 rotated corpus fragments report an ``x_end`` outside their own page's mediabox,
+    one 753.8 pt past a 595.3 pt page, because it is ``x_start`` plus advance widths laid
+    along the ROTATED axis and never projected onto x. So it can be neither ruled out as a
+    straddler nor recorded as one, and every guard that reads x -- :func:`_straddle_refusal`,
+    :func:`_truncated_column_refusal`, :func:`_orphan_below_refusal` -- skips it. That is
+    correct individually and, left alone, adds up to a hole: on one of the table's own
+    printed lines, a rotated fragment vanishes the way the straddler did.
+
+    So the question is asked where x is not needed: against the table's printed LINES. Every
+    baseline a row carries counts, its own and the affix baselines folded into it, because a
+    subscript's line is a printed line too and the merge is what would otherwise hide it.
+
+    **The scope is argued structurally AND the corpus discriminates -- measured at THIS
+    ordering, which is the only ordering the numbers mean anything at.** Of probe 50's four
+    registered footprints, which check each one refuses at decides whether it ever reaches
+    this line at all:
+
+    ===========================  ==========  =======================================
+    footprint                    y_bottom    refuses at
+    ===========================  ==========  =======================================
+    ``WHOLE_TABLE`` (p4)              45.0    :func:`_straddle_refusal` -- never reaches
+    ``TRUNCATED`` (p4)                65.0    the look-below guard -- REACHES
+    ``SHOCK_TUBE_CAPTION_ONLY``      680.0    the orphan-above guard -- never reaches
+    ``SHOCK_TUBE_CAPTION_INSIDE``    680.0    :attr:`COLUMN_STRUCTURE_UNRESOLVED` -- REACHES
+    ===========================  ==========  =======================================
+
+    So two reach, and band-scoped both pass: probe 50 reports 4/4 on THIS branch with the
+    branch expectation set. Substituting a WINDOW-scoped variant here instead gives **3/4**
+    -- ``SHOCK_TUBE_CAPTION_INSIDE`` flips from :attr:`COLUMN_STRUCTURE_UNRESOLVED` to a
+    rotated refusal raised on a page watermark, a correct finding replaced by a false one.
+
+    Every probe count here is scoped to a checkout, because a bare "4/4" is not a fact about
+    the corpus. Measured against ``official/main`` ``499835c``, three of the four footprints
+    return exactly what they return here; ``WHOLE_TABLE`` returns
+    :attr:`InventoryRefusalReason.UNMAPPED_MEMBER` there and
+    :attr:`InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE` here, which is this
+    ticket in one line -- the cut fragment used to be invisible and the box was blamed for
+    an unmapped glyph instead. The probe file as registered cannot be RUN against that commit
+    at all: its expectation set names a member ``499835c`` does not define, so it dies at
+    import rather than reporting a score.
+
+    Which of the two the hoist actually added is the sharper point. ``TRUNCATED`` reached
+    at both orderings, because the look-below guard has always run after this line.
+    ``SHOCK_TUBE_CAPTION_INSIDE`` reached only once this check moved above the
+    column-structure test -- and it is precisely the footprint that flips. The hoist did not
+    merely change a count; it put the one discriminating footprint in front of this
+    function.
+
+    That is also why a window variant measured 4/4 while this check sat below
+    column-structure: nothing could be masked there, because the better refusal had already
+    fired. **Any measurement quoted in this docstring must be re-taken against the shipped
+    order of checks. This paragraph has carried a wrong statement three times -- the masking
+    claim, then its retraction, then the identity of the p4 footprint -- and all three were
+    the same claim in different clothes: which footprints reach this line, at which ordering.**
+
+    What decides the scope independently of that is what a LINE is in this module. Row
+    identity here is
+    :data:`_BAND_TOLERANCE_PT` via :func:`_bands` -- the same constant that decides two
+    fragments are one row -- so the question "does this rotated fragment share a printed
+    line" has exactly one available answer, and it is not the footprint's y-window. The
+    window is caller-supplied and 80, 100, 55 and 75 pt tall on the registered footprints;
+    it says where the box is, never where a line is. The tolerance is therefore derived
+    rather than chosen: widening it would merge distinct rows long before it changed this
+    check, which is what makes it a scope and not a knob.
+
+    One disclosed difference from ``pdf_cells``, of tolerance and not of rule: its band is
+    ``BASELINE_BAND = 4.0`` pt against this one's 0.5, and each lane uses the constant that
+    defines a line in it. The difference is not a corner case -- of 266 non-blank rotated
+    corpus fragments, **61 sit within 0.5 pt of a printed baseline and 227 within 4.0 pt**,
+    so the two rules disagree about roughly 166 fragments -- the ``Downloaded from
+    http://asmedig...`` watermark, 1.92 pt from the nearest printed baseline, is one of many
+    rather than a curiosity (probes/i004_bad_geometry_census.py).
+
+    Two denominators appear above and neither is a typo, but they are NOT one filter apart.
+    The corpus holds 267 rotated fragments; 266 are non-blank, which is the base for the
+    band counts; 257 sit on a page whose mediabox is readable, which is the base for the
+    extent measurement, since the other 10 would otherwise be checked against a guessed page
+    width and the guess would be what decided whether an extent counts as off-page. The two
+    filters are independent and the intersection is 256, so neither figure is reachable from
+    the other by subtracting one number.
+    """
+    printed_baselines = [y for baseline_y, _, folded in rows_raw for y in (baseline_y, *folded)]
+    sharers = [
+        f
+        for f in extraction.fragments
+        if f.page == footprint.page
+        and f.rotated
+        and f.text.strip()
+        and any(abs(f.baseline_y - y) <= _BAND_TOLERANCE_PT for y in printed_baselines)
+    ]
+    if not sharers:
+        return None
+    return InventoryRefusal(
+        InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
+        f"{len(sharers)} rotated fragment(s) share a printed line of the table",
+    )
+
+
 def _truncated_column_refusal(
     extraction: FragmentExtraction,
     footprint: ClaimedFootprint,
@@ -797,6 +1133,21 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     insane = _footprint_refusal(footprint)
     if insane is not None:
         return refused(insane)
+    # Comparable geometry is the precondition of every check below, so it is established
+    # before the FIRST of them -- including the caption anchor, which is itself a geometric
+    # comparison (`math.isclose` against the claimed baseline). Behind this gate, a caption
+    # fragment with a NaN baseline reported CAPTION_ANCHOR_ABSENT: true, in that the anchor
+    # was not found, but the reason names the wrong fault and points a reader at the
+    # footprint's caption fields when the document's geometry is what is unreadable. That is
+    # the same reason-attribution class as the straddle and rotated placements.
+    #
+    # Page-scoped, for the reason `pdf_cells` gives at UNCOMPARABLE_NEIGHBOUR: a NaN BASELINE
+    # never reaches the box's y-window at all, so a window-scoped check would inspect only
+    # the fragments that already passed the test NaN defeats.
+    uncomparable = _uncomparable_geometry_refusal(extraction, footprint)
+    if uncomparable is not None:
+        return refused(uncomparable)
+
     if not _caption_anchored(extraction, footprint):
         return refused(
             InventoryRefusal(
@@ -827,17 +1178,54 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
             )
         )
 
+    # The SIDE edges are settled here, before the box's contents are read, because a
+    # boundary that cuts through a fragment makes the membership set itself untrustworthy
+    # -- the same footing the orphan check above stands on, and unlike the edge guards at
+    # the bottom of this function, which genuinely need the derivation they check. Running
+    # it after `unmapped` instead would make the reason a caller reads depend on whether
+    # some OTHER fragment mapped: on the real target the whole-table footprint carries both
+    # faults, and repairing the glyph would have taken the straddler's refusal away again.
+    straddling = _straddle_refusal(extraction, footprint)
+    if straddling is not None:
+        return refused(straddling)
+
     inside = _in_footprint(extraction, footprint)
-    insane_fragments = [
-        f for f in inside if f.rotated or not _is_finite(f.x_start, f.x_end, f.baseline_y) or f.x_end < f.x_start
-    ]
-    if insane_fragments:
+    # Rotation ONLY. The non-finite and backwards clauses that used to stand here were dead
+    # the moment the page-scoped gate went in above: it applies the same predicate to a
+    # superset of these fragments, so nothing could reach here carrying one.
+    rotated_members = [f for f in inside if f.rotated]
+    if rotated_members:
         return refused(
             InventoryRefusal(
                 InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT,
-                f"{len(insane_fragments)} fragment(s) inside the box are rotated or have a bad extent",
+                f"{len(rotated_members)} fragment(s) inside the box are rotated",
             )
         )
+    if not inside:
+        return refused(InventoryRefusal(InventoryRefusalReason.EMPTY, "no fragment lies inside the claimed box"))
+
+    # The ROW derivation is hoisted above the unmapped check, and it is safe to hoist
+    # because it reads geometry ONLY: `_bands` reads `baseline_y`, `_merge_affix_bands`
+    # reads `baseline_y`, `font_height` and the x-extents, and no glyph is consulted until
+    # cell text is built further down -- which is why THAT stays where it is.
+    #
+    # It is hoisted because the boundary guarantee the straddle check earns is worthless if
+    # its rotated twin does not share it. Below the unmapped check, one document with an
+    # unmapped member inside the box would report `straddling_fragment_at_the_box_edge` for
+    # an upright fragment the edge cuts and `unmapped_member` for a rotated one on a row's
+    # own printed line: same document, same class of fault, and an unrelated glyph choosing
+    # which reason the caller reads.
+    #
+    # The affix refusals move with the derivation, since they ARE its outcome. That is a
+    # deliberate consequence and the same rule covers it: what the geometry alone decides is
+    # settled before anything that needs a glyph to be readable.
+    rows_raw, ambiguous = _merge_affix_bands(_bands(inside))
+    if ambiguous is not None:
+        return refused(ambiguous)
+    rotated_sharer = _rotated_band_sharer_refusal(extraction, footprint, rows_raw)
+    if rotated_sharer is not None:
+        return refused(rotated_sharer)
+
     unmapped = [f for f in inside if f.glyph_mapping is not GlyphMapping.MAPPED]
     if unmapped:
         return refused(
@@ -846,12 +1234,6 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                 f"{len(unmapped)} fragment(s) inside the footprint have unmapped glyphs",
             )
         )
-    if not inside:
-        return refused(InventoryRefusal(InventoryRefusalReason.EMPTY, "no fragment lies inside the claimed box"))
-
-    rows_raw, ambiguous = _merge_affix_bands(_bands(inside))
-    if ambiguous is not None:
-        return refused(ambiguous)
     bounds = _column_bounds(rows_raw)
     for baseline_y, members, _ in rows_raw:
         own = _column_bounds([(baseline_y, members, [])])
@@ -907,6 +1289,10 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     # close the same hole the top edge's orphan check closes, on the sides the box was
     # otherwise free to shrink -- measured: shrinking `x_end` deleted a whole fuel mixture
     # and raising `y_bottom` deleted the phi row, each returning a COMPLETE inventory.
+    # Both SKIP rotated fragments, and are only sound because nothing rotated shares a row's
+    # printed line -- which `_rotated_band_sharer_refusal` established above, as soon as the
+    # bands it is scoped to existed. That reliance used to be implicit; now it is a check
+    # that has already run.
     truncated = _truncated_column_refusal(extraction, footprint, rows, rows_raw)
     if truncated is not None:
         return refused(truncated)
