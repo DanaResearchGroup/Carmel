@@ -25,6 +25,7 @@ from carmel.schemas.datasets import (
     Absent,
     DatasetEnvelope,
     DatasetEnvelopeParseError,
+    SourceGraph,
 )
 from carmel.services.dataset_bridge import (
     UnstorableDatasetEnvelopeError,
@@ -33,6 +34,7 @@ from carmel.services.dataset_bridge import (
 )
 from carmel.services.dataset_store import canonical_json_bytes, compute_dataset_sha
 from tests.test_dataset_identity_payload import (
+    _maximal_bbox,
     _maximal_envelope,
     _minimal_envelope_with_composition,
 )
@@ -319,6 +321,51 @@ class TestStoreRefusesAnEnvelopeItsOwnLoaderWouldReject:
         # The refusal must say what the reader would have choked on, not just
         # "invalid" -- the caller cannot fix what the message does not name.
         assert "at least 1 item" in str(excinfo.value)
+
+    @staticmethod
+    def _envelope_with_a_stray_crop_region() -> DatasetEnvelope:
+        """A PAPER_PDF carrying a real ``BBox`` -- illegal under I7, so
+        reachable only by skipping validation.
+
+        The interesting case for a CONDITIONALLY projected field, and the
+        reason ``_addresses_a_crop_region`` reads the field's VALUE rather
+        than the node's ``kind``. Value-keyed, this node projects its stray
+        region, the payload no longer parses, and the write is refused.
+        Kind-keyed, the projection would drop it, the tampered envelope would
+        address byte-identically to a clean one, and the store would take it
+        -- nothing untrue written, but a producer bug gone unremarked.
+        """
+        valid = _maximal_envelope()
+        paper = valid.source_graph.node("paper")
+        tampered = paper.model_copy()
+        object.__setattr__(tampered, "crop_region", _maximal_bbox())
+        nodes = tuple(tampered if node.node_id == "paper" else node for node in valid.source_graph.nodes)
+        graph = SourceGraph.model_construct(nodes=nodes)
+        return DatasetEnvelope.model_construct(**{**valid.__dict__, "source_graph": graph})
+
+    def test_store_refuses_a_node_carrying_a_region_it_has_no_right_to(self, tmp_path: Path) -> None:
+        envelope = self._envelope_with_a_stray_crop_region()
+        assert not isinstance(envelope.source_graph.node("paper").crop_region, Absent), (
+            "fixture drift: the validators were supposed to be skipped"
+        )
+
+        with pytest.raises(UnstorableDatasetEnvelopeError) as excinfo:
+            store_dataset_envelope(tmp_path, envelope)
+
+        assert "crop_region" in str(excinfo.value), (
+            "the refusal must name what the reader would choke on -- if this fails, the projection "
+            "dropped the stray region and the tampered envelope was stored, or refused for some "
+            "unrelated reason"
+        )
+
+    def test_the_stray_region_does_not_address_like_a_clean_envelope(self) -> None:
+        """The half that pins the design rather than the refusal: the tampered
+        envelope must not project the SAME bytes as a clean one. If it did,
+        the refusal above would evaporate the moment some neighbouring
+        invariant moved, and nothing would notice it had."""
+        tampered = canonical_json_bytes(self._envelope_with_a_stray_crop_region().identity_payload())
+
+        assert tampered != canonical_json_bytes(_maximal_envelope().identity_payload())
 
     def test_the_refusal_writes_nothing_at_all(self, tmp_path: Path) -> None:
         """Fail CLOSED, not fail-halfway.

@@ -119,6 +119,10 @@ def _embedded_table_v1() -> EmbeddedConversionTable:
 _NO_ORIGIN = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 _NO_EXTRACTION = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+_NO_CROP_REGION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""SourceNode.crop_region for any kind that is not a FIGURE_CROP: nothing but
+a crop was cut out of a page, and NOT_APPLICABLE is the only reason I7 accepts
+there."""
 _NO_EXTRACTION_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 _NO_GLYPH_HEALTH_CROP = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """FIGURE_CROP-specific counterparts of ``_NO_EXTRACTION``/``_NO_GLYPH_HEALTH``:
@@ -151,6 +155,11 @@ def _node(
         extraction=_NO_EXTRACTION_CROP if is_crop else _NO_EXTRACTION,
         glyph_health=_NO_GLYPH_HEALTH_CROP if is_crop else _NO_GLYPH_HEALTH,
         verification=_verification_for(_NO_EXTRACTION_CROP if is_crop else _NO_EXTRACTION),
+        # I7: a crop must address the figure it was cut from, and nothing else
+        # may. The region is keyed off the node id so two crops in one graph
+        # never collide under I9 -- see `_crop_region` in
+        # tests/test_dataset_graph_and_envelope.py for the same reasoning.
+        crop_region=_bbox(frame=_frame(render_fingerprint=f"fp-{node_id}")) if is_crop else _NO_CROP_REGION,
     )
 
 
@@ -271,6 +280,7 @@ def _extracted_paper_graph(node_id: str = "paper") -> SourceGraph:
                 verification=_verification_for(
                     _extraction_binding(parent_raw_sha256=SHA_A, extracted_text_sha256=SHA_B)
                 ),
+                crop_region=_NO_CROP_REGION,
             ),
         )
     )

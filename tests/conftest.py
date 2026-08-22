@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+
+# Must match project.requires-python. A bare `pytest` with no environment activated finds the
+# base anaconda interpreter, where PEP 758's `except A, B:` is a SyntaxError in eight modules:
+# the run then reports failures that describe the interpreter and not the code, and it writes
+# `.cpython-312*.pyc` files into the tree on its way past. Fail here instead, before collection.
+#
+# UP036 reads this as dead code because project.requires-python already says >= 3.14. That is
+# true of every install pip performs and false of the case this guards: a bare `pytest` on a
+# tree that is already populated never consults requires-python at all.
+if sys.version_info < (3, 14):  # noqa: UP036
+    raise RuntimeError(
+        f"Carmel's tests require Python >= 3.14; this interpreter is {sys.version.split()[0]} "
+        f"at {sys.executable}. Run `conda activate crml_env` first."
+    )
 
 
 @pytest.fixture

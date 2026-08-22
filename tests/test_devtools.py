@@ -343,6 +343,19 @@ class TestThePythonFloorIsDeclaredOnce:
         assert match, "environment.yml no longer pins a python floor for crml_env"
         assert (int(match.group(1)), int(match.group(2))) == self.floor()
 
+    def test_the_conftest_interpreter_guard_matches_the_floor(self) -> None:
+        """A stale guard admits the exact interpreter it exists to refuse.
+
+        `tests/conftest.py` refuses to collect below the floor, because a bare `pytest`
+        with no environment activated never consults `requires-python` at all. Raising
+        the floor without raising the guard leaves that refusal silently one version
+        behind, which reads as protection and is not.
+        """
+        text = (REPO_ROOT / "tests" / "conftest.py").read_text()
+        match = re.search(r"^if sys\.version_info < \((\d+), (\d+)\):", text, flags=re.MULTILINE)
+        assert match, "tests/conftest.py no longer guards the interpreter version"
+        assert (int(match.group(1)), int(match.group(2))) == self.floor()
+
     @pytest.mark.parametrize("workflow", ["ci.yml", "docs.yml"], ids=lambda name: name)
     def test_every_workflow_python_matches_the_floor(self, workflow: str) -> None:
         """A lane on an older Python tests something users cannot install."""

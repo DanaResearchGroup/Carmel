@@ -1498,6 +1498,9 @@ def _prepare_grounding(
         sha256=sha256,
         parent_node_id=None,
         origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        # This root is a whole document, never a region cut out of one, so the
+        # only reason SourceNode's I7 accepts here is NOT_APPLICABLE.
+        crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         extraction=binding,
         glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         # Each tier states what this function ACTUALLY established, and nothing

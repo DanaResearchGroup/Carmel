@@ -190,6 +190,59 @@ class TestTheRecordIsAClaimTheDocumentCanRefute:
         assert verify_inventory_record(payload, GRID).reproduced
 
 
+class TestRefusalProseIsDiagnosticsAndTheReasonIsTheFinding:
+    """``detail`` sat inside the compared bytes, so rewording one broke stored records.
+
+    A record written before a diagnostic was rephrased came back MISMATCHED -- the status
+    that means "this record is not evidence" -- with nothing about the document, the
+    footprint or the finding changed. That is not a schema fault and does not move
+    ``INVENTORY_PAYLOAD_VERSION``, which stamps the payload's SHAPE: the shape is identical
+    and ``detail`` is still written. What was wrong is that prose was being asked to
+    reproduce.
+    """
+
+    @staticmethod
+    def _refused_payload() -> dict:
+        truncating = replace(FOOTPRINT, y_bottom=679.0)
+        inventory = build_inventory(extract_fragments(GRID), truncating)
+        assert inventory.refusals, "expected the truncated box to refuse"
+        return inventory_record_payload(inventory, raw_sha256=hashlib.sha256(GRID).hexdigest())
+
+    def test_rewording_a_detail_does_not_break_a_stored_record(self) -> None:
+        payload = self._refused_payload()
+        reworded = {
+            **payload,
+            "refusals": [{**entry, "detail": "worded differently, same finding"} for entry in payload["refusals"]],
+        }
+
+        result = verify_inventory_record(reworded, GRID)
+
+        assert result.status is InventoryVerificationStatus.REPRODUCED
+        assert result.identity_moved == (), "nothing about the derivation's identity moved either"
+
+    def test_changing_a_REASON_still_mismatches(self) -> None:
+        """The half that makes the exclusion a narrowing rather than a hole. ``reason`` names
+        which check refused and is what a consumer switches on, so a record claiming a
+        different one has not reproduced."""
+        payload = self._refused_payload()
+        relabelled = {
+            **payload,
+            "refusals": [{**entry, "reason": InventoryRefusalReason.EMPTY.value} for entry in payload["refusals"]],
+        }
+
+        result = verify_inventory_record(relabelled, GRID)
+
+        assert result.status is InventoryVerificationStatus.MISMATCHED
+
+    def test_detail_is_excluded_from_the_comparison_not_from_the_record(self) -> None:
+        """A reader holding these bytes still gets the sentence, and the key set is
+        unchanged -- which is the whole reason the version does not move."""
+        payload = self._refused_payload()
+
+        assert all(entry["detail"] for entry in payload["refusals"])
+        assert set(payload) == INVENTORY_PAYLOAD_KEYS
+
+
 class TestEachWayOfNotReachingAVerdictStaysDistinct:
     def test_the_wrong_document_is_a_source_mismatch_not_an_inability_to_verify(self, record: dict) -> None:
         other = _pdf("BT /F1 9 Tf 53 700 Td (something else) Tj ET\n")

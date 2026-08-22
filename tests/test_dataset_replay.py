@@ -1592,6 +1592,7 @@ class TestIndependentNodeVerificationOutcomeCategories:
             extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             verification=_verification_for(Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)),
+            crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
         assert text is None
@@ -2047,6 +2048,24 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
             extraction=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             glyph_health=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             verification=_verification_for(Absent(reason=AbsenceReason.NOT_APPLICABLE)),
+            # WHERE on the parent's page this crop was cut from -- required by
+            # I7, and distinct from the BBoxLocator built below, which
+            # addresses a region within the crop's own render.
+            crop_region=BBox(
+                frame=CoordinateFrame(
+                    render_fingerprint="fp-parent-page",
+                    cropbox=("0", "0", "612", "792"),
+                    mediabox=("0", "0", "612", "792"),
+                    rotation=0,
+                    units="pt",
+                    dpi="300",
+                    render_settings="antialias=on",
+                ),
+                x0="72",
+                y0="500",
+                x1="300",
+                y1="700",
+            ),
         )
         graph = loaded.source_graph.model_copy(update={"nodes": (*loaded.source_graph.nodes, crop)})
         frame = CoordinateFrame(
@@ -2072,15 +2091,23 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         return DatasetEnvelope.model_validate(json.loads(envelope.model_dump_json()))
 
     def test_mixed_text_and_bbox_envelope_is_unverifiable_for_the_label_only(self, tmp_path: Path) -> None:
-        """The crop shares its parent's ``sha256`` (legal per I5) so its bytes
-        ARE in the store, and nothing text-dependent targets the crop node
-        itself -- so the envelope must NOT be UNVERIFIABLE for the absent
-        extraction. It must, however, be UNVERIFIABLE for the BBox-backed
-        ``label_ref``: a `BBoxLocator` can attest the region exists but can
-        never attest to the text recorded in ``label_raw``, and this
-        replayer has no renderer to re-derive that text with."""
-        stored_artifact, loaded = _produce_and_load(tmp_path)
-        envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
+        """The crop's OWN bytes are in the store, and nothing text-dependent
+        targets the crop node itself -- so the envelope must NOT be
+        UNVERIFIABLE for the absent extraction. It must, however, be
+        UNVERIFIABLE for the BBox-backed ``label_ref``: a `BBoxLocator` can
+        attest the region exists but can never attest to the text recorded in
+        ``label_raw``, and this replayer has no renderer to re-derive that
+        text with.
+
+        The crop used to reuse its parent's ``sha256`` here, which I8 now
+        refuses: a crop is a sub-region and never holds the whole parent's
+        bytes. Storing a second artifact for the crop is what that invariant
+        asks of a real digitizer too -- the crop's bytes have to BE in the
+        store under the crop's own address, or replay can only ever report it
+        UNVERIFIABLE (which is what the last test in this class pins)."""
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        crop_artifact = _store_synthetic_artifact(tmp_path, "crop bytes, not the parent's")
+        envelope = self._mixed_envelope(loaded, crop_sha256=crop_artifact.sha256)
 
         report = replay_envelope(tmp_path, envelope)
 
@@ -2113,8 +2140,9 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         The crop is the ONLY node here without a verification record; the root
         has one and its root tier is readable, so an empty tuple pins both
         halves at once."""
-        stored_artifact, loaded = _produce_and_load(tmp_path)
-        envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        crop_artifact = _store_synthetic_artifact(tmp_path, "crop bytes, not the parent's")
+        envelope = self._mixed_envelope(loaded, crop_sha256=crop_artifact.sha256)
         crop = envelope.source_graph.nodes[1]
         assert isinstance(crop.verification, Absent), "fixture drift: the crop must claim nothing"
 
@@ -2129,8 +2157,9 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
         ``label_raw`` on the BBox-backed axis must never ride into a VERIFIED
         envelope; the outcome must stay non-VERIFIED regardless of what text
         was written there."""
-        stored_artifact, loaded = _produce_and_load(tmp_path)
-        envelope = self._mixed_envelope(loaded, crop_sha256=stored_artifact.sha256)
+        _stored_artifact, loaded = _produce_and_load(tmp_path)
+        crop_artifact = _store_synthetic_artifact(tmp_path, "crop bytes, not the parent's")
+        envelope = self._mixed_envelope(loaded, crop_sha256=crop_artifact.sha256)
         series = envelope.series[0]
         fabricated_axes = (
             series.axes[0].model_copy(update={"label_raw": "not in the crop"}),

@@ -100,6 +100,12 @@ _NO_GLYPH_HEALTH = Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
 """Module-level singleton default for SourceNode.glyph_health, matching
 _NO_ORIGIN's reasoning."""
 
+_NO_CROP_REGION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""Module-level singleton for SourceNode.crop_region, matching _NO_ORIGIN's
+reasoning. Every node in this file is a non-crop kind, and NOT_APPLICABLE is
+the only reason I7 accepts there -- nothing but a FIGURE_CROP was ever cut out
+of a page."""
+
 _NO_PYPDF_VERSION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """Module-level singleton default for ExtractionBinding.pypdf_version on a
 non-pypdf extractor, matching _NO_ORIGIN's reasoning. Reason is
@@ -206,6 +212,7 @@ def _node(
         extraction=extraction,
         glyph_health=glyph_health,
         verification=_verification_for(extraction),
+        crop_region=_NO_CROP_REGION,
     )
 
 
@@ -513,6 +520,7 @@ class TestSourceGraph:
                 extraction=_NO_EXTRACTION,
                 glyph_health=_NO_GLYPH_HEALTH,
                 verification=_verification_for(_NO_EXTRACTION),
+                crop_region=_NO_CROP_REGION,
             )
 
     def test_source_node_rejects_trailing_newline_in_sha256(self) -> None:
@@ -541,6 +549,7 @@ class TestSourceGraph:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=_verification_for(_NO_EXTRACTION),
+            crop_region=_NO_CROP_REGION,
         )
         assert member.parent_node_id == "paper"
 
@@ -558,6 +567,7 @@ class TestSourceGraph:
             extraction=_NO_EXTRACTION,
             glyph_health=_NO_GLYPH_HEALTH,
             verification=_verification_for(_NO_EXTRACTION),
+            crop_region=_NO_CROP_REGION,
         )
         assert isinstance(member.origin, ArchiveOrigin)
         assert member.origin.archive_sha256 == SHA_A
@@ -576,6 +586,7 @@ class TestSourceGraph:
                 extraction=_NO_EXTRACTION,
                 glyph_health=_NO_GLYPH_HEALTH,
                 verification=_verification_for(_NO_EXTRACTION),
+                crop_region=_NO_CROP_REGION,
             )
 
     def test_extraction_binding_rejects_bad_hex(self) -> None:
@@ -715,6 +726,7 @@ class TestSourceGraph:
                 extraction=_extraction_binding(parent_raw_sha256=SHA_B),
                 glyph_health=_NO_GLYPH_HEALTH,
                 verification=_verification_for(_extraction_binding(parent_raw_sha256=SHA_B)),
+                crop_region=_NO_CROP_REGION,
             )
 
     def test_glyph_health_assessment_rejects_wrong_dependency_id(self) -> None:
