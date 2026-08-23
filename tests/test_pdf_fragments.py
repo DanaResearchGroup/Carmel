@@ -328,6 +328,157 @@ class TestCharacterSpacingIsChargedPerGlyph:
         assert (spaced.x_end - spaced.x_start) - (plain.x_end - plain.x_start) == pytest.approx(6.0)
 
 
+class TestGlyphRepairsAreScopedByDocumentFontAndCode:
+    """The repair table's gate, exercised end to end through `extract_fragments`.
+
+    A global glyph-name mapping is silent semantic corruption, so every test here is
+    about the SCOPE: an entry applies only when the whole document's sha256, the
+    embedded font program's sha256 and the decoded glyph name all match, and every
+    partial match leaves the fragment UNMAPPED with its text unmodified.
+    """
+
+    FONT_PROGRAM = b"synthetic-font-program-bytes"
+
+    def _differences_pdf(self, *, embed_program: bool = True, names: str = "/C14") -> bytes:
+        """One page drawing byte 0x20 (and 0x21 when two names are given) through a
+        ``/Differences`` font that binds them to unmapped glyph names, with a real
+        embedded ``/FontFile3`` for the repair gate to digest."""
+        count = len(names.split()[0:2])
+        text = "\x20" if count == 1 else "\x20\x21"
+        stream = f"BT /F1 10 Tf\n72 700 Td ({text}) Tj\nET".encode("latin-1")
+        descriptor = b"<< /Type /FontDescriptor /FontName /Synth /Flags 4"
+        if embed_program:
+            descriptor += b" /FontFile3 7 0 R"
+        descriptor += b" >>"
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+            b"<< /Type /Encoding /Differences [32 " + names.encode() + b"] >> "
+            b"/FontDescriptor 6 0 R >>",
+            descriptor,
+        ]
+        if embed_program:
+            objects.append(
+                b"<< /Length "
+                + str(len(self.FONT_PROGRAM)).encode()
+                + b" /Subtype /Type1C >>\nstream\n"
+                + self.FONT_PROGRAM
+                + b"\nendstream"
+            )
+        return _pdf(objects)
+
+    def _repair(self, pdf: bytes, **overrides):
+        import hashlib
+
+        entry = {
+            "document_sha256": hashlib.sha256(pdf).hexdigest(),
+            "font_program_sha256": hashlib.sha256(self.FONT_PROGRAM).hexdigest(),
+            "font_base_name": "Synth",
+            "glyph_name": "/C14",
+            "replacement": "\u00b0",
+            "evidence": "synthetic test entry; the scope, not the conclusion, is under test",
+        }
+        entry.update(overrides)
+        return pdf_fragments.GlyphRepair(**entry)
+
+    def test_a_fully_scoped_entry_repairs_the_glyph_and_says_repaired(self, monkeypatch) -> None:
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "\u00b0")
+
+        assert frag.glyph_mapping is GlyphMapping.REPAIRED
+
+    def test_the_repair_is_textual_only_and_the_geometry_is_untouched(self, monkeypatch) -> None:
+        require_pypdf()
+        pdf = self._differences_pdf()
+        unrepaired = _by_text(extract_fragments(pdf).fragments, "/C14")
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        repaired = _by_text(extract_fragments(pdf).fragments, "\u00b0")
+
+        assert (repaired.x_start, repaired.x_end, repaired.baseline_y, repaired.ink_x_end) == (
+            unrepaired.x_start,
+            unrepaired.x_end,
+            unrepaired.baseline_y,
+            unrepaired.ink_x_end,
+        )
+
+    def test_a_matching_font_in_a_different_document_is_not_repaired(self, monkeypatch) -> None:
+        """The narrowest scope is the DOCUMENT: the same font program embedded in other
+        bytes is outside what the evidence was read from."""
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf, document_sha256="0" * 64),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+
+    def test_a_matching_name_in_a_different_font_program_is_not_repaired(self, monkeypatch) -> None:
+        """`/C14` is a font-local code: another program is free to bind the same name
+        to anything, so the program digest gates even inside the registered document."""
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf, font_program_sha256="0" * 64),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+
+    def test_a_font_without_an_embedded_program_never_matches(self, monkeypatch) -> None:
+        """No program, no identity to scope on, no repair -- fail closed."""
+        require_pypdf()
+        pdf = self._differences_pdf(embed_program=False)
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+
+    def test_a_partially_repairable_fragment_stays_unmapped_and_unmodified(self, monkeypatch) -> None:
+        """Two markers, one entry: half a repair would read as data while still
+        carrying a marker, so the whole fragment keeps its published contract --
+        UNMAPPED, text exactly as the document emitted it."""
+        require_pypdf()
+        pdf = self._differences_pdf(names="/C14 /C15")
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14/C15")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+        assert frag.text == "/C14/C15"
+
+    def test_an_empty_registry_costs_nothing_and_changes_nothing(self, monkeypatch) -> None:
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", ())
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+        assert frag.text == "/C14"
+
+    def test_the_shipped_registry_is_scoped_on_every_axis(self) -> None:
+        """Whatever entries ship, each must carry a full 64-hex document AND font
+        program scope, a marker-shaped glyph name, a non-marker replacement, and
+        recorded evidence. This is the shape that makes a global mapping
+        unregisterable, pinned against the live table rather than stated in prose."""
+        assert pdf_fragments._GLYPH_REPAIRS, "the registry ships at least the /C14 entry"
+        for entry in pdf_fragments._GLYPH_REPAIRS:
+            assert len(entry.document_sha256) == 64 and all(c in "0123456789abcdef" for c in entry.document_sha256)
+            assert len(entry.font_program_sha256) == 64
+            assert pdf_fragments._UNMAPPED_MARKER_RE.fullmatch(entry.glyph_name)
+            assert entry.replacement
+            assert not pdf_fragments._UNMAPPED_MARKER_RE.search(entry.replacement)
+            assert len(entry.evidence) > 100, "an entry without recorded evidence is a guess"
+
+
 class TestTheInkExtentStopsAtTheLastGlyph:
     """``ink_x_end`` is ``x_end`` minus exactly the spacing charged past the final glyph.
 
@@ -672,7 +823,7 @@ class TestAnEngineMismatchIsNotAPageFailure:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -739,7 +890,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -776,7 +927,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         assert issubclass(mod._EngineMismatch, Exception)
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -794,7 +945,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -823,7 +974,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         produced = {extract_fragments(_one_page_pdf(self._PDF)).status}
@@ -960,10 +1111,10 @@ class TestLossRecordsWhatWasLost:
 
         real = mod._page_fragments
 
-        def _boom(page, page_number, engine, budget):
+        def _boom(page, page_number, engine, budget, repairs=None):
             if page_number == 2:
                 raise ValueError("synthetic page explosion")
-            return real(page, page_number, engine, budget)
+            return real(page, page_number, engine, budget, repairs)
 
         monkeypatch.setattr(mod, "_page_fragments", _boom)
         pdf = _two_page_pdf(
@@ -1105,9 +1256,9 @@ class TestLossRecordsWhatWasLost:
         real = mod._page_fragments
         parsed: list[int] = []
 
-        def _recording(page, page_number, engine, budget):
+        def _recording(page, page_number, engine, budget, repairs=None):
             parsed.append(page_number)
-            return real(page, page_number, engine, budget)
+            return real(page, page_number, engine, budget, repairs)
 
         monkeypatch.setattr(mod, "_page_fragments", _recording)
         monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 1)

@@ -1082,7 +1082,7 @@ _FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd6
 # component is unmoved for the eighth consecutive time.
 _FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "54de5761c2a1dc3c188b83880f86cbd5d302d309d5dfc99e2a397f8614012611"
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "e9b97bd5b6485f9d1cf78ca461096f46a2e7ed6993ce62081b0c776deeb96e9a"
 _FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
 
 # The NINTH entry, SUPERSEDED. V8 shipped the availability taxonomy; this tightened two
@@ -1109,7 +1109,22 @@ _FRAGMENT_GEOMETRY_SHA256_V9 = "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d4
 # failure status changes; what moves is that every fragment now carries one more
 # number, which is a new output and therefore a new identity, the same reasoning under
 # which V5's pure-refusal change superseded. Borrowed unmoved for the tenth time.
-_FRAGMENT_GEOMETRY_SHA256 = "e1711da64528498ef76d1161a7f0c54e026a45742778dde2e9d0e25dbc6de2a0"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V10 = "54de5761c2a1dc3c188b83880f86cbd5d302d309d5dfc99e2a397f8614012611"
+_FRAGMENT_GEOMETRY_SHA256_V10 = "e1711da64528498ef76d1161a7f0c54e026a45742778dde2e9d0e25dbc6de2a0"
+
+# The ELEVENTH entry, and the first under which a fragment's TEXT can differ from what
+# pypdf decoded: the evidence-scoped glyph-repair table (`_GLYPH_REPAIRS`). V10 and
+# every predecessor published unmapped glyph names verbatim and only flagged them;
+# this entry adds `GlyphMapping.REPAIRED` and a registry whose entries apply only when
+# the whole document's sha256, the embedded font program's sha256 and the decoded
+# glyph name all match -- one registered entry at this writing, the /C14 degree sign
+# of 10.1016-j.ijhydene.2013.10.164, with its evidence recorded on the entry. On every
+# document without a registered entry the pipeline's output is bit-for-bit V10's; on
+# the registered one, four fragments' text moves from "/C14" to "\u00b0" and their
+# mapping to REPAIRED, geometry untouched. A supersession because what a fragment SAYS
+# is this identity's core output, and a stored artifact must be able to tell text the
+# document decoded from text Carmel concluded. Borrowed unmoved for the eleventh time.
+_FRAGMENT_GEOMETRY_SHA256 = "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1192,6 +1207,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V9: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V9,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V10: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V10,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1353,6 +1373,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V9,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V10,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

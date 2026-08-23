@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+import carmel.services.pdf_fragments as pdf_fragments
 from carmel.services.pdf_fragments import FragmentExtraction, GlyphMapping, extract_fragments
 from carmel.services.pdf_tables import ClaimedFootprint, InventoryRefusalReason, build_inventory
 from tests.pypdf_gate import require_pypdf
@@ -86,30 +87,42 @@ def _with_the_degree_glyph_forced_mapped(extraction: FragmentExtraction) -> Frag
     return replace(extraction, fragments=tuple(forced))
 
 
+def _without_the_glyph_repair(monkeypatch: pytest.MonkeyPatch) -> FragmentExtraction:
+    """The target's extraction with the repair registry emptied: the "repair disabled"
+    knob the isolation tests below need, applied at the registry rather than by
+    editing fragments, so what is measured is the shipped pipeline minus exactly one
+    table."""
+    monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", ())
+    return _target_extraction()
+
+
 class TestInkContainmentOnTheTargetPage:
     """Commit 1's invariants 2 and 3, on the page that motivated them."""
 
-    def test_ink_admits_the_bridging_fragment_and_it_still_bridges_columns(self) -> None:
+    def test_ink_admits_the_bridging_fragment_and_it_still_bridges_columns(self, monkeypatch) -> None:
         """THE load-bearing assertion, and deliberately not a weaker one.
 
-        With the unmapped glyph forced out of the way and the sub-fragment split not in
-        play, the box must reach ``column_structure_unresolved`` -- the refusal that can
-        only fire if the once-refused ``(91)Tj`` fragment was ADMITTED as a member and
-        its span still bridges the value columns. Asserting merely "no longer refuses
+        With the glyph repair DISABLED, the unmapped glyph forced out of the way in
+        memory, and the sub-fragment split not in play, the box must reach
+        ``column_structure_unresolved`` -- the refusal that can only fire if the
+        once-refused ``(91)Tj`` fragment was ADMITTED as a member and its span still
+        bridges the value columns. Asserting merely "no longer refuses
         ``straddling_fragment_at_the_box_edge``" would also pass if the containment
         change had silently DROPPED the fragment; measured, that inventory COMPLETES
         with the pressure row reading ``1e`` beside ``e8`` -- so reaching this refusal,
         with this detail, is what proves admission.
         """
-        inventory = build_inventory(_with_the_degree_glyph_forced_mapped(_target_extraction()), WHOLE_TABLE)
+        extraction = _with_the_degree_glyph_forced_mapped(_without_the_glyph_repair(monkeypatch))
+
+        inventory = build_inventory(extraction, WHOLE_TABLE)
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
         assert "resolves 3 blocks where the table resolves 2" in inventory.refusals[0].detail
 
-    def test_without_the_glyph_repair_the_box_refuses_the_unmapped_member(self) -> None:
+    def test_without_the_glyph_repair_the_box_refuses_the_unmapped_member(self, monkeypatch) -> None:
         """The refusal chain's middle link, pinned so the order stays observable: ink
         containment alone moves the refusal from the straddler to the unmapped glyph."""
-        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+        inventory = build_inventory(_without_the_glyph_repair(monkeypatch), WHOLE_TABLE)
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNMAPPED_MEMBER]
 
@@ -140,3 +153,51 @@ class TestInkContainmentOnTheTargetPage:
                 "a fragment this test counts as a genuine straddler carries trailing "
                 "spacing, so it no longer measures what it claims to"
             )
+
+
+class TestTheDegreeGlyphRepairOnTheTargetPage:
+    """Commit 2's verifier: the header decodes, and the unmapped-member refusal is gone.
+
+    Deliberately NOT verified by table completion -- completion needs the third fix
+    too, and would anyway be no justification for a glyph mapping.
+    """
+
+    def test_the_temperature_header_glyph_decodes_to_the_degree_sign(self) -> None:
+        """The shipped repair, observed end to end on the real bytes: same code, same
+        geometry, the placeholder text replaced by the degree sign, and the fragment
+        saying REPAIRED -- Carmel's conclusion, never passed off as the document's."""
+        extraction = _target_extraction()
+
+        degree = [f for f in extraction.fragments if f.page == WHOLE_TABLE.page and abs(f.baseline_y - 64.063) < 0.01]
+        assert len(degree) == 1
+        fragment = degree[0]
+        assert fragment.text == "\u00b0"
+        assert fragment.glyph_mapping is GlyphMapping.REPAIRED
+        # The repair is textual only: the measured zero-advance geometry is untouched.
+        assert fragment.x_start == pytest.approx(61.7952, abs=1e-4)
+        assert fragment.x_end == fragment.x_start
+
+    def test_the_inventory_no_longer_refuses_the_unmapped_member(self) -> None:
+        """With the repair live the box's refusal moves PAST unmapped_member to the
+        next link of the measured chain -- and only that far, because the split is
+        commit 3's."""
+        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+
+    def test_only_the_registered_glyph_is_repaired_anywhere_in_the_document(self) -> None:
+        """The scope doing its work on the real input: one document, one font, one
+        glyph. The document draws that code in that font FOUR times (three prose uses
+        on page 2, the table header on page 4) -- each is the identical conclusion, so
+        each repairs -- and nothing else does: the same font's /C0, /C6 and /C20, for
+        which no evidence was recorded, stay UNMAPPED and keep refusing with their
+        glyph named."""
+        extraction = _target_extraction()
+
+        repaired = [f for f in extraction.fragments if f.glyph_mapping is GlyphMapping.REPAIRED]
+        assert len(repaired) == 4
+        assert all(f.text == "°" for f in repaired)
+        assert {f.page for f in repaired} == {2, WHOLE_TABLE.page}
+
+        unmapped = {f.text for f in extraction.fragments if f.glyph_mapping is GlyphMapping.UNMAPPED}
+        assert unmapped == {"/C0", "/C6", "/C20"}

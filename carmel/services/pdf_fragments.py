@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import importlib.metadata
 import io
 import logging
@@ -79,6 +80,17 @@ class GlyphMapping(StrEnum):
     a character. The fragment's text is returned UNMODIFIED; a consumer that treats
     it as a value is reading a marker as data."""
 
+    REPAIRED = "repaired"
+    """Every glyph decoded, but at least one of them only through Carmel's own
+    evidence-scoped repair table (:data:`_GLYPH_REPAIRS`) rather than through the
+    document. A third member instead of a promotion to :attr:`MAPPED`, deliberately:
+    the document never said what this glyph means -- Carmel concluded it, from
+    recorded evidence, under a gate scoped to one document, one embedded font program
+    and one glyph code -- and an artifact built from the fragment must be able to say
+    so. Consumers that admit it are admitting that conclusion by name, never by
+    accident: everything else in this codebase that switches on this enum treats any
+    member it does not explicitly admit as refusable."""
+
 
 # Markers a PDF text extractor emits when a glyph has no usable ``ToUnicode`` entry.
 #
@@ -89,10 +101,15 @@ class GlyphMapping(StrEnum):
 # SIGN INVERSION inside an otherwise perfectly well-formed number. That is strictly
 # worse than a missing value, because nothing downstream looks wrong.
 #
-# Flagged, never repaired. Mapping ``/C0`` to U+2212 -- or ``þ`` to ``+`` and ``¼``
-# to ``=``, which the same PDFs also need -- is a SEMANTIC claim about what the
-# document meant, and grounding proves LOCATION, never MEANING. A repair table needs
-# its own gate and its own evidence; it does not belong in a mechanical extractor.
+# Flagged, and never repaired by DEFAULT. Mapping ``/C0`` to U+2212 -- or ``þ`` to
+# ``+`` and ``¼`` to ``=``, which the same PDFs also need -- is a SEMANTIC claim about
+# what the document meant, and grounding proves LOCATION, never MEANING. A repair
+# table needs its own gate and its own evidence. That table now exists
+# (:data:`_GLYPH_REPAIRS`): each entry is scoped to ONE document's bytes, ONE embedded
+# font program and ONE glyph code, carries the recorded evidence it rests on, and
+# surfaces as :attr:`GlyphMapping.REPAIRED` -- never as ``MAPPED``, so nothing
+# downstream can mistake Carmel's conclusion for the document's. A glyph with no
+# entry stays flagged with its text unmodified, exactly as before.
 # The `/C\d+` arm is DELIBERATELY bounded on both sides. An unanchored `/C\d+`
 # substring match is catastrophic in a combustion codebase: it flags `/C2H4`, `C1/C2`,
 # `H2/CO`-style species lists, appendix labels and file paths as corrupt. The lookarounds
@@ -106,6 +123,153 @@ _UNMAPPED_MARKER_RE = re.compile(
     """,
     re.VERBOSE,
 )
+
+
+@dataclass(frozen=True)
+class GlyphRepair:
+    """One evidence-scoped decoding for one glyph the document itself does not decode.
+
+    **A global glyph-name mapping is silent semantic corruption and must never ship.**
+    A ``/Differences`` name like ``/C14`` is a FONT-LOCAL code, not a character:
+    another embedded font is free to bind the same name to anything at all, and a
+    table keyed on the name alone would rewrite it everywhere while looking perfectly
+    reasonable. Every entry here is therefore scoped three times over, and applies
+    only when ALL THREE match:
+
+    * ``document_sha256`` -- the sha256 of the WHOLE document's raw bytes. The
+      narrowest honest scope: the evidence below was read out of one file, so the
+      conclusion is asserted for that file and no other, even one embedding the same
+      font program with the same digest.
+    * ``font_program_sha256`` -- the sha256 of the embedded font program's decoded
+      bytes (``FontFile``/``FontFile2``/``FontFile3``). The glyph's meaning lives in
+      the program that draws it, so this is the identity the conclusion is actually
+      ABOUT; the document scope narrows it further rather than standing in for it.
+    * ``glyph_name`` -- the decoded per-glyph substring the fragment lane produces
+      for the code (``/C14``), which is the font's own ``/Differences`` name.
+
+    A repaired fragment surfaces as :attr:`GlyphMapping.REPAIRED`, never ``MAPPED``,
+    and a fragment whose markers are not ALL covered by matching entries keeps its
+    text unmodified and stays ``UNMAPPED`` -- a half-repaired string would read as
+    data while still carrying a marker. Where the evidence does not support a
+    mapping, the honest entry is NO entry: the fragment then refuses downstream with
+    the glyph named, which is a better outcome than a guess.
+    """
+
+    document_sha256: str
+    font_program_sha256: str
+    font_base_name: str
+    """The font's ``/BaseFont`` at the time the evidence was read. Diagnostic only --
+    subset prefixes are arbitrary and names are forgeable, so this never gates."""
+
+    glyph_name: str
+    replacement: str
+    evidence: str
+    """What the conclusion rests on, recorded beside it so a reviewer can re-derive or
+    refute it without an archaeology dig. State what was actually consulted."""
+
+
+#: Every glyph repair this module will apply. Append-only; scoping rules and the
+#: refuse-don't-guess policy are on :class:`GlyphRepair`.
+_GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
+    GlyphRepair(
+        # Table 1, p4 of the combustion-conditions paper this lane's M2 target lives
+        # in. Its temperature header renders "T (<glyph 2> C)" where glyph 2 of the
+        # /F7 font is the unmapped /C14.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="fef02938850ee399076ea5efc5960c08a91546241c2814ea86ab49011919bed1",
+        font_base_name="NNEIFK+AdvP4C4E74",
+        glyph_name="/C14",
+        replacement="°",
+        evidence=(
+            "Read from the document itself, in order of authority: (1) the font's "
+            "/Encoding /Differences binds code 2 to the non-semantic name /C14, and its "
+            "/ToUnicode CMap is silent about it (codespace <bc><fe> only), so the "
+            "document does not decode this glyph; (2) the embedded 633-byte CFF program "
+            "(sha256 above) draws C14 as two concentric near-circular closed contours -- "
+            "an annulus of outer bbox [56,443]x[56,444] in the 1000-unit em, advance "
+            "width 500 -- i.e. a small ring; (3) the page typesets it at 70% of the "
+            "surrounding body height (font_height 4.88 vs 6.97) with its baseline raised "
+            "2.55 pt, a superscript placement. A small raised ring is the degree sign "
+            "U+00B0; the ring-shaped alternatives are excluded by that same placement "
+            "and proportion (U+2218 RING OPERATOR sits centred on the math axis, U+25CB "
+            "WHITE CIRCLE is full-size). No neighbouring text was used to reach the "
+            "conclusion; that the repaired header reads 'T (°C)' is corroboration, "
+            "not evidence."
+        ),
+    ),
+)
+
+
+def _font_program_sha256(font: Any) -> str | None:
+    """The sha256 of the embedded font program this font resolves to, or ``None``.
+
+    ``None`` -- no repair can match -- for a font with no embedded program at all, and
+    for every failure while reaching or inflating one: fail closed, a repair that
+    cannot verify its scope does not apply.
+
+    ``get_data()`` inflates the font stream with no output bound, which this module
+    refuses for content streams. It is admissible here because of WHERE the call
+    sits: :func:`_page_fragments` consults this only after the DOCUMENT scope
+    matched, so the only bytes this can ever inflate are those of a document whose
+    entire content is already pinned by sha256 in :data:`_GLYPH_REPAIRS` -- an input
+    chosen by whoever registered the repair, not by whoever supplies a PDF.
+    """
+    try:
+        stream = font.font_descriptor.font_file
+        if stream is None:
+            return None
+        return hashlib.sha256(bytes(stream.get_data())).hexdigest()
+    except Exception:  # noqa: BLE001 - any failure to identify the program is "no match"
+        logger.debug("embedded font program could not be identified for repair scoping", exc_info=True)
+        return None
+
+
+def _repaired_text(show: Any, repairs: dict[str, str]) -> str | None:
+    """This show's text with every unmapped glyph repaired, or ``None`` -- no change.
+
+    ``repairs`` is already scoped: the caller has matched the document and the font
+    program, so the keys here are glyph names valid for exactly this show's font.
+
+    The replacement is performed per GLYPH, never by string substitution on the
+    joined text: a substring that merely looks like a marker inside an ordinary run
+    must not be rewritten, and the per-glyph partition is what distinguishes "this
+    code decoded to the name /C14" from "these four characters happen to spell it".
+    Only a piece that is a complete standalone marker is eligible.
+
+    Refuses (returns ``None``) rather than repairing when:
+
+    * the per-glyph partition is unavailable, or no longer concatenates to the text
+      pypdf produced -- the alignment premise moved, so touching the text would edit
+      a string this module no longer understands;
+    * no piece actually matched -- nothing to do;
+    * a marker remains after every available repair -- a half-repaired fragment
+      would read as data while still carrying a marker, so it stays UNMAPPED with
+      its text unmodified, which is the published contract for unmapped fragments.
+    """
+    substrings = _glyph_substrings(show)
+    if substrings is None:
+        return None
+    if isinstance(show.value, bytes):
+        character_map = show.font.character_map
+        pieces = ["".join(character_map.get(c, c) for c in substring) for substring in substrings]
+    else:
+        pieces = substrings
+    if "".join(pieces) != show.text:
+        return None
+    repaired: list[str] = []
+    changed = False
+    for piece in pieces:
+        if piece in repairs and _UNMAPPED_MARKER_RE.fullmatch(piece):
+            repaired.append(repairs[piece])
+            changed = True
+        else:
+            repaired.append(piece)
+    if not changed:
+        return None
+    text = "".join(repaired)
+    if _UNMAPPED_MARKER_RE.search(text):
+        return None
+    return text
 
 
 @dataclass(frozen=True)
@@ -2211,9 +2375,18 @@ def _walk_operations(
 
 
 def _page_fragments(
-    page: Any, page_number: int, engine: tuple[Any, ...], budget: int
+    page: Any,
+    page_number: int,
+    engine: tuple[Any, ...],
+    budget: int,
+    repairs: dict[str, dict[str, str]] | None = None,
 ) -> tuple[list[TextFragment], bool]:
     """Recover every text-show operation on one page, with absolute geometry.
+
+    ``repairs`` is the glyph-repair table ALREADY narrowed to this document by
+    :func:`extract_fragments` -- font-program sha256 to {glyph name: replacement} --
+    and is empty or ``None`` for every document without a registered entry, which
+    keeps the repair path at literally zero cost where it does not apply.
 
     Stops after ``budget`` fragments and reports that it did, so a single page cannot
     exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own.
@@ -2271,6 +2444,10 @@ def _page_fragments(
     )
 
     fragments: list[TextFragment] = []
+    # Font-program digests, hashed once per font OBJECT rather than once per show:
+    # `_layout_mode_fonts` builds one `Font` per resource name per page, so identity
+    # is a safe cache key for the duration of this call and no longer.
+    font_sha_cache: dict[int, str | None] = {}
     for show in shows:
         if len(fragments) >= budget:
             return fragments, True
@@ -2282,6 +2459,21 @@ def _page_fragments(
         text = show.text
         if not text:
             continue
+        mapping = GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED
+        if mapping is GlyphMapping.UNMAPPED and repairs:
+            # Scope order is the safety argument: the DOCUMENT matched before this
+            # function was even handed a table, so identifying the font program (an
+            # unbounded `get_data`, see `_font_program_sha256`) only ever runs on
+            # bytes the registry already pins in full.
+            if id(show.font) not in font_sha_cache:
+                font_sha_cache[id(show.font)] = _font_program_sha256(show.font)
+            font_sha = font_sha_cache[id(show.font)]
+            for_this_font = repairs.get(font_sha) if font_sha is not None else None
+            if for_this_font:
+                repaired = _repaired_text(show, for_this_font)
+                if repaired is not None:
+                    text = repaired
+                    mapping = GlyphMapping.REPAIRED
         fragments.append(
             TextFragment(
                 page=page_number,
@@ -2291,7 +2483,7 @@ def _page_fragments(
                 baseline_y=float(show.ty),
                 font_height=float(show.font_height),
                 rotated=bool(show.rotated),
-                glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
+                glyph_mapping=mapping,
                 ink_x_end=None if bool(show.rotated) else _ink_x_end(show),
             )
         )
@@ -2361,6 +2553,16 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
     # Recording the gate's own constant says exactly what is true and no more: this
     # extraction ran against the pinned pypdf, because nothing else gets this far.
     version = _PINNED_PYPDF_VERSION
+    # The glyph-repair table, narrowed to THIS document before any page is read. The
+    # document gate is one whole-input sha256 -- the same identity every stored
+    # artifact uses -- so for the overwhelming case of a document with no registered
+    # entry the repair machinery costs one hash and never runs again.
+    repairs: dict[str, dict[str, str]] = {}
+    if _GLYPH_REPAIRS:
+        document_sha256 = hashlib.sha256(data).hexdigest()
+        for repair in _GLYPH_REPAIRS:
+            if repair.document_sha256 == document_sha256:
+                repairs.setdefault(repair.font_program_sha256, {})[repair.glyph_name] = repair.replacement
     fragments: list[TextFragment] = []
     failures: list[FragmentPageFailure] = []
     lossy = False
@@ -2394,7 +2596,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     break
                 try:
                     page_fragments, hit_budget = _page_fragments(
-                        page, page_number, engine, MAX_PDF_FRAGMENTS - len(fragments)
+                        page, page_number, engine, MAX_PDF_FRAGMENTS - len(fragments), repairs
                     )
                 except _EngineMismatch:
                     # Not a page failure. The engine is wrong, so nothing extracted

@@ -143,6 +143,17 @@ AFFIX_PARENT_MARGIN = 0.5
 #: exactly what the first run against the real document produced.
 _BAND_TOLERANCE_PT = 0.5
 
+#: The glyph mappings this module reads as "this fragment's text is characters".
+#:
+#: An ADMIT set rather than a `is not UNMAPPED` test, so the failure direction is
+#: chosen once and stays chosen: a future :class:`GlyphMapping` member is refused here
+#: until someone admits it by name, instead of sailing through because it is not the
+#: one member a negation happened to spell. ``REPAIRED`` is admitted deliberately --
+#: its text is real characters, concluded by the fragment lane's evidence-scoped
+#: repair table rather than by the document, and the member's name is what keeps that
+#: distinction visible in every stored member digest.
+_ADMISSIBLE_GLYPH_MAPPINGS = frozenset({GlyphMapping.MAPPED, GlyphMapping.REPAIRED})
+
 
 class InventoryRefusalReason(StrEnum):
     """Why no inventory can be derived for a claimed footprint.
@@ -916,7 +927,7 @@ def _orphan_below_refusal(
         for f in extraction.fragments
         if f.page == footprint.page
         and f.text.strip()
-        and f.glyph_mapping is GlyphMapping.MAPPED
+        and f.glyph_mapping in _ADMISSIBLE_GLYPH_MAPPINGS
         and footprint.y_bottom - pitch <= f.baseline_y < footprint.y_bottom
         and any(left <= f.x_start and _ink_x_end(f) <= right for left, right in bounds)
     ]
@@ -1260,7 +1271,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     if rotated_sharer is not None:
         return refused(rotated_sharer)
 
-    unmapped = [f for f in inside if f.glyph_mapping is not GlyphMapping.MAPPED]
+    unmapped = [f for f in inside if f.glyph_mapping not in _ADMISSIBLE_GLYPH_MAPPINGS]
     if unmapped:
         return refused(
             InventoryRefusal(

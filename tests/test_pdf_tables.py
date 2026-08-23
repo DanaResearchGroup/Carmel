@@ -411,6 +411,23 @@ class TestCellTextIsReadingOrderAndNeverRepaired:
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNMAPPED_MEMBER]
 
+    def test_a_repaired_fragment_is_admitted_where_an_unmapped_one_refuses(self) -> None:
+        """REPAIRED is an admission by name: the fragment lane concluded the character
+        from recorded, document-scoped evidence, and the fragment says so. Its text is
+        real characters, so a cell built from it is not a marker read as data -- and
+        the member's mapping travels into the stored digest, where the distinction
+        from MAPPED stays visible."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("\u00b0 1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.REPAIRED),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        assert [c.text for c in inventory.cells] == ["Fuel", "\u00b0 1.0"]
+
 
 class TestTheAffixMergeIsRecordedOrRefused:
     def test_a_merged_band_records_the_baselines_it_joined(self) -> None:
@@ -834,6 +851,15 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         inventory = build_inventory(extraction_of(*simple_grid(), marker), footprint())
 
         assert inventory.refusals == ()
+
+    def test_a_repaired_fragment_below_the_box_is_a_cut_row(self) -> None:
+        """The other half of the admission: a REPAIRED fragment is real text, so where
+        an unmapped marker below the box is rightly ignored, a repaired glyph aligned
+        with a derived column is evidence a row was cut off."""
+        repaired = frag("\u00b0", 125.0, 130.0, 58.5, glyph_mapping=GlyphMapping.REPAIRED)
+        inventory = build_inventory(extraction_of(*simple_grid(), repaired), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX]
 
     def test_a_column_dropped_by_the_side_of_the_box_refuses(self) -> None:
         inventory = build_inventory(extraction_of(*simple_grid(), *dropped_column()), footprint(x_end=200.0))
