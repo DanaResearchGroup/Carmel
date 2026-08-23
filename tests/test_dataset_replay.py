@@ -341,6 +341,7 @@ def _tabular_envelope_from_artifact(
         axes=tuple(axes),
         constants=(),
         points=(point,),
+        digitization_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
     return DatasetEnvelope(
         source_graph=grounding.graph,
@@ -348,6 +349,7 @@ def _tabular_envelope_from_artifact(
         series=(series,),
         conversion_tables=(_ACTIVE.embedded,),
         table_inventories=(inventory_for(sha256),),
+        figure_digitizations=(),
     )
 
 
