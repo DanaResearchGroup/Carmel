@@ -328,6 +328,89 @@ class TestCharacterSpacingIsChargedPerGlyph:
         assert (spaced.x_end - spaced.x_start) - (plain.x_end - plain.x_start) == pytest.approx(6.0)
 
 
+class TestGlyphIntervalsAreRecordedEvidence:
+    """Extraction records per-glyph ink evidence and nothing more: final page-space
+    positions after all spacing, one text piece per glyph code, no splitting here.
+    """
+
+    SPACING = 4.0
+
+    def test_pieces_partition_the_published_text(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Hi) Tj\nET"), "Hi")
+        assert frag.glyph_intervals is not None
+        assert [piece for piece, _, _ in frag.glyph_intervals] == ["H", "i"]
+        assert "".join(piece for piece, _, _ in frag.glyph_intervals) == frag.text
+
+    def test_character_spacing_opens_the_gap_between_intervals(self) -> None:
+        """The recorded positions are AFTER spacing: the inter-glyph gap is exactly
+        the `Tc` charge, and the ink never includes it."""
+        require_pypdf()
+        frag = _by_text(_fragments(f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (AB) Tj\nET"), "AB")
+        assert frag.glyph_intervals is not None
+        (_, _, first_end), (_, second_start, second_end) = frag.glyph_intervals
+        assert second_start - first_end == pytest.approx(self.SPACING)
+        assert second_end == pytest.approx(frag.ink_x_end)
+
+    def test_word_spacing_opens_the_gap_after_a_space_glyph(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n6 Tw\n72 700 Td (A B) Tj\nET"), "A B")
+        assert frag.glyph_intervals is not None
+        pieces = [piece for piece, _, _ in frag.glyph_intervals]
+        assert pieces == ["A", " ", "B"]
+        space_end = frag.glyph_intervals[1][2]
+        b_start = frag.glyph_intervals[2][1]
+        assert b_start - space_end == pytest.approx(6.0)
+
+    def test_a_placeholder_glyph_name_is_one_interval_not_four(self) -> None:
+        """The glyph-count-vs-len(text) pin, carried into the evidence: one code, one
+        interval, however many characters its name spells."""
+        require_pypdf()
+        stream = "BT /F1 10 Tf\n72 700 Td (\x20\x21) Tj\nET".encode("latin-1")
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+                b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+                b"<< /Type /Encoding /Differences [32 /C20 /C21] >> >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        frag = _by_text(result.fragments, "/C20/C21")
+        assert frag.glyph_intervals is not None
+        assert [piece for piece, _, _ in frag.glyph_intervals] == ["/C20", "/C21"]
+
+    def test_rotated_text_carries_no_intervals(self) -> None:
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n0 1 -1 0 300 400 Tm (rotated) Tj\nET"))
+        assert _by_text(result.fragments, "rotated").glyph_intervals is None
+
+    def test_the_glyph_budget_truncates_rather_than_stripping_evidence(self, monkeypatch) -> None:
+        """One page of five one-glyph shows against a budget of three: the document
+        truncates at the fragment that would exceed it, and every SHIPPED fragment
+        still carries its whole partition -- a fragment stripped of evidence would
+        silently lose the sub-fragment structure the field exists to carry."""
+        require_pypdf()
+        monkeypatch.setattr(pdf_fragments, "MAX_PDF_GLYPH_INTERVALS", 3)
+        stream = "BT /F1 10 Tf\n72 700 Td (A) Tj (B) Tj (C) Tj (D) Tj (E) Tj\nET"
+
+        result = extract_fragments(_one_page_pdf(stream))
+
+        assert result.truncated is True
+        assert result.lossy is True
+        assert len(result.fragments) == 3
+        assert all(f.glyph_intervals is not None for f in result.fragments)
+
+    def test_a_document_under_the_budget_is_untouched_by_it(self) -> None:
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (AB) Tj\nET"))
+        assert result.truncated is False
+        assert all(f.glyph_intervals is not None for f in result.fragments)
+
+
 class TestGlyphRepairsAreScopedByDocumentFontAndCode:
     """The repair table's gate, exercised end to end through `extract_fragments`.
 
@@ -408,6 +491,11 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
             unrepaired.baseline_y,
             unrepaired.ink_x_end,
         )
+        # The per-glyph evidence names the REPAIRED piece at the unrepaired geometry:
+        # what a consumer slices is what the fragment says.
+        assert repaired.glyph_intervals is not None and unrepaired.glyph_intervals is not None
+        assert [piece for piece, _, _ in repaired.glyph_intervals] == ["\u00b0"]
+        assert [(s, e) for _, s, e in repaired.glyph_intervals] == [(s, e) for _, s, e in unrepaired.glyph_intervals]
 
     def test_a_matching_font_in_a_different_document_is_not_repaired(self, monkeypatch) -> None:
         """The narrowest scope is the DOCUMENT: the same font program embedded in other
@@ -823,7 +911,7 @@ class TestAnEngineMismatchIsNotAPageFailure:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -890,7 +978,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -927,7 +1015,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         assert issubclass(mod._EngineMismatch, Exception)
 
-        def _mismatch(page, page_number, engine, budget, repairs=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -945,7 +1033,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -974,7 +1062,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         produced = {extract_fragments(_one_page_pdf(self._PDF)).status}
@@ -1111,10 +1199,10 @@ class TestLossRecordsWhatWasLost:
 
         real = mod._page_fragments
 
-        def _boom(page, page_number, engine, budget, repairs=None):
+        def _boom(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             if page_number == 2:
                 raise ValueError("synthetic page explosion")
-            return real(page, page_number, engine, budget, repairs)
+            return real(page, page_number, engine, budget, repairs, glyph_budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _boom)
         pdf = _two_page_pdf(
@@ -1256,9 +1344,9 @@ class TestLossRecordsWhatWasLost:
         real = mod._page_fragments
         parsed: list[int] = []
 
-        def _recording(page, page_number, engine, budget, repairs=None):
+        def _recording(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             parsed.append(page_number)
-            return real(page, page_number, engine, budget, repairs)
+            return real(page, page_number, engine, budget, repairs, glyph_budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _recording)
         monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 1)

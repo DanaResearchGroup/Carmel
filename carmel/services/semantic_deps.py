@@ -1082,7 +1082,7 @@ _FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd6
 # component is unmoved for the eighth consecutive time.
 _FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "e9b97bd5b6485f9d1cf78ca461096f46a2e7ed6993ce62081b0c776deeb96e9a"
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "77f6ff3aa2156864451ea855058bb036ad07d0748b265ef70dd93a7a3d4acbe2"
 _FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
 
 # The NINTH entry, SUPERSEDED. V8 shipped the availability taxonomy; this tightened two
@@ -1124,7 +1124,21 @@ _FRAGMENT_GEOMETRY_SHA256_V10 = "e1711da64528498ef76d1161a7f0c54e026a45742778dde
 # mapping to REPAIRED, geometry untouched. A supersession because what a fragment SAYS
 # is this identity's core output, and a stored artifact must be able to tell text the
 # document decoded from text Carmel concluded. Borrowed unmoved for the eleventh time.
-_FRAGMENT_GEOMETRY_SHA256 = "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V11 = "e9b97bd5b6485f9d1cf78ca461096f46a2e7ed6993ce62081b0c776deeb96e9a"
+_FRAGMENT_GEOMETRY_SHA256_V11 = "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a"
+
+# The TWELFTH entry: per-glyph ink evidence. V11's fragments carried two scalars per
+# horizontal extent; a single show operator can draw the last glyph of one table cell
+# and the first of the next with the inter-column gap as character spacing, and no
+# scalar extent can carry that interior. `extract_fragments` now records
+# `TextFragment.glyph_intervals` -- one (text piece, ink start, ink end) per glyph
+# code, final page space, after all spacing -- bounded by the new document-wide
+# MAX_PDF_GLYPH_INTERVALS (exhaustion truncates, so a fragment never ships stripped of
+# its partition). No published coordinate moves and no page's failure status changes
+# (measured: all eight corpus documents byte-identical on page/text/x_start/x_end/
+# baseline_y, 274,212 evidence entries added); a new recorded output is a new
+# identity, as with V10. Borrowed unmoved for the twelfth time.
+_FRAGMENT_GEOMETRY_SHA256 = "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1212,6 +1226,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V10: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V10,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V11: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V11,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1379,6 +1398,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V10,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V11,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

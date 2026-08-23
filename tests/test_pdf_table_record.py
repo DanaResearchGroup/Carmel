@@ -446,8 +446,54 @@ class TestTheStoredFormIsCanonicalAndExact:
         """Text and an x-extent alone would not pin composition.
 
         Two different fragment sets can concatenate to the same string across the same span,
-        so the member digests are what make the cell's makeup checkable.
+        so each member names its parent fragment's digest -- and, since one show can ground
+        two cells, the glyph range and exact text piece the cell claims from it.
         """
-        cells = [c for c in record["cells"] if c["member_digests"]]
-        assert cells, "expected at least one cell with members"
-        assert all(len(d) == 64 for c in cells for d in c["member_digests"])
+        members = [m for c in record["cells"] for m in c["members"]]
+        assert members, "expected at least one cell member"
+        for member in members:
+            assert set(member) == {"fragment_sha256", "glyph_start", "glyph_end", "text", "x_start", "x_end"}
+            assert len(member["fragment_sha256"]) == 64
+            assert member["text"]
+
+    def test_a_version_1_record_is_unreadable_not_mismatched(self, record: dict) -> None:
+        """The bump's contract: version 1 stored bare member digests, this code reads
+        version 2, and "I cannot read this" must never degrade into "this does not
+        reproduce". No v1 record exists in any workspace store (measured before the
+        bump), so there is no versioned v1 verifier to keep honest -- just the refusal.
+        """
+        result = verify_inventory_record({**record, "payload_version": 1}, GRID)
+
+        assert result.status is InventoryVerificationStatus.PAYLOAD_UNREADABLE
+        assert "1" in result.detail
+
+    def test_two_fragments_with_different_interiors_have_different_digests(self) -> None:
+        """The demonstrated collision the v2 identity closes: same text, same outer
+        extents, different interiors -- one drawn as a contiguous run, one with an
+        internal spacing gap -- must not share a member identity."""
+        from dataclasses import replace as _replace
+
+        from carmel.services.pdf_table_record import _fragment_digest
+
+        extraction = extract_fragments(GRID)
+        fragment = next(f for f in extraction.fragments if f.text == "phi")
+        assert fragment.glyph_intervals is not None
+        pieces = list(fragment.glyph_intervals)
+        # Shift one interior glyph's interval without touching text or outer extents.
+        piece, start, end = pieces[1]
+        pieces[1] = (piece, start + 0.5, end + 0.5)
+        gapped = _replace(fragment, glyph_intervals=tuple(pieces))
+
+        assert _fragment_digest(gapped) != _fragment_digest(fragment)
+
+    def test_a_fragment_without_evidence_digests_differently_from_one_with_it(self) -> None:
+        """`None` (unrecorded) is not an empty recording; the digest must keep them
+        apart or a stripped fragment could impersonate a measured one."""
+        from dataclasses import replace as _replace
+
+        from carmel.services.pdf_table_record import _fragment_digest
+
+        extraction = extract_fragments(GRID)
+        fragment = next(f for f in extraction.fragments if f.text == "phi")
+
+        assert _fragment_digest(_replace(fragment, glyph_intervals=None)) != _fragment_digest(fragment)

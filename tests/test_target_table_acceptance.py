@@ -87,6 +87,21 @@ def _with_the_degree_glyph_forced_mapped(extraction: FragmentExtraction) -> Frag
     return replace(extraction, fragments=tuple(forced))
 
 
+def _with_the_split_disabled(extraction: FragmentExtraction) -> FragmentExtraction:
+    """The "split disabled" knob: strip every fragment's per-glyph evidence.
+
+    The sub-fragment split is not a flag -- it runs exactly where glyph evidence
+    exists -- so disabling it faithfully means removing the evidence and nothing
+    else. Ink extents stay, so containment still judges by ink; what goes away is the
+    per-glyph partition, which sends `build_inventory` down its documented fallback
+    (hull-derived columns, no split) -- the same path every pre-split document takes.
+    """
+    return replace(
+        extraction,
+        fragments=tuple(replace(f, glyph_intervals=None) for f in extraction.fragments),
+    )
+
+
 def _without_the_glyph_repair(monkeypatch: pytest.MonkeyPatch) -> FragmentExtraction:
     """The target's extraction with the repair registry emptied: the "repair disabled"
     knob the isolation tests below need, applied at the registry rather than by
@@ -112,7 +127,9 @@ class TestInkContainmentOnTheTargetPage:
         with the pressure row reading ``1e`` beside ``e8`` -- so reaching this refusal,
         with this detail, is what proves admission.
         """
-        extraction = _with_the_degree_glyph_forced_mapped(_without_the_glyph_repair(monkeypatch))
+        extraction = _with_the_split_disabled(
+            _with_the_degree_glyph_forced_mapped(_without_the_glyph_repair(monkeypatch))
+        )
 
         inventory = build_inventory(extraction, WHOLE_TABLE)
 
@@ -178,10 +195,10 @@ class TestTheDegreeGlyphRepairOnTheTargetPage:
         assert fragment.x_end == fragment.x_start
 
     def test_the_inventory_no_longer_refuses_the_unmapped_member(self) -> None:
-        """With the repair live the box's refusal moves PAST unmapped_member to the
-        next link of the measured chain -- and only that far, because the split is
-        commit 3's."""
-        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+        """With the repair live (and the split disabled, so this is not verified by
+        table completion) the box's refusal moves PAST unmapped_member to the next
+        link of the measured chain, exactly one link."""
+        inventory = build_inventory(_with_the_split_disabled(_target_extraction()), WHOLE_TABLE)
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
 
@@ -201,3 +218,62 @@ class TestTheDegreeGlyphRepairOnTheTargetPage:
 
         unmapped = {f.text for f in extraction.fragments if f.glyph_mapping is GlyphMapping.UNMAPPED}
         assert unmapped == {"/C0", "/C6", "/C20"}
+
+
+class TestJointAcceptance:
+    """The pull request's own verifier: under all three fixes together, the table
+    completes -- measured before it was promised, asserted here forever after."""
+
+    def test_the_measurement_table_extracts_completely(self) -> None:
+        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+
+        assert inventory.refusals == ()
+        assert len(inventory.rows) == 9
+        assert len(inventory.column_bounds) == 3
+        assert len(inventory.cells) == 20
+
+    def test_the_pressure_row_reads_1e9_beside_1e8(self) -> None:
+        """The row the whole branch exists for: its middle value was drawn by one
+        show operator whose `9` closes this cell and whose `1` opens the next."""
+        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+
+        pressure = [c for c in inventory.cells if any(m.split for m in c.members)]
+        assert len(pressure) == 2
+        rows = {c.row for c in pressure}
+        assert len(rows) == 1
+        ordinal = rows.pop()
+        by_col = {c.col: c.text for c in inventory.cells if c.row == ordinal}
+        assert by_col[1] == "1e9"
+        assert by_col[2] == "1e8"
+
+    def test_the_temperature_header_row_carries_the_repaired_degree_sign(self) -> None:
+        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+
+        header = next(c for c in inventory.cells if "\u00b0" in c.text)
+        assert header.text == "T(\u00b0C)"
+        assert header.col == 0
+
+    def test_the_complete_inventory_replays_reproduced(self) -> None:
+        """The stored form of the same result: a version-2 record whose member
+        records (parent digest + glyph range) recompute bit-for-bit from the raw
+        bytes -- the record is a claim the document can refute, and does not."""
+        import hashlib as _hashlib
+
+        from carmel.services.pdf_table_record import (
+            InventoryVerificationStatus,
+            inventory_record_payload,
+            verify_inventory_record,
+        )
+
+        # _target_extraction() owns this module's skip gate (document present, and the
+        # measured bytes). Read the document only after it has run: reading first makes
+        # this the one test of the ten that raises FileNotFoundError instead of skipping
+        # on a machine without the corpus -- which is every CI runner.
+        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+        data = _DOCUMENT.read_bytes()
+        payload = inventory_record_payload(inventory, raw_sha256=_hashlib.sha256(data).hexdigest())
+
+        result = verify_inventory_record(payload, data)
+
+        assert result.status is InventoryVerificationStatus.REPRODUCED
+        assert result.identity_moved == ()

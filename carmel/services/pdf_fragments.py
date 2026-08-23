@@ -224,27 +224,22 @@ def _font_program_sha256(font: Any) -> str | None:
         return None
 
 
-def _repaired_text(show: Any, repairs: dict[str, str]) -> str | None:
-    """This show's text with every unmapped glyph repaired, or ``None`` -- no change.
+def _text_pieces(show: Any) -> list[str] | None:
+    """This show's PUBLISHED text, partitioned one piece per glyph code, or ``None``.
 
-    ``repairs`` is already scoped: the caller has matched the document and the font
-    program, so the keys here are glyph names valid for exactly this show's font.
+    The glyph-aligned view of ``show.text``: :func:`_glyph_substrings` partitions the
+    DECODED value per code, and this maps each substring through the font's
+    ``character_map`` exactly the way pypdf built the text -- so the pieces
+    concatenate to ``show.text`` by construction, and that construction is verified
+    rather than trusted: any disagreement (a pypdf decode this partition no longer
+    mirrors) returns ``None``, and every per-glyph consumer -- the repair table, the
+    glyph/ink evidence -- degrades to "no per-glyph view" rather than operating on an
+    alignment that is a guess.
 
-    The replacement is performed per GLYPH, never by string substitution on the
-    joined text: a substring that merely looks like a marker inside an ordinary run
-    must not be rewritten, and the per-glyph partition is what distinguishes "this
-    code decoded to the name /C14" from "these four characters happen to spell it".
-    Only a piece that is a complete standalone marker is eligible.
-
-    Refuses (returns ``None``) rather than repairing when:
-
-    * the per-glyph partition is unavailable, or no longer concatenates to the text
-      pypdf produced -- the alignment premise moved, so touching the text would edit
-      a string this module no longer understands;
-    * no piece actually matched -- nothing to do;
-    * a marker remains after every available repair -- a half-repaired fragment
-      would read as data while still carrying a marker, so it stays UNMAPPED with
-      its text unmodified, which is the published contract for unmapped fragments.
+    This partition is the one sound way to slice fragment text at glyph boundaries.
+    Glyph count can differ from ``len(text)`` (a ``/Differences`` name is one code and
+    four characters), so any consumer slicing text by glyph COUNT is already wrong;
+    slicing at piece boundaries is exact.
     """
     substrings = _glyph_substrings(show)
     if substrings is None:
@@ -256,6 +251,28 @@ def _repaired_text(show: Any, repairs: dict[str, str]) -> str | None:
         pieces = substrings
     if "".join(pieces) != show.text:
         return None
+    return pieces
+
+
+def _repaired_pieces(pieces: list[str], repairs: dict[str, str]) -> list[str] | None:
+    """``pieces`` with every unmapped glyph repaired, or ``None`` -- no change.
+
+    ``repairs`` is already scoped: the caller has matched the document and the font
+    program, so the keys here are glyph names valid for exactly this show's font.
+
+    The replacement is performed per GLYPH, never by string substitution on the
+    joined text: a substring that merely looks like a marker inside an ordinary run
+    must not be rewritten, and the per-glyph partition is what distinguishes "this
+    code decoded to the name /C14" from "these four characters happen to spell it".
+    Only a piece that is a complete standalone marker is eligible.
+
+    Refuses (returns ``None``) rather than repairing when no piece actually matched,
+    or when a marker remains after every available repair -- a half-repaired fragment
+    would read as data while still carrying a marker, so it stays UNMAPPED with its
+    text unmodified, which is the published contract for unmapped fragments. (The
+    third refusal, an unavailable or misaligned partition, is upstream: the caller
+    only reaches here holding real pieces from :func:`_text_pieces`.)
+    """
     repaired: list[str] = []
     changed = False
     for piece in pieces:
@@ -266,10 +283,9 @@ def _repaired_text(show: Any, repairs: dict[str, str]) -> str | None:
             repaired.append(piece)
     if not changed:
         return None
-    text = "".join(repaired)
-    if _UNMAPPED_MARKER_RE.search(text):
+    if _UNMAPPED_MARKER_RE.search("".join(repaired)):
         return None
-    return text
+    return repaired
 
 
 @dataclass(frozen=True)
@@ -353,6 +369,41 @@ class TextFragment:
     outside :func:`extract_fragments` (every synthetic test fixture). Consumers fall
     back to :attr:`x_end`, which restores exactly the pre-field behaviour and fails in
     the refusing direction, because the advance extent is never narrower than the ink."""
+
+    glyph_intervals: tuple[tuple[str, float, float], ...] | None = None
+    """Per-glyph evidence: one ``(text piece, ink x-start, ink x-end)`` per glyph code,
+    in drawing order, in absolute page space -- or ``None`` when not recorded.
+
+    This is EVIDENCE, not a decision. A single show operator can draw the last glyph of
+    one table cell and the first glyph of the next, carrying the inter-column gap as
+    character spacing -- the real target's ``(91)Tj`` with ``13.1949 Tc`` draws ``9``
+    closing one column's value and ``1`` opening the next's, 92 pt apart. Extraction
+    cannot split that safely: it has no footprint, no rows and no table context, and
+    the per-glyph spacing it would need is otherwise discarded during construction. So
+    it records where each glyph's ink actually landed AFTER all spacing and
+    displacement -- final page-space intervals, never raw spacing operands, because
+    ``Tc`` is not the only gap source (``TJ`` displacements and ``Tw`` open internal
+    space too) -- and the split decision lives one layer up, in
+    :func:`carmel.services.pdf_tables.build_inventory`, where the columns exist to
+    judge it against.
+
+    The intervals are the WIDTH each glyph's advance reserves (``w0 * Tfs * Th``,
+    through pypdf's own width lookup), excluding the ``Tc``/``Tw`` charged after it; a
+    space glyph's width is an interval like any other. The text pieces are
+    :func:`_text_pieces`' partition of :attr:`text` -- pieces concatenate to the text
+    exactly, so a consumer can slice at piece boundaries where slicing by glyph count
+    is unsound. Verified on the motivating fragment: the two glyphs land at
+    [130.734, 134.583] and [226.602, 230.451], the second opening exactly where its
+    column's other members sit.
+
+    ``None`` for a rotated show, for a partition that is unavailable or no longer
+    concatenates to the published text, for any non-finite or backwards interval, and
+    for direct construction (synthetic fixtures) -- a strict subset of the situations
+    where consumers already degrade, and never PARTIAL: a fragment carries its whole
+    partition or none of it, and a consumer holding ``None`` must refuse to split
+    rather than guess. Bounded document-wide by :data:`MAX_PDF_GLYPH_INTERVALS`,
+    which truncates the extraction rather than shipping a fragment stripped of its
+    evidence."""
 
 
 @dataclass(frozen=True)
@@ -740,6 +791,29 @@ _PINNED_PYPDF_VERSION = "6.14.2"
 #: while bounding peak retention at ~200 MB -- the same order as the ~381 MB peak the
 #: text lane's own cap was written against.
 MAX_PDF_FRAGMENTS = 1_000_000
+
+#: Hard cap on the total number of per-glyph interval entries one document may record,
+#: counted across all pages, independent of both caps above -- because neither bounds
+#: this: the fragment cap counts SHOWS and the page-content cap counts BYTES, and one
+#: large show under the 6 MB content cap can carry millions of glyphs, each now costing
+#: a retained ``(str, float, float)`` entry. Measured cost of the field at corpus scale
+#: is ~45 bytes per entry (+12.6 MB over the design probe's 276,909 corpus entries); a
+#: cap-saturating document would otherwise cost on the order of 160 MB for this field
+#: alone.
+#:
+#: Sized against the corpus the way the sibling caps are: as shipped, the eight papers
+#: record 274,212 entries in total and the largest single document 46,361 (the shipped
+#: field skips rotated shows and the undecodable partition, hence slightly under the
+#: probe's count), so two million is 43x headroom over the largest legitimate document
+#: in hand while bounding the field's retention at ~91 MB -- inside the ~200 MB ceiling
+#: the other two caps already express.
+#:
+#: Exhaustion TRUNCATES the extraction (``truncated=True, lossy=True``, same channel as
+#: the fragment cap) rather than continuing without the field, deliberately: a fragment
+#: stripped of its evidence would silently lose exactly the sub-fragment structure the
+#: field exists to carry, and `build_inventory` refuses truncated documents wholesale,
+#: which is the fail-closed direction.
+MAX_PDF_GLYPH_INTERVALS = 2_000_000
 
 #: Hard cap on the DECOMPRESSED content-stream bytes of a single page, checked before
 #: pypdf parses it. A page over this is recorded as a page failure and skipped; the rest
@@ -1280,6 +1354,60 @@ def _ink_x_end(show: Any) -> float | None:
     if not ink >= float(show.tx):  # `not >=` rather than `<` so NaN lands here too
         return None
     return ink
+
+
+def _glyph_geometry(show: Any, pieces: list[str]) -> tuple[tuple[str, float, float], ...] | None:
+    """Final page-space ink intervals per glyph, paired with the text pieces, or ``None``.
+
+    The per-glyph unrolling of exactly the arithmetic :func:`_advance` and
+    :func:`_pen_x_after` already apply in aggregate: each glyph's width comes from the
+    same pypdf lookups ``word_tx`` uses (``get_text_width`` per decoded character,
+    ``space_width`` for the space character), its ink interval is that width scaled by
+    ``Tfs``/``Tz`` and projected by ``transform[0]``, and the pen then advances by the
+    width PLUS the ``Tc``/``Tw`` charge -- so the recorded intervals are positions
+    after ALL spacing, never raw spacing operands, and the per-glyph pen lands where
+    the aggregate arithmetic says the show ends (bit-identical on the motivating
+    corpus fragment; equal analytically everywhere, to float summation order).
+
+    ``pieces`` is :func:`_text_pieces`' partition of the PUBLISHED text -- repaired
+    pieces where the repair table applied -- zipped strictly against the decoded
+    substrings that drive the width lookups, so the evidence names the text a consumer
+    will actually slice.
+
+    ``None``, whole-fragment rather than partial, when the partitions disagree in
+    length or any interval comes out non-finite or backwards: evidence this function
+    cannot vouch for is not evidence, and the consumer's fallback (the ink hull, no
+    split) fails toward refusal.
+    """
+    substrings = _glyph_substrings(show)
+    if substrings is None or len(substrings) != len(pieces):
+        return None
+    font = show.font
+    space_char = font.space_char
+    scale = float(show.font_size) / 1000.0
+    tz = float(show.Tz) / 100.0
+    tc = float(show.Tc)
+    tw = float(show.Tw)
+    a = float(show.transform[0])
+    pen = float(show.tx)
+    intervals: list[tuple[str, float, float]] = []
+    for substring, piece in zip(substrings, pieces, strict=True):
+        width = 0.0
+        spaces = 0
+        for character in substring:
+            if character == space_char:
+                width += font.space_width
+                spaces += 1
+            else:
+                width += font.get_text_width(character)
+        ink = width * scale * tz
+        start = pen
+        end = pen + ink * a
+        if not (math.isfinite(start) and math.isfinite(end)) or end < start:
+            return None
+        intervals.append((piece, start, end))
+        pen += (ink + (tc + spaces * tw) * tz) * a
+    return tuple(intervals)
 
 
 class UnsupportedContentConstruct(Exception):
@@ -2380,6 +2508,7 @@ def _page_fragments(
     engine: tuple[Any, ...],
     budget: int,
     repairs: dict[str, dict[str, str]] | None = None,
+    glyph_budget: int = MAX_PDF_GLYPH_INTERVALS,
 ) -> tuple[list[TextFragment], bool]:
     """Recover every text-show operation on one page, with absolute geometry.
 
@@ -2387,6 +2516,10 @@ def _page_fragments(
     :func:`extract_fragments` -- font-program sha256 to {glyph name: replacement} --
     and is empty or ``None`` for every document without a registered entry, which
     keeps the repair path at literally zero cost where it does not apply.
+
+    ``glyph_budget`` bounds the per-glyph interval entries THIS CALL may record; like
+    ``budget`` it is the document-wide cap minus what earlier pages already used, so
+    a single page cannot spend what the document has left.
 
     Stops after ``budget`` fragments and reports that it did, so a single page cannot
     exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own.
@@ -2444,6 +2577,7 @@ def _page_fragments(
     )
 
     fragments: list[TextFragment] = []
+    glyphs_recorded = 0
     # Font-program digests, hashed once per font OBJECT rather than once per show:
     # `_layout_mode_fonts` builds one `Font` per resource name per page, so identity
     # is a safe cache key for the duration of this call and no longer.
@@ -2459,8 +2593,10 @@ def _page_fragments(
         text = show.text
         if not text:
             continue
+        rotated = bool(show.rotated)
+        pieces = _text_pieces(show)
         mapping = GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED
-        if mapping is GlyphMapping.UNMAPPED and repairs:
+        if mapping is GlyphMapping.UNMAPPED and repairs and pieces is not None:
             # Scope order is the safety argument: the DOCUMENT matched before this
             # function was even handed a table, so identifying the font program (an
             # unbounded `get_data`, see `_font_program_sha256`) only ever runs on
@@ -2470,10 +2606,21 @@ def _page_fragments(
             font_sha = font_sha_cache[id(show.font)]
             for_this_font = repairs.get(font_sha) if font_sha is not None else None
             if for_this_font:
-                repaired = _repaired_text(show, for_this_font)
+                repaired = _repaired_pieces(pieces, for_this_font)
                 if repaired is not None:
-                    text = repaired
+                    pieces = repaired
+                    text = "".join(pieces)
                     mapping = GlyphMapping.REPAIRED
+        glyphs = None if rotated or pieces is None else _glyph_geometry(show, pieces)
+        if glyphs is not None:
+            if glyphs_recorded + len(glyphs) > glyph_budget:
+                # Truncate BEFORE this fragment rather than shipping it stripped of
+                # its evidence: a fragment without its partition would silently lose
+                # exactly the sub-fragment structure the field exists to carry. Same
+                # channel as the fragment cap; `build_inventory` refuses truncated
+                # documents wholesale.
+                return fragments, True
+            glyphs_recorded += len(glyphs)
         fragments.append(
             TextFragment(
                 page=page_number,
@@ -2482,9 +2629,10 @@ def _page_fragments(
                 x_end=_pen_x_after(show),
                 baseline_y=float(show.ty),
                 font_height=float(show.font_height),
-                rotated=bool(show.rotated),
+                rotated=rotated,
                 glyph_mapping=mapping,
-                ink_x_end=None if bool(show.rotated) else _ink_x_end(show),
+                ink_x_end=None if rotated else _ink_x_end(show),
+                glyph_intervals=glyphs,
             )
         )
     return fragments, stopped_early
@@ -2564,6 +2712,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
             if repair.document_sha256 == document_sha256:
                 repairs.setdefault(repair.font_program_sha256, {})[repair.glyph_name] = repair.replacement
     fragments: list[TextFragment] = []
+    glyphs_recorded = 0
     failures: list[FragmentPageFailure] = []
     lossy = False
     truncated = False
@@ -2587,7 +2736,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     truncated = True
                     lossy = True
                     break
-                if len(fragments) >= MAX_PDF_FRAGMENTS:
+                if len(fragments) >= MAX_PDF_FRAGMENTS or glyphs_recorded >= MAX_PDF_GLYPH_INTERVALS:
                     # BEFORE parsing, not after. A page that ended exactly ON the cap
                     # leaves a zero budget, and entering with it would pay for the whole
                     # content stream only to report truncation on the way out.
@@ -2596,7 +2745,12 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     break
                 try:
                     page_fragments, hit_budget = _page_fragments(
-                        page, page_number, engine, MAX_PDF_FRAGMENTS - len(fragments), repairs
+                        page,
+                        page_number,
+                        engine,
+                        MAX_PDF_FRAGMENTS - len(fragments),
+                        repairs,
+                        MAX_PDF_GLYPH_INTERVALS - glyphs_recorded,
                     )
                 except _EngineMismatch:
                     # Not a page failure. The engine is wrong, so nothing extracted
@@ -2611,6 +2765,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     lossy = True
                     continue
                 fragments.extend(page_fragments)
+                glyphs_recorded += sum(len(f.glyph_intervals) for f in page_fragments if f.glyph_intervals)
                 if kind is _PageKind.UNINSPECTABLE:
                     # RECORDED, not merely counted as `lossy`, and worded exactly as the
                     # text lane words it. A consumer asking "is page N sound?" reads
