@@ -3,14 +3,22 @@
 
 Every other test module in this repository is synthetic by policy -- corpus paper text is
 copyrighted and non-redistributable, so no document may be checked in. This one is the
-deliberate, narrow exception in the OTHER direction: the three extraction defects this
-branch repairs were measured on one published table, and a suite that never touches that
-table can prove each mechanism while silently failing the page they exist for. The
+deliberate, narrow exception in the OTHER direction: the extraction defects this branch
+repairs were measured on one published table, and a suite that never touches that table
+can prove each mechanism while silently failing the page they exist for. The defects are
+the ink-containment and sub-fragment-split fixes, and the glyph-repair registry, which now
+covers four glyphs of this document: the ``/C14`` degree sign (unmapped), and three glyphs
+a symbol font MIS-DECODES to valid Latin and so nothing else flags -- an en-dash handed
+back as ``e``, a minus handed back as ``L`` inside ``exp(-Ea/RT)``, and the
+equivalence-ratio phi handed back as ``f`` (from two distinct embedded programs). The
 repository still carries no paper: the document is read from the operator's corpus inbox
 at runtime, and every test SKIPS -- never passes -- when it is absent or is not
 byte-for-byte the measured document. What is checked in is a locator (the caption anchor
-and box coordinates, which are this project's own footprint claim, not prose) and the two
-cell values the acceptance criterion names.
+and box coordinates, which are this project's own footprint claim, not prose) and the
+cell values the acceptance criterion names. The caption anchor carries an EN-DASH, not an
+``e``: ``Table 1 - Measurement conditions`` is the corrected caption -- the same en-dash
+repair that fixes the value ranges also fixes the title the box is anchored by, so the
+checked-in ``caption_text`` is a corrected claim, not a transcription of the raw decode.
 
 The expectations here are MEASUREMENTS, not aspirations: each refusal below was observed
 by the read-only census that preceded the implementation, and the joint 9x3/20-cell
@@ -20,20 +28,40 @@ result was observed under all three fixes together before it was promised.
 from __future__ import annotations
 
 import hashlib
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import carmel.services.pdf_fragments as pdf_fragments
+from carmel.paths import default_workspaces_root
 from carmel.services.pdf_fragments import FragmentExtraction, GlyphMapping, extract_fragments
 from carmel.services.pdf_tables import ClaimedFootprint, InventoryRefusalReason, build_inventory
 from tests.pypdf_gate import require_pypdf
 
-#: Where the operator's corpus keeps the target document. Runtime-read, never shipped.
-_DOCUMENT = (
-    Path.home() / "runs/carmel/workspaces/live-syngas/literature_requests/inbox/10.1016-j.ijhydene.2013.10.164.pdf"
-)
+#: Relative location of the target document inside a workspaces root. Runtime-read,
+#: never shipped.
+_DOCUMENT_SUBPATH = "live-syngas/literature_requests/inbox/10.1016-j.ijhydene.2013.10.164.pdf"
+
+#: Workspaces roots to look under, in order. ``default_workspaces_root()`` is the pinned
+#: resolver -- it honours ``$CARMEL_WORKSPACES`` and otherwise returns the packaged
+#: default -- so a machine following the documented layout finds the corpus. The second
+#: entry is the older location some operator corpora still live at; without it this
+#: module would skip on exactly the machines where the measurements were taken. Resolving
+#: by search rather than by a single hard-coded path is why this test can actually RUN
+#: somewhere other than the author's laptop.
+_WORKSPACES_ROOTS = (default_workspaces_root(), Path.home() / "runs/carmel/workspaces")
+
+
+def _locate_document() -> Path | None:
+    """First existing copy of the target document across the known roots, or None."""
+    for root in _WORKSPACES_ROOTS:
+        candidate = root / _DOCUMENT_SUBPATH
+        if candidate.exists():
+            return candidate
+    return None
+
 
 #: The exact bytes every measurement in this module was taken against. A different file
 #: at the same path is a different document, and asserting these expectations against it
@@ -50,20 +78,32 @@ WHOLE_TABLE = ClaimedFootprint(
     x_end=290.0,
     y_top=145.0,
     y_bottom=45.0,
-    caption_text="Table1eMeasurementconditions.",
+    # The caption's separator is the en-dash the /F2 symbol font mis-decodes to 'e'
+    # (see the glyph-repair registry); the repaired anchor reads "Table 1 - Measurement
+    # conditions". This is a corrected claim, not the raw decode "Table1e...".
+    caption_text="Table1–Measurementconditions.",
     caption_x_start=53.0,
     caption_baseline_y=148.8,
 )
 
+#: The same footprint with the caption separator as the raw-decode ``e`` rather than the
+#: repaired en-dash. The ink-containment isolation tests run with the glyph-repair registry
+#: emptied, and that is the same caption coupling seen from the other side: turn the
+#: en-dash repair off and the box's own title reverts to what the document mis-decodes, so
+#: the anchor those runs must match is the uncorrected one.
+WHOLE_TABLE_RAW_CAPTION = replace(WHOLE_TABLE, caption_text="Table1eMeasurementconditions.")
+
 
 def _target_extraction() -> FragmentExtraction:
     require_pypdf()
-    if not _DOCUMENT.exists():
-        pytest.skip(f"target corpus document is not present at {_DOCUMENT}")
-    data = _DOCUMENT.read_bytes()
+    document = _locate_document()
+    if document is None:
+        roots = ", ".join(str(r) for r in _WORKSPACES_ROOTS)
+        pytest.skip(f"target corpus document is not present under any of: {roots}")
+    data = document.read_bytes()
     actual = hashlib.sha256(data).hexdigest()
     if actual != _DOCUMENT_SHA256:
-        pytest.skip(f"document at {_DOCUMENT} is {actual}, not the measured {_DOCUMENT_SHA256}")
+        pytest.skip(f"document at {document} is {actual}, not the measured {_DOCUMENT_SHA256}")
     extraction = extract_fragments(data)
     assert extraction.available, f"the fragment lane refused the target document: {extraction.status}"
     return extraction
@@ -131,7 +171,7 @@ class TestInkContainmentOnTheTargetPage:
             _with_the_degree_glyph_forced_mapped(_without_the_glyph_repair(monkeypatch))
         )
 
-        inventory = build_inventory(extraction, WHOLE_TABLE)
+        inventory = build_inventory(extraction, WHOLE_TABLE_RAW_CAPTION)
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
         assert "resolves 3 blocks where the table resolves 2" in inventory.refusals[0].detail
@@ -139,7 +179,7 @@ class TestInkContainmentOnTheTargetPage:
     def test_without_the_glyph_repair_the_box_refuses_the_unmapped_member(self, monkeypatch) -> None:
         """The refusal chain's middle link, pinned so the order stays observable: ink
         containment alone moves the refusal from the straddler to the unmapped glyph."""
-        inventory = build_inventory(_without_the_glyph_repair(monkeypatch), WHOLE_TABLE)
+        inventory = build_inventory(_without_the_glyph_repair(monkeypatch), WHOLE_TABLE_RAW_CAPTION)
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNMAPPED_MEMBER]
 
@@ -172,11 +212,15 @@ class TestInkContainmentOnTheTargetPage:
             )
 
 
-class TestTheDegreeGlyphRepairOnTheTargetPage:
-    """Commit 2's verifier: the header decodes, and the unmapped-member refusal is gone.
+class TestTheGlyphRepairsOnTheTargetPage:
+    """The glyph-repair registry's verifiers on the real bytes: the degree header
+    decodes and its unmapped-member refusal is gone, and the whole registry stays
+    scoped to exactly the glyphs whose evidence was recorded.
 
-    Deliberately NOT verified by table completion -- completion needs the third fix
-    too, and would anyway be no justification for a glyph mapping.
+    The degree checks are deliberately NOT verified by table completion -- completion
+    needs the sub-fragment split too, and would anyway be no justification for a glyph
+    mapping. The mis-decoded glyphs (en-dash, minus, phi) are asserted at the cell
+    level in :class:`TestJointAcceptance`, where their effect on the table is visible.
     """
 
     def test_the_temperature_header_glyph_decodes_to_the_degree_sign(self) -> None:
@@ -202,19 +246,26 @@ class TestTheDegreeGlyphRepairOnTheTargetPage:
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
 
-    def test_only_the_registered_glyph_is_repaired_anywhere_in_the_document(self) -> None:
-        """The scope doing its work on the real input: one document, one font, one
-        glyph. The document draws that code in that font FOUR times (three prose uses
-        on page 2, the table header on page 4) -- each is the identical conclusion, so
-        each repairs -- and nothing else does: the same font's /C0, /C6 and /C20, for
-        which no evidence was recorded, stay UNMAPPED and keep refusing with their
-        glyph named."""
+    def test_exactly_the_registered_glyphs_are_repaired_document_wide(self) -> None:
+        """The scope doing its work on the real input: every repaired fragment is one of
+        the FOUR registered glyphs and nothing else, document-wide. The degree sign (4x,
+        the only UNMAPPED one), and the three mis-decoded symbol-font glyphs -- the
+        en-dash (188x), the phi (17x, from two embedded programs), and the single minus
+        inside exp(-Ea/RT). Each is the identical evidence-scoped conclusion applied
+        wherever the pinned program draws that code; a mis-decoded glyph repairs on every
+        page it appears, not only in the table, because the conclusion is about the font
+        program and not the page.
+
+        And nothing else is touched: the degree font's other glyphs /C0, /C6 and /C20,
+        for which no evidence was recorded, stay UNMAPPED and keep refusing with their
+        glyph named -- the counts are exact measurements, so a future entry that widened
+        the registry, or a decode that drifted, would move one of them and fail here."""
         extraction = _target_extraction()
 
         repaired = [f for f in extraction.fragments if f.glyph_mapping is GlyphMapping.REPAIRED]
-        assert len(repaired) == 4
-        assert all(f.text == "°" for f in repaired)
-        assert {f.page for f in repaired} == {2, WHOLE_TABLE.page}
+        by_text = Counter(f.text for f in repaired)
+        assert by_text == Counter({"–": 188, "φ": 17, "°": 4, "−": 1})
+        assert len(repaired) == 210
 
         unmapped = {f.text for f in extraction.fragments if f.glyph_mapping is GlyphMapping.UNMAPPED}
         assert unmapped == {"/C0", "/C6", "/C20"}
@@ -232,9 +283,12 @@ class TestJointAcceptance:
         assert len(inventory.column_bounds) == 3
         assert len(inventory.cells) == 20
 
-    def test_the_pressure_row_reads_1e9_beside_1e8(self) -> None:
-        """The row the whole branch exists for: its middle value was drawn by one
-        show operator whose `9` closes this cell and whose `1` opens the next."""
+    def test_the_pressure_row_reads_1_en_9_beside_1_en_8(self) -> None:
+        """The row the whole branch exists for, now reading correctly. Two repairs meet
+        in each cell: the show-operator split (whose `9` closes this cell and whose `1`
+        opens the next) supplies the range endpoints, and the en-dash repair supplies the
+        separator the /F2 symbol font mis-decodes to `e`. So the cell reads `1-9`
+        (1 to 9 atm), not the raw `1e9`, which is neither a pressure nor a range."""
         inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
 
         pressure = [c for c in inventory.cells if any(m.split for m in c.members)]
@@ -243,8 +297,23 @@ class TestJointAcceptance:
         assert len(rows) == 1
         ordinal = rows.pop()
         by_col = {c.col: c.text for c in inventory.cells if c.row == ordinal}
-        assert by_col[1] == "1e9"
-        assert by_col[2] == "1e8"
+        assert by_col[1] == "1–9"
+        assert by_col[2] == "1–8"
+
+    def test_the_equivalence_ratio_row_reads_phi_and_repaired_ranges(self) -> None:
+        """The header the symbol font hid: the label is a phi (U+03C6), not the `f` its
+        `f`-slot decodes to, and its two range values carry the en-dash separator, not
+        `e`. This is the mis-decode fix at the cell level -- every glyph here decoded
+        `successfully` to valid Latin, so without the repair the row would read
+        `f | 0.6e1.0 | 0.5e0.7` and nothing downstream would flag it."""
+        inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
+
+        phi_cell = next(c for c in inventory.cells if "φ" in c.text)
+        assert phi_cell.text == "φ"
+        assert phi_cell.col == 0
+        by_col = {c.col: c.text for c in inventory.cells if c.row == phi_cell.row}
+        assert by_col[1] == "0.6–1.0"
+        assert by_col[2] == "0.5–0.7"
 
     def test_the_temperature_header_row_carries_the_repaired_degree_sign(self) -> None:
         inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
@@ -270,7 +339,9 @@ class TestJointAcceptance:
         # this the one test of the ten that raises FileNotFoundError instead of skipping
         # on a machine without the corpus -- which is every CI runner.
         inventory = build_inventory(_target_extraction(), WHOLE_TABLE)
-        data = _DOCUMENT.read_bytes()
+        document = _locate_document()
+        assert document is not None  # _target_extraction() already skipped if it were
+        data = document.read_bytes()
         payload = inventory_record_payload(inventory, raw_sha256=_hashlib.sha256(data).hexdigest())
 
         result = verify_inventory_record(payload, data)

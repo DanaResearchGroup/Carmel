@@ -417,7 +417,14 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
     A global glyph-name mapping is silent semantic corruption, so every test here is
     about the SCOPE: an entry applies only when the whole document's sha256, the
     embedded font program's sha256 and the decoded glyph name all match, and every
-    partial match leaves the fragment UNMAPPED with its text unmodified.
+    partial match leaves the fragment unrepaired with its text unmodified.
+
+    Two kinds of glyph reach the table. An UNMAPPED one (a `/Differences` name like
+    `/C14`, tested through `_differences_pdf`) surfaces as a marker; a MIS-DECODED one
+    (a symbol font's `f`/`e` slot holding a phi/en-dash, tested through `_winansi_pdf`)
+    decodes to valid Latin and surfaces MAPPED, so nothing else would ever flag it. The
+    mis-decode tests are the ones that prove the repair fires on the font PROGRAM and
+    not on the character -- the same `e` from an unregistered program is left alone.
     """
 
     FONT_PROGRAM = b"synthetic-font-program-bytes"
@@ -450,6 +457,44 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
                 + str(len(self.FONT_PROGRAM)).encode()
                 + b" /Subtype /Type1C >>\nstream\n"
                 + self.FONT_PROGRAM
+                + b"\nendstream"
+            )
+        return _pdf(objects)
+
+    def _winansi_pdf(self, *programs: bytes) -> bytes:
+        """One page drawing byte 0x65 (``e``) once per embedded program, each from its
+        own WinAnsi Type1 font with a real ``/FontFile3``. No ``/Differences`` and no
+        ``/ToUnicode``: the byte decodes to a literal ``e`` by the base encoding alone --
+        the synthetic analogue of a symbol font whose ``e`` slot draws an en-dash. Each
+        show sits on its own baseline (700, 688, 676, ...) so a test can tell the
+        fragment from one program apart from another's identical ``e``."""
+        shows = b"".join(
+            f"BT /F{i} 10 Tf 72 {700 - 12 * i} Td (e) Tj ET\n".encode("latin-1") for i in range(len(programs))
+        )
+        font_refs = b" ".join(f"/F{i} {5 + 3 * i} 0 R".encode() for i in range(len(programs)))
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << " + font_refs + b" >> >> /Contents 4 0 R >>",
+            b"<< /Length " + str(len(shows)).encode() + b" >>\nstream\n" + shows + b"\nendstream",
+        ]
+        for i, program in enumerate(programs):
+            # objects 5,6,7 for F0; 8,9,10 for F1; ... font / descriptor / program.
+            objects.append(
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding "
+                b"/FontDescriptor " + str(6 + 3 * i).encode() + b" 0 R >>"
+            )
+            objects.append(
+                b"<< /Type /FontDescriptor /FontName /Synth /Flags 32 /FontFile3 "
+                + str(7 + 3 * i).encode()
+                + b" 0 R >>"
+            )
+            objects.append(
+                b"<< /Length "
+                + str(len(program)).encode()
+                + b" /Subtype /Type1C >>\nstream\n"
+                + program
                 + b"\nendstream"
             )
         return _pdf(objects)
@@ -542,6 +587,70 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         assert frag.glyph_mapping is GlyphMapping.UNMAPPED
         assert frag.text == "/C14/C15"
 
+    def test_a_symbol_font_glyph_decoding_to_valid_latin_is_caught_not_passed_through(self, monkeypatch) -> None:
+        """The mis-decode case: the glyph decodes `successfully` to a literal `e`, so it
+        arrives MAPPED and every structural check passes it through as data. Registered
+        by document + program + name, it is REPAIRED to the en-dash instead -- caught,
+        with Carmel's conclusion named, never silently accepted as an `e`."""
+        require_pypdf()
+        program = self.FONT_PROGRAM + b"-endash"
+        pdf = self._winansi_pdf(program)
+        import hashlib
+
+        before = _by_text(extract_fragments(pdf).fragments, "e")
+        assert before.glyph_mapping is GlyphMapping.MAPPED, "premise: the raw decode is a valid, unflagged 'e'"
+        monkeypatch.setattr(
+            pdf_fragments,
+            "_GLYPH_REPAIRS",
+            (
+                self._repair(
+                    pdf,
+                    font_program_sha256=hashlib.sha256(program).hexdigest(),
+                    glyph_name="e",
+                    replacement="–",
+                ),
+            ),
+        )
+
+        frag = _by_text(extract_fragments(pdf).fragments, "–")
+
+        assert frag.glyph_mapping is GlyphMapping.REPAIRED
+        assert not any(f.text == "e" for f in extract_fragments(pdf).fragments)
+
+    def test_the_same_latin_char_from_an_unregistered_program_is_left_alone(self, monkeypatch) -> None:
+        """The proof that the repair is NOT a global `e` -> en-dash substitution. Two
+        fonts on one page both draw a plain `e`; only ONE program's is registered. The
+        registered `e` becomes an en-dash; the other stays exactly `e`, MAPPED. A repair
+        keyed on the character rather than the font program would rewrite both -- silent
+        corruption of the correct one."""
+        require_pypdf()
+        registered = self.FONT_PROGRAM + b"-A"
+        innocent = self.FONT_PROGRAM + b"-B"
+        pdf = self._winansi_pdf(registered, innocent)
+        import hashlib
+
+        monkeypatch.setattr(
+            pdf_fragments,
+            "_GLYPH_REPAIRS",
+            (
+                self._repair(
+                    pdf,
+                    font_program_sha256=hashlib.sha256(registered).hexdigest(),
+                    glyph_name="e",
+                    replacement="–",
+                ),
+            ),
+        )
+
+        fragments = extract_fragments(pdf).fragments
+        endash = _by_text(fragments, "–")
+        innocent_e = _by_text(fragments, "e")
+        # The registered show sits on baseline 700 (i=0), the innocent on 688 (i=1).
+        assert endash.baseline_y == pytest.approx(700.0, abs=1.0)
+        assert endash.glyph_mapping is GlyphMapping.REPAIRED
+        assert innocent_e.baseline_y == pytest.approx(688.0, abs=1.0)
+        assert innocent_e.glyph_mapping is GlyphMapping.MAPPED
+
     def test_an_empty_registry_costs_nothing_and_changes_nothing(self, monkeypatch) -> None:
         require_pypdf()
         pdf = self._differences_pdf()
@@ -553,15 +662,25 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         assert frag.text == "/C14"
 
     def test_the_shipped_registry_is_scoped_on_every_axis(self) -> None:
-        """Whatever entries ship, each must carry a full 64-hex document AND font
-        program scope, a marker-shaped glyph name, a non-marker replacement, and
-        recorded evidence. This is the shape that makes a global mapping
-        unregisterable, pinned against the live table rather than stated in prose."""
+        """Whatever entries ship, each must carry a full 64-hex document AND font program
+        scope, a glyph name that can only match one glyph, a non-marker replacement, and
+        recorded evidence. This is the shape that makes a global mapping unregisterable,
+        pinned against the live table rather than stated in prose.
+
+        The glyph name is either an unmapped MARKER (`/C14`) or a SINGLE character (the
+        mis-decoded `e`/`f`/`L`): both match exactly one glyph piece, because a piece is
+        one glyph's decode and a multi-character non-marker key could otherwise be
+        mistaken for a substring of ordinary text. What it must never be is a bare
+        multi-character string, which is why the length-one branch is asserted, not
+        merely allowed."""
         assert pdf_fragments._GLYPH_REPAIRS, "the registry ships at least the /C14 entry"
         for entry in pdf_fragments._GLYPH_REPAIRS:
             assert len(entry.document_sha256) == 64 and all(c in "0123456789abcdef" for c in entry.document_sha256)
             assert len(entry.font_program_sha256) == 64
-            assert pdf_fragments._UNMAPPED_MARKER_RE.fullmatch(entry.glyph_name)
+            is_marker = bool(pdf_fragments._UNMAPPED_MARKER_RE.fullmatch(entry.glyph_name))
+            assert is_marker or len(entry.glyph_name) == 1, (
+                "a glyph name that is neither a marker nor a single character could match a substring of ordinary text"
+            )
             assert entry.replacement
             assert not pdf_fragments._UNMAPPED_MARKER_RE.search(entry.replacement)
             assert len(entry.evidence) > 100, "an entry without recorded evidence is a guess"

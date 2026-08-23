@@ -145,12 +145,30 @@ class GlyphRepair:
       the program that draws it, so this is the identity the conclusion is actually
       ABOUT; the document scope narrows it further rather than standing in for it.
     * ``glyph_name`` -- the decoded per-glyph substring the fragment lane produces
-      for the code (``/C14``), which is the font's own ``/Differences`` name.
+      for the code, matched against ONE glyph piece at a time. For a glyph the
+      document leaves unmapped this is the font's own ``/Differences`` name (``/C14``),
+      an unmapped MARKER; for a glyph the document mis-decodes it is the wrong
+      character the font hands back (a symbol font's ``f`` slot holds a phi, so the
+      piece is a literal ``f``). Either way the match is per PIECE, and a piece is
+      exactly one glyph's decode -- ordinary text that merely SPELLS ``f`` or ``/C14``
+      arrives as several pieces and cannot match. That per-glyph partition, together
+      with the two scopes above, is what makes matching on a bare ``f`` a
+      font-program-and-code conclusion and NOT a global ``f`` -> phi substitution: the
+      entry fires only on the one embedded program's one glyph, in the one document.
+
+    Two kinds of glyph therefore reach this table, and they surface differently on the
+    way IN but identically on the way OUT. An UNMAPPED glyph (marker piece) is one the
+    document never decoded; a MIS-DECODED glyph (valid-Latin piece) is one the document
+    decoded to the wrong character -- a symbol font handing back ``f``/``e`` that no
+    ``/ToUnicode`` and no ``/Differences`` contradict, so nothing downstream flags it.
+    The mis-decoded case is the more dangerous of the two precisely because it reads as
+    clean data; it is caught here only because the embedded program that draws it is
+    pinned by sha256 and its glyph identified by outline (see each entry's evidence).
 
     A repaired fragment surfaces as :attr:`GlyphMapping.REPAIRED`, never ``MAPPED``,
-    and a fragment whose markers are not ALL covered by matching entries keeps its
-    text unmodified and stays ``UNMAPPED`` -- a half-repaired string would read as
-    data while still carrying a marker. Where the evidence does not support a
+    and an UNMAPPED fragment whose markers are not ALL covered by matching entries
+    keeps its text unmodified and stays ``UNMAPPED`` -- a half-repaired string would
+    read as data while still carrying a marker. Where the evidence does not support a
     mapping, the honest entry is NO entry: the fragment then refuses downstream with
     the glyph named, which is a better outcome than a guess.
     """
@@ -195,6 +213,110 @@ _GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
             "WHITE CIRCLE is full-size). No neighbouring text was used to reach the "
             "conclusion; that the repaired header reads 'T (°C)' is corroboration, "
             "not evidence."
+        ),
+    ),
+    GlyphRepair(
+        # Same document, Table 1. Its equivalence-ratio column header, and the caption
+        # ("Table 1 <glyph> Measurement conditions"), and the ranges "0.6<glyph>1.0"
+        # etc., all draw an en-dash from the /F2 symbol font whose WinAnsi 'e' slot
+        # holds it. The document decodes it to a literal 'e' -- valid Latin, so it
+        # surfaces MAPPED and nothing flags it. 188 glyphs in this document.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="08ab6520b901000f5ccd4ff5cf535ccde7465ce0d985ff38d7258e3574e93f40",
+        font_base_name="NNEIEF+AdvPS44A44B",
+        glyph_name="e",
+        replacement="–",
+        evidence=(
+            "Read from the document itself. (1) The font carries WinAnsiEncoding with "
+            "NO /ToUnicode and NO /Encoding /Differences, so byte 0x65 decodes to 'e' "
+            "purely by the base encoding -- the font asserts no Unicode of its own; its "
+            "/Flags are 32 (Nonsymbolic), and even the embedded CFF names the glyph 'e'. "
+            "Every name and flag AGREES with 'e'; only the outline disagrees. (2) The "
+            "embedded 363-byte CFF program (sha256 above; charset ['.notdef','L','e'], a "
+            "two-glyph symbol subset) draws 'e' as a SINGLE contour, bbox [50,700]x"
+            "[274,326] in the 1000-unit em, advance width 750: a 650-unit horizontal bar "
+            "52 units tall, floating on the math axis and never touching the baseline. A "
+            "genuine 'e' (the body font's, for contrast) is a two-contour bowl on the "
+            "baseline, bbox [47,509]x[-11,528]. A bar this wide excludes a hyphen (short, "
+            "low); at 0.65 em it excludes an em-dash (~1 em). It is a dash-class mark; "
+            "read as an en-dash U+2013 because this glyph is the document's range and "
+            "caption separator (its math-axis sibling 'L', used once inside exp(-Ea/RT), "
+            "is the minus -- separate entry). That the repaired caption reads "
+            "'Table 1 - Measurement conditions' and the ranges read '0.6-1.0' is "
+            "corroboration, not evidence."
+        ),
+    ),
+    GlyphRepair(
+        # Same document. The one occurrence of the /F2 symbol font's OTHER glyph, its
+        # WinAnsi 'L' slot, drawn once inside a rate expression "[A T^n exp(<glyph>Ea/
+        # RT)]" on p8. Decodes to a literal 'L'; a bar read as a capital L inside an
+        # Arrhenius exponent is a silent sign that is not even a sign.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="08ab6520b901000f5ccd4ff5cf535ccde7465ce0d985ff38d7258e3574e93f40",
+        font_base_name="NNEIEF+AdvPS44A44B",
+        glyph_name="L",
+        replacement="−",
+        evidence=(
+            "Same 363-byte CFF program as the en-dash entry above (charset "
+            "['.notdef','L','e']); WinAnsi, no /ToUnicode, no /Differences, /Flags 32, "
+            "CFF glyph name 'L' -- every name and flag agrees with 'L', only the outline "
+            "disagrees. The 'L' glyph is a SINGLE contour, bbox [170,830]x[261,339], "
+            "advance width unread here but the ink is a 660-unit horizontal bar 78 units "
+            "tall centred on the math axis (y 261-339) -- structurally a dash/minus, not "
+            "a letter L (which is a baseline-to-cap vertical plus a foot). Excludes "
+            "hyphen (too wide) and em-dash (~1 em). Distinguished from its sibling 'e' "
+            "en-dash by placement AND role: this glyph occurs once, between 'exp(' and "
+            "'Ea/RT', i.e. as the operator of exp(-Ea/RT). A minus sign U+2212 (the math "
+            "operator), not U+2013; the mathematical position is the one place the "
+            "outline alone cannot choose between the two dash-class marks and the role "
+            "decides."
+        ),
+    ),
+    GlyphRepair(
+        # Same document, Table 1 equivalence-ratio header cell (p4). The label phi is
+        # drawn from the /F13 symbol font whose WinAnsi 'f' slot holds it; decodes to a
+        # literal 'f'. Surfaces MAPPED.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="45b1e0bf5d9e3a6e5e7af5f2b83ba95e1b19696d7eb4a0cea93dd412c80df3ac",
+        font_base_name="NNEJBM+AdvPS4721B4",
+        glyph_name="f",
+        replacement="φ",
+        evidence=(
+            "Read from the document. (1) WinAnsiEncoding, no /ToUnicode, no /Differences; "
+            "byte 0x66 decodes to 'f' by base encoding alone; /Flags 32 (Nonsymbolic); "
+            "the embedded CFF even names the glyph 'f'. Every name and flag agrees with "
+            "'f'; only the outline disagrees. (2) The embedded 533-byte CFF program "
+            "(sha256 above; charset ['.notdef','f','g']) draws 'f' with THREE contours, "
+            "bbox [44,564]x[-189,660] in the 1000-unit em, advance width 604: a bowl "
+            "(outer + inner counter = two contours) crossed by a vertical stroke that "
+            "DESCENDS to y=-189, well below the baseline. A genuine 'f' (body font, for "
+            "contrast) is a SINGLE contour, bbox [47,436]x[0,777], with no descender at "
+            "all. A circular bowl with a counter and a descending vertical stroke is a "
+            "phi U+03C6; the deep descender excludes every Latin letter, and the closed "
+            "bowl excludes the descenderless 'f' the byte decodes to. That the repaired "
+            "header labels an equivalence-ratio column is corroboration, not evidence."
+        ),
+    ),
+    GlyphRepair(
+        # Same document. A SECOND symbol font (AdvPS3ECA66) whose 'f' slot also holds a
+        # phi, drawn in the body text on pages 5-11 (11 occurrences), NOT in the table.
+        # Registered so the document reports phi uniformly: a paper that renders phi
+        # correctly in one place and as 'f' in another is worse than one uniformly
+        # wrong. Same fault, distinct embedded program, distinct sha256.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="22a1e061856b2e27b6d4997553c4f76538889b56abdef7fa05ec049538e42605",
+        font_base_name="NNFAME+AdvPS3ECA66",
+        glyph_name="f",
+        replacement="φ",
+        evidence=(
+            "Read from the document. WinAnsiEncoding, no /ToUnicode, no /Differences, "
+            "byte 0x66 -> 'f' by base encoding; /Flags 32; CFF glyph name 'f'. The "
+            "embedded 439-byte CFF program (sha256 above; charset ['.notdef','f'], a "
+            "one-glyph symbol subset) draws 'f' with THREE contours, bbox [44,624]x"
+            "[-189,664], advance width 666: the same bowl-plus-descending-stroke as the "
+            "/F13 phi above, descender to y=-189. Contrast the body 'f': one contour, no "
+            "descender. A phi U+03C6, on the same outline grounds. Used on pages 5-11 as "
+            "the equivalence-ratio symbol in running text."
         ),
     ),
 )
@@ -255,28 +377,36 @@ def _text_pieces(show: Any) -> list[str] | None:
 
 
 def _repaired_pieces(pieces: list[str], repairs: dict[str, str]) -> list[str] | None:
-    """``pieces`` with every unmapped glyph repaired, or ``None`` -- no change.
+    """``pieces`` with every registered glyph repaired, or ``None`` -- no change.
 
     ``repairs`` is already scoped: the caller has matched the document and the font
-    program, so the keys here are glyph names valid for exactly this show's font.
+    program, so the keys here are glyph names valid for exactly this show's font
+    program -- a bare ``f`` key means "the glyph THIS program draws at the code that
+    decodes to f", not "any f anywhere".
 
-    The replacement is performed per GLYPH, never by string substitution on the
-    joined text: a substring that merely looks like a marker inside an ordinary run
-    must not be rewritten, and the per-glyph partition is what distinguishes "this
-    code decoded to the name /C14" from "these four characters happen to spell it".
-    Only a piece that is a complete standalone marker is eligible.
+    The replacement is performed per GLYPH, never by string substitution on the joined
+    text, and that is the whole safety argument. A piece is exactly one glyph's decode
+    (:func:`_text_pieces`), so a key that is a marker (``/C14``) matches only a glyph
+    that decoded to that marker, and a key that is a plain character (``f``) matches
+    only a glyph that decoded to that one character -- ordinary text that merely SPELLS
+    ``f`` or ``/C14`` arrives as several pieces and cannot match. There is deliberately
+    no "only a marker is eligible" gate: the mis-decoded glyphs this table also repairs
+    (a symbol font's ``f`` that is really a phi) are valid Latin, never markers, and the
+    font-program scope -- not the shape of the piece -- is what bounds the match.
 
-    Refuses (returns ``None``) rather than repairing when no piece actually matched,
-    or when a marker remains after every available repair -- a half-repaired fragment
-    would read as data while still carrying a marker, so it stays UNMAPPED with its
-    text unmodified, which is the published contract for unmapped fragments. (The
-    third refusal, an unavailable or misaligned partition, is upstream: the caller
-    only reaches here holding real pieces from :func:`_text_pieces`.)
+    Refuses (returns ``None``) rather than repairing when no piece actually matched, or
+    when an unmapped MARKER remains after every available repair -- a half-repaired
+    fragment would read as data while still carrying a marker, so it stays UNMAPPED with
+    its text unmodified, which is the published contract for unmapped fragments. A
+    fragment that carried no marker to begin with (the mis-decoded case) has nothing for
+    that check to trip on and is repaired outright. (The third refusal, an unavailable
+    or misaligned partition, is upstream: the caller only reaches here holding real
+    pieces from :func:`_text_pieces`.)
     """
     repaired: list[str] = []
     changed = False
     for piece in pieces:
-        if piece in repairs and _UNMAPPED_MARKER_RE.fullmatch(piece):
+        if piece in repairs:
             repaired.append(repairs[piece])
             changed = True
         else:
@@ -2596,7 +2726,13 @@ def _page_fragments(
         rotated = bool(show.rotated)
         pieces = _text_pieces(show)
         mapping = GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED
-        if mapping is GlyphMapping.UNMAPPED and repairs and pieces is not None:
+        if repairs and pieces is not None:
+            # Attempted whether the show is UNMAPPED or MAPPED: the fault this table also
+            # covers -- a symbol font decoding a phi to a literal 'f' -- surfaces MAPPED,
+            # so gating on UNMAPPED would skip exactly the mis-decoded glyphs. `repairs`
+            # is empty for every document but the registered ones, so an unregistered
+            # document still does no per-show work here.
+            #
             # Scope order is the safety argument: the DOCUMENT matched before this
             # function was even handed a table, so identifying the font program (an
             # unbounded `get_data`, see `_font_program_sha256`) only ever runs on
