@@ -440,6 +440,31 @@ class CellInventory:
             )
 
 
+def _ink_x_end(fragment: TextFragment) -> float:
+    """The x this fragment's drawn ink ends at, falling back to its advance extent.
+
+    Every horizontal judgement in this module reads THIS, not ``fragment.x_end``, and
+    the distinction was measured before it was made: character spacing charges after
+    the last glyph too, so a fragment's advance extent can reach far past anything it
+    drew -- 92.019 pt past, on the real target table's pressure-row value, which the
+    containment test then refused for spacing it never printed. The questions this
+    module asks -- is this fragment inside the box, did an edge cut it, does it sit in
+    a derived column, what x-interval does it occupy -- are all questions about INK.
+
+    The fallback to ``x_end`` is exact, not approximate: a fragment without a measured
+    ink extent (a synthetic fixture, or the one decode shape the fragment lane cannot
+    partition per glyph) is judged by its advance extent, which is never narrower than
+    the ink, so every fallback errs toward refusal -- and restores this module's
+    pre-``ink_x_end`` behaviour bit for bit.
+
+    One reader deliberately does NOT go through this: nothing here. The advance extent
+    stays published and stays what ``pdf_cells`` and the clip guard read, because "how
+    far does this fragment reach" and "what does this fragment occupy" are different
+    questions with different fail-closed directions.
+    """
+    return fragment.x_end if fragment.ink_x_end is None else fragment.ink_x_end
+
+
 def _is_finite(*values: float) -> bool:
     return all(math.isfinite(v) for v in values)
 
@@ -500,7 +525,7 @@ def _caption_anchored(extraction: FragmentExtraction, footprint: ClaimedFootprin
         if f.page == footprint.page
         and math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=_BAND_TOLERANCE_PT)
         and f.x_start >= footprint.x_start
-        and f.x_end <= footprint.x_end
+        and _ink_x_end(f) <= footprint.x_end
     ]
     if not band:
         return False
@@ -524,7 +549,7 @@ def _in_footprint(extraction: FragmentExtraction, footprint: ClaimedFootprint) -
         for f in extraction.fragments
         if f.page == footprint.page
         and f.x_start >= footprint.x_start
-        and f.x_end <= footprint.x_end
+        and _ink_x_end(f) <= footprint.x_end
         and footprint.y_bottom <= f.baseline_y <= footprint.y_top
     ]
 
@@ -591,6 +616,15 @@ def _has_comparable_geometry(fragment: TextFragment) -> bool:
         _is_finite(fragment.x_start, fragment.x_end, fragment.baseline_y, fragment.font_height)
         and fragment.x_start <= fragment.x_end
         and fragment.font_height > 0.0
+        # The ink extent joins the predicate the moment it joins the comparisons: every
+        # horizontal judgement in this module now reads `_ink_x_end`, so a NaN or
+        # backwards `ink_x_end` is the same every-comparison-quietly-False fault the
+        # four patches above kept rediscovering, arriving through the new field. `None`
+        # stays legal -- it means "unmeasured, judge by the advance extent", which is a
+        # fallback, not an unreadable number.
+        and (
+            fragment.ink_x_end is None or (math.isfinite(fragment.ink_x_end) and fragment.x_start <= fragment.ink_x_end)
+        )
     )
 
 
@@ -666,7 +700,7 @@ def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprin
         and f.text.strip()
         and not f.rotated
         and footprint.y_bottom <= f.baseline_y <= footprint.y_top
-        and (f.x_start < footprint.x_start < f.x_end or f.x_start < footprint.x_end < f.x_end)
+        and (f.x_start < footprint.x_start < _ink_x_end(f) or f.x_start < footprint.x_end < _ink_x_end(f))
     ]
     if not cut:
         return None
@@ -732,8 +766,8 @@ def _is_adjacent_to(band: list[TextFragment], other: list[TextFragment]) -> bool
     if not other:
         return False
     left = min(f.x_start for f in other) - COLUMN_VALLEY_PT
-    right = max(f.x_end for f in other) + COLUMN_VALLEY_PT
-    return all(f.x_end >= left and f.x_start <= right for f in band)
+    right = max(_ink_x_end(f) for f in other) + COLUMN_VALLEY_PT
+    return all(_ink_x_end(f) >= left and f.x_start <= right for f in band)
 
 
 def _looks_like_affix(band: list[TextFragment], neighbour: list[TextFragment]) -> bool:
@@ -823,7 +857,7 @@ def _column_bounds(
     not the next is a word space, and probe 6 measured those as a population that does
     not reach 4 pt.
     """
-    spans = sorted((f.x_start, f.x_end) for _, members, _ in rows for f in members)
+    spans = sorted((f.x_start, _ink_x_end(f)) for _, members, _ in rows for f in members)
     if not spans:
         return []
     blocks: list[list[float]] = [[spans[0][0], spans[0][1]]]
@@ -884,7 +918,7 @@ def _orphan_below_refusal(
         and f.text.strip()
         and f.glyph_mapping is GlyphMapping.MAPPED
         and footprint.y_bottom - pitch <= f.baseline_y < footprint.y_bottom
-        and any(left <= f.x_start and f.x_end <= right for left, right in bounds)
+        and any(left <= f.x_start and _ink_x_end(f) <= right for left, right in bounds)
     ]
     if not cut:
         return None
@@ -1049,7 +1083,7 @@ def _truncated_column_refusal(
     for f in extraction.fragments:
         if f.page != footprint.page or not f.text.strip() or f.rotated:
             continue
-        if not (f.x_end <= footprint.x_start or f.x_start >= footprint.x_end):
+        if not (_ink_x_end(f) <= footprint.x_start or f.x_start >= footprint.x_end):
             continue
         matched = [
             ordinal
@@ -1167,7 +1201,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
         # caption as a band the caller cut off the top. Same tolerance as
         # `_caption_anchored`, because it must be the same band.
         and not math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=_BAND_TOLERANCE_PT)
-        and f.x_end >= footprint.x_start
+        and _ink_x_end(f) >= footprint.x_start
         and f.x_start <= footprint.x_end
     ]
     if orphaned:
@@ -1251,7 +1285,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
         row_cells: list[InventoryCell] = []
         for col, (left, right) in enumerate(bounds):
             in_cell = sorted(
-                (f for f in members if f.x_start >= left and f.x_end <= right),
+                (f for f in members if f.x_start >= left and _ink_x_end(f) <= right),
                 key=lambda f: f.x_start,
             )
             if not in_cell:
@@ -1265,7 +1299,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                     col=col,
                     text="".join(f.text for f in in_cell),
                     x_start=min(f.x_start for f in in_cell),
-                    x_end=max(f.x_end for f in in_cell),
+                    x_end=max(_ink_x_end(f) for f in in_cell),
                     members=tuple(in_cell),
                 )
             )

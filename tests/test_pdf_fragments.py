@@ -328,6 +328,100 @@ class TestCharacterSpacingIsChargedPerGlyph:
         assert (spaced.x_end - spaced.x_start) - (plain.x_end - plain.x_start) == pytest.approx(6.0)
 
 
+class TestTheInkExtentStopsAtTheLastGlyph:
+    """``ink_x_end`` is ``x_end`` minus exactly the spacing charged past the final glyph.
+
+    The advance extent includes that trailing charge because the PDF operator does; on
+    the real corpus table this made one fragment read 92.019 pt wider than its ink and
+    refused the whole table's containment. Every test here asserts the two extents
+    TOGETHER, because the invariant is a relation: the advance extent must not move
+    (callers that need the pen position keep it), and the ink extent must differ from it
+    by precisely the trailing charge and nothing else.
+    """
+
+    SPACING = 4.0
+
+    def test_unspaced_text_has_identical_ink_and_advance(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Hello) Tj\nET"), "Hello")
+        assert frag.ink_x_end == frag.x_end
+
+    def test_character_spacing_trails_by_exactly_one_charge(self) -> None:
+        """Five glyphs owe five ``Tc``, and the ink excludes ONE of them -- the last."""
+        require_pypdf()
+        plain = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (ABCDE) Tj\nET"), "ABCDE")
+        spaced = _by_text(_fragments(f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (ABCDE) Tj\nET"), "ABCDE")
+        assert spaced.x_end - plain.x_end == pytest.approx(5 * self.SPACING), "the advance extent moved"
+        assert spaced.x_end - spaced.ink_x_end == pytest.approx(self.SPACING)
+
+    def test_a_trailing_space_glyph_charges_word_spacing_too(self) -> None:
+        """A show ending in a space owes ``Tw`` after that space's width as well."""
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n6 Tw\n72 700 Td (A B ) Tj\nET"), "A B")
+        assert frag.x_end - frag.ink_x_end == pytest.approx(6.0)
+
+    def test_horizontal_scaling_scales_the_trailing_charge(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments(f"BT /F1 10 Tf\n50 Tz\n{self.SPACING} Tc\n72 700 Td (ABCDE) Tj\nET"), "ABCDE")
+        assert frag.x_end - frag.ink_x_end == pytest.approx(self.SPACING * 0.5)
+
+    def test_a_scaled_text_matrix_scales_the_trailing_charge(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments(f"BT /F1 1 Tf\n{self.SPACING} Tc\n3 0 0 3 72 700 Tm (ABCDE) Tj\nET"), "ABCDE")
+        assert frag.x_end - frag.ink_x_end == pytest.approx(self.SPACING * 3.0)
+
+    def test_a_placeholder_final_glyph_owes_one_trailing_charge_not_its_spelling(self) -> None:
+        """The trailing glyph of a ``/Differences`` run is ONE code, however it spells.
+
+        The sibling of the per-glyph `Tc` count above: the final code decodes to the
+        four-character name ``/C21``, and subtracting a per-CHARACTER trailing charge
+        would take four spacings where one is owed.
+        """
+        require_pypdf()
+        stream = f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (\x20\x21) Tj\nET".encode("latin-1")
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+                b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+                b"<< /Type /Encoding /Differences [32 /C20 /C21] >> >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        assert result.available is True and result.lossy is False
+        frag = _by_text(result.fragments, "/C20/C21")
+        assert frag.ink_x_end is not None
+        assert frag.x_end - frag.ink_x_end == pytest.approx(self.SPACING)
+
+    def test_rotated_text_carries_no_ink_extent(self) -> None:
+        """A rotated show's x-projection is meaningless; the new field declines to exist
+        rather than shipping a number with a warning attached, unlike ``x_end`` which
+        predates that option."""
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n0 1 -1 0 300 400 Tm (rotated) Tj\nET"))
+        frag = _by_text(result.fragments, "rotated")
+        assert frag.rotated is True
+        assert frag.ink_x_end is None
+
+    def test_a_directly_built_fragment_defaults_to_no_ink_extent(self) -> None:
+        """Synthetic fixtures predate the field; ``None`` must mean "judge by advance",
+        so their behaviour under every consumer is exactly the pre-field behaviour."""
+        fragment = pdf_fragments.TextFragment(
+            page=1,
+            text="x",
+            x_start=1.0,
+            x_end=2.0,
+            baseline_y=3.0,
+            font_height=4.0,
+            rotated=False,
+            glyph_mapping=GlyphMapping.MAPPED,
+        )
+        assert fragment.ink_x_end is None
+
+
 class TestPageNumbering:
     def test_a_phantom_page_tree_entry_does_not_shift_page_numbers(self) -> None:
         """pypdf counts a linearization dictionary as a page on real corpus papers.

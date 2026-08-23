@@ -158,6 +158,38 @@ class TextFragment:
 
     glyph_mapping: GlyphMapping
 
+    ink_x_end: float | None = None
+    """Absolute page-space x where the last glyph's own advance width ends -- the
+    fragment's INK extent, as opposed to :attr:`x_end`, its ADVANCE extent.
+
+    The two differ because the PDF text-space displacement charges character spacing
+    (and word spacing, on a space) after EVERY glyph including the last (ISO 32000-1
+    9.4.4), so ``x_end`` reaches one full character space past anything the fragment
+    drew. On body text that trailing charge is zero and the two are equal; on a
+    ``Tc``-spaced run it is not, and the gap is not small: the real corpus table this
+    was built against carries a two-glyph show whose advance extent is 191.736 pt while
+    its ink ends 92.019 pt earlier. A containment test that reads ``x_end`` refuses
+    that fragment for spacing it never drew.
+
+    Both extents are published because they answer different questions and each has
+    call sites that need it. ``x_end`` is where the NEXT show starts, the fail-closed
+    reading for anything that must not undercount a fragment's reach (the clip guard,
+    ``pdf_cells``' neighbour geometry); this one is what the fragment actually
+    occupies, the honest reading for containment and cut tests in
+    :mod:`carmel.services.pdf_tables`.
+
+    This is the extent of the last glyph's WIDTH, not a drawn-pixels bound: a glyph
+    box is still the em-square estimate it always was, internal spacing is still
+    inside the span, and a trailing SPACE glyph's width counts as ink here (its width
+    is what the document reserves for it; erring wide costs a refusal, not a
+    publication).
+
+    ``None`` when the per-glyph decomposition needed to charge the trailing spacing is
+    unavailable -- a dict-encoded show with an undecodable byte, or a fragment built
+    outside :func:`extract_fragments` (every synthetic test fixture). Consumers fall
+    back to :attr:`x_end`, which restores exactly the pre-field behaviour and fails in
+    the refusing direction, because the advance extent is never narrower than the ink."""
+
 
 @dataclass(frozen=True)
 class FragmentPageFailure:
@@ -522,6 +554,10 @@ _REQUIRED_PARAM_ATTRS = (
     "Tc",
     "Tz",
     "transform",
+    # Read by `_ink_x_end` to charge the trailing word spacing when the final glyph is
+    # a space. `Tc`/`Tz`/`transform`/`tx` were already listed for the sibling
+    # corrections; `Tw` is the one the ink extent adds.
+    "Tw",
 )
 
 _PINNED_PYPDF_VERSION = "6.14.2"
@@ -917,9 +953,13 @@ def _pen_x_after(show: Any) -> float:
 
     * The pen position INCLUDES the trailing ``Tc`` after the final glyph, because that
       is what the PDF operator does and what ``displaced_tx`` is documented to mean. It
-      is therefore past the last glyph's ink by one character space. For a containment
-      test that is the fail-closed direction -- a fragment reads WIDER than its ink, so
-      a region that does not really contain it refuses.
+      is therefore past the last glyph's ink by one character space. That stays the
+      right number for THIS function -- the pen is where the next show starts -- and it
+      stays fail-closed for a consumer that must not undercount a fragment's reach. It
+      is no longer the only extent published: a containment test reading it refused a
+      real table over 92 pt of trailing spacing the fragment never drew, so the ink
+      extent is measured separately (:func:`_ink_x_end`) and travels on
+      :attr:`TextFragment.ink_x_end`, with the choice of extent made per call site.
     * ``x_start`` is untouched and is separately suspect: on some mid-word shows it sits
       ~4 pt left of where pdfminer puts the first character, with every internal advance
       still exact. Different root cause, not fixed here, and not to be conflated with
@@ -988,6 +1028,94 @@ def _pen_x_after(show: Any) -> float:
     # displacement (`e' = dx * n[0] + n[4]`), so the delta lands in page space the way
     # the value it corrects did.
     return float(show.displaced_tx) + undercharged * float(show.transform[0])
+
+
+def _glyph_substrings(show: Any) -> list[str] | None:
+    """One decoded substring per GLYPH CODE the show draws, in drawing order, or ``None``.
+
+    The per-code decomposition of the same decode :func:`_glyphs_drawn` counts and
+    pypdf's ``word_tx`` charges widths over -- the three cases mirror
+    ``TextStateParams.__post_init__`` exactly, because the point is to partition the
+    string pypdf already produced, never to decode differently:
+
+    * a non-``bytes`` operand: one character per code, by the same reading
+      ``_glyphs_drawn`` gives it;
+    * a str-encoded font: the operand decodes as a whole, so one decoded character is
+      one code, composite fonts included;
+    * a dict-encoded font: pypdf indexes BY BYTE, so one byte is one code, and an
+      entry may be a multi-character glyph NAME -- the ``/C14``-style substrings that
+      make ``len(text)`` unequal to the glyph count and make slicing ``text`` by
+      glyph COUNT unsound. Returning the substrings is what makes a per-glyph
+      consumer able to slice at code boundaries instead.
+
+    ``None`` on the one path where the partition cannot be aligned to codes at all: a
+    dict-encoded operand with a byte that is in no encoding entry and does not decode
+    as ASCII. pypdf handles that show by re-decoding the WHOLE operand as UTF-8 with
+    replacement, so its width loop runs over a string with no per-byte alignment, and
+    any partition this function returned would be a guess. Callers treat ``None`` as
+    "no per-glyph geometry", which degrades to the advance-based extent -- the wider,
+    refusing direction.
+    """
+    value = show.value
+    if not isinstance(value, bytes):
+        return [character for character in str(value)]
+    encoding = show.font.encoding
+    if isinstance(encoding, str):
+        return list(show._decoded_value)
+    substrings: list[str] = []
+    for code in value:
+        if code in encoding:
+            substrings.append(encoding[code])
+        else:
+            try:
+                substrings.append(bytes((code,)).decode())
+            except UnicodeDecodeError:
+                return None
+    return substrings
+
+
+def _ink_x_end(show: Any) -> float | None:
+    """Absolute page x where the last glyph's own width ends, or ``None`` if unknowable.
+
+    :func:`_pen_x_after` deliberately includes the trailing spacing charged after the
+    final glyph, because that is what the advance operator does; this subtracts exactly
+    that charge and nothing else. Per ISO 32000-1 9.4.4 the charge after the last
+    glyph's width is ``(Tc + Tw-if-the-glyph-is-a-space) * Th``, and both terms are
+    taken the way pypdf's own ``word_tx`` accounts them -- ``Tw`` once per space
+    CHARACTER of the glyph's decoded substring -- so the subtraction undoes pypdf's
+    arithmetic rather than a fresh reading of the specification that could disagree
+    with it.
+
+    Verified against the real corpus fragment that motivated the field: the two-glyph
+    ``Tc``-spaced show on the target table's pressure row publishes
+    ``x_end = 322.469842`` and this returns ``230.451249``, reproducing the probe's
+    independently measured ink extent to the last digit, with the same per-glyph
+    arithmetic placing the second glyph's start at the column its neighbours occupy.
+
+    A NEGATIVE ``Tc`` makes this larger than ``x_end`` -- with tightening spacing the
+    pen ends inside the last glyph's width -- which is not clamped, because the ink
+    genuinely does extend past the pen there and clamping would re-introduce the
+    undercount this module exists to avoid. The OTHER direction is refused rather than
+    published: spacing negative enough to walk the pen left of the show's own start
+    breaks the left-to-right hull this value is read as one edge of, so a result left
+    of ``x_start`` (or not a number at all) is returned as ``None``, unmeasured.
+
+    ``None`` too for a ROTATED show, decided at the call site: the page-space
+    projection here is ``transform[0]``'s, so a rotated show's value would be exactly
+    as meaningless as its ``x_end`` -- and unlike ``x_end`` this field is new, so it
+    can decline to exist instead of shipping a number with a warning attached.
+    """
+    substrings = _glyph_substrings(show)
+    if not substrings:
+        return None
+    last = substrings[-1]
+    space_char = show.font.space_char
+    spaces = sum(1 for character in last if character == space_char)
+    trailing = (float(show.Tc) + spaces * float(show.Tw)) * (float(show.Tz) / 100.0)
+    ink = _pen_x_after(show) - trailing * float(show.transform[0])
+    if not ink >= float(show.tx):  # `not >=` rather than `<` so NaN lands here too
+        return None
+    return ink
 
 
 class UnsupportedContentConstruct(Exception):
@@ -2164,6 +2292,7 @@ def _page_fragments(
                 font_height=float(show.font_height),
                 rotated=bool(show.rotated),
                 glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
+                ink_x_end=None if bool(show.rotated) else _ink_x_end(show),
             )
         )
     return fragments, stopped_early

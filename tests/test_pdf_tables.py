@@ -48,6 +48,7 @@ def frag(
     font_height: float = BODY_HEIGHT,
     glyph_mapping: GlyphMapping = GlyphMapping.MAPPED,
     rotated: bool = False,
+    ink_x_end: float | None = None,
 ) -> TextFragment:
     return TextFragment(
         page=page,
@@ -58,6 +59,7 @@ def frag(
         font_height=font_height,
         rotated=rotated,
         glyph_mapping=glyph_mapping,
+        ink_x_end=ink_x_end,
     )
 
 
@@ -571,6 +573,83 @@ class TestColumnsComeFromTheMeasuredValley:
 
         assert len(inventory.column_bounds) == 2
         assert [(c.col, c.text) for c in inventory.cells] == [(0, "aa"), (1, "bb")]
+
+
+class TestContainmentIsJudgedByInkNotByTrailingSpacing:
+    """A fragment's ADVANCE extent includes spacing charged after its last glyph, so it
+    can reach far past anything drawn -- 92.019 pt past, on the real target table's
+    pressure row, where it refused the whole table's containment. Every horizontal
+    judgement here reads the INK extent instead, with the advance extent as the exact
+    fallback where no ink was measured.
+    """
+
+    def test_trailing_spacing_does_not_change_the_inventory(self) -> None:
+        """Two extractions with the same ink and wildly different trailing advance must
+        derive the same grid -- rows, columns, cells, coordinates -- differing only in
+        the member fragments themselves, which carry the differing advance extents."""
+
+        def grid(trailing: float) -> tuple[TextFragment, ...]:
+            return (
+                CAPTION,
+                frag("Fuel", 53.0, 70.0, 134.5),
+                frag("alpha", 123.0, 181.0, 134.5),
+                frag("beta", 223.0, 280.0, 134.5),
+                frag("phi", 53.0, 57.0, 71.5),
+                # The motivated case: ink ends at 146, the advance runs `trailing` pt
+                # further -- past the box's own right edge in the second variant.
+                frag("0.6", 122.0, 146.0 + trailing, 71.5, ink_x_end=146.0),
+                frag("0.5", 227.0, 251.0, 71.5),
+            )
+
+        tight = build_inventory(extraction_of(*grid(0.0)), footprint())
+        trailed = build_inventory(extraction_of(*grid(90.0)), footprint())
+
+        assert tight.refusals == () and trailed.refusals == ()
+        assert trailed.rows == tight.rows
+        assert trailed.column_bounds == tight.column_bounds
+        assert [(c.row, c.col, c.text, c.x_start, c.x_end) for c in trailed.cells] == [
+            (c.row, c.col, c.text, c.x_start, c.x_end) for c in tight.cells
+        ]
+
+    def test_a_fragment_whose_ink_the_edge_cuts_still_refuses(self) -> None:
+        """A genuine straddler -- drawn ink on both sides of the edge -- is exactly as
+        refused as before the ink extent existed."""
+        fragments = (*simple_grid(), frag("wide", 270.0, 320.0, 71.5, ink_x_end=310.0))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_trailing_spacing_crossing_the_edge_is_not_a_cut(self) -> None:
+        """The same advance extent, with the ink inside the box: a member, not a
+        straddler, and its cell records the ink extent it actually occupies."""
+        fragments = (*simple_grid(), frag("v", 255.0, 320.0, 71.5, ink_x_end=262.0))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        cell = next(c for c in inventory.cells if "v" in c.text)
+        assert cell.x_end == pytest.approx(262.0)
+
+    def test_an_unmeasured_ink_extent_falls_back_to_the_advance(self) -> None:
+        """`ink_x_end=None` must reproduce the pre-field behaviour exactly: the advance
+        extent is never narrower than the ink, so the fallback errs toward refusal."""
+        fragments = (*simple_grid(), frag("cut", 270.0, 320.0, 71.5))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_an_uncomparable_ink_extent_refuses_the_page(self) -> None:
+        """A NaN or backwards `ink_x_end` fails every comparison quietly -- the exact
+        fault class the comparable-geometry gate exists for, arriving via the new
+        field."""
+        for bad in (float("nan"), 100.0):
+            fragments = (*simple_grid(), frag("bad", 122.0, 146.0, 71.5, ink_x_end=bad))
+
+            inventory = build_inventory(extraction_of(*fragments), footprint())
+
+            assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
 
 
 class TestSpanningAndEmptyCells:
