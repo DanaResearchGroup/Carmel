@@ -1088,11 +1088,11 @@ def _rotated_band_sharer_refusal(
     merely change a count; it put the one discriminating footprint in front of this
     function.
 
-    That is also why a window variant measured 4/4 while this check sat below
-    column-structure: nothing could be masked there, because the better refusal had already
-    fired. **Any measurement quoted in this docstring must be re-taken against the shipped
-    order of checks. This paragraph has carried a wrong statement three times -- the masking
-    claim, then its retraction, then the identity of the p4 footprint -- and all three were
+    That is also why nothing could be masked while this check sat below column-structure: the
+    better refusal fires first, so a window variant placed there runs behind it and can hide
+    nothing regardless of what it scores. **Any measurement quoted in this docstring must be
+    re-taken against the shipped order of checks. This paragraph has carried a wrong statement
+    three times -- the masking claim, then its retraction, then the identity of the p4 footprint -- and all three were
     the same claim in different clothes: which footprints reach this line, at which ordering.**
 
     What decides the scope independently of that is what a LINE is in this module. Row
