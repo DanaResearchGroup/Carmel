@@ -110,6 +110,7 @@ _HISTORICALLY_SHIPPED_SHAS = frozenset(
         "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a",
         "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446",
         "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647",
+        "587e9aa7e651e590d95ff2559e203c0a16c76e6b1a02b13f90ef265ab7869de7",
     }
 )
 
@@ -1237,7 +1238,7 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
 #   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
 # This is the half that moves when fragment GEOMETRY changes.
 _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
-_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "385530c8ce3cab2461cfd29da39415ff0c845f993f8348a1bbcf2638ffd8d4f3"
 
 # The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
 # historical row rather than only asserted in prose. Its own component moved when
@@ -1328,7 +1329,14 @@ _PINNED_FRAGMENT_GEOMETRY_SHA256_V11 = "b8f3e9a95a425c12eeabddea34c0614261a89693
 # it, none on any other document.
 _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V12 = "77f6ff3aa2156864451ea855058bb036ad07d0748b265ef70dd93a7a3d4acbe2"
 _PINNED_FRAGMENT_GEOMETRY_SHA256_V12 = "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446"
-_PINNED_FRAGMENT_GEOMETRY_SHA256 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
+
+# SUPERSEDED -- the THIRTEENTH, whose registry held only repairs, each gated on a mandatory
+# document sha256. The FOURTEENTH makes it a VERDICT registry: repairs OR explicit refusals,
+# keyed font-program-sha-first (DOCUMENT scope kept only for the dashes and degree), and adds
+# GlyphMapping.UNRESOLVED_IMPOSTOR so an outline-unpinned impostor refuses downstream.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V13 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V13 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "587e9aa7e651e590d95ff2559e203c0a16c76e6b1a02b13f90ef265ab7869de7"
 
 # The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
 # completeness claim of the composite identity, spelled out as data: extract_fragments runs

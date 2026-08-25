@@ -504,6 +504,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         import hashlib
 
         entry = {
+            "scope": pdf_fragments.GlyphVerdictScope.DOCUMENT,
             "document_sha256": hashlib.sha256(pdf).hexdigest(),
             "font_program_sha256": hashlib.sha256(self.FONT_PROGRAM).hexdigest(),
             "font_base_name": "Synth",
@@ -514,10 +515,24 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         entry.update(overrides)
         return pdf_fragments.GlyphRepair(**entry)
 
+    def _refusal(self, pdf: bytes, **overrides):
+        import hashlib
+
+        entry = {
+            "scope": pdf_fragments.GlyphVerdictScope.FONT_PROGRAM,
+            "font_program_sha256": hashlib.sha256(self.FONT_PROGRAM).hexdigest(),
+            "font_base_name": "Synth",
+            "glyph_name": "/C14",
+            "reason": "synthetic test refusal; the outline does not pin this glyph's character",
+            "evidence": "synthetic test entry; the refusal, not the conclusion, is under test",
+        }
+        entry.update(overrides)
+        return pdf_fragments.GlyphRefusal(**entry)
+
     def test_a_fully_scoped_entry_repairs_the_glyph_and_says_repaired(self, monkeypatch) -> None:
         require_pypdf()
         pdf = self._differences_pdf()
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._repair(pdf),))
 
         frag = _by_text(extract_fragments(pdf).fragments, "\u00b0")
 
@@ -527,7 +542,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         require_pypdf()
         pdf = self._differences_pdf()
         unrepaired = _by_text(extract_fragments(pdf).fragments, "/C14")
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._repair(pdf),))
 
         repaired = _by_text(extract_fragments(pdf).fragments, "\u00b0")
 
@@ -548,7 +563,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         bytes is outside what the evidence was read from."""
         require_pypdf()
         pdf = self._differences_pdf()
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf, document_sha256="0" * 64),))
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._repair(pdf, document_sha256="0" * 64),))
 
         frag = _by_text(extract_fragments(pdf).fragments, "/C14")
 
@@ -559,7 +574,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         to anything, so the program digest gates even inside the registered document."""
         require_pypdf()
         pdf = self._differences_pdf()
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf, font_program_sha256="0" * 64),))
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._repair(pdf, font_program_sha256="0" * 64),))
 
         frag = _by_text(extract_fragments(pdf).fragments, "/C14")
 
@@ -569,7 +584,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         """No program, no identity to scope on, no repair -- fail closed."""
         require_pypdf()
         pdf = self._differences_pdf(embed_program=False)
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._repair(pdf),))
 
         frag = _by_text(extract_fragments(pdf).fragments, "/C14")
 
@@ -581,7 +596,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         UNMAPPED, text exactly as the document emitted it."""
         require_pypdf()
         pdf = self._differences_pdf(names="/C14 /C15")
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._repair(pdf),))
 
         frag = _by_text(extract_fragments(pdf).fragments, "/C14/C15")
 
@@ -602,7 +617,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
         assert before.glyph_mapping is GlyphMapping.MAPPED, "premise: the raw decode is a valid, unflagged 'e'"
         monkeypatch.setattr(
             pdf_fragments,
-            "_GLYPH_REPAIRS",
+            "_GLYPH_VERDICTS",
             (
                 self._repair(
                     pdf,
@@ -632,7 +647,7 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
 
         monkeypatch.setattr(
             pdf_fragments,
-            "_GLYPH_REPAIRS",
+            "_GLYPH_VERDICTS",
             (
                 self._repair(
                     pdf,
@@ -655,36 +670,151 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
     def test_an_empty_registry_costs_nothing_and_changes_nothing(self, monkeypatch) -> None:
         require_pypdf()
         pdf = self._differences_pdf()
-        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", ())
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", ())
 
         frag = _by_text(extract_fragments(pdf).fragments, "/C14")
 
         assert frag.glyph_mapping is GlyphMapping.UNMAPPED
         assert frag.text == "/C14"
 
-    def test_the_shipped_registry_is_scoped_on_every_axis(self) -> None:
-        """Whatever entries ship, each must carry a full 64-hex document AND font program
-        scope, a glyph name that can only match one glyph, a non-marker replacement, and
-        recorded evidence. This is the shape that makes a global mapping unregisterable,
-        pinned against the live table rather than stated in prose.
+    def test_a_refusal_verdict_surfaces_unresolved_impostor_leaving_the_text_unmodified(self, monkeypatch) -> None:
+        """A refusal decides nothing: the glyph keeps its (marker or wrong-Latin) text, but the
+        fragment surfaces UNRESOLVED_IMPOSTOR so downstream refuses instead of reading it."""
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", (self._refusal(pdf),))
 
-        The glyph name is either an unmapped MARKER (`/C14`) or a SINGLE character (the
-        mis-decoded `e`/`f`/`L`): both match exactly one glyph piece, because a piece is
-        one glyph's decode and a multi-character non-marker key could otherwise be
-        mistaken for a substring of ordinary text. What it must never be is a bare
-        multi-character string, which is why the length-one branch is asserted, not
-        merely allowed."""
-        assert pdf_fragments._GLYPH_REPAIRS, "the registry ships at least the /C14 entry"
-        for entry in pdf_fragments._GLYPH_REPAIRS:
-            assert len(entry.document_sha256) == 64 and all(c in "0123456789abcdef" for c in entry.document_sha256)
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNRESOLVED_IMPOSTOR
+        assert frag.text == "/C14"
+
+    def test_a_refusal_on_a_mis_decoded_glyph_refuses_the_clean_looking_latin(self, monkeypatch) -> None:
+        """The dangerous case: the glyph decodes to a valid `e`, arrives MAPPED, and nothing
+        flags it -- until a refusal names it an impostor. The text stays `e` (a refusal has no
+        character to put there), but the mapping becomes UNRESOLVED_IMPOSTOR."""
+        require_pypdf()
+        import hashlib
+
+        program = self.FONT_PROGRAM + b"-endash"
+        pdf = self._winansi_pdf(program)
+        assert _by_text(extract_fragments(pdf).fragments, "e").glyph_mapping is GlyphMapping.MAPPED
+        monkeypatch.setattr(
+            pdf_fragments,
+            "_GLYPH_VERDICTS",
+            (self._refusal(pdf, font_program_sha256=hashlib.sha256(program).hexdigest(), glyph_name="e"),),
+        )
+
+        frag = _by_text(extract_fragments(pdf).fragments, "e")
+
+        assert frag.glyph_mapping is GlyphMapping.UNRESOLVED_IMPOSTOR
+        assert frag.text == "e"
+
+    def test_a_font_program_scoped_verdict_matches_regardless_of_document(self, monkeypatch) -> None:
+        """A FONT_PROGRAM verdict carries no document sha and fires on any document embedding
+        its program -- the widening the phi repairs rely on. Proven by registering it with the
+        WRONG document as its provenance evidence, which cannot gate because there is no
+        document gate."""
+        require_pypdf()
+        import hashlib
+
+        program = self.FONT_PROGRAM + b"-endash"
+        pdf = self._winansi_pdf(program)
+        monkeypatch.setattr(
+            pdf_fragments,
+            "_GLYPH_VERDICTS",
+            (
+                pdf_fragments.GlyphRepair(
+                    scope=pdf_fragments.GlyphVerdictScope.FONT_PROGRAM,
+                    font_program_sha256=hashlib.sha256(program).hexdigest(),
+                    font_base_name="Synth",
+                    glyph_name="e",
+                    replacement="φ",
+                    evidence="x" * 120,
+                ),
+            ),
+        )
+
+        frag = _by_text(extract_fragments(pdf).fragments, "φ")
+
+        assert frag.glyph_mapping is GlyphMapping.REPAIRED
+
+    def test_overlapping_verdicts_are_rejected_when_the_registry_loads(self) -> None:
+        """Two entries that could both match one (document, program, glyph) are a bug, not
+        last-write-wins. A FONT_PROGRAM verdict matches every document, so it cannot coexist
+        with any other entry for the same glyph; two DOCUMENT verdicts collide only on the same
+        document."""
+        scope = pdf_fragments.GlyphVerdictScope
+
+        def repair(**kw):
+            base = {"font_base_name": "S", "glyph_name": "f", "evidence": "x" * 120, "replacement": "φ"}
+            base.update(kw)
+            return pdf_fragments.GlyphRepair(**base)
+
+        with pytest.raises(ValueError, match="matches every document"):
+            pdf_fragments._assert_no_overlapping_verdicts(
+                (
+                    repair(scope=scope.FONT_PROGRAM, font_program_sha256="a" * 64),
+                    repair(scope=scope.DOCUMENT, document_sha256="c" * 64, font_program_sha256="a" * 64),
+                )
+            )
+        with pytest.raises(ValueError, match="name the same document"):
+            pdf_fragments._assert_no_overlapping_verdicts(
+                (
+                    repair(scope=scope.DOCUMENT, document_sha256="c" * 64, font_program_sha256="b" * 64),
+                    repair(scope=scope.DOCUMENT, document_sha256="c" * 64, font_program_sha256="b" * 64),
+                )
+            )
+        # Distinct documents, same program+glyph: DISJOINT, permitted.
+        pdf_fragments._assert_no_overlapping_verdicts(
+            (
+                repair(scope=scope.DOCUMENT, document_sha256="c" * 64, font_program_sha256="b" * 64),
+                repair(scope=scope.DOCUMENT, document_sha256="d" * 64, font_program_sha256="b" * 64),
+            )
+        )
+
+    def test_the_shipped_registry_is_well_formed_on_every_axis(self) -> None:
+        """Whatever entries ship, each -- repair or refusal -- must carry a full 64-hex font
+        program digest, a glyph name that can only match one glyph, and recorded evidence, and
+        its scope and ``document_sha256`` must agree. This is the shape that makes a global
+        mapping unregisterable, pinned against the live registry rather than stated in prose.
+
+        The glyph name is either an unmapped MARKER (`/C14`) or a SINGLE character (a
+        mis-decoded `e`/`f`/`L`, or a refused `w`/`[`/`g`/`r`/`b`): both match exactly one
+        glyph piece, because a piece is one glyph's decode and a multi-character non-marker key
+        could otherwise be mistaken for a substring of ordinary text. What it must never be is
+        a bare multi-character string, which is why the length-one branch is asserted, not
+        merely allowed.
+
+        Scope and document sha must be consistent: a DOCUMENT verdict carries a 64-hex sha
+        (its character needed document context); a FONT_PROGRAM verdict carries none. A repair
+        carries a non-marker replacement; a refusal carries a reason and NO replacement -- the
+        point of a refusal is that Carmel has no character to put there."""
+        assert pdf_fragments._GLYPH_VERDICTS, "the registry ships at least the /C14 entry"
+        seen_repair = seen_refusal = False
+        for entry in pdf_fragments._GLYPH_VERDICTS:
             assert len(entry.font_program_sha256) == 64
+            if entry.scope is pdf_fragments.GlyphVerdictScope.DOCUMENT:
+                assert entry.document_sha256 is not None
+                assert len(entry.document_sha256) == 64 and all(c in "0123456789abcdef" for c in entry.document_sha256)
+            else:
+                assert entry.scope is pdf_fragments.GlyphVerdictScope.FONT_PROGRAM
+                assert entry.document_sha256 is None
             is_marker = bool(pdf_fragments._UNMAPPED_MARKER_RE.fullmatch(entry.glyph_name))
             assert is_marker or len(entry.glyph_name) == 1, (
                 "a glyph name that is neither a marker nor a single character could match a substring of ordinary text"
             )
-            assert entry.replacement
-            assert not pdf_fragments._UNMAPPED_MARKER_RE.search(entry.replacement)
             assert len(entry.evidence) > 100, "an entry without recorded evidence is a guess"
+            if isinstance(entry, pdf_fragments.GlyphRepair):
+                seen_repair = True
+                assert entry.replacement
+                assert not pdf_fragments._UNMAPPED_MARKER_RE.search(entry.replacement)
+            else:
+                assert isinstance(entry, pdf_fragments.GlyphRefusal)
+                seen_refusal = True
+                assert entry.reason and not hasattr(entry, "replacement")
+        assert seen_repair, "the registry ships at least one repair"
+        _ = seen_refusal  # refusal entries, when present, are shape-checked above
 
 
 class TestTheInkExtentStopsAtTheLastGlyph:
@@ -1031,7 +1161,7 @@ class TestAnEngineMismatchIsNotAPageFailure:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1098,7 +1228,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1135,7 +1265,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         assert issubclass(mod._EngineMismatch, Exception)
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1153,7 +1283,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1182,7 +1312,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         produced = {extract_fragments(_one_page_pdf(self._PDF)).status}
@@ -1319,7 +1449,7 @@ class TestLossRecordsWhatWasLost:
 
         real = mod._page_fragments
 
-        def _boom(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _boom(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             if page_number == 2:
                 raise ValueError("synthetic page explosion")
             return real(page, page_number, engine, budget, repairs, glyph_budget)
@@ -1464,7 +1594,7 @@ class TestLossRecordsWhatWasLost:
         real = mod._page_fragments
         parsed: list[int] = []
 
-        def _recording(page, page_number, engine, budget, repairs=None, glyph_budget=None):
+        def _recording(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
             parsed.append(page_number)
             return real(page, page_number, engine, budget, repairs, glyph_budget)
 
@@ -1485,6 +1615,24 @@ class TestLossRecordsWhatWasLost:
         result = extract_fragments(_two_page_pdf(page, page))
         assert len(result.fragments) == 3
         assert result.truncated is True
+
+    def test_a_page_with_no_contents_yields_no_fragments(self) -> None:
+        """A ``/Page`` with no ``/Contents`` is a legal empty page: it draws nothing, so it
+        contributes no fragments and is neither a page failure nor a truncation -- the
+        no-content early return in the page walker."""
+        require_pypdf()
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        assert result.fragments == ()
+        assert result.available is True
+        assert result.page_failures == ()
+        assert result.truncated is False
 
 
 def _split_contents_pdf(first: bytes, second: bytes) -> bytes:
@@ -1811,14 +1959,93 @@ class TestFontProgramScopingFailsClosed:
 
     def test_a_font_with_no_descriptor_program_has_no_sha(self) -> None:
         font = SimpleNamespace(font_descriptor=SimpleNamespace(font_file=None))
-        assert pdf_fragments._font_program_sha256(font) is None
+        # No program -- no sha and, exactly, zero bytes charged against the font budget.
+        assert pdf_fragments._font_program_sha256(font) == (None, 0)
 
     def test_a_program_that_cannot_be_read_has_no_sha(self) -> None:
         def _explode():
             raise ValueError("the font stream is broken")
 
         font = SimpleNamespace(font_descriptor=SimpleNamespace(font_file=SimpleNamespace(get_data=_explode)))
-        assert pdf_fragments._font_program_sha256(font) is None
+        assert pdf_fragments._font_program_sha256(font) == (None, 0)
+
+
+class _FakeFlateFontStream:
+    """A single-``/FlateDecode`` font-program stream, the shape ``_decoded_content_length``
+    reads: ``get_object`` returns self, ``get`` answers ``/Filter`` and ``/DecodeParms``,
+    ``_data`` is the compressed bytes, ``get_data`` inflates them."""
+
+    def __init__(self, decoded: bytes) -> None:
+        self._decoded = decoded
+        self._data = zlib.compress(decoded)
+
+    def get_object(self) -> _FakeFlateFontStream:
+        return self
+
+    def get(self, key: str, default: object = None) -> object:
+        return "/FlateDecode" if key == "/Filter" else default
+
+    def get_data(self) -> bytes:
+        return self._decoded
+
+
+def _flate_font(decoded: bytes) -> SimpleNamespace:
+    return SimpleNamespace(font_descriptor=SimpleNamespace(font_file=_FakeFlateFontStream(decoded)))
+
+
+class TestTheFontProgramInflateIsBounded:
+    """R-012 §2/§5: the font-program inflate is bounded per stream AND cumulatively per
+    document, and both bounds refuse in the fail-closed direction -- no sha, no verdict, no
+    crash. Pinned here because the shipped tests covered only page CONTENT, so a regression of
+    the font path would go unnoticed."""
+
+    def test_a_font_program_over_the_per_stream_cap_has_no_sha(self) -> None:
+        import hashlib
+
+        font = _flate_font(b"P" * 5000)
+        # A cap below the decoded size refuses without a sha and charges zero bytes; the decode
+        # is bounded exactly like the content lane's, so an over-cap font program never matches.
+        assert pdf_fragments._font_program_sha256(font, 4999) == (None, 0)
+        # At the cap the real sha and the EXACT inflated length come back -- the length is what
+        # the caller charges against the document-wide budget.
+        sha, length = pdf_fragments._font_program_sha256(font, 5000)
+        assert length == 5000
+        assert sha == hashlib.sha256(b"P" * 5000).hexdigest()
+
+    def test_a_spent_budget_refuses_every_further_font(self) -> None:
+        # `_page_fragments` passes ``min(per-stream cap, remaining document budget)`` as the
+        # limit, so once the document budget is spent the limit is non-positive and every
+        # further font fails closed -- which is how the cumulative bound stops a many-font bomb.
+        font = _flate_font(b"Q" * 3000)
+        assert pdf_fragments._font_program_sha256(font, 0) == (None, 0)
+        assert pdf_fragments._font_program_sha256(font, -1) == (None, 0)
+
+    def test_the_document_wide_budget_is_threaded_across_pages_and_fonts(self, monkeypatch) -> None:
+        """The cumulative bound end to end: each distinct font charges the running total and
+        the next font is granted only what is left, so N fonts cannot each inflate the
+        per-stream cap. Driven with a spy because the registry's FONT_PROGRAM verdicts make the
+        per-font hashing path run on any document."""
+        require_pypdf()
+        import carmel.services.pdf_fragments as mod
+
+        seen_limits: list[int] = []
+
+        def _spy(font: object, limit: int = mod.MAX_FONT_PROGRAM_BYTES) -> tuple[str, int]:
+            seen_limits.append(limit)
+            # A font that inflates exactly to whatever it is granted, spending the budget.
+            return "a" * 64, max(limit, 0)
+
+        monkeypatch.setattr(mod, "_font_program_sha256", _spy)
+        monkeypatch.setattr(mod, "MAX_FONT_PROGRAM_BYTES", 100)
+        monkeypatch.setattr(mod, "MAX_FONT_PROGRAM_BYTES_PER_DOCUMENT", 100)
+
+        page = b"BT /F1 10 Tf 72 700 Td (x) Tj ET"
+        extract_fragments(_two_page_pdf(page, page))
+
+        assert seen_limits, "the per-font hashing path did not run; the budget is untested"
+        # First font sees the whole budget; a later font, after the budget is spent, sees none.
+        assert seen_limits[0] == 100
+        assert seen_limits[-1] <= 0
 
 
 class TestGlyphSubstringsPartition:

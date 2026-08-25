@@ -1082,7 +1082,7 @@ _FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd6
 # component is unmoved for the eighth consecutive time.
 _FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "385530c8ce3cab2461cfd29da39415ff0c845f993f8348a1bbcf2638ffd8d4f3"
 _FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
 
 # The NINTH entry, SUPERSEDED. V8 shipped the availability taxonomy; this tightened two
@@ -1152,7 +1152,23 @@ _FRAGMENT_GEOMETRY_SHA256_V12 = "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1
 # programs). On every other document the output is bit-for-bit V12's; on the registered
 # one 210 fragments' text and mapping move. A supersession because what a fragment SAYS is
 # this identity's core output, as with V11. Borrowed unmoved for the thirteenth time.
-_FRAGMENT_GEOMETRY_SHA256 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V13 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
+_FRAGMENT_GEOMETRY_SHA256_V13 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
+
+# The FOURTEENTH entry: the glyph-repair table becomes a VERDICT registry. V13's
+# `_GLYPH_REPAIRS` held only repairs, each gated on a mandatory document sha256;
+# `_GLYPH_VERDICTS` now holds repairs AND explicit refusals, keyed font-program-sha-FIRST
+# (an explicit `GlyphVerdictScope`: FONT_PROGRAM for a character the outline pins context-free
+# -- a phi -- or declines; DOCUMENT only where the character needs document context -- which
+# dash a bar is, where a ring sits). A refusal surfaces the new
+# `GlyphMapping.UNRESOLVED_IMPOSTOR`, so a symbol-font glyph the outline does not pin refuses
+# downstream instead of being read as its wrong Latin decode. This entry ships the machinery
+# and rescopes the two existing phi repairs to FONT_PROGRAM; it is OUTPUT-PRESERVING -- every
+# document's fragment text, mapping and geometry is bit-for-bit V13's, the same OWN-only,
+# no-coordinate move V8 and V9 were -- because it adds no new glyph. The refusal and widening
+# entries that DO move output on the three affected documents land in the next commit, which
+# re-pins this same current sha. Borrowed unmoved for the fourteenth time.
+_FRAGMENT_GEOMETRY_SHA256 = "587e9aa7e651e590d95ff2559e203c0a16c76e6b1a02b13f90ef265ab7869de7"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1250,6 +1266,11 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V12: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V12,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V13: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V13,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1429,6 +1450,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V12,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V13,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

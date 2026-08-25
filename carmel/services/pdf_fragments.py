@@ -82,14 +82,34 @@ class GlyphMapping(StrEnum):
 
     REPAIRED = "repaired"
     """Every glyph decoded, but at least one of them only through Carmel's own
-    evidence-scoped repair table (:data:`_GLYPH_REPAIRS`) rather than through the
+    evidence-scoped verdict registry (:data:`_GLYPH_VERDICTS`) rather than through the
     document. A third member instead of a promotion to :attr:`MAPPED`, deliberately:
     the document never said what this glyph means -- Carmel concluded it, from
-    recorded evidence, under a gate scoped to one document, one embedded font program
-    and one glyph code -- and an artifact built from the fragment must be able to say
-    so. Consumers that admit it are admitting that conclusion by name, never by
-    accident: everything else in this codebase that switches on this enum treats any
-    member it does not explicitly admit as refusable."""
+    recorded evidence, under a gate scoped to one embedded font program and one glyph
+    code (and, where the character needs document context, one document) -- and an
+    artifact built from the fragment must be able to say so. Consumers that admit it
+    are admitting that conclusion by name, never by accident: everything else in this
+    codebase that switches on this enum treats any member it does not explicitly admit
+    as refusable."""
+
+    UNRESOLVED_IMPOSTOR = "unresolved_impostor"
+    """A glyph the registry has LOOKED AT and declined to decide: a known symbol-font
+    impostor whose true character the embedded outline does not pin. Stronger than
+    silence -- an unregistered mis-decode surfaces :attr:`MAPPED` (nothing flagged it)
+    and an unregistered marker surfaces :attr:`UNMAPPED`; this member is reserved for a
+    glyph a :class:`GlyphRefusal` verdict names explicitly, on recorded evidence, as an
+    impostor Carmel refuses to guess. The fragment's text is returned UNMODIFIED (the
+    wrong Latin character the font handed back), so a consumer that reads it as data is
+    reading a known-wrong character -- which is why this member is NOT admissible.
+
+    It must never be added to ``carmel.services.pdf_tables._ADMISSIBLE_GLYPH_MAPPINGS``.
+    That allowlist is the seam that makes an impostor inside a table box REFUSE with no
+    change at the table layer; admitting this member there would ship the very
+    mis-decoded value the verdict exists to withhold. It IS text, though (a printed
+    character, not a marker), so the row-membership allowlists that ask "is this a
+    printed line at all?" DO count it -- see
+    ``carmel.services.pdf_tables._ROW_TEXT_GLYPH_MAPPINGS`` and
+    ``carmel.services.pdf_cells``."""
 
 
 # Markers a PDF text extractor emits when a glyph has no usable ``ToUnicode`` entry.
@@ -104,12 +124,15 @@ class GlyphMapping(StrEnum):
 # Flagged, and never repaired by DEFAULT. Mapping ``/C0`` to U+2212 -- or ``þ`` to
 # ``+`` and ``¼`` to ``=``, which the same PDFs also need -- is a SEMANTIC claim about
 # what the document meant, and grounding proves LOCATION, never MEANING. A repair
-# table needs its own gate and its own evidence. That table now exists
-# (:data:`_GLYPH_REPAIRS`): each entry is scoped to ONE document's bytes, ONE embedded
-# font program and ONE glyph code, carries the recorded evidence it rests on, and
-# surfaces as :attr:`GlyphMapping.REPAIRED` -- never as ``MAPPED``, so nothing
-# downstream can mistake Carmel's conclusion for the document's. A glyph with no
-# entry stays flagged with its text unmodified, exactly as before.
+# needs its own gate and its own evidence. That registry now exists
+# (:data:`_GLYPH_VERDICTS`): each entry pins ONE embedded font program and ONE glyph
+# code (and, for a character that needs document context, ONE document's bytes),
+# carries the recorded evidence it rests on, and is EITHER a :class:`GlyphRepair`
+# (surfaces :attr:`GlyphMapping.REPAIRED` -- never ``MAPPED``, so nothing downstream can
+# mistake Carmel's conclusion for the document's) OR a :class:`GlyphRefusal` (surfaces
+# :attr:`GlyphMapping.UNRESOLVED_IMPOSTOR` -- a glyph looked at and declined, which
+# refuses downstream instead of being read as its wrong Latin decode). A glyph with no
+# entry at all stays flagged with its text unmodified, exactly as before.
 # The `/C\d+` arm is DELIBERATELY bounded on both sides. An unanchored `/C\d+`
 # substring match is catastrophic in a combustion codebase: it flags `/C2H4`, `C1/C2`,
 # `H2/CO`-style species lists, appendix labels and file paths as corrupt. The lookarounds
@@ -125,74 +148,183 @@ _UNMAPPED_MARKER_RE = re.compile(
 )
 
 
-@dataclass(frozen=True)
-class GlyphRepair:
-    """One evidence-scoped decoding for one glyph the document itself does not decode.
+class GlyphVerdictScope(StrEnum):
+    """How widely a :class:`GlyphVerdict` is asserted -- the keying decision made explicit
+    rather than encoded in whether ``document_sha256`` happens to be set.
 
-    **A global glyph-name mapping is silent semantic corruption and must never ship.**
-    A ``/Differences`` name like ``/C14`` is a FONT-LOCAL code, not a character:
-    another embedded font is free to bind the same name to anything at all, and a
-    table keyed on the name alone would rewrite it everywhere while looking perfectly
-    reasonable. Every entry here is therefore scoped three times over, and applies
-    only when ALL THREE match:
-
-    * ``document_sha256`` -- the sha256 of the WHOLE document's raw bytes. The
-      narrowest honest scope: the evidence below was read out of one file, so the
-      conclusion is asserted for that file and no other, even one embedding the same
-      font program with the same digest.
-    * ``font_program_sha256`` -- the sha256 of the embedded font program's decoded
-      bytes (``FontFile``/``FontFile2``/``FontFile3``). The glyph's meaning lives in
-      the program that draws it, so this is the identity the conclusion is actually
-      ABOUT; the document scope narrows it further rather than standing in for it.
-    * ``glyph_name`` -- the decoded per-glyph substring the fragment lane produces
-      for the code, matched against ONE glyph piece at a time. For a glyph the
-      document leaves unmapped this is the font's own ``/Differences`` name (``/C14``),
-      an unmapped MARKER; for a glyph the document mis-decodes it is the wrong
-      character the font hands back (a symbol font's ``f`` slot holds a phi, so the
-      piece is a literal ``f``). Either way the match is per PIECE, and a piece is
-      exactly one glyph's decode -- ordinary text that merely SPELLS ``f`` or ``/C14``
-      arrives as several pieces and cannot match. That per-glyph partition, together
-      with the two scopes above, is what makes matching on a bare ``f`` a
-      font-program-and-code conclusion and NOT a global ``f`` -> phi substitution: the
-      entry fires only on the one embedded program's one glyph, in the one document.
-
-    Two kinds of glyph therefore reach this table, and they surface differently on the
-    way IN but identically on the way OUT. An UNMAPPED glyph (marker piece) is one the
-    document never decoded; a MIS-DECODED glyph (valid-Latin piece) is one the document
-    decoded to the wrong character -- a symbol font handing back ``f``/``e`` that no
-    ``/ToUnicode`` and no ``/Differences`` contradict, so nothing downstream flags it.
-    The mis-decoded case is the more dangerous of the two precisely because it reads as
-    clean data; it is caught here only because the embedded program that draws it is
-    pinned by sha256 and its glyph identified by outline (see each entry's evidence).
-
-    A repaired fragment surfaces as :attr:`GlyphMapping.REPAIRED`, never ``MAPPED``,
-    and an UNMAPPED fragment whose markers are not ALL covered by matching entries
-    keeps its text unmodified and stays ``UNMAPPED`` -- a half-repaired string would
-    read as data while still carrying a marker. Where the evidence does not support a
-    mapping, the honest entry is NO entry: the fragment then refuses downstream with
-    the glyph named, which is a better outcome than a guess.
+    The safety of a verdict comes from ``font_program_sha256`` + ``glyph_name``: together
+    they pin the exact embedded program and the exact decoded piece, and hence the exact
+    ink. ``document_sha256`` is a blast-radius limiter and an evidence-provenance guard,
+    not the thing that makes the conclusion true. So a verdict whose character the OUTLINE
+    pins independent of context can be asserted for every document embedding the program;
+    one whose character needs document context must stay narrowed to the one document the
+    evidence was read from.
     """
 
-    document_sha256: str
-    font_program_sha256: str
-    font_base_name: str
-    """The font's ``/BaseFont`` at the time the evidence was read. Diagnostic only --
-    subset prefixes are arbitrary and names are forgeable, so this never gates."""
+    FONT_PROGRAM = "font_program"
+    """Context-free: matches any document embedding this program. ``document_sha256`` is
+    absent -- there is no per-document claim to make -- and the document the evidence was
+    read from is recorded in ``evidence`` for provenance only. Used where the outline alone
+    pins the character (a phi's bowl-and-through-stroke) or declines it (a refusal)."""
 
+    DOCUMENT = "document"
+    """Narrowed: matches only the one document whose sha256 is ``document_sha256``. Used
+    where the replacement chose using document context -- which dash a bar is (en-dash vs
+    minus, by role), where a ring sits (a degree, by its superscript placement) -- so the
+    conclusion is asserted for that file and no other."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class GlyphVerdict:
+    """One decided glyph: one embedded font program's one decoded piece, judged.
+
+    **A global glyph-name mapping is silent semantic corruption and must never ship.** A
+    ``/Differences`` name like ``/C14`` is a FONT-LOCAL code, not a character, and even a
+    base-encoded ``f`` is a font-local claim once the font is a symbol subset: another
+    embedded font is free to bind the same name or slot to anything at all, and a table
+    keyed on the name alone would rewrite it everywhere while looking perfectly reasonable.
+    So every entry is pinned by, and applies only when BOTH match:
+
+    * ``font_program_sha256`` -- the sha256 of the embedded font program's decoded bytes
+      (``FontFile``/``FontFile2``/``FontFile3``). The glyph's meaning lives in the program
+      that draws it, so this is the identity the conclusion is actually ABOUT, and this is
+      where the safety comes from: it pins the exact program, and hence the exact ink.
+    * ``glyph_name`` -- the decoded per-glyph substring the fragment lane produces for the
+      code, matched against ONE glyph piece at a time. For a glyph the document leaves
+      unmapped this is the font's own ``/Differences`` name (``/C14``), an unmapped MARKER;
+      for a glyph the document mis-decodes it is the wrong character the font hands back (a
+      symbol font's ``f`` slot holds a phi, so the piece is a literal ``f``). The match is
+      per PIECE, and a piece is exactly one glyph's decode -- ordinary text that merely
+      SPELLS ``f`` or ``/C14`` arrives as several pieces and cannot match. That per-glyph
+      partition, together with the program pin, is what makes matching on a bare ``f`` a
+      font-program-and-code conclusion and NOT a global ``f`` -> phi substitution.
+
+    ``scope`` records how widely the conclusion is asserted (see :class:`GlyphVerdictScope`).
+    The old design made ``document_sha256`` a mandatory third gate and argued at length for
+    it; that argument was right for the dash class, whose character DOES need document
+    context, but wrong as a universal rule -- for a context-free character (a phi the outline
+    pins) the document sha limits blast radius without adding truth, and keying on it forces
+    one hand-authored entry per document, which does not scale past a handful. ``FONT_PROGRAM``
+    is the principled widening; ``DOCUMENT`` is the narrowing the dash class still needs. Two
+    entries that could both match the same (document, program, glyph) are a registry bug, not
+    last-write-wins: :func:`_assert_no_overlapping_verdicts` rejects them at import.
+
+    A concrete verdict is EITHER a :class:`GlyphRepair` (a replacement, surfaces
+    :attr:`GlyphMapping.REPAIRED`) or a :class:`GlyphRefusal` (a reason, surfaces
+    :attr:`GlyphMapping.UNRESOLVED_IMPOSTOR`). Where the evidence does not support a mapping,
+    the honest entry is a refusal -- or, for a glyph not looked at at all, NO entry: the
+    fragment then refuses downstream with the glyph named, a better outcome than a guess.
+    """
+
+    scope: GlyphVerdictScope
+    font_program_sha256: str
     glyph_name: str
-    replacement: str
     evidence: str
     """What the conclusion rests on, recorded beside it so a reviewer can re-derive or
     refute it without an archaeology dig. State what was actually consulted."""
 
+    font_base_name: str = ""
+    """The font's ``/BaseFont`` at the time the evidence was read. Diagnostic only --
+    subset prefixes are arbitrary and names are forgeable, so this never gates."""
 
-#: Every glyph repair this module will apply. Append-only; scoping rules and the
-#: refuse-don't-guess policy are on :class:`GlyphRepair`.
-_GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
+    document_sha256: str | None = None
+    """Present iff ``scope`` is :attr:`~GlyphVerdictScope.DOCUMENT`; the sha256 of the whole
+    document's raw bytes it is narrowed to."""
+
+    def __post_init__(self) -> None:
+        if self.scope is GlyphVerdictScope.DOCUMENT and self.document_sha256 is None:
+            raise ValueError(f"DOCUMENT-scoped verdict for {self.glyph_name!r} needs a document_sha256")
+        if self.scope is GlyphVerdictScope.FONT_PROGRAM and self.document_sha256 is not None:
+            raise ValueError(
+                f"FONT_PROGRAM-scoped verdict for {self.glyph_name!r} must not carry a document_sha256 "
+                "(the provenance document belongs in evidence, not the gate)"
+            )
+
+    def applies_to(self, document_sha256: str) -> bool:
+        """Whether this verdict is in force for the document with this raw-bytes sha256."""
+        return self.scope is GlyphVerdictScope.FONT_PROGRAM or self.document_sha256 == document_sha256
+
+
+@dataclass(frozen=True, kw_only=True)
+class GlyphRepair(GlyphVerdict):
+    """A verdict that DECODES the glyph: its piece is replaced with ``replacement`` and the
+    fragment surfaces :attr:`GlyphMapping.REPAIRED`.
+
+    Two kinds of glyph reach a repair, surfacing differently on the way IN but identically on
+    the way OUT. An UNMAPPED glyph (marker piece) is one the document never decoded; a
+    MIS-DECODED glyph (valid-Latin piece) is one the document decoded to the wrong character
+    -- a symbol font handing back ``f``/``e`` that no ``/ToUnicode`` and no ``/Differences``
+    contradict, so nothing downstream flags it. The mis-decoded case is the more dangerous of
+    the two precisely because it reads as clean data; it is caught only because the embedded
+    program that draws it is pinned by sha256 and its glyph identified by outline (see each
+    entry's evidence). A fragment whose markers are not ALL covered by matching repairs keeps
+    its text unmodified and stays ``UNMAPPED`` -- a half-repaired string would read as data
+    while still carrying a marker.
+    """
+
+    replacement: str
+
+
+@dataclass(frozen=True, kw_only=True)
+class GlyphRefusal(GlyphVerdict):
+    """A verdict that DECLINES the glyph: a known impostor whose true character the outline
+    does not pin. The piece is left UNMODIFIED and the fragment surfaces
+    :attr:`GlyphMapping.UNRESOLVED_IMPOSTOR`, which is non-admissible, so the fragment refuses
+    downstream instead of being read as its wrong Latin decode.
+
+    A refusal is a DIFFERENT and stronger claim than silence. An unregistered mis-decode
+    surfaces ``MAPPED`` and sails through; a refusal says a human looked at this program's
+    glyph, on recorded evidence, and could not honestly name its character -- a bar that could
+    be a tilde or an approx sign, a double rule that could be an equals or a parallel-to, a
+    single descender that resembles a gamma without excluding its alternatives the way a phi's
+    bowl-and-through-stroke excludes them. Better a refusal than the guess that produced the
+    original phi-as-``f`` fault run in the other direction.
+    """
+
+    reason: str
+
+
+def _assert_no_overlapping_verdicts(verdicts: tuple[GlyphVerdict, ...]) -> None:
+    """Reject a registry where two entries could both match one (document, program, glyph).
+
+    The match key is ``(font_program_sha256, glyph_name)``. Within a key, a FONT_PROGRAM entry
+    matches EVERY document, so it overlaps any other entry for the same key; two DOCUMENT
+    entries overlap iff they name the same document; anything else is disjoint. An overlap is a
+    bug -- the application site narrows by document into a ``dict`` keyed on glyph name, which
+    would otherwise resolve a collision by last-write-wins, silently picking one conclusion
+    over another -- so it fails at import, loudly, naming the glyph.
+    """
+    by_key: dict[tuple[str, str], list[GlyphVerdict]] = {}
+    for verdict in verdicts:
+        by_key.setdefault((verdict.font_program_sha256, verdict.glyph_name), []).append(verdict)
+    for (program, name), group in by_key.items():
+        if len(group) == 1:
+            continue
+        if any(v.scope is GlyphVerdictScope.FONT_PROGRAM for v in group):
+            raise ValueError(
+                f"overlapping glyph verdicts for program {program[:12]} glyph {name!r}: a FONT_PROGRAM "
+                "verdict matches every document, so it cannot coexist with another entry for the same glyph"
+            )
+        documents = [v.document_sha256 for v in group]
+        if len(set(documents)) != len(documents):
+            raise ValueError(
+                f"overlapping glyph verdicts for program {program[:12]} glyph {name!r}: two DOCUMENT "
+                "verdicts name the same document"
+            )
+
+
+#: Every glyph verdict this module will apply -- repairs and refusals both. Append-only;
+#: the keying, scope and refuse-don't-guess policy are on :class:`GlyphVerdict`, and
+#: :func:`_assert_no_overlapping_verdicts` (called just below) rejects any pair that could
+#: both match one glyph. Dash and degree entries stay :attr:`GlyphVerdictScope.DOCUMENT`
+#: (their character needed document context); phi entries are
+#: :attr:`GlyphVerdictScope.FONT_PROGRAM` (the outline pins phi context-free).
+_GLYPH_VERDICTS: tuple[GlyphVerdict, ...] = (
     GlyphRepair(
         # Table 1, p4 of the combustion-conditions paper this lane's M2 target lives
         # in. Its temperature header renders "T (<glyph 2> C)" where glyph 2 of the
         # /F7 font is the unmapped /C14.
+        scope=GlyphVerdictScope.DOCUMENT,
         document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
         font_program_sha256="fef02938850ee399076ea5efc5960c08a91546241c2814ea86ab49011919bed1",
         font_base_name="NNEIFK+AdvP4C4E74",
@@ -221,6 +353,7 @@ _GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
         # etc., all draw an en-dash from the /F2 symbol font whose WinAnsi 'e' slot
         # holds it. The document decodes it to a literal 'e' -- valid Latin, so it
         # surfaces MAPPED and nothing flags it. 188 glyphs in this document.
+        scope=GlyphVerdictScope.DOCUMENT,
         document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
         font_program_sha256="08ab6520b901000f5ccd4ff5cf535ccde7465ce0d985ff38d7258e3574e93f40",
         font_base_name="NNEIEF+AdvPS44A44B",
@@ -251,6 +384,7 @@ _GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
         # WinAnsi 'L' slot, drawn once inside a rate expression "[A T^n exp(<glyph>Ea/
         # RT)]" on p8. Decodes to a literal 'L'; a bar read as a capital L inside an
         # Arrhenius exponent is a silent sign that is not even a sign.
+        scope=GlyphVerdictScope.DOCUMENT,
         document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
         font_program_sha256="08ab6520b901000f5ccd4ff5cf535ccde7465ce0d985ff38d7258e3574e93f40",
         font_base_name="NNEIEF+AdvPS44A44B",
@@ -275,14 +409,16 @@ _GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
     GlyphRepair(
         # Same document, Table 1 equivalence-ratio header cell (p4). The label phi is
         # drawn from the /F13 symbol font whose WinAnsi 'f' slot holds it; decodes to a
-        # literal 'f'. Surfaces MAPPED.
-        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        # literal 'f'. Surfaces MAPPED. FONT_PROGRAM scope: the outline pins phi with no
+        # document context, so the conclusion holds for any document embedding this program.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
         font_program_sha256="45b1e0bf5d9e3a6e5e7af5f2b83ba95e1b19696d7eb4a0cea93dd412c80df3ac",
         font_base_name="NNEJBM+AdvPS4721B4",
         glyph_name="f",
         replacement="φ",
         evidence=(
-            "Read from the document. (1) WinAnsiEncoding, no /ToUnicode, no /Differences; "
+            "Read from document 9c59f1c6...d298 (provenance; the conclusion is font-program "
+            "scoped, not document scoped). (1) WinAnsiEncoding, no /ToUnicode, no /Differences; "
             "byte 0x66 decodes to 'f' by base encoding alone; /Flags 32 (Nonsymbolic); "
             "the embedded CFF even names the glyph 'f'. Every name and flag agrees with "
             "'f'; only the outline disagrees. (2) The embedded 533-byte CFF program "
@@ -303,13 +439,14 @@ _GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
         # Registered so the document reports phi uniformly: a paper that renders phi
         # correctly in one place and as 'f' in another is worse than one uniformly
         # wrong. Same fault, distinct embedded program, distinct sha256.
-        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        scope=GlyphVerdictScope.FONT_PROGRAM,
         font_program_sha256="22a1e061856b2e27b6d4997553c4f76538889b56abdef7fa05ec049538e42605",
         font_base_name="NNFAME+AdvPS3ECA66",
         glyph_name="f",
         replacement="φ",
         evidence=(
-            "Read from the document. WinAnsiEncoding, no /ToUnicode, no /Differences, "
+            "Read from document 9c59f1c6...d298 (provenance; font-program scoped). "
+            "WinAnsiEncoding, no /ToUnicode, no /Differences, "
             "byte 0x66 -> 'f' by base encoding; /Flags 32; CFF glyph name 'f'. The "
             "embedded 439-byte CFF program (sha256 above; charset ['.notdef','f'], a "
             "one-glyph symbol subset) draws 'f' with THREE contours, bbox [44,624]x"
@@ -321,29 +458,66 @@ _GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
     ),
 )
 
+_assert_no_overlapping_verdicts(_GLYPH_VERDICTS)
 
-def _font_program_sha256(font: Any) -> str | None:
-    """The sha256 of the embedded font program this font resolves to, or ``None``.
 
-    ``None`` -- no repair can match -- for a font with no embedded program at all, and
-    for every failure while reaching or inflating one: fail closed, a repair that
-    cannot verify its scope does not apply.
+#: Ceiling on the decompressed size of one embedded font program before its sha256 is
+#: taken. An embedded CFF/TrueType/Type1 subset is small -- the corpus's symbol subsets
+#: decompress to well under 2 kB, and even a full non-subset font is a few hundred kB --
+#: so this generous 6 MB bound never refuses a real program while still capping the
+#: inflate below.
+MAX_FONT_PROGRAM_BYTES = 6_000_000
 
-    ``get_data()`` inflates the font stream with no output bound, which this module
-    refuses for content streams. It is admissible here because of WHERE the call
-    sits: :func:`_page_fragments` consults this only after the DOCUMENT scope
-    matched, so the only bytes this can ever inflate are those of a document whose
-    entire content is already pinned by sha256 in :data:`_GLYPH_REPAIRS` -- an input
-    chosen by whoever registered the repair, not by whoever supplies a PDF.
+MAX_FONT_PROGRAM_BYTES_PER_DOCUMENT = 60_000_000
+"""Cumulative decompressed font-program bytes one document may inflate for verdict scoping.
+
+:data:`MAX_FONT_PROGRAM_BYTES` bounds ONE stream; this bounds their SUM across every distinct
+embedded font on every page, the same way :data:`MAX_PDF_GLYPH_INTERVALS` bounds a document
+and not a page. The per-stream ceiling alone is not a document bound: a crafted PDF embedding
+many distinct sub-6 MB font programs, or repeating them page by page, forces one bounded
+inflate each and their total is unbounded. The sibling page-content path already carries a
+document-wide cap (``glyph_budget`` is "the document-wide cap minus what earlier pages already
+used"); this makes the font path follow the same pattern.
+
+Headroom, not a corpus measurement: real papers embed SUBSETTED symbol fonts totalling far
+under a megabyte, so this 10x-the-per-stream ceiling never bites a genuine document. It exists
+so the cumulative inflate of a many-font bomb is bounded rather than only each font individually.
+When it IS reached the last fonts fail closed -- their sha comes back ``None``, no verdict
+matches, and their repairs are simply not applied -- which is the refusing direction."""
+
+
+def _font_program_sha256(font: Any, limit: int = MAX_FONT_PROGRAM_BYTES) -> tuple[str | None, int]:
+    """The sha of this font's embedded program and the bytes it inflated, or ``(None, 0)``.
+
+    Returns ``(sha256_hex, decompressed_length)`` on success and ``(None, 0)`` -- no verdict
+    can match, nothing was inflated -- for a font with no embedded program at all, and for
+    every failure while reaching or inflating one: fail closed, a verdict that cannot verify
+    its scope does not apply. The length is what the caller charges against the document-wide
+    font budget, so ``0`` on the no-match paths is exact: those paths inflate nothing.
+
+    ``get_data()`` inflates the font stream, and under FONT_PROGRAM-scoped verdicts this
+    runs on the fonts of ANY supplied PDF, not only registered documents: a context-free
+    verdict matches every document embedding its program, so the narrowing that used to
+    guarantee "these bytes are already pinned in full" no longer holds. The inflate is
+    therefore BOUNDED here exactly as the content lane bounds its own -- a
+    :func:`_decoded_content_length` pass with ``limit`` as the ceiling runs FIRST and refuses
+    (the ``except`` below turns it into ``(None, 0)``, i.e. no match) the moment the stream
+    would decompress past the bound, so ``get_data`` only ever materialises bytes that pass.
+    ``limit`` is the smaller of :data:`MAX_FONT_PROGRAM_BYTES` (this one stream) and the
+    document's remaining font budget, so a document that has already spent its budget passes a
+    non-positive ``limit`` and every further font fails closed. Measured on the corpus: every
+    registered program is a single ``/FlateDecode`` (or unfiltered) stream whose bounded length
+    equals ``get_data``'s exactly, so the bound costs nothing and changes no repair.
     """
     try:
         stream = font.font_descriptor.font_file
         if stream is None:
-            return None
-        return hashlib.sha256(bytes(stream.get_data())).hexdigest()
-    except Exception:  # noqa: BLE001 - any failure to identify the program is "no match"
-        logger.debug("embedded font program could not be identified for repair scoping", exc_info=True)
-        return None
+            return None, 0
+        length = _decoded_content_length(stream, limit)
+        return hashlib.sha256(bytes(stream.get_data())).hexdigest(), length
+    except Exception:  # noqa: BLE001 - any failure to identify the program (incl. an over-bound inflate) is "no match"
+        logger.debug("embedded font program could not be identified for verdict scoping", exc_info=True)
+        return None, 0
 
 
 def _text_pieces(show: Any) -> list[str] | None:
@@ -376,46 +550,58 @@ def _text_pieces(show: Any) -> list[str] | None:
     return pieces
 
 
-def _repaired_pieces(pieces: list[str], repairs: dict[str, str]) -> list[str] | None:
-    """``pieces`` with every registered glyph repaired, or ``None`` -- no change.
+def _judged_pieces(pieces: list[str], verdicts: dict[str, GlyphVerdict]) -> tuple[list[str], GlyphMapping] | None:
+    """Apply the font-program-scoped verdicts to one glyph-partitioned fragment.
 
-    ``repairs`` is already scoped: the caller has matched the document and the font
-    program, so the keys here are glyph names valid for exactly this show's font
-    program -- a bare ``f`` key means "the glyph THIS program draws at the code that
-    decodes to f", not "any f anywhere".
+    ``verdicts`` maps glyph_name -> the :class:`GlyphVerdict` in force for this show's font
+    program in this document (the caller has narrowed by both). Returns the pieces to keep
+    and the resulting :class:`GlyphMapping`, or ``None`` when nothing changed and the caller
+    should leave the fragment exactly as it found it.
 
-    The replacement is performed per GLYPH, never by string substitution on the joined
-    text, and that is the whole safety argument. A piece is exactly one glyph's decode
-    (:func:`_text_pieces`), so a key that is a marker (``/C14``) matches only a glyph
-    that decoded to that marker, and a key that is a plain character (``f``) matches
-    only a glyph that decoded to that one character -- ordinary text that merely SPELLS
-    ``f`` or ``/C14`` arrives as several pieces and cannot match. There is deliberately
-    no "only a marker is eligible" gate: the mis-decoded glyphs this table also repairs
-    (a symbol font's ``f`` that is really a phi) are valid Latin, never markers, and the
-    font-program scope -- not the shape of the piece -- is what bounds the match.
+    The match is per GLYPH, never string substitution on the joined text, and that is the
+    whole safety argument. A piece is exactly one glyph's decode (:func:`_text_pieces`), so a
+    key that is a marker (``/C14``) matches only a glyph that decoded to that marker, and a
+    key that is a plain character (``f``) matches only a glyph that decoded to that one
+    character -- ordinary text that merely SPELLS ``f`` or ``/C14`` arrives as several pieces
+    and cannot match. There is deliberately no "only a marker is eligible" gate: the
+    mis-decoded glyphs the registry also covers (a symbol font's ``f`` that is really a phi)
+    are valid Latin, never markers, and the font-program scope -- not the shape of the piece
+    -- is what bounds the match.
 
-    Refuses (returns ``None``) rather than repairing when no piece actually matched, or
-    when an unmapped MARKER remains after every available repair -- a half-repaired
-    fragment would read as data while still carrying a marker, so it stays UNMAPPED with
-    its text unmodified, which is the published contract for unmapped fragments. A
-    fragment that carried no marker to begin with (the mis-decoded case) has nothing for
-    that check to trip on and is repaired outright. (The third refusal, an unavailable
-    or misaligned partition, is upstream: the caller only reaches here holding real
-    pieces from :func:`_text_pieces`.)
+    Precedence and the no-change cases:
+
+    * A :class:`GlyphRefusal` on ANY piece makes the WHOLE fragment
+      :attr:`~GlyphMapping.UNRESOLVED_IMPOSTOR`, text UNMODIFIED. An undecided impostor is not
+      shipped as data even beside a repairable neighbour: a partly-repaired-partly-impostor
+      string would read as clean while carrying a glyph Carmel refused to name.
+    * Otherwise every match is a :class:`GlyphRepair` and the pieces are replaced. If a marker
+      survives every repair the fragment stays UNMAPPED (returns ``None`` -- text unmodified,
+      the published contract for a half-repaired fragment); else it is
+      :attr:`~GlyphMapping.REPAIRED`.
+    * No verdict matched any piece: returns ``None``, and the fragment keeps the mapping it
+      already had (MAPPED or UNMAPPED).
     """
+    matched = False
+    refused = False
     repaired: list[str] = []
-    changed = False
     for piece in pieces:
-        if piece in repairs:
-            repaired.append(repairs[piece])
-            changed = True
+        verdict = verdicts.get(piece)
+        if isinstance(verdict, GlyphRepair):
+            matched = True
+            repaired.append(verdict.replacement)
+        elif isinstance(verdict, GlyphRefusal):
+            matched = True
+            refused = True
+            repaired.append(piece)
         else:
             repaired.append(piece)
-    if not changed:
+    if not matched:
         return None
+    if refused:
+        return list(pieces), GlyphMapping.UNRESOLVED_IMPOSTOR
     if _UNMAPPED_MARKER_RE.search("".join(repaired)):
         return None
-    return repaired
+    return repaired, GlyphMapping.REPAIRED
 
 
 @dataclass(frozen=True)
@@ -434,7 +620,15 @@ class TextFragment:
     produces. See :func:`extract_fragments` for why that agreement is not optional."""
 
     text: str
-    """The decoded text, exactly as the document emitted it. Never repaired."""
+    """The decoded text as the document emitted it, EXCEPT where the glyph verdict registry
+    rewrote it. A :class:`GlyphRepair` in force for this show's font program replaces the
+    offending glyph pieces and :attr:`glyph_mapping` is then :attr:`~GlyphMapping.REPAIRED`; a
+    :class:`GlyphRefusal` leaves the text byte-for-byte as emitted but marks
+    :attr:`glyph_mapping` :attr:`~GlyphMapping.UNRESOLVED_IMPOSTOR`, so a downstream consumer
+    refuses the mis-decoded character rather than trusting it. Read :attr:`glyph_mapping` to
+    know which of the three this is; it is the only field that says whether the text was
+    touched, and treating this string as the raw document emission is exactly the wrong trust
+    assumption on a repaired fragment."""
 
     x_start: float
     """Absolute page-space x of the first glyph."""
@@ -2637,19 +2831,28 @@ def _page_fragments(
     page_number: int,
     engine: tuple[Any, ...],
     budget: int,
-    repairs: dict[str, dict[str, str]] | None = None,
+    verdicts: dict[str, dict[str, GlyphVerdict]] | None = None,
     glyph_budget: int = MAX_PDF_GLYPH_INTERVALS,
-) -> tuple[list[TextFragment], bool]:
+    font_budget: int = MAX_FONT_PROGRAM_BYTES_PER_DOCUMENT,
+) -> tuple[list[TextFragment], bool, int]:
     """Recover every text-show operation on one page, with absolute geometry.
 
-    ``repairs`` is the glyph-repair table ALREADY narrowed to this document by
-    :func:`extract_fragments` -- font-program sha256 to {glyph name: replacement} --
-    and is empty or ``None`` for every document without a registered entry, which
-    keeps the repair path at literally zero cost where it does not apply.
+    ``verdicts`` is the glyph verdict registry ALREADY narrowed to this document by
+    :func:`extract_fragments` -- font-program sha256 to {glyph name: verdict}. It is ``None``
+    or empty only for a document embedding NONE of the registry's programs; because a
+    FONT_PROGRAM-scoped verdict matches every document embedding its program, any registry
+    holding one such verdict makes ``verdicts`` non-empty for every document, and the per-show
+    font hashing below then runs for all of them (bounded by ``font_budget``).
 
     ``glyph_budget`` bounds the per-glyph interval entries THIS CALL may record; like
     ``budget`` it is the document-wide cap minus what earlier pages already used, so
     a single page cannot spend what the document has left.
+
+    ``font_budget`` is the same shape for font-program inflate: the document-wide
+    :data:`MAX_FONT_PROGRAM_BYTES_PER_DOCUMENT` minus what earlier pages already inflated. The
+    third return value is how many decompressed font-program bytes THIS page charged, so the
+    caller can carry the running total forward and a many-font document cannot inflate an
+    unbounded total one bounded stream at a time.
 
     Stops after ``budget`` fragments and reports that it did, so a single page cannot
     exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own.
@@ -2678,7 +2881,7 @@ def _page_fragments(
     _refuse_a_reframed_page(page)
     contents = page.get("/Contents")
     if contents is None:
-        return [], False
+        return [], False, 0
     resolved = contents.get_object()
     # The cap is enforced INSIDE, and no second check follows it here. The measurement
     # and the refusal used to be two steps -- measure, then compare -- and that shape is
@@ -2708,13 +2911,14 @@ def _page_fragments(
 
     fragments: list[TextFragment] = []
     glyphs_recorded = 0
+    font_bytes_used = 0
     # Font-program digests, hashed once per font OBJECT rather than once per show:
     # `_layout_mode_fonts` builds one `Font` per resource name per page, so identity
     # is a safe cache key for the duration of this call and no longer.
     font_sha_cache: dict[int, str | None] = {}
     for show in shows:
         if len(fragments) >= budget:
-            return fragments, True
+            return fragments, True, font_bytes_used
         if any(not hasattr(show, attr) for attr in _REQUIRED_PARAM_ATTRS):
             # Belt-and-braces against a pypdf change that slipped past `_engine`.
             # `_EngineMismatch` rather than a plain error: this must abort the WHOLE
@@ -2726,27 +2930,32 @@ def _page_fragments(
         rotated = bool(show.rotated)
         pieces = _text_pieces(show)
         mapping = GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED
-        if repairs and pieces is not None:
-            # Attempted whether the show is UNMAPPED or MAPPED: the fault this table also
-            # covers -- a symbol font decoding a phi to a literal 'f' -- surfaces MAPPED,
-            # so gating on UNMAPPED would skip exactly the mis-decoded glyphs. `repairs`
-            # is empty for every document but the registered ones, so an unregistered
-            # document still does no per-show work here.
+        if verdicts and pieces is not None:
+            # Attempted whether the show is UNMAPPED or MAPPED: the fault the registry also
+            # covers -- a symbol font decoding a phi to a literal 'f' -- surfaces MAPPED, so
+            # gating on UNMAPPED would skip exactly the mis-decoded glyphs.
             #
-            # Scope order is the safety argument: the DOCUMENT matched before this
-            # function was even handed a table, so identifying the font program (an
-            # unbounded `get_data`, see `_font_program_sha256`) only ever runs on
-            # bytes the registry already pins in full.
+            # `verdicts` is non-empty whenever ANY FONT_PROGRAM-scoped verdict is registered,
+            # because such a verdict matches every document embedding its program -- so this
+            # per-show hashing runs on the fonts of unregistered PDFs too, not only the
+            # registered ones. `_font_program_sha256` therefore bounds its own inflate, and
+            # `font_budget` bounds the CUMULATIVE inflate across every distinct font on the
+            # page: the smaller of the per-stream ceiling and the document's remaining budget
+            # is passed as the limit, and once the budget is spent every further font hashes to
+            # `None` and its verdicts simply do not apply. The DOCUMENT-scope-first ordering
+            # that used to guarantee "these bytes are pinned in full" no longer does.
             if id(show.font) not in font_sha_cache:
-                font_sha_cache[id(show.font)] = _font_program_sha256(show.font)
+                remaining = font_budget - font_bytes_used
+                font_sha, inflated = _font_program_sha256(show.font, min(MAX_FONT_PROGRAM_BYTES, remaining))
+                font_sha_cache[id(show.font)] = font_sha
+                font_bytes_used += inflated
             font_sha = font_sha_cache[id(show.font)]
-            for_this_font = repairs.get(font_sha) if font_sha is not None else None
+            for_this_font = verdicts.get(font_sha) if font_sha is not None else None
             if for_this_font:
-                repaired = _repaired_pieces(pieces, for_this_font)
-                if repaired is not None:
-                    pieces = repaired
+                judged = _judged_pieces(pieces, for_this_font)
+                if judged is not None:
+                    pieces, mapping = judged
                     text = "".join(pieces)
-                    mapping = GlyphMapping.REPAIRED
         glyphs = None if rotated or pieces is None else _glyph_geometry(show, pieces)
         if glyphs is not None:
             if glyphs_recorded + len(glyphs) > glyph_budget:
@@ -2755,7 +2964,7 @@ def _page_fragments(
                 # exactly the sub-fragment structure the field exists to carry. Same
                 # channel as the fragment cap; `build_inventory` refuses truncated
                 # documents wholesale.
-                return fragments, True
+                return fragments, True, font_bytes_used
             glyphs_recorded += len(glyphs)
         fragments.append(
             TextFragment(
@@ -2771,7 +2980,7 @@ def _page_fragments(
                 glyph_intervals=glyphs,
             )
         )
-    return fragments, stopped_early
+    return fragments, stopped_early, font_bytes_used
 
 
 def extract_fragments(data: bytes) -> FragmentExtraction:
@@ -2837,18 +3046,25 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
     # Recording the gate's own constant says exactly what is true and no more: this
     # extraction ran against the pinned pypdf, because nothing else gets this far.
     version = _PINNED_PYPDF_VERSION
-    # The glyph-repair table, narrowed to THIS document before any page is read. The
-    # document gate is one whole-input sha256 -- the same identity every stored
-    # artifact uses -- so for the overwhelming case of a document with no registered
-    # entry the repair machinery costs one hash and never runs again.
-    repairs: dict[str, dict[str, str]] = {}
-    if _GLYPH_REPAIRS:
+    # The glyph verdict registry, narrowed to THIS document before any page is read:
+    # font-program sha256 -> {glyph name: verdict}. A verdict applies when it is
+    # FONT_PROGRAM-scoped (any document) or DOCUMENT-scoped to this exact document sha256,
+    # the same whole-input identity every stored artifact uses. A collision inside one
+    # font+glyph is impossible by construction -- `_assert_no_overlapping_verdicts` rejects
+    # the registry at import if two entries could both match -- so the setdefault below is
+    # never a silent last-write-wins. `verdicts` is non-empty for EVERY document as soon as one
+    # FONT_PROGRAM-scoped verdict is registered (it matches any document embedding its program),
+    # so `_page_fragments` then hashes this document's fonts to find out whether any of its
+    # programs are the registered one; that per-font work is what `font_budget` bounds.
+    verdicts: dict[str, dict[str, GlyphVerdict]] = {}
+    if _GLYPH_VERDICTS:
         document_sha256 = hashlib.sha256(data).hexdigest()
-        for repair in _GLYPH_REPAIRS:
-            if repair.document_sha256 == document_sha256:
-                repairs.setdefault(repair.font_program_sha256, {})[repair.glyph_name] = repair.replacement
+        for verdict in _GLYPH_VERDICTS:
+            if verdict.applies_to(document_sha256):
+                verdicts.setdefault(verdict.font_program_sha256, {})[verdict.glyph_name] = verdict
     fragments: list[TextFragment] = []
     glyphs_recorded = 0
+    font_bytes_used = 0
     failures: list[FragmentPageFailure] = []
     lossy = False
     truncated = False
@@ -2880,13 +3096,14 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     lossy = True
                     break
                 try:
-                    page_fragments, hit_budget = _page_fragments(
+                    page_fragments, hit_budget, page_font_bytes = _page_fragments(
                         page,
                         page_number,
                         engine,
                         MAX_PDF_FRAGMENTS - len(fragments),
-                        repairs,
+                        verdicts,
                         MAX_PDF_GLYPH_INTERVALS - glyphs_recorded,
+                        MAX_FONT_PROGRAM_BYTES_PER_DOCUMENT - font_bytes_used,
                     )
                 except _EngineMismatch:
                     # Not a page failure. The engine is wrong, so nothing extracted
@@ -2902,6 +3119,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     continue
                 fragments.extend(page_fragments)
                 glyphs_recorded += sum(len(f.glyph_intervals) for f in page_fragments if f.glyph_intervals)
+                font_bytes_used += page_font_bytes
                 if kind is _PageKind.UNINSPECTABLE:
                     # RECORDED, not merely counted as `lossy`, and worded exactly as the
                     # text lane words it. A consumer asking "is page N sound?" reads

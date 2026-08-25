@@ -143,11 +143,11 @@ def _with_the_split_disabled(extraction: FragmentExtraction) -> FragmentExtracti
 
 
 def _without_the_glyph_repair(monkeypatch: pytest.MonkeyPatch) -> FragmentExtraction:
-    """The target's extraction with the repair registry emptied: the "repair disabled"
+    """The target's extraction with the verdict registry emptied: the "repair disabled"
     knob the isolation tests below need, applied at the registry rather than by
     editing fragments, so what is measured is the shipped pipeline minus exactly one
     table."""
-    monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", ())
+    monkeypatch.setattr(pdf_fragments, "_GLYPH_VERDICTS", ())
     return _target_extraction()
 
 
