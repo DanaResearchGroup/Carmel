@@ -37,6 +37,7 @@ from carmel.schemas.datasets import (
     SourceGraph,
     SourceNodeKind,
     ValueOrigin,
+    _validate_figure_digitizations_cover_cited,
 )
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.figure_digitization_record import (
@@ -145,6 +146,51 @@ def _point(*, coord_node: str = "fig", obs_node: str = "fig", point_id: str = "p
     )
 
 
+def _axes_with_a_second_observation() -> tuple[AxisDeclaration, ...]:
+    """``_axes()`` plus a second OBSERVATION axis (flame_temperature), so one
+    point can carry a PRESENT observation and an ABSENT one at once -- the shape
+    V9's same-crop join has to walk past without dereferencing the absent slot.
+    Still ascending by axis_id."""
+    return (
+        *_axes(),
+        AxisDeclaration(
+            axis_id="flame_temperature",
+            role=AxisRole.OBSERVATION,
+            quantity_kind=QuantityKind.TEMPERATURE,
+            label_raw="T_f",
+            label_ref=_bbox_ref("paper"),
+        ),
+    )
+
+
+def _point_with_an_absent_observation(*, crop_node: str = "fig") -> DataPoint:
+    """A point observing burning_velocity (PRESENT, off the crop) and
+    flame_temperature (ABSENT). Valid -- at least one observation carries a
+    present value -- and the absent one is exactly the branch
+    ``_iter_series_point_value_refs`` skips."""
+    coordinate = Coordinate(
+        axis_id="equivalence_ratio",
+        value=_equivalence_ratio_amount(value_ref=_bbox_ref(crop_node), unit_ref=_bbox_ref("paper")),
+        uncertainty=_NOT_REPORTED,
+    )
+    present = Observation(
+        axis_id="burning_velocity",
+        value=_velocity_amount(value_ref=_bbox_ref(crop_node), unit_ref=_bbox_ref("paper")),
+        uncertainty=_NOT_REPORTED,
+    )
+    absent = Observation(
+        axis_id="flame_temperature",
+        value=_NOT_REPORTED,
+        uncertainty=_NOT_APPLICABLE,
+    )
+    return DataPoint(
+        point_id="p1",
+        coordinates=(coordinate,),
+        observations=(present, absent),
+        composition=_SAME_AS_DATASET,
+    )
+
+
 def _digitized_series(
     *,
     digitization_sha256: object,
@@ -211,6 +257,30 @@ class TestAValidDigitizedEnvelope:
         assert payload["identity_payload_version"] == 3
         assert payload["series"][0]["digitization_sha256"] == envelope.series[0].digitization_sha256
         assert len(payload["figure_digitizations"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Series._validate_digitization_sha256_shape: a PRESENT citation must be 64
+# lowercase hex, refused at Series construction before any envelope join runs
+# ---------------------------------------------------------------------------
+
+
+class TestTheDigitizationShaShapeValidator:
+    def test_a_present_but_malformed_sha_is_refused_naming_the_field_and_value(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _digitized_series(digitization_sha256="not-a-real-sha")
+        msg = str(excinfo.value)
+        assert "Series.digitization_sha256" in msg
+        assert "64 lowercase hex characters" in msg
+        assert "not-a-real-sha" in msg
+
+    def test_a_64_hex_sha_with_a_trailing_newline_is_refused(self) -> None:
+        """The exact case the validator's comment calls out: ``$`` matches just
+        before a trailing newline, so only ``fullmatch`` catches ``"a"*64 +
+        "\\n"``. A prefix match would let it through and mint a distinct address
+        for logically identical bytes."""
+        with pytest.raises(ValidationError, match="64 lowercase hex characters"):
+            _digitized_series(digitization_sha256="a" * 64 + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -326,6 +396,35 @@ class TestTheTwoJoinsBeyondTheObviousOne:
 
 
 # ---------------------------------------------------------------------------
+# V9's same-crop join must WALK PAST an absent observation, not dereference it
+# ---------------------------------------------------------------------------
+
+
+class TestAnAbsentObservationIsWalkedPast:
+    def test_a_digitized_series_with_an_absent_observation_validates(self) -> None:
+        """``_iter_series_point_value_refs`` yields a value ref for every point
+        coordinate and every PRESENT observation; an ABSENT observation has no
+        value ref and must be skipped. A point with one present and one absent
+        observation drives that skip, and -- because the present coordinate and
+        observation both read off the cited crop -- the envelope still
+        validates."""
+        embedded = _embed()
+        series = Series(
+            series_id="s1",
+            source_form=SourceForm.DIGITIZED,
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            axes=_axes_with_a_second_observation(),
+            constants=(),
+            points=(_point_with_an_absent_observation(),),
+            digitization_sha256=embedded.digitization_sha256,
+        )
+        envelope = _envelope(series=(series,), figure_digitizations=(embedded,))
+        observations = envelope.series[0].points[0].observations
+        assert any(isinstance(obs.value, Absent) for obs in observations)
+        assert any(not isinstance(obs.value, Absent) for obs in observations)
+
+
+# ---------------------------------------------------------------------------
 # Non-digitized series must cite nothing
 # ---------------------------------------------------------------------------
 
@@ -423,6 +522,25 @@ class TestFigureDigitizationsCoverExactlyNoDuplicatesSorted:
         series = _digitized_series(digitization_sha256=embedded.digitization_sha256)
         with pytest.raises(ValidationError, match="duplicate digitization_sha256"):
             _envelope(series=(series,), figure_digitizations=(embedded, embedded))
+
+    def test_the_no_fewer_half_reports_a_cited_digitization_that_is_not_embedded(self) -> None:
+        """FD1's "no fewer" half restates, over the whole envelope, what V9
+        enforces per series. V9 is declared first, so a DIGITIZED series citing
+        an unembedded record is already refused at construction and this arm
+        cannot be reached that way -- it is the defense-in-depth the docstring
+        describes. Drive the function directly: take a valid envelope, strip its
+        ``figure_digitizations`` via ``model_copy`` (which does not re-run the
+        validators) while the series keeps its citation, and the cover check
+        names exactly that sha as missing."""
+        valid = _valid_envelope()
+        cited = valid.series[0].digitization_sha256
+        assert isinstance(cited, str)
+        stripped = valid.model_copy(update={"figure_digitizations": ()})
+        with pytest.raises(ValueError) as excinfo:
+            _validate_figure_digitizations_cover_cited(stripped)
+        msg = str(excinfo.value)
+        assert "is missing digitization" in msg
+        assert cited in msg
 
     def test_unsorted_figure_digitizations_are_refused(self) -> None:
         graph = _two_crop_graph()
