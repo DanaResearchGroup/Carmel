@@ -1545,10 +1545,10 @@ class TestGeometryThatCannotBeComparedRefuses:
         ``TextFragment`` carries exactly four -- ``x_start``, ``x_end``, ``baseline_y``,
         ``font_height`` -- and ``page`` only for equality, so this is exhaustive over the
         FIELDS. It is deliberately not claimed to be exhaustive over the FAULT: an earlier
-        version of this docstring said no fifth patch was possible, and
-        ``_looks_like_affix``'s unbounded height ratio refutes that with four finite,
-        positive, well-ordered numbers. Comparability is what is closed here, completely;
-        magnitude is a separate fault, tracked separately.
+        version of this docstring said no fifth patch was possible, and ``_looks_like_affix``
+        refutes that with four finite, positive, well-ordered numbers -- a header tall enough
+        relative to the row beneath it folds that row away on magnitude alone. Comparability is
+        what is closed here, completely; magnitude is a separate fault, tracked separately.
         """
         geometry = {"x_start": 300.0, "x_end": 320.0, "baseline_y": 91.0, "font_height": BODY_HEIGHT}
         geometry[field] = bad
