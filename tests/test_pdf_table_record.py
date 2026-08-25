@@ -319,6 +319,38 @@ class TestIdentityIsReportedWithoutBlockingTheRecomputation:
         assert result.status is InventoryVerificationStatus.REPRODUCED
         assert result.reproduced
 
+    def test_a_moved_fragment_geometry_still_recomputes_and_says_so(self, record: dict) -> None:
+        """The geometry-engine identity is excluded from the bytes, exactly like the code one.
+
+        ``fragment_geometry_sha256`` is one of ``_IDENTITY_FIELDS``, so a record written under a
+        different geometry engine must still recompute its grid and report the drift, not come
+        back an indistinguishable MISMATCHED. This is the test that fails if that field is
+        dropped from the exclusion set and so creeps back into the compared bytes.
+        """
+        stale = {**record, "fragment_geometry_sha256": "0" * 64}
+
+        result = verify_inventory_record(stale, GRID)
+
+        assert result.identity_moved == ("fragment_geometry",)
+        assert result.status is InventoryVerificationStatus.REPRODUCED
+        assert result.reproduced
+
+    def test_a_moved_pypdf_version_still_recomputes_and_says_so(self, record: dict) -> None:
+        """``pypdf_version`` is identity too, and its exclusion needs its own witness.
+
+        A record written under a different ``pypdf`` build must reproduce with the version
+        drift named, rather than being read as a grid that no longer reproduces. This is the
+        test that fails if ``pypdf_version`` is dropped from the exclusion set and so creeps
+        back into the compared bytes.
+        """
+        stale = {**record, "pypdf_version": "0.0.0-not-a-real-pypdf"}
+
+        result = verify_inventory_record(stale, GRID)
+
+        assert result.identity_moved == ("pypdf_version",)
+        assert result.status is InventoryVerificationStatus.REPRODUCED
+        assert result.reproduced
+
     def test_reproduced_under_drift_is_not_the_same_answer_as_reproduced(self, record: dict) -> None:
         """A caller that needs "same grid AND same code" must be able to tell them apart.
 
