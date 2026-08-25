@@ -777,7 +777,7 @@ def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprin
         return None
     return InventoryRefusal(
         InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE,
-        f"{len(cut)} fragment(s) on the box's own bands are cut by its side edge",
+        f"{len(cut)} fragment(s) inside the box's y-window are cut by its side edge",
     )
 
 
