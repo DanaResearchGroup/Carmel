@@ -69,7 +69,18 @@ __all__ = [
 #: A reader that does not know a shape must not guess at it, and a shape change alters every
 #: address even when no coordinate moved -- so the version is what lets a verifier say "I
 #: cannot read this" instead of "this does not reproduce". Those are different facts.
-INVENTORY_PAYLOAD_VERSION = 1
+#:
+#: **Version 2** stores sub-fragment membership: a cell's ``members`` are records naming the
+#: parent fragment's digest PLUS the glyph range and text piece the cell actually claims,
+#: where version 1 stored bare fragment digests. Forced by the sub-fragment split -- one
+#: show operator can ground two cells, and a bare parent digest cannot say WHICH glyphs
+#: grounded which -- and the fragment digest itself now carries the glyph/ink evidence
+#: (see :func:`_fragment_digest`), closing a demonstrated collision. Version-1 records are
+#: refused as ``PAYLOAD_UNREADABLE`` rather than read by a compatibility path: measured
+#: before the bump, no version-1 record exists in any workspace store, so a v1 verifier
+#: would be untested code guarding an empty set -- and the new identity is not weakened to
+#: preserve old behaviour.
+INVENTORY_PAYLOAD_VERSION = 2
 
 #: The names whose within-module closure defines "the derivation this record came from".
 #:
@@ -255,19 +266,42 @@ def _pt(value: float) -> str:
     return value.hex()
 
 
+def _glyph_ink_sha256(fragment: TextFragment) -> str | None:
+    """The digest of a fragment's per-glyph ink evidence, or ``None`` where unrecorded.
+
+    Serialized the same way everything else here is -- text pieces verbatim, coordinates
+    as exact hex -- so two fragments with different interiors can never share it, and
+    ``None`` (evidence not recorded) stays distinguishable from every real digest.
+    """
+    if fragment.glyph_intervals is None:
+        return None
+    return hashlib.sha256(
+        canonical_json_bytes([[piece, _pt(start), _pt(end)] for piece, start, end in fragment.glyph_intervals])
+    ).hexdigest()
+
+
 def _fragment_digest(fragment: TextFragment) -> str:
     """A fragment's identity: everything the derivation reads off it, and nothing else.
 
     Cell text and an x-extent alone would not pin the members -- two different fragment sets
     can concatenate to the same string across the same span. The digest is what makes the
     cell's COMPOSITION checkable rather than just its rendering.
+
+    The glyph/ink evidence (and the ink extent) is IN the digest, and its absence was a
+    demonstrated collision, not a hypothetical: two fragments with the same text and the
+    same outer extents but different interiors -- the same string drawn with and without
+    an internal spacing gap -- digested identically, so a member identity built on the
+    digest could not say which interior grounded a cell. Included as the evidence's own
+    digest rather than inline, to keep member records flat.
     """
     return hashlib.sha256(
         canonical_json_bytes(
             {
                 "baseline_y": _pt(fragment.baseline_y),
                 "font_height": _pt(fragment.font_height),
+                "glyph_ink_sha256": _glyph_ink_sha256(fragment),
                 "glyph_mapping": fragment.glyph_mapping.value,
+                "ink_x_end": None if fragment.ink_x_end is None else _pt(fragment.ink_x_end),
                 "page": fragment.page,
                 "rotated": fragment.rotated,
                 "text": fragment.text,
@@ -313,7 +347,23 @@ def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> di
         "cells": [
             {
                 "col": cell.col,
-                "member_digests": [_fragment_digest(f) for f in cell.members],
+                # A version-2 member is a CLAIM ON A RANGE, not a bare digest: the
+                # parent fragment's digest (which itself pins the glyph/ink evidence),
+                # plus the glyph range and the exact text piece this cell takes from
+                # it. Without the range, two cells grounded by halves of one split
+                # fragment would each cite the whole, and replay could not prove which
+                # bytes grounded which cell.
+                "members": [
+                    {
+                        "fragment_sha256": _fragment_digest(member.fragment),
+                        "glyph_end": member.glyph_end,
+                        "glyph_start": member.glyph_start,
+                        "text": member.text,
+                        "x_end": _pt(member.x_end),
+                        "x_start": _pt(member.x_start),
+                    }
+                    for member in cell.members
+                ],
                 "row": cell.row,
                 "text": cell.text,
                 "x_end": _pt(cell.x_end),

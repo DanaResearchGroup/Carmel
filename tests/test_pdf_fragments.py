@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tracemalloc
 import zlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -328,6 +329,458 @@ class TestCharacterSpacingIsChargedPerGlyph:
         assert (spaced.x_end - spaced.x_start) - (plain.x_end - plain.x_start) == pytest.approx(6.0)
 
 
+class TestGlyphIntervalsAreRecordedEvidence:
+    """Extraction records per-glyph ink evidence and nothing more: final page-space
+    positions after all spacing, one text piece per glyph code, no splitting here.
+    """
+
+    SPACING = 4.0
+
+    def test_pieces_partition_the_published_text(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Hi) Tj\nET"), "Hi")
+        assert frag.glyph_intervals is not None
+        assert [piece for piece, _, _ in frag.glyph_intervals] == ["H", "i"]
+        assert "".join(piece for piece, _, _ in frag.glyph_intervals) == frag.text
+
+    def test_character_spacing_opens_the_gap_between_intervals(self) -> None:
+        """The recorded positions are AFTER spacing: the inter-glyph gap is exactly
+        the `Tc` charge, and the ink never includes it."""
+        require_pypdf()
+        frag = _by_text(_fragments(f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (AB) Tj\nET"), "AB")
+        assert frag.glyph_intervals is not None
+        (_, _, first_end), (_, second_start, second_end) = frag.glyph_intervals
+        assert second_start - first_end == pytest.approx(self.SPACING)
+        assert second_end == pytest.approx(frag.ink_x_end)
+
+    def test_word_spacing_opens_the_gap_after_a_space_glyph(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n6 Tw\n72 700 Td (A B) Tj\nET"), "A B")
+        assert frag.glyph_intervals is not None
+        pieces = [piece for piece, _, _ in frag.glyph_intervals]
+        assert pieces == ["A", " ", "B"]
+        space_end = frag.glyph_intervals[1][2]
+        b_start = frag.glyph_intervals[2][1]
+        assert b_start - space_end == pytest.approx(6.0)
+
+    def test_a_placeholder_glyph_name_is_one_interval_not_four(self) -> None:
+        """The glyph-count-vs-len(text) pin, carried into the evidence: one code, one
+        interval, however many characters its name spells."""
+        require_pypdf()
+        stream = "BT /F1 10 Tf\n72 700 Td (\x20\x21) Tj\nET".encode("latin-1")
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+                b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+                b"<< /Type /Encoding /Differences [32 /C20 /C21] >> >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        frag = _by_text(result.fragments, "/C20/C21")
+        assert frag.glyph_intervals is not None
+        assert [piece for piece, _, _ in frag.glyph_intervals] == ["/C20", "/C21"]
+
+    def test_rotated_text_carries_no_intervals(self) -> None:
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n0 1 -1 0 300 400 Tm (rotated) Tj\nET"))
+        assert _by_text(result.fragments, "rotated").glyph_intervals is None
+
+    def test_the_glyph_budget_truncates_rather_than_stripping_evidence(self, monkeypatch) -> None:
+        """One page of five one-glyph shows against a budget of three: the document
+        truncates at the fragment that would exceed it, and every SHIPPED fragment
+        still carries its whole partition -- a fragment stripped of evidence would
+        silently lose the sub-fragment structure the field exists to carry."""
+        require_pypdf()
+        monkeypatch.setattr(pdf_fragments, "MAX_PDF_GLYPH_INTERVALS", 3)
+        stream = "BT /F1 10 Tf\n72 700 Td (A) Tj (B) Tj (C) Tj (D) Tj (E) Tj\nET"
+
+        result = extract_fragments(_one_page_pdf(stream))
+
+        assert result.truncated is True
+        assert result.lossy is True
+        assert len(result.fragments) == 3
+        assert all(f.glyph_intervals is not None for f in result.fragments)
+
+    def test_a_document_under_the_budget_is_untouched_by_it(self) -> None:
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n72 700 Td (AB) Tj\nET"))
+        assert result.truncated is False
+        assert all(f.glyph_intervals is not None for f in result.fragments)
+
+
+class TestGlyphRepairsAreScopedByDocumentFontAndCode:
+    """The repair table's gate, exercised end to end through `extract_fragments`.
+
+    A global glyph-name mapping is silent semantic corruption, so every test here is
+    about the SCOPE: an entry applies only when the whole document's sha256, the
+    embedded font program's sha256 and the decoded glyph name all match, and every
+    partial match leaves the fragment unrepaired with its text unmodified.
+
+    Two kinds of glyph reach the table. An UNMAPPED one (a `/Differences` name like
+    `/C14`, tested through `_differences_pdf`) surfaces as a marker; a MIS-DECODED one
+    (a symbol font's `f`/`e` slot holding a phi/en-dash, tested through `_winansi_pdf`)
+    decodes to valid Latin and surfaces MAPPED, so nothing else would ever flag it. The
+    mis-decode tests are the ones that prove the repair fires on the font PROGRAM and
+    not on the character -- the same `e` from an unregistered program is left alone.
+    """
+
+    FONT_PROGRAM = b"synthetic-font-program-bytes"
+
+    def _differences_pdf(self, *, embed_program: bool = True, names: str = "/C14") -> bytes:
+        """One page drawing byte 0x20 (and 0x21 when two names are given) through a
+        ``/Differences`` font that binds them to unmapped glyph names, with a real
+        embedded ``/FontFile3`` for the repair gate to digest."""
+        count = len(names.split()[0:2])
+        text = "\x20" if count == 1 else "\x20\x21"
+        stream = f"BT /F1 10 Tf\n72 700 Td ({text}) Tj\nET".encode("latin-1")
+        descriptor = b"<< /Type /FontDescriptor /FontName /Synth /Flags 4"
+        if embed_program:
+            descriptor += b" /FontFile3 7 0 R"
+        descriptor += b" >>"
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+            b"<< /Type /Encoding /Differences [32 " + names.encode() + b"] >> "
+            b"/FontDescriptor 6 0 R >>",
+            descriptor,
+        ]
+        if embed_program:
+            objects.append(
+                b"<< /Length "
+                + str(len(self.FONT_PROGRAM)).encode()
+                + b" /Subtype /Type1C >>\nstream\n"
+                + self.FONT_PROGRAM
+                + b"\nendstream"
+            )
+        return _pdf(objects)
+
+    def _winansi_pdf(self, *programs: bytes) -> bytes:
+        """One page drawing byte 0x65 (``e``) once per embedded program, each from its
+        own WinAnsi Type1 font with a real ``/FontFile3``. No ``/Differences`` and no
+        ``/ToUnicode``: the byte decodes to a literal ``e`` by the base encoding alone --
+        the synthetic analogue of a symbol font whose ``e`` slot draws an en-dash. Each
+        show sits on its own baseline (700, 688, 676, ...) so a test can tell the
+        fragment from one program apart from another's identical ``e``."""
+        shows = b"".join(
+            f"BT /F{i} 10 Tf 72 {700 - 12 * i} Td (e) Tj ET\n".encode("latin-1") for i in range(len(programs))
+        )
+        font_refs = b" ".join(f"/F{i} {5 + 3 * i} 0 R".encode() for i in range(len(programs)))
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            b"/Resources << /Font << " + font_refs + b" >> >> /Contents 4 0 R >>",
+            b"<< /Length " + str(len(shows)).encode() + b" >>\nstream\n" + shows + b"\nendstream",
+        ]
+        for i, program in enumerate(programs):
+            # objects 5,6,7 for F0; 8,9,10 for F1; ... font / descriptor / program.
+            objects.append(
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding "
+                b"/FontDescriptor " + str(6 + 3 * i).encode() + b" 0 R >>"
+            )
+            objects.append(
+                b"<< /Type /FontDescriptor /FontName /Synth /Flags 32 /FontFile3 "
+                + str(7 + 3 * i).encode()
+                + b" 0 R >>"
+            )
+            objects.append(
+                b"<< /Length "
+                + str(len(program)).encode()
+                + b" /Subtype /Type1C >>\nstream\n"
+                + program
+                + b"\nendstream"
+            )
+        return _pdf(objects)
+
+    def _repair(self, pdf: bytes, **overrides):
+        import hashlib
+
+        entry = {
+            "document_sha256": hashlib.sha256(pdf).hexdigest(),
+            "font_program_sha256": hashlib.sha256(self.FONT_PROGRAM).hexdigest(),
+            "font_base_name": "Synth",
+            "glyph_name": "/C14",
+            "replacement": "\u00b0",
+            "evidence": "synthetic test entry; the scope, not the conclusion, is under test",
+        }
+        entry.update(overrides)
+        return pdf_fragments.GlyphRepair(**entry)
+
+    def test_a_fully_scoped_entry_repairs_the_glyph_and_says_repaired(self, monkeypatch) -> None:
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "\u00b0")
+
+        assert frag.glyph_mapping is GlyphMapping.REPAIRED
+
+    def test_the_repair_is_textual_only_and_the_geometry_is_untouched(self, monkeypatch) -> None:
+        require_pypdf()
+        pdf = self._differences_pdf()
+        unrepaired = _by_text(extract_fragments(pdf).fragments, "/C14")
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        repaired = _by_text(extract_fragments(pdf).fragments, "\u00b0")
+
+        assert (repaired.x_start, repaired.x_end, repaired.baseline_y, repaired.ink_x_end) == (
+            unrepaired.x_start,
+            unrepaired.x_end,
+            unrepaired.baseline_y,
+            unrepaired.ink_x_end,
+        )
+        # The per-glyph evidence names the REPAIRED piece at the unrepaired geometry:
+        # what a consumer slices is what the fragment says.
+        assert repaired.glyph_intervals is not None and unrepaired.glyph_intervals is not None
+        assert [piece for piece, _, _ in repaired.glyph_intervals] == ["\u00b0"]
+        assert [(s, e) for _, s, e in repaired.glyph_intervals] == [(s, e) for _, s, e in unrepaired.glyph_intervals]
+
+    def test_a_matching_font_in_a_different_document_is_not_repaired(self, monkeypatch) -> None:
+        """The narrowest scope is the DOCUMENT: the same font program embedded in other
+        bytes is outside what the evidence was read from."""
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf, document_sha256="0" * 64),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+
+    def test_a_matching_name_in_a_different_font_program_is_not_repaired(self, monkeypatch) -> None:
+        """`/C14` is a font-local code: another program is free to bind the same name
+        to anything, so the program digest gates even inside the registered document."""
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf, font_program_sha256="0" * 64),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+
+    def test_a_font_without_an_embedded_program_never_matches(self, monkeypatch) -> None:
+        """No program, no identity to scope on, no repair -- fail closed."""
+        require_pypdf()
+        pdf = self._differences_pdf(embed_program=False)
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+
+    def test_a_partially_repairable_fragment_stays_unmapped_and_unmodified(self, monkeypatch) -> None:
+        """Two markers, one entry: half a repair would read as data while still
+        carrying a marker, so the whole fragment keeps its published contract --
+        UNMAPPED, text exactly as the document emitted it."""
+        require_pypdf()
+        pdf = self._differences_pdf(names="/C14 /C15")
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", (self._repair(pdf),))
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14/C15")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+        assert frag.text == "/C14/C15"
+
+    def test_a_symbol_font_glyph_decoding_to_valid_latin_is_caught_not_passed_through(self, monkeypatch) -> None:
+        """The mis-decode case: the glyph decodes `successfully` to a literal `e`, so it
+        arrives MAPPED and every structural check passes it through as data. Registered
+        by document + program + name, it is REPAIRED to the en-dash instead -- caught,
+        with Carmel's conclusion named, never silently accepted as an `e`."""
+        require_pypdf()
+        program = self.FONT_PROGRAM + b"-endash"
+        pdf = self._winansi_pdf(program)
+        import hashlib
+
+        before = _by_text(extract_fragments(pdf).fragments, "e")
+        assert before.glyph_mapping is GlyphMapping.MAPPED, "premise: the raw decode is a valid, unflagged 'e'"
+        monkeypatch.setattr(
+            pdf_fragments,
+            "_GLYPH_REPAIRS",
+            (
+                self._repair(
+                    pdf,
+                    font_program_sha256=hashlib.sha256(program).hexdigest(),
+                    glyph_name="e",
+                    replacement="–",
+                ),
+            ),
+        )
+
+        frag = _by_text(extract_fragments(pdf).fragments, "–")
+
+        assert frag.glyph_mapping is GlyphMapping.REPAIRED
+        assert not any(f.text == "e" for f in extract_fragments(pdf).fragments)
+
+    def test_the_same_latin_char_from_an_unregistered_program_is_left_alone(self, monkeypatch) -> None:
+        """The proof that the repair is NOT a global `e` -> en-dash substitution. Two
+        fonts on one page both draw a plain `e`; only ONE program's is registered. The
+        registered `e` becomes an en-dash; the other stays exactly `e`, MAPPED. A repair
+        keyed on the character rather than the font program would rewrite both -- silent
+        corruption of the correct one."""
+        require_pypdf()
+        registered = self.FONT_PROGRAM + b"-A"
+        innocent = self.FONT_PROGRAM + b"-B"
+        pdf = self._winansi_pdf(registered, innocent)
+        import hashlib
+
+        monkeypatch.setattr(
+            pdf_fragments,
+            "_GLYPH_REPAIRS",
+            (
+                self._repair(
+                    pdf,
+                    font_program_sha256=hashlib.sha256(registered).hexdigest(),
+                    glyph_name="e",
+                    replacement="–",
+                ),
+            ),
+        )
+
+        fragments = extract_fragments(pdf).fragments
+        endash = _by_text(fragments, "–")
+        innocent_e = _by_text(fragments, "e")
+        # The registered show sits on baseline 700 (i=0), the innocent on 688 (i=1).
+        assert endash.baseline_y == pytest.approx(700.0, abs=1.0)
+        assert endash.glyph_mapping is GlyphMapping.REPAIRED
+        assert innocent_e.baseline_y == pytest.approx(688.0, abs=1.0)
+        assert innocent_e.glyph_mapping is GlyphMapping.MAPPED
+
+    def test_an_empty_registry_costs_nothing_and_changes_nothing(self, monkeypatch) -> None:
+        require_pypdf()
+        pdf = self._differences_pdf()
+        monkeypatch.setattr(pdf_fragments, "_GLYPH_REPAIRS", ())
+
+        frag = _by_text(extract_fragments(pdf).fragments, "/C14")
+
+        assert frag.glyph_mapping is GlyphMapping.UNMAPPED
+        assert frag.text == "/C14"
+
+    def test_the_shipped_registry_is_scoped_on_every_axis(self) -> None:
+        """Whatever entries ship, each must carry a full 64-hex document AND font program
+        scope, a glyph name that can only match one glyph, a non-marker replacement, and
+        recorded evidence. This is the shape that makes a global mapping unregisterable,
+        pinned against the live table rather than stated in prose.
+
+        The glyph name is either an unmapped MARKER (`/C14`) or a SINGLE character (the
+        mis-decoded `e`/`f`/`L`): both match exactly one glyph piece, because a piece is
+        one glyph's decode and a multi-character non-marker key could otherwise be
+        mistaken for a substring of ordinary text. What it must never be is a bare
+        multi-character string, which is why the length-one branch is asserted, not
+        merely allowed."""
+        assert pdf_fragments._GLYPH_REPAIRS, "the registry ships at least the /C14 entry"
+        for entry in pdf_fragments._GLYPH_REPAIRS:
+            assert len(entry.document_sha256) == 64 and all(c in "0123456789abcdef" for c in entry.document_sha256)
+            assert len(entry.font_program_sha256) == 64
+            is_marker = bool(pdf_fragments._UNMAPPED_MARKER_RE.fullmatch(entry.glyph_name))
+            assert is_marker or len(entry.glyph_name) == 1, (
+                "a glyph name that is neither a marker nor a single character could match a substring of ordinary text"
+            )
+            assert entry.replacement
+            assert not pdf_fragments._UNMAPPED_MARKER_RE.search(entry.replacement)
+            assert len(entry.evidence) > 100, "an entry without recorded evidence is a guess"
+
+
+class TestTheInkExtentStopsAtTheLastGlyph:
+    """``ink_x_end`` is ``x_end`` minus exactly the spacing charged past the final glyph.
+
+    The advance extent includes that trailing charge because the PDF operator does; on
+    the real corpus table this made one fragment read 92.019 pt wider than its ink and
+    refused the whole table's containment. Every test here asserts the two extents
+    TOGETHER, because the invariant is a relation: the advance extent must not move
+    (callers that need the pen position keep it), and the ink extent must differ from it
+    by precisely the trailing charge and nothing else.
+    """
+
+    SPACING = 4.0
+
+    def test_unspaced_text_has_identical_ink_and_advance(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (Hello) Tj\nET"), "Hello")
+        assert frag.ink_x_end == frag.x_end
+
+    def test_character_spacing_trails_by_exactly_one_charge(self) -> None:
+        """Five glyphs owe five ``Tc``, and the ink excludes ONE of them -- the last."""
+        require_pypdf()
+        plain = _by_text(_fragments("BT /F1 10 Tf\n72 700 Td (ABCDE) Tj\nET"), "ABCDE")
+        spaced = _by_text(_fragments(f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (ABCDE) Tj\nET"), "ABCDE")
+        assert spaced.x_end - plain.x_end == pytest.approx(5 * self.SPACING), "the advance extent moved"
+        assert spaced.x_end - spaced.ink_x_end == pytest.approx(self.SPACING)
+
+    def test_a_trailing_space_glyph_charges_word_spacing_too(self) -> None:
+        """A show ending in a space owes ``Tw`` after that space's width as well."""
+        require_pypdf()
+        frag = _by_text(_fragments("BT /F1 10 Tf\n6 Tw\n72 700 Td (A B ) Tj\nET"), "A B")
+        assert frag.x_end - frag.ink_x_end == pytest.approx(6.0)
+
+    def test_horizontal_scaling_scales_the_trailing_charge(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments(f"BT /F1 10 Tf\n50 Tz\n{self.SPACING} Tc\n72 700 Td (ABCDE) Tj\nET"), "ABCDE")
+        assert frag.x_end - frag.ink_x_end == pytest.approx(self.SPACING * 0.5)
+
+    def test_a_scaled_text_matrix_scales_the_trailing_charge(self) -> None:
+        require_pypdf()
+        frag = _by_text(_fragments(f"BT /F1 1 Tf\n{self.SPACING} Tc\n3 0 0 3 72 700 Tm (ABCDE) Tj\nET"), "ABCDE")
+        assert frag.x_end - frag.ink_x_end == pytest.approx(self.SPACING * 3.0)
+
+    def test_a_placeholder_final_glyph_owes_one_trailing_charge_not_its_spelling(self) -> None:
+        """The trailing glyph of a ``/Differences`` run is ONE code, however it spells.
+
+        The sibling of the per-glyph `Tc` count above: the final code decodes to the
+        four-character name ``/C21``, and subtracting a per-CHARACTER trailing charge
+        would take four spacings where one is owed.
+        """
+        require_pypdf()
+        stream = f"BT /F1 10 Tf\n{self.SPACING} Tc\n72 700 Td (\x20\x21) Tj\nET".encode("latin-1")
+        pdf = _pdf(
+            [
+                b"<< /Type /Catalog /Pages 2 0 R >>",
+                b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+                b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+                b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+                b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+                b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding "
+                b"<< /Type /Encoding /Differences [32 /C20 /C21] >> >>",
+            ]
+        )
+        result = extract_fragments(pdf)
+        assert result.available is True and result.lossy is False
+        frag = _by_text(result.fragments, "/C20/C21")
+        assert frag.ink_x_end is not None
+        assert frag.x_end - frag.ink_x_end == pytest.approx(self.SPACING)
+
+    def test_rotated_text_carries_no_ink_extent(self) -> None:
+        """A rotated show's x-projection is meaningless; the new field declines to exist
+        rather than shipping a number with a warning attached, unlike ``x_end`` which
+        predates that option."""
+        require_pypdf()
+        result = extract_fragments(_one_page_pdf("BT /F1 10 Tf\n0 1 -1 0 300 400 Tm (rotated) Tj\nET"))
+        frag = _by_text(result.fragments, "rotated")
+        assert frag.rotated is True
+        assert frag.ink_x_end is None
+
+    def test_a_directly_built_fragment_defaults_to_no_ink_extent(self) -> None:
+        """Synthetic fixtures predate the field; ``None`` must mean "judge by advance",
+        so their behaviour under every consumer is exactly the pre-field behaviour."""
+        fragment = pdf_fragments.TextFragment(
+            page=1,
+            text="x",
+            x_start=1.0,
+            x_end=2.0,
+            baseline_y=3.0,
+            font_height=4.0,
+            rotated=False,
+            glyph_mapping=GlyphMapping.MAPPED,
+        )
+        assert fragment.ink_x_end is None
+
+
 class TestPageNumbering:
     def test_a_phantom_page_tree_entry_does_not_shift_page_numbers(self) -> None:
         """pypdf counts a linearization dictionary as a page on real corpus papers.
@@ -578,7 +1031,7 @@ class TestAnEngineMismatchIsNotAPageFailure:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -645,7 +1098,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -682,7 +1135,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         assert issubclass(mod._EngineMismatch, Exception)
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -700,7 +1153,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -729,7 +1182,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget):
+        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         produced = {extract_fragments(_one_page_pdf(self._PDF)).status}
@@ -866,10 +1319,10 @@ class TestLossRecordsWhatWasLost:
 
         real = mod._page_fragments
 
-        def _boom(page, page_number, engine, budget):
+        def _boom(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             if page_number == 2:
                 raise ValueError("synthetic page explosion")
-            return real(page, page_number, engine, budget)
+            return real(page, page_number, engine, budget, repairs, glyph_budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _boom)
         pdf = _two_page_pdf(
@@ -1011,9 +1464,9 @@ class TestLossRecordsWhatWasLost:
         real = mod._page_fragments
         parsed: list[int] = []
 
-        def _recording(page, page_number, engine, budget):
+        def _recording(page, page_number, engine, budget, repairs=None, glyph_budget=None):
             parsed.append(page_number)
-            return real(page, page_number, engine, budget)
+            return real(page, page_number, engine, budget, repairs, glyph_budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _recording)
         monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 1)
@@ -1293,3 +1746,157 @@ class TestOnePageCannotCostUnboundedMemory:
         """836,591 B is the largest decompressed page in the 8-paper corpus (median
         22,035 B). Pinned so that lowering the cap has to face the measurement."""
         assert MAX_PAGE_CONTENT_BYTES >= 836_591 * 7
+
+
+def _fake_font(
+    *,
+    encoding,
+    character_map=None,
+    space_char=" ",
+    space_width=250.0,
+    text_width=500.0,
+):
+    """A stand-in for the ``font`` a pypdf ``TextStateParams`` exposes, carrying exactly
+    the attributes the per-glyph helpers read: ``encoding`` (a ``str`` codec name or a
+    ``dict`` code->substring map), ``character_map``, ``space_char``/``space_width``, and
+    a ``get_text_width`` lookup."""
+    return SimpleNamespace(
+        encoding=encoding,
+        character_map=character_map if character_map is not None else {},
+        space_char=space_char,
+        space_width=space_width,
+        get_text_width=lambda character: text_width,
+    )
+
+
+def _fake_show(
+    *,
+    value,
+    font,
+    decoded_value="",
+    text="",
+    Tc=0.0,
+    Tw=0.0,
+    Tz=100.0,
+    transform=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+    tx=0.0,
+    font_size=1000.0,
+    displaced_tx=0.0,
+):
+    """A stand-in for one pypdf ``TextStateParams`` show, carrying only the fields the
+    glyph helpers read. The happy paths of these helpers are already driven end-to-end by
+    the synthetic-PDF tests above; this fabricates the pathological states a well-formed
+    PDF cannot reach -- an undecodable dict-encoded byte, a pen walked left of its own
+    start, a non-finite or backwards interval -- so the refusal/degradation arms that a
+    corpus PDF never exercises are exercised deliberately here."""
+    return SimpleNamespace(
+        value=value,
+        font=font,
+        _decoded_value=decoded_value,
+        text=text,
+        Tc=Tc,
+        Tw=Tw,
+        Tz=Tz,
+        transform=transform,
+        tx=tx,
+        font_size=font_size,
+        displaced_tx=displaced_tx,
+    )
+
+
+class TestFontProgramScopingFailsClosed:
+    """A repair is scoped by the sha of the embedded font PROGRAM. When that sha cannot be
+    computed -- a font with no program, or any failure reaching or inflating one -- the
+    scope cannot match and the repair does not apply: no match, fail closed."""
+
+    def test_a_font_with_no_descriptor_program_has_no_sha(self) -> None:
+        font = SimpleNamespace(font_descriptor=SimpleNamespace(font_file=None))
+        assert pdf_fragments._font_program_sha256(font) is None
+
+    def test_a_program_that_cannot_be_read_has_no_sha(self) -> None:
+        def _explode():
+            raise ValueError("the font stream is broken")
+
+        font = SimpleNamespace(font_descriptor=SimpleNamespace(font_file=SimpleNamespace(get_data=_explode)))
+        assert pdf_fragments._font_program_sha256(font) is None
+
+
+class TestGlyphSubstringsPartition:
+    """``_glyph_substrings`` partitions a show's decoded value one piece per glyph code, or
+    degrades to ``None`` when no per-code alignment exists -- the wider, refusing direction."""
+
+    def test_a_non_bytes_operand_is_one_character_per_code(self) -> None:
+        show = _fake_show(value="ab", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_substrings(show) == ["a", "b"]
+
+    def test_a_dict_encoded_byte_absent_from_the_map_but_ascii_decodes(self) -> None:
+        # 0x41 is in no /Differences entry yet decodes as 'A': pypdf's own fallback, mirrored.
+        show = _fake_show(value=b"\x41", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_substrings(show) == ["A"]
+
+    def test_a_dict_encoded_byte_that_cannot_decode_degrades_to_none(self) -> None:
+        # 0x80 is a bare UTF-8 continuation byte: no per-code alignment, so None.
+        show = _fake_show(value=b"\x80", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_substrings(show) is None
+
+
+class TestTextPiecesAreVerifiedNotTrusted:
+    """``_text_pieces`` returns a glyph-aligned view of the PUBLISHED text only when that
+    partition provably reconstructs it; any disagreement returns ``None`` so every per-glyph
+    consumer degrades to "no per-glyph view" rather than slicing on a guess."""
+
+    def test_an_unavailable_partition_yields_no_pieces(self) -> None:
+        show = _fake_show(value=b"\x80", font=_fake_font(encoding={}))
+        assert pdf_fragments._text_pieces(show) is None
+
+    def test_a_non_bytes_operand_pieces_are_its_substrings(self) -> None:
+        show = _fake_show(value="ab", font=_fake_font(encoding={}), text="ab")
+        assert pdf_fragments._text_pieces(show) == ["a", "b"]
+
+    def test_a_partition_that_disagrees_with_the_text_yields_no_pieces(self) -> None:
+        # The partition reconstructs "AB"; the published text is something else, so the
+        # alignment is not trusted and the fragment degrades to no per-glyph view.
+        show = _fake_show(value=b"AB", font=_fake_font(encoding={}), text="mismatch")
+        assert pdf_fragments._text_pieces(show) is None
+
+
+class TestInkExtentRefusesRatherThanGuess:
+    """``_ink_x_end`` publishes the last glyph's ink edge, or ``None`` when it is unknowable
+    or would break the left-to-right hull it is read as one edge of."""
+
+    def test_a_show_with_no_glyphs_has_no_ink_extent(self) -> None:
+        show = _fake_show(value=b"", font=_fake_font(encoding={}))
+        assert pdf_fragments._ink_x_end(show) is None
+
+    def test_an_ink_edge_left_of_the_start_is_refused(self) -> None:
+        # displaced_tx=0 with tx=10 walks the pen left of the show's own start: refused.
+        show = _fake_show(value=b"A", font=_fake_font(encoding={}), tx=10.0, displaced_tx=0.0)
+        assert pdf_fragments._ink_x_end(show) is None
+
+    def test_an_ink_edge_at_or_right_of_the_start_is_published(self) -> None:
+        # The faithful positive: no trailing charge, pen at 5, start at 0 -> the edge is 5.0,
+        # anchoring the fabricated show against the arithmetic the real shows drive.
+        show = _fake_show(value=b"A", font=_fake_font(encoding={}), tx=0.0, displaced_tx=5.0)
+        assert pdf_fragments._ink_x_end(show) == 5.0
+
+
+class TestGlyphGeometryIsWholeFragmentOrNothing:
+    """``_glyph_geometry`` zips the width-driving substrings against the published pieces
+    and returns per-glyph page-space intervals, or ``None`` for the whole fragment when the
+    partitions disagree in length or any interval is non-finite or backwards."""
+
+    def test_a_length_mismatch_yields_no_geometry(self) -> None:
+        show = _fake_show(value=b"AB", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_geometry(show, ["only-one"]) is None
+
+    def test_a_backwards_interval_yields_no_geometry(self) -> None:
+        # A negative horizontal projection sends the glyph's end left of its start: refused.
+        font = _fake_font(encoding={}, text_width=500.0)
+        show = _fake_show(value=b"A", font=font, transform=(-1.0, 0.0, 0.0, 1.0, 0.0, 0.0), tx=0.0)
+        assert pdf_fragments._glyph_geometry(show, ["A"]) is None
+
+    def test_a_well_formed_show_yields_one_interval_per_glyph(self) -> None:
+        # The faithful positive: a 500-unit glyph at 1000 pt / 100% Th spans [0, 500).
+        font = _fake_font(encoding={}, text_width=500.0)
+        show = _fake_show(value=b"A", font=font, transform=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0), tx=0.0)
+        assert pdf_fragments._glyph_geometry(show, ["A"]) == (("A", 0.0, 500.0),)

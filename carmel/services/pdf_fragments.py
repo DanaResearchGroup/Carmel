@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import importlib.metadata
 import io
 import logging
@@ -79,6 +80,17 @@ class GlyphMapping(StrEnum):
     a character. The fragment's text is returned UNMODIFIED; a consumer that treats
     it as a value is reading a marker as data."""
 
+    REPAIRED = "repaired"
+    """Every glyph decoded, but at least one of them only through Carmel's own
+    evidence-scoped repair table (:data:`_GLYPH_REPAIRS`) rather than through the
+    document. A third member instead of a promotion to :attr:`MAPPED`, deliberately:
+    the document never said what this glyph means -- Carmel concluded it, from
+    recorded evidence, under a gate scoped to one document, one embedded font program
+    and one glyph code -- and an artifact built from the fragment must be able to say
+    so. Consumers that admit it are admitting that conclusion by name, never by
+    accident: everything else in this codebase that switches on this enum treats any
+    member it does not explicitly admit as refusable."""
+
 
 # Markers a PDF text extractor emits when a glyph has no usable ``ToUnicode`` entry.
 #
@@ -89,10 +101,15 @@ class GlyphMapping(StrEnum):
 # SIGN INVERSION inside an otherwise perfectly well-formed number. That is strictly
 # worse than a missing value, because nothing downstream looks wrong.
 #
-# Flagged, never repaired. Mapping ``/C0`` to U+2212 -- or ``þ`` to ``+`` and ``¼``
-# to ``=``, which the same PDFs also need -- is a SEMANTIC claim about what the
-# document meant, and grounding proves LOCATION, never MEANING. A repair table needs
-# its own gate and its own evidence; it does not belong in a mechanical extractor.
+# Flagged, and never repaired by DEFAULT. Mapping ``/C0`` to U+2212 -- or ``þ`` to
+# ``+`` and ``¼`` to ``=``, which the same PDFs also need -- is a SEMANTIC claim about
+# what the document meant, and grounding proves LOCATION, never MEANING. A repair
+# table needs its own gate and its own evidence. That table now exists
+# (:data:`_GLYPH_REPAIRS`): each entry is scoped to ONE document's bytes, ONE embedded
+# font program and ONE glyph code, carries the recorded evidence it rests on, and
+# surfaces as :attr:`GlyphMapping.REPAIRED` -- never as ``MAPPED``, so nothing
+# downstream can mistake Carmel's conclusion for the document's. A glyph with no
+# entry stays flagged with its text unmodified, exactly as before.
 # The `/C\d+` arm is DELIBERATELY bounded on both sides. An unanchored `/C\d+`
 # substring match is catastrophic in a combustion codebase: it flags `/C2H4`, `C1/C2`,
 # `H2/CO`-style species lists, appendix labels and file paths as corrupt. The lookarounds
@@ -106,6 +123,299 @@ _UNMAPPED_MARKER_RE = re.compile(
     """,
     re.VERBOSE,
 )
+
+
+@dataclass(frozen=True)
+class GlyphRepair:
+    """One evidence-scoped decoding for one glyph the document itself does not decode.
+
+    **A global glyph-name mapping is silent semantic corruption and must never ship.**
+    A ``/Differences`` name like ``/C14`` is a FONT-LOCAL code, not a character:
+    another embedded font is free to bind the same name to anything at all, and a
+    table keyed on the name alone would rewrite it everywhere while looking perfectly
+    reasonable. Every entry here is therefore scoped three times over, and applies
+    only when ALL THREE match:
+
+    * ``document_sha256`` -- the sha256 of the WHOLE document's raw bytes. The
+      narrowest honest scope: the evidence below was read out of one file, so the
+      conclusion is asserted for that file and no other, even one embedding the same
+      font program with the same digest.
+    * ``font_program_sha256`` -- the sha256 of the embedded font program's decoded
+      bytes (``FontFile``/``FontFile2``/``FontFile3``). The glyph's meaning lives in
+      the program that draws it, so this is the identity the conclusion is actually
+      ABOUT; the document scope narrows it further rather than standing in for it.
+    * ``glyph_name`` -- the decoded per-glyph substring the fragment lane produces
+      for the code, matched against ONE glyph piece at a time. For a glyph the
+      document leaves unmapped this is the font's own ``/Differences`` name (``/C14``),
+      an unmapped MARKER; for a glyph the document mis-decodes it is the wrong
+      character the font hands back (a symbol font's ``f`` slot holds a phi, so the
+      piece is a literal ``f``). Either way the match is per PIECE, and a piece is
+      exactly one glyph's decode -- ordinary text that merely SPELLS ``f`` or ``/C14``
+      arrives as several pieces and cannot match. That per-glyph partition, together
+      with the two scopes above, is what makes matching on a bare ``f`` a
+      font-program-and-code conclusion and NOT a global ``f`` -> phi substitution: the
+      entry fires only on the one embedded program's one glyph, in the one document.
+
+    Two kinds of glyph therefore reach this table, and they surface differently on the
+    way IN but identically on the way OUT. An UNMAPPED glyph (marker piece) is one the
+    document never decoded; a MIS-DECODED glyph (valid-Latin piece) is one the document
+    decoded to the wrong character -- a symbol font handing back ``f``/``e`` that no
+    ``/ToUnicode`` and no ``/Differences`` contradict, so nothing downstream flags it.
+    The mis-decoded case is the more dangerous of the two precisely because it reads as
+    clean data; it is caught here only because the embedded program that draws it is
+    pinned by sha256 and its glyph identified by outline (see each entry's evidence).
+
+    A repaired fragment surfaces as :attr:`GlyphMapping.REPAIRED`, never ``MAPPED``,
+    and an UNMAPPED fragment whose markers are not ALL covered by matching entries
+    keeps its text unmodified and stays ``UNMAPPED`` -- a half-repaired string would
+    read as data while still carrying a marker. Where the evidence does not support a
+    mapping, the honest entry is NO entry: the fragment then refuses downstream with
+    the glyph named, which is a better outcome than a guess.
+    """
+
+    document_sha256: str
+    font_program_sha256: str
+    font_base_name: str
+    """The font's ``/BaseFont`` at the time the evidence was read. Diagnostic only --
+    subset prefixes are arbitrary and names are forgeable, so this never gates."""
+
+    glyph_name: str
+    replacement: str
+    evidence: str
+    """What the conclusion rests on, recorded beside it so a reviewer can re-derive or
+    refute it without an archaeology dig. State what was actually consulted."""
+
+
+#: Every glyph repair this module will apply. Append-only; scoping rules and the
+#: refuse-don't-guess policy are on :class:`GlyphRepair`.
+_GLYPH_REPAIRS: tuple[GlyphRepair, ...] = (
+    GlyphRepair(
+        # Table 1, p4 of the combustion-conditions paper this lane's M2 target lives
+        # in. Its temperature header renders "T (<glyph 2> C)" where glyph 2 of the
+        # /F7 font is the unmapped /C14.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="fef02938850ee399076ea5efc5960c08a91546241c2814ea86ab49011919bed1",
+        font_base_name="NNEIFK+AdvP4C4E74",
+        glyph_name="/C14",
+        replacement="°",
+        evidence=(
+            "Read from the document itself, in order of authority: (1) the font's "
+            "/Encoding /Differences binds code 2 to the non-semantic name /C14, and its "
+            "/ToUnicode CMap is silent about it (codespace <bc><fe> only), so the "
+            "document does not decode this glyph; (2) the embedded 633-byte CFF program "
+            "(sha256 above) draws C14 as two concentric near-circular closed contours -- "
+            "an annulus of outer bbox [56,443]x[56,444] in the 1000-unit em, advance "
+            "width 500 -- i.e. a small ring; (3) the page typesets it at 70% of the "
+            "surrounding body height (font_height 4.88 vs 6.97) with its baseline raised "
+            "2.55 pt, a superscript placement. A small raised ring is the degree sign "
+            "U+00B0; the ring-shaped alternatives are excluded by that same placement "
+            "and proportion (U+2218 RING OPERATOR sits centred on the math axis, U+25CB "
+            "WHITE CIRCLE is full-size). No neighbouring text was used to reach the "
+            "conclusion; that the repaired header reads 'T (°C)' is corroboration, "
+            "not evidence."
+        ),
+    ),
+    GlyphRepair(
+        # Same document, Table 1. Its equivalence-ratio column header, and the caption
+        # ("Table 1 <glyph> Measurement conditions"), and the ranges "0.6<glyph>1.0"
+        # etc., all draw an en-dash from the /F2 symbol font whose WinAnsi 'e' slot
+        # holds it. The document decodes it to a literal 'e' -- valid Latin, so it
+        # surfaces MAPPED and nothing flags it. 188 glyphs in this document.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="08ab6520b901000f5ccd4ff5cf535ccde7465ce0d985ff38d7258e3574e93f40",
+        font_base_name="NNEIEF+AdvPS44A44B",
+        glyph_name="e",
+        replacement="–",
+        evidence=(
+            "Read from the document itself. (1) The font carries WinAnsiEncoding with "
+            "NO /ToUnicode and NO /Encoding /Differences, so byte 0x65 decodes to 'e' "
+            "purely by the base encoding -- the font asserts no Unicode of its own; its "
+            "/Flags are 32 (Nonsymbolic), and even the embedded CFF names the glyph 'e'. "
+            "Every name and flag AGREES with 'e'; only the outline disagrees. (2) The "
+            "embedded 363-byte CFF program (sha256 above; charset ['.notdef','L','e'], a "
+            "two-glyph symbol subset) draws 'e' as a SINGLE contour, bbox [50,700]x"
+            "[274,326] in the 1000-unit em, advance width 750: a 650-unit horizontal bar "
+            "52 units tall, floating on the math axis and never touching the baseline. A "
+            "genuine 'e' (the body font's, for contrast) is a two-contour bowl on the "
+            "baseline, bbox [47,509]x[-11,528]. A bar this wide excludes a hyphen (short, "
+            "low); at 0.65 em it excludes an em-dash (~1 em). It is a dash-class mark; "
+            "read as an en-dash U+2013 because this glyph is the document's range and "
+            "caption separator (its math-axis sibling 'L', used once inside exp(-Ea/RT), "
+            "is the minus -- separate entry). That the repaired caption reads "
+            "'Table 1 - Measurement conditions' and the ranges read '0.6-1.0' is "
+            "corroboration, not evidence."
+        ),
+    ),
+    GlyphRepair(
+        # Same document. The one occurrence of the /F2 symbol font's OTHER glyph, its
+        # WinAnsi 'L' slot, drawn once inside a rate expression "[A T^n exp(<glyph>Ea/
+        # RT)]" on p8. Decodes to a literal 'L'; a bar read as a capital L inside an
+        # Arrhenius exponent is a silent sign that is not even a sign.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="08ab6520b901000f5ccd4ff5cf535ccde7465ce0d985ff38d7258e3574e93f40",
+        font_base_name="NNEIEF+AdvPS44A44B",
+        glyph_name="L",
+        replacement="−",
+        evidence=(
+            "Same 363-byte CFF program as the en-dash entry above (charset "
+            "['.notdef','L','e']); WinAnsi, no /ToUnicode, no /Differences, /Flags 32, "
+            "CFF glyph name 'L' -- every name and flag agrees with 'L', only the outline "
+            "disagrees. The 'L' glyph is a SINGLE contour, bbox [170,830]x[261,339], "
+            "advance width unread here but the ink is a 660-unit horizontal bar 78 units "
+            "tall centred on the math axis (y 261-339) -- structurally a dash/minus, not "
+            "a letter L (which is a baseline-to-cap vertical plus a foot). Excludes "
+            "hyphen (too wide) and em-dash (~1 em). Distinguished from its sibling 'e' "
+            "en-dash by placement AND role: this glyph occurs once, between 'exp(' and "
+            "'Ea/RT', i.e. as the operator of exp(-Ea/RT). A minus sign U+2212 (the math "
+            "operator), not U+2013; the mathematical position is the one place the "
+            "outline alone cannot choose between the two dash-class marks and the role "
+            "decides."
+        ),
+    ),
+    GlyphRepair(
+        # Same document, Table 1 equivalence-ratio header cell (p4). The label phi is
+        # drawn from the /F13 symbol font whose WinAnsi 'f' slot holds it; decodes to a
+        # literal 'f'. Surfaces MAPPED.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="45b1e0bf5d9e3a6e5e7af5f2b83ba95e1b19696d7eb4a0cea93dd412c80df3ac",
+        font_base_name="NNEJBM+AdvPS4721B4",
+        glyph_name="f",
+        replacement="φ",
+        evidence=(
+            "Read from the document. (1) WinAnsiEncoding, no /ToUnicode, no /Differences; "
+            "byte 0x66 decodes to 'f' by base encoding alone; /Flags 32 (Nonsymbolic); "
+            "the embedded CFF even names the glyph 'f'. Every name and flag agrees with "
+            "'f'; only the outline disagrees. (2) The embedded 533-byte CFF program "
+            "(sha256 above; charset ['.notdef','f','g']) draws 'f' with THREE contours, "
+            "bbox [44,564]x[-189,660] in the 1000-unit em, advance width 604: a bowl "
+            "(outer + inner counter = two contours) crossed by a vertical stroke that "
+            "DESCENDS to y=-189, well below the baseline. A genuine 'f' (body font, for "
+            "contrast) is a SINGLE contour, bbox [47,436]x[0,777], with no descender at "
+            "all. A circular bowl with a counter and a descending vertical stroke is a "
+            "phi U+03C6; the deep descender excludes every Latin letter, and the closed "
+            "bowl excludes the descenderless 'f' the byte decodes to. That the repaired "
+            "header labels an equivalence-ratio column is corroboration, not evidence."
+        ),
+    ),
+    GlyphRepair(
+        # Same document. A SECOND symbol font (AdvPS3ECA66) whose 'f' slot also holds a
+        # phi, drawn in the body text on pages 5-11 (11 occurrences), NOT in the table.
+        # Registered so the document reports phi uniformly: a paper that renders phi
+        # correctly in one place and as 'f' in another is worse than one uniformly
+        # wrong. Same fault, distinct embedded program, distinct sha256.
+        document_sha256="9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b",
+        font_program_sha256="22a1e061856b2e27b6d4997553c4f76538889b56abdef7fa05ec049538e42605",
+        font_base_name="NNFAME+AdvPS3ECA66",
+        glyph_name="f",
+        replacement="φ",
+        evidence=(
+            "Read from the document. WinAnsiEncoding, no /ToUnicode, no /Differences, "
+            "byte 0x66 -> 'f' by base encoding; /Flags 32; CFF glyph name 'f'. The "
+            "embedded 439-byte CFF program (sha256 above; charset ['.notdef','f'], a "
+            "one-glyph symbol subset) draws 'f' with THREE contours, bbox [44,624]x"
+            "[-189,664], advance width 666: the same bowl-plus-descending-stroke as the "
+            "/F13 phi above, descender to y=-189. Contrast the body 'f': one contour, no "
+            "descender. A phi U+03C6, on the same outline grounds. Used on pages 5-11 as "
+            "the equivalence-ratio symbol in running text."
+        ),
+    ),
+)
+
+
+def _font_program_sha256(font: Any) -> str | None:
+    """The sha256 of the embedded font program this font resolves to, or ``None``.
+
+    ``None`` -- no repair can match -- for a font with no embedded program at all, and
+    for every failure while reaching or inflating one: fail closed, a repair that
+    cannot verify its scope does not apply.
+
+    ``get_data()`` inflates the font stream with no output bound, which this module
+    refuses for content streams. It is admissible here because of WHERE the call
+    sits: :func:`_page_fragments` consults this only after the DOCUMENT scope
+    matched, so the only bytes this can ever inflate are those of a document whose
+    entire content is already pinned by sha256 in :data:`_GLYPH_REPAIRS` -- an input
+    chosen by whoever registered the repair, not by whoever supplies a PDF.
+    """
+    try:
+        stream = font.font_descriptor.font_file
+        if stream is None:
+            return None
+        return hashlib.sha256(bytes(stream.get_data())).hexdigest()
+    except Exception:  # noqa: BLE001 - any failure to identify the program is "no match"
+        logger.debug("embedded font program could not be identified for repair scoping", exc_info=True)
+        return None
+
+
+def _text_pieces(show: Any) -> list[str] | None:
+    """This show's PUBLISHED text, partitioned one piece per glyph code, or ``None``.
+
+    The glyph-aligned view of ``show.text``: :func:`_glyph_substrings` partitions the
+    DECODED value per code, and this maps each substring through the font's
+    ``character_map`` exactly the way pypdf built the text -- so the pieces
+    concatenate to ``show.text`` by construction, and that construction is verified
+    rather than trusted: any disagreement (a pypdf decode this partition no longer
+    mirrors) returns ``None``, and every per-glyph consumer -- the repair table, the
+    glyph/ink evidence -- degrades to "no per-glyph view" rather than operating on an
+    alignment that is a guess.
+
+    This partition is the one sound way to slice fragment text at glyph boundaries.
+    Glyph count can differ from ``len(text)`` (a ``/Differences`` name is one code and
+    four characters), so any consumer slicing text by glyph COUNT is already wrong;
+    slicing at piece boundaries is exact.
+    """
+    substrings = _glyph_substrings(show)
+    if substrings is None:
+        return None
+    if isinstance(show.value, bytes):
+        character_map = show.font.character_map
+        pieces = ["".join(character_map.get(c, c) for c in substring) for substring in substrings]
+    else:
+        pieces = substrings
+    if "".join(pieces) != show.text:
+        return None
+    return pieces
+
+
+def _repaired_pieces(pieces: list[str], repairs: dict[str, str]) -> list[str] | None:
+    """``pieces`` with every registered glyph repaired, or ``None`` -- no change.
+
+    ``repairs`` is already scoped: the caller has matched the document and the font
+    program, so the keys here are glyph names valid for exactly this show's font
+    program -- a bare ``f`` key means "the glyph THIS program draws at the code that
+    decodes to f", not "any f anywhere".
+
+    The replacement is performed per GLYPH, never by string substitution on the joined
+    text, and that is the whole safety argument. A piece is exactly one glyph's decode
+    (:func:`_text_pieces`), so a key that is a marker (``/C14``) matches only a glyph
+    that decoded to that marker, and a key that is a plain character (``f``) matches
+    only a glyph that decoded to that one character -- ordinary text that merely SPELLS
+    ``f`` or ``/C14`` arrives as several pieces and cannot match. There is deliberately
+    no "only a marker is eligible" gate: the mis-decoded glyphs this table also repairs
+    (a symbol font's ``f`` that is really a phi) are valid Latin, never markers, and the
+    font-program scope -- not the shape of the piece -- is what bounds the match.
+
+    Refuses (returns ``None``) rather than repairing when no piece actually matched, or
+    when an unmapped MARKER remains after every available repair -- a half-repaired
+    fragment would read as data while still carrying a marker, so it stays UNMAPPED with
+    its text unmodified, which is the published contract for unmapped fragments. A
+    fragment that carried no marker to begin with (the mis-decoded case) has nothing for
+    that check to trip on and is repaired outright. (The third refusal, an unavailable
+    or misaligned partition, is upstream: the caller only reaches here holding real
+    pieces from :func:`_text_pieces`.)
+    """
+    repaired: list[str] = []
+    changed = False
+    for piece in pieces:
+        if piece in repairs:
+            repaired.append(repairs[piece])
+            changed = True
+        else:
+            repaired.append(piece)
+    if not changed:
+        return None
+    if _UNMAPPED_MARKER_RE.search("".join(repaired)):
+        return None
+    return repaired
 
 
 @dataclass(frozen=True)
@@ -157,6 +467,73 @@ class TextFragment:
     dropped; see :func:`_page_fragments`."""
 
     glyph_mapping: GlyphMapping
+
+    ink_x_end: float | None = None
+    """Absolute page-space x where the last glyph's own advance width ends -- the
+    fragment's INK extent, as opposed to :attr:`x_end`, its ADVANCE extent.
+
+    The two differ because the PDF text-space displacement charges character spacing
+    (and word spacing, on a space) after EVERY glyph including the last (ISO 32000-1
+    9.4.4), so ``x_end`` reaches one full character space past anything the fragment
+    drew. On body text that trailing charge is zero and the two are equal; on a
+    ``Tc``-spaced run it is not, and the gap is not small: the real corpus table this
+    was built against carries a two-glyph show whose advance extent is 191.736 pt while
+    its ink ends 92.019 pt earlier. A containment test that reads ``x_end`` refuses
+    that fragment for spacing it never drew.
+
+    Both extents are published because they answer different questions and each has
+    call sites that need it. ``x_end`` is where the NEXT show starts, the fail-closed
+    reading for anything that must not undercount a fragment's reach (the clip guard,
+    ``pdf_cells``' neighbour geometry); this one is what the fragment actually
+    occupies, the honest reading for containment and cut tests in
+    :mod:`carmel.services.pdf_tables`.
+
+    This is the extent of the last glyph's WIDTH, not a drawn-pixels bound: a glyph
+    box is still the em-square estimate it always was, internal spacing is still
+    inside the span, and a trailing SPACE glyph's width counts as ink here (its width
+    is what the document reserves for it; erring wide costs a refusal, not a
+    publication).
+
+    ``None`` when the per-glyph decomposition needed to charge the trailing spacing is
+    unavailable -- a dict-encoded show with an undecodable byte, or a fragment built
+    outside :func:`extract_fragments` (every synthetic test fixture). Consumers fall
+    back to :attr:`x_end`, which restores exactly the pre-field behaviour and fails in
+    the refusing direction, because the advance extent is never narrower than the ink."""
+
+    glyph_intervals: tuple[tuple[str, float, float], ...] | None = None
+    """Per-glyph evidence: one ``(text piece, ink x-start, ink x-end)`` per glyph code,
+    in drawing order, in absolute page space -- or ``None`` when not recorded.
+
+    This is EVIDENCE, not a decision. A single show operator can draw the last glyph of
+    one table cell and the first glyph of the next, carrying the inter-column gap as
+    character spacing -- the real target's ``(91)Tj`` with ``13.1949 Tc`` draws ``9``
+    closing one column's value and ``1`` opening the next's, 92 pt apart. Extraction
+    cannot split that safely: it has no footprint, no rows and no table context, and
+    the per-glyph spacing it would need is otherwise discarded during construction. So
+    it records where each glyph's ink actually landed AFTER all spacing and
+    displacement -- final page-space intervals, never raw spacing operands, because
+    ``Tc`` is not the only gap source (``TJ`` displacements and ``Tw`` open internal
+    space too) -- and the split decision lives one layer up, in
+    :func:`carmel.services.pdf_tables.build_inventory`, where the columns exist to
+    judge it against.
+
+    The intervals are the WIDTH each glyph's advance reserves (``w0 * Tfs * Th``,
+    through pypdf's own width lookup), excluding the ``Tc``/``Tw`` charged after it; a
+    space glyph's width is an interval like any other. The text pieces are
+    :func:`_text_pieces`' partition of :attr:`text` -- pieces concatenate to the text
+    exactly, so a consumer can slice at piece boundaries where slicing by glyph count
+    is unsound. Verified on the motivating fragment: the two glyphs land at
+    [130.734, 134.583] and [226.602, 230.451], the second opening exactly where its
+    column's other members sit.
+
+    ``None`` for a rotated show, for a partition that is unavailable or no longer
+    concatenates to the published text, for any non-finite or backwards interval, and
+    for direct construction (synthetic fixtures) -- a strict subset of the situations
+    where consumers already degrade, and never PARTIAL: a fragment carries its whole
+    partition or none of it, and a consumer holding ``None`` must refuse to split
+    rather than guess. Bounded document-wide by :data:`MAX_PDF_GLYPH_INTERVALS`,
+    which truncates the extraction rather than shipping a fragment stripped of its
+    evidence."""
 
 
 @dataclass(frozen=True)
@@ -522,6 +899,10 @@ _REQUIRED_PARAM_ATTRS = (
     "Tc",
     "Tz",
     "transform",
+    # Read by `_ink_x_end` to charge the trailing word spacing when the final glyph is
+    # a space. `Tc`/`Tz`/`transform`/`tx` were already listed for the sibling
+    # corrections; `Tw` is the one the ink extent adds.
+    "Tw",
 )
 
 _PINNED_PYPDF_VERSION = "6.14.2"
@@ -540,6 +921,29 @@ _PINNED_PYPDF_VERSION = "6.14.2"
 #: while bounding peak retention at ~200 MB -- the same order as the ~381 MB peak the
 #: text lane's own cap was written against.
 MAX_PDF_FRAGMENTS = 1_000_000
+
+#: Hard cap on the total number of per-glyph interval entries one document may record,
+#: counted across all pages, independent of both caps above -- because neither bounds
+#: this: the fragment cap counts SHOWS and the page-content cap counts BYTES, and one
+#: large show under the 6 MB content cap can carry millions of glyphs, each now costing
+#: a retained ``(str, float, float)`` entry. Measured cost of the field at corpus scale
+#: is ~45 bytes per entry (+12.6 MB over the design probe's 276,909 corpus entries); a
+#: cap-saturating document would otherwise cost on the order of 160 MB for this field
+#: alone.
+#:
+#: Sized against the corpus the way the sibling caps are: as shipped, the eight papers
+#: record 274,212 entries in total and the largest single document 46,361 (the shipped
+#: field skips rotated shows and the undecodable partition, hence slightly under the
+#: probe's count), so two million is 43x headroom over the largest legitimate document
+#: in hand while bounding the field's retention at ~91 MB -- inside the ~200 MB ceiling
+#: the other two caps already express.
+#:
+#: Exhaustion TRUNCATES the extraction (``truncated=True, lossy=True``, same channel as
+#: the fragment cap) rather than continuing without the field, deliberately: a fragment
+#: stripped of its evidence would silently lose exactly the sub-fragment structure the
+#: field exists to carry, and `build_inventory` refuses truncated documents wholesale,
+#: which is the fail-closed direction.
+MAX_PDF_GLYPH_INTERVALS = 2_000_000
 
 #: Hard cap on the DECOMPRESSED content-stream bytes of a single page, checked before
 #: pypdf parses it. A page over this is recorded as a page failure and skipped; the rest
@@ -917,9 +1321,13 @@ def _pen_x_after(show: Any) -> float:
 
     * The pen position INCLUDES the trailing ``Tc`` after the final glyph, because that
       is what the PDF operator does and what ``displaced_tx`` is documented to mean. It
-      is therefore past the last glyph's ink by one character space. For a containment
-      test that is the fail-closed direction -- a fragment reads WIDER than its ink, so
-      a region that does not really contain it refuses.
+      is therefore past the last glyph's ink by one character space. That stays the
+      right number for THIS function -- the pen is where the next show starts -- and it
+      stays fail-closed for a consumer that must not undercount a fragment's reach. It
+      is no longer the only extent published: a containment test reading it refused a
+      real table over 92 pt of trailing spacing the fragment never drew, so the ink
+      extent is measured separately (:func:`_ink_x_end`) and travels on
+      :attr:`TextFragment.ink_x_end`, with the choice of extent made per call site.
     * ``x_start`` is untouched and is separately suspect: on some mid-word shows it sits
       ~4 pt left of where pdfminer puts the first character, with every internal advance
       still exact. Different root cause, not fixed here, and not to be conflated with
@@ -988,6 +1396,148 @@ def _pen_x_after(show: Any) -> float:
     # displacement (`e' = dx * n[0] + n[4]`), so the delta lands in page space the way
     # the value it corrects did.
     return float(show.displaced_tx) + undercharged * float(show.transform[0])
+
+
+def _glyph_substrings(show: Any) -> list[str] | None:
+    """One decoded substring per GLYPH CODE the show draws, in drawing order, or ``None``.
+
+    The per-code decomposition of the same decode :func:`_glyphs_drawn` counts and
+    pypdf's ``word_tx`` charges widths over -- the three cases mirror
+    ``TextStateParams.__post_init__`` exactly, because the point is to partition the
+    string pypdf already produced, never to decode differently:
+
+    * a non-``bytes`` operand: one character per code, by the same reading
+      ``_glyphs_drawn`` gives it;
+    * a str-encoded font: the operand decodes as a whole, so one decoded character is
+      one code, composite fonts included;
+    * a dict-encoded font: pypdf indexes BY BYTE, so one byte is one code, and an
+      entry may be a multi-character glyph NAME -- the ``/C14``-style substrings that
+      make ``len(text)`` unequal to the glyph count and make slicing ``text`` by
+      glyph COUNT unsound. Returning the substrings is what makes a per-glyph
+      consumer able to slice at code boundaries instead.
+
+    ``None`` on the one path where the partition cannot be aligned to codes at all: a
+    dict-encoded operand with a byte that is in no encoding entry and does not decode
+    as ASCII. pypdf handles that show by re-decoding the WHOLE operand as UTF-8 with
+    replacement, so its width loop runs over a string with no per-byte alignment, and
+    any partition this function returned would be a guess. Callers treat ``None`` as
+    "no per-glyph geometry", which degrades to the advance-based extent -- the wider,
+    refusing direction.
+    """
+    value = show.value
+    if not isinstance(value, bytes):
+        return [character for character in str(value)]
+    encoding = show.font.encoding
+    if isinstance(encoding, str):
+        return list(show._decoded_value)
+    substrings: list[str] = []
+    for code in value:
+        if code in encoding:
+            substrings.append(encoding[code])
+        else:
+            try:
+                substrings.append(bytes((code,)).decode())
+            except UnicodeDecodeError:
+                return None
+    return substrings
+
+
+def _ink_x_end(show: Any) -> float | None:
+    """Absolute page x where the last glyph's own width ends, or ``None`` if unknowable.
+
+    :func:`_pen_x_after` deliberately includes the trailing spacing charged after the
+    final glyph, because that is what the advance operator does; this subtracts exactly
+    that charge and nothing else. Per ISO 32000-1 9.4.4 the charge after the last
+    glyph's width is ``(Tc + Tw-if-the-glyph-is-a-space) * Th``, and both terms are
+    taken the way pypdf's own ``word_tx`` accounts them -- ``Tw`` once per space
+    CHARACTER of the glyph's decoded substring -- so the subtraction undoes pypdf's
+    arithmetic rather than a fresh reading of the specification that could disagree
+    with it.
+
+    Verified against the real corpus fragment that motivated the field: the two-glyph
+    ``Tc``-spaced show on the target table's pressure row publishes
+    ``x_end = 322.469842`` and this returns ``230.451249``, reproducing the probe's
+    independently measured ink extent to the last digit, with the same per-glyph
+    arithmetic placing the second glyph's start at the column its neighbours occupy.
+
+    A NEGATIVE ``Tc`` makes this larger than ``x_end`` -- with tightening spacing the
+    pen ends inside the last glyph's width -- which is not clamped, because the ink
+    genuinely does extend past the pen there and clamping would re-introduce the
+    undercount this module exists to avoid. The OTHER direction is refused rather than
+    published: spacing negative enough to walk the pen left of the show's own start
+    breaks the left-to-right hull this value is read as one edge of, so a result left
+    of ``x_start`` (or not a number at all) is returned as ``None``, unmeasured.
+
+    ``None`` too for a ROTATED show, decided at the call site: the page-space
+    projection here is ``transform[0]``'s, so a rotated show's value would be exactly
+    as meaningless as its ``x_end`` -- and unlike ``x_end`` this field is new, so it
+    can decline to exist instead of shipping a number with a warning attached.
+    """
+    substrings = _glyph_substrings(show)
+    if not substrings:
+        return None
+    last = substrings[-1]
+    space_char = show.font.space_char
+    spaces = sum(1 for character in last if character == space_char)
+    trailing = (float(show.Tc) + spaces * float(show.Tw)) * (float(show.Tz) / 100.0)
+    ink = _pen_x_after(show) - trailing * float(show.transform[0])
+    if not ink >= float(show.tx):  # `not >=` rather than `<` so NaN lands here too
+        return None
+    return ink
+
+
+def _glyph_geometry(show: Any, pieces: list[str]) -> tuple[tuple[str, float, float], ...] | None:
+    """Final page-space ink intervals per glyph, paired with the text pieces, or ``None``.
+
+    The per-glyph unrolling of exactly the arithmetic :func:`_advance` and
+    :func:`_pen_x_after` already apply in aggregate: each glyph's width comes from the
+    same pypdf lookups ``word_tx`` uses (``get_text_width`` per decoded character,
+    ``space_width`` for the space character), its ink interval is that width scaled by
+    ``Tfs``/``Tz`` and projected by ``transform[0]``, and the pen then advances by the
+    width PLUS the ``Tc``/``Tw`` charge -- so the recorded intervals are positions
+    after ALL spacing, never raw spacing operands, and the per-glyph pen lands where
+    the aggregate arithmetic says the show ends (bit-identical on the motivating
+    corpus fragment; equal analytically everywhere, to float summation order).
+
+    ``pieces`` is :func:`_text_pieces`' partition of the PUBLISHED text -- repaired
+    pieces where the repair table applied -- zipped strictly against the decoded
+    substrings that drive the width lookups, so the evidence names the text a consumer
+    will actually slice.
+
+    ``None``, whole-fragment rather than partial, when the partitions disagree in
+    length or any interval comes out non-finite or backwards: evidence this function
+    cannot vouch for is not evidence, and the consumer's fallback (the ink hull, no
+    split) fails toward refusal.
+    """
+    substrings = _glyph_substrings(show)
+    if substrings is None or len(substrings) != len(pieces):
+        return None
+    font = show.font
+    space_char = font.space_char
+    scale = float(show.font_size) / 1000.0
+    tz = float(show.Tz) / 100.0
+    tc = float(show.Tc)
+    tw = float(show.Tw)
+    a = float(show.transform[0])
+    pen = float(show.tx)
+    intervals: list[tuple[str, float, float]] = []
+    for substring, piece in zip(substrings, pieces, strict=True):
+        width = 0.0
+        spaces = 0
+        for character in substring:
+            if character == space_char:
+                width += font.space_width
+                spaces += 1
+            else:
+                width += font.get_text_width(character)
+        ink = width * scale * tz
+        start = pen
+        end = pen + ink * a
+        if not (math.isfinite(start) and math.isfinite(end)) or end < start:
+            return None
+        intervals.append((piece, start, end))
+        pen += (ink + (tc + spaces * tw) * tz) * a
+    return tuple(intervals)
 
 
 class UnsupportedContentConstruct(Exception):
@@ -2083,9 +2633,23 @@ def _walk_operations(
 
 
 def _page_fragments(
-    page: Any, page_number: int, engine: tuple[Any, ...], budget: int
+    page: Any,
+    page_number: int,
+    engine: tuple[Any, ...],
+    budget: int,
+    repairs: dict[str, dict[str, str]] | None = None,
+    glyph_budget: int = MAX_PDF_GLYPH_INTERVALS,
 ) -> tuple[list[TextFragment], bool]:
     """Recover every text-show operation on one page, with absolute geometry.
+
+    ``repairs`` is the glyph-repair table ALREADY narrowed to this document by
+    :func:`extract_fragments` -- font-program sha256 to {glyph name: replacement} --
+    and is empty or ``None`` for every document without a registered entry, which
+    keeps the repair path at literally zero cost where it does not apply.
+
+    ``glyph_budget`` bounds the per-glyph interval entries THIS CALL may record; like
+    ``budget`` it is the document-wide cap minus what earlier pages already used, so
+    a single page cannot spend what the document has left.
 
     Stops after ``budget`` fragments and reports that it did, so a single page cannot
     exhaust :data:`MAX_PDF_FRAGMENTS`-worth of memory on its own.
@@ -2143,6 +2707,11 @@ def _page_fragments(
     )
 
     fragments: list[TextFragment] = []
+    glyphs_recorded = 0
+    # Font-program digests, hashed once per font OBJECT rather than once per show:
+    # `_layout_mode_fonts` builds one `Font` per resource name per page, so identity
+    # is a safe cache key for the duration of this call and no longer.
+    font_sha_cache: dict[int, str | None] = {}
     for show in shows:
         if len(fragments) >= budget:
             return fragments, True
@@ -2154,6 +2723,40 @@ def _page_fragments(
         text = show.text
         if not text:
             continue
+        rotated = bool(show.rotated)
+        pieces = _text_pieces(show)
+        mapping = GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED
+        if repairs and pieces is not None:
+            # Attempted whether the show is UNMAPPED or MAPPED: the fault this table also
+            # covers -- a symbol font decoding a phi to a literal 'f' -- surfaces MAPPED,
+            # so gating on UNMAPPED would skip exactly the mis-decoded glyphs. `repairs`
+            # is empty for every document but the registered ones, so an unregistered
+            # document still does no per-show work here.
+            #
+            # Scope order is the safety argument: the DOCUMENT matched before this
+            # function was even handed a table, so identifying the font program (an
+            # unbounded `get_data`, see `_font_program_sha256`) only ever runs on
+            # bytes the registry already pins in full.
+            if id(show.font) not in font_sha_cache:
+                font_sha_cache[id(show.font)] = _font_program_sha256(show.font)
+            font_sha = font_sha_cache[id(show.font)]
+            for_this_font = repairs.get(font_sha) if font_sha is not None else None
+            if for_this_font:
+                repaired = _repaired_pieces(pieces, for_this_font)
+                if repaired is not None:
+                    pieces = repaired
+                    text = "".join(pieces)
+                    mapping = GlyphMapping.REPAIRED
+        glyphs = None if rotated or pieces is None else _glyph_geometry(show, pieces)
+        if glyphs is not None:
+            if glyphs_recorded + len(glyphs) > glyph_budget:
+                # Truncate BEFORE this fragment rather than shipping it stripped of
+                # its evidence: a fragment without its partition would silently lose
+                # exactly the sub-fragment structure the field exists to carry. Same
+                # channel as the fragment cap; `build_inventory` refuses truncated
+                # documents wholesale.
+                return fragments, True
+            glyphs_recorded += len(glyphs)
         fragments.append(
             TextFragment(
                 page=page_number,
@@ -2162,8 +2765,10 @@ def _page_fragments(
                 x_end=_pen_x_after(show),
                 baseline_y=float(show.ty),
                 font_height=float(show.font_height),
-                rotated=bool(show.rotated),
-                glyph_mapping=(GlyphMapping.UNMAPPED if _UNMAPPED_MARKER_RE.search(text) else GlyphMapping.MAPPED),
+                rotated=rotated,
+                glyph_mapping=mapping,
+                ink_x_end=None if rotated else _ink_x_end(show),
+                glyph_intervals=glyphs,
             )
         )
     return fragments, stopped_early
@@ -2232,7 +2837,18 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
     # Recording the gate's own constant says exactly what is true and no more: this
     # extraction ran against the pinned pypdf, because nothing else gets this far.
     version = _PINNED_PYPDF_VERSION
+    # The glyph-repair table, narrowed to THIS document before any page is read. The
+    # document gate is one whole-input sha256 -- the same identity every stored
+    # artifact uses -- so for the overwhelming case of a document with no registered
+    # entry the repair machinery costs one hash and never runs again.
+    repairs: dict[str, dict[str, str]] = {}
+    if _GLYPH_REPAIRS:
+        document_sha256 = hashlib.sha256(data).hexdigest()
+        for repair in _GLYPH_REPAIRS:
+            if repair.document_sha256 == document_sha256:
+                repairs.setdefault(repair.font_program_sha256, {})[repair.glyph_name] = repair.replacement
     fragments: list[TextFragment] = []
+    glyphs_recorded = 0
     failures: list[FragmentPageFailure] = []
     lossy = False
     truncated = False
@@ -2256,7 +2872,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     truncated = True
                     lossy = True
                     break
-                if len(fragments) >= MAX_PDF_FRAGMENTS:
+                if len(fragments) >= MAX_PDF_FRAGMENTS or glyphs_recorded >= MAX_PDF_GLYPH_INTERVALS:
                     # BEFORE parsing, not after. A page that ended exactly ON the cap
                     # leaves a zero budget, and entering with it would pay for the whole
                     # content stream only to report truncation on the way out.
@@ -2265,7 +2881,12 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     break
                 try:
                     page_fragments, hit_budget = _page_fragments(
-                        page, page_number, engine, MAX_PDF_FRAGMENTS - len(fragments)
+                        page,
+                        page_number,
+                        engine,
+                        MAX_PDF_FRAGMENTS - len(fragments),
+                        repairs,
+                        MAX_PDF_GLYPH_INTERVALS - glyphs_recorded,
                     )
                 except _EngineMismatch:
                     # Not a page failure. The engine is wrong, so nothing extracted
@@ -2280,6 +2901,7 @@ def extract_fragments(data: bytes) -> FragmentExtraction:
                     lossy = True
                     continue
                 fragments.extend(page_fragments)
+                glyphs_recorded += sum(len(f.glyph_intervals) for f in page_fragments if f.glyph_intervals)
                 if kind is _PageKind.UNINSPECTABLE:
                     # RECORDED, not merely counted as `lossy`, and worded exactly as the
                     # text lane words it. A consumer asking "is page N sound?" reads

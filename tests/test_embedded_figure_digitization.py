@@ -1283,17 +1283,29 @@ POLICED_MODULES = ("test_figure_digitization_record.py", "test_embedded_figure_d
 
 
 def _marker_content(docstring: str, marker: str) -> str | None:
-    """The prose following ``marker``, to the next blank line, or ``None`` if it is absent."""
+    """The prose following ``marker``, to the next blank line, or ``None`` if it is absent.
+
+    A blank line BETWEEN the header and its prose does not end the section: a marker written as
+    ``header / blank / prose`` carries the same claim as ``header: prose`` and must read the
+    same, or a legal layout scores zero characters and is wrongly rejected. A line that opens a
+    DIFFERENT marker ends the section regardless of blanks, so an empty header is never credited
+    with the next marker's prose.
+    """
     lines = docstring.splitlines()
     for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith(marker):
             continue
         collected = [stripped[len(marker) :].strip()]
-        for following in lines[index + 1 :]:
-            if not following.strip():
+        rest = lines[index + 1 :]
+        if not collected[0]:
+            while rest and not rest[0].strip():
+                rest = rest[1:]
+        for following in rest:
+            following_stripped = following.strip()
+            if not following_stripped or following_stripped.startswith(SCOPE_MARKERS):
                 break
-            collected.append(following.strip())
+            collected.append(following_stripped)
         return " ".join(part for part in collected if part)
     return None
 
@@ -1367,19 +1379,24 @@ class TestEveryUniversalTestNameAccountsForItsScope:
     no exemption list, deliberately: an exemption list is where a lint goes to die, and every
     false positive this raises is answered by a rename that makes the name more precise.
 
-    Exhaustive over: the ``test_``-prefixed functions of the two modules named in
-    ``POLICED_MODULES``, read from source via AST, so a test cannot escape by not being
-    imported. Both ``def`` forms and every nesting level are walked (see :func:`_policed_defs`),
-    so an ``async def`` or a method nested in a class does not slip the rule.
+    Exhaustive over: the ``def``- and ``async def``-form ``test_``-prefixed function DEFINITIONS
+    of the two modules named in ``POLICED_MODULES``, read from source via AST, so a test written
+    as a real function cannot escape by not being imported. Every nesting level is walked (see
+    :func:`_policed_defs`), so an ``async def`` or a method nested in a class does not slip the
+    rule.
 
     Not covered: whether the claim a marker makes is TRUE. This lint checks that a claim was
     made and has content behind it; it cannot check that an ``Exhaustive over:`` really is
     exhaustive, nor that a ``Not covered:`` names every uncovered route, nor that a marker's
     prose is more than filler long enough to clear the length floor. It also does not police the
     rest of the repository's tests, universals that live only in a ``parametrize`` id rather than
-    a def name, or universals phrased around the vocabulary ("in either direction"). What it
-    converts is the cheapest half of the review finding -- the half that recurred seven times --
-    into something that fails before review sees it.
+    a def name, or universals phrased around the vocabulary ("in either direction"). Nor does the
+    AST walk reach a ``test_``-prefixed name that is not a ``def``: a module-level alias
+    (``test_x = some_function``), a ``lambda`` bound to such a name, and a test generated into
+    ``globals()`` are all collected by pytest yet invisible to a walk over function definitions --
+    which is why ``Exhaustive over:`` above is scoped to definitions, so this is a written gap
+    rather than a hidden one. What it converts is the cheapest half of the review finding -- the
+    half that recurred seven times -- into something that fails before review sees it.
     """
 
     @staticmethod
@@ -1475,3 +1492,22 @@ class TestEveryUniversalTestNameAccountsForItsScope:
         for marker in SCOPE_MARKERS:
             docstring = f"A summary line.\n\n        {marker} -"
             assert _scope_violation("test_every_route_escapes", docstring) is not None
+
+    def test_a_blank_line_between_a_header_and_its_prose_still_counts(self) -> None:
+        """A marker written header / blank / prose is the same claim as header: prose.
+
+        Exhaustive over: both markers, each written with its prose one blank line below the
+        header rather than on it -- the layout ``_marker_content`` used to read as zero chars
+        and so wrongly reject.
+
+        Not covered: a header credited with a following DIFFERENT marker's prose. That is a
+        separate hazard the blank-skipping guards against, checked in the sibling assertion.
+        """
+        prose = "the prose this header names begins one blank line below it."
+        for marker in SCOPE_MARKERS:
+            docstring = f"A summary line.\n\n        {marker}\n\n        {prose}"
+            assert _marker_content(docstring, marker) == prose
+            assert _scope_violation("test_every_route_is_covered", docstring) is None
+
+        both = "A summary line.\n\n        Exhaustive over:\n\n        Not covered: the sibling wins."
+        assert _marker_content(both, "Exhaustive over:") == ""

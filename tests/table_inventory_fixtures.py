@@ -77,7 +77,7 @@ def inventory_payload(
 ) -> dict[str, Any]:
     """A structurally complete inventory record payload.
 
-    Carries EXACTLY the top-level keys of a real version-1 record --
+    Carries EXACTLY the top-level keys of a real version-2 record --
     ``INVENTORY_PAYLOAD_KEYS``, which T1 now requires -- because a payload
     missing ``footprint`` could never be read by ``verify_inventory_record``
     and one with a stray key could never reproduce. A fixture standing in for
@@ -97,7 +97,19 @@ def inventory_payload(
         "cells": [
             {
                 "col": col,
-                "member_digests": [_PLACEHOLDER_SHA],
+                # A version-2 member record: parent digest plus the glyph/text range
+                # the cell claims. Whole-fragment members carry a null range, exactly
+                # as the real builder writes for a fragment without glyph evidence.
+                "members": [
+                    {
+                        "fragment_sha256": _PLACEHOLDER_SHA,
+                        "glyph_end": None,
+                        "glyph_start": None,
+                        "text": f"r{row}c{col}",
+                        "x_end": float(10 * col + 9).hex(),
+                        "x_start": float(10 * col).hex(),
+                    }
+                ],
                 "row": row,
                 "text": f"r{row}c{col}",
                 "x_end": float(10 * col + 9).hex(),
