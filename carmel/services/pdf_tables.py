@@ -55,6 +55,7 @@ __all__ = [
     "AFFIX_HEIGHT_RATIO",
     "COLUMN_VALLEY_PT",
     "CellInventory",
+    "CellMember",
     "ClaimedFootprint",
     "InventoryCell",
     "InventoryRefusal",
@@ -142,6 +143,17 @@ AFFIX_PARENT_MARGIN = 0.5
 #: hundredth of a point is how a correct caption becomes seven orphaned bands, which is
 #: exactly what the first run against the real document produced.
 _BAND_TOLERANCE_PT = 0.5
+
+#: The glyph mappings this module reads as "this fragment's text is characters".
+#:
+#: An ADMIT set rather than a `is not UNMAPPED` test, so the failure direction is
+#: chosen once and stays chosen: a future :class:`GlyphMapping` member is refused here
+#: until someone admits it by name, instead of sailing through because it is not the
+#: one member a negation happened to spell. ``REPAIRED`` is admitted deliberately --
+#: its text is real characters, concluded by the fragment lane's evidence-scoped
+#: repair table rather than by the document, and the member's name is what keeps that
+#: distinction visible in every stored member digest.
+_ADMISSIBLE_GLYPH_MAPPINGS = frozenset({GlyphMapping.MAPPED, GlyphMapping.REPAIRED})
 
 
 class InventoryRefusalReason(StrEnum):
@@ -297,6 +309,28 @@ class InventoryRefusalReason(StrEnum):
     on it is the only honest answer, because the column structure genuinely is not
     derivable from aligned emptiness once a row spans."""
 
+    UNSPLITTABLE_SPANNING_FRAGMENT = "unsplittable_spanning_fragment"
+    """A fragment's glyphs land in more than one derived column and no safe split exists.
+
+    The sub-fragment split (see :func:`_members_by_column`) is allowed exactly where a
+    spanning fragment's glyph runs partition cleanly, left to right, into columns that
+    OTHER fragments independently support. Everything else refuses under this member,
+    with the failing condition in the detail:
+
+    * a glyph interval contained in no derived block -- geometry the derivation cannot
+      place (a non-finite interval fails every containment test quietly, so "nowhere"
+      is also the NaN case, caught fail-closed);
+    * glyph runs that revisit a column (``A..B..A``), which is not a table-cell shape
+      this module can read;
+    * a run whose column is supported by NO other fragment's ink -- splitting there
+      would rest the column's existence on the very fragment being split, a
+      self-justifying claim with no independent evidence.
+
+    Distinct from :attr:`COLUMN_STRUCTURE_UNRESOLVED`, deliberately: that one says the
+    column structure could not be DERIVED; this one says it was derived, and one
+    fragment cannot be safely decomposed against it.
+    """
+
     ROTATED_OR_INSANE_FRAGMENT = "rotated_or_insane_fragment"
     """This module cannot read a fragment's geometry, so it declines to read the box.
 
@@ -364,6 +398,43 @@ class ClaimedFootprint:
 
 
 @dataclass(frozen=True, slots=True)
+class CellMember:
+    """One cell's claim on one fragment: the whole of it, or a named glyph range.
+
+    Until the sub-fragment split existed a member WAS a fragment. A single show
+    operator can draw the last glyph of one cell and the first of the next, though, so
+    a member must be able to say "glyphs ``glyph_start..glyph_end`` of this fragment"
+    -- otherwise replay cannot prove which bytes grounded which cell, and two cells
+    citing halves of one fragment would each cite the whole.
+
+    ``glyph_start``/``glyph_end`` index the fragment's ``glyph_intervals``
+    (:class:`~carmel.services.pdf_fragments.TextFragment`; end exclusive).
+    ``None``/``None`` means
+    "the whole fragment, whose per-glyph partition was not recorded" -- the only form a
+    fragment without glyph evidence can take, and never a split one. ``text`` is the
+    exact concatenation of the range's text pieces (the whole fragment's text for a
+    whole member), so slicing happened at glyph-piece boundaries or not at all.
+    """
+
+    fragment: TextFragment
+    glyph_start: int | None
+    glyph_end: int | None
+    text: str
+    x_start: float
+    x_end: float
+
+    @property
+    def split(self) -> bool:
+        """Whether this member is a proper sub-range of its fragment's glyphs."""
+        return (
+            self.glyph_start is not None
+            and self.glyph_end is not None
+            and self.fragment.glyph_intervals is not None
+            and (self.glyph_end - self.glyph_start) != len(self.fragment.glyph_intervals)
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class InventoryCell:
     """One derived cell. ``text`` is its members in reading order, never repaired."""
 
@@ -372,7 +443,7 @@ class InventoryCell:
     text: str
     x_start: float
     x_end: float
-    members: tuple[TextFragment, ...]
+    members: tuple[CellMember, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +511,31 @@ class CellInventory:
             )
 
 
+def _ink_x_end(fragment: TextFragment) -> float:
+    """The x this fragment's drawn ink ends at, falling back to its advance extent.
+
+    Every horizontal judgement in this module reads THIS, not ``fragment.x_end``, and
+    the distinction was measured before it was made: character spacing charges after
+    the last glyph too, so a fragment's advance extent can reach far past anything it
+    drew -- 92.019 pt past, on the real target table's pressure-row value, which the
+    containment test then refused for spacing it never printed. The questions this
+    module asks -- is this fragment inside the box, did an edge cut it, does it sit in
+    a derived column, what x-interval does it occupy -- are all questions about INK.
+
+    The fallback to ``x_end`` is exact, not approximate: a fragment without a measured
+    ink extent (a synthetic fixture, or the one decode shape the fragment lane cannot
+    partition per glyph) is judged by its advance extent, which is never narrower than
+    the ink, so every fallback errs toward refusal -- and restores this module's
+    pre-``ink_x_end`` behaviour bit for bit.
+
+    One reader deliberately does NOT go through this: nothing here. The advance extent
+    stays published and stays what ``pdf_cells`` and the clip guard read, because "how
+    far does this fragment reach" and "what does this fragment occupy" are different
+    questions with different fail-closed directions.
+    """
+    return fragment.x_end if fragment.ink_x_end is None else fragment.ink_x_end
+
+
 def _is_finite(*values: float) -> bool:
     return all(math.isfinite(v) for v in values)
 
@@ -500,7 +596,7 @@ def _caption_anchored(extraction: FragmentExtraction, footprint: ClaimedFootprin
         if f.page == footprint.page
         and math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=_BAND_TOLERANCE_PT)
         and f.x_start >= footprint.x_start
-        and f.x_end <= footprint.x_end
+        and _ink_x_end(f) <= footprint.x_end
     ]
     if not band:
         return False
@@ -524,7 +620,7 @@ def _in_footprint(extraction: FragmentExtraction, footprint: ClaimedFootprint) -
         for f in extraction.fragments
         if f.page == footprint.page
         and f.x_start >= footprint.x_start
-        and f.x_end <= footprint.x_end
+        and _ink_x_end(f) <= footprint.x_end
         and footprint.y_bottom <= f.baseline_y <= footprint.y_top
     ]
 
@@ -591,6 +687,15 @@ def _has_comparable_geometry(fragment: TextFragment) -> bool:
         _is_finite(fragment.x_start, fragment.x_end, fragment.baseline_y, fragment.font_height)
         and fragment.x_start <= fragment.x_end
         and fragment.font_height > 0.0
+        # The ink extent joins the predicate the moment it joins the comparisons: every
+        # horizontal judgement in this module now reads `_ink_x_end`, so a NaN or
+        # backwards `ink_x_end` is the same every-comparison-quietly-False fault the
+        # four patches above kept rediscovering, arriving through the new field. `None`
+        # stays legal -- it means "unmeasured, judge by the advance extent", which is a
+        # fallback, not an unreadable number.
+        and (
+            fragment.ink_x_end is None or (math.isfinite(fragment.ink_x_end) and fragment.x_start <= fragment.ink_x_end)
+        )
     )
 
 
@@ -666,7 +771,7 @@ def _straddle_refusal(extraction: FragmentExtraction, footprint: ClaimedFootprin
         and f.text.strip()
         and not f.rotated
         and footprint.y_bottom <= f.baseline_y <= footprint.y_top
-        and (f.x_start < footprint.x_start < f.x_end or f.x_start < footprint.x_end < f.x_end)
+        and (f.x_start < footprint.x_start < _ink_x_end(f) or f.x_start < footprint.x_end < _ink_x_end(f))
     ]
     if not cut:
         return None
@@ -732,8 +837,8 @@ def _is_adjacent_to(band: list[TextFragment], other: list[TextFragment]) -> bool
     if not other:
         return False
     left = min(f.x_start for f in other) - COLUMN_VALLEY_PT
-    right = max(f.x_end for f in other) + COLUMN_VALLEY_PT
-    return all(f.x_end >= left and f.x_start <= right for f in band)
+    right = max(_ink_x_end(f) for f in other) + COLUMN_VALLEY_PT
+    return all(_ink_x_end(f) >= left and f.x_start <= right for f in band)
 
 
 def _looks_like_affix(band: list[TextFragment], neighbour: list[TextFragment]) -> bool:
@@ -812,18 +917,51 @@ def _merge_affix_bands(
     return merged, None
 
 
+def _occupied_intervals(fragment: TextFragment) -> tuple[tuple[float, float], ...]:
+    """The x-intervals this fragment's ink occupies: per glyph where measured, else its hull.
+
+    THE substrate of column derivation, and the granularity is the finding: deriving
+    columns from whole-show hulls lets one ``Tc``-spaced show that bridges two columns
+    ERASE the very valley needed to detect it -- on the real target the table resolved
+    2 columns while its own pressure row resolved 3, so splitting after hull-derived
+    bounds was structurally too late. Per-glyph intervals keep the inter-glyph gap
+    empty, so the valley survives and the bounds are derivable first.
+
+    A SPACE glyph's width counts as occupied, exactly as it does inside a hull. That is
+    a deliberate anti-false-split stance: the refuted magnitude rule established that
+    normalised intra-show spacing is continuous with no valley (52,629 shows, 0-23.7 em),
+    so emptiness at a space glyph is not evidence of column structure -- only spacing
+    charged BEYOND glyph widths (``Tc``/``Tw``/``TJ`` displacement) opens a gap here,
+    and it still needs :data:`COLUMN_VALLEY_PT` of aligned width to separate anything.
+
+    The hull fallback is exact for every fragment without a recorded partition: one
+    interval, ink-wide, which reproduces the pre-split derivation bit for bit -- and
+    since a hull can never expose an internal gap, such a fragment can never be split,
+    which is the fail-closed direction (`_members_by_column` then has one block to
+    assign it to, or the structure check refuses).
+    """
+    if fragment.glyph_intervals is None:
+        return ((fragment.x_start, _ink_x_end(fragment)),)
+    return tuple((start, end) for _, start, end in fragment.glyph_intervals)
+
+
 def _column_bounds(
     rows: list[tuple[float, list[TextFragment], list[float]]],
 ) -> list[tuple[float, float]]:
     """Column blocks from the aligned-emptiness valley.
 
-    Occupied x-intervals are unioned across ALL rows, and a run of x that no row occupies
-    and that is at least :data:`COLUMN_VALLEY_PT` wide separates two columns. Unioning
-    across rows is what makes it an ALIGNED emptiness: a gap that exists on one line and
-    not the next is a word space, and probe 6 measured those as a population that does
-    not reach 4 pt.
+    Occupied x-intervals (:func:`_occupied_intervals` -- per-glyph ink where measured,
+    the ink hull otherwise) are unioned across ALL rows, and a run of x that no row
+    occupies and that is at least :data:`COLUMN_VALLEY_PT` wide separates two columns.
+    Unioning across rows is what makes it an ALIGNED emptiness: a gap that exists on
+    one line and not the next is a word space, and probe 6 measured those as a
+    population that does not reach 4 pt.
+
+    A useful consequence of building blocks as unions of the very intervals being
+    placed: every occupied interval is wholly contained in exactly one derived block,
+    so per-glyph column assignment downstream is total on comparable geometry.
     """
-    spans = sorted((f.x_start, f.x_end) for _, members, _ in rows for f in members)
+    spans = sorted(interval for _, members, _ in rows for f in members for interval in _occupied_intervals(f))
     if not spans:
         return []
     blocks: list[list[float]] = [[spans[0][0], spans[0][1]]]
@@ -882,9 +1020,9 @@ def _orphan_below_refusal(
         for f in extraction.fragments
         if f.page == footprint.page
         and f.text.strip()
-        and f.glyph_mapping is GlyphMapping.MAPPED
+        and f.glyph_mapping in _ADMISSIBLE_GLYPH_MAPPINGS
         and footprint.y_bottom - pitch <= f.baseline_y < footprint.y_bottom
-        and any(left <= f.x_start and f.x_end <= right for left, right in bounds)
+        and any(left <= f.x_start and _ink_x_end(f) <= right for left, right in bounds)
     ]
     if not cut:
         return None
@@ -1049,7 +1187,7 @@ def _truncated_column_refusal(
     for f in extraction.fragments:
         if f.page != footprint.page or not f.text.strip() or f.rotated:
             continue
-        if not (f.x_end <= footprint.x_start or f.x_start >= footprint.x_end):
+        if not (_ink_x_end(f) <= footprint.x_start or f.x_start >= footprint.x_end):
             continue
         matched = [
             ordinal
@@ -1081,6 +1219,124 @@ def _truncated_column_refusal(
             f"{len(cluster)} fragment(s) beside the box align across {len({o for _, o in cluster})} of its rows",
         )
     return None
+
+
+def _block_of(start: float, end: float, bounds: list[tuple[float, float]]) -> int | None:
+    """The one derived block wholly containing ``[start, end]``, or ``None``.
+
+    ``None`` is unreachable for an interval that participated in the union the bounds
+    were built from -- a block is the union of its intervals, so each is inside its
+    block -- which leaves exactly the intervals the union could not see: non-finite
+    geometry, whose every comparison is quietly False. The caller treats ``None`` as a
+    refusal, so the NaN that vanishes from every other test surfaces here, closed.
+    """
+    for col, (left, right) in enumerate(bounds):
+        if left <= start and end <= right:
+            return col
+    return None
+
+
+def _column_support(fragments: list[TextFragment], bounds: list[tuple[float, float]]) -> dict[int, set[int]]:
+    """Which fragments' ink occupies each derived column, by ``id()``.
+
+    The evidence base for the split's independence requirement: a spanning fragment
+    may only be divided at a column whose existence OTHER ink already establishes.
+    Keyed by ``id`` because the question is "is there support besides THIS fragment",
+    and fragments are plain frozen dataclasses that can compare equal while being
+    distinct pieces of ink.
+    """
+    support: dict[int, set[int]] = {}
+    for fragment in fragments:
+        for start, end in _occupied_intervals(fragment):
+            col = _block_of(start, end, bounds)
+            if col is not None:
+                support.setdefault(col, set()).add(id(fragment))
+    return support
+
+
+def _members_by_column(
+    fragment: TextFragment,
+    bounds: list[tuple[float, float]],
+    support: dict[int, set[int]],
+) -> list[tuple[int, CellMember]] | InventoryRefusal:
+    """This fragment's cell membership: one whole member, or a split into glyph runs.
+
+    The design's ordering is the point and is fixed by the caller: rows are banded
+    first, the bounds arrive derived from GLYPH ink (so a bridging show has not
+    already erased the valley between its columns), and only then is each fragment
+    asked which columns its glyphs actually sit in. A fragment whose glyphs all share
+    one block is one member, exactly as before the split existed; one whose glyph
+    runs partition left-to-right into blocks that other fragments independently
+    support becomes one member per run; everything else refuses
+    (:attr:`InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT` carries the
+    enumerated cases).
+
+    The split slices TEXT at glyph-piece boundaries only -- each member's ``text`` is
+    the concatenation of its range's recorded pieces, never an index into the joined
+    string, because glyph count and character count are different numbers
+    (``len("/C14") == 4`` for one glyph, pinned by test).
+    """
+    intervals = fragment.glyph_intervals
+    if intervals is None:
+        start, end = fragment.x_start, _ink_x_end(fragment)
+        col = _block_of(start, end, bounds)
+        if col is None:
+            return InventoryRefusal(
+                InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT,
+                f"a fragment at y={fragment.baseline_y} occupies no derived column",
+            )
+        return [(col, CellMember(fragment, None, None, fragment.text, start, end))]
+
+    columns: list[int] = []
+    for _, start, end in intervals:
+        col = _block_of(start, end, bounds)
+        if col is None:
+            return InventoryRefusal(
+                InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT,
+                f"a glyph of a fragment at y={fragment.baseline_y} lies in no derived column",
+            )
+        columns.append(col)
+
+    runs: list[tuple[int, int, int]] = []  # (col, glyph_start, glyph_end)
+    for index, col in enumerate(columns):
+        if runs and runs[-1][0] == col:
+            runs[-1] = (col, runs[-1][1], index + 1)
+        else:
+            runs.append((col, index, index + 1))
+
+    def member(col: int, glyph_start: int, glyph_end: int) -> tuple[int, CellMember]:
+        window = intervals[glyph_start:glyph_end]
+        return (
+            col,
+            CellMember(
+                fragment=fragment,
+                glyph_start=glyph_start,
+                glyph_end=glyph_end,
+                text="".join(piece for piece, _, _ in window),
+                x_start=min(start for _, start, _ in window),
+                x_end=max(end for _, _, end in window),
+            ),
+        )
+
+    if len(runs) == 1:
+        col, glyph_start, glyph_end = runs[0]
+        return [member(col, glyph_start, glyph_end)]
+
+    if any(later[0] <= earlier[0] for earlier, later in zip(runs, runs[1:], strict=False)):
+        return InventoryRefusal(
+            InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT,
+            f"a fragment at y={fragment.baseline_y} weaves between derived columns "
+            f"({[col for col, _, _ in runs]}), which is not a cell shape",
+        )
+    for col, _, _ in runs:
+        if not (support.get(col, set()) - {id(fragment)}):
+            return InventoryRefusal(
+                InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT,
+                f"a fragment at y={fragment.baseline_y} spans column {col}, which no "
+                "other fragment's ink supports; splitting there would rest the column "
+                "on the fragment being split",
+            )
+    return [member(col, glyph_start, glyph_end) for col, glyph_start, glyph_end in runs]
 
 
 def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint) -> CellInventory:
@@ -1167,7 +1423,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
         # caption as a band the caller cut off the top. Same tolerance as
         # `_caption_anchored`, because it must be the same band.
         and not math.isclose(f.baseline_y, footprint.caption_baseline_y, abs_tol=_BAND_TOLERANCE_PT)
-        and f.x_end >= footprint.x_start
+        and _ink_x_end(f) >= footprint.x_start
         and f.x_start <= footprint.x_end
     ]
     if orphaned:
@@ -1226,7 +1482,7 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     if rotated_sharer is not None:
         return refused(rotated_sharer)
 
-    unmapped = [f for f in inside if f.glyph_mapping is not GlyphMapping.MAPPED]
+    unmapped = [f for f in inside if f.glyph_mapping not in _ADMISSIBLE_GLYPH_MAPPINGS]
     if unmapped:
         return refused(
             InventoryRefusal(
@@ -1245,27 +1501,36 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
                 )
             )
 
+    # Who supports which column, computed over every member of the table BEFORE any
+    # fragment is split against it: the independence requirement compares a spanning
+    # fragment against everyone else's ink, and computing support per row would let a
+    # column supported only elsewhere in the table read as unsupported here.
+    support = _column_support(inside, bounds)
     rows: list[InventoryRow] = []
     cells: list[InventoryCell] = []
     for ordinal, (baseline_y, members, folded) in enumerate(rows_raw):
+        by_column: dict[int, list[CellMember]] = {}
+        for f in members:
+            assigned = _members_by_column(f, bounds, support)
+            if isinstance(assigned, InventoryRefusal):
+                return refused(assigned)
+            for col, cell_member in assigned:
+                by_column.setdefault(col, []).append(cell_member)
         row_cells: list[InventoryCell] = []
-        for col, (left, right) in enumerate(bounds):
-            in_cell = sorted(
-                (f for f in members if f.x_start >= left and f.x_end <= right),
-                key=lambda f: f.x_start,
-            )
-            if not in_cell:
+        for col in range(len(bounds)):
+            if col not in by_column:
                 # An empty cell stays empty. A value printed across two columns is not
                 # duplicated into this one -- that would fabricate a cell the page never
                 # carried, and the association it implies is a claim, not geometry.
                 continue
+            in_cell = sorted(by_column[col], key=lambda m: m.x_start)
             row_cells.append(
                 InventoryCell(
                     row=ordinal,
                     col=col,
-                    text="".join(f.text for f in in_cell),
-                    x_start=min(f.x_start for f in in_cell),
-                    x_end=max(f.x_end for f in in_cell),
+                    text="".join(m.text for m in in_cell),
+                    x_start=min(m.x_start for m in in_cell),
+                    x_end=max(m.x_end for m in in_cell),
                     members=tuple(in_cell),
                 )
             )

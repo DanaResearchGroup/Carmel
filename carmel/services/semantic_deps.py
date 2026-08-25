@@ -1082,18 +1082,77 @@ _FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd6
 # component is unmoved for the eighth consecutive time.
 _FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "ab24abb65eb68fdfbc6634289124465143bdd3d2720e095b322f2bf2df89000d"
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
 _FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
 
-# The NINTH entry. V8 shipped the availability taxonomy; this tightens two of its own
-# invariants after review. `pypdf_version` was checked for PRESENCE, which let a
-# meaningless string satisfy a field whose entire meaning is "the pinned engine ran";
-# it is now checked against the pin itself. And ENGINE_ABSENT's docstring now names the
-# one case it knowingly misreports -- a poisoned `sys.modules` entry, which the
-# interpreter itself reports as absence. No coordinate moves: 78,178 fragments and 0
+# The NINTH entry, SUPERSEDED. V8 shipped the availability taxonomy; this tightened two
+# of its own invariants after review. `pypdf_version` was checked for PRESENCE, which
+# let a meaningless string satisfy a field whose entire meaning is "the pinned engine
+# ran"; it is now checked against the pin itself. And ENGINE_ABSENT's docstring now
+# names the one case it knowingly misreports -- a poisoned `sys.modules` entry, which
+# the interpreter itself reports as absence. No coordinate moves: 78,178 fragments and 0
 # page failures over the eight-paper corpus, all eight AVAILABLE, for the ninth
 # consecutive entry. Borrowed unmoved for the ninth time.
-_FRAGMENT_GEOMETRY_SHA256 = "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V9 = "ab24abb65eb68fdfbc6634289124465143bdd3d2720e095b322f2bf2df89000d"
+_FRAGMENT_GEOMETRY_SHA256_V9 = "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c"
+
+# The TENTH entry, and the first to publish a second horizontal extent. V9's fragments
+# carried one right edge, the ADVANCE extent, which includes the character (and word)
+# spacing charged after the final glyph -- correct for where the next show starts, and
+# wrong for what the fragment drew: on the real target table a two-glyph `Tc`-spaced
+# show declares 191.736 pt of advance of which 92.019 pt is trailing spacing past the
+# last glyph's ink, and the containment test that read it refused the whole table for
+# spacing it never printed. `extract_fragments` now measures the ink extent per show
+# (`_ink_x_end`, subtracting exactly the trailing charge pypdf's own `word_tx`
+# accounting implies) and publishes it as `TextFragment.ink_x_end`, alongside -- never
+# instead of -- the advance extent. No published coordinate moves and no page's
+# failure status changes; what moves is that every fragment now carries one more
+# number, which is a new output and therefore a new identity, the same reasoning under
+# which V5's pure-refusal change superseded. Borrowed unmoved for the tenth time.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V10 = "54de5761c2a1dc3c188b83880f86cbd5d302d309d5dfc99e2a397f8614012611"
+_FRAGMENT_GEOMETRY_SHA256_V10 = "e1711da64528498ef76d1161a7f0c54e026a45742778dde2e9d0e25dbc6de2a0"
+
+# The ELEVENTH entry, and the first under which a fragment's TEXT can differ from what
+# pypdf decoded: the evidence-scoped glyph-repair table (`_GLYPH_REPAIRS`). V10 and
+# every predecessor published unmapped glyph names verbatim and only flagged them;
+# this entry adds `GlyphMapping.REPAIRED` and a registry whose entries apply only when
+# the whole document's sha256, the embedded font program's sha256 and the decoded
+# glyph name all match -- one registered entry at this writing, the /C14 degree sign
+# of 10.1016-j.ijhydene.2013.10.164, with its evidence recorded on the entry. On every
+# document without a registered entry the pipeline's output is bit-for-bit V10's; on
+# the registered one, four fragments' text moves from "/C14" to "\u00b0" and their
+# mapping to REPAIRED, geometry untouched. A supersession because what a fragment SAYS
+# is this identity's core output, and a stored artifact must be able to tell text the
+# document decoded from text Carmel concluded. Borrowed unmoved for the eleventh time.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V11 = "e9b97bd5b6485f9d1cf78ca461096f46a2e7ed6993ce62081b0c776deeb96e9a"
+_FRAGMENT_GEOMETRY_SHA256_V11 = "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a"
+
+# The TWELFTH entry: per-glyph ink evidence. V11's fragments carried two scalars per
+# horizontal extent; a single show operator can draw the last glyph of one table cell
+# and the first of the next with the inter-column gap as character spacing, and no
+# scalar extent can carry that interior. `extract_fragments` now records
+# `TextFragment.glyph_intervals` -- one (text piece, ink start, ink end) per glyph
+# code, final page space, after all spacing -- bounded by the new document-wide
+# MAX_PDF_GLYPH_INTERVALS (exhaustion truncates, so a fragment never ships stripped of
+# its partition). No published coordinate moves and no page's failure status changes
+# (measured: all eight corpus documents byte-identical on page/text/x_start/x_end/
+# baseline_y, 274,212 evidence entries added); a new recorded output is a new
+# identity, as with V10. Borrowed unmoved for the twelfth time.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V12 = "77f6ff3aa2156864451ea855058bb036ad07d0748b265ef70dd93a7a3d4acbe2"
+_FRAGMENT_GEOMETRY_SHA256_V12 = "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446"
+
+# The THIRTEENTH entry: the glyph-repair table gains the MIS-DECODED-glyph case. V12's
+# `_GLYPH_REPAIRS` only repaired glyphs the document left UNMAPPED (a `/Differences`
+# marker); a symbol font that decodes a phi to a literal `f`, or an en-dash to `e`,
+# surfaces MAPPED, and V12's `_page_fragments` gated the repair path on UNMAPPED so it
+# never saw them. `_repaired_pieces` now matches a registered glyph piece whether it is a
+# marker or a valid character -- bounded, as before, by the document + font-program scope,
+# never by the character -- and the repair path runs on MAPPED shows too. Four entries
+# ship for 10.1016-j.ijhydene.2013.10.164 (en-dash, minus, phi from two embedded
+# programs). On every other document the output is bit-for-bit V12's; on the registered
+# one 210 fragments' text and mapping move. A supersession because what a fragment SAYS is
+# this identity's core output, as with V11. Borrowed unmoved for the thirteenth time.
+_FRAGMENT_GEOMETRY_SHA256 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1171,6 +1230,26 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V8: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V8,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V9: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V9,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V10: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V10,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V11: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V11,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V12: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V12,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1326,6 +1405,30 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V8,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V9,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V10,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V11,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V12,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),

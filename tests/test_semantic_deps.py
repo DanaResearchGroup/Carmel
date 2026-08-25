@@ -106,6 +106,10 @@ _HISTORICALLY_SHIPPED_SHAS = frozenset(
         "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd69dee9e830abd940e",
         "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491",
         "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c",
+        "e1711da64528498ef76d1161a7f0c54e026a45742778dde2e9d0e25dbc6de2a0",
+        "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a",
+        "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446",
+        "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647",
     }
 )
 
@@ -1233,7 +1237,7 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
 #   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
 # This is the half that moves when fragment GEOMETRY changes.
 _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
-_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "ab24abb65eb68fdfbc6634289124465143bdd3d2720e095b322f2bf2df89000d"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
 
 # The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
 # historical row rather than only asserted in prose. Its own component moved when
@@ -1294,7 +1298,37 @@ _PINNED_FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b
 # HARDCODED. The registered content_sha256 itself, verified once via:
 #   compose_component_sha({"borrowed_sha256": <borrowed>, "own_sha256": <own>})
 _PINNED_FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
-_PINNED_FRAGMENT_GEOMETRY_SHA256 = "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c"
+
+# SUPERSEDED -- the NINTH, whose fragments carried a single right edge: the ADVANCE
+# extent, trailing spacing included. On the real target table that read a two-glyph
+# `Tc`-spaced show as 92.019 pt wider than its ink, and the containment test that read
+# it refused the whole table for spacing it never drew. The TENTH publishes the ink
+# extent alongside it (`TextFragment.ink_x_end`); the advance extent is unchanged.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V9 = "ab24abb65eb68fdfbc6634289124465143bdd3d2720e095b322f2bf2df89000d"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V9 = "911ad6dd28259c4da4c63a1cc32b68de06e967377773f4d467ff3c9541103f5c"
+
+# SUPERSEDED -- the TENTH, whose fragments' text was always exactly what pypdf decoded,
+# unmapped glyph names included. The ELEVENTH adds the evidence-scoped glyph-repair
+# table: text can now be a character Carmel concluded from recorded evidence, and the
+# fragment says so via GlyphMapping.REPAIRED.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V10 = "54de5761c2a1dc3c188b83880f86cbd5d302d309d5dfc99e2a397f8614012611"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V10 = "e1711da64528498ef76d1161a7f0c54e026a45742778dde2e9d0e25dbc6de2a0"
+
+# SUPERSEDED -- the ELEVENTH, whose fragments carried two scalars per horizontal
+# extent and nothing about their interior. The TWELFTH records per-glyph ink evidence
+# (`TextFragment.glyph_intervals`), the substrate of the inventory's sub-fragment
+# split; no coordinate moved on any of the eight corpus documents.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V11 = "e9b97bd5b6485f9d1cf78ca461096f46a2e7ed6993ce62081b0c776deeb96e9a"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V11 = "b8f3e9a95a425c12eeabddea34c0614261a896933c31bd28f5622044c7ccde1a"
+
+# SUPERSEDED -- the TWELFTH, whose glyph-repair table repaired only glyphs the document
+# left UNMAPPED. The THIRTEENTH extends it to MIS-DECODED glyphs: a symbol font's
+# phi-as-'f' or en-dash-as-'e' that decodes to valid Latin and so surfaced MAPPED and
+# unrepaired. Four entries ship for 10.1016-j.ijhydene.2013.10.164; 210 fragments move on
+# it, none on any other document.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V12 = "77f6ff3aa2156864451ea855058bb036ad07d0748b265ef70dd93a7a3d4acbe2"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V12 = "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446"
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
 
 # The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
 # completeness claim of the composite identity, spelled out as data: extract_fragments runs
@@ -1676,6 +1710,10 @@ def test_the_superseded_fragment_geometry_row_is_still_resolvable() -> None:
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V7,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V8,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V9,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V10,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V11,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V12,
     ):
         superseded = dependency_for_sha(superseded_sha)
         assert superseded.dependency_id == FRAGMENT_GEOMETRY_DEPENDENCY_ID
@@ -1699,6 +1737,10 @@ def test_every_superseded_geometry_row_is_distinct() -> None:
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V7,
         _PINNED_FRAGMENT_GEOMETRY_SHA256_V8,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V9,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V10,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V11,
+        _PINNED_FRAGMENT_GEOMETRY_SHA256_V12,
         _PINNED_FRAGMENT_GEOMETRY_SHA256,
     )
     owns = (
@@ -1710,6 +1752,10 @@ def test_every_superseded_geometry_row_is_distinct() -> None:
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V6,
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V7,
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V8,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V9,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V10,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V11,
+        _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V12,
         _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256,
     )
     assert len(set(shas)) == len(shas)
@@ -1733,6 +1779,10 @@ def test_the_supersession_moved_only_the_own_component() -> None:
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V6,
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V7,
             _PINNED_FRAGMENT_GEOMETRY_SHA256_V8,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V9,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V10,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V11,
+            _PINNED_FRAGMENT_GEOMETRY_SHA256_V12,
             _PINNED_FRAGMENT_GEOMETRY_SHA256,
         )
     ]

@@ -29,7 +29,10 @@ from carmel.services.pdf_tables import (
     InventoryRefusal,
     InventoryRefusalReason,
     _bands,
+    _block_of,
     _column_bounds,
+    _column_support,
+    _members_by_column,
     _merge_affix_bands,
     build_inventory,
 )
@@ -48,6 +51,8 @@ def frag(
     font_height: float = BODY_HEIGHT,
     glyph_mapping: GlyphMapping = GlyphMapping.MAPPED,
     rotated: bool = False,
+    ink_x_end: float | None = None,
+    glyph_intervals: tuple[tuple[str, float, float], ...] | None = None,
 ) -> TextFragment:
     return TextFragment(
         page=page,
@@ -58,6 +63,8 @@ def frag(
         font_height=font_height,
         rotated=rotated,
         glyph_mapping=glyph_mapping,
+        ink_x_end=ink_x_end,
+        glyph_intervals=glyph_intervals,
     )
 
 
@@ -146,6 +153,25 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
             footprint(),
         ),
         (extraction_of(*a_row_the_edge_can_cut(), RIGHT_EDGE_STRADDLER), footprint()),
+        (
+            # A glyph-bridging fragment whose far run lands in a column no other ink
+            # supports: splitting there would rest the column on the fragment itself.
+            extraction_of(
+                CAPTION,
+                frag("Fuel", 53.0, 70.0, 134.5),
+                frag("aa", 122.0, 146.0, 134.5),
+                frag("phi", 53.0, 57.0, 71.5),
+                frag(
+                    "pq",
+                    122.0,
+                    206.0,
+                    71.5,
+                    ink_x_end=206.0,
+                    glyph_intervals=(("p", 122.0, 126.0), ("q", 200.0, 206.0)),
+                ),
+            ),
+            footprint(),
+        ),
     ]
 
 
@@ -409,6 +435,23 @@ class TestCellTextIsReadingOrderAndNeverRepaired:
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNMAPPED_MEMBER]
 
+    def test_a_repaired_fragment_is_admitted_where_an_unmapped_one_refuses(self) -> None:
+        """REPAIRED is an admission by name: the fragment lane concluded the character
+        from recorded, document-scoped evidence, and the fragment says so. Its text is
+        real characters, so a cell built from it is not a marker read as data -- and
+        the member's mapping travels into the stored digest, where the distinction
+        from MAPPED stays visible."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("\u00b0 1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.REPAIRED),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        assert [c.text for c in inventory.cells] == ["Fuel", "\u00b0 1.0"]
+
 
 class TestTheAffixMergeIsRecordedOrRefused:
     def test_a_merged_band_records_the_baselines_it_joined(self) -> None:
@@ -571,6 +614,226 @@ class TestColumnsComeFromTheMeasuredValley:
 
         assert len(inventory.column_bounds) == 2
         assert [(c.col, c.text) for c in inventory.cells] == [(0, "aa"), (1, "bb")]
+
+
+class TestContainmentIsJudgedByInkNotByTrailingSpacing:
+    """A fragment's ADVANCE extent includes spacing charged after its last glyph, so it
+    can reach far past anything drawn -- 92.019 pt past, on the real target table's
+    pressure row, where it refused the whole table's containment. Every horizontal
+    judgement here reads the INK extent instead, with the advance extent as the exact
+    fallback where no ink was measured.
+    """
+
+    def test_trailing_spacing_does_not_change_the_inventory(self) -> None:
+        """Two extractions with the same ink and wildly different trailing advance must
+        derive the same grid -- rows, columns, cells, coordinates -- differing only in
+        the member fragments themselves, which carry the differing advance extents."""
+
+        def grid(trailing: float) -> tuple[TextFragment, ...]:
+            return (
+                CAPTION,
+                frag("Fuel", 53.0, 70.0, 134.5),
+                frag("alpha", 123.0, 181.0, 134.5),
+                frag("beta", 223.0, 280.0, 134.5),
+                frag("phi", 53.0, 57.0, 71.5),
+                # The motivated case: ink ends at 146, the advance runs `trailing` pt
+                # further -- past the box's own right edge in the second variant.
+                frag("0.6", 122.0, 146.0 + trailing, 71.5, ink_x_end=146.0),
+                frag("0.5", 227.0, 251.0, 71.5),
+            )
+
+        tight = build_inventory(extraction_of(*grid(0.0)), footprint())
+        trailed = build_inventory(extraction_of(*grid(90.0)), footprint())
+
+        assert tight.refusals == () and trailed.refusals == ()
+        assert trailed.rows == tight.rows
+        assert trailed.column_bounds == tight.column_bounds
+        assert [(c.row, c.col, c.text, c.x_start, c.x_end) for c in trailed.cells] == [
+            (c.row, c.col, c.text, c.x_start, c.x_end) for c in tight.cells
+        ]
+
+    def test_a_fragment_whose_ink_the_edge_cuts_still_refuses(self) -> None:
+        """A genuine straddler -- drawn ink on both sides of the edge -- is exactly as
+        refused as before the ink extent existed."""
+        fragments = (*simple_grid(), frag("wide", 270.0, 320.0, 71.5, ink_x_end=310.0))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_trailing_spacing_crossing_the_edge_is_not_a_cut(self) -> None:
+        """The same advance extent, with the ink inside the box: a member, not a
+        straddler, and its cell records the ink extent it actually occupies."""
+        fragments = (*simple_grid(), frag("v", 255.0, 320.0, 71.5, ink_x_end=262.0))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        cell = next(c for c in inventory.cells if "v" in c.text)
+        assert cell.x_end == pytest.approx(262.0)
+
+    def test_an_unmeasured_ink_extent_falls_back_to_the_advance(self) -> None:
+        """`ink_x_end=None` must reproduce the pre-field behaviour exactly: the advance
+        extent is never narrower than the ink, so the fallback errs toward refusal."""
+        fragments = (*simple_grid(), frag("cut", 270.0, 320.0, 71.5))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.STRADDLING_FRAGMENT_AT_THE_BOX_EDGE]
+
+    def test_an_uncomparable_ink_extent_refuses_the_page(self) -> None:
+        """A NaN or backwards `ink_x_end` fails every comparison quietly -- the exact
+        fault class the comparable-geometry gate exists for, arriving via the new
+        field."""
+        for bad in (float("nan"), 100.0):
+            fragments = (*simple_grid(), frag("bad", 122.0, 146.0, 71.5, ink_x_end=bad))
+
+            inventory = build_inventory(extraction_of(*fragments), footprint())
+
+            assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ROTATED_OR_INSANE_FRAGMENT]
+
+
+class TestOneShowOperatorTwoTableCells:
+    """The sub-fragment split: rows first, glyph-ink columns second, split only into
+    independently supported columns, refuse otherwise -- in that order, because
+    hull-derived bounds let a bridging show erase the very valley needed to detect it.
+    """
+
+    @staticmethod
+    def _grid_with_bridge(intervals: tuple[tuple[str, float, float], ...], text: str = "xy"):
+        """Header row establishing three columns; value row whose second fragment is
+        one show bridging the two value columns, glyph evidence attached."""
+        return (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("alpha", 122.0, 146.0, 134.5),
+            frag("beta", 227.0, 251.0, 134.5),
+            frag("phi", 53.0, 57.0, 71.5),
+            frag(text, intervals[0][1], intervals[-1][2], 71.5, ink_x_end=intervals[-1][2], glyph_intervals=intervals),
+        )
+
+    def test_a_bridging_fragment_splits_into_independently_supported_columns(self) -> None:
+        fragments = self._grid_with_bridge((("x", 122.0, 130.0), ("y", 240.0, 251.0)))
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.column_bounds) == 3
+        value_row = [c for c in inventory.cells if c.row == 1]
+        assert [(c.col, c.text) for c in value_row] == [(0, "phi"), (1, "x"), (2, "y")]
+
+    def test_split_members_name_their_parent_and_glyph_range(self) -> None:
+        """What replay needs: which glyphs of which fragment grounded which cell."""
+        fragments = self._grid_with_bridge((("x", 122.0, 130.0), ("y", 240.0, 251.0)))
+        bridge = fragments[-1]
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        left = next(c for c in inventory.cells if c.row == 1 and c.col == 1)
+        right = next(c for c in inventory.cells if c.row == 1 and c.col == 2)
+        assert [m.fragment for m in left.members] == [bridge]
+        assert [m.fragment for m in right.members] == [bridge]
+        assert (left.members[0].glyph_start, left.members[0].glyph_end) == (0, 1)
+        assert (right.members[0].glyph_start, right.members[0].glyph_end) == (1, 2)
+        assert left.members[0].split and right.members[0].split
+        whole = next(c for c in inventory.cells if c.row == 1 and c.col == 0)
+        assert (whole.members[0].glyph_start, whole.members[0].glyph_end) == (None, None)
+        assert not whole.members[0].split
+
+    def test_the_split_slices_text_at_glyph_piece_boundaries_not_character_counts(self) -> None:
+        """Glyph count and character count are different numbers; a member's text is
+        its range's recorded pieces, so multi-character pieces travel whole."""
+        fragments = self._grid_with_bridge((("ab", 122.0, 130.0), ("cd", 240.0, 251.0)), text="abcd")
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        value_row = [c for c in inventory.cells if c.row == 1]
+        assert [(c.col, c.text) for c in value_row] == [(0, "phi"), (1, "ab"), (2, "cd")]
+
+    def test_adjacent_glyphs_in_one_column_stay_one_member(self) -> None:
+        """Runs, not per-glyph members: consecutive glyphs sharing a block belong to
+        one member with one contiguous range."""
+        fragments = self._grid_with_bridge((("a", 122.0, 126.0), ("b", 126.0, 130.0), ("c", 240.0, 251.0)), text="abc")
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        left = next(c for c in inventory.cells if c.row == 1 and c.col == 1)
+        assert left.text == "ab"
+        assert (left.members[0].glyph_start, left.members[0].glyph_end) == (0, 2)
+
+    def test_a_split_into_a_column_only_the_fragment_itself_supports_refuses(self) -> None:
+        """Independence is the safety property: a column whose only ink is the
+        fragment being split is the fragment's own claim, and splitting on it would
+        be self-justifying."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("aa", 122.0, 146.0, 134.5),
+            frag("phi", 53.0, 57.0, 71.5),
+            frag("pq", 122.0, 206.0, 71.5, ink_x_end=206.0, glyph_intervals=(("p", 122.0, 126.0), ("q", 200.0, 206.0))),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT]
+        assert "no other fragment's ink supports" in inventory.refusals[0].detail
+
+    def test_a_fragment_weaving_between_columns_refuses(self) -> None:
+        fragments = self._grid_with_bridge(
+            # The third glyph returns to the first column at a sub-valley gap, so the
+            # row's own block structure stays consistent and the WEAVE is what refuses.
+            (("x", 122.0, 126.0), ("y", 240.0, 246.0), ("z", 127.0, 131.0)),
+            text="xyz",
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT]
+        assert "weaves" in inventory.refusals[0].detail
+
+    def test_a_spanning_fragment_without_glyph_evidence_cannot_split(self) -> None:
+        """The hull fallback can never expose an internal gap, so a bridging show
+        without recorded evidence collapses the valley exactly as before the split
+        existed -- and the structure check refuses rather than guessing."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("alpha", 122.0, 146.0, 134.5),
+            frag("beta", 227.0, 251.0, 134.5),
+            frag("phi", 53.0, 57.0, 71.5),
+            frag("xy", 122.0, 251.0, 71.5, ink_x_end=251.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+
+    def test_glyph_gaps_below_the_valley_do_not_split_anything(self) -> None:
+        """Ordinary per-glyph spacing opens gaps too; only an ALIGNED gap at least
+        COLUMN_VALLEY_PT wide is column structure. The refuted magnitude rule is not
+        rebuilt here: sub-valley gaps merge into one block and one member."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("alpha", 122.0, 146.0, 134.5),
+            frag(
+                "ab",
+                122.0,
+                146.0,
+                71.5,
+                ink_x_end=146.0,
+                glyph_intervals=(("a", 122.0, 130.0), ("b", 134.0, 146.0)),
+            ),
+            frag("phi", 53.0, 57.0, 71.5),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        cell = next(c for c in inventory.cells if c.row == 1 and c.col == 1)
+        assert cell.text == "ab"
+        assert len(cell.members) == 1
+        assert (cell.members[0].glyph_start, cell.members[0].glyph_end) == (0, 2)
 
 
 class TestSpanningAndEmptyCells:
@@ -755,6 +1018,15 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         inventory = build_inventory(extraction_of(*simple_grid(), marker), footprint())
 
         assert inventory.refusals == ()
+
+    def test_a_repaired_fragment_below_the_box_is_a_cut_row(self) -> None:
+        """The other half of the admission: a REPAIRED fragment is real text, so where
+        an unmapped marker below the box is rightly ignored, a repaired glyph aligned
+        with a derived column is evidence a row was cut off."""
+        repaired = frag("\u00b0", 125.0, 130.0, 58.5, glyph_mapping=GlyphMapping.REPAIRED)
+        inventory = build_inventory(extraction_of(*simple_grid(), repaired), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX]
 
     def test_a_column_dropped_by_the_side_of_the_box_refuses(self) -> None:
         inventory = build_inventory(extraction_of(*simple_grid(), *dropped_column()), footprint(x_end=200.0))
@@ -1444,3 +1716,46 @@ class TestFailClosedIsStructural:
         }
 
         assert produced == set(InventoryRefusalReason), f"unreachable: {set(InventoryRefusalReason) - produced}"
+
+
+class TestAnIntervalInNoDerivedBlockIsRefused:
+    """``_block_of`` returns ``None`` for an interval no derived column contains, and the
+    docstring pins the shape that reaches it: geometry the block union could not see --
+    an interval outside every block, or non-finite coordinates whose every comparison is
+    quietly False. Every consumer treats that ``None`` as a refusal, never a guess, so the
+    arms are exercised deliberately rather than left as decisions nothing has taken."""
+
+    def test_an_interval_outside_every_block_finds_no_column(self) -> None:
+        assert _block_of(5.0, 8.0, [(10.0, 20.0), (30.0, 40.0)]) is None
+
+    def test_non_finite_geometry_finds_no_column(self) -> None:
+        # A NaN vanishes from every ``<=`` comparison, so the union never claimed it; it
+        # surfaces here, closed. This is the case the docstring names as otherwise unreachable.
+        assert _block_of(float("nan"), float("nan"), [(0.0, 100.0)]) is None
+
+    def test_column_support_skips_a_fragment_whose_ink_lands_in_no_block(self) -> None:
+        # The ``col is not None`` arm's false side (1252->1250): a fragment whose occupied
+        # interval sits in no derived block contributes no support and does not crash.
+        outside = frag("x", 500.0, 510.0, 71.5, ink_x_end=510.0)
+        assert _column_support([outside], [(0.0, 100.0)]) == {}
+
+    def test_a_hull_fragment_in_no_column_is_an_unsplittable_refusal(self) -> None:
+        # No per-glyph partition, and the ink hull lands outside every block: refuse.
+        outside = frag("x", 500.0, 510.0, 71.5, ink_x_end=510.0)
+        result = _members_by_column(outside, [(0.0, 100.0)], {})
+        assert isinstance(result, InventoryRefusal)
+        assert result.reason is InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT
+
+    def test_a_glyph_in_no_column_is_an_unsplittable_refusal(self) -> None:
+        # A partitioned fragment one of whose glyph intervals lands in no block: refuse.
+        outside = frag(
+            "ab",
+            500.0,
+            510.0,
+            71.5,
+            ink_x_end=510.0,
+            glyph_intervals=(("a", 500.0, 504.0), ("b", 506.0, 510.0)),
+        )
+        result = _members_by_column(outside, [(0.0, 100.0)], {})
+        assert isinstance(result, InventoryRefusal)
+        assert result.reason is InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT

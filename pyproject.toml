@@ -24,6 +24,14 @@ dev = [
     "mypy>=1.10",
     "types-PyYAML>=6.0",
     "mkdocs-material>=9.0",
+    # fontTools reads embedded CFF/TrueType glyph OUTLINES, which is the only ground truth
+    # for the symbol-font-Latin-impostor fault (a font whose `f` slot draws a phi: its
+    # names, /Flags and base encoding all agree with the wrong `f`, and only the drawn ink
+    # disagrees). It backs `glyph_impostor_census`, a DEV/OFFLINE triage tool, and its
+    # tests. Deliberately NOT a runtime dependency: the extraction path stays pypdf-only,
+    # `glyph_impostor_census` imports fontTools lazily, and no `carmel` runtime module
+    # imports it -- so a production install never pulls it in.
+    "fonttools>=4.50",
 ]
 # pydantic-ai floor raised from the old >=0.0.20 to >=2.0: the pre-2.0 releases
 # predate the current provider/model/usage APIs `carmel/agents/models.py` calls
@@ -108,3 +116,11 @@ select = ["E", "F", "W", "I", "UP", "B", "SIM"]
 python_version = "3.14"
 strict = true
 plugins = ["pydantic.mypy"]
+
+# fontTools ships no py.typed marker and no stubs. It is a DEV-only dependency, imported
+# lazily by `glyph_impostor_census` (the offline outline-triage tool) and never on the
+# runtime extraction path, so its untyped surface cannot reach shipped code -- silencing
+# the missing-stubs error for it does not weaken the strict checks anywhere that matters.
+[[tool.mypy.overrides]]
+module = ["fontTools.*"]
+ignore_missing_imports = true
