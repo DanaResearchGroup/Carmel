@@ -277,7 +277,8 @@ def scan_document(pdf_bytes: bytes) -> DocumentCensus:
                 charstrings[glyph_name].draw(recording)
                 contours = sum(1 for op, _ in recording.value if op == "moveTo")
                 advance = getattr(charstrings[glyph_name], "width", None)
-            except Exception:  # noqa: BLE001 - an unreadable outline is not a candidate
+            except Exception:  # noqa: BLE001  # pragma: no cover - reaching here needs a charstring that decompiles but raises mid-draw, i.e. hand-corrupted CFF bytecode whose corruption is unstable across fontTools versions; not drivable from a synthetic fixture
+                # an unreadable outline is not a candidate
                 continue
             flags = _outline_flags(decoded_char, bbox, contours, upm)  # type: ignore[arg-type]
             if flags:
