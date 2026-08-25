@@ -456,6 +456,216 @@ _GLYPH_VERDICTS: tuple[GlyphVerdict, ...] = (
             "the equivalence-ratio symbol in running text."
         ),
     ),
+    # ---- Target document (9c59...): the impostors the outline does NOT pin. Each was
+    # refused by an earlier reviewer because a plausible resemblance is not the
+    # exclude-the-alternatives standard the phi repairs above meet; refusing turns a silent
+    # wrong character into an honest UNRESOLVED_IMPOSTOR. FONT_PROGRAM scope: the refusal is a
+    # font-program claim (this program's glyph is an impostor) independent of document.
+    GlyphRefusal(
+        # /F? symbol font (AdvPS3FDD77), WinAnsi 'w' slot, drawn x3 in the target.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="a77cf75d3face992f0f8db90afa59c9f63aa2dec2eff86f02fa39fe3ff247159",
+        font_base_name="NNEKEG+AdvPS3FDD77",
+        glyph_name="w",
+        reason="a single wide horizontal bar of the tilde/dash class; the outline does not pin WHICH mark",
+        evidence=(
+            "Read from document 9c59f1c6...d298 (provenance; font-program scoped). "
+            "WinAnsiEncoding, no /ToUnicode, no /Differences, /Flags 32; byte 0x77 -> 'w' by "
+            "base encoding; the embedded 416-byte CFF (charset ['.notdef','bracketleft','w']) "
+            "draws 'w' as a SINGLE contour, bbox [170,830]x[194,406] in the 1000-unit em, "
+            "advance 1000: a 660-unit-wide horizontal mark 212 units tall floating on the math "
+            "axis, rendered as a shallow wave (a tilde-shaped stroke). This is a dash/tilde "
+            "class mark, not a letter -- but the outline alone cannot choose between a tilde "
+            "U+223C, an approx/similar sign, a swung dash and a wide rule, and no document role "
+            "excludes them. Refused, not guessed."
+        ),
+    ),
+    GlyphRefusal(
+        # Same program (AdvPS3FDD77), WinAnsi '[' slot. Present in the subset; a double bar.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="a77cf75d3face992f0f8db90afa59c9f63aa2dec2eff86f02fa39fe3ff247159",
+        font_base_name="NNEKEG+AdvPS3FDD77",
+        glyph_name="[",
+        reason="two stacked horizontal bars of the equals/double-rule class; the outline does not pin WHICH",
+        evidence=(
+            "Read from document 9c59f1c6...d298 (provenance; font-program scoped). Same 416-byte "
+            "CFF program as the tilde 'w' above (charset ['.notdef','bracketleft','w']); "
+            "WinAnsiEncoding, no /ToUnicode, no /Differences, /Flags 32; byte 0x5B -> '[' by "
+            "base encoding. The 'bracketleft' glyph is TWO contours, bbox [170,830]x[157,443], "
+            "advance 1000: two parallel horizontal bars (upper [170,830]x[365,443], lower "
+            "[170,830]x[157,235]), each a 660-unit rule. A double-bar mark -- most likely an "
+            "equals U+003D, but the outline does not exclude an identical-to U+2261 fragment, a "
+            "parallel-to U+2225, or a double rule, and there is no role to decide. Refused."
+        ),
+    ),
+    GlyphRefusal(
+        # AdvPS4721B4 (same program as the target phi 'f'), WinAnsi 'g' slot, drawn x3.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="45b1e0bf5d9e3a6e5e7af5f2b83ba95e1b19696d7eb4a0cea93dd412c80df3ac",
+        font_base_name="NNEJBM+AdvPS4721B4",
+        glyph_name="g",
+        reason="a single-contour deep descender resembling a gamma, but not excluded from its alternatives",
+        evidence=(
+            "Read from document 9c59f1c6...d298 (provenance; font-program scoped). Same program "
+            "as the phi 'f' repair above (charset ['.notdef','f','g']); WinAnsiEncoding, no "
+            "/ToUnicode, no /Differences, /Flags 32; byte 0x67 -> 'g' by base encoding. The 'g' "
+            "glyph is a SINGLE contour, bbox [40,549]x[-190,447], advance 593: a stroke that "
+            "descends to y=-190 with no closed counter, resembling a lowercase gamma. But a "
+            "single open descender is exactly what the phi repair required MORE than to convict: "
+            "the phi is pinned by a bowl-plus-through-stroke structure that excludes its "
+            "alternatives, and this glyph has no comparable feature excluding an eta, a script "
+            "descender or an integral-like mark. Held to the same standard, it refuses."
+        ),
+    ),
+    # ---- 2012 document (7cc5...): en-dash repair; tilde and RHO refusals.
+    GlyphRepair(
+        # AdvPS44A44B 'e' slot: the en-dash, byte-identical outline to the target's. Drawn x90.
+        scope=GlyphVerdictScope.DOCUMENT,
+        document_sha256="7cc544150b26056b6bfcc48eec248943c8bbd72de99c469c6d7d50c672ed564e",
+        font_program_sha256="6ace515f455d19c37d4f715242c1c2e5a4d049853bdc6ad2bce5bbf0dee5654b",
+        font_base_name="JIAKBG+AdvPS44A44B",
+        glyph_name="e",
+        replacement="–",
+        evidence=(
+            "Read from this document. WinAnsiEncoding, no /ToUnicode, no /Differences, /Flags 32; "
+            "byte 0x65 -> 'e' by base encoding; the embedded 375-byte CFF (charset "
+            "['.notdef','dollar','e']) draws 'e' as a SINGLE contour, bbox [50,700]x[274,326], "
+            "advance 750 -- a 650-unit horizontal bar 52 units tall on the math axis, the "
+            "byte-for-byte outline of the target document's confirmed en-dash 'e'. A bar this "
+            "wide excludes a hyphen and at 0.65 em an em-dash; read as en-dash U+2013 because "
+            "this glyph is the document's range/caption separator (drawn 90 times). Dash class, "
+            "so DOCUMENT scope: the en-dash-vs-minus choice used the separator role. That the "
+            "repaired ranges read '0.6-1.0' is corroboration, not evidence."
+        ),
+    ),
+    GlyphRefusal(
+        # AdvPS3FDD77 'w' slot: the same tilde outline as the target's, distinct program. x1.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="6badb7b4d560bde0581a37225a626f5f12b76015e627625528f2ab190832452a",
+        font_base_name="JIAKIH+AdvPS3FDD77",
+        glyph_name="w",
+        reason="a single wide horizontal bar of the tilde/dash class; the outline does not pin WHICH mark",
+        evidence=(
+            "Read from document 7cc54415...d564 (provenance; font-program scoped). WinAnsiEncoding, "
+            "no /ToUnicode, no /Differences, /Flags 32; byte 0x77 -> 'w'; the embedded 416-byte "
+            "CFF (charset ['.notdef','bracketleft','w']) draws 'w' as a SINGLE contour, bbox "
+            "[170,830]x[194,406], advance 1000 -- the same tilde-class bar as the target's "
+            "AdvPS3FDD77 'w'. Not pinned to a specific tilde/rule/dash; refused for the same "
+            "reason as that one."
+        ),
+    ),
+    GlyphRefusal(
+        # AdvPS4721B4 'r' slot, drawn x5. The census labelled this "phi", but the OUTLINE is a
+        # RHO -- one counter, a bowl topping out at x-height, a left descender, and no
+        # through-stroke ascending to cap height. Both confirmed corpus phis (target 'f',
+        # 2014 'f') have a through-stroke to ~660 and TWO counters; this has neither. The
+        # brief's own "~54 phi" total (target 17 + 2014 37) excludes these 5. Refused rather
+        # than repaired to phi (that would be repairing against the outline on a label) or to
+        # rho (a repair the operator never confirmed).
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="6bfd9d5860c56e9e6585c75e772c8927b9d2cbb3ff7f6ae9bc58f8a5fd5c1402",
+        font_base_name="JIAKAD+AdvPS4721B4",
+        glyph_name="r",
+        reason=(
+            "a closed bowl with a left descender -- a rho, NOT the phi the census labelled it; "
+            "refused pending confirmation"
+        ),
+        evidence=(
+            "Read from document 7cc54415...d564 (provenance; font-program scoped). WinAnsiEncoding, "
+            "no /ToUnicode, no /Differences, /Flags 32; byte 0x72 -> 'r'; the embedded 1045-byte "
+            "CFF (an 8-glyph symbol subset ['.notdef','F','h','k','l','r','s','u']) draws 'r' as "
+            "TWO contours, bbox [18,469]x[-189,443], advance 500: an outer bowl whose stem "
+            "descends to y=-189 on the left (x 18-93), plus ONE inner counter [183,389]x[17,413]. "
+            "It tops out at x-height (443) with NO stroke ascending above the bowl. The two "
+            "confirmed phi glyphs in this corpus (target/2014 'f') each have a vertical stroke "
+            "spanning descender to cap height (~660) and TWO counters split by it; this glyph has "
+            "one counter and no ascending stroke, so it is NOT that phi -- structurally it is a "
+            "rho U+03C1 (bowl + left descender). Rendered, it is unmistakably a rho. The census "
+            "annotation 'phi' is contradicted by the outline (and by the brief's own ~54-phi "
+            "total, which excludes these 5). Refused: repairing to phi would be a label over the "
+            "outline, and rho is a conclusion the outline supports but no reviewer has confirmed."
+        ),
+    ),
+    # ---- 2014 document (a083...): en-dash and phi repairs; beta refusals (x2 programs).
+    GlyphRepair(
+        # AdvPS44A44B 'e' slot: the en-dash again, byte-identical outline. Drawn x153.
+        scope=GlyphVerdictScope.DOCUMENT,
+        document_sha256="a08397afba890749545aa69ea54769e002d40bbc78016eeabe0bb48d2120f73c",
+        font_program_sha256="902c8300b657c496935a839491f176ee51b3263b8de9e841dafd7a5071441244",
+        font_base_name="FCHIBE+AdvPS44A44B",
+        glyph_name="e",
+        replacement="–",
+        evidence=(
+            "Read from this document. WinAnsiEncoding, no /ToUnicode, no /Differences, /Flags 32; "
+            "byte 0x65 -> 'e'; the embedded 347-byte CFF (charset ['.notdef','e']) draws 'e' as a "
+            "SINGLE contour, bbox [50,700]x[274,326], advance 750 -- the byte-for-byte en-dash "
+            "outline of the target and 2012 documents. Read as en-dash U+2013, the document's "
+            "range/caption separator, drawn 153 times. Dash class -> DOCUMENT scope."
+        ),
+    ),
+    GlyphRepair(
+        # AdvP4721B4 'f' slot: phi, the bowl-plus-through-stroke structure. Drawn x37.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="e0afd5cb18fb6e556c5af5544747abb85212d52cd2a0365ae8eb4229b662bb76",
+        font_base_name="FCHIHO+AdvP4721B4",
+        glyph_name="f",
+        replacement="φ",
+        evidence=(
+            "Read from document a08397af...0f73c (provenance; font-program scoped). WinAnsiEncoding, "
+            "no /ToUnicode, no /Differences, /Flags 32; byte 0x66 -> 'f'; the embedded 686-byte CFF "
+            "(charset ['.notdef','a','b','f']) draws 'f' with THREE contours, bbox "
+            "[44,564]x[-189,660], advance 604: a vertical stroke spanning the descender (y=-189) to "
+            "cap height (y=660), crossing a bowl split into TWO counters ([290,484]x[17,416] and "
+            "[124,328]x[15,417]) on either side of it. A bowl crossed by a through-stroke that "
+            "extends above and below is a phi U+03C6; the through-stroke and paired counters "
+            "exclude the descenderless body 'f' the byte decodes to. Same structure as the target "
+            "document's confirmed phi. Rendered, unmistakably a phi. Used x37 as the equivalence "
+            "ratio."
+        ),
+    ),
+    GlyphRefusal(
+        # AdvP4721B4 'b' slot (same program as the 2014 phi 'f'), drawn x14. A beta.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="e0afd5cb18fb6e556c5af5544747abb85212d52cd2a0365ae8eb4229b662bb76",
+        font_base_name="FCHIHO+AdvP4721B4",
+        glyph_name="b",
+        reason=(
+            "an ascender-plus-double-bowl resembling a beta, but not the confirmed en-dash/phi "
+            "fault; refused pending confirmation"
+        ),
+        evidence=(
+            "Read from document a08397af...0f73c (provenance; font-program scoped). WinAnsiEncoding, "
+            "no /ToUnicode, no /Differences, /Flags 32; byte 0x62 -> 'b'; same 686-byte CFF as the "
+            "phi 'f' above (charset ['.notdef','a','b','f']) draws 'b' with TWO contours, bbox "
+            "[35,522]x[-174,693], advance 552: a form that BOTH ascends (to y=693) and descends "
+            "(to y=-174), unlike a Latin 'b' which ascends but never descends. Rendered, it is a "
+            "beta (a left stem carrying two stacked bowls). The census flagged it with a question "
+            "mark, and the brief is explicit that a question mark is not evidence: repairing it to "
+            "beta while holding gamma/rho/the bars to the exclude-the-alternatives standard would "
+            "apply a weaker bar to the one that merely LOOKS plausible -- the phi-as-f fault run "
+            "backwards. Refused: the honest state for a glyph looked at and not confirmed."
+        ),
+    ),
+    GlyphRefusal(
+        # AdvP3ECA66 'b' slot, a SECOND program, drawn x1. Same beta fault, distinct program.
+        scope=GlyphVerdictScope.FONT_PROGRAM,
+        font_program_sha256="06fcebb4ccfa8272a362e3f81be7ef5dfac5527d40e1fc5b6b74d56bc21e0ab4",
+        font_base_name="FCHNAI+AdvP3ECA66",
+        glyph_name="b",
+        reason=(
+            "an ascender-plus-double-bowl resembling a beta, but not the confirmed en-dash/phi "
+            "fault; refused pending confirmation"
+        ),
+        evidence=(
+            "Read from document a08397af...0f73c (provenance; font-program scoped). WinAnsiEncoding, "
+            "no /ToUnicode, no /Differences, /Flags 32; byte 0x62 -> 'b'; the embedded 553-byte CFF "
+            "(charset ['.notdef','a','b']) draws 'b' with TWO contours, bbox [35,569]x[-177,697], "
+            "advance 593: the same ascending-and-descending beta form as the AdvP4721B4 'b', in a "
+            "distinct embedded program (drawn once). Refused on the same grounds -- registered so "
+            "the document reports this glyph uniformly rather than refusing it in one program and "
+            "reading it as 'b' in another."
+        ),
+    ),
 )
 
 _assert_no_overlapping_verdicts(_GLYPH_VERDICTS)

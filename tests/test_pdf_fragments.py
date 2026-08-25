@@ -814,7 +814,41 @@ class TestGlyphRepairsAreScopedByDocumentFontAndCode:
                 seen_refusal = True
                 assert entry.reason and not hasattr(entry, "replacement")
         assert seen_repair, "the registry ships at least one repair"
-        _ = seen_refusal  # refusal entries, when present, are shape-checked above
+        assert seen_refusal, "the registry ships at least one refusal"
+
+    def test_the_registry_ships_the_expected_verdicts_for_the_three_affected_documents(self) -> None:
+        """The registry-level guarantee behind Verifier items 2 and 3, pinned to the shipped
+        entries. The target document's `w`, `[` and `g` and the 2014 document's `b` are
+        REFUSALS naming the glyph; the two further documents carry en-dash/phi REPAIRS, keyed
+        font-program-sha-first with document narrowing only for the dash class. The 2012 `r` is
+        a refusal, not the phi its census row labelled -- the outline pins a rho, and the brief
+        sanctions the outline over the label."""
+        by_glyph: dict[str, list] = {}
+        for v in pdf_fragments._GLYPH_VERDICTS:
+            by_glyph.setdefault(v.glyph_name, []).append(v)
+
+        def kinds(name):
+            return {type(v).__name__ for v in by_glyph.get(name, [])}
+
+        # Refusals naming the glyph (Verifier item 2), plus the rho and the tildes.
+        for glyph in ("w", "[", "g", "r", "b"):
+            assert by_glyph.get(glyph), f"expected a verdict for {glyph!r}"
+            assert kinds(glyph) == {"GlyphRefusal"}, f"{glyph!r} must be refused, not repaired"
+
+        # Widened repairs for the two further documents (Verifier item 3).
+        endash = [v for v in by_glyph.get("e", []) if v.replacement == "–"]
+        docs = {v.document_sha256 for v in endash}
+        assert {
+            "7cc544150b26056b6bfcc48eec248943c8bbd72de99c469c6d7d50c672ed564e",  # 2012
+            "a08397afba890749545aa69ea54769e002d40bbc78016eeabe0bb48d2120f73c",  # 2014
+        } <= docs, "en-dash repair must widen to the 2012 and 2014 documents"
+        assert all(v.scope is pdf_fragments.GlyphVerdictScope.DOCUMENT for v in endash), (
+            "the dash class stays DOCUMENT-scoped -- en-dash vs minus needs document context"
+        )
+        phi = [v for v in by_glyph.get("f", []) if getattr(v, "replacement", None) == "φ"]
+        assert phi and all(v.scope is pdf_fragments.GlyphVerdictScope.FONT_PROGRAM for v in phi), (
+            "phi is context-free, so its repairs are keyed font-program-sha-first"
+        )
 
 
 class TestTheInkExtentStopsAtTheLastGlyph:
@@ -1161,7 +1195,7 @@ class TestAnEngineMismatchIsNotAPageFailure:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _mismatch(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1228,7 +1262,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _mismatch(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1265,7 +1299,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         assert issubclass(mod._EngineMismatch, Exception)
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _mismatch(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1283,7 +1317,7 @@ class TestUnavailabilityIsNotOneEvent:
         require_pypdf()
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _mismatch(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         monkeypatch.setattr(mod, "_page_fragments", _mismatch)
@@ -1312,7 +1346,7 @@ class TestUnavailabilityIsNotOneEvent:
 
         import carmel.services.pdf_fragments as mod
 
-        def _mismatch(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _mismatch(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             raise mod._EngineMismatch("pypdf TextStateParams is missing a required attribute")
 
         produced = {extract_fragments(_one_page_pdf(self._PDF)).status}
@@ -1449,10 +1483,10 @@ class TestLossRecordsWhatWasLost:
 
         real = mod._page_fragments
 
-        def _boom(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _boom(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             if page_number == 2:
                 raise ValueError("synthetic page explosion")
-            return real(page, page_number, engine, budget, repairs, glyph_budget)
+            return real(page, page_number, engine, budget, verdicts, glyph_budget, font_budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _boom)
         pdf = _two_page_pdf(
@@ -1594,9 +1628,9 @@ class TestLossRecordsWhatWasLost:
         real = mod._page_fragments
         parsed: list[int] = []
 
-        def _recording(page, page_number, engine, budget, repairs=None, glyph_budget=None, font_budget=None):
+        def _recording(page, page_number, engine, budget, verdicts=None, glyph_budget=None, font_budget=None):
             parsed.append(page_number)
-            return real(page, page_number, engine, budget, repairs, glyph_budget)
+            return real(page, page_number, engine, budget, verdicts, glyph_budget, font_budget)
 
         monkeypatch.setattr(mod, "_page_fragments", _recording)
         monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 1)
