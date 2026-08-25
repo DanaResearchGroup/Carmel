@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tracemalloc
 import zlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -1745,3 +1746,157 @@ class TestOnePageCannotCostUnboundedMemory:
         """836,591 B is the largest decompressed page in the 8-paper corpus (median
         22,035 B). Pinned so that lowering the cap has to face the measurement."""
         assert MAX_PAGE_CONTENT_BYTES >= 836_591 * 7
+
+
+def _fake_font(
+    *,
+    encoding,
+    character_map=None,
+    space_char=" ",
+    space_width=250.0,
+    text_width=500.0,
+):
+    """A stand-in for the ``font`` a pypdf ``TextStateParams`` exposes, carrying exactly
+    the attributes the per-glyph helpers read: ``encoding`` (a ``str`` codec name or a
+    ``dict`` code->substring map), ``character_map``, ``space_char``/``space_width``, and
+    a ``get_text_width`` lookup."""
+    return SimpleNamespace(
+        encoding=encoding,
+        character_map=character_map if character_map is not None else {},
+        space_char=space_char,
+        space_width=space_width,
+        get_text_width=lambda character: text_width,
+    )
+
+
+def _fake_show(
+    *,
+    value,
+    font,
+    decoded_value="",
+    text="",
+    Tc=0.0,
+    Tw=0.0,
+    Tz=100.0,
+    transform=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0),
+    tx=0.0,
+    font_size=1000.0,
+    displaced_tx=0.0,
+):
+    """A stand-in for one pypdf ``TextStateParams`` show, carrying only the fields the
+    glyph helpers read. The happy paths of these helpers are already driven end-to-end by
+    the synthetic-PDF tests above; this fabricates the pathological states a well-formed
+    PDF cannot reach -- an undecodable dict-encoded byte, a pen walked left of its own
+    start, a non-finite or backwards interval -- so the refusal/degradation arms that a
+    corpus PDF never exercises are exercised deliberately here."""
+    return SimpleNamespace(
+        value=value,
+        font=font,
+        _decoded_value=decoded_value,
+        text=text,
+        Tc=Tc,
+        Tw=Tw,
+        Tz=Tz,
+        transform=transform,
+        tx=tx,
+        font_size=font_size,
+        displaced_tx=displaced_tx,
+    )
+
+
+class TestFontProgramScopingFailsClosed:
+    """A repair is scoped by the sha of the embedded font PROGRAM. When that sha cannot be
+    computed -- a font with no program, or any failure reaching or inflating one -- the
+    scope cannot match and the repair does not apply: no match, fail closed."""
+
+    def test_a_font_with_no_descriptor_program_has_no_sha(self) -> None:
+        font = SimpleNamespace(font_descriptor=SimpleNamespace(font_file=None))
+        assert pdf_fragments._font_program_sha256(font) is None
+
+    def test_a_program_that_cannot_be_read_has_no_sha(self) -> None:
+        def _explode():
+            raise ValueError("the font stream is broken")
+
+        font = SimpleNamespace(font_descriptor=SimpleNamespace(font_file=SimpleNamespace(get_data=_explode)))
+        assert pdf_fragments._font_program_sha256(font) is None
+
+
+class TestGlyphSubstringsPartition:
+    """``_glyph_substrings`` partitions a show's decoded value one piece per glyph code, or
+    degrades to ``None`` when no per-code alignment exists -- the wider, refusing direction."""
+
+    def test_a_non_bytes_operand_is_one_character_per_code(self) -> None:
+        show = _fake_show(value="ab", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_substrings(show) == ["a", "b"]
+
+    def test_a_dict_encoded_byte_absent_from_the_map_but_ascii_decodes(self) -> None:
+        # 0x41 is in no /Differences entry yet decodes as 'A': pypdf's own fallback, mirrored.
+        show = _fake_show(value=b"\x41", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_substrings(show) == ["A"]
+
+    def test_a_dict_encoded_byte_that_cannot_decode_degrades_to_none(self) -> None:
+        # 0x80 is a bare UTF-8 continuation byte: no per-code alignment, so None.
+        show = _fake_show(value=b"\x80", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_substrings(show) is None
+
+
+class TestTextPiecesAreVerifiedNotTrusted:
+    """``_text_pieces`` returns a glyph-aligned view of the PUBLISHED text only when that
+    partition provably reconstructs it; any disagreement returns ``None`` so every per-glyph
+    consumer degrades to "no per-glyph view" rather than slicing on a guess."""
+
+    def test_an_unavailable_partition_yields_no_pieces(self) -> None:
+        show = _fake_show(value=b"\x80", font=_fake_font(encoding={}))
+        assert pdf_fragments._text_pieces(show) is None
+
+    def test_a_non_bytes_operand_pieces_are_its_substrings(self) -> None:
+        show = _fake_show(value="ab", font=_fake_font(encoding={}), text="ab")
+        assert pdf_fragments._text_pieces(show) == ["a", "b"]
+
+    def test_a_partition_that_disagrees_with_the_text_yields_no_pieces(self) -> None:
+        # The partition reconstructs "AB"; the published text is something else, so the
+        # alignment is not trusted and the fragment degrades to no per-glyph view.
+        show = _fake_show(value=b"AB", font=_fake_font(encoding={}), text="mismatch")
+        assert pdf_fragments._text_pieces(show) is None
+
+
+class TestInkExtentRefusesRatherThanGuess:
+    """``_ink_x_end`` publishes the last glyph's ink edge, or ``None`` when it is unknowable
+    or would break the left-to-right hull it is read as one edge of."""
+
+    def test_a_show_with_no_glyphs_has_no_ink_extent(self) -> None:
+        show = _fake_show(value=b"", font=_fake_font(encoding={}))
+        assert pdf_fragments._ink_x_end(show) is None
+
+    def test_an_ink_edge_left_of_the_start_is_refused(self) -> None:
+        # displaced_tx=0 with tx=10 walks the pen left of the show's own start: refused.
+        show = _fake_show(value=b"A", font=_fake_font(encoding={}), tx=10.0, displaced_tx=0.0)
+        assert pdf_fragments._ink_x_end(show) is None
+
+    def test_an_ink_edge_at_or_right_of_the_start_is_published(self) -> None:
+        # The faithful positive: no trailing charge, pen at 5, start at 0 -> the edge is 5.0,
+        # anchoring the fabricated show against the arithmetic the real shows drive.
+        show = _fake_show(value=b"A", font=_fake_font(encoding={}), tx=0.0, displaced_tx=5.0)
+        assert pdf_fragments._ink_x_end(show) == 5.0
+
+
+class TestGlyphGeometryIsWholeFragmentOrNothing:
+    """``_glyph_geometry`` zips the width-driving substrings against the published pieces
+    and returns per-glyph page-space intervals, or ``None`` for the whole fragment when the
+    partitions disagree in length or any interval is non-finite or backwards."""
+
+    def test_a_length_mismatch_yields_no_geometry(self) -> None:
+        show = _fake_show(value=b"AB", font=_fake_font(encoding={}))
+        assert pdf_fragments._glyph_geometry(show, ["only-one"]) is None
+
+    def test_a_backwards_interval_yields_no_geometry(self) -> None:
+        # A negative horizontal projection sends the glyph's end left of its start: refused.
+        font = _fake_font(encoding={}, text_width=500.0)
+        show = _fake_show(value=b"A", font=font, transform=(-1.0, 0.0, 0.0, 1.0, 0.0, 0.0), tx=0.0)
+        assert pdf_fragments._glyph_geometry(show, ["A"]) is None
+
+    def test_a_well_formed_show_yields_one_interval_per_glyph(self) -> None:
+        # The faithful positive: a 500-unit glyph at 1000 pt / 100% Th spans [0, 500).
+        font = _fake_font(encoding={}, text_width=500.0)
+        show = _fake_show(value=b"A", font=font, transform=(1.0, 0.0, 0.0, 1.0, 0.0, 0.0), tx=0.0)
+        assert pdf_fragments._glyph_geometry(show, ["A"]) == (("A", 0.0, 500.0),)

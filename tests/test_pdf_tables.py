@@ -29,7 +29,10 @@ from carmel.services.pdf_tables import (
     InventoryRefusal,
     InventoryRefusalReason,
     _bands,
+    _block_of,
     _column_bounds,
+    _column_support,
+    _members_by_column,
     _merge_affix_bands,
     build_inventory,
 )
@@ -1713,3 +1716,46 @@ class TestFailClosedIsStructural:
         }
 
         assert produced == set(InventoryRefusalReason), f"unreachable: {set(InventoryRefusalReason) - produced}"
+
+
+class TestAnIntervalInNoDerivedBlockIsRefused:
+    """``_block_of`` returns ``None`` for an interval no derived column contains, and the
+    docstring pins the shape that reaches it: geometry the block union could not see --
+    an interval outside every block, or non-finite coordinates whose every comparison is
+    quietly False. Every consumer treats that ``None`` as a refusal, never a guess, so the
+    arms are exercised deliberately rather than left as decisions nothing has taken."""
+
+    def test_an_interval_outside_every_block_finds_no_column(self) -> None:
+        assert _block_of(5.0, 8.0, [(10.0, 20.0), (30.0, 40.0)]) is None
+
+    def test_non_finite_geometry_finds_no_column(self) -> None:
+        # A NaN vanishes from every ``<=`` comparison, so the union never claimed it; it
+        # surfaces here, closed. This is the case the docstring names as otherwise unreachable.
+        assert _block_of(float("nan"), float("nan"), [(0.0, 100.0)]) is None
+
+    def test_column_support_skips_a_fragment_whose_ink_lands_in_no_block(self) -> None:
+        # The ``col is not None`` arm's false side (1252->1250): a fragment whose occupied
+        # interval sits in no derived block contributes no support and does not crash.
+        outside = frag("x", 500.0, 510.0, 71.5, ink_x_end=510.0)
+        assert _column_support([outside], [(0.0, 100.0)]) == {}
+
+    def test_a_hull_fragment_in_no_column_is_an_unsplittable_refusal(self) -> None:
+        # No per-glyph partition, and the ink hull lands outside every block: refuse.
+        outside = frag("x", 500.0, 510.0, 71.5, ink_x_end=510.0)
+        result = _members_by_column(outside, [(0.0, 100.0)], {})
+        assert isinstance(result, InventoryRefusal)
+        assert result.reason is InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT
+
+    def test_a_glyph_in_no_column_is_an_unsplittable_refusal(self) -> None:
+        # A partitioned fragment one of whose glyph intervals lands in no block: refuse.
+        outside = frag(
+            "ab",
+            500.0,
+            510.0,
+            71.5,
+            ink_x_end=510.0,
+            glyph_intervals=(("a", 500.0, 504.0), ("b", 506.0, 510.0)),
+        )
+        result = _members_by_column(outside, [(0.0, 100.0)], {})
+        assert isinstance(result, InventoryRefusal)
+        assert result.reason is InventoryRefusalReason.UNSPLITTABLE_SPANNING_FRAGMENT

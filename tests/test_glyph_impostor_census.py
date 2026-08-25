@@ -335,6 +335,23 @@ class TestIterCffProgramsSkips:
         descriptor = b"<< /Type /FontDescriptor /FontName /X /Flags 32 >>"
         assert _iter_cff_programs(_catalog(page, font, descriptor)) == []
 
+    def test_the_same_program_seen_twice_is_recorded_once(self) -> None:
+        pytest.importorskip("pypdf")
+        # Two font resource entries resolve to the SAME embedded program, so its sha is seen
+        # a second time (the ``sha not in seen`` false arm, 163->153): the program is
+        # deduplicated and returned once, never scanned twice. This is what keeps the census
+        # from double-counting a pi-font that recurs across a document's pages.
+        program = _cff_program("e", _bar)
+        page = (
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R /F2 4 0 R >> >> >>"
+        )
+        font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Synth /FontDescriptor 5 0 R >>"
+        descriptor = b"<< /Type /FontDescriptor /FontName /Synth /Flags 32 /FontFile3 6 0 R >>"
+        stream = (
+            b"<< /Length " + str(len(program)).encode() + b" /Subtype /Type1C >>\nstream\n" + program + b"\nendstream"
+        )
+        assert len(_iter_cff_programs(_catalog(page, font, descriptor, stream))) == 1
+
 
 class TestDrawnCountsSkips:
     """Drawn counts are an enrichment, never a correctness dependency: every malformed shape
