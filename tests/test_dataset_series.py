@@ -29,6 +29,7 @@ from carmel.schemas.datasets import (
     DataPoint,
     DatasetEnvelope,
     EmbeddedConversionTable,
+    EmbeddedFigureDigitization,
     ExtractedTextVerification,
     ExtractionBinding,
     Maybe,
@@ -60,11 +61,15 @@ from carmel.schemas.datasets import (
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import TABLE_V1
+from tests.figure_digitization_fixtures import cite_digitization
 from tests.table_inventory_fixtures import cover_for, inventory_for
 from tests.test_dataset_graph_and_envelope import _extraction_binding, _glyph_health_assessment
 
 _NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """The only legal absence for a table cell with no PDF fragment geometry (V8)."""
+
+_NO_DIGITIZATION = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+"""The only legal absence for a non-DIGITIZED series's digitization_sha256 (V9)."""
 
 
 def _verification_for(extraction: ExtractionBinding | Absent) -> SourceVerification | Absent:
@@ -462,6 +467,7 @@ def _valid_series(
     points: tuple[DataPoint, ...] | None = None,
     source_form: SourceForm = SourceForm.TABULAR,
     value_origin: ValueOrigin = ValueOrigin.EXPERIMENTAL,
+    digitization_sha256: Maybe[str] = _NO_DIGITIZATION,
 ) -> Series:
     return Series(
         series_id=series_id,
@@ -470,6 +476,7 @@ def _valid_series(
         axes=axes if axes is not None else _valid_axes(node_id),
         constants=constants if constants is not None else _valid_constants(node_id),
         points=points if points is not None else (_valid_point(node_id=node_id),),
+        digitization_sha256=digitization_sha256,
     )
 
 
@@ -477,6 +484,7 @@ def _envelope_with_series(
     series: tuple[Series, ...],
     graph: SourceGraph | None = None,
     composition: Maybe[Composition] = _NO_COMPOSITION,
+    figure_digitizations: tuple[EmbeddedFigureDigitization, ...] = (),
 ) -> DatasetEnvelope:
     return DatasetEnvelope(
         source_graph=graph if graph is not None else _single_paper_graph(),
@@ -484,6 +492,7 @@ def _envelope_with_series(
         series=series,
         conversion_tables=(_embedded_table_v1(),),
         table_inventories=cover_for(series, composition),
+        figure_digitizations=figure_digitizations,
     )
 
 
@@ -980,7 +989,8 @@ class TestSourceFormConstrainsValueRef:
             ),
         )
         series = _valid_series(points=(point,), source_form=SourceForm.DIGITIZED)
-        envelope = _envelope_with_series((series,), graph=graph)
+        series, embedded = cite_digitization(series, graph, "fig")
+        envelope = _envelope_with_series((series,), graph=graph, figure_digitizations=(embedded,))
         assert envelope.series[0].source_form is SourceForm.DIGITIZED
 
     def test_source_form_does_not_constrain_unit_ref_or_label_ref(self) -> None:
@@ -1011,7 +1021,8 @@ class TestSourceFormConstrainsValueRef:
         )
         constants = (_coordinate("pressure", _pressure_amount(node_id="paper")),)
         series = _valid_series(axes=axes, constants=constants, points=(point,), source_form=SourceForm.DIGITIZED)
-        envelope = _envelope_with_series((series,), graph=graph)
+        series, embedded = cite_digitization(series, graph, "fig")
+        envelope = _envelope_with_series((series,), graph=graph, figure_digitizations=(embedded,))
         assert isinstance(envelope, DatasetEnvelope)
 
     def test_check_source_form_for_ref_has_no_silent_escape_branch(self) -> None:
@@ -1480,6 +1491,7 @@ class TestFunctionalRealisticSeries:
             axes=axes,
             constants=constants,
             points=points,
+            digitization_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         return DatasetEnvelope(
             source_graph=graph,
@@ -1487,6 +1499,7 @@ class TestFunctionalRealisticSeries:
             series=(series,),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=cover_for((series,)),
+            figure_digitizations=(),
         )
 
     def test_constructs(self) -> None:

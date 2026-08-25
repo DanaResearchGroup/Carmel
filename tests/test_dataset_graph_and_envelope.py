@@ -84,6 +84,7 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1, ConversionTable, IdentityRule
+from tests.figure_digitization_fixtures import cite_digitization
 from tests.table_inventory_fixtures import cited_inventories, cover_for, inventory_for
 
 _NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
@@ -540,6 +541,7 @@ def _envelope_with_value_ref_locator(
         series=(_fully_populated_series("unit-root", raw_sha256=SHA_D),),
         conversion_tables=(_embedded_table_v1(),),
         table_inventories=cover_for(composition, (_fully_populated_series("unit-root", raw_sha256=SHA_D),)),
+        figure_digitizations=(),
     )
 
 
@@ -709,6 +711,7 @@ def _fully_populated_series(node_id: str = "paper", raw_sha256: str = SHA_A) -> 
         axes=(phi_axis, sl_axis, const_axis),
         constants=(constant,),
         points=(point,),
+        digitization_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
 
 
@@ -752,6 +755,7 @@ def _fully_populated_envelope(
         series=(_fully_populated_series("paper"),),
         conversion_tables=conversion_tables if conversion_tables is not None else (_embedded_table_v1(),),
         table_inventories=cover_for(composition, (_fully_populated_series("paper"),)),
+        figure_digitizations=(),
     )
 
 
@@ -889,6 +893,7 @@ def _envelope_citing_two_tables(conversion_tables: tuple[EmbeddedConversionTable
         series=(_fully_populated_series("paper"),),
         conversion_tables=conversion_tables,
         table_inventories=cited_inventories(SHA_A),
+        figure_digitizations=(),
     )
 
 
@@ -2004,6 +2009,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
@@ -2029,6 +2035,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
         msg = str(excinfo.value)
         assert "does-not-exist" in msg
@@ -2048,6 +2055,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
         msg = str(excinfo.value)
         assert "ghost" in msg
@@ -2068,6 +2076,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
         msg = str(excinfo.value)
         assert "ghost" in msg
@@ -2095,6 +2104,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
 
     def test_unreferenced_ancestor_of_a_referenced_node_is_allowed(self) -> None:
@@ -2165,6 +2175,10 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             axes=(phi_axis, sl_axis),
             constants=(),
             points=(point,),
+            digitization_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+        series_referencing_crop_only, embedded_digitization = cite_digitization(
+            series_referencing_crop_only, graph, "crop"
         )
         envelope = DatasetEnvelope(
             source_graph=graph,
@@ -2172,6 +2186,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             series=(series_referencing_crop_only,),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=(),
+            figure_digitizations=(embedded_digitization,),
         )
         assert envelope.source_graph.node("paper").parent_node_id is None
 
@@ -2207,6 +2222,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 series=(),
                 conversion_tables=(),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
 
 
@@ -2267,6 +2283,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
             axes=(phi_axis, sl_axis),
             constants=(),
             points=(point,),
+            digitization_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         with pytest.raises(ValidationError) as excinfo:
             DatasetEnvelope(
@@ -2275,6 +2292,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
                 series=(series,),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                figure_digitizations=(),
             )
         msg = str(excinfo.value)
         assert "spans multiple root artifacts" in msg
@@ -2331,6 +2349,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
             axes=(phi_axis, sl_axis),
             constants=(),
             points=(point,),
+            digitization_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         envelope = DatasetEnvelope(
             source_graph=graph,
@@ -2338,6 +2357,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
             series=(series,),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=cited_inventories(SHA_A),
+            figure_digitizations=(),
         )
         assert len(envelope.series) == 1
 
@@ -2573,6 +2593,7 @@ class TestFunctionalRealisticEnvelope:
             series=(_fully_populated_series("paper"),),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=cover_for(composition, (_fully_populated_series("paper"),)),
+            figure_digitizations=(),
         )
 
     def test_constructs(self) -> None:

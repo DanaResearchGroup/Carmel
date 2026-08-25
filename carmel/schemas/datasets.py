@@ -3307,11 +3307,57 @@ class Series(BaseModel):
     axes: tuple[AxisDeclaration, ...]
     constants: tuple[Coordinate, ...]
     points: tuple[DataPoint, ...]
+    digitization_sha256: Maybe[str]
+    """The content address of the :class:`EmbeddedFigureDigitization` whose
+    record recovered this series from a figure -- i.e. the
+    ``digitization_sha256`` computed by
+    :func:`carmel.services.figure_digitization_record.compute_digitization_sha`.
+
+    This is the figure lane's counterpart to
+    :attr:`TableCellLocator.pdf_table_inventory_sha256`, and it exists to close
+    the hole that lane's citation already closes one level down: a series whose
+    ``source_form`` is :attr:`SourceForm.DIGITIZED` reports ``len(points)`` and
+    nothing about how PARTIAL the recovery was, so without a citation it could
+    be stored with no digitization record and no partialness at all -- exactly
+    the gap :class:`EmbeddedFigureDigitization` was built to close, reappearing
+    at series level. Whether a digitization record applies is a per-SERIES fact
+    (one figure, one recovered curve), not a per-point one, so the citation
+    lives HERE rather than on a locator the way the table lane's does.
+
+    ``Maybe``-typed with NO default, for the same "no unreasoned absence"
+    reasoning as :attr:`TableCellLocator.pdf_table_inventory_sha256`: every
+    series must STATE which case it is in. WHICH absences are legal, and when a
+    citation is mandatory, is NOT a property of this field -- a series does not
+    know the envelope's ``figure_digitizations`` or ``source_graph`` -- so it is
+    enforced at envelope level by
+    :func:`_validate_series_digitization_citation` (V9), which requires a
+    present citation for a ``DIGITIZED`` series and ``Absent(NOT_APPLICABLE)``
+    for every other form.
+
+    **A STATED CEILING, so a reader meets it here.** A resolvable citation
+    proves the digitized coordinates were RECORDED and are UNALTERED -- the
+    embedded record's canonical bytes hash to this address, its census balances,
+    its coverage claim cannot contradict its own ledger, and the chain reaches
+    the document's raw bytes. It proves NOTHING about whether those coordinates
+    are TRUE: nothing here re-derives markers from the crop's pixels, so a
+    verified record is not a validated measurement, and "the curve was traced
+    accurately" is a claim this schema cannot make. See
+    :class:`EmbeddedFigureDigitization` for the same limit stated on the record."""
 
     @field_validator("series_id")
     @classmethod
     def _validate_series_id(cls, value: str) -> str:
         return _require_identifier(value, field_name="series_id")
+
+    @field_validator("digitization_sha256")
+    @classmethod
+    def _validate_digitization_sha256_shape(cls, value: Maybe[str]) -> Maybe[str]:
+        # fullmatch, never match: `$` also matches just BEFORE a trailing newline, so
+        # match would let "a" * 64 + "\n" through -- same reasoning as
+        # TableCellLocator._validate_inventory_sha256_shape.
+        if isinstance(value, str) and not _SHA256_RE.fullmatch(value):
+            raise ValueError(f"Series.digitization_sha256 {value!r} is not 64 lowercase hex characters")
+        return value
 
     @model_validator(mode="after")
     def _validate_no_duplicate_axis_id(self) -> Series:
@@ -5373,6 +5419,7 @@ def _series_identity_payload(series: Series) -> dict[str, Any]:
         "axes": [_axis_declaration_identity_payload(a) for a in series.axes],
         "constants": [_coordinate_identity_payload(c) for c in series.constants],
         "points": [_data_point_identity_payload(p) for p in series.points],
+        "digitization_sha256": _project_maybe(series.digitization_sha256),
     }
 
 
@@ -5385,6 +5432,14 @@ def _embedded_table_inventory_identity_payload(inventory: EmbeddedTableInventory
         "inventory_sha256": inventory.inventory_sha256,
         "raw_sha256": inventory.raw_sha256,
         "canonical_json": inventory.canonical_json,
+    }
+
+
+def _embedded_figure_digitization_identity_payload(digitization: EmbeddedFigureDigitization) -> dict[str, Any]:
+    return {
+        "digitization_sha256": digitization.digitization_sha256,
+        "raw_sha256": digitization.raw_sha256,
+        "canonical_json": digitization.canonical_json,
     }
 
 
@@ -5664,7 +5719,7 @@ _CONDITION_SET_ENVELOPE_TYPE = "condition_set"
 """``envelope_type`` value emitted by
 :meth:`ConditionSetEnvelope.identity_payload`."""
 
-_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 2
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 3
 """The one envelope-projection version this module can parse. A payload
 carrying any other version was projected by code this module has never
 seen, so parsing it here could only produce a silently reinterpreted
@@ -5678,6 +5733,17 @@ Version history:
    :func:`_addresses_a_crop_region` for why the condition is written
    against the value rather than the kind, and
    :data:`_CONDITIONALLY_PROJECTED_FIELDS` for the registry entry.
+3. :attr:`Series.digitization_sha256` and
+   :attr:`DatasetEnvelope.figure_digitizations` added -- the figure lane's
+   citation surface (V9/FD1/FD2/FD3), the counterpart to the table lane's
+   :attr:`TableCellLocator.pdf_table_inventory_sha256` and
+   :attr:`DatasetEnvelope.table_inventories`. The version is a single shared
+   projection-schema number, so a :class:`ConditionSetEnvelope` -- whose own
+   shape is unchanged, since a condition set carries no series -- also stamps
+   3: the projection MODULE changed, and a consumer keyed on this number must
+   be told so. Nothing has been stored under any version (the branch is
+   unreleased and no runtime constructs an envelope), so re-addressing every
+   projection carries no migration cost.
 
 A version-1 payload is REFUSED here, never migrated. Refusing is the whole
 reason this key exists: a payload written under a projection this code has
@@ -6274,6 +6340,234 @@ def _validate_table_inventories_sorted(envelope: _SourceGraphEnvelope) -> None:
         raise ValueError("table_inventories must be sorted ascending by inventory_sha256")
 
 
+def _validate_series_digitization_citation(envelope: DatasetEnvelope) -> None:
+    """V9: every ``DIGITIZED`` :class:`Series` must cite a figure digitization
+    this envelope actually embeds, whose record is about THAT series, over THAT
+    crop, chained to the document's raw bytes -- and every non-digitized series
+    must cite none.
+
+    The figure lane's counterpart to :func:`_validate_table_cell_inventory_citation`,
+    matched to its shape rather than reinvented. It closes, at series level, the
+    hole :class:`EmbeddedFigureDigitization` was built to close at record level:
+    a series whose ``source_form`` is :attr:`SourceForm.DIGITIZED` reports only
+    ``len(points)``, so without this join it could be stored with no digitization
+    record and no partialness at all.
+
+    Runs AFTER V1 (``_validate_refs_resolve``) so every point-value ``ref.node_id``
+    already resolves, and AFTER V4 (``_validate_source_form_constrains_value_refs``)
+    so a value ref that is not a ``FIGURE_CROP`` at all is reported by V4's precise
+    message before this validator's same-crop join speaks.
+
+    Two cases, both fail-closed:
+
+    * ``DIGITIZED``: the citation MUST be present. An ``Absent`` here is exactly
+      the hole -- a digitized series that cites nothing. The cited address must be
+      embedded (a citation resolvable only against an evidence store makes the
+      envelope's meaning depend on the replaying machine), and the embedded
+      record must pass four producer checks and two further joins (below).
+    * every other form: the citation MUST be ``Absent(NOT_APPLICABLE)``. A present
+      citation on a ``TABULAR``/``TEXTUAL`` series would widen the requirement
+      beyond digitized series; any other absence reason would record a claim
+      nothing checked.
+
+    The FOUR producer checks -- enforced here, not left for a producer to remember:
+
+    * ``record.series_id == series.series_id`` -- the record is about THIS series.
+    * ``record.recovered == len(series.points)`` -- the count the record's census
+      balances against (D9) is the count the series actually has.
+    * ``record.figure_crop_node_id`` resolves to a ``FIGURE_CROP`` node -- not to
+      a page, a table, or an SI member, and not to nothing at all.
+    * ``record.figure_crop_sha256 == that node's sha256`` -- the two halves of
+      the crop's identity agree, so the record names one crop rather than one
+      crop's id and another's bytes.
+
+    The TWO joins beyond the obvious one, both required:
+
+    * **One crop.** Every digitized point's value ref must target the SAME crop
+      the record names. A series assembled from two different crops is not one
+      digitization, and a record can only describe one.
+    * **Root bytes.** ``record.raw_sha256`` must equal the crop's ROOT artifact's
+      ``sha256`` -- the parentless node the crop descends from (a ``PAPER_PDF`` or
+      ``JATS_XML``), not merely the crop's immediate parent. This is what makes
+      the chain reach actual document bytes rather than stopping at an
+      intermediate artifact (an SI member a crop was cut from is itself derived).
+
+    **A STATED CEILING.** Everything this join proves is that the digitized
+    coordinates were RECORDED and are UNALTERED: the record's canonical bytes
+    hash to the cited address (T1), its census balances against a count this
+    series really has, and the chain reaches the document's raw bytes. It proves
+    NOTHING about whether those coordinates are TRUE -- nothing here re-derives
+    markers from the crop's pixels, so replay can confirm a record was faithfully
+    stored and never that the curve was traced accurately. A verified record is
+    not a validated measurement; see :class:`EmbeddedFigureDigitization`'s "SCOPE
+    OF WHAT VALIDATION HERE PROVES".
+    """
+    embedded_by_sha = {digitization.digitization_sha256: digitization for digitization in envelope.figure_digitizations}
+    for series in envelope.series:
+        citation = series.digitization_sha256
+        if series.source_form is not SourceForm.DIGITIZED:
+            if not isinstance(citation, Absent):
+                raise ValueError(
+                    f"Series(series_id={series.series_id!r}) has source_form={series.source_form.value!r} "
+                    f"but cites digitization_sha256={citation!r} -- only a DIGITIZED series may cite a "
+                    "figure digitization, and widening the requirement to any other form would record a "
+                    "citation nothing constrains"
+                )
+            if citation.reason is not AbsenceReason.NOT_APPLICABLE:
+                raise ValueError(
+                    f"Series(series_id={series.series_id!r}) has source_form={series.source_form.value!r} "
+                    f"and digitization_sha256 Absent ({citation.reason.value!r}) -- the only true absence for "
+                    f"a series that was not digitized is {AbsenceReason.NOT_APPLICABLE.value!r}"
+                )
+            continue
+
+        if isinstance(citation, Absent):
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) has source_form=DIGITIZED but its "
+                f"digitization_sha256 is Absent ({citation.reason.value!r}) -- a digitized series must cite "
+                "the figure digitization that recovered it, so its partialness is stated rather than "
+                "silently absent, and no absence reason is legal here"
+            )
+
+        digitization = embedded_by_sha.get(citation)
+        if digitization is None:
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization_sha256={citation!r}, which this "
+                "envelope does not embed -- a citation resolvable only against an evidence store makes the "
+                "envelope's meaning depend on the machine replaying it"
+            )
+        record = digitization._validated_record()
+
+        if record.series_id != series.series_id:
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization {citation!r}, whose record is "
+                f"about series {record.series_id!r} -- a digitization must name the series it recovered"
+            )
+        if record.recovered != len(series.points):
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization {citation!r}, whose record "
+                f"recovered {record.recovered} marker(s), but the series has {len(series.points)} point(s) "
+                "-- the count the record's census balances against must be the count the series actually has"
+            )
+        if record.figure_crop_node_id not in envelope.source_graph.node_ids:
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization {citation!r}, whose record names "
+                f"figure_crop_node_id={record.figure_crop_node_id!r}, which is not the id of any node in this "
+                "envelope's source graph -- a digitization must name a crop this envelope actually carries"
+            )
+        crop_node = envelope.source_graph.node(record.figure_crop_node_id)
+        if crop_node.kind is not SourceNodeKind.FIGURE_CROP:
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization {citation!r}, whose "
+                f"figure_crop_node_id {record.figure_crop_node_id!r} resolves to a {crop_node.kind.value!r} "
+                "node, not a FIGURE_CROP -- a digitization is read off a figure crop and off nothing else"
+            )
+        if crop_node.sha256 != record.figure_crop_sha256:
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization {citation!r}, whose record names "
+                f"figure_crop_sha256={record.figure_crop_sha256!r}, but crop node "
+                f"{record.figure_crop_node_id!r} has sha256={crop_node.sha256!r} -- the two halves of the "
+                "crop's identity must agree, so the record names one crop rather than one crop's id and "
+                "another's bytes"
+            )
+
+        for where, ref in _iter_series_point_value_refs(series):
+            if ref.node_id != record.figure_crop_node_id:
+                raise ValueError(
+                    f"Series(series_id={series.series_id!r}) cites digitization {citation!r} over crop "
+                    f"{record.figure_crop_node_id!r}, but {where} grounds in crop {ref.node_id!r} -- a "
+                    "series assembled from two different crops is not one digitization, and one record can "
+                    "describe only one crop"
+                )
+
+        ancestors = envelope.source_graph.ancestors(record.figure_crop_node_id)
+        root_node = ancestors[-1] if ancestors else crop_node
+        if record.raw_sha256 != root_node.sha256:
+            raise ValueError(
+                f"Series(series_id={series.series_id!r}) cites digitization {citation!r}, whose record was "
+                f"derived from document raw_sha256={record.raw_sha256!r}, but crop "
+                f"{record.figure_crop_node_id!r} descends from root artifact {root_node.node_id!r} with "
+                f"sha256={root_node.sha256!r} -- the record's document digest must reach the crop's root PDF "
+                "bytes rather than stopping at an intermediate artifact"
+            )
+
+
+def _iter_series_point_value_refs(series: Series) -> Iterator[tuple[str, SourceRef]]:
+    """Yield ``(where, value_ref)`` for every point coordinate and present point
+    observation of ``series`` -- the exact scope V4
+    (:func:`_check_source_form_for_ref`) constrains, and the scope V9's same-crop
+    join checks. A whole-series ``constant`` is deliberately excluded, for the
+    same reason V4 excludes it: a constant is not a point reference, so it makes
+    no per-point crop claim."""
+    for point in series.points:
+        for coord in point.coordinates:
+            yield (
+                f"Series(series_id={series.series_id!r}) point {point.point_id!r} coordinate axis_id={coord.axis_id!r}",
+                coord.value.value_ref,
+            )
+        for obs in point.observations:
+            if isinstance(obs.value, Absent):
+                continue
+            yield (
+                f"Series(series_id={series.series_id!r}) point {point.point_id!r} observation axis_id={obs.axis_id!r}",
+                obs.value.value_ref,
+            )
+
+
+def _validate_figure_digitizations_cover_cited(envelope: DatasetEnvelope) -> None:
+    """FD1: ``figure_digitizations`` must cover EXACTLY the digitizations cited
+    by the ``DIGITIZED`` series in this envelope -- no fewer, no more.
+
+    The "no fewer" half is enforced per-series by V9 above (which reports WHICH
+    series dangles, information a set difference cannot give); this states the
+    same requirement over the whole envelope and adds the "no more" half. An
+    embedded digitization nothing cites is unearned provenance -- the same
+    failure class T4 closes for table inventories. Same declaration-order note as
+    T4: V9 first, so an envelope violating both reports the missing citation."""
+    cited = {series.digitization_sha256 for series in envelope.series if isinstance(series.digitization_sha256, str)}
+    embedded = {digitization.digitization_sha256 for digitization in envelope.figure_digitizations}
+    missing = cited - embedded
+    if missing:
+        raise ValueError(
+            f"figure_digitizations is missing digitization(s) {sorted(missing)!r} cited by a DIGITIZED "
+            "series -- every cited digitization must be embedded"
+        )
+    decorative = embedded - cited
+    if decorative:
+        raise ValueError(
+            f"figure_digitizations embeds decorative digitization(s) {sorted(decorative)!r} that no series "
+            "cites -- an embedded record nothing needs is unearned provenance"
+        )
+
+
+def _validate_figure_digitizations_no_duplicate_sha256(envelope: DatasetEnvelope) -> None:
+    """FD2: ``figure_digitizations`` must not embed the same
+    ``digitization_sha256`` twice -- the same gap the table-inventory duplicate
+    guard closes, for the same reason: FD1 compares SETS and FD3's adjacent-pair
+    sort accepts two equal entries, so two envelopes with the same logical
+    content and different bytes would address differently."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for digitization in envelope.figure_digitizations:
+        if digitization.digitization_sha256 in seen:
+            duplicates.add(digitization.digitization_sha256)
+        seen.add(digitization.digitization_sha256)
+    if duplicates:
+        raise ValueError(
+            f"figure_digitizations embeds duplicate digitization_sha256(s) {sorted(duplicates)!r} -- each "
+            "cited digitization must be embedded exactly once"
+        )
+
+
+def _validate_figure_digitizations_sorted(envelope: DatasetEnvelope) -> None:
+    """FD3: ``figure_digitizations`` must be sorted ascending by
+    ``digitization_sha256``, so exactly one legal ordering -- and therefore
+    exactly one addressable representation -- exists. Same idiom as T5."""
+    expected = tuple(sorted(envelope.figure_digitizations, key=lambda digitization: digitization.digitization_sha256))
+    if envelope.figure_digitizations != expected:
+        raise ValueError("figure_digitizations must be sorted ascending by digitization_sha256")
+
+
 class DatasetEnvelope(BaseModel):
     """The top-level payload for one literature-extracted dataset: a source
     graph plus the extracted content that cites it.
@@ -6378,6 +6672,21 @@ class DatasetEnvelope(BaseModel):
     REQUIRES it: ``source_form=TABULAR`` demands a ``TABLE_CELL`` locator).
     Embedding on the condition-set side alone would leave this class as the
     bypass surface for the whole citation rule."""
+    figure_digitizations: tuple[EmbeddedFigureDigitization, ...]
+    """Every figure digitization cited (by :attr:`Series.digitization_sha256`)
+    by any ``DIGITIZED`` :class:`Series` in this envelope, embedded verbatim --
+    see :class:`EmbeddedFigureDigitization`, and V9/FD1/FD2/FD3 for the
+    invariants.
+
+    The figure lane's counterpart to :attr:`table_inventories`, and present
+    ONLY here, not on :class:`ConditionSetEnvelope`: a condition set carries no
+    :class:`Series`, so no digitized series can exist there to cite one. That is
+    the whole difference from the table lane, where a condition-set claim CAN
+    cite a table cell and so ``table_inventories`` must live on both. Embedded,
+    rather than resolvable only against an evidence store, for the same reason
+    every other embedded record here is: a citation the replaying machine cannot
+    resolve from the envelope's own bytes makes the envelope's meaning depend on
+    a directory that may have been pruned or never written."""
 
     @model_validator(mode="after")
     def _validate_conversion_tables_cover_cited_tables(self) -> DatasetEnvelope:
@@ -6657,6 +6966,34 @@ class DatasetEnvelope(BaseModel):
                     )
         return self
 
+    @model_validator(mode="after")
+    def _validate_series_digitization_citation(self) -> DatasetEnvelope:
+        """V9: see :func:`_validate_series_digitization_citation`. Declared
+        AFTER V1 (refs resolve) and V4 (source_form constrains value refs) so a
+        value ref that is not a FIGURE_CROP at all is reported by V4's precise
+        message, and before FD1 below so an envelope violating both reports the
+        missing citation, which is the actionable half."""
+        _validate_series_digitization_citation(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_figure_digitizations_cover_cited(self) -> DatasetEnvelope:
+        """FD1: see :func:`_validate_figure_digitizations_cover_cited`."""
+        _validate_figure_digitizations_cover_cited(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_figure_digitizations_no_duplicate_sha256(self) -> DatasetEnvelope:
+        """FD2: see :func:`_validate_figure_digitizations_no_duplicate_sha256`."""
+        _validate_figure_digitizations_no_duplicate_sha256(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_figure_digitizations_sorted(self) -> DatasetEnvelope:
+        """FD3: see :func:`_validate_figure_digitizations_sorted`."""
+        _validate_figure_digitizations_sorted(self)
+        return self
+
     def identity_payload(self) -> dict[str, Any]:
         """Project this envelope to its canonical-JSON identity payload.
 
@@ -6719,6 +7056,10 @@ class DatasetEnvelope(BaseModel):
             ],
             "table_inventories": [
                 _embedded_table_inventory_identity_payload(inventory) for inventory in self.table_inventories
+            ],
+            "figure_digitizations": [
+                _embedded_figure_digitization_identity_payload(digitization)
+                for digitization in self.figure_digitizations
             ],
         }
 

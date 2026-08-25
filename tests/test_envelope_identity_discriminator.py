@@ -64,12 +64,12 @@ class TestDiscriminatorIsProjected:
     def test_dataset_payload_carries_its_own_type_and_version(self) -> None:
         payload = _maximal_envelope().identity_payload()
         assert payload["envelope_type"] == "dataset"
-        assert payload["identity_payload_version"] == 2
+        assert payload["identity_payload_version"] == 3
 
     def test_condition_set_payload_carries_its_own_type_and_version(self) -> None:
         payload = _maximal_condition_set_envelope().identity_payload()
         assert payload["envelope_type"] == "condition_set"
-        assert payload["identity_payload_version"] == 2
+        assert payload["identity_payload_version"] == 3
 
 
 # --------------------------------------------------------------------------
@@ -160,8 +160,8 @@ class TestMissingOrUnsupportedDiscriminatorIsRefused:
     @pytest.mark.parametrize(("envelope_class", "build"), _PARSERS)
     def test_a_payload_with_an_unsupported_version_is_refused(self, envelope_class, build) -> None:
         payload = copy.deepcopy(build().identity_payload())
-        payload["identity_payload_version"] = 3
-        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 2"):
+        payload["identity_payload_version"] = 4
+        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 3"):
             envelope_class.from_identity_payload(payload)
 
     @pytest.mark.parametrize(("envelope_class", "build"), _PARSERS)
@@ -189,7 +189,7 @@ class TestMissingOrUnsupportedDiscriminatorIsRefused:
         for node in payload["source_graph"]["nodes"]:
             node.pop("crop_region", None)
 
-        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 2") as excinfo:
+        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 3") as excinfo:
             envelope_class.from_identity_payload(payload)
 
         message = str(excinfo.value)
@@ -211,7 +211,7 @@ class TestMissingOrUnsupportedDiscriminatorIsRefused:
         to refuse for an unrelated-sounding reason."""
         payload = copy.deepcopy(build().identity_payload())
         payload["identity_payload_version"] = True
-        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 2"):
+        with pytest.raises(DatasetEnvelopeParseError, match="supports exactly version 3"):
             envelope_class.from_identity_payload(payload)
 
 
@@ -243,6 +243,7 @@ class TestDatasetNodeOrderDoesNotAffectIdentity:
             # test varies node ORDER and nothing else, so every other field must be
             # the baseline's own.
             table_inventories=baseline.table_inventories,
+            figure_digitizations=baseline.figure_digitizations,
         )
 
         assert canonical_json_bytes(permuted.identity_payload()) == canonical_json_bytes(baseline.identity_payload()), (
