@@ -1203,15 +1203,21 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
                 f"refusals -- the docstring and the code have drifted apart"
             )
 
-    def test_the_class_does_not_anchor_its_dormancy_to_series(self) -> None:
-        """`Series` is a REQUIRED DatasetEnvelope field with min_length=1 and is projected into
-        the envelope's identity payload -- the most-cited type in this module. Calling this class
-        dormant "in exactly the way Series is" was false on the axis that was meant."""
+    def test_the_class_describes_its_live_citation_surface(self) -> None:
+        """The citation surface this class once called absent -- "Nothing cites one of these
+        today", no `figure_digitizations` field, wiring "blocked on FIGURE_CROP crop addressing"
+        -- was built and merged. The docstring now names it: the envelope field, the series
+        citation, and the validator that joins them. Pinned so the false-absence prose, and the
+        old dormancy framing, cannot drift back."""
         doc = EmbeddedFigureDigitization.__doc__
         assert doc is not None
         assert "DORMANT" not in doc
         assert "way :class:`Series`" not in doc
-        assert "Nothing cites one of these today" in doc
+        assert "Nothing cites one of these today" not in doc
+        assert "NOT AN ENVELOPE FIELD" not in doc
+        assert ":attr:`DatasetEnvelope.figure_digitizations`" in doc
+        assert ":attr:`Series.digitization_sha256`" in doc
+        assert "_validate_series_digitization_citation" in doc
 
     def test_series_really_is_a_required_envelope_field(self) -> None:
         """The fact that made the old sentence false, asserted rather than assumed."""
@@ -1220,7 +1226,8 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
 
     def test_the_four_producer_checks_are_named(self) -> None:
         """They span the record and the Series, so nothing in this class can perform them --
-        which is exactly why they have to be written down where a producer will look."""
+        which is why the docstring names them, now alongside the note that
+        `_validate_series_digitization_citation` (V9) enforces all four at envelope level."""
         doc = EmbeddedFigureDigitization.__doc__
         assert doc is not None
         for check in (

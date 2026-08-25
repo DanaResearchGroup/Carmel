@@ -4562,19 +4562,26 @@ class EmbeddedFigureDigitization(BaseModel):
     was recovered. See :mod:`carmel.services.figure_digitization_record` for what would have to
     be folded in to make it identify the digitization, and why none of it can be yet.
 
-    NOT AN ENVELOPE FIELD, deliberately. **Nothing cites one of these today.** There is no
-    ``figure_digitizations`` field on :class:`DatasetEnvelope`, no exact-cover validator, no
-    duplicate-``digitization_sha256`` guard, no sort rule, and no locator kind carrying a
-    ``digitization_sha256``. This class is defined, tested and referenced by no other type in
-    this file.
+    AN ENVELOPE FIELD, and cited. :attr:`DatasetEnvelope.figure_digitizations` embeds these
+    verbatim, and a ``DIGITIZED`` :class:`Series` names the record that recovered it through
+    :attr:`Series.digitization_sha256` -- the citation lives on the series, not on a locator,
+    because whether a digitization applies is a per-SERIES fact. Four envelope validators stand
+    behind that surface: :func:`_validate_series_digitization_citation` (V9) joins each series to
+    its record; :func:`_validate_figure_digitizations_cover_cited` (FD1) makes the embedded set
+    cover EXACTLY the cited addresses; :func:`_validate_figure_digitizations_no_duplicate_sha256`
+    (FD2) forbids a repeated ``digitization_sha256``; and
+    :func:`_validate_figure_digitizations_sorted` (FD3) fixes the order.
 
-    Wiring that up is blocked on ``FIGURE_CROP`` crop addressing, and the blocker is CORRECTNESS
-    rather than scheduling: until a crop node can say which figure of which page it is, an
-    envelope citing this record would resolve ``figure_crop_node_id`` to a node that cannot
-    identify its own subject, so the citation would be well-formed and unusable.
+    This wiring was once described here as blocked on ``FIGURE_CROP`` crop addressing -- the worry
+    being that an envelope citing this record would resolve ``figure_crop_node_id`` to a node that
+    could not identify its own subject. That blocker is discharged: V9 resolves
+    ``figure_crop_node_id`` to a node in the envelope's source graph, requires it to be of kind
+    ``FIGURE_CROP``, and requires ``figure_crop_sha256`` to match that node's ``sha256`` -- the
+    crop identifies its own subject, so the citation is usable.
 
-    Four checks that a PRODUCER will owe, and that nothing in this class can perform because they
-    span two objects that never meet inside it -- the record and the ``Series`` it describes:
+    Four checks span two objects that never meet inside this class -- the record and the ``Series``
+    it describes -- and so cannot be performed HERE. **All four are now enforced at envelope level
+    by** :func:`_validate_series_digitization_citation` **(V9); a producer owes NONE of them:**
 
     - ``record.series_id == series.series_id`` -- the record is about THAT series.
     - ``record.recovered == len(series.points)`` -- the count the census balances against (D9) is
@@ -4584,9 +4591,13 @@ class EmbeddedFigureDigitization(BaseModel):
     - ``record.figure_crop_sha256`` equals that node's ``sha256`` -- the two halves of the crop's
       identity agree, so the record names one crop rather than one crop's id and another's bytes.
 
-    What those limits leave is still the thing this ticket needed: partialness that the stored
-    evidence STATES and cannot state incoherently, rather than partialness a reader infers from
-    a number that looks the same either way.
+    V9 adds two joins beyond those four: every digitized point's value ref must target the SAME
+    crop the record names, and ``record.raw_sha256`` must equal the crop's ROOT artifact's
+    ``sha256`` rather than an intermediate one. What none of this reaches is whether the recovered
+    coordinates are TRUE -- nothing here re-derives markers from the crop's pixels (see the
+    "Weaker than it looks" paragraph above). What it leaves is the thing this ticket needed:
+    partialness that the stored evidence STATES and cannot state incoherently, rather than
+    partialness a reader infers from a number that looks the same either way.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
