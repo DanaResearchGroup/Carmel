@@ -212,6 +212,7 @@ from typing import NamedTuple
 
 from carmel.agents.tools.extract import ExtractedText
 from carmel.schemas.datasets import (
+    AbsenceReason,
     Absent,
     CharSpanLocator,
     ConditionSetEnvelope,
@@ -220,12 +221,16 @@ from carmel.schemas.datasets import (
     EmbeddedTableInventory,
     MeasuredValue,
     RootSidecarVerification,
+    Series,
+    SourceForm,
     SourceNode,
+    SourceNodeKind,
     SourceRef,
     TableCellLocator,
     Uncertainty,
     UncertaintyKind,
     UnresolvedSubject,
+    _iter_series_point_value_refs,
     iter_measured_values,
     iter_source_refs,
     iter_uncertainties,
@@ -243,6 +248,11 @@ from carmel.services.extraction_record import (
     ExtractionRecordError,
     extraction_record_dir,
     load_extraction_record,
+)
+from carmel.services.figure_digitization_record import (
+    UNREADABLE_PAYLOAD,
+    FigureDigitization,
+    compute_digitization_sha,
 )
 from carmel.services.numeric import (
     NUMERAL_CANDIDATE_RE,
@@ -3041,17 +3051,542 @@ def _verify_cited_cell_texts(
     return _CellTextVerification(checked=checked, findings=tuple(findings))
 
 
+def _claims_digitized(source_form: object) -> bool:
+    """Whether ``source_form`` claims to be DIGITIZED, by the SAME value-equality test the schema
+    uses -- deliberately ``==``, never ``is``.
+
+    ``SourceForm`` is a ``StrEnum``, so a member equals its own string value, and the schema decides
+    a series IS digitized with ``==`` (:func:`~carmel.schemas.datasets._check_source_form_for_ref`,
+    which then constrains that series' value refs). A series reaching replay through
+    ``model_construct`` -- the case this whole service exists for -- can carry the plain string
+    ``"digitized"`` in ``source_form``, and to validation that object IS digitized. Comparing with
+    ``is`` here would disagree: identity fails for a plain string, so the figure lane would wave the
+    series past both its citation re-derivation AND the attestation claim that keeps a figure-bearing
+    envelope off a VERIFIED verdict -- a lie about where a number came from rewarded with a stronger
+    verdict than the truth. ``==`` fails closed: a value the schema treats as digitized is treated as
+    digitized here too, verified and attested like any other.
+
+    The ``is``-then-value split IS the module's idiom for :class:`ReplayOutcome` (see
+    :meth:`ReplayFinding.__post_init__`) -- but it is safe there ONLY because a construction-time
+    ``isinstance`` guard refuses a non-member before any ``is`` runs. ``source_form`` on a
+    ``model_construct`` envelope passed no such guard, so the comparison itself has to carry the
+    weight, and value equality is the test that does.
+    """
+    return source_form == SourceForm.DIGITIZED
+
+
+def _verify_figure_digitizations(
+    envelope: DatasetEnvelope,
+    raw_bytes_by_sha: Mapping[str, bytes],
+) -> list[ReplayFinding]:
+    """Re-derive at replay every join the figure validators assert at construction.
+
+    The figure lane's counterpart to :func:`_verify_embedded_inventories` and
+    :func:`_verify_cited_cell_texts` together, and it exists for the same reason: an
+    envelope reaching replay by a route that skipped model validation (``model_construct``,
+    an in-memory object handed straight here) carries figure citations that FD1-FD3, V9 and
+    :class:`EmbeddedFigureDigitization`'s own T1 fired on only at construction. Replay repeats
+    them from the envelope's own material -- the embedded record's canonical bytes are re-hashed
+    (never trusted), the record is reconstructed by :meth:`FigureDigitization.from_payload`
+    (never read off the object's accessors, which would re-run that same T1 and merely RAISE),
+    and V9's series-record-crop joins are re-walked over the source graph.
+
+    Emits :class:`ReplayFinding`\\ s ONLY, and DELIBERATELY no ``checked`` count. Nothing in
+    this codebase re-derives markers from a crop's pixels, so a figure check that passed would
+    be attesting that a citation is coherent, never that a measurement reproduced -- letting it
+    increment a "how much was checked" counter would let a replay whose only evidence is a figure
+    read VERIFIED, the one outcome this design rules out. A passing figure join therefore adds
+    nothing to any count and appears in the report only as the ABSENCE of a finding; what it
+    cannot establish is stated on the semantic axis by :func:`_figure_semantic_claims`.
+
+    Two failure vocabularies, drawn on the module's own line (see :class:`ReplayOutcome`):
+    FAILED where a check RAN and disagreed (a record that does not live at its address, a
+    citation the envelope's own cover does not honour, a V9 join that does not hold), and
+    UNVERIFIABLE where a check could not run (canonical_json that will not parse, or a document
+    whose hash-verified raw bytes are not in hand -- reported explicitly, never a silent pass,
+    exactly as :func:`_verify_embedded_inventories` reports its missing-bytes branch). Every
+    source-graph lookup is guarded so a corrupted-in-memory envelope degrades to an UNVERIFIABLE
+    finding rather than an escaping crash.
+    """
+    findings: list[ReplayFinding] = []
+    graph = envelope.source_graph
+    node_ids = graph.node_ids
+    embedded_shas = {digitization.digitization_sha256 for digitization in envelope.figure_digitizations}
+    records_by_sha: dict[str, FigureDigitization] = {}
+
+    # Pass 1: re-derive each embedded record from its OWN bytes -- address, reconstruction,
+    # document digest, and hash-verified bytes in hand. Iterates the embedded collection
+    # (unique by digitization_sha256), so one re-derivation per record, never one per citing
+    # series.
+    for digitization in envelope.figure_digitizations:
+        ref_path = f"figure_digitizations[{digitization.digitization_sha256!r}]"
+        # The embedded payload already parsed and self-cohered through T1 when the envelope
+        # validated -- but this replay exists for the envelope that never validated, so nothing
+        # here trusts that. json.loads is guarded so a payload that will not parse degrades to
+        # UNVERIFIABLE rather than an escaping crash.
+        try:
+            payload = json.loads(digitization.canonical_json)
+        except (json.JSONDecodeError, RecursionError, TypeError) as exc:
+            # TypeError is the model_construct case the JSONDecodeError/RecursionError pair missed: a
+            # canonical_json of None (or any non-str/bytes) raises TypeError from json.loads, which
+            # must degrade to a finding, not escape as a traceback -- exactly the policy the
+            # reconstruction site fifteen lines below already holds for compute_digitization_sha.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"embedded figure digitization {digitization.digitization_sha256!r} canonical_json "
+                    f"does not parse, so its record could not be re-derived: {exc!r}",
+                )
+            )
+            continue
+        # Recomputed from the payload, which re-canonicalizes and re-hashes -- so this cannot be
+        # satisfied by a non-canonical rendering carrying an honestly computed address, and it
+        # subsumes T1's canonical-rendering check without a second idea of what canonical means.
+        try:
+            recomputed = compute_digitization_sha(payload)
+        except (RecursionError, TypeError, ValueError, OverflowError) as exc:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"embedded figure digitization {digitization.digitization_sha256!r} canonical_json "
+                    f"could not be re-canonicalized to recompute its address, so it could not be re-checked: "
+                    f"{exc!r}",
+                )
+            )
+            continue
+        if recomputed != digitization.digitization_sha256:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=ref_path,
+                    reason=f"figure digitization canonical_json's bytes hash to {recomputed!r}, so this record "
+                    f"does not live at the address {digitization.digitization_sha256!r} it claims",
+                    expected=digitization.digitization_sha256,
+                    actual=recomputed,
+                )
+            )
+            continue
+        # The record is reconstructed by from_payload, which re-runs D0-D9 -- so a payload
+        # claiming complete coverage while carrying an omission, or one whose census does not
+        # balance against its recovered count, is refused HERE, on the bytes. Asked of the record
+        # module so the replayer carries no second idea of what a coherent digitization is.
+        try:
+            record = FigureDigitization.from_payload(payload)
+        except UNREADABLE_PAYLOAD as exc:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=ref_path,
+                    reason=f"figure digitization {digitization.digitization_sha256!r} does not reconstruct, so "
+                    f"its coverage claim is not one anything could act on: {exc!r}",
+                )
+            )
+            continue
+        if record.raw_sha256 != digitization.raw_sha256:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=ref_path,
+                    reason=f"figure digitization {digitization.digitization_sha256!r} record names document "
+                    f"{record.raw_sha256!r}, not the declared raw_sha256 {digitization.raw_sha256!r} an "
+                    f"envelope-level join would trust",
+                    expected=digitization.raw_sha256,
+                    actual=record.raw_sha256,
+                )
+            )
+            continue
+        if digitization.raw_sha256 not in raw_bytes_by_sha:
+            # No re-derivation of the crop's pixels is possible or attempted; what is required is
+            # that the document the record chains to is one whose bytes the replay loop actually
+            # hash-verified. Its absence (raw.bin missing or tampered -- reported against the node)
+            # is an inability to reach the chain's root, UNVERIFIABLE and never a silent pass.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"figure digitization {digitization.digitization_sha256!r} names document "
+                    f"{digitization.raw_sha256!r}, but no hash-verified raw bytes for that document are in "
+                    "hand (its raw.bin is missing or tampered -- reported against the node), so the chain to "
+                    "the crop's root document could not be confirmed",
+                )
+            )
+            # Not a `continue`: the series-record-crop joins below need no bytes and are still
+            # worth re-deriving, so the record is registered even when its root bytes are absent.
+        records_by_sha[digitization.digitization_sha256] = record
+
+    # Pass 2: re-walk V9's series-record-crop joins and the exact-cover rule (FD1). Runs over the
+    # envelope's own series, so a citation that resolves to no embedded record and a record no
+    # series cites are each caught here -- the two directions of the cover FD1 asserts.
+    #
+    # Deliberately NOT re-derived here, and left to the schema: FD2 (no two embedded records share a
+    # digitization_sha256, _validate_figure_digitizations_no_duplicate_sha256) and FD3 (the embedded
+    # records are stored in sorted address order, _validate_figure_digitizations_sorted). Both are
+    # canonical-form rules about the embedded collection's SHAPE, not about whether a citation is
+    # TRUE -- a duplicate or an out-of-order record cannot make a coherent citation resolve to the
+    # wrong bytes (the address is content-derived and re-hashed in Pass 1). Replaying them would add
+    # no falsification a corrupted-in-memory envelope could fail that the joins above do not already
+    # catch, so their absence from replay is a decision on the record, not a gap in coverage.
+    cited: set[str] = set()
+    for index, series in enumerate(envelope.series):
+        series_path = f"series[{index}]"
+        if not _claims_digitized(series.source_form):
+            # V9's OTHER branch (_validate_series_digitization_citation, datasets.py:6471-6484), the
+            # one the DIGITIZED path above is the mirror of: a series that is NOT digitized must cite
+            # no figure record at all, and if its citation is Absent that absence must read
+            # NOT_APPLICABLE. Replay re-derives both halves here so a series lying AWAY from
+            # DIGITIZED -- keeping a non-digitized source_form while pointing at a figure record --
+            # is examined at all; without this the figure lane iterates only the series that CLAIM
+            # to be digitized, so such a series is looked at by no check on any axis and launders a
+            # VERIFIED verdict for numbers that name the plotted curve they came from. FAILED, not
+            # UNVERIFIABLE: source_form and the citation are both in hand, so the check RUNS and
+            # DEMONSTRATES a disagreement with an invariant the schema states -- the module's own
+            # line for FAILED (a claim the envelope's own cover does not honour), never the
+            # could-not-run case UNVERIFIABLE is reserved for.
+            findings.extend(_verify_non_digitized_series_cites_nothing(series, series_path))
+            continue
+        citation = series.digitization_sha256
+        if not isinstance(citation, str):
+            # A DIGITIZED series citing nothing is exactly the hole the figure lane was built to
+            # close; V9 forbids it, and a model_construct envelope can still carry it. The record
+            # it should have named is absent, so the joins below could not run.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=series_path,
+                    reason=f"series {series.series_id!r} is DIGITIZED but cites no figure digitization, so its "
+                    "record could not be re-checked",
+                )
+            )
+            continue
+        cited.add(citation)
+        cited_record = records_by_sha.get(citation)
+        if cited_record is None:
+            if citation not in embedded_shas:
+                findings.append(
+                    ReplayFinding(
+                        category=ReplayOutcome.FAILED,
+                        ref_path=series_path,
+                        reason=f"series {series.series_id!r} cites figure digitization {citation!r}, which this "
+                        "envelope does not embed -- a citation resolvable only against an evidence store makes "
+                        "the envelope's meaning depend on the machine replaying it",
+                    )
+                )
+            # else: the record IS embedded but failed its own re-derivation above (address,
+            # reconstruction, document digest); that finding already speaks, so no second one here.
+            continue
+        findings.extend(_verify_series_digitization_joins(series, series_path, citation, cited_record, graph, node_ids))
+
+    for digitization in envelope.figure_digitizations:
+        if digitization.digitization_sha256 not in cited:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=f"figure_digitizations[{digitization.digitization_sha256!r}]",
+                    reason=f"figure digitization {digitization.digitization_sha256!r} is embedded but no DIGITIZED "
+                    "series cites it -- the embedded set must cover EXACTLY the cited addresses, and a record "
+                    "nothing cites is decorative provenance no series's partialness rests on",
+                )
+            )
+    return findings
+
+
+def _verify_non_digitized_series_cites_nothing(series: Series, series_path: str) -> list[ReplayFinding]:
+    """Re-derive V9's non-DIGITIZED branch for one series that does NOT claim to be digitized.
+
+    The counterpart to :func:`_verify_series_digitization_joins`, and V9's own two-part rule for a
+    series whose ``source_form`` is anything but ``DIGITIZED``
+    (:func:`~carmel.schemas.datasets._validate_series_digitization_citation`, datasets.py:6471-6484):
+
+    * it must cite NO figure digitization -- ``digitization_sha256`` must be ``Absent``; a present
+      citation is one only a digitized series may carry, and a non-digitized series pointing at a
+      figure record is claiming its numbers came off a plotted curve while labelling them as
+      something else;
+    * and if that citation is ``Absent``, the absence must read ``NOT_APPLICABLE`` -- the only true
+      reason a series that was never digitized has no digitization, as opposed to one that borrows a
+      reason (``NOT_REPORTED_HERE``, ``UNRESOLVED``) recording a gap the form does not have.
+
+    Both disagreements are ``FAILED``: the series' ``source_form`` and its citation are both in hand,
+    so each check RUNS and DEMONSTRATES a violation of an invariant the schema states -- never the
+    could-not-run case ``UNVERIFIABLE`` is reserved for. ``series_path`` names the offending series;
+    the reason carries its ``series_id`` so a report reader sees which series lied.
+
+    A non-``Absent``, non-``str`` citation (a ``model_construct`` envelope carries whatever it was
+    handed) is still a citation the series must not have, so it too fails the first check -- the test
+    is "is the citation truly absent", not "is it a well-formed digest".
+    """
+    citation = series.digitization_sha256
+    if not isinstance(citation, Absent):
+        return [
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=series_path,
+                reason=f"series {series.series_id!r} has source_form={series.source_form!r} but cites figure "
+                f"digitization {citation!r} -- only a DIGITIZED series may cite one, so a non-digitized series "
+                "pointing at a figure record claims its numbers came off a plotted curve while labelling them "
+                "otherwise",
+            )
+        ]
+    if citation.reason is not AbsenceReason.NOT_APPLICABLE:
+        return [
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=series_path,
+                reason=f"series {series.series_id!r} has source_form={series.source_form!r} and an Absent "
+                f"digitization_sha256 whose reason is {citation.reason.value!r} -- the only true absence for a "
+                f"series that was not digitized is {AbsenceReason.NOT_APPLICABLE.value!r}",
+            )
+        ]
+    return []
+
+
+def _verify_series_digitization_joins(
+    series: Series,
+    series_path: str,
+    citation: str,
+    record: FigureDigitization,
+    graph: object,
+    node_ids: AbstractSet[str],
+) -> list[ReplayFinding]:
+    """Re-derive V9's six series-record-crop joins for one DIGITIZED ``series``.
+
+    Split out of :func:`_verify_figure_digitizations` so the per-series joins read as one unit:
+    the record is about THIS series (``series_id``), the count its census balances against is the
+    count the series has (``recovered``), the crop it names resolves to a ``FIGURE_CROP`` node
+    whose ``sha256`` matches, every point grounds in that ONE crop, and the record's document
+    digest reaches the crop's ROOT artifact. Each disagreement is a FAILED finding; a crop lookup
+    that cannot be walked at all is UNVERIFIABLE. ``graph`` is a
+    :class:`~carmel.schemas.datasets.SourceGraph`, typed loosely only so this module need not
+    import it solely to annotate a re-walk of V9's own logic.
+    """
+    findings: list[ReplayFinding] = []
+    if record.series_id != series.series_id:
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=series_path,
+                reason=f"series {series.series_id!r} cites figure digitization {citation!r}, whose record is "
+                f"about series {record.series_id!r} -- a digitization must name the series it recovered",
+                expected=series.series_id,
+                actual=record.series_id,
+            )
+        )
+    if record.recovered != len(series.points):
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=series_path,
+                reason=f"series {series.series_id!r} cites figure digitization {citation!r}, whose record "
+                f"recovered {record.recovered} marker(s), but the series has {len(series.points)} point(s) -- "
+                "the count the record's census balances against must be the count the series actually has",
+                expected=str(len(series.points)),
+                actual=str(record.recovered),
+            )
+        )
+    if record.figure_crop_node_id not in node_ids:
+        findings.append(
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=series_path,
+                reason=f"series {series.series_id!r} cites figure digitization {citation!r}, whose record names "
+                f"figure_crop_node_id={record.figure_crop_node_id!r}, which is not the id of any node in this "
+                "envelope's source graph -- a digitization must name a crop this envelope actually carries",
+            )
+        )
+    else:
+        # ``node()`` scans the same ``nodes`` tuple ``node_ids`` is derived from, so membership
+        # here guarantees it returns -- no try/except, because there is no reachable state where
+        # the id is in ``node_ids`` and ``node()`` still raises.
+        crop_node = graph.node(record.figure_crop_node_id)  # type: ignore[attr-defined]
+        if crop_node.kind is not SourceNodeKind.FIGURE_CROP:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=series_path,
+                    reason=f"series {series.series_id!r} cites figure digitization {citation!r}, whose "
+                    f"figure_crop_node_id {record.figure_crop_node_id!r} resolves to a "
+                    f"{crop_node.kind.value!r} node, not a FIGURE_CROP -- a digitization is read off a "
+                    "figure crop and off nothing else",
+                )
+            )
+        elif crop_node.sha256 != record.figure_crop_sha256:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=series_path,
+                    reason=f"series {series.series_id!r} cites figure digitization {citation!r}, whose record "
+                    f"names figure_crop_sha256={record.figure_crop_sha256!r}, but crop node "
+                    f"{record.figure_crop_node_id!r} has sha256={crop_node.sha256!r} -- the two halves of "
+                    "the crop's identity must agree",
+                    expected=record.figure_crop_sha256,
+                    actual=crop_node.sha256,
+                )
+            )
+    # The same-crop join: every digitized point grounds in the ONE crop the record names. Uses
+    # V9's own scope (_iter_series_point_value_refs) so it cannot drift from what V9 checks, and
+    # reports the FIRST offending ref rather than one finding per point, exactly as V9 raises on
+    # the first.
+    for where, ref in _iter_series_point_value_refs(series):
+        if ref.node_id != record.figure_crop_node_id:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=series_path,
+                    reason=f"series {series.series_id!r} cites figure digitization {citation!r} over crop "
+                    f"{record.figure_crop_node_id!r}, but {where} grounds in crop {ref.node_id!r} -- a series "
+                    "assembled from two different crops is not one digitization",
+                )
+            )
+            break
+    # Root bytes: the record's document digest must reach the crop's ROOT artifact, not stop at an
+    # intermediate derived one. Re-walks V9's ancestry join; a graph that cannot be walked is
+    # UNVERIFIABLE rather than a crash.
+    if record.figure_crop_node_id in node_ids:
+        try:
+            ancestors = graph.ancestors(record.figure_crop_node_id)  # type: ignore[attr-defined]
+            root_node = ancestors[-1] if ancestors else graph.node(record.figure_crop_node_id)  # type: ignore[attr-defined]
+        except (KeyError, ValueError) as exc:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=series_path,
+                    reason=f"series {series.series_id!r} cites figure digitization {citation!r}, but the crop's "
+                    f"ancestry could not be walked, so the record's document digest could not be checked against "
+                    f"the crop's root: {exc!r}",
+                )
+            )
+        else:
+            if record.raw_sha256 != root_node.sha256:
+                findings.append(
+                    ReplayFinding(
+                        category=ReplayOutcome.FAILED,
+                        ref_path=series_path,
+                        reason=f"series {series.series_id!r} cites figure digitization {citation!r}, whose record "
+                        f"was derived from document raw_sha256={record.raw_sha256!r}, but crop "
+                        f"{record.figure_crop_node_id!r} descends from root artifact {root_node.node_id!r} with "
+                        f"sha256={root_node.sha256!r} -- the record's document digest must reach the crop's root "
+                        "bytes rather than stopping at an intermediate artifact",
+                        expected=root_node.sha256,
+                        actual=record.raw_sha256,
+                    )
+                )
+    return findings
+
+
+def _series_value_ref_paths(index: int, series: Series) -> tuple[str, ...]:
+    """Positional ref paths for the point values a digitized ``series`` grounds -- the addresses a
+    consumer follows back to the SPECIFIC coordinate/observation whose support went unchecked.
+
+    Mirrors :func:`~carmel.schemas.datasets._iter_series_point_value_refs` (every coordinate, then
+    each present observation, per point, in order -- an absent observation offered no ref) but emits
+    the addressable path the rest of replay uses for an envelope location (compare
+    :func:`_dataset_uncertainty_sites`), NOT the crop NODE id the first cut of this claim used -- a
+    crop id cannot say WHICH value it supported -- nor that function's ``where`` prose, which reads
+    for a human and no consumer can parse back to a location. A ``value_ref`` is the same slot V9's
+    same-crop join walks, so the support named here is exactly the support whose location the figure
+    lane re-derived.
+    """
+    paths: list[str] = []
+    for point_index, point in enumerate(series.points):
+        base = f"series[{index}].points[{point_index}]"
+        for coord_index in range(len(point.coordinates)):
+            paths.append(f"{base}.coordinates[{coord_index}].value.value_ref")
+        for obs_index, observation in enumerate(point.observations):
+            if isinstance(observation.value, Absent):
+                continue
+            paths.append(f"{base}.observations[{obs_index}].value.value_ref")
+    return tuple(paths)
+
+
+def _figure_semantic_claims(envelope: DatasetEnvelope) -> tuple[UncheckedSemanticClaim, ...]:
+    """Two :class:`UncheckedSemanticClaim`\\ s per DIGITIZED series: the two DISTINCT ceilings a
+    coherent figure citation cannot pass, each machine-visible at its own ``claim_path``.
+
+    :func:`_verify_figure_digitizations` re-derives that a digitization is stored UNALTERED and
+    joined to its series and crop. It establishes NOTHING about two SEPARATE things, and folding
+    both into one bucket plus a sentence is exactly the human-only-sortable prose this lane refuses
+    everywhere else. So they are filed as two claims a consumer can tell apart by ``claim_path`` --
+    a structured coordinate, not a phrase to grep:
+
+    * a MEASUREMENT gap, at ``series[i]``: nothing in this repository re-derives markers from a
+      crop's pixels, so whether the recovered coordinates are TRUE is an operator attestation. Its
+      support is the point value refs whose LOCATION (never meaning) the lane checked, addressed
+      positionally by :func:`_series_value_ref_paths`.
+    * a PROVENANCE gap, at ``series[i].digitization_sha256``: the crop's OWN region within its parent
+      image is never re-derived -- there is no renderer here, on purpose -- so that the crop's pixels
+      were cut from the region it names is an attestation too. Its support is the embedded record
+      carrying the crop identity, reached through the citation.
+
+    Both are on the same semantic axis the condition-set attribution claim uses (see
+    :func:`_condition_set_semantic_claims`): grounding proves LOCATION, never MEANING. Each gap is
+    :attr:`SemanticGap.LOCATION_UNRESOLVED` where support was offered -- and deliberately not the
+    softer ``SUPPORT_UNRECORDED``: a digitized point's support is a ``BBoxLocator`` over a pixel
+    region, never a :class:`~carmel.schemas.datasets.CharSpanLocator`, so its span cannot be
+    re-sliced at all, STRICTLY LESS than a located text span whose meaning merely went unrecorded --
+    and :attr:`SemanticGap.NO_SUPPORT_OFFERED` where none was: a series (through ``model_construct``)
+    with no point ref offers nothing for the measurement gap, and one citing no digitization offers
+    no crop for the provenance gap. Distinguishing the two keeps an empty ``support_paths`` off a
+    claim whose gap says support WAS offered, which the claim refuses. ``claim`` is the
+    digitization's content address (or, absent a citation, the series id), carrying no word of the
+    paper, so it never reaches the redaction gate the source text does.
+
+    The selector is :func:`_claims_digitized`, deliberately value-equality: a ``model_construct``
+    series carrying the plain string ``"digitized"`` is digitized to the schema, so it earns these
+    ceilings here rather than skipping them on an identity miss.
+    """
+    claims: list[UncheckedSemanticClaim] = []
+    for index, series in enumerate(envelope.series):
+        if not _claims_digitized(series.source_form):
+            continue
+        citation = series.digitization_sha256
+        claim = citation if isinstance(citation, str) else f"digitized series {series.series_id!r}"
+
+        measurement_support = _series_value_ref_paths(index, series)
+        claims.append(
+            UncheckedSemanticClaim(
+                claim_path=f"series[{index}]",
+                claim=claim,
+                gap=SemanticGap.LOCATION_UNRESOLVED if measurement_support else SemanticGap.NO_SUPPORT_OFFERED,
+                reason=f"series {series.series_id!r} was digitized from a figure crop; replay re-derives that its "
+                "digitization citation is coherent and chains to the document's raw bytes, but nothing re-derives "
+                "markers from the crop's pixels, so whether the recovered coordinates are true is an operator "
+                "attestation replay structurally cannot test",
+                support_paths=measurement_support,
+            )
+        )
+
+        provenance_support = (f"figure_digitizations[{citation!r}]",) if isinstance(citation, str) else ()
+        claims.append(
+            UncheckedSemanticClaim(
+                claim_path=f"series[{index}].digitization_sha256",
+                claim=claim,
+                gap=SemanticGap.LOCATION_UNRESOLVED if provenance_support else SemanticGap.NO_SUPPORT_OFFERED,
+                reason=f"series {series.series_id!r} cites a figure crop; replay re-derives that the crop's stored "
+                "bytes and its citation cohere, but the crop's OWN region within its parent image is never "
+                "re-derived -- there is no renderer here to confirm the crop's pixels were cut from the region it "
+                "names, so the crop's provenance within the document is an operator attestation replay structurally "
+                "cannot test",
+                support_paths=provenance_support,
+            )
+        )
+    return tuple(claims)
+
+
 def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_text: bool = False) -> ReplayReport:
     """Independently re-verify an already-loaded ``envelope`` OBJECT against
     the evidence store rooted at ``workspace_root``.
 
-    Combines all four checks this module performs (evidence identity,
-    every character span, every measured unit's normalization against its
-    recorded table, and every measured unit's boundary/admission against
-    its recorded locator and recorded table) into one :class:`ReplayReport`.
-    Never trusts anything the envelope
-    itself carries as pre-verified -- every fact is re-derived from the
-    evidence store or from the hand-reviewed
+    Combines every check this module performs into one :class:`ReplayReport`:
+    evidence identity; every character span; every measured unit's
+    normalization, boundary and admission against its recorded locator and
+    recorded table; every embedded table inventory's grid re-derived from the
+    document's bytes and every cited cell's text; and every figure
+    digitization's citation joins re-derived from the envelope
+    (:func:`_verify_figure_digitizations`), with the limit a coherent
+    digitization cannot pass stated on the semantic axis. Never trusts anything
+    the envelope itself carries as pre-verified -- every fact is re-derived from
+    the evidence store or from the hand-reviewed
     :data:`~carmel.services.units.TABLES_BY_SHA` registry.
 
     This proves "the envelope OBJECT handed to this call verifies against
@@ -3133,7 +3668,10 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # consumer could see and none would expect (Codex round 89).
     uncertainty_sites = _dataset_uncertainty_sites(envelope)
     uncertainty_reconciliation = _reconcile_uncertainty_sites(envelope, {path for path, _ in uncertainty_sites})
-    semantic_claims = _derived_value_claims(envelope, uncertainty_sites)
+    # The figure lane's claim about MEANING that replay structurally cannot test -- one per
+    # DIGITIZED series, folded onto the SAME semantic axis as the derived-value claims, so a
+    # digitized envelope's overall_outcome is UNVERIFIABLE by design and never launders VERIFIED.
+    semantic_claims = _derived_value_claims(envelope, uncertainty_sites) + _figure_semantic_claims(envelope)
 
     # The table lane, made to mean something: every embedded inventory's grid
     # re-derived from the document's own bytes (T-cell replay), and every
@@ -3141,6 +3679,12 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
     inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
     cell_verification = _verify_cited_cell_texts(_dataset_text_pairings(envelope), embedded_by_sha)
+
+    # The figure lane, re-derived: every embedded digitization's address re-hashed, its record
+    # reconstructed, and V9's series-record-crop joins re-walked from the envelope. Findings only,
+    # NO ``checked`` count -- a coherent figure citation is not a reproduced measurement, so it
+    # must never let a figure-only replay read VERIFIED (see the function's docstring).
+    figure_findings = _verify_figure_digitizations(envelope, raw_bytes_by_sha)
 
     all_findings = (
         tuple(span_findings)
@@ -3150,6 +3694,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         + uncertainty_reconciliation
         + tuple(inventory_findings)
         + cell_verification.findings
+        + tuple(figure_findings)
     )
 
     # A replay that verified NOTHING must never report VERIFIED: that would
