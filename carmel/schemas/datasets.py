@@ -4559,8 +4559,26 @@ class EmbeddedFigureDigitization(BaseModel):
     so two different digitizations of one figure agreeing on series id, crop, region, coverage,
     census and ledger share an address while holding different points. Two citations at one
     address mean two producers said the same thing about coverage; they never mean the same data
-    was recovered. See :mod:`carmel.services.figure_digitization_record` for what would have to
-    be folded in to make it identify the digitization, and why none of it can be yet.
+    was recovered. That collision is the citation surface's, on purpose: telling two such
+    digitizations apart is what
+    :func:`~carmel.services.figure_digitization_record.compute_digitization_identity` folds the
+    recovered points, the calibration and the producer in to do, and it is a separate address that
+    nothing embeds here.
+
+    THE CROP'S REGION IS NOT VERIFIED, AND WILL NOT BE. A ``FIGURE_CROP`` node carries a required
+    ``crop_region`` and its bytes are addressed by hash; replay confirms the crop's bytes hash to
+    what the node claims. NOTHING confirms those bytes ARE that region -- or even that page -- of
+    the document. A crop cut from the wrong part of the page, or the wrong page entirely, is
+    hash-verified and wrong, and every figure claim resting on it reads as fully grounded. Proving
+    otherwise needs a PDF renderer this repository does not have and is not getting; the check is
+    ruled out of scope, so this is a knowingly accepted hole, not an oversight.
+
+    BOTH UNVERIFIABLE FACTS STACK, and a reader who learns only one will still over-trust the
+    claim. Neither the crop's region nor the coordinates recovered from it is independently
+    checkable here: the region because nothing renders the page to confirm it, the coordinates
+    because nothing re-derives markers from the pixels (see "Weaker than it looks" above). Attested
+    points read off a crop of the wrong region, and hash-verified points read off the right region
+    but never checked against the image, each reads as grounded and neither is.
 
     AN ENVELOPE FIELD, and cited. :attr:`DatasetEnvelope.figure_digitizations` embeds these
     verbatim, and a ``DIGITIZED`` :class:`Series` names the record that recovered it through

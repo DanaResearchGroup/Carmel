@@ -1238,6 +1238,20 @@ class TestTheDocstringSaysWhatIsActuallyTrue:
         ):
             assert check in doc, f"the producer check {check!r} is documented nowhere"
 
+    def test_the_unverified_crop_region_limit_is_stated_at_the_claim_surface(self) -> None:
+        """Half 2: the crop-region hole is a knowingly accepted limit, stated where a reader of a
+        figure claim meets it -- the class that carries the claim, not only a module docstring.
+
+        Pinned so a later change that starts implying the crop region is verified fails here: the
+        blunt statement, and the fact that it STACKS with the unverifiability of the recovered
+        points, must both survive at this surface. A comment nothing enforces drifts out within
+        two tickets."""
+        doc = EmbeddedFigureDigitization.__doc__
+        assert doc is not None
+        assert "THE CROP'S REGION IS NOT VERIFIED" in doc
+        assert "BOTH UNVERIFIABLE FACTS STACK" in doc
+        assert "renderer this repository does not have" in doc
+
 
 #: Test-name tokens that quantify over a space rather than describe one case.
 #:
