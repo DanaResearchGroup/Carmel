@@ -80,7 +80,17 @@ __all__ = [
 #: before the bump, no version-1 record exists in any workspace store, so a v1 verifier
 #: would be untested code guarding an empty set -- and the new identity is not weakened to
 #: preserve old behaviour.
-INVENTORY_PAYLOAD_VERSION = 2
+#:
+#: **Version 3** gives a member-specific refusal a structured identity: a refusal's entry now
+#: carries ``member_digests``, the sorted fragment digests of the offending members, beside
+#: ``reason`` and ``detail``. Version 2 stored only ``reason`` (compared) and ``detail``
+#: (prose, stripped before comparison), so two refusals over DIFFERENT offending glyphs were
+#: indistinguishable to replay and a stored refusal reproduced even when the glyph that caused
+#: it had changed. The digests are compared, closing that hole the same way a successful cell's
+#: members are pinned. Same reasoning as the version-2 bump: no version-2 record exists in any
+#: workspace store, so old records are refused as ``PAYLOAD_UNREADABLE`` rather than read by an
+#: untested compatibility path.
+INVENTORY_PAYLOAD_VERSION = 3
 
 #: The names whose within-module closure defines "the derivation this record came from".
 #:
@@ -318,7 +328,9 @@ def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> di
     There IS a diagnostics half, and it has exactly one member: a refusal's ``detail``.
     :func:`_comparable` strips it from every refusal entry before comparison, so the prose is
     STORED but not COMPARED, and rewording it cannot invalidate a stored record. Every other
-    field here is identity.
+    field here is identity -- including a refusal's ``member_digests``, the structured
+    identity of the fragments a member-specific refusal is about, which IS compared so that a
+    refusal reproduces only when the same offending glyphs are present.
 
     The general worry that split raises is real -- an excluded field is a field the verifier
     does not check, which is a place for a wrong value to live unnoticed -- and ``detail`` is
@@ -386,7 +398,19 @@ def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> di
         "payload_version": INVENTORY_PAYLOAD_VERSION,
         "pypdf_version": inventory.pypdf_version,
         "raw_sha256": raw_sha256,
-        "refusals": [{"detail": r.detail, "reason": r.reason.value} for r in inventory.refusals],
+        "refusals": [
+            {
+                "detail": r.detail,
+                # Sorted so the digest set is order-independent: which offending fragment the
+                # derivation happened to list first is not identity, the SET of them is. This
+                # is the refusal's structured identity and it is COMPARED (unlike `detail`), so
+                # a member-specific refusal reproduces only when the same offending glyphs are
+                # present. Empty for a refusal whose fault is the grid's shape, not a member.
+                "member_digests": sorted(_fragment_digest(f) for f in r.members),
+                "reason": r.reason.value,
+            }
+            for r in inventory.refusals
+        ],
         "rows": [
             {
                 "anchor_text": row.anchor_text,

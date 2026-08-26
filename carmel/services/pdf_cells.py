@@ -135,6 +135,19 @@ BASELINE_BAND = 4.0
 #: 3-5 pt up.
 _SUPERSCRIPT_RISE = 2.0
 
+#: The glyph mappings this module reads as READABLE TEXT -- a fragment whose characters may
+#: be trusted as the value or affix they decode to.
+#:
+#: An ADMIT set, not a `is UNMAPPED` test, so the failure direction is chosen once: a
+#: :class:`GlyphMapping` member not named here is treated as unreadable, rather than sailing
+#: through because it is not the one member a negation happened to spell. Both ``UNMAPPED``
+#: (a marker) and ``UNRESOLVED_IMPOSTOR`` (a known-wrong Latin character) are unreadable: a
+#: value built from either, or an affix classified from either, is a guess. The impostor case
+#: is the one this set adds over the old ``is UNMAPPED`` checks -- an impostor reads as clean
+#: text, so without the allowlist an adjacent impostor would fall through into token
+#: classification on its wrong character.
+_READABLE_GLYPH_MAPPINGS = frozenset({GlyphMapping.MAPPED, GlyphMapping.REPAIRED})
+
 
 class RegionRefusalReason(StrEnum):
     """Why a claimed region cannot be vouched for.
@@ -176,9 +189,12 @@ class RegionRefusalReason(StrEnum):
     the most direct way to manufacture a groundless claim."""
 
     UNMAPPED_MEMBER = "unmapped_member"
-    """A member fragment contains a glyph that never decoded -- ``/C0``, ``(cid:3)``,
-    U+FFFD. Its text is a MARKER, not data, and this is the case that finally makes
-    :class:`carmel.services.pdf_fragments.GlyphMapping` load-bearing."""
+    """A member fragment's glyphs are not readable text: either a glyph that never decoded
+    -- ``/C0``, ``(cid:3)``, U+FFFD (a MARKER, not data) -- or a known symbol-font impostor
+    the registry declined to decide (``UNRESOLVED_IMPOSTOR``), whose text reads as a clean but
+    KNOWN-WRONG Latin character. Both are caught by the same readable-text allowlist, and this
+    is the case that finally makes :class:`carmel.services.pdf_fragments.GlyphMapping`
+    load-bearing."""
 
     ROTATED_MEMBER = "rotated_member"
     """A member is rotated with respect to the page. Its x-extent is not a horizontal
@@ -478,10 +494,11 @@ def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tu
                 RegionRefusalReason.MEMBER_OUTSIDE_REGION,
                 "a claimed member lies on another page",
             )
-        if member.glyph_mapping is GlyphMapping.UNMAPPED:
+        if member.glyph_mapping not in _READABLE_GLYPH_MAPPINGS:
             note(
                 RegionRefusalReason.UNMAPPED_MEMBER,
-                "a member fragment carries an unmapped-glyph marker, not text",
+                "a member fragment's glyphs are not readable text (an unmapped marker or an "
+                "undecided symbol-font impostor)",
             )
         if member.rotated:
             # Its extent is not a horizontal one, so the box test below would compare
@@ -559,15 +576,18 @@ def region_refusals(extraction: FragmentExtraction, region: ClaimedRegion) -> tu
     for neighbour, from_end, side in ((left, True, "left"), (right, False, "right")):
         if neighbour is None:
             continue
-        # An unmapped neighbour refuses on the FLAG, before any token matching. Its
-        # text is markers, so an edge token like `n=/C0` matches no affix while the
-        # fragment is exactly the unreadable thing next to the number that this module
-        # exists to catch. Asking the classifier first would make the check depend on
-        # the marker landing alone in its own fragment.
-        if neighbour.glyph_mapping is GlyphMapping.UNMAPPED:
+        # An unreadable neighbour refuses on the FLAG, before any token matching. For an
+        # unmapped marker its text is `/C0`-style noise, so an edge token like `n=/C0` matches
+        # no affix while the fragment is exactly the unreadable thing next to the number this
+        # module exists to catch; for an undecided impostor the text reads as a clean Latin
+        # character, so classifying it would run the affix matcher on a KNOWN-WRONG token --
+        # worse, because it can spuriously match. Both refuse here on the mapping, before the
+        # classifier, so the check never depends on the noise landing alone in its own fragment.
+        if neighbour.glyph_mapping not in _READABLE_GLYPH_MAPPINGS:
             return note(
                 RegionRefusalReason.ADJACENT_UNREADABLE,
-                f"the nearest fragment to the {side} carries an unmapped-glyph marker",
+                f"the nearest fragment to the {side} is not readable text (an unmapped marker "
+                "or an undecided symbol-font impostor)",
             )
         # A RAISED neighbour is a superscript, and a superscript binds to what precedes
         # it -- so `−3` above and right of `1.0` is its exponent, not the next cell's

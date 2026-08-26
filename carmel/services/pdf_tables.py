@@ -144,16 +144,34 @@ AFFIX_PARENT_MARGIN = 0.5
 #: exactly what the first run against the real document produced.
 _BAND_TOLERANCE_PT = 0.5
 
-#: The glyph mappings this module reads as "this fragment's text is characters".
+#: The glyph mappings this module admits as DATA -- a fragment whose text may become a
+#: stored cell value.
 #:
-#: An ADMIT set rather than a `is not UNMAPPED` test, so the failure direction is
-#: chosen once and stays chosen: a future :class:`GlyphMapping` member is refused here
-#: until someone admits it by name, instead of sailing through because it is not the
-#: one member a negation happened to spell. ``REPAIRED`` is admitted deliberately --
-#: its text is real characters, concluded by the fragment lane's evidence-scoped
-#: repair table rather than by the document, and the member's name is what keeps that
-#: distinction visible in every stored member digest.
+#: An ADMIT set rather than a `is not UNMAPPED` test, so the failure direction is chosen
+#: once and stays chosen: a future :class:`GlyphMapping` member is refused here until
+#: someone admits it by name, instead of sailing through because it is not the one member a
+#: negation happened to spell. ``REPAIRED`` is admitted deliberately -- its text is real
+#: characters, concluded by the fragment lane's evidence-scoped verdict registry rather than
+#: by the document, and the member's name is what keeps that distinction visible in every
+#: stored member digest. ``UNRESOLVED_IMPOSTOR`` is deliberately NOT admitted: its text is a
+#: known-wrong Latin character an impostor glyph handed back, so a fragment carrying one
+#: inside a claimed box must refuse rather than reach a cell. Adding it here would ship the
+#: very value the verdict withheld -- which is why the refusal test asserts it stays out.
 _ADMISSIBLE_GLYPH_MAPPINGS = frozenset({GlyphMapping.MAPPED, GlyphMapping.REPAIRED})
+
+#: The glyph mappings that count as a PRINTED LINE OF TEXT -- everything except a
+#: marker-only band (``UNMAPPED``).
+#:
+#: A DIFFERENT question from :data:`_ADMISSIBLE_GLYPH_MAPPINGS`, and the difference is
+#: load-bearing. That set asks "may this become data?"; this one asks "is this a row at
+#: all?" -- used where skipping a fragment makes a guard refuse LESS. An
+#: ``UNRESOLVED_IMPOSTOR`` fragment is NOT data (it must refuse), but it IS a printed line: a
+#: cut table row whose cell holds an impostor character is still a cut row, so a look-below
+#: guard that skipped it would stop noticing the box edge sliced a row off. So this set adds
+#: ``UNRESOLVED_IMPOSTOR`` to the admissible pair; only a marker-only ``UNMAPPED`` band -- not
+#: a row -- is left out, and one of those inside the box refuses under ``UNMAPPED_MEMBER``
+#: anyway. Still an ADMIT set, for the same failure-direction reason.
+_ROW_TEXT_GLYPH_MAPPINGS = frozenset({GlyphMapping.MAPPED, GlyphMapping.REPAIRED, GlyphMapping.UNRESOLVED_IMPOSTOR})
 
 
 class InventoryRefusalReason(StrEnum):
@@ -371,6 +389,16 @@ class InventoryRefusalReason(StrEnum):
     character: a corpus rate table renders the minus sign of ``-1.0`` as ``/C0``, and a
     cell built from it reads ``+1.0``. Flagged by the fragment lane, refused here."""
 
+    IMPOSTOR_MEMBER = "impostor_member"
+    """A fragment inside the footprint carries a known symbol-font impostor glyph whose true
+    character the registry looked at and declined to decide
+    (:attr:`~carmel.services.pdf_fragments.GlyphMapping.UNRESOLVED_IMPOSTOR`). Unlike an
+    unmapped marker its text reads as a clean Latin character, which is exactly why it must
+    refuse rather than reach a cell. Caught by the SAME allowlist gate as UNMAPPED_MEMBER --
+    :data:`_ADMISSIBLE_GLYPH_MAPPINGS` -- so admitting the member there would silently turn
+    this refusal into a stored wrong value; the reason is split out only so the message names
+    the fault honestly."""
+
     EMPTY = "empty"
     """No fragment lies inside the claimed box below the caption. An empty grid is not a
     table with no rows; it is evidence that the box is wrong."""
@@ -473,6 +501,20 @@ class InventoryRefusal:
     reason: InventoryRefusalReason
     detail: str
     """Short and human-readable. Never the document's text beyond the offending token."""
+
+    members: tuple[TextFragment, ...] = ()
+    """The offending fragments this refusal is ABOUT, for the reasons that point at specific
+    members -- :attr:`~InventoryRefusalReason.IMPOSTOR_MEMBER` and
+    :attr:`~InventoryRefusalReason.UNMAPPED_MEMBER`. Empty for a refusal whose fault is the
+    grid's shape (an empty box, an orphaned band) rather than a particular fragment.
+
+    ``reason`` and ``detail`` alone under-identify these: two refusals over DIFFERENT offending
+    glyphs carry the same reason and a prose count, so a stored refusal reproduces even when the
+    glyph that caused it has changed, and a replayer cannot tell one impostor refusal from
+    another. The record layer digests these members exactly as it digests a successful cell's
+    members (:func:`~carmel.services.pdf_table_record._fragment_digest`, which pins each
+    fragment's text, geometry, glyph/ink evidence and ``glyph_mapping``), and that digest is
+    COMPARED -- so a refusal now reproduces only when the same offending glyphs are present."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -1009,9 +1051,14 @@ def _orphan_below_refusal(
     CONTAINMENT in a derived column is the test, not proximity: prose runs across the
     gutters this table's columns are separated by, so a running-text fragment does not fit
     inside one; a cut table row's cell does, because the column was derived from that very
-    alignment. Unmapped fragments are skipped -- they carry markers rather than text, so
-    they are not a row (the real target's is a raised zero-width degree sign), and one
-    inside the box refuses under :attr:`InventoryRefusalReason.UNMAPPED_MEMBER` anyway.
+    alignment. Only marker-only UNMAPPED bands are skipped -- they carry markers rather than
+    text, so they are not a row (the real target's is a raised zero-width degree sign), and
+    one inside the box refuses under :attr:`InventoryRefusalReason.UNMAPPED_MEMBER` anyway.
+    An UNRESOLVED_IMPOSTOR band is NOT skipped: its text is a printed character (a wrong Latin
+    one), so a cut row whose cell holds an impostor is still a cut row, and skipping it would
+    make this guard refuse LESS -- the box edge could slice such a row off unnoticed. Hence
+    the :data:`_ROW_TEXT_GLYPH_MAPPINGS` admit-set here, not the data admit-set: this asks
+    "is it a printed line?", not "may it become a value?".
     """
     if pitch <= 0:
         return None
@@ -1020,7 +1067,7 @@ def _orphan_below_refusal(
         for f in extraction.fragments
         if f.page == footprint.page
         and f.text.strip()
-        and f.glyph_mapping in _ADMISSIBLE_GLYPH_MAPPINGS
+        and f.glyph_mapping in _ROW_TEXT_GLYPH_MAPPINGS
         and footprint.y_bottom - pitch <= f.baseline_y < footprint.y_bottom
         and any(left <= f.x_start and _ink_x_end(f) <= right for left, right in bounds)
     ]
@@ -1482,12 +1529,29 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
     if rotated_sharer is not None:
         return refused(rotated_sharer)
 
-    unmapped = [f for f in inside if f.glyph_mapping not in _ADMISSIBLE_GLYPH_MAPPINGS]
-    if unmapped:
+    # The ONE gate is the allowlist: a member outside _ADMISSIBLE_GLYPH_MAPPINGS is not data
+    # and the box refuses. That is what the refusal test inverts -- add UNRESOLVED_IMPOSTOR to
+    # the allowlist and an impostor inside the box reaches a cell, so the test fails. The
+    # reason is only SPLIT afterwards, over the already-gated set, so the message names the
+    # fault honestly: a marker (UNMAPPED) and an undecided impostor (UNRESOLVED_IMPOSTOR) are
+    # different faults, and an impostor reads as clean text where a marker does not.
+    non_admissible = [f for f in inside if f.glyph_mapping not in _ADMISSIBLE_GLYPH_MAPPINGS]
+    if non_admissible:
+        impostors = [f for f in non_admissible if f.glyph_mapping is GlyphMapping.UNRESOLVED_IMPOSTOR]
+        if impostors:
+            return refused(
+                InventoryRefusal(
+                    InventoryRefusalReason.IMPOSTOR_MEMBER,
+                    f"{len(impostors)} fragment(s) inside the footprint carry a known symbol-font "
+                    "impostor glyph whose character the registry declined to decide",
+                    members=tuple(impostors),
+                )
+            )
         return refused(
             InventoryRefusal(
                 InventoryRefusalReason.UNMAPPED_MEMBER,
-                f"{len(unmapped)} fragment(s) inside the footprint have unmapped glyphs",
+                f"{len(non_admissible)} fragment(s) inside the footprint have unmapped glyphs",
+                members=tuple(non_admissible),
             )
         )
     bounds = _column_bounds(rows_raw)

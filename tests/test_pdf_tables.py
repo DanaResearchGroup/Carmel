@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import pytest
 
+from carmel.services import pdf_tables
 from carmel.services.pdf_fragments import (
     FragmentAvailability,
     FragmentExtraction,
@@ -142,6 +143,10 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
         ),
         (
             extraction_of(CAPTION, frag("/C0 1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNMAPPED)),
+            footprint(),
+        ),
+        (
+            extraction_of(CAPTION, frag("1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNRESOLVED_IMPOSTOR)),
             footprint(),
         ),
         (extraction_of(CAPTION), footprint(y_top=60.0, y_bottom=10.0)),
@@ -451,6 +456,70 @@ class TestCellTextIsReadingOrderAndNeverRepaired:
 
         assert inventory.refusals == ()
         assert [c.text for c in inventory.cells] == ["Fuel", "\u00b0 1.0"]
+
+    def test_an_unresolved_impostor_fragment_refuses_the_inventory(self) -> None:
+        """An impostor's text is a clean but KNOWN-WRONG Latin character. A cell built from
+        one would ship exactly the mis-decoded value the verdict withheld, so the box refuses
+        -- under IMPOSTOR_MEMBER, distinct from UNMAPPED_MEMBER because an impostor reads as
+        text where a marker does not."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNRESOLVED_IMPOSTOR),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.IMPOSTOR_MEMBER]
+
+    def test_the_impostor_refusal_is_gated_only_by_the_admissibility_allowlist(self, monkeypatch) -> None:
+        """The seam, proven by inversion. The impostor refuses ONLY because
+        UNRESOLVED_IMPOSTOR is not in :data:`_ADMISSIBLE_GLYPH_MAPPINGS`; admit it there and the
+        SAME fragment reaches a cell. If the refusal ran through a separate ``is IMPOSTOR``
+        check instead, patching the allowlist would not move the outcome and this test would
+        fail -- which is exactly the guarantee Verifier item 1 asks for, that adding the member
+        to the allowlist inverts the result.
+
+        The shipped counterpart -- :meth:`test_an_unresolved_impostor_fragment_refuses_the_inventory`
+        -- is the test that FAILS if the member is ever permanently admitted."""
+        fragments = (
+            CAPTION,
+            frag("Fuel", 53.0, 70.0, 134.5),
+            frag("1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNRESOLVED_IMPOSTOR),
+        )
+        monkeypatch.setattr(
+            pdf_tables,
+            "_ADMISSIBLE_GLYPH_MAPPINGS",
+            pdf_tables._ADMISSIBLE_GLYPH_MAPPINGS | {GlyphMapping.UNRESOLVED_IMPOSTOR},
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.refusals == ()
+        assert [c.text for c in inventory.cells] == ["Fuel", "1.0"]
+
+    def test_a_member_refusal_names_the_offending_fragments(self) -> None:
+        """R-012 §3: the refusal records WHICH members offended, as the fragments themselves,
+        not merely a count in prose. The record layer digests these so a stored refusal
+        reproduces only when the same offending glyph is present; a bare count cannot say
+        that."""
+        impostor = frag("1.0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNRESOLVED_IMPOSTOR)
+        inventory = build_inventory(extraction_of(CAPTION, frag("Fuel", 53.0, 70.0, 134.5), impostor), footprint())
+
+        (refusal,) = inventory.refusals
+        assert refusal.reason is InventoryRefusalReason.IMPOSTOR_MEMBER
+        assert refusal.members == (impostor,)
+
+    def test_an_unmapped_member_refusal_also_names_its_fragments(self) -> None:
+        """The sibling gate carries the same identity: the two share the allowlist and the
+        block that builds the refusal, so an unmapped marker inside the box is named too."""
+        marker = frag("/C0", 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNMAPPED)
+        inventory = build_inventory(extraction_of(CAPTION, frag("Fuel", 53.0, 70.0, 134.5), marker), footprint())
+
+        (refusal,) = inventory.refusals
+        assert refusal.reason is InventoryRefusalReason.UNMAPPED_MEMBER
+        assert refusal.members == (marker,)
 
 
 class TestTheAffixMergeIsRecordedOrRefused:
@@ -1025,6 +1094,18 @@ class TestEveryEdgeOfTheBoxIsFalsifiable:
         with a derived column is evidence a row was cut off."""
         repaired = frag("\u00b0", 125.0, 130.0, 58.5, glyph_mapping=GlyphMapping.REPAIRED)
         inventory = build_inventory(extraction_of(*simple_grid(), repaired), footprint())
+
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX]
+
+    def test_an_unresolved_impostor_below_the_box_is_a_cut_row(self) -> None:
+        """UNRESOLVED_IMPOSTOR is not admissible AS DATA, but it IS a printed line of text: a
+        cut row whose cell holds an impostor character is still a cut row. So this guard must
+        count it -- otherwise raising ``y_bottom`` past a row whose value is a mis-decoded
+        symbol would slice that row off UNNOTICED, the guard refusing LESS than it should. This
+        is the concrete consequence of the fragment being in the row-text allowlist but not the
+        data allowlist."""
+        impostor = frag("1.0", 122.0, 140.0, 58.5, glyph_mapping=GlyphMapping.UNRESOLVED_IMPOSTOR)
+        inventory = build_inventory(extraction_of(*simple_grid(), impostor), footprint())
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.ORPHANED_BAND_BELOW_THE_BOX]
 

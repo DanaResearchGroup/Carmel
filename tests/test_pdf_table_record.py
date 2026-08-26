@@ -23,11 +23,13 @@ import pytest
 
 from carmel.services import pdf_tables
 from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.pdf_fragments import extract_fragments
+from carmel.services.pdf_fragments import GlyphMapping, extract_fragments
 from carmel.services.pdf_table_record import (
+    _REFUSAL_DIAGNOSTIC_FIELDS,
     INVENTORY_PAYLOAD_KEYS,
     INVENTORY_PAYLOAD_VERSION,
     InventoryVerificationStatus,
+    _comparable,
     compute_inventory_sha,
     footprint_unreadable_reason,
     inventory_code_sha256,
@@ -241,6 +243,46 @@ class TestRefusalProseIsDiagnosticsAndTheReasonIsTheFinding:
 
         assert all(entry["detail"] for entry in payload["refusals"])
         assert set(payload) == INVENTORY_PAYLOAD_KEYS
+
+
+class TestAMemberRefusalIsIdentifiedByItsOffendingGlyphs:
+    """R-012 §3: ``reason`` + prose ``detail`` under-identified a member-specific refusal -- two
+    refusals over DIFFERENT offending glyphs shared a reason and a count, so a stored refusal
+    reproduced even when the glyph that caused it had changed. The refusal now carries
+    ``member_digests``, structured identity that IS compared, the same way a successful cell's
+    members are pinned."""
+
+    @staticmethod
+    def _impostor_payload(text: str) -> dict:
+        from tests.test_pdf_tables import CAPTION, extraction_of, footprint, frag
+
+        impostor = frag(text, 122.0, 146.0, 134.5, glyph_mapping=GlyphMapping.UNRESOLVED_IMPOSTOR)
+        extraction = extraction_of(CAPTION, frag("Fuel", 53.0, 70.0, 134.5), impostor)
+        inventory = build_inventory(extraction, footprint())
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.IMPOSTOR_MEMBER]
+        return inventory_record_payload(inventory, raw_sha256="0" * 64)
+
+    def test_the_refusal_records_its_offending_members_as_structured_identity(self) -> None:
+        (refusal,) = self._impostor_payload("1.0")["refusals"]
+        assert refusal["member_digests"], "an impostor refusal with no member identity is a prose count again"
+        assert all(len(d) == 64 for d in refusal["member_digests"])
+
+    def test_member_digests_is_compared_where_detail_is_not(self) -> None:
+        assert "member_digests" not in _REFUSAL_DIAGNOSTIC_FIELDS
+        assert "detail" in _REFUSAL_DIAGNOSTIC_FIELDS
+        (compared,) = _comparable(self._impostor_payload("1.0"))["refusals"]
+        assert "member_digests" in compared
+        assert "detail" not in compared
+
+    def test_two_refusals_over_different_glyphs_do_not_reproduce_each_other(self) -> None:
+        one = self._impostor_payload("1.0")
+        other = self._impostor_payload("9.9")
+
+        # Same finding, same prose shape -- and yet distinguishable, because the offending
+        # member digests differ and are part of what must reproduce.
+        assert one["refusals"][0]["reason"] == other["refusals"][0]["reason"]
+        assert one["refusals"][0]["member_digests"] != other["refusals"][0]["member_digests"]
+        assert _comparable(one) != _comparable(other)
 
 
 class TestEachWayOfNotReachingAVerdictStaysDistinct:

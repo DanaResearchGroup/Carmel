@@ -461,6 +461,18 @@ class TestAffixesAttachedToOtherText:
         assert refusal is not None
         assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
 
+    def test_an_unresolved_impostor_neighbour_refuses_on_the_flag_before_classifying(self) -> None:
+        """The impostor case is MORE dangerous than the marker: its text reads as a clean
+        Latin token, so classifying it would run the affix matcher on a known-wrong character
+        -- and could spuriously match. Refusing on the mapping, before the classifier, is what
+        stops that. Here `-` beside the number would classify as a leading sign; the flag
+        refuses first."""
+        left = _fragment("-", 60.0, 100.0, mapping=GlyphMapping.UNRESOLVED_IMPOSTOR)
+        number = _fragment("1.0", 103.5, 115.0)
+        refusal = refuse_region(_extraction(left, number), _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.ADJACENT_UNREADABLE
+
 
 class TestTheRegionItself:
     def test_an_empty_region_refuses(self) -> None:
@@ -472,6 +484,15 @@ class TestTheRegionItself:
 
     def test_an_unmapped_member_refuses(self) -> None:
         number = _fragment("1.�", 103.5, 115.0, mapping=GlyphMapping.UNMAPPED)
+        refusal = refuse_region(_extraction(number), _region(number))
+        assert refusal is not None
+        assert refusal.reason is RegionRefusalReason.UNMAPPED_MEMBER
+
+    def test_an_unresolved_impostor_member_refuses_as_unreadable(self) -> None:
+        """A member whose glyph is a known impostor reads as clean text (`1.0`) but is a
+        known-wrong character, so it is not readable data. Caught by the same readable-text
+        allowlist as an unmapped marker, under UNMAPPED_MEMBER."""
+        number = _fragment("1.0", 103.5, 115.0, mapping=GlyphMapping.UNRESOLVED_IMPOSTOR)
         refusal = refuse_region(_extraction(number), _region(number))
         assert refusal is not None
         assert refusal.reason is RegionRefusalReason.UNMAPPED_MEMBER
