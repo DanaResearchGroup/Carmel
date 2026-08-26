@@ -223,6 +223,7 @@ def _refusal(**kwargs: object) -> UnextractedConditionStatement:
         "statement_id": "phi_range",
         "label_raw": "equivalence ratio",
         "label_ref": _table_ref(),
+        "statement_raw": "0.6-1.0",
         "statement_ref": _bbox_ref(),
         "reason": UnextractedReason.VALUE_RANGE,
         "quantity_kind": _NO_QUANTITY_KIND,

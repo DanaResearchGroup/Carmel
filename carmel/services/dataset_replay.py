@@ -459,10 +459,13 @@ class UncheckedSemanticClaim:
     locator like any other, and its span re-slices like any other. What is
     missing is the other half of a grounding pair: the value it supports is
     ``ConditionAttribution.OWN_EXPERIMENT`` (an enum), and no recorded text says
-    that span means that enum. ``statement_ref`` is the same shape. Contrast
-    ``label_ref``, which IS paired with a recorded ``label_raw`` and therefore
-    IS checkable in the ordinary way -- the axis is a property of the PAIRING,
-    not of the ref.
+    that span means that enum. ``subject.reason_ref`` is the same shape.
+    Contrast ``label_ref``, which IS paired with a recorded ``label_raw`` and
+    therefore IS checkable in the ordinary way -- the axis is a property of the
+    PAIRING, not of the ref. ``unextracted[*].statement_ref`` was once the
+    third worked example here; once ``statement_raw`` recorded the refused
+    statement's own words beside it, it became exactly that ordinary paired
+    case, which is why the example moved to ``subject.reason_ref``.
 
     This is the load-bearing rule stated as a data type: grounding proves
     LOCATION, never MEANING. A semantic claim is never something replay could
@@ -1727,10 +1730,12 @@ def _dataset_text_pairings(envelope: DatasetEnvelope) -> Iterator[_TextPairing]:
 def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_TextPairing]:
     """Enumerate, BY HAND, every grounding PAIR a :class:`ConditionSetEnvelope`
     exposes -- i.e. every ``SourceRef`` beside a recorded verbatim string it
-    is supposed to ground. Deliberately excludes the THREE ref locations that
-    are not pairs at all (``attribution_ref``, ``subject.reason_ref``,
-    ``unextracted[*].statement_ref``) -- see :func:`replay_condition_set`'s
-    own semantic-obligation enumerator for those.
+    is supposed to ground. Deliberately excludes the TWO ref locations that
+    are not pairs at all (``attribution_ref``, ``subject.reason_ref``) -- see
+    :func:`replay_condition_set`'s own semantic-obligation enumerator for those.
+    ``unextracted[*].statement_ref`` USED to be a third such location; it is now
+    a grounding pair, beside ``statement_raw`` (the refused statement's own
+    words), and is enumerated here like any other pair.
 
     Hand-written and NOT derived from :func:`iter_source_refs`, for exactly
     the reason :func:`_dataset_text_pairings` gives: a check is only
@@ -1782,6 +1787,15 @@ def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_Te
             statement.label_raw,
             uncompensated_fields=_label_token_policy(statement.label_ref.locator, ("label_ref", "label_raw")),
         )
+        yield _TextPairing(
+            f"unextracted[{index}].statement_ref",
+            statement.statement_ref.node_id,
+            statement.statement_ref.locator,
+            statement.statement_raw,
+            uncompensated_fields=_label_token_policy(
+                statement.statement_ref.locator, ("statement_ref", "statement_raw")
+            ),
+        )
 
 
 def _semantic_ref_gap(
@@ -1802,8 +1816,9 @@ def _semantic_ref_gap(
     :attr:`SemanticGap.SUPPORT_UNRECORDED` only once the span itself is
     confirmed to re-slice cleanly -- STRICTLY MORE is known there than in
     the ``LOCATION_UNRESOLVED`` case, but still nothing that says the span
-    MEANS the derived value, because (by construction, for these three ref
-    locations) nothing was ever recorded to compare it against.
+    MEANS the derived value, because (by construction, for the two ref
+    locations that remain unpaired -- ``attribution_ref`` and
+    ``subject.reason_ref``) nothing was ever recorded to compare it against.
     """
     node_problems = node_problems or {}
     if not isinstance(ref.locator, CharSpanLocator):
@@ -2087,10 +2102,17 @@ def _condition_set_semantic_claims(
     node_problems: Mapping[str, ReplayFinding] | None = None,
 ) -> tuple[UncheckedSemanticClaim, ...]:
     """Enumerate, BY HAND, every SEMANTIC obligation a
-    :class:`ConditionSetEnvelope` imposes -- the three ref locations that are
+    :class:`ConditionSetEnvelope` imposes -- the two ref locations that are
     NOT grounding pairs (see :func:`_condition_set_text_pairings`'s
     docstring): a located span exists, but nothing recorded says the span
     MEANS the derived value it is cited to support.
+
+    ``unextracted[*].statement_ref`` was a THIRD such location until its own
+    verbatim text (``statement_raw``) was recorded beside it; it is now a
+    grounding pair checked by the pairing enumerator, not a semantic obligation,
+    so it no longer yields a claim here. The statement's ``reason`` is a
+    property of that recorded text, not a separate span-means-enum assertion the
+    way ``attribution`` and ``subject.reason`` are.
 
     ``attribution_ref`` is unconditionally present on every legal envelope,
     so this always yields at least one claim -- see
@@ -2120,30 +2142,27 @@ def _condition_set_semantic_claims(
                 support_paths=("subject.reason_ref",),
             )
         )
-    for index, statement in enumerate(envelope.unextracted):
-        claims.append(
-            UncheckedSemanticClaim(
-                claim_path=f"unextracted[{index}]",
-                claim=statement.reason.value,
-                gap=_semantic_ref_gap(statement.statement_ref, text_by_node_id, node_problems),
-                reason=f"unextracted[{index}].statement_ref locates the span the statement was "
-                "read from, but by design nothing is ever recorded to compare it against -- the "
-                "statement was deliberately not turned into a claim",
-                support_paths=(f"unextracted[{index}].statement_ref",),
-            )
-        )
+    # unextracted[*].statement_ref is deliberately NOT enumerated here: it now
+    # sits beside statement_raw as a grounding pair (see
+    # _condition_set_text_pairings), so the pairing enumerator compares its text
+    # and this axis -- "a span located but nothing recorded says what it means"
+    # -- no longer describes it. Leaving a claim here too would be the double
+    # accounting the Verifier forbids: the same statement reported as both
+    # compared and never checkable.
     return tuple(claims)
 
 
-_UNPAIRED_REF_FIELDS = frozenset({"attribution_ref", "reason_ref", "statement_ref"})
+_UNPAIRED_REF_FIELDS = frozenset({"attribution_ref", "reason_ref"})
 """The ONLY ref fields in the condition-set graph with no recorded counterpart.
 
-``attribution_ref`` supports a ``ConditionAttribution``, ``reason_ref`` a
-``SubjectRefusalReason``, and ``statement_ref`` nothing stored at all. Every
-OTHER ref field in that graph sits beside a sibling holding the verbatim text
-read at the span (``label_raw``, ``token_raw``, ``raw_text``, ``unit_raw``),
-which makes it a grounding pair that MUST be quote-checked rather than merely
-located.
+``attribution_ref`` supports a ``ConditionAttribution`` and ``reason_ref`` a
+``SubjectRefusalReason`` -- each an ENUM no recorded span-text can attest to.
+``statement_ref`` was a third such field until ``statement_raw`` was recorded
+beside it; it is now a grounding PAIR and quote-checked like the rest, so it is
+NOT in this set. Every OTHER ref field in that graph sits beside a sibling
+holding the verbatim text read at the span (``label_raw``, ``token_raw``,
+``raw_text``, ``unit_raw``, and now ``statement_raw``), which makes it a
+grounding pair that MUST be quote-checked rather than merely located.
 
 Written as a frozen literal, independently of both enumerators, ON PURPOSE.
 It is what stops a paired ref from being quietly reclassified as
@@ -2258,9 +2277,10 @@ def _replay_text_pairings(
     is either checked here or turned into a finding here -- true for a
     :class:`DatasetEnvelope`, where every char-span ref is paired, but FALSE
     for a :class:`ConditionSetEnvelope`, which has char-span refs
-    (``attribution_ref``, ``subject.reason_ref``,
-    ``unextracted[*].statement_ref``) that are legitimately UNPAIRED -- no
-    recorded text stands beside them to compare against. Passing ``False``
+    (``attribution_ref``, ``subject.reason_ref``) that are legitimately
+    UNPAIRED -- no recorded text stands beside them to compare against.
+    (``unextracted[*].statement_ref`` used to belong on that list; it is now
+    paired with ``statement_raw`` and checked like any other pair.) Passing ``False``
     skips that audit and reports ``total_char_span_refs`` as simply
     ``checked + len(findings)`` (i.e. exactly what THIS pairing set
     accounted for); the caller is then responsible for its own, separately
@@ -2974,9 +2994,11 @@ def _verify_cited_cell_texts(
 
     Runs over the SAME grounding pairs the char-span replayer uses -- every
     ``SourceRef`` beside the verbatim string it is meant to ground -- so the
-    coverage is exactly ``raw_text``/``unit_raw``/every label and token, and
-    exactly NOT the three ref-only locations (attribution/reason/statement) that
-    ground a location rather than a quoted string. A cell is atomic and a
+    coverage is exactly ``raw_text``/``unit_raw``/every label and token/every
+    unextracted statement's own words, and exactly NOT the two ref-only
+    locations (attribution/reason) that ground a location rather than a quoted
+    string. (``statement_ref`` joined the quoted-string side once ``statement_raw``
+    recorded the refused statement's words beside it.) A cell is atomic and a
     ``TableCellLocator`` has no sub-cell addressing, so the only comparison that
     means what it says is EXACT equality of the whole cell text against the
     whole grounded string: a substring match would let ``raw_text="8"`` cite a
@@ -3945,11 +3967,13 @@ def replay_condition_set(
 
     Mirrors :func:`replay_envelope`'s single-pass node-verification structure
     exactly, then diverges where the two envelope types genuinely differ: a
-    condition set has THREE ``SourceRef`` locations that are not grounding
-    pairs at all (``attribution_ref``, ``subject.reason_ref``,
-    ``unextracted[*].statement_ref``) -- a location proves nothing recorded
-    says what it MEANS, so each becomes an :class:`UncheckedSemanticClaim`
-    rather than a pass/fail check.
+    condition set has TWO ``SourceRef`` locations that are not grounding
+    pairs at all (``attribution_ref``, ``subject.reason_ref``) -- a location
+    proves nothing recorded says what it MEANS, so each becomes an
+    :class:`UncheckedSemanticClaim` rather than a pass/fail check.
+    (``unextracted[*].statement_ref`` was a third until ``statement_raw``
+    recorded the statement's own words beside it; it is now a grounding pair,
+    compared like every label and token.)
 
     Because ``attribution_ref`` is unconditionally present on every legal
     envelope (see the contract), :attr:`ReplayReport.overall_outcome` is

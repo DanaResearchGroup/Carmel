@@ -61,6 +61,7 @@ def _statement(**kwargs: object) -> UnextractedConditionStatement:
         "statement_id": "phi_sweep",
         "label_raw": "equivalence ratio",
         "label_ref": _char_span_ref(),
+        "statement_raw": "0.6 to 5.0",
         "statement_ref": _char_span_ref(start=20, end=40),
         "reason": UnextractedReason.VALUE_RANGE,
         "quantity_kind": QuantityKind.EQUIVALENCE_RATIO,
@@ -125,6 +126,34 @@ class TestLabelRawMustBeNonEmpty:
     def test_an_empty_label_is_refused(self) -> None:
         with pytest.raises(ValidationError):
             _statement(label_raw="")
+
+
+class TestStatementRawCarriesTheRefusedWords:
+    """``statement_raw`` records the refused statement's OWN words verbatim --
+    the counterpart to ``statement_ref`` that lets replay COMPARE the text, not
+    merely locate it. Required and non-empty, exactly like ``label_raw``: a
+    refused statement with no recorded words is the amnesia this field abolishes.
+    """
+
+    def test_the_words_are_held_verbatim_on_the_record(self) -> None:
+        statement = _statement(statement_raw="0.6 to 1.0")
+        assert statement.statement_raw == "0.6 to 1.0"
+
+    def test_an_empty_statement_raw_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            _statement(statement_raw="")
+
+    def test_a_missing_statement_raw_is_refused(self) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            UnextractedConditionStatement(  # type: ignore[call-arg]
+                statement_id="phi_sweep",
+                label_raw="equivalence ratio",
+                label_ref=_char_span_ref(),
+                statement_ref=_char_span_ref(start=20, end=40),
+                reason=UnextractedReason.VALUE_RANGE,
+                quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+            )
+        assert "statement_raw" in str(excinfo.value)
 
 
 class TestTheTwoRefsAreRequiredAndNeverAbsent:
