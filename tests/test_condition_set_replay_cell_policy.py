@@ -169,9 +169,10 @@ class TestProductionSitesApplyThePolicy:
 
 class TestTheCompensatingGateActuallyComparesContent:
     """The fix is only sound because _verify_cited_cell_texts really compares the cell: a
-    match is silent, a mismatch is FAILED (never a silent pass)."""
+    match raises no finding AND is counted as a real check (I-027), a mismatch is FAILED
+    (never a silent pass)."""
 
-    def test_a_matching_cell_raises_no_finding(self) -> None:
+    def test_a_matching_cell_raises_no_finding_and_is_counted(self) -> None:
         embedded = make_embedded_inventory_with_texts(raw_sha256="b" * 64, cell_texts={(0, 0): "Fuel"})
         pairing = _TextPairing(
             "categorical_claims[0].label_ref",
@@ -180,10 +181,12 @@ class TestTheCompensatingGateActuallyComparesContent:
             "Fuel",
             uncompensated_fields=None,
         )
-        findings = _verify_cited_cell_texts([pairing], {embedded.inventory_sha256: embedded})
-        assert findings == []
+        result = _verify_cited_cell_texts([pairing], {embedded.inventory_sha256: embedded})
+        assert result.findings == ()
+        # The match used to vanish; it is now a counted check.
+        assert result.checked == 1
 
-    def test_a_mismatched_cell_is_failed(self) -> None:
+    def test_a_mismatched_cell_is_failed_and_not_counted(self) -> None:
         embedded = make_embedded_inventory_with_texts(raw_sha256="b" * 64, cell_texts={(0, 0): "Fuel"})
         pairing = _TextPairing(
             "categorical_claims[0].label_ref",
@@ -192,6 +195,8 @@ class TestTheCompensatingGateActuallyComparesContent:
             "Oxidizer",
             uncompensated_fields=None,
         )
-        findings = _verify_cited_cell_texts([pairing], {embedded.inventory_sha256: embedded})
-        assert len(findings) == 1
-        assert findings[0].category is ReplayOutcome.FAILED
+        result = _verify_cited_cell_texts([pairing], {embedded.inventory_sha256: embedded})
+        assert len(result.findings) == 1
+        assert result.findings[0].category is ReplayOutcome.FAILED
+        # A disagreement verified nothing -- it must not count as a checked cell.
+        assert result.checked == 0

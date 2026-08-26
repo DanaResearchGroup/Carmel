@@ -97,13 +97,20 @@ could not run," and reporting ``FAILED`` never hides the ``UNVERIFIABLE``
 findings either -- both lists are always present on the report in full.
 
 A ``VERIFIED`` outcome can never be reached having independently checked
-ZERO character spans. A replayer that reports "verified" while never
-actually re-slicing anything (an envelope with no char-span refs at all, or
-one where every ref happened to be unreachable) would launder the
-guarantee this module exists to provide, so ``checked_char_spans == 0``
-always forces ``UNVERIFIABLE`` (never ``FAILED`` -- there is no
-disagreement, only nothing checked) via an explicit finding naming that
-fact. ``ReplayReport`` also carries ``total_char_spans`` and
+NOTHING. A replayer that reports "verified" while never actually verifying
+anything (an envelope with no checkable grounding at all, or one where every
+ref happened to be unreachable) would launder the guarantee this module
+exists to provide, so a report that checked nothing always forces
+``UNVERIFIABLE`` (never ``FAILED`` -- there is no disagreement, only nothing
+checked) via an explicit finding naming that fact. "Checked nothing" is
+WIDER than "re-sliced zero character spans": a table-cell text comparison
+that ran and MATCHED is also a real check (counted as
+``ReplayReport.checked_table_cells``, a quantity deliberately separate from
+the char-span counts), so the guard forces ``UNVERIFIABLE`` only when
+``checked_char_spans == 0`` AND ``checked_table_cells == 0`` -- an artifact
+grounded entirely at table cells, every cell matching, re-slices zero char
+spans yet has verified something real and reads ``VERIFIED``.
+``ReplayReport`` also carries ``total_char_spans`` and
 ``unchecked_char_spans`` alongside ``checked_char_spans`` so a MIXED
 envelope (some refs checked, some not) reports its partiality honestly
 instead of collapsing to one outcome that overstates or understates how
@@ -781,6 +788,22 @@ class ReplayReport:
     "unchecked" (the location genuinely was resolved) -- collapsing them into
     either one misreports coverage."""
 
+    checked_table_cells: int = 0
+    """Table-cell text comparisons that RAN and MATCHED -- each a recorded
+    verbatim string re-derived, whole-cell and exact, from a
+    :class:`TableCellLocator`-grounded value against the embedded inventory
+    it cites (see :func:`_verify_cited_cell_texts`). A DELIBERATELY SEPARATE
+    quantity from the char-span counts, and pointedly NOT folded into
+    ``total_char_spans`` or its arithmetic: a cell comparison is a different
+    kind of check from re-slicing a character span, so it is carried as a
+    different number. Its only role in the verdict is the widened zero-check
+    rule -- a replay that re-sliced no char span AND matched no cell has
+    established nothing and must read UNVERIFIABLE, but one that matched even a
+    single cell has verified something real, even with zero char spans. That is
+    the whole point of this field: "re-sliced zero character spans" and
+    "established nothing" stopped being the same sentence the moment a cell
+    comparison became a real check."""
+
     def __post_init__(self) -> None:
         # `frozen=True` stops the FIELD being rebound; it does nothing about the
         # object the field points at. Handed a list, the report would keep the
@@ -869,7 +892,7 @@ class ReplayReport:
         # `bool` subclasses `int`, so `True` satisfies every bound below and
         # reads as a count of 1; a float satisfies them too and can make the
         # arithmetic agree by coincidence. Exact type only.
-        for name in ("checked_char_spans", "total_char_spans", "unchecked_char_spans"):
+        for name in ("checked_char_spans", "total_char_spans", "unchecked_char_spans", "checked_table_cells"):
             count = getattr(self, name)
             if type(count) is not int:
                 raise ValueError(
@@ -894,6 +917,11 @@ class ReplayReport:
                 f"support_only_char_spans ({self.support_only_char_spans}) cannot be negative "
                 "-- it counts refs that were resolved and re-sliced, so a negative value "
                 "misreports coverage"
+            )
+        if self.checked_table_cells < 0:
+            raise ValueError(
+                f"checked_table_cells ({self.checked_table_cells}) cannot be negative -- it counts "
+                "cell comparisons that ran and matched, so a negative value misreports coverage"
             )
         if self.checked_char_spans + self.support_only_char_spans > self.total_char_spans:
             raise ValueError(
@@ -949,12 +977,24 @@ class ReplayReport:
             # has to hold for every report, not only the ones this module
             # happens to build.
             return ReplayOutcome.UNVERIFIABLE
-        if self.checked_char_spans == 0:
-            # A replay that re-sliced nothing has established nothing. The
+        if self.checked_char_spans == 0 and self.checked_table_cells == 0:
+            # A replay that established nothing has established nothing. The
             # producer also records a finding saying so, carrying the reason a
             # caller needs -- but a rule enforced only by the one caller that
             # remembers it is not an invariant, and this report type is public
             # and constructible by anyone.
+            #
+            # The question this asks is deliberately WIDER than it once was. It
+            # used to test only ``checked_char_spans == 0`` -- correct while a
+            # re-sliced char span was the ONLY check there was. Now a matched
+            # table cell is also a real check (see ``checked_table_cells``), so
+            # "re-sliced zero char spans" no longer implies "established
+            # nothing": an artifact grounded entirely at table cells re-slices
+            # zero char spans yet may have compared and matched every one of its
+            # cells. The rule the zero-span guard exists to enforce -- a replay
+            # that verified NOTHING must never read VERIFIED -- survives intact;
+            # only its definition of "nothing" widened to match what a replay
+            # can now check.
             return ReplayOutcome.UNVERIFIABLE
         return ReplayOutcome.VERIFIED
 
@@ -2897,10 +2937,29 @@ def _verify_embedded_inventories(
     return findings
 
 
+class _CellTextVerification(NamedTuple):
+    """What one sweep of :func:`_verify_cited_cell_texts` produced.
+
+    Two values, not one, because a cell comparison has two outcomes worth
+    carrying: what went WRONG (``findings`` -- FAILED disagreements and
+    UNVERIFIABLE blocked comparisons) and how much went RIGHT (``checked`` --
+    comparisons that ran and matched, whole-cell and exact). A matched cell used
+    to produce no value at all: the loop fell through and the success vanished,
+    so a report could compare 22 cells and count coverage of zero. ``checked``
+    is exactly that lost quantity, recovered so the outcome machinery can treat
+    a matched cell as the real check it is (see
+    :attr:`ReplayReport.checked_table_cells`). It counts ONLY the exact-match
+    branch -- never a skipped non-cell pairing, never a non-PDF cell with no
+    grid to compare against; neither of those verified anything."""
+
+    checked: int
+    findings: tuple[ReplayFinding, ...]
+
+
 def _verify_cited_cell_texts(
     pairings: Iterable[_TextPairing],
     embedded_by_sha: Mapping[str, EmbeddedTableInventory],
-) -> list[ReplayFinding]:
+) -> _CellTextVerification:
     """Compare each table-cell-grounded verbatim text against the cell it cites.
 
     Runs over the SAME grounding pairs the char-span replayer uses -- every
@@ -2915,7 +2974,14 @@ def _verify_cited_cell_texts(
     A disagreement is therefore FAILED and names the row, the column and both
     strings; a cell that exists but records no comparable string is
     UNVERIFIABLE (nothing to compare against, never a silent pass).
+
+    Returns a :class:`_CellTextVerification`: the findings this always produced,
+    PLUS a count of the comparisons that ran and matched. Only the exact-match
+    branch increments that count -- every ``continue`` above it (a non-cell
+    pairing, a non-PDF cell with no grid) verified nothing and is not a checked
+    anything.
     """
+    checked = 0
     findings: list[ReplayFinding] = []
     for pairing in pairings:
         locator = pairing.locator
@@ -2962,7 +3028,17 @@ def _verify_cited_cell_texts(
                     actual=cell,
                 )
             )
-    return findings
+            continue
+        # The exact whole-cell match -- the ONLY branch that ESTABLISHED the
+        # recorded text. Of the `continue`s above, most never reached a
+        # comparison at all (a non-cell pairing, a non-PDF cell, a missing
+        # inventory, a missing cell); the disagreement branch is different --
+        # it DID compare this cell and found the texts differ, and it reports
+        # that as its own FAILED finding. `checked` counts agreements, not
+        # comparisons, so neither kind of `continue` grows it: a disagreement
+        # proves something, but it does not prove the recorded text.
+        checked += 1
+    return _CellTextVerification(checked=checked, findings=tuple(findings))
 
 
 def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_text: bool = False) -> ReplayReport:
@@ -3064,7 +3140,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # table-cell-grounded value's text compared against the cell it cites.
     embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
     inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
-    cell_text_findings = _verify_cited_cell_texts(_dataset_text_pairings(envelope), embedded_by_sha)
+    cell_verification = _verify_cited_cell_texts(_dataset_text_pairings(envelope), embedded_by_sha)
 
     all_findings = (
         tuple(span_findings)
@@ -3073,24 +3149,27 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         + tuple(claim_findings)
         + uncertainty_reconciliation
         + tuple(inventory_findings)
-        + tuple(cell_text_findings)
+        + cell_verification.findings
     )
 
-    # A replay that independently re-sliced ZERO character spans must never
-    # report VERIFIED: that would launder the "verified" label onto an
-    # envelope where nothing about its grounding was actually checked
-    # (either because it has no char-span refs at all, or because every
-    # reachable ref turned into some other finding instead of a clean
-    # check). This is UNVERIFIABLE, not FAILED -- there is no demonstrated
-    # disagreement, only nothing to point to as having passed.
-    if checked == 0:
+    # A replay that verified NOTHING must never report VERIFIED: that would
+    # launder the "verified" label onto an envelope where nothing about its
+    # grounding was actually checked. This is UNVERIFIABLE, not FAILED --
+    # there is no demonstrated disagreement, only nothing to point to as
+    # having passed. The test is now over BOTH kinds of check: an artifact
+    # grounded entirely at table cells re-slices zero char spans yet may have
+    # matched every one of its cells, so a re-sliced char span is no longer the
+    # only thing that counts as "checked something".
+    if checked == 0 and cell_verification.checked == 0:
         all_findings = all_findings + (
             ReplayFinding(
                 category=ReplayOutcome.UNVERIFIABLE,
                 ref_path="<check_char_spans>",
-                reason="independently re-sliced ZERO character spans (total_char_spans="
-                f"{total_char_spans}); a replay cannot report VERIFIED without ever having checked "
-                "a single char-span",
+                reason="independently re-sliced ZERO character spans and matched ZERO table cells "
+                f"(total_char_spans={total_char_spans}); a replay cannot report VERIFIED without at "
+                "least one char span or table cell having been compared AND AGREED. Comparisons may "
+                "still have run here and disagreed -- a disagreement is reported as its own FAILED "
+                "finding and is not silence",
             ),
         )
 
@@ -3105,6 +3184,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         findings=all_findings,
         unchecked_store_claims=tuple(unchecked_store_claims),
         unchecked_semantic_claims=semantic_claims,
+        checked_table_cells=cell_verification.checked,
     )
 
 
@@ -3444,7 +3524,7 @@ def replay_condition_set(
     # text against the cell it cites.
     embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
     inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
-    cell_text_findings = _verify_cited_cell_texts(_condition_set_text_pairings(envelope), embedded_by_sha)
+    cell_verification = _verify_cited_cell_texts(_condition_set_text_pairings(envelope), embedded_by_sha)
     all_findings = (
         tuple(pair_findings)
         + tuple(unit_findings)
@@ -3454,20 +3534,25 @@ def replay_condition_set(
         + uncertainty_reconciliation
         + stitching.findings
         + tuple(inventory_findings)
-        + tuple(cell_text_findings)
+        + cell_verification.findings
     )
 
-    # A replay that independently re-sliced ZERO paired character spans must
-    # never report VERIFIED -- same rule as replay_envelope's, for the same
-    # reason: nothing about this envelope's grounding was actually checked.
-    if checked == 0:
+    # A replay that verified NOTHING must never report VERIFIED -- same rule as
+    # replay_envelope's, for the same reason and widened the same way: a
+    # condition set grounded entirely at table cells (which is exactly the
+    # shape of this codebase's first real stored artifact) re-slices zero paired
+    # char spans yet may have matched every one of its cells, so the guard now
+    # tests both kinds of check, not char spans alone.
+    if checked == 0 and cell_verification.checked == 0:
         all_findings = all_findings + (
             ReplayFinding(
                 category=ReplayOutcome.UNVERIFIABLE,
                 ref_path="<_condition_set_text_pairings>",
-                reason="independently re-sliced ZERO paired character spans (total paired "
-                f"refs={paired_total}); a replay cannot report VERIFIED without ever having "
-                "checked a single char-span",
+                reason="independently re-sliced ZERO paired character spans and matched ZERO table "
+                f"cells (total paired refs={paired_total}); a replay cannot report VERIFIED without "
+                "at least one char span or table cell having been compared AND AGREED. Comparisons "
+                "may still have run here and disagreed -- a disagreement is reported as its own "
+                "FAILED finding and is not silence",
             ),
         )
 
@@ -3482,6 +3567,7 @@ def replay_condition_set(
         unchecked_semantic_claims=semantic_claims,
         attempted_refutations=stitching.attempts,
         support_only_char_spans=support_only_char_spans,
+        checked_table_cells=cell_verification.checked,
     )
 
 
