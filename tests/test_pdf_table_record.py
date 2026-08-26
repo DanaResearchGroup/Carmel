@@ -21,9 +21,15 @@ from dataclasses import replace
 
 import pytest
 
-from carmel.services import pdf_tables
+from carmel.services import pdf_table_record, pdf_tables
 from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.pdf_fragments import GlyphMapping, extract_fragments
+from carmel.services.pdf_fragments import (
+    _PINNED_PYPDF_VERSION,
+    FragmentAvailability,
+    FragmentExtraction,
+    GlyphMapping,
+    extract_fragments,
+)
 from carmel.services.pdf_table_record import (
     _REFUSAL_DIAGNOSTIC_FIELDS,
     INVENTORY_PAYLOAD_KEYS,
@@ -305,8 +311,32 @@ class TestEachWayOfNotReachingAVerdictStaysDistinct:
 
         assert result.status is InventoryVerificationStatus.PAYLOAD_UNREADABLE
 
-    def test_an_unreadable_document_is_engine_unavailable_not_mismatched(self, record: dict) -> None:
-        """Reached with bytes the fragment lane cannot read AT ALL.
+    def test_a_payload_that_cannot_be_canonicalized_is_unreadable_not_mismatched(self, record: dict) -> None:
+        """A compared field the canonical encoder rejects is PAYLOAD_UNREADABLE, not a grid
+        disagreement.
+
+        Reaches the branch AFTER extraction succeeds: footprint, version and sha all check out
+        and the recomputation runs; it is canonicalizing the STORED payload for comparison that
+        raises. A raw float is the encoder's documented refusal (geometry is stored as hex for
+        exactly this reason), so injecting one into a compared field trips it without contriving
+        an unreachable state.
+        """
+        poisoned = {**record, "rows": [*record["rows"], 3.14]}
+
+        result = verify_inventory_record(poisoned, GRID)
+
+        assert result.status is InventoryVerificationStatus.PAYLOAD_UNREADABLE
+        assert result.status is not InventoryVerificationStatus.MISMATCHED
+        assert "not comparable" in result.detail
+
+    def test_a_document_that_defeats_the_engine_is_extraction_failed_not_engine_unavailable(self, record: dict) -> None:
+        """Bytes a HEALTHY pinned engine cannot walk -- here, a non-PDF -- are the record's
+        fault, not the machine's.
+
+        The premise is checked, not assumed: ``extract_fragments`` reports these bytes as
+        ``READER_WALK_FAILED`` (probed in the contract), which maps to ``EXTRACTION_FAILED``.
+        Asserting it is NOT ``ENGINE_UNAVAILABLE`` is the whole point: a caller told 'could
+        not check here' would retry forever against bytes that will never verify.
 
         The record must claim those bytes as its own, or ``SOURCE_MISMATCH`` fires first and
         this branch is never entered -- which is how an unreachable status survives a suite
@@ -317,14 +347,87 @@ class TestEachWayOfNotReachingAVerdictStaysDistinct:
 
         result = verify_inventory_record(claiming_garbage, garbage)
 
-        assert result.status is InventoryVerificationStatus.ENGINE_UNAVAILABLE
+        assert result.status is InventoryVerificationStatus.EXTRACTION_FAILED
+        assert result.status is not InventoryVerificationStatus.ENGINE_UNAVAILABLE
+        assert "reader_walk_failed" in result.detail
 
-    def test_every_status_is_reachable(self, record: dict) -> None:
+    def test_a_machine_with_no_engine_is_engine_unavailable_not_extraction_failed(
+        self, record: dict, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A missing PDF engine says ENGINE_UNAVAILABLE -- nothing looked at the document.
+
+        This machine HAS pypdf, so the state cannot arise naturally; it is forced by standing
+        in a fragment lane that reports ``ENGINE_ABSENT``, the shape of CI's pypdf-free base
+        job. The opposite of ``EXTRACTION_FAILED``: the record is fine and a retry on a
+        repaired machine can still verify it, so the two must be distinguishable.
+        """
+
+        def engine_absent(_data: bytes) -> FragmentExtraction:
+            return FragmentExtraction(status=FragmentAvailability.ENGINE_ABSENT, lossy=True)
+
+        monkeypatch.setattr(pdf_table_record, "extract_fragments", engine_absent)
+
+        result = verify_inventory_record(record, GRID)
+
+        assert result.status is InventoryVerificationStatus.ENGINE_UNAVAILABLE
+        assert result.status is not InventoryVerificationStatus.EXTRACTION_FAILED
+        assert "engine_absent" in result.detail
+
+    def test_every_unavailable_fragment_status_is_mapped(self) -> None:
+        """The fragment lane -> status mapping is TOTAL over every non-AVAILABLE outcome.
+
+        Enumerates :class:`FragmentAvailability` rather than listing members by hand, so a
+        member added to the fragment lane and left unclassified fails HERE -- loudly, at the
+        seam -- instead of being silently misfiled as a machine fault by a catch-all default.
+        """
+        unavailable = {m for m in FragmentAvailability if m is not FragmentAvailability.AVAILABLE}
+
+        assert set(pdf_table_record._UNAVAILABLE_TO_STATUS) == unavailable, (
+            f"unmapped fragment-lane outcomes: {unavailable - set(pdf_table_record._UNAVAILABLE_TO_STATUS)}"
+        )
+
+    def test_each_engine_ran_failure_maps_by_its_owner(self, record: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Every non-AVAILABLE fragment outcome reaches the status its OWNER dictates.
+
+        ``ENGINE_CONTRADICTED_GATE`` and ``READER_WALK_FAILED`` both ran the pinned engine, so
+        they are constructed with the pinned version; the first is Carmel's gate (machine-side,
+        ENGINE_UNAVAILABLE) and only the second is the document's fault (EXTRACTION_FAILED).
+        Watches each branch fire rather than trusting the table.
+        """
+        cases = {
+            FragmentAvailability.ENGINE_ABSENT: (InventoryVerificationStatus.ENGINE_UNAVAILABLE, ""),
+            FragmentAvailability.ENGINE_REFUSED: (InventoryVerificationStatus.ENGINE_UNAVAILABLE, ""),
+            FragmentAvailability.ENGINE_CONTRADICTED_GATE: (
+                InventoryVerificationStatus.ENGINE_UNAVAILABLE,
+                _PINNED_PYPDF_VERSION,
+            ),
+            FragmentAvailability.READER_WALK_FAILED: (
+                InventoryVerificationStatus.EXTRACTION_FAILED,
+                _PINNED_PYPDF_VERSION,
+            ),
+        }
+        for fragment_status, (expected, version) in cases.items():
+            monkeypatch.setattr(
+                pdf_table_record,
+                "extract_fragments",
+                lambda _data, s=fragment_status, v=version: FragmentExtraction(status=s, lossy=True, pypdf_version=v),
+            )
+
+            result = verify_inventory_record(record, GRID)
+
+            assert result.status is expected, (
+                f"{fragment_status.value} -> {result.status.value}, expected {expected.value}"
+            )
+            assert fragment_status.value in result.detail
+
+    def test_every_status_is_reachable(self, record: dict, monkeypatch: pytest.MonkeyPatch) -> None:
         """Runs each scenario for real and collects what came back.
 
         Deliberately NOT a comparison of the enum against a hand-written set of its own
         members: that shape passes with every code path deleted, which this project has
-        shipped once and caught once.
+        shipped once and caught once. ``ENGINE_UNAVAILABLE`` cannot arise naturally on a
+        machine that has pypdf, so its ONE scenario stands in a fragment lane reporting
+        ``ENGINE_ABSENT`` -- while ``EXTRACTION_FAILED`` is reached for real, with a non-PDF.
         """
         garbage = b"not a pdf at all"
         produced = {
@@ -338,6 +441,13 @@ class TestEachWayOfNotReachingAVerdictStaysDistinct:
             )
         }
         with monkeypatched_unreadable_source():
+            produced.add(verify_inventory_record(record, GRID).status)
+        with monkeypatch.context() as m:
+            m.setattr(
+                pdf_table_record,
+                "extract_fragments",
+                lambda _data: FragmentExtraction(status=FragmentAvailability.ENGINE_ABSENT, lossy=True),
+            )
             produced.add(verify_inventory_record(record, GRID).status)
 
         assert produced == set(InventoryVerificationStatus), (
@@ -454,6 +564,22 @@ class TestTheDeclaredShapeIsTheShapeActuallyWritten:
         it, because the verifier and the builder would still agree with each other.
         """
         assert footprint_unreadable_reason(record) is None
+
+    def test_footprint_unreadable_reason_reports_an_unreadable_footprint(self, record: dict) -> None:
+        """The refusing branch: a footprint replay cannot read returns its failure repr, not
+        ``None``.
+
+        A version-4 footprint missing ``geometry_origin`` is unreadable -- ``_footprint_from``
+        raises ``KeyError`` rather than defaulting to a confident provenance -- and this is the
+        check a schema runs BEFORE citing the record, so its firing must be observable and name
+        the fault.
+        """
+        broken = {**record, "footprint": {k: v for k, v in record["footprint"].items() if k != "geometry_origin"}}
+
+        reason = footprint_unreadable_reason(broken)
+
+        assert reason is not None
+        assert "geometry_origin" in reason
 
     def test_a_real_record_names_each_coordinate_once(self, record: dict) -> None:
         """The third pin, for the rule the schema now enforces on embedded records.

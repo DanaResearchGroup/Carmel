@@ -2776,12 +2776,20 @@ def verify_measured_value_value_boundary(
 
 
 #: How each non-``REPRODUCED`` inventory-verification status maps onto a replay
-#: outcome. The split is the whole point of the six-member enum and must not be
-#: collapsed: a grid that re-derived DIFFERENTLY, or bytes that are not the
-#: document the record names, are definite disagreements (FAILED); an engine
-#: that could not read the document at all, a record shape this code cannot
-#: read, or a machine that cannot identify its own derivation code are
-#: inabilities to check (UNVERIFIABLE), never conflated with VERIFIED.
+#: outcome. FAILED is reserved, in this module's vocabulary, for "a check RAN and
+#: produced a definite disagreement"; every inability to reach a verdict is
+#: UNVERIFIABLE, never conflated with VERIFIED. That line -- not retriability -- is
+#: the one this table draws, exactly as ``test_quantity_kind_other_is_unverifiable_
+#: not_failed`` draws it: a check that could not run is UNVERIFIABLE even when
+#: re-running will never help, because it demonstrated nothing wrong.
+#:
+#: An EXPLICIT total dict, not a "failure set" with an ``else`` default. The old
+#: form mapped two members to FAILED by name and swept everything else into
+#: UNVERIFIABLE; a member added to the enum would then have inherited "could not
+#: check" silently. Every member is named here and the subscript below carries no
+#: default, so an unmapped member raises rather than being misfiled, and
+#: ``test_every_inventory_status_maps_to_a_replay_outcome`` fails the moment one is
+#: added and left out.
 #:
 #: * ``MISMATCHED`` -> FAILED: the recomputation ran and produced a different
 #:   grid. The stored record is not evidence for the cells it claims.
@@ -2793,15 +2801,36 @@ def verify_measured_value_value_boundary(
 #:   shape or version. It never reached a verdict about the grid; a schema-valid
 #:   embedded record cannot reach here, but the honest report if it did is
 #:   inability, not disagreement.
-#: * ``ENGINE_UNAVAILABLE`` -> UNVERIFIABLE: the fragment lane could not read
-#:   the document (not a PDF, or pypdf absent). A property of this machine, not
-#:   of the record -- an honest "could not check".
+#: * ``ENGINE_UNAVAILABLE`` -> UNVERIFIABLE: this machine has no working PDF
+#:   engine (pypdf absent, broken, or a gate the engine contradicted), so nothing
+#:   ever looked at the document. A property of this machine, not of the record --
+#:   fixing the machine and retrying the SAME bytes can still verify.
+#: * ``EXTRACTION_FAILED`` -> UNVERIFIABLE, and the SAME outcome as
+#:   ``ENGINE_UNAVAILABLE`` deliberately, argued here because the split ticket asks
+#:   for the argument when it is not distinguished at this layer. The pinned engine
+#:   was in hand and this document defeated it (not a PDF, truncated, unwalkable),
+#:   so the grid comparison never RAN and nothing was demonstrated wrong. By this
+#:   module's own line, that is UNVERIFIABLE, not FAILED -- the same call the OTHER
+#:   test makes for a permanently-unmodelled unit: an inability that retrying will
+#:   never cure is still an inability, and reporting it as a demonstrated
+#:   disagreement would be the overclaim in the other direction. UNVERIFIABLE never
+#:   passes the record either -- it is not conflated with VERIFIED. What the ticket
+#:   needs distinguished IS distinguished, one layer up: the *status* separates the
+#:   machine's fault (``ENGINE_UNAVAILABLE``, retry may verify) from the record's
+#:   (``EXTRACTION_FAILED``, retry is pointless), and it rides into the finding's
+#:   ``reason`` below, so a retry-driven caller reads the difference where it lives
+#:   rather than inferring it from a coarse tri-state that was never about retries.
 #: * ``IDENTITY_UNAVAILABLE`` -> UNVERIFIABLE: this machine cannot say what its
 #:   own derivation code is (a source-stripped install), so no comparison would
 #:   be honest.
-_INVENTORY_STATUS_IS_FAILURE: frozenset[InventoryVerificationStatus] = frozenset(
-    {InventoryVerificationStatus.MISMATCHED, InventoryVerificationStatus.SOURCE_MISMATCH}
-)
+_INVENTORY_STATUS_TO_OUTCOME: dict[InventoryVerificationStatus, ReplayOutcome] = {
+    InventoryVerificationStatus.MISMATCHED: ReplayOutcome.FAILED,
+    InventoryVerificationStatus.SOURCE_MISMATCH: ReplayOutcome.FAILED,
+    InventoryVerificationStatus.PAYLOAD_UNREADABLE: ReplayOutcome.UNVERIFIABLE,
+    InventoryVerificationStatus.ENGINE_UNAVAILABLE: ReplayOutcome.UNVERIFIABLE,
+    InventoryVerificationStatus.EXTRACTION_FAILED: ReplayOutcome.UNVERIFIABLE,
+    InventoryVerificationStatus.IDENTITY_UNAVAILABLE: ReplayOutcome.UNVERIFIABLE,
+}
 
 
 def _verify_embedded_inventories(
@@ -2854,7 +2883,9 @@ def _verify_embedded_inventories(
         if result.status is InventoryVerificationStatus.REPRODUCED:
             continue
         moved = f" (recorded identities moved: {', '.join(result.identity_moved)})" if result.identity_moved else ""
-        category = ReplayOutcome.FAILED if result.status in _INVENTORY_STATUS_IS_FAILURE else ReplayOutcome.UNVERIFIABLE
+        # REPRODUCED returned above, so `result.status` is always a mapped non-success member;
+        # the subscript raises rather than defaulting if a future member is left unmapped.
+        category = _INVENTORY_STATUS_TO_OUTCOME[result.status]
         findings.append(
             ReplayFinding(
                 category=category,

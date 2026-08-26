@@ -73,6 +73,7 @@ from carmel.services.dataset_producer import (
     ground_quote,
 )
 from carmel.services.dataset_replay import (
+    _INVENTORY_STATUS_TO_OUTCOME,
     AttemptedRefutation,
     RefutationStatus,
     ReplayFinding,
@@ -96,6 +97,7 @@ from carmel.services.extraction_record import (
     store_extraction_record,
 )
 from carmel.services.numeric import QuoteRole
+from carmel.services.pdf_table_record import InventoryVerificationStatus
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     current_sha_for,
@@ -237,10 +239,11 @@ def _assert_unverifiable_only_for_the_value_locators(report, *, checked_spans: i
 
     One MORE unverifiable finding is expected now: the embedded inventory this
     fixture cites is over the artifact's SYNTHETIC text bytes, which are not a
-    PDF, so replay's grid re-derivation honestly reports ENGINE_UNAVAILABLE ->
-    UNVERIFIABLE (the truthful "could not check", never a silent pass). The
-    value cells now genuinely SAY the value's raw_text, so the content check
-    finds no mismatch -- there is still no failure.
+    PDF, so the pinned engine walks them and fails -- replay's grid re-derivation
+    honestly reports EXTRACTION_FAILED, which maps to UNVERIFIABLE (the truthful
+    "could not check", never a silent pass; no grid comparison ran, so nothing
+    was shown to disagree). The value cells now genuinely SAY the value's
+    raw_text, so the content check finds no mismatch -- there is still no failure.
     """
     assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
     assert report.evidence_failures == ()
@@ -248,7 +251,7 @@ def _assert_unverifiable_only_for_the_value_locators(report, *, checked_spans: i
     assert len(inventory_paths) == 1
     inventory_finding = next(f for f in report.findings if f.ref_path in inventory_paths)
     assert inventory_finding.category is ReplayOutcome.UNVERIFIABLE
-    assert "engine_unavailable" in inventory_finding.reason
+    assert "extraction_failed" in inventory_finding.reason
     # The value refs are unverifiable for the non-char-span reason, plus the one
     # inventory that could not be re-derived -- and nothing else.
     assert {finding.ref_path for finding in report.evidence_unverifiable} == _VALUE_REF_PATHS | inventory_paths
@@ -296,8 +299,8 @@ def _tabular_envelope_from_artifact(
     # "r{row}c{col}" never did, which was a fraudulent premise (the value never
     # came from a cell reading "r0c1"), not a property worth preserving. The
     # bytes are still synthetic text, so replay re-derivation of this inventory
-    # is honestly ENGINE_UNAVAILABLE (UNVERIFIABLE) -- see this module's clean-
-    # round-trip assertion.
+    # is honestly EXTRACTION_FAILED (the engine walked non-PDF bytes and failed),
+    # which maps to UNVERIFIABLE -- see this module's clean-round-trip assertion.
     inventory = make_embedded_inventory(
         raw_sha256=sha256,
         cells=tuple((index, 1) for index in range(len(sorted_specs))),
@@ -387,6 +390,27 @@ def _produce_and_load(tmp_path: Path, text: str = _TEXT):
     stored_dataset = store_dataset_envelope(datasets_root, envelope)
     loaded = load_dataset_envelope(datasets_root, stored_dataset.sha256)
     return stored_artifact, loaded
+
+
+class TestInventoryStatusToReplayOutcomeMapping:
+    """The status -> outcome table is total and explicit, so no member is misfiled."""
+
+    def test_every_inventory_status_maps_to_a_replay_outcome(self) -> None:
+        """Enumerate the enum, not a hand-written list, so the guard cannot rot.
+
+        Every non-``REPRODUCED`` member must be a key: ``REPRODUCED`` returns before the table
+        is consulted (a clean check produces no finding), and a ReplayFinding may never be
+        VERIFIED, so it is the one member deliberately absent. A member ADDED to the enum and
+        left unmapped fails here rather than raising a KeyError deep in a replay, or -- worse --
+        being swept into "could not check" by a catch-all default.
+        """
+        expected = {m for m in InventoryVerificationStatus if m is not InventoryVerificationStatus.REPRODUCED}
+
+        assert set(_INVENTORY_STATUS_TO_OUTCOME) == expected, (
+            f"unmapped inventory statuses: {expected - set(_INVENTORY_STATUS_TO_OUTCOME)}"
+        )
+        assert InventoryVerificationStatus.REPRODUCED not in _INVENTORY_STATUS_TO_OUTCOME
+        assert ReplayOutcome.VERIFIED not in _INVENTORY_STATUS_TO_OUTCOME.values()
 
 
 class TestReplayEnvelopeCleanRoundTrip:

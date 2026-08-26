@@ -41,7 +41,7 @@ from typing import Any
 
 from carmel.services import pdf_tables
 from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.pdf_fragments import TextFragment, extract_fragments
+from carmel.services.pdf_fragments import FragmentAvailability, TextFragment, extract_fragments
 from carmel.services.pdf_tables import (
     CellInventory,
     ClaimedFootprint,
@@ -204,8 +204,48 @@ class InventoryVerificationStatus(StrEnum):
     is meant to be checking."""
 
     ENGINE_UNAVAILABLE = "engine_unavailable"
-    """The fragment lane could not read the document at all, so no recomputation happened.
-    A property of this machine, not of the record."""
+    """This machine has no working PDF engine, so nothing ever looked at the document.
+
+    A property of this machine, not of the record -- and now that is the WHOLE truth of it. It
+    covers exactly the fragment-lane outcomes whose owner is the toolchain: pypdf absent
+    (:attr:`~carmel.services.pdf_fragments.FragmentAvailability.ENGINE_ABSENT`), pypdf present
+    but unusable or broken (``ENGINE_REFUSED``), and the front-door capability gate passing an
+    engine that then broke the contract mid-walk (``ENGINE_CONTRADICTED_GATE``). Every one of
+    these says nothing whatsoever about the document -- it was either never read, or it was
+    Carmel's own gate that broke, not the document. Fixing the machine and re-running can still
+    verify the record, so a caller is right to retry later against the SAME bytes.
+
+    It deliberately no longer covers ``READER_WALK_FAILED`` -- the pinned engine reaching this
+    document and failing ON it -- which is :attr:`EXTRACTION_FAILED` below. The old docstring
+    asserted 'a property of this machine' while the code ALSO returned this for that
+    record-side cause; that contradiction was the defect being fixed. The exact fragment-lane
+    -> status assignment is :data:`_UNAVAILABLE_TO_STATUS`."""
+
+    EXTRACTION_FAILED = "extraction_failed"
+    """The pinned engine was in hand and reading THIS document raised, so no fragments came out
+    and no recomputation happened.
+
+    A property of the RECORD's own document, not of this machine's toolchain: the engine that
+    the ``ENGINE_UNAVAILABLE`` states are missing is present and healthy here, and it was this
+    document -- garbage bytes, a non-PDF, a truncated or malformed file, a PDF that defeats the
+    reader -- that could not be turned into fragments. Re-presenting the same bytes to the same
+    pinned engine will not change the result, so a caller driving a RETRY must NOT treat it as
+    it treats ``ENGINE_UNAVAILABLE``: fixing the machine and re-running verifies THAT one and
+    never this. That retriability distinction is the whole reason this is a separate member --
+    it is the signal a retry-driven caller reads, and it is what the old single word destroyed.
+
+    It does NOT, however, promote the replay outcome to a demonstrated failure. No grid
+    comparison ran, so nothing was shown to DISAGREE; replay reports it ``UNVERIFIABLE`` (an
+    honest "could not check", never conflated with verified), the same call this codebase makes
+    for every check that cannot run even when re-running would not help -- see
+    ``carmel.services.dataset_replay._INVENTORY_STATUS_TO_OUTCOME``. The record-vs-machine split
+    lives in THIS status and in the finding's reason, not in that coarser tri-state.
+
+    Honest about its own limit, mirroring the fragment lane's ``READER_WALK_FAILED`` (which is
+    itself deliberately not named ``DOCUMENT_UNREADABLE``): the same guard also catches a
+    transient ``MemoryError`` or a bug inside the reader, so this does NOT assert the document
+    is intrinsically corrupt. What it asserts is the verification consequence, which holds
+    either way -- the record cannot stand as reproduced evidence here."""
 
     IDENTITY_UNAVAILABLE = "identity_unavailable"
     """This machine cannot say what its own derivation code IS, so no comparison is honest.
@@ -581,6 +621,26 @@ def _first_difference(stored: Mapping[str, Any], recomputed: Mapping[str, Any]) 
     return "canonical bytes differ with no differing top-level key"
 
 
+#: Which verification status each NON-``AVAILABLE`` fragment-lane outcome becomes.
+#:
+#: The fragment lane already records WHY it produced nothing
+#: (:class:`~carmel.services.pdf_fragments.FragmentAvailability`); the old code threw that away
+#: and returned ``ENGINE_UNAVAILABLE`` for every cause -- including ``READER_WALK_FAILED``, which
+#: is the document's fault, not the machine's. This is the split made explicit, and it is TOTAL
+#: over the non-available members on purpose: a new fragment-lane state must be classified here,
+#: as machine-side (retry can verify -> :attr:`~InventoryVerificationStatus.ENGINE_UNAVAILABLE`)
+#: or record-side (retry is pointless -> :attr:`~InventoryVerificationStatus.EXTRACTION_FAILED`),
+#: rather than silently inheriting whichever bucket a catch-all happened to pick. The subscript
+#: below carries no default, so an unmapped member raises rather than being misfiled, and
+#: ``test_every_unavailable_fragment_status_is_mapped`` fails the moment one is added and left out.
+_UNAVAILABLE_TO_STATUS: dict[FragmentAvailability, InventoryVerificationStatus] = {
+    FragmentAvailability.ENGINE_ABSENT: InventoryVerificationStatus.ENGINE_UNAVAILABLE,
+    FragmentAvailability.ENGINE_REFUSED: InventoryVerificationStatus.ENGINE_UNAVAILABLE,
+    FragmentAvailability.ENGINE_CONTRADICTED_GATE: InventoryVerificationStatus.ENGINE_UNAVAILABLE,
+    FragmentAvailability.READER_WALK_FAILED: InventoryVerificationStatus.EXTRACTION_FAILED,
+}
+
+
 def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> InventoryVerification:
     """Re-derive the inventory from ``data`` and the STORED footprint, and compare.
 
@@ -613,8 +673,12 @@ def verify_inventory_record(payload: Mapping[str, Any], data: bytes) -> Inventor
     except InventoryIdentityUnavailable as exc:
         return InventoryVerification(InventoryVerificationStatus.IDENTITY_UNAVAILABLE, detail=str(exc))
     if not extraction.available:
+        # The fragment lane's status says WHOSE fault the empty result is; `_UNAVAILABLE_TO_STATUS`
+        # keeps that distinction instead of flattening it to one word. `status` is never AVAILABLE
+        # here (guarded above), so the subscript resolves for every real case and raises only for a
+        # fragment-lane member nobody mapped -- the loud failure the guard test also pins.
         return InventoryVerification(
-            InventoryVerificationStatus.ENGINE_UNAVAILABLE,
+            _UNAVAILABLE_TO_STATUS[extraction.status],
             identity_moved=moved,
             detail=f"fragment lane reported {extraction.status.value}",
         )
