@@ -57,6 +57,7 @@ __all__ = [
     "CellInventory",
     "CellMember",
     "ClaimedFootprint",
+    "FootprintGeometryOrigin",
     "InventoryCell",
     "InventoryRefusal",
     "InventoryRefusalReason",
@@ -404,6 +405,27 @@ class InventoryRefusalReason(StrEnum):
     table with no rows; it is evidence that the box is wrong."""
 
 
+class FootprintGeometryOrigin(StrEnum):
+    """How a footprint's GEOMETRY came to be, recorded so a reader can tell.
+
+    Replay proves one thing about a stored inventory: this BOX over this document
+    still yields this grid. It cannot prove the box is the RIGHT box -- the four
+    edges are a claim no re-derivation touches. That gap is invisible unless the
+    record says where the box came from, so this rides in the serialized footprint
+    (see :func:`~carmel.services.pdf_table_record.footprint_geometry_origin`) and a
+    reader holding only the loaded record can distinguish the two cases.
+
+    Every footprint in the codebase today is :attr:`HAND_DRAWN`: a caller drew the
+    box (:class:`ClaimedFootprint`'s own docstring says so). :attr:`DERIVED` is
+    reserved for the day a footprint is computed from the document rather than
+    asserted, so that a hand-drawn box and a derived one are never byte-identical
+    and never silently conflated.
+    """
+
+    HAND_DRAWN = "hand_drawn"
+    DERIVED = "derived"
+
+
 @dataclass(frozen=True, slots=True)
 class ClaimedFootprint:
     """The box a caller drew, and the caption it says anchors it.
@@ -423,6 +445,11 @@ class ClaimedFootprint:
     caption_text: str
     caption_x_start: float
     caption_baseline_y: float
+    geometry_origin: FootprintGeometryOrigin = FootprintGeometryOrigin.HAND_DRAWN
+    """How these edges came to be. Defaults to :attr:`FootprintGeometryOrigin.HAND_DRAWN`
+    because every caller-drawn box is exactly that, and this is the only origin the
+    codebase produces today; carried in the serialized record so replay's silence about
+    whether the box is correct is at least VISIBLE rather than implicit."""
 
 
 @dataclass(frozen=True, slots=True)

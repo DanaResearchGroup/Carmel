@@ -139,6 +139,9 @@ def inventory_payload(
             "caption_baseline_y": float(700).hex(),
             "caption_text": marker or "Table 1. A fixture, not a table.",
             "caption_x_start": float(72).hex(),
+            # V4 (INVENTORY_PAYLOAD_VERSION == 4) added footprint provenance; a footprint
+            # dict without geometry_origin is PAYLOAD_UNREADABLE, so the fixture carries it.
+            "geometry_origin": "hand_drawn",
             "page": 0,
             "x_end": float(500).hex(),
             "x_start": float(72).hex(),
