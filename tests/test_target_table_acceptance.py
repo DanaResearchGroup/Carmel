@@ -166,6 +166,15 @@ class TestInkContainmentOnTheTargetPage:
         change had silently DROPPED the fragment; measured, that inventory COMPLETES
         with the pressure row reading ``1e`` beside ``e8`` -- so reaching this refusal,
         with this detail, is what proves admission.
+
+        The detail now NAMES that bridging row directly. The guard was refined (i032) to
+        separate a boundary-DESTROYING row from a header with an internal label gap the
+        data fills: it fires by leave-one-out, on the row whose removal REVEALS a hidden
+        column. Here that row is the pressure row at ``y~=51.534`` -- the very row whose
+        admitted, unsplit ``1e9``/``1e8`` ink bridges the value boundary -- so the message
+        pins admission even more sharply than the old "resolves 3 blocks" phrasing did:
+        it says which row erased the boundary, and that it reveals three columns where the
+        collapsed union shows two.
         """
         extraction = _with_the_split_disabled(
             _with_the_degree_glyph_forced_mapped(_without_the_glyph_repair(monkeypatch))
@@ -174,7 +183,10 @@ class TestInkContainmentOnTheTargetPage:
         inventory = build_inventory(extraction, WHOLE_TABLE_RAW_CAPTION)
 
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
-        assert "resolves 3 blocks where the table resolves 2" in inventory.refusals[0].detail
+        detail = inventory.refusals[0].detail
+        assert "reveals 3 columns where the table union resolves 2" in detail
+        # The named row is the bridging pressure row, not just any over-resolving row.
+        assert "y=51.5" in detail
 
     def test_without_the_glyph_repair_the_box_refuses_the_unmapped_member(self, monkeypatch) -> None:
         """The refusal chain's middle link, pinned so the order stays observable: ink
