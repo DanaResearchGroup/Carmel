@@ -45,6 +45,7 @@ from carmel.services.pdf_fragments import TextFragment, extract_fragments
 from carmel.services.pdf_tables import (
     CellInventory,
     ClaimedFootprint,
+    FootprintGeometryOrigin,
     InventoryRefusalReason,
     build_inventory,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "InventoryVerification",
     "InventoryVerificationStatus",
     "compute_inventory_sha",
+    "footprint_geometry_origin",
     "footprint_unreadable_reason",
     "inventory_code_sha256",
     "inventory_record_bytes",
@@ -90,7 +92,16 @@ __all__ = [
 #: members are pinned. Same reasoning as the version-2 bump: no version-2 record exists in any
 #: workspace store, so old records are refused as ``PAYLOAD_UNREADABLE`` rather than read by an
 #: untested compatibility path.
-INVENTORY_PAYLOAD_VERSION = 3
+#:
+#: **Version 4** records footprint PROVENANCE: the serialized ``footprint`` object now carries
+#: ``geometry_origin`` (a :class:`~carmel.services.pdf_tables.FootprintGeometryOrigin` value),
+#: saying whether the box was hand-drawn or derived. Replay proves this box over this document
+#: yields this grid; it can never prove the box is the RIGHT box, and that gap was invisible
+#: while the record was silent about where the four edges came from. Same reasoning as every
+#: prior bump: no version-3 record exists in any workspace store (the condition-set and dataset
+#: envelope stores are empty), so old records are refused as ``PAYLOAD_UNREADABLE`` rather than
+#: read by an untested compatibility path.
+INVENTORY_PAYLOAD_VERSION = 4
 
 #: The names whose within-module closure defines "the derivation this record came from".
 #:
@@ -387,6 +398,7 @@ def inventory_record_payload(inventory: CellInventory, *, raw_sha256: str) -> di
             "caption_baseline_y": _pt(footprint.caption_baseline_y),
             "caption_text": footprint.caption_text,
             "caption_x_start": _pt(footprint.caption_x_start),
+            "geometry_origin": footprint.geometry_origin.value,
             "page": footprint.page,
             "x_end": _pt(footprint.x_end),
             "x_start": _pt(footprint.x_start),
@@ -459,7 +471,28 @@ def _footprint_from(stored: Mapping[str, Any]) -> ClaimedFootprint:
         caption_text=str(stored["caption_text"]),
         caption_x_start=float.fromhex(stored["caption_x_start"]),
         caption_baseline_y=float.fromhex(stored["caption_baseline_y"]),
+        # Required, not defaulted: a version-4 record carries geometry_origin, and a
+        # footprint dict missing it -- or carrying a value outside the enum -- is
+        # PAYLOAD_UNREADABLE (the caller catches the KeyError/ValueError), never a
+        # silent fallback to HAND_DRAWN that would launder an unreadable record into a
+        # confident provenance claim.
+        geometry_origin=FootprintGeometryOrigin(str(stored["geometry_origin"])),
     )
+
+
+def footprint_geometry_origin(payload: Mapping[str, Any]) -> FootprintGeometryOrigin:
+    """The provenance of this record's footprint geometry, off the LOADED record alone.
+
+    The reader half of the version-4 provenance key: a consumer holding only the stored
+    payload -- no live :class:`ClaimedFootprint` -- can still tell a hand-drawn box from a
+    derived one, which is the whole point of persisting it. Reads through the same
+    ``_footprint_from`` the verifier uses, so "can this record be read at all" and "what
+    does it say about its own geometry" cannot answer differently. Raises the members of
+    :data:`_FOOTPRINT_UNREADABLE` for an unreadable footprint, exactly as
+    :func:`footprint_unreadable_reason` reports; guard with that first if the record's
+    provenance is untrusted.
+    """
+    return _footprint_from(payload["footprint"]).geometry_origin
 
 
 def footprint_unreadable_reason(payload: Mapping[str, Any]) -> str | None:
