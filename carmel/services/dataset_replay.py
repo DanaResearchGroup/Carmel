@@ -196,7 +196,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from collections.abc import Set as AbstractSet
 from dataclasses import dataclass
 from enum import StrEnum
@@ -210,10 +210,12 @@ from carmel.schemas.datasets import (
     ConditionSetEnvelope,
     DatasetEnvelope,
     DeviceClassDeclaration,
+    EmbeddedTableInventory,
     MeasuredValue,
     RootSidecarVerification,
     SourceNode,
     SourceRef,
+    TableCellLocator,
     Uncertainty,
     UncertaintyKind,
     UnresolvedSubject,
@@ -241,6 +243,10 @@ from carmel.services.numeric import (
     find_numeral_extent,
     has_clean_token_boundary,
     unit_boundary_violation,
+)
+from carmel.services.pdf_table_record import (
+    InventoryVerificationStatus,
+    verify_inventory_record,
 )
 from carmel.services.stitching import (
     StitchGateUnrunnable,
@@ -1020,6 +1026,62 @@ class ReplayReport:
         return tuple(f for f in self.findings if f.category is ReplayOutcome.UNVERIFIABLE)
 
 
+class _RawBin(NamedTuple):
+    """One node's ``raw.bin`` after a single read-and-hash against ``node.sha256``.
+
+    Read ONCE, in the replay loop, and handed to everything that needs the
+    node's raw bytes -- text re-verification AND the table-inventory
+    re-derivation -- so the two can never observe different bytes for the same
+    document (which would make the two halves of a replay report on different
+    files). ``data`` is the bytes ONLY when they were present and hashed to
+    ``node.sha256``; a missing file (``UNVERIFIABLE``) or a hash mismatch
+    (``FAILED``, positive evidence of tampering) yields ``data=None`` and a
+    ``problem`` naming which."""
+
+    data: bytes | None
+    problem: ReplayFinding | None
+
+
+def _load_and_check_raw_bin(workspace_root: Path, node: SourceNode) -> _RawBin:
+    """Read ``node``'s ``raw.bin`` once and hash it against ``node.sha256``.
+
+    Absence is inability to check: ``raw.bin`` may simply have been
+    garbage-collected or never fetched into this workspace, which says nothing
+    about whether the node's identity is trustworthy -- ``UNVERIFIABLE``. A
+    ``raw.bin`` that IS present but hashes to something other than
+    ``node.sha256`` is different in kind: positive evidence the store's raw
+    bytes were tampered with or corrupted -- ``FAILED``. The two must never be
+    conflated into one outcome."""
+    path = f"source_graph.node({node.node_id!r})"
+    raw_path = artifact_dir(workspace_root, node.sha256) / "raw.bin"
+    try:
+        data = raw_path.read_bytes()
+    except (FileNotFoundError, OSError) as exc:
+        return _RawBin(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.UNVERIFIABLE,
+                ref_path=path,
+                reason=f"no readable raw.bin for node {node.node_id!r} (sha256={node.sha256!r}): {exc}",
+            ),
+        )
+    actual_raw_sha256 = hashlib.sha256(data).hexdigest()
+    if actual_raw_sha256 != node.sha256:
+        return _RawBin(
+            None,
+            ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=path,
+                reason=f"raw.bin on disk for node {node.node_id!r} hashes to {actual_raw_sha256!r}, not "
+                f"the node.sha256={node.sha256!r} it is stored under -- the evidence store's raw bytes "
+                "have been tampered with or corrupted since this node was recorded",
+                expected=node.sha256,
+                actual=actual_raw_sha256,
+            ),
+        )
+    return _RawBin(data, None)
+
+
 class NodeVerification(NamedTuple):
     """Outcome of independently re-verifying one node against the store."""
 
@@ -1038,7 +1100,7 @@ class NodeVerification(NamedTuple):
     record disagreement)."""
 
 
-def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> NodeVerification:
+def _independently_verify_node_text(workspace_root: Path, node: SourceNode, raw_bin: _RawBin) -> NodeVerification:
     """Re-derive ``node``'s extracted text from the evidence store, from
     bytes, independent of anything the envelope itself carries.
 
@@ -1058,11 +1120,15 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
     would authenticate is trivially rewritten by anyone who can write to the
     store, so the envelope's own binding is the only acceptable anchor.
 
-    The node's bytes are checked FIRST and unconditionally: every node
-    admitted into a VERIFIED envelope must have ``raw.bin`` present and
-    hashing to its recorded ``sha256``, whether or not it carries an
-    ExtractionBinding. Only after that check passes does this function look
-    at whether there is any extracted text to re-verify at all.
+    The node's bytes are checked FIRST and unconditionally, by
+    :func:`_load_and_check_raw_bin` in the replay loop: every node admitted
+    into a VERIFIED envelope must have ``raw.bin`` present and hashing to its
+    recorded ``sha256``, whether or not it carries an ExtractionBinding. That
+    check's result is handed in as ``raw_bin`` -- read ONCE so the table-
+    inventory re-derivation and this text re-verification cannot observe
+    different bytes for the same document -- and this function short-circuits
+    on its problem before looking at whether there is any extracted text to
+    re-verify at all.
 
     Returns ``NodeVerification(text, None, False)`` on success, or
     ``NodeVerification(None, finding, problem_is_text_only)`` naming
@@ -1074,42 +1140,10 @@ def _independently_verify_node_text(workspace_root: Path, node: SourceNode) -> N
     """
     path = f"source_graph.node({node.node_id!r})"
     extraction = node.extraction
-    raw_path = artifact_dir(workspace_root, node.sha256) / "raw.bin"
-    try:
-        raw_bin_bytes = raw_path.read_bytes()
-    except (FileNotFoundError, OSError) as exc:
-        # Absence is inability to check: raw.bin may simply have been
-        # garbage-collected or never fetched into this workspace, which says
-        # nothing about whether the node's identity is trustworthy -- report
-        # UNVERIFIABLE, not FAILED. A raw.bin that IS present but hashes to
-        # something other than node.sha256 (below) is different in kind: it
-        # is positive evidence that the store's raw bytes were tampered with
-        # or corrupted, so that case is reported as FAILED instead. The two
-        # must never be conflated into a single outcome.
-        return NodeVerification(
-            None,
-            ReplayFinding(
-                category=ReplayOutcome.UNVERIFIABLE,
-                ref_path=path,
-                reason=f"no readable raw.bin for node {node.node_id!r} (sha256={node.sha256!r}): {exc}",
-            ),
-            False,
-        )
-    actual_raw_sha256 = hashlib.sha256(raw_bin_bytes).hexdigest()
-    if actual_raw_sha256 != node.sha256:
-        return NodeVerification(
-            None,
-            ReplayFinding(
-                category=ReplayOutcome.FAILED,
-                ref_path=path,
-                reason=f"raw.bin on disk for node {node.node_id!r} hashes to {actual_raw_sha256!r}, not "
-                f"the node.sha256={node.sha256!r} it is stored under -- the evidence store's raw bytes "
-                "have been tampered with or corrupted since this node was recorded",
-                expected=node.sha256,
-                actual=actual_raw_sha256,
-            ),
-            False,
-        )
+    if raw_bin.problem is not None:
+        # Missing (UNVERIFIABLE) or tampered (FAILED) raw.bin -- the single
+        # read already classified which, and neither is a text-only problem.
+        return NodeVerification(None, raw_bin.problem, False)
     if isinstance(extraction, Absent):
         return NodeVerification(
             None,
@@ -2717,6 +2751,165 @@ def verify_measured_value_value_boundary(
     return None
 
 
+#: How each non-``REPRODUCED`` inventory-verification status maps onto a replay
+#: outcome. The split is the whole point of the six-member enum and must not be
+#: collapsed: a grid that re-derived DIFFERENTLY, or bytes that are not the
+#: document the record names, are definite disagreements (FAILED); an engine
+#: that could not read the document at all, a record shape this code cannot
+#: read, or a machine that cannot identify its own derivation code are
+#: inabilities to check (UNVERIFIABLE), never conflated with VERIFIED.
+#:
+#: * ``MISMATCHED`` -> FAILED: the recomputation ran and produced a different
+#:   grid. The stored record is not evidence for the cells it claims.
+#: * ``SOURCE_MISMATCH`` -> FAILED: the bytes are not the document the record
+#:   is about. Unreachable on this path (bytes are keyed by the record's own
+#:   ``raw_sha256``), but if it ever fires it is a real contradiction, not an
+#:   inability -- so it fails rather than hiding as "could not check".
+#: * ``PAYLOAD_UNREADABLE`` -> UNVERIFIABLE: this code cannot read the record's
+#:   shape or version. It never reached a verdict about the grid; a schema-valid
+#:   embedded record cannot reach here, but the honest report if it did is
+#:   inability, not disagreement.
+#: * ``ENGINE_UNAVAILABLE`` -> UNVERIFIABLE: the fragment lane could not read
+#:   the document (not a PDF, or pypdf absent). A property of this machine, not
+#:   of the record -- an honest "could not check".
+#: * ``IDENTITY_UNAVAILABLE`` -> UNVERIFIABLE: this machine cannot say what its
+#:   own derivation code is (a source-stripped install), so no comparison would
+#:   be honest.
+_INVENTORY_STATUS_IS_FAILURE: frozenset[InventoryVerificationStatus] = frozenset(
+    {InventoryVerificationStatus.MISMATCHED, InventoryVerificationStatus.SOURCE_MISMATCH}
+)
+
+
+def _verify_embedded_inventories(
+    table_inventories: tuple[EmbeddedTableInventory, ...],
+    raw_bytes_by_sha: Mapping[str, bytes],
+) -> list[ReplayFinding]:
+    """Re-derive every embedded inventory's grid from the document's raw bytes.
+
+    Iterates the EMBEDDED collection, which is unique by ``inventory_sha256``
+    and (by T4/T5) exactly the set any ref cites -- so one PDF re-derivation
+    per inventory, never one per citing cell. The bytes are the ones the replay
+    loop already read and hash-verified; an inventory whose document has no
+    hash-verified bytes in hand (raw.bin missing or tampered -- both already
+    reported against the node) is an inability to re-derive, reported here as
+    UNVERIFIABLE rather than passed over in silence.
+    """
+    findings: list[ReplayFinding] = []
+    for inventory in table_inventories:
+        ref_path = f"table_inventories[{inventory.inventory_sha256!r}]"
+        raw = raw_bytes_by_sha.get(inventory.raw_sha256)
+        if raw is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"inventory {inventory.inventory_sha256!r} names document "
+                    f"{inventory.raw_sha256!r}, but no hash-verified raw bytes for that document are in "
+                    "hand (its raw.bin is missing or tampered -- reported against the node), so its grid "
+                    "could not be re-derived",
+                )
+            )
+            continue
+        # The embedded payload already parsed and self-cohered through T1 when
+        # the envelope validated, so json.loads cannot honestly fail here; it is
+        # guarded only so a corrupted-in-memory object degrades to UNVERIFIABLE
+        # rather than an escaping crash.
+        try:
+            payload = json.loads(inventory.canonical_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"embedded inventory {inventory.inventory_sha256!r} canonical_json does not "
+                    f"parse, so its grid could not be re-derived: {exc!r}",
+                )
+            )
+            continue
+        result = verify_inventory_record(payload, raw)
+        if result.status is InventoryVerificationStatus.REPRODUCED:
+            continue
+        moved = f" (recorded identities moved: {', '.join(result.identity_moved)})" if result.identity_moved else ""
+        category = ReplayOutcome.FAILED if result.status in _INVENTORY_STATUS_IS_FAILURE else ReplayOutcome.UNVERIFIABLE
+        findings.append(
+            ReplayFinding(
+                category=category,
+                ref_path=ref_path,
+                reason=f"re-deriving the grid of inventory {inventory.inventory_sha256!r} from document "
+                f"{inventory.raw_sha256!r} reported {result.status.value!r}: {result.detail}{moved}",
+            )
+        )
+    return findings
+
+
+def _verify_cited_cell_texts(
+    pairings: Iterable[_TextPairing],
+    embedded_by_sha: Mapping[str, EmbeddedTableInventory],
+) -> list[ReplayFinding]:
+    """Compare each table-cell-grounded verbatim text against the cell it cites.
+
+    Runs over the SAME grounding pairs the char-span replayer uses -- every
+    ``SourceRef`` beside the verbatim string it is meant to ground -- so the
+    coverage is exactly ``raw_text``/``unit_raw``/every label and token, and
+    exactly NOT the three ref-only locations (attribution/reason/statement) that
+    ground a location rather than a quoted string. A cell is atomic and a
+    ``TableCellLocator`` has no sub-cell addressing, so the only comparison that
+    means what it says is EXACT equality of the whole cell text against the
+    whole grounded string: a substring match would let ``raw_text="8"`` cite a
+    cell reading ``"1-8"``, which is the very laundering this check abolishes.
+    A disagreement is therefore FAILED and names the row, the column and both
+    strings; a cell that exists but records no comparable string is
+    UNVERIFIABLE (nothing to compare against, never a silent pass).
+    """
+    findings: list[ReplayFinding] = []
+    for pairing in pairings:
+        locator = pairing.locator
+        if not isinstance(locator, TableCellLocator):
+            continue
+        citation = locator.pdf_table_inventory_sha256
+        if not isinstance(citation, str):
+            # Absent citation (a non-PDF cell) -- its legality is the schema's
+            # to judge; there is no grid here to compare against.
+            continue
+        inventory = embedded_by_sha.get(citation)
+        if inventory is None:
+            # V8 makes every present citation resolve to an embedded inventory,
+            # so this is defensive: report inability rather than assume.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=pairing.path,
+                    reason=f"cites inventory {citation!r}, which this envelope does not embed, so its cell "
+                    "text could not be compared",
+                )
+            )
+            continue
+        cell = inventory.cell_text(row=locator.row, col=locator.col)
+        if cell is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=pairing.path,
+                    reason=f"cites row={locator.row}, col={locator.col} in inventory {citation!r}, whose "
+                    "grid records no comparable text at that cell",
+                )
+            )
+            continue
+        if cell != pairing.expected:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=pairing.path,
+                    reason=f"cites row={locator.row}, col={locator.col} in inventory {citation!r}, whose "
+                    f"cell text {cell!r} is not the recorded text {pairing.expected!r} -- a table-cell "
+                    "citation names a whole cell, and the value's text is not what that cell says",
+                    expected=pairing.expected,
+                    actual=cell,
+                )
+            )
+    return findings
+
+
 def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_text: bool = False) -> ReplayReport:
     """Independently re-verify an already-loaded ``envelope`` OBJECT against
     the evidence store rooted at ``workspace_root``.
@@ -2745,8 +2938,14 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     node_level_problems: dict[str, ReplayFinding] = {}
     claim_findings: list[ReplayFinding] = []
     unchecked_store_claims: list[UncheckedStoreClaim] = []
+    raw_bytes_by_sha: dict[str, bytes] = {}
     for node in envelope.source_graph.nodes:
-        text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
+        raw_bin = _load_and_check_raw_bin(workspace_root, node)
+        if raw_bin.data is not None:
+            # Keyed by document digest, so the inventory re-derivation reuses the
+            # SAME bytes this loop already hash-verified -- never a second read.
+            raw_bytes_by_sha[node.sha256] = raw_bin.data
+        text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node, raw_bin)
         if problem is not None:
             node_problems[node.node_id] = problem
             if not problem_is_text_only:
@@ -2805,12 +3004,21 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     uncertainty_reconciliation = _reconcile_uncertainty_sites(envelope, {path for path, _ in uncertainty_sites})
     semantic_claims = _derived_value_claims(envelope, uncertainty_sites)
 
+    # The table lane, made to mean something: every embedded inventory's grid
+    # re-derived from the document's own bytes (T-cell replay), and every
+    # table-cell-grounded value's text compared against the cell it cites.
+    embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
+    inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
+    cell_text_findings = _verify_cited_cell_texts(_dataset_text_pairings(envelope), embedded_by_sha)
+
     all_findings = (
         tuple(span_findings)
         + tuple(unit_findings)
         + node_level_findings
         + tuple(claim_findings)
         + uncertainty_reconciliation
+        + tuple(inventory_findings)
+        + tuple(cell_text_findings)
     )
 
     # A replay that independently re-sliced ZERO character spans must never
@@ -3081,8 +3289,14 @@ def replay_condition_set(
     node_level_problems: dict[str, ReplayFinding] = {}
     claim_findings: list[ReplayFinding] = []
     unchecked_store_claims: list[UncheckedStoreClaim] = []
+    raw_bytes_by_sha: dict[str, bytes] = {}
     for node in envelope.source_graph.nodes:
-        text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node)
+        raw_bin = _load_and_check_raw_bin(workspace_root, node)
+        if raw_bin.data is not None:
+            # Keyed by document digest, so the inventory re-derivation reuses the
+            # SAME bytes this loop already hash-verified -- never a second read.
+            raw_bytes_by_sha[node.sha256] = raw_bin.data
+        text, problem, problem_is_text_only = _independently_verify_node_text(workspace_root, node, raw_bin)
         if problem is not None:
             node_problems[node.node_id] = problem
             if not problem_is_text_only:
@@ -3169,6 +3383,13 @@ def replay_condition_set(
 
     node_level_findings = tuple(node_level_problems.values())
     stitching = _refute_condition_set_stitching(envelope, text_by_node_id, node_problems)
+    # The table lane, on the condition-set side too (Verifier 2 requires BOTH
+    # envelope kinds): re-derive every embedded inventory's grid from the
+    # document bytes, and compare every table-cell-grounded label/token/value
+    # text against the cell it cites.
+    embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
+    inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
+    cell_text_findings = _verify_cited_cell_texts(_condition_set_text_pairings(envelope), embedded_by_sha)
     all_findings = (
         tuple(pair_findings)
         + tuple(unit_findings)
@@ -3177,6 +3398,8 @@ def replay_condition_set(
         + reconciliation_findings
         + uncertainty_reconciliation
         + stitching.findings
+        + tuple(inventory_findings)
+        + tuple(cell_text_findings)
     )
 
     # A replay that independently re-sliced ZERO paired character spans must
