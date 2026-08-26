@@ -617,9 +617,10 @@ class TestSupportThatCouldNotEvenBeLocated:
         # -- there is no failure. `evidence_outcome` is nonetheless UNVERIFIABLE,
         # and for a reason specific to what this envelope cites: the inventory
         # the table cell names is over this node's SYNTHETIC text bytes, which
-        # are not a PDF, so replay's grid re-derivation honestly reports
-        # ENGINE_UNAVAILABLE -> UNVERIFIABLE (the table lane is an evidence check
-        # now, and "could not re-derive" is not "verified"). The attribution
+        # are not a PDF, so the pinned engine walks them and fails -- replay's
+        # grid re-derivation honestly reports EXTRACTION_FAILED -> UNVERIFIABLE
+        # (the table lane is an evidence check now, and "could not re-derive" is
+        # not "verified"). The attribution
         # ref's location still went unresolved, which `overall_outcome` also
         # folds in.
         assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
@@ -627,7 +628,7 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert any(
             f.ref_path.startswith("table_inventories[")
             and f.category is ReplayOutcome.UNVERIFIABLE
-            and "engine_unavailable" in f.reason
+            and "extraction_failed" in f.reason
             for f in report.findings
         )
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE

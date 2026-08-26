@@ -22,8 +22,8 @@ payload's shape, so these build inventories at runtime and assert on outcomes):
 The inventories here are REAL: built by running the production fragment lane
 over a minimal PDF assembled at runtime, so ``verify_inventory_record`` can
 genuinely reproduce them (or catch a corruption as a mismatch) rather than
-report ``ENGINE_UNAVAILABLE`` over bytes that are not a PDF. No paper text
-enters the repo.
+report ``EXTRACTION_FAILED`` over bytes a healthy engine cannot walk. No paper
+text enters the repo.
 """
 
 from __future__ import annotations
