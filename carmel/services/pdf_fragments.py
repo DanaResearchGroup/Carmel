@@ -51,8 +51,10 @@ __all__ = [
     "FragmentExtraction",
     "FragmentPageFailure",
     "GlyphMapping",
+    "GlyphRepair",
     "TextFragment",
     "extract_fragments",
+    "registry_glyph_repairs_for_document",
 ]
 
 logger = logging.getLogger(__name__)
@@ -669,6 +671,46 @@ _GLYPH_VERDICTS: tuple[GlyphVerdict, ...] = (
 )
 
 _assert_no_overlapping_verdicts(_GLYPH_VERDICTS)
+
+
+def registry_glyph_repairs_for_document(document_sha256: str) -> tuple[GlyphRepair, ...]:
+    """The DOCUMENT-scoped glyph REPAIRS the table lane holds in force for this document.
+
+    This is the fragment lane telling the text lane what it repairs -- the seam where the
+    two lanes meet. The table lane runs every fragment of a PDF through :data:`_GLYPH_VERDICTS`
+    (:func:`extract_fragments`); the running-text lane (``carmel.agents.tools.extract`` ->
+    pypdf ``extract_text``) never traverses that path, so its stored characters keep the raw
+    mis-decode. A char-span grounding into that text (``carmel.services.dataset_producer``)
+    consults THIS function so it can name a mis-decode instead of reporting an
+    uninformative "not found" (see ``ground_quote``'s ``repairs`` argument).
+
+    Returns ONLY :class:`GlyphRepair` entries, and only :attr:`GlyphVerdictScope.DOCUMENT`-scoped
+    ones whose ``document_sha256`` matches. Two deliberate exclusions:
+
+    * :class:`GlyphRefusal` entries are omitted: a refusal leaves the impostor's WRONG Latin
+      decode in place (``'e'``, ``'['``), which collides with the same character legitimately
+      elsewhere in the text -- the running-text lane keeps no per-glyph font-program identity,
+      so those cannot be located without re-aligning the two lanes, and refusing every ``'e'``
+      would reject honest text. The impostor direction is therefore a design finding, not a
+      thing this seam can close (see the ticket's Intent and this module's ``GlyphMapping``).
+    * :attr:`GlyphVerdictScope.FONT_PROGRAM`-scoped verdicts are omitted: whether one is in
+      force depends on the embedded program being PRESENT, which a sha-only query cannot
+      confirm without parsing the document, and the same character (a genuine ``φ``, a genuine
+      U+2212 minus) can be correctly decoded elsewhere in the very same file. Including one
+      unconfirmed would refuse a real glyph. The text-lane mis-decodes this closes -- the
+      en-dash, the degree sign, the exponent minus -- are all DOCUMENT-scoped by construction
+      (their character needed document context; see :data:`_GLYPH_VERDICTS`).
+
+    The result never widens the registry's evidence standard (a non-goal); it only re-reads,
+    keyed on the document, repairs the registry already asserts.
+    """
+    return tuple(
+        verdict
+        for verdict in _GLYPH_VERDICTS
+        if isinstance(verdict, GlyphRepair)
+        and verdict.scope is GlyphVerdictScope.DOCUMENT
+        and verdict.document_sha256 == document_sha256
+    )
 
 
 #: Ceiling on the decompressed size of one embedded font program before its sha256 is
