@@ -70,12 +70,27 @@ GRID_CELLS: tuple[tuple[int, int], ...] = tuple((row, col) for row in _GRID_ROWS
 _PLACEHOLDER_SHA = "f" * 64
 
 
+def _cell_text_of(row: int, col: int, texts: dict[tuple[int, int], str] | None) -> str:
+    """The text a fixture cell records: an explicit override where given,
+    otherwise the synthetic ``r{row}c{col}`` marker.
+
+    The override exists so a fixture that CITES a cell from a real value can
+    make the cell say what the value says -- which a table-cell citation now
+    means (see ``carmel.services.dataset_replay``). Without it every fixture
+    cell reads ``r{row}c{col}``, which no real value ever equals, so replay's
+    content check would (correctly) call every such citation a mismatch."""
+    if texts is not None and (row, col) in texts:
+        return texts[(row, col)]
+    return f"r{row}c{col}"
+
+
 def inventory_payload(
     *,
     raw_sha256: str,
     cells: tuple[tuple[int, int], ...] = ((0, 0), (0, 1)),
     refusals: list[dict[str, str]] | None = None,
     marker: str = "",
+    texts: dict[tuple[int, int], str] | None = None,
 ) -> dict[str, Any]:
     """A structurally complete inventory record payload.
 
@@ -107,13 +122,13 @@ def inventory_payload(
                         "fragment_sha256": _PLACEHOLDER_SHA,
                         "glyph_end": None,
                         "glyph_start": None,
-                        "text": f"r{row}c{col}",
+                        "text": _cell_text_of(row, col, texts),
                         "x_end": float(10 * col + 9).hex(),
                         "x_start": float(10 * col).hex(),
                     }
                 ],
                 "row": row,
-                "text": f"r{row}c{col}",
+                "text": _cell_text_of(row, col, texts),
                 "x_end": float(10 * col + 9).hex(),
                 "x_start": float(10 * col).hex(),
             }
@@ -224,9 +239,14 @@ def make_embedded_inventory(
     cells: tuple[tuple[int, int], ...] = ((0, 0), (0, 1)),
     refusals: list[dict[str, str]] | None = None,
     marker: str = "",
+    texts: dict[tuple[int, int], str] | None = None,
 ) -> EmbeddedTableInventory:
-    """An ``EmbeddedTableInventory`` that validates, over ``raw_sha256``."""
-    payload = inventory_payload(raw_sha256=raw_sha256, cells=cells, refusals=refusals, marker=marker)
+    """An ``EmbeddedTableInventory`` that validates, over ``raw_sha256``.
+
+    ``texts`` overrides individual cells' recorded text -- used where a fixture
+    cites a cell from a real value and needs the cell to actually say what the
+    value says (replay now compares the two)."""
+    payload = inventory_payload(raw_sha256=raw_sha256, cells=cells, refusals=refusals, marker=marker, texts=texts)
     canonical = canonical_json_bytes(payload).decode("utf-8")
     inventory = EmbeddedTableInventory(
         inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),

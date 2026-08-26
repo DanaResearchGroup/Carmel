@@ -81,6 +81,7 @@ from carmel.services.dataset_replay import (
     SemanticGap,
     UncheckedSemanticClaim,
     _independently_verify_node_text,
+    _load_and_check_raw_bin,
     check_char_spans,
     replay_envelope,
     verify_measured_value_unit,
@@ -101,7 +102,7 @@ from carmel.services.semantic_deps import (
 )
 from carmel.services.units import TABLE_V1, QuantityKind
 from tests.pypdf_gate import require_pypdf
-from tests.table_inventory_fixtures import inventory_for
+from tests.table_inventory_fixtures import make_embedded_inventory
 
 _NO_INVENTORY = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 """The only legal absence for a table cell with no PDF fragment geometry (V8)."""
@@ -231,15 +232,27 @@ def _assert_unverifiable_only_for_the_value_locators(report, *, checked_spans: i
     anything is broken, but because its values are now located by things this
     runtime cannot re-read. Asserting the bare UNVERIFIABLE would be a test a
     genuine regression also satisfies, so this pins the REASON: the two value
-    refs and nothing else are unverifiable, there are no failures, and every
-    char span that does exist (the units and axis labels) was checked and
-    re-sliced clean.
+    refs are unverifiable, there are no failures, and every char span that does
+    exist (the units and axis labels) was checked and re-sliced clean.
+
+    One MORE unverifiable finding is expected now: the embedded inventory this
+    fixture cites is over the artifact's SYNTHETIC text bytes, which are not a
+    PDF, so replay's grid re-derivation honestly reports ENGINE_UNAVAILABLE ->
+    UNVERIFIABLE (the truthful "could not check", never a silent pass). The
+    value cells now genuinely SAY the value's raw_text, so the content check
+    finds no mismatch -- there is still no failure.
     """
     assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
     assert report.evidence_failures == ()
-    assert {finding.ref_path for finding in report.evidence_unverifiable} == _VALUE_REF_PATHS
-    # Nothing ELSE is wrong: the only findings are those same two.
-    assert {finding.ref_path for finding in report.findings} == _VALUE_REF_PATHS
+    inventory_paths = {f.ref_path for f in report.findings if f.ref_path.startswith("table_inventories[")}
+    assert len(inventory_paths) == 1
+    inventory_finding = next(f for f in report.findings if f.ref_path in inventory_paths)
+    assert inventory_finding.category is ReplayOutcome.UNVERIFIABLE
+    assert "engine_unavailable" in inventory_finding.reason
+    # The value refs are unverifiable for the non-char-span reason, plus the one
+    # inventory that could not be re-derived -- and nothing else.
+    assert {finding.ref_path for finding in report.evidence_unverifiable} == _VALUE_REF_PATHS | inventory_paths
+    assert {finding.ref_path for finding in report.findings} == _VALUE_REF_PATHS | inventory_paths
     assert report.checked_char_spans == checked_spans
     assert report.checked_char_spans == report.total_char_spans
 
@@ -276,7 +289,21 @@ def _tabular_envelope_from_artifact(
     axes: list[AxisDeclaration] = []
     coordinates: list[Coordinate] = []
     observations: list[Observation] = []
-    for index, spec in enumerate(sorted(measurements, key=lambda spec: spec.axis_id)):
+    sorted_specs = sorted(measurements, key=lambda spec: spec.axis_id)
+    # Each value cites its own cell (row=index, col=1). Now that replay compares
+    # a table-cell citation's text against the cell it names, the cited cell has
+    # to actually SAY the value's raw_text -- the old fixture's synthetic
+    # "r{row}c{col}" never did, which was a fraudulent premise (the value never
+    # came from a cell reading "r0c1"), not a property worth preserving. The
+    # bytes are still synthetic text, so replay re-derivation of this inventory
+    # is honestly ENGINE_UNAVAILABLE (UNVERIFIABLE) -- see this module's clean-
+    # round-trip assertion.
+    inventory = make_embedded_inventory(
+        raw_sha256=sha256,
+        cells=tuple((index, 1) for index in range(len(sorted_specs))),
+        texts={(index, 1): spec.value_quote for index, spec in enumerate(sorted_specs)},
+    )
+    for index, spec in enumerate(sorted_specs):
         label_locator = ground_quote(
             grounding.text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence
         )
@@ -317,7 +344,7 @@ def _tabular_envelope_from_artifact(
                     table_key=CaptionLabelKey(kind=TableKeyKind.CAPTION_LABEL, label="Table 1"),
                     # The node's document is the stored artifact, so the citation has to
                     # be built over its real digest -- V8 requires the two to agree.
-                    pdf_table_inventory_sha256=inventory_for(sha256).inventory_sha256,
+                    pdf_table_inventory_sha256=inventory.inventory_sha256,
                 ),
             ),
             unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=unit_locator),
@@ -348,7 +375,7 @@ def _tabular_envelope_from_artifact(
         composition=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         series=(series,),
         conversion_tables=(_ACTIVE.embedded,),
-        table_inventories=(inventory_for(sha256),),
+        table_inventories=(inventory,),
         figure_digitizations=(),
     )
 
@@ -1596,7 +1623,9 @@ class TestIndependentNodeVerificationOutcomeCategories:
             verification=_verification_for(Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)),
             crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
-        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(
+            tmp_path, node, _load_and_check_raw_bin(tmp_path, node)
+        )
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.UNVERIFIABLE
@@ -1625,7 +1654,9 @@ class TestIndependentNodeVerificationOutcomeCategories:
         )
         (record_dir / "meta.json").write_text("{this is not json", encoding="utf-8")
 
-        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(
+            tmp_path, node, _load_and_check_raw_bin(tmp_path, node)
+        )
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.UNVERIFIABLE
@@ -1654,7 +1685,9 @@ class TestIndependentNodeVerificationOutcomeCategories:
         )
         (record_dir / "extracted.json").unlink()
 
-        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(
+            tmp_path, node, _load_and_check_raw_bin(tmp_path, node)
+        )
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.UNVERIFIABLE
@@ -1747,7 +1780,9 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         forged_node, decoy_sha, real_sha = self._forge_record_with(tmp_path, loaded, "extracted_sha256")
 
-        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, forged_node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(
+            tmp_path, forged_node, _load_and_check_raw_bin(tmp_path, forged_node)
+        )
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
@@ -1770,7 +1805,9 @@ class TestReplaySidecarBookkeepingInconsistencyIsFailed:
         _stored_artifact, loaded = _produce_and_load(tmp_path)
         forged_node, decoy_sha, real_sha = self._forge_record_with(tmp_path, loaded, "extracted_text_sha256")
 
-        text, finding, problem_is_text_only = _independently_verify_node_text(tmp_path, forged_node)
+        text, finding, problem_is_text_only = _independently_verify_node_text(
+            tmp_path, forged_node, _load_and_check_raw_bin(tmp_path, forged_node)
+        )
         assert text is None
         assert finding is not None
         assert finding.category is ReplayOutcome.FAILED
