@@ -43,7 +43,9 @@ __all__ = [
     "embed",
     "inventory_for",
     "inventory_payload",
+    "inventory_payload_with_texts",
     "make_embedded_inventory",
+    "make_embedded_inventory_with_texts",
     "sha_of_payload",
 ]
 
@@ -145,6 +147,52 @@ def inventory_payload(
             for row in sorted({row for row, _ in cells})
         ],
     }
+
+
+def inventory_payload_with_texts(
+    *,
+    raw_sha256: str,
+    cell_texts: dict[tuple[int, int], str],
+    marker: str = "",
+) -> dict[str, Any]:
+    """A structurally complete payload whose cells carry CALLER-CHOSEN text.
+
+    :func:`inventory_payload` fixes every cell's text to ``f"r{row}c{col}"``, which
+    is fine for tests about identity or shape but useless for a producer test that
+    must ground a quote whose whole string equals a cell's whole text. This overlays
+    ``cell_texts`` -- ``{(row, col): text}`` -- onto both the cell and its lone member,
+    leaving all the other (fake) values exactly as ``inventory_payload`` sets them.
+    """
+    # Sort the (row, col) keys so the payload -- and thus the inventory sha, computed
+    # from canonical JSON where list order is significant -- is a function of the GRID,
+    # not of the order a caller happened to spell the dict in. This mirrors the payload's
+    # own precedent of sorting a refusal's member digests: which item the derivation listed
+    # first is not identity, the set is.
+    payload = inventory_payload(raw_sha256=raw_sha256, cells=tuple(sorted(cell_texts)), marker=marker)
+    for cell in payload["cells"]:
+        text = cell_texts[(cell["row"], cell["col"])]
+        cell["text"] = text
+        for member in cell["members"]:
+            member["text"] = text
+    return payload
+
+
+def make_embedded_inventory_with_texts(
+    *,
+    raw_sha256: str,
+    cell_texts: dict[tuple[int, int], str],
+    marker: str = "",
+) -> EmbeddedTableInventory:
+    """An ``EmbeddedTableInventory`` whose cells hold ``cell_texts``, at its true address."""
+    payload = inventory_payload_with_texts(raw_sha256=raw_sha256, cell_texts=cell_texts, marker=marker)
+    canonical = canonical_json_bytes(payload).decode("utf-8")
+    inventory = EmbeddedTableInventory(
+        inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        raw_sha256=raw_sha256,
+        canonical_json=canonical,
+    )
+    _BY_INVENTORY_SHA[inventory.inventory_sha256] = inventory
+    return inventory
 
 
 def embed(payload: dict[str, Any], *, raw_sha256: str) -> EmbeddedTableInventory:

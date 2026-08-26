@@ -72,13 +72,19 @@ from pathlib import Path
 from carmel.schemas.datasets import (
     AbsenceReason,
     Absent,
+    CaptionLabelKey,
     ConditionAttribution,
     ConditionSetEnvelope,
     DeviceClassDeclaration,
+    EmbeddedTableInventory,
     GroundedCategoricalClaim,
     GroundedScalarClaim,
+    MemberSheetKey,
+    SourceNode,
+    SourceNodeKind,
     SourceRef,
     SubjectRefusalReason,
+    TableCellLocator,
     UnextractedConditionStatement,
     UnextractedReason,
     UnresolvedSubject,
@@ -92,7 +98,7 @@ from carmel.services.dataset_producer import (
     _prepare_grounding,
     ground_quote,
 )
-from carmel.services.numeric import QuoteRole
+from carmel.services.numeric import GlyphHealth, QuoteRole, SourceContext
 from carmel.services.stitching import (
     StitchGateUnrunnable,
     StitchRefutation,
@@ -104,6 +110,7 @@ __all__ = [
     "ConditionSetProducerError",
     "DeviceClassSpec",
     "ScalarConditionSpec",
+    "TableCellGrounding",
     "UnextractedConditionSpec",
     "UnresolvedSubjectSpec",
     "produce_condition_set_from_artifact",
@@ -137,6 +144,91 @@ def _require_int_occurrences(owner: str, **occurrences: int | None) -> None:
 
 
 @dataclass(frozen=True, slots=True)
+class TableCellGrounding:
+    """Ground ONE quote at a specific cell of a specific PDF table grid.
+
+    This is the input nothing in the codebase supplied before: it names WHICH
+    table (``table_key``), WHERE in it (``row``/``col``), and the extracted
+    inventory that DEFINES that grid (``inventory``). Given one, the producer
+    builds the existing :class:`~carmel.schemas.datasets.TableCellLocator` for the
+    quote instead of a :class:`~carmel.schemas.datasets.CharSpanLocator` -- it is
+    NOT a new locator, it is the missing path to the tiny ordinal-only one the
+    schema already models.
+
+    ``table_key`` is the decision this ticket had to make: no existing spec field
+    carried it. It is the schema's own discriminated union, but only ONE of its two
+    arms is reachable today: a :class:`~carmel.schemas.datasets.CaptionLabelKey`
+    (the printed caption, e.g. ``"Table 1"``) over a ``PAPER_PDF`` node. The union's
+    other arm, :class:`~carmel.schemas.datasets.MemberSheetKey` (a workbook sheet
+    name), is RESERVED and NOT YET REACHABLE: :meth:`_CellCiter.validate` refuses any
+    grounding whose root node is not ``PAPER_PDF``, and a sheet is not a PDF node, so
+    a ``MemberSheetKey`` grounding can only ever be rejected -- do not supply one
+    until that guard is taught to accept a sheet's cells. A key is needed at all
+    because ``row``/``col`` alone are meaningless without saying which of a node's
+    several tables they index into. It is carried on THIS object, alongside the row
+    and column, rather than once per spec, because a single claim can in principle
+    draw its label and its value from two different tables of one document.
+
+    ``inventory`` is embedded, not looked up: the producer places every cited
+    inventory into the envelope's ``table_inventories`` so the citation resolves
+    from the envelope's own bytes, never from an evidence store at replay time.
+    Its ``inventory_sha256`` becomes the locator's ``pdf_table_inventory_sha256``
+    -- which is why the producer NEVER emits an ``Absent`` sha for a cell it
+    grounds: an absent sha is a citation nothing can ever resolve.
+
+    The grounded quote STRING still lives on the spec (``value_quote`` etc.): a
+    cell citation carries no text of its own, so the spec's quote is what the
+    producer holds the cell text to. The two must be EXACTLY equal -- whole cell
+    text against whole quote -- or the producer refuses (the settled matching
+    contract), because "the cell contains my text" would let ``8`` cite a cell
+    reading ``1-8``.
+    """
+
+    table_key: CaptionLabelKey | MemberSheetKey
+    row: int
+    col: int
+    inventory: EmbeddedTableInventory
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.table_key, (CaptionLabelKey, MemberSheetKey)):
+            raise ConditionSetProducerError(
+                f"TableCellGrounding.table_key={self.table_key!r} must be a CaptionLabelKey or "
+                f"MemberSheetKey, not {type(self.table_key).__name__}"
+            )
+        if not isinstance(self.inventory, EmbeddedTableInventory):
+            raise ConditionSetProducerError(
+                f"TableCellGrounding.inventory must be an EmbeddedTableInventory, not "
+                f"{type(self.inventory).__name__} -- the producer embeds it and reads the cell's own "
+                "text from it, so a stand-in that only carries a sha would defeat the exact-equality check"
+            )
+        for name, value in (("row", self.row), ("col", self.col)):
+            # bool is an int subclass; a `True` row is a caller typo, never ordinal 1.
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ConditionSetProducerError(
+                    f"TableCellGrounding.{name}={value!r} must be a non-negative int -- a negative or "
+                    "non-integer ordinal locates no real table cell"
+                )
+
+
+def _reject_cell_with_occurrence(owner: str, **quotes: tuple[int | None, TableCellGrounding | None]) -> None:
+    """Refuse a quote that is BOTH text-disambiguated and cell-grounded.
+
+    An ``occurrence`` disambiguates a substring SEARCH of running text; a
+    ``TableCellGrounding`` says the quote is not in running text at all but at a
+    named grid cell. Supplying both is a contradiction the producer cannot honour,
+    and silently preferring one would ground the quote somewhere the caller did not
+    unambiguously ask for.
+    """
+    for name, (occurrence, cell) in quotes.items():
+        if occurrence is not None and cell is not None:
+            raise ConditionSetProducerError(
+                f"{owner}.{name}: an occurrence ({occurrence!r}) disambiguates a running-text search "
+                "while a TableCellGrounding names a table cell -- a quote cannot be grounded both ways, "
+                "so supply exactly one"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ScalarConditionSpec:
     """One stated condition that resolves to a single grounded number.
 
@@ -154,6 +246,11 @@ class ScalarConditionSpec:
     label_occurrence: int | None = None
     value_occurrence: int | None = None
     unit_occurrence: int | None = None
+    #: Per-quote cell grounding. When set, that quote is located at a table cell
+    #: (a TableCellLocator) instead of searched in running text (a CharSpanLocator).
+    label_cell: TableCellGrounding | None = None
+    value_cell: TableCellGrounding | None = None
+    unit_cell: TableCellGrounding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.quantity_kind, units.QuantityKind):
@@ -168,6 +265,12 @@ class ScalarConditionSpec:
             label_occurrence=self.label_occurrence,
             value_occurrence=self.value_occurrence,
             unit_occurrence=self.unit_occurrence,
+        )
+        _reject_cell_with_occurrence(
+            "ScalarConditionSpec",
+            label=(self.label_occurrence, self.label_cell),
+            value=(self.value_occurrence, self.value_cell),
+            unit=(self.unit_occurrence, self.unit_cell),
         )
 
 
@@ -185,12 +288,19 @@ class CategoricalConditionSpec:
     token_quote: str
     label_occurrence: int | None = None
     token_occurrence: int | None = None
+    label_cell: TableCellGrounding | None = None
+    token_cell: TableCellGrounding | None = None
 
     def __post_init__(self) -> None:
         _require_int_occurrences(
             "CategoricalConditionSpec",
             label_occurrence=self.label_occurrence,
             token_occurrence=self.token_occurrence,
+        )
+        _reject_cell_with_occurrence(
+            "CategoricalConditionSpec",
+            label=(self.label_occurrence, self.label_cell),
+            token=(self.token_occurrence, self.token_cell),
         )
 
 
@@ -212,6 +322,11 @@ class UnextractedConditionSpec:
     quantity_kind: units.QuantityKind | None = None
     label_occurrence: int | None = None
     statement_occurrence: int | None = None
+    #: BOTH refs of an unextracted statement -- its label and the statement itself
+    #: -- can be cell-grounded, so a refused range still points at the cells it
+    #: refused rather than declining to say where it declined.
+    label_cell: TableCellGrounding | None = None
+    statement_cell: TableCellGrounding | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.reason, UnextractedReason):
@@ -233,6 +348,11 @@ class UnextractedConditionSpec:
             "UnextractedConditionSpec",
             label_occurrence=self.label_occurrence,
             statement_occurrence=self.statement_occurrence,
+        )
+        _reject_cell_with_occurrence(
+            "UnextractedConditionSpec",
+            label=(self.label_occurrence, self.label_cell),
+            statement=(self.statement_occurrence, self.statement_cell),
         )
 
 
@@ -268,8 +388,133 @@ class UnresolvedSubjectSpec:
         _require_int_occurrences("UnresolvedSubjectSpec", reason_occurrence=self.reason_occurrence)
 
 
-def _ref(text: str, quote: str, *, role: QuoteRole, occurrence: int | None) -> SourceRef:
-    """Ground ``quote`` in ``text`` and wrap the located span as a ``SourceRef``."""
+def _cell_locator(cell: TableCellGrounding) -> TableCellLocator:
+    """The ordinal-only :class:`TableCellLocator` for one validated cell grounding.
+
+    Always carries a resolvable ``pdf_table_inventory_sha256`` -- the embedded
+    inventory's own address -- never :class:`Absent`: an absent sha is a citation
+    nothing can resolve, and a produced cell citation must be resolvable from the
+    envelope's own bytes. The grounding this is built from is validated by
+    :class:`_CellCiter` first, so building the locator here is pure assembly.
+    """
+    return TableCellLocator(
+        table_key=cell.table_key,
+        row=cell.row,
+        col=cell.col,
+        pdf_table_inventory_sha256=cell.inventory.inventory_sha256,
+    )
+
+
+class _CellCiter:
+    """The producer's single authority on table-cell groundings for one envelope.
+
+    Holds the target node and enforces, ACROSS ALL cells requested in one build:
+
+    * the node is a ``PAPER_PDF`` -- only there does a cell have the fragment
+      geometry an inventory describes, and only there may a locator carry a
+      resolvable ``pdf_table_inventory_sha256``. Any other node kind would demand
+      an ``Absent`` sha, which this producer never emits;
+    * one cell is never asked to be two different strings (the ``TableCellLocator``
+      has no sub-cell addressing, so a value and its unit sharing a cell is
+      unrepresentable and must be refused, not laundered);
+    * every cited cell EXISTS in its inventory, its inventory describes THIS
+      document, and its whole text equals the whole grounded quote exactly.
+
+    Validating the whole batch up front -- before any ref is built -- is what lets
+    the one-cell-two-strings refusal win over the per-cell exact-equality message
+    for the value-and-unit-share-a-cell case, which is the clearer diagnosis.
+    """
+
+    def __init__(self, node: SourceNode) -> None:
+        self._node = node
+        self._inventories: dict[str, EmbeddedTableInventory] = {}
+
+    def validate(self, requests: tuple[tuple[str, str, TableCellGrounding], ...]) -> None:
+        """Refuse any request that cannot become an honest citation; record the rest.
+
+        ``requests`` is ``(owner, quote, cell)`` per grounded quote, where ``owner``
+        names the claim and field for messages and ``quote`` is the exact string the
+        cell must hold. Raises :class:`ConditionSetProducerError` on the first
+        problem; on success every cited inventory is recorded for
+        :meth:`table_inventories`.
+        """
+        if not requests:
+            return
+        if self._node.kind is not SourceNodeKind.PAPER_PDF:
+            owners = sorted({owner for owner, _, _ in requests})
+            raise ConditionSetProducerError(
+                f"cell grounding requested by {owners} but the artifact's root node is "
+                f"{self._node.kind.value!r}, not PAPER_PDF -- only a PDF node's cells have the fragment "
+                "geometry a table inventory describes, and only there may a locator carry a resolvable "
+                "pdf_table_inventory_sha256. Grounding a cell against any other node kind would require an "
+                "Absent sha, which is a citation nothing can resolve and this producer never emits"
+            )
+        # A single cell cannot honestly be two different strings. Checked across the
+        # whole batch first so the value-and-unit-share-a-cell spec is refused with
+        # this precise message rather than a per-cell exact-equality complaint.
+        by_cell: dict[tuple[str, int, int], set[str]] = {}
+        for _owner, quote, cell in requests:
+            by_cell.setdefault((cell.inventory.inventory_sha256, cell.row, cell.col), set()).add(quote)
+        for (inv_sha, row, col), quotes in by_cell.items():
+            if len(quotes) > 1:
+                raise ConditionSetProducerError(
+                    f"cell row={row}, col={col} of inventory {inv_sha!r} is grounded by two different strings "
+                    f"{sorted(quotes)!r} -- a TableCellLocator has row, col, table_key and the inventory sha and "
+                    "no sub-cell addressing whatsoever, so one cell cannot honestly be both; split the datum "
+                    "across two cells or record it as a single grounded string"
+                )
+        for owner, quote, cell in requests:
+            inventory = cell.inventory
+            if inventory.raw_sha256 != self._node.sha256:
+                raise ConditionSetProducerError(
+                    f"{owner}: cell grounding cites inventory {inventory.inventory_sha256!r}, whose grid was "
+                    f"derived from document {inventory.raw_sha256!r}, but the artifact's node is "
+                    f"{self._node.sha256!r} -- the grid describes a different document than the one grounded here"
+                )
+            if not inventory.has_cell(row=cell.row, col=cell.col):
+                raise ConditionSetProducerError(
+                    f"{owner}: cell grounding names row={cell.row}, col={cell.col} in inventory "
+                    f"{inventory.inventory_sha256!r}, whose grid has no such cell -- refusing to emit a citation "
+                    "naming an ordinal the inventory never derived"
+                )
+            actual = inventory.cell_text(row=cell.row, col=cell.col)
+            if actual is None:
+                raise ConditionSetProducerError(
+                    f"{owner}: cell row={cell.row}, col={cell.col} in inventory {inventory.inventory_sha256!r} "
+                    "carries no readable text, so the exact-equality matching contract cannot be checked and the "
+                    "citation cannot be shown true"
+                )
+            if actual != quote:
+                raise ConditionSetProducerError(
+                    f"{owner}: cell row={cell.row}, col={cell.col} in inventory {inventory.inventory_sha256!r} "
+                    f"reads {actual!r}, but the grounded quote is {quote!r} -- the whole cell text must equal the "
+                    "whole grounded string exactly (no substring, prefix or normalisation), or a value of '8' "
+                    "could cite a cell reading '1-8'"
+                )
+            self._inventories[inventory.inventory_sha256] = inventory
+
+    def table_inventories(self) -> tuple[EmbeddedTableInventory, ...]:
+        """Every cited inventory, deduplicated by sha and sorted -- exactly what
+        the envelope's T4 exact-cover and T5 sort-order validators require."""
+        return tuple(sorted(self._inventories.values(), key=lambda inventory: inventory.inventory_sha256))
+
+
+def _ref(
+    text: str,
+    quote: str,
+    *,
+    role: QuoteRole,
+    occurrence: int | None,
+    cell: TableCellGrounding | None = None,
+) -> SourceRef:
+    """Ground ``quote`` and wrap the locator as a ``SourceRef``.
+
+    When ``cell`` is given the quote is located at a table cell (already validated
+    by :class:`_CellCiter`); otherwise it is searched in ``text`` as a character
+    span, byte-for-byte as before -- the char-span path is unchanged.
+    """
+    if cell is not None:
+        return SourceRef(node_id=_ROOT_NODE_ID, locator=_cell_locator(cell))
     return SourceRef(
         node_id=_ROOT_NODE_ID,
         locator=ground_quote(text, quote, role=role, occurrence=occurrence),
@@ -324,6 +569,95 @@ def _duplicate_ids(ids: list[str], *, owner: str) -> None:
                 "must have a unique id, or a per-claim finding cannot say which one it means"
             )
         seen.add(value)
+
+
+def _cell_grounding_requests(
+    scalars: tuple[ScalarConditionSpec, ...],
+    categoricals: tuple[CategoricalConditionSpec, ...],
+    unextracted: tuple[UnextractedConditionSpec, ...],
+) -> tuple[tuple[str, str, TableCellGrounding], ...]:
+    """Every ``(owner, quote, cell)`` a cell must be validated for, across all specs.
+
+    ``owner`` names the claim and field for refusal messages; ``quote`` is the exact
+    string the cell text must equal. Gathered up front so :class:`_CellCiter` can
+    judge the whole batch at once -- collisions and exact-equality alike -- before a
+    single ref is built.
+    """
+    requests: list[tuple[str, str, TableCellGrounding]] = []
+    for scalar in scalars:
+        if scalar.label_cell is not None:
+            requests.append((f"scalar claim {scalar.claim_id!r} label", scalar.label_quote, scalar.label_cell))
+        if scalar.value_cell is not None:
+            requests.append((f"scalar claim {scalar.claim_id!r} value", scalar.value_quote, scalar.value_cell))
+        if scalar.unit_cell is not None:
+            requests.append((f"scalar claim {scalar.claim_id!r} unit", scalar.unit_quote, scalar.unit_cell))
+    for categorical in categoricals:
+        if categorical.label_cell is not None:
+            requests.append(
+                (f"categorical claim {categorical.claim_id!r} label", categorical.label_quote, categorical.label_cell)
+            )
+        if categorical.token_cell is not None:
+            requests.append(
+                (f"categorical claim {categorical.claim_id!r} token", categorical.token_quote, categorical.token_cell)
+            )
+    for statement in unextracted:
+        if statement.label_cell is not None:
+            requests.append(
+                (f"unextracted statement {statement.statement_id!r} label", statement.label_quote, statement.label_cell)
+            )
+        if statement.statement_cell is not None:
+            requests.append(
+                (
+                    f"unextracted statement {statement.statement_id!r} statement",
+                    statement.statement_quote,
+                    statement.statement_cell,
+                )
+            )
+    return tuple(requests)
+
+
+def _scalar_claim(
+    spec: ScalarConditionSpec,
+    text: str,
+    *,
+    document_source_context: SourceContext,
+    document_glyph_health: GlyphHealth,
+) -> GroundedScalarClaim:
+    """One :class:`GroundedScalarClaim`, cell- or char-grounded per its spec.
+
+    The span-stitching refutation runs ONLY for a fully char-span claim. When any of
+    the claim's three grounds is a table cell, the gate is structurally unrunnable --
+    it reads a character window over one text span, and a cell has no such offsets --
+    so ``refute_stitched_claim`` returns ``StitchGateUnrunnable`` and replay records
+    the claim UNVERIFIABLE on that axis. Skipping it here recognises the gate's
+    domain rather than relaxing it: the row/column adjacency a table encodes is not
+    the text co-location the gate attacks, and forcing it to "refuse" would reject
+    every honest table-grounded scalar. The cell citation was already validated by
+    :class:`_CellCiter` (the cell exists, and its whole text equals this quote).
+    """
+    claim = GroundedScalarClaim(
+        claim_id=spec.claim_id,
+        label_raw=spec.label_quote,
+        label_ref=_ref(
+            text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence, cell=spec.label_cell
+        ),
+        value=_measured_value(
+            text,
+            spec,
+            where=f"claim {spec.claim_id!r}",
+            document_source_context=document_source_context,
+            document_glyph_health=document_glyph_health,
+            value_locator=_cell_locator(spec.value_cell) if spec.value_cell is not None else None,
+            unit_locator=_cell_locator(spec.unit_cell) if spec.unit_cell is not None else None,
+        ),
+        # This producer reads no uncertainty from the document. That is a
+        # NOT_EXTRACTED_YET refusal, not an assertion that the paper stated
+        # none -- the two must never conflate.
+        uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+    )
+    if spec.label_cell is None and spec.value_cell is None and spec.unit_cell is None:
+        return _refuse_stitched(claim, text)
+    return claim
 
 
 def produce_condition_set_from_artifact(
@@ -411,6 +745,16 @@ def produce_condition_set_from_artifact(
     )
     text = grounding.text
 
+    # The single authority on cell citations. Every cell grounding requested across
+    # every spec is validated as ONE batch here -- before any ref is built -- so a
+    # cell that does not exist, whose text differs from its quote, or that a value and
+    # a unit both claim, is refused with the clearest message, and the inventories the
+    # envelope must embed are collected exactly once. The subject and attribution are
+    # deliberately NOT cell-groundable: they are the set's provenance frame, not a
+    # datum read out of a grid.
+    citer = _CellCiter(grounding.graph.node(_ROOT_NODE_ID))
+    citer.validate(_cell_grounding_requests(scalars, categoricals, unextracted))
+
     resolved_subject: DeviceClassDeclaration | UnresolvedSubject
     if isinstance(subject, DeviceClassSpec):
         resolved_subject = DeviceClassDeclaration(
@@ -434,24 +778,11 @@ def produce_condition_set_from_artifact(
         )
 
     scalar_claims = tuple(
-        _refuse_stitched(
-            GroundedScalarClaim(
-                claim_id=spec.claim_id,
-                label_raw=spec.label_quote,
-                label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
-                value=_measured_value(
-                    text,
-                    spec,
-                    where=f"claim {spec.claim_id!r}",
-                    document_source_context=grounding.document_source_context,
-                    document_glyph_health=grounding.document_glyph_health,
-                ),
-                # This producer reads no uncertainty from the document. That is a
-                # NOT_EXTRACTED_YET refusal, not an assertion that the paper stated
-                # none -- the two must never conflate.
-                uncertainty=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
-            ),
+        _scalar_claim(
+            spec,
             text,
+            document_source_context=grounding.document_source_context,
+            document_glyph_health=grounding.document_glyph_health,
         )
         for spec in scalars
     )
@@ -459,9 +790,13 @@ def produce_condition_set_from_artifact(
         GroundedCategoricalClaim(
             claim_id=spec.claim_id,
             label_raw=spec.label_quote,
-            label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
+            label_ref=_ref(
+                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence, cell=spec.label_cell
+            ),
             token_raw=spec.token_quote,
-            token_ref=_ref(text, spec.token_quote, role=QuoteRole.VALUE, occurrence=spec.token_occurrence),
+            token_ref=_ref(
+                text, spec.token_quote, role=QuoteRole.VALUE, occurrence=spec.token_occurrence, cell=spec.token_cell
+            ),
         )
         for spec in categoricals
     )
@@ -469,12 +804,15 @@ def produce_condition_set_from_artifact(
         UnextractedConditionStatement(
             statement_id=spec.statement_id,
             label_raw=spec.label_quote,
-            label_ref=_ref(text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence),
+            label_ref=_ref(
+                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence, cell=spec.label_cell
+            ),
             statement_ref=_ref(
                 text,
                 spec.statement_quote,
                 role=QuoteRole.VALUE,
                 occurrence=spec.statement_occurrence,
+                cell=spec.statement_cell,
             ),
             reason=spec.reason,
             quantity_kind=(
@@ -492,12 +830,13 @@ def produce_condition_set_from_artifact(
         # refusal-only condition set is a legitimate result, and it may not
         # carry provenance for a conversion it never performed.
         conversion_tables=(_ACTIVE.embedded,) if scalar_claims else (),
-        # Empty, and structurally so: this producer emits only CHAR_SPAN locators, so
-        # nothing it builds can cite a table inventory, and T4 refuses an embedded
-        # record nothing cites as unearned provenance for the same reason as
-        # conversion_tables above. The table-cell producer does not exist yet; when it
-        # does, THIS field is what it must fill -- never a store lookup at replay time.
-        table_inventories=(),
+        # Exactly the inventories this build's TABLE_CELL locators cite -- collected,
+        # deduplicated and sorted by _CellCiter, filled from the specs and NEVER from a
+        # store lookup at replay time. Empty when nothing was cell-grounded, which keeps
+        # a pure char-span condition set byte-identical to before: T4 refuses a decorative
+        # inventory nothing cites for the same reason conversion_tables above refuses a
+        # decorative table.
+        table_inventories=citer.table_inventories(),
         subject=resolved_subject,
         attribution=attribution,
         attribution_ref=_ref(text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence),
