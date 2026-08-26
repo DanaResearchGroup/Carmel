@@ -117,6 +117,10 @@ from carmel.services.numeric import (
     normalize_numeric_span,
     unit_boundary_violation,
 )
+from carmel.services.pdf_fragments import (
+    GlyphRepair,
+    registry_glyph_repairs_for_document,
+)
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     current_sha_for,
@@ -127,6 +131,7 @@ __all__ = [
     "DatasetProducerError",
     "MeasurementSpec",
     "QuoteGroundingError",
+    "TextLaneMisdecodeError",
     "ground_quote",
     "produce_envelope_from_artifact",
 ]
@@ -215,6 +220,26 @@ class QuoteGroundingError(ValueError):
     unambiguously: empty quote, quote not found, ambiguous quote with no
     explicit occurrence, or an occurrence out of range for the matches
     actually found. Never a silent guess."""
+
+
+class TextLaneMisdecodeError(QuoteGroundingError):
+    """Raised by :func:`ground_quote` when a quote is not found in the text lane
+    AND it contains a character this document is KNOWN to store mis-decoded.
+
+    A :class:`QuoteGroundingError` subclass, so every existing ``except
+    QuoteGroundingError`` / ``pytest.raises(QuoteGroundingError)`` still catches
+    it -- but distinguishable, and carrying the specific mis-decode on
+    :attr:`repair`, so a consumer can tell "this document never carried that
+    character" from "the agent fabricated a quote". This is the closed half of
+    the lane divergence: the table lane repairs the glyph (``carmel.services
+    .pdf_fragments._GLYPH_VERDICTS``); the running-text lane never traverses
+    that path, so a citation quoting the REPAIRED character can never resolve
+    against it. Rather than the bare "not found" that hides WHY, this names the
+    glyph, its stored wrong form, and the table lane that carries the truth."""
+
+    def __init__(self, message: str, *, repair: GlyphRepair) -> None:
+        super().__init__(message)
+        self.repair = repair
 
 
 class DatasetProducerError(ValueError):
@@ -469,6 +494,39 @@ def binding_for_known_sha(sha256: str) -> _ActiveTableBinding | None:
     return _BINDINGS_BY_SHA.get(sha256)
 
 
+def _text_lane_misdecode(quote: str, repairs: tuple[GlyphRepair, ...]) -> TextLaneMisdecodeError | None:
+    """A :class:`TextLaneMisdecodeError` if ``quote`` cites a character the document
+    stores mis-decoded, else ``None``.
+
+    Called ONLY on the not-found path of :func:`ground_quote`: a quote that DID resolve
+    is a genuinely-present character and is never second-guessed here. A quote is a
+    mis-decode citation when it contains the REPLACEMENT character of an in-force
+    :class:`GlyphRepair` -- the character the table lane produces but the text lane never
+    carries, because it stored the raw glyph decode instead. The first such repair (registry
+    order) names the error; a quote rarely cites two repaired characters, and naming one is
+    enough to redirect the consumer to the repaired lane.
+
+    ``glyph_name`` is the wrong form the text lane actually stored: an unmapped marker
+    (``/C14``) for a glyph the document never decoded, or the impostor Latin character
+    (``e``) for one it mis-decoded. Reported verbatim so the reason is checkable against the
+    stored text.
+    """
+    for repair in repairs:
+        if repair.replacement and repair.replacement in quote:
+            display = quote if len(quote) <= 120 else quote[:117] + "..."
+            return TextLaneMisdecodeError(
+                f"ground_quote: quote {display!r} was not found in the text lane, but it contains "
+                f"{repair.replacement!r}, which THIS document stores mis-decoded. The table lane's "
+                f"glyph-verdict registry repairs glyph {repair.glyph_name!r} of embedded font "
+                f"{repair.font_base_name or '(unnamed)'} to {repair.replacement!r}; the running-text "
+                f"lane never traverses that repair path, so it stores the raw mis-decode instead and "
+                f"the repaired character never appears in it. This citation cannot be verified against "
+                f"the text lane -- cite the repaired table cell, which carries {repair.replacement!r}.",
+                repair=repair,
+            )
+    return None
+
+
 def ground_quote(
     text: str,
     quote: str,
@@ -477,9 +535,23 @@ def ground_quote(
     occurrence: int | None = None,
     value_span: tuple[int, int] | None = None,
     quantity: QuantityKind | None = None,
+    repairs: tuple[GlyphRepair, ...] = (),
 ) -> CharSpanLocator:
     """Locate ``quote`` in ``text`` by SEARCHING, returning a half-open
     :class:`CharSpanLocator` over ``TextSpace.EXTRACTED_TEXT``.
+
+    ``repairs`` is the seam where this text-lane grounding meets the table lane's
+    glyph-repair path (:func:`carmel.services.pdf_fragments.registry_glyph_repairs_for_document`,
+    threaded in by :func:`_prepare_grounding`). The running-text lane never runs
+    the repair registry, so its stored characters keep the raw mis-decode; when a
+    quote is NOT found and it contains a character this document is known to store
+    mis-decoded, this raises :class:`TextLaneMisdecodeError` naming the glyph,
+    its stored wrong form and the repaired character, instead of the bare "not
+    found" that hides why. It fires ONLY on the not-found path, so it can never
+    reject a character that is genuinely present and correctly decoded (a real
+    U+2212 minus, a real ``φ``, both of which also occur in these documents) --
+    it only replaces an uninformative miss with a precise one. Empty ``()`` (the
+    default) makes it inert, so every existing call site is unchanged.
 
     ``role`` is required and keyword-only, deliberately with NO default: one
     boundary rule cannot serve every quote's job. A VALUE quote ("1023") and
@@ -645,6 +717,9 @@ def ground_quote(
             "quote to include the adjacent text as its own token if that is what is meant"
         )
     if not starts:
+        misdecode = _text_lane_misdecode(quote, repairs)
+        if misdecode is not None:
+            raise misdecode
         raise QuoteGroundingError(f"ground_quote: quote {display!r} was not found in the supplied text")
     if occurrence is None:
         if len(starts) > 1:
@@ -1100,6 +1175,7 @@ def _measured_value(
     where: str,
     document_source_context: SourceContext,
     document_glyph_health: GlyphHealth,
+    document_glyph_repairs: tuple[GlyphRepair, ...] = (),
     value_locator: TableCellLocator | None = None,
     unit_locator: TableCellLocator | None = None,
 ) -> MeasuredValue:
@@ -1132,7 +1208,11 @@ def _measured_value(
     """
     if value_locator is None:
         char_value_locator = ground_quote(
-            text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence
+            text,
+            spec.value_quote,
+            role=QuoteRole.VALUE,
+            occurrence=spec.value_occurrence,
+            repairs=document_glyph_repairs,
         )
         resolved_value_locator: TableCellLocator | CharSpanLocator = char_value_locator
         # P1: pass the VALUE locator's own span so UNIT's leading-edge digit-glue
@@ -1155,6 +1235,7 @@ def _measured_value(
             occurrence=spec.unit_occurrence,
             value_span=value_span,
             quantity=spec.quantity_kind,
+            repairs=document_glyph_repairs,
         )
     else:
         resolved_unit_locator = unit_locator
@@ -1380,12 +1461,21 @@ class _GroundingContext:
         document_source_context: P1-D canary -- the artifact's REAL source
             context, derived the way ``carmel.services.grounding`` derives it.
         document_glyph_health: P1-D canary -- the artifact's REAL glyph health.
+        glyph_repairs: The DOCUMENT-scoped glyph repairs the table lane holds in
+            force for this document
+            (:func:`carmel.services.pdf_fragments.registry_glyph_repairs_for_document`).
+            This is the lane seam: the text-lane grounding preamble carries what
+            the fragment lane repairs, so :func:`ground_quote` can refuse a
+            citation into a character the text lane stores mis-decoded, naming it.
+            Empty for a document with no in-force repairs (every non-PDF artifact,
+            and any PDF the registry has no verdict for).
     """
 
     text: str
     graph: SourceGraph
     document_source_context: SourceContext
     document_glyph_health: GlyphHealth
+    glyph_repairs: tuple[GlyphRepair, ...]
 
 
 def _prepare_grounding(
@@ -1550,6 +1640,12 @@ def _prepare_grounding(
         graph=graph,
         document_source_context=document_source_context,
         document_glyph_health=document_glyph_health,
+        # The lane seam. Every char-span grounding off this context (ground_quote,
+        # _measured_value, condition_set_producer._ref) is handed these repairs so a
+        # citation into a character the text lane stores mis-decoded is refused with the
+        # mis-decode named -- the table lane's repair conclusions reaching the text lane
+        # that never runs them. Keyed on the raw-bytes sha256 this context authenticated.
+        glyph_repairs=registry_glyph_repairs_for_document(sha256),
     )
 
 

@@ -61,13 +61,18 @@ from carmel.services.condition_set_producer import (
     UnextractedConditionSpec,
     produce_condition_set_from_artifact,
 )
-from carmel.services.dataset_producer import QuoteGroundingError, _prepare_grounding
+from carmel.services.dataset_producer import (
+    TextLaneMisdecodeError,
+    _prepare_grounding,
+    ground_quote,
+)
 from carmel.services.dataset_replay import (
     ReplayOutcome,
     SemanticGap,
     replay_stored_condition_set,
 )
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.numeric import QuoteRole
 from carmel.services.pdf_fragments import extract_fragments
 from carmel.services.pdf_table_record import (
     InventoryVerificationStatus,
@@ -396,8 +401,13 @@ class TestTheTemperatureCannotBeStoredAsAScalar:
             )
 
     def test_grounding_the_unit_in_running_text_is_refused(self, tmp_path: Path) -> None:
-        """The other route: search deg-C in the running text. It is not there (zero U+00B0),
-        so the char-span grounding refuses too."""
+        """The other route: search deg-C in the running text. It is not there (zero U+00B0) --
+        and the refusal now NAMES why (ticket I-019). The degree sign is a KNOWN mis-decode the
+        table lane repairs (glyph /C14 -> '°') and the text lane never does, so grounding raises
+        a ``TextLaneMisdecodeError`` whose reason names the glyph, the repaired character and the
+        table lane -- not a bare 'not found' that hides that this document never carried a '°'
+        in its text lane at all. This is the closed half of the lane divergence, on the real
+        document."""
         workspace, raw = _staged_workspace(tmp_path)
         embedded, _ = _embedded_inventory(raw)
 
@@ -413,7 +423,7 @@ class TestTheTemperatureCannotBeStoredAsAScalar:
             label_cell=cell(7, 0),
             value_cell=cell(7, 1),
         )
-        with pytest.raises(QuoteGroundingError):
+        with pytest.raises(TextLaneMisdecodeError) as excinfo:
             produce_condition_set_from_artifact(
                 workspace,
                 sha256=_DOCUMENT_SHA256,
@@ -422,3 +432,32 @@ class TestTheTemperatureCannotBeStoredAsAScalar:
                 subject=DeviceClassSpec(label_quote=_SUBJECT_QUOTE, label_occurrence=_SUBJECT_OCCURRENCE),
                 scalars=(scalar,),
             )
+        message = str(excinfo.value)
+        assert "°" in message
+        assert "/C14" in message
+        assert "table" in message.lower()
+        assert excinfo.value.repair.replacement == "°"
+
+    def test_grounding_a_real_en_dash_from_the_caption_is_refused_by_name(self, tmp_path: Path) -> None:
+        """The en-dash direction, on the real document, exercised at the seam directly. The
+        caption prints 'Table 1 – Measurement conditions', but the text lane stores the en-dash
+        mis-decoded to the letter 'e' ('Table 1 e Measurement conditions'). A consumer quoting
+        the caption AS PRINTED (with the real en-dash) finds nothing -- and the refusal, carrying
+        the document's in-force repairs from ``_prepare_grounding``, names the en-dash mis-decode
+        rather than implying the caption was fabricated."""
+        workspace, _ = _staged_workspace(tmp_path)
+        grounding = _prepare_grounding(
+            workspace, _DOCUMENT_SHA256, envelope_noun="condition set", envelope_subject="A condition set"
+        )
+        # The seam populated the context with the table lane's DOCUMENT-scoped repairs.
+        assert "–" in {r.replacement for r in grounding.glyph_repairs}
+        assert grounding.text.count("–") == 0  # the text lane never carries the repaired en-dash
+        with pytest.raises(TextLaneMisdecodeError) as excinfo:
+            ground_quote(
+                grounding.text,
+                "Table 1 – Measurement conditions",
+                role=QuoteRole.LABEL,
+                repairs=grounding.glyph_repairs,
+            )
+        assert excinfo.value.repair.replacement == "–"
+        assert "–" in str(excinfo.value)

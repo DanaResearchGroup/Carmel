@@ -99,6 +99,7 @@ from carmel.services.dataset_producer import (
     ground_quote,
 )
 from carmel.services.numeric import GlyphHealth, QuoteRole, SourceContext
+from carmel.services.pdf_fragments import GlyphRepair
 from carmel.services.stitching import (
     StitchGateUnrunnable,
     StitchRefutation,
@@ -505,6 +506,7 @@ def _ref(
     *,
     role: QuoteRole,
     occurrence: int | None,
+    repairs: tuple[GlyphRepair, ...],
     cell: TableCellGrounding | None = None,
 ) -> SourceRef:
     """Ground ``quote`` and wrap the locator as a ``SourceRef``.
@@ -512,12 +514,20 @@ def _ref(
     When ``cell`` is given the quote is located at a table cell (already validated
     by :class:`_CellCiter`); otherwise it is searched in ``text`` as a character
     span, byte-for-byte as before -- the char-span path is unchanged.
+
+    ``repairs`` is keyword-only and REQUIRED (no default): it is this producer's half
+    of the lane seam -- the table lane's in-force glyph repairs for the document
+    (``grounding.glyph_repairs``), passed through to :func:`ground_quote` so a citation
+    into a character the text lane stores mis-decoded is refused, naming the mis-decode.
+    Required rather than defaulted so a NEW char-span grounding cannot silently
+    reintroduce a text lane that bypasses the repair path -- the omission is a type error
+    at the call, not a quiet regression.
     """
     if cell is not None:
         return SourceRef(node_id=_ROOT_NODE_ID, locator=_cell_locator(cell))
     return SourceRef(
         node_id=_ROOT_NODE_ID,
-        locator=ground_quote(text, quote, role=role, occurrence=occurrence),
+        locator=ground_quote(text, quote, role=role, occurrence=occurrence, repairs=repairs),
     )
 
 
@@ -622,6 +632,7 @@ def _scalar_claim(
     *,
     document_source_context: SourceContext,
     document_glyph_health: GlyphHealth,
+    document_glyph_repairs: tuple[GlyphRepair, ...],
 ) -> GroundedScalarClaim:
     """One :class:`GroundedScalarClaim`, cell- or char-grounded per its spec.
 
@@ -639,7 +650,12 @@ def _scalar_claim(
         claim_id=spec.claim_id,
         label_raw=spec.label_quote,
         label_ref=_ref(
-            text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence, cell=spec.label_cell
+            text,
+            spec.label_quote,
+            role=QuoteRole.LABEL,
+            occurrence=spec.label_occurrence,
+            repairs=document_glyph_repairs,
+            cell=spec.label_cell,
         ),
         value=_measured_value(
             text,
@@ -647,6 +663,7 @@ def _scalar_claim(
             where=f"claim {spec.claim_id!r}",
             document_source_context=document_source_context,
             document_glyph_health=document_glyph_health,
+            document_glyph_repairs=document_glyph_repairs,
             value_locator=_cell_locator(spec.value_cell) if spec.value_cell is not None else None,
             unit_locator=_cell_locator(spec.unit_cell) if spec.unit_cell is not None else None,
         ),
@@ -744,6 +761,10 @@ def produce_condition_set_from_artifact(
         workspace_root, sha256, envelope_noun="condition set", envelope_subject="A condition set"
     )
     text = grounding.text
+    # The lane seam, on the condition-set side: every char-span grounding below is handed the
+    # table lane's in-force glyph repairs for this document, so a citation into a character the
+    # text lane stores mis-decoded is refused with the mis-decode named (see ground_quote).
+    repairs = grounding.glyph_repairs
 
     # The single authority on cell citations. Every cell grounding requested across
     # every spec is validated as ONE batch here -- before any ref is built -- so a
@@ -764,6 +785,7 @@ def produce_condition_set_from_artifact(
                 subject.label_quote,
                 role=QuoteRole.LABEL,
                 occurrence=subject.label_occurrence,
+                repairs=repairs,
             ),
         )
     else:
@@ -774,6 +796,7 @@ def produce_condition_set_from_artifact(
                 subject.reason_quote,
                 role=QuoteRole.LABEL,
                 occurrence=subject.reason_occurrence,
+                repairs=repairs,
             ),
         )
 
@@ -783,6 +806,7 @@ def produce_condition_set_from_artifact(
             text,
             document_source_context=grounding.document_source_context,
             document_glyph_health=grounding.document_glyph_health,
+            document_glyph_repairs=repairs,
         )
         for spec in scalars
     )
@@ -791,11 +815,21 @@ def produce_condition_set_from_artifact(
             claim_id=spec.claim_id,
             label_raw=spec.label_quote,
             label_ref=_ref(
-                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence, cell=spec.label_cell
+                text,
+                spec.label_quote,
+                role=QuoteRole.LABEL,
+                occurrence=spec.label_occurrence,
+                repairs=repairs,
+                cell=spec.label_cell,
             ),
             token_raw=spec.token_quote,
             token_ref=_ref(
-                text, spec.token_quote, role=QuoteRole.VALUE, occurrence=spec.token_occurrence, cell=spec.token_cell
+                text,
+                spec.token_quote,
+                role=QuoteRole.VALUE,
+                occurrence=spec.token_occurrence,
+                repairs=repairs,
+                cell=spec.token_cell,
             ),
         )
         for spec in categoricals
@@ -805,13 +839,19 @@ def produce_condition_set_from_artifact(
             statement_id=spec.statement_id,
             label_raw=spec.label_quote,
             label_ref=_ref(
-                text, spec.label_quote, role=QuoteRole.LABEL, occurrence=spec.label_occurrence, cell=spec.label_cell
+                text,
+                spec.label_quote,
+                role=QuoteRole.LABEL,
+                occurrence=spec.label_occurrence,
+                repairs=repairs,
+                cell=spec.label_cell,
             ),
             statement_ref=_ref(
                 text,
                 spec.statement_quote,
                 role=QuoteRole.VALUE,
                 occurrence=spec.statement_occurrence,
+                repairs=repairs,
                 cell=spec.statement_cell,
             ),
             reason=spec.reason,
@@ -839,7 +879,9 @@ def produce_condition_set_from_artifact(
         table_inventories=citer.table_inventories(),
         subject=resolved_subject,
         attribution=attribution,
-        attribution_ref=_ref(text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence),
+        attribution_ref=_ref(
+            text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence, repairs=repairs
+        ),
         scalar_claims=scalar_claims,
         categorical_claims=categorical_claims,
         unextracted=unextracted_statements,
