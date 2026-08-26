@@ -923,50 +923,58 @@ class TestTheGapClassifierHonoursItsOwnContract:
 
 
 class TestNothingCheckedIsNeverQuietlyClean:
-    """Zero re-sliced spans must be SAID, not merely reflected in a counter.
+    """Checking NOTHING must be SAID, not merely reflected in a counter.
 
     ``evidence_outcome`` already reports UNVERIFIABLE when nothing was
     checked, so the outcome alone cannot tell this case apart from a dozen
     others. The explicit finding is what makes "the replayer checked nothing
     here" legible to an operator instead of inferable from arithmetic.
+
+    "Nothing checked" is WIDER than "no char span re-sliced" (I-027): a
+    table-cell text comparison that ran and MATCHED is also a real check, so
+    the zero-check finding fires only when NEITHER a char span was re-sliced
+    NOR a cell was matched. The first test below pins that widening (matched
+    cells suppress the finding); the second pins that the guarantee survives it
+    (nothing checked by ANY means still reports why).
     """
 
-    def test_an_envelope_with_no_char_span_pairs_reports_why(self, tmp_path: Path) -> None:
+    def _cell(self, inventory_sha: str, col: int) -> SourceRef:
+        return SourceRef(
+            node_id="paper",
+            locator=TableCellLocator(
+                table_key=CaptionLabelKey(label="Table 1"),
+                row=0,
+                col=col,
+                pdf_table_inventory_sha256=inventory_sha,
+            ),
+        )
+
+    def test_matched_cells_are_counted_so_the_zero_check_finding_does_not_fire(self, tmp_path: Path) -> None:
         # Two distinct cells, because a cell is atomic and a table-cell citation
         # names a WHOLE cell: the label and the token are different strings, so
-        # they cannot honestly cite one cell (replay now compares the two). Each
-        # cell says exactly what the ref it grounds says, so there is no content
-        # mismatch -- what this test is about is that NONE of these refs is a
-        # char span, so nothing is re-sliceable.
+        # they cannot honestly cite one cell (replay compares the two). Each cell
+        # says exactly what the ref it grounds says, so BOTH comparisons match.
+        # None of these refs is a char span -- yet the artifact is not "nothing
+        # checked": it compared two cells and they held. That is exactly the
+        # conflation I-027 dissolves, so the zero-check finding must NOT fire.
         inventory = make_embedded_inventory(
             raw_sha256=_ROOT_RAW_SHA,
             cells=((0, 1), (0, 2)),
             texts={(0, 1): _LABEL_QUOTE, (0, 2): _TOKEN_QUOTE},
         )
 
-        def _cell(col: int) -> SourceRef:
-            return SourceRef(
-                node_id="paper",
-                locator=TableCellLocator(
-                    table_key=CaptionLabelKey(label="Table 1"),
-                    row=0,
-                    col=col,
-                    pdf_table_inventory_sha256=inventory.inventory_sha256,
-                ),
-            )
-
         envelope = _minimal_condition_set(
             tmp_path,
-            # The unresolved arm carries no label pair at all, and both
-            # categorical refs are table cells, so NOTHING is re-sliceable.
-            subject=UnresolvedSubject(reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=_cell(1)),
+            subject=UnresolvedSubject(
+                reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=self._cell(inventory.inventory_sha256, 1)
+            ),
             categorical_claims=(
                 GroundedCategoricalClaim(
                     claim_id="diluent",
                     label_raw=_LABEL_QUOTE,
-                    label_ref=_cell(1),
+                    label_ref=self._cell(inventory.inventory_sha256, 1),
                     token_raw=_TOKEN_QUOTE,
-                    token_ref=_cell(2),
+                    token_ref=self._cell(inventory.inventory_sha256, 2),
                 ),
             ),
         )
@@ -974,11 +982,59 @@ class TestNothingCheckedIsNeverQuietlyClean:
         report = replay_condition_set(tmp_path, envelope)
 
         assert report.checked_char_spans == 0
+        # The label and token cells were both compared and matched -- counted.
+        assert report.checked_table_cells == 2
+        # So the zero-check finding must NOT be present: something WAS checked.
+        assert not any(finding.ref_path == "<_condition_set_text_pairings>" for finding in report.findings), (
+            f"matched cells are a real check; the zero-check finding must not fire. findings={report.findings}"
+        )
+        # Still UNVERIFIABLE overall, but on other accounts (the unchecked
+        # attribution/reason semantic claims, and the synthetic bytes' grid not
+        # re-deriving), never for having checked nothing.
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+
+    def test_an_envelope_whose_cells_all_disagree_checks_nothing_and_reports_why(self, tmp_path: Path) -> None:
+        # Both categorical refs cite cells that EXIST but whose text does not
+        # match what the ref grounds (the grid says "n2"/"co2 diluted", the refs
+        # ground "diluent"/"CO2"), so each comparison RUNS and DISAGREES -- no
+        # cell is COUNTED as a successful check. No ref is a char span either.
+        # So nothing was successfully checked by any means, and the producer must
+        # still emit the zero-check finding -- exactly the guarantee this class
+        # exists for, now that a matched cell (the sibling above) no longer
+        # trivially satisfies it.
+        inventory = make_embedded_inventory(
+            raw_sha256=_ROOT_RAW_SHA,
+            cells=((0, 1), (0, 2)),
+            texts={(0, 1): "n2", (0, 2): "co2 diluted"},
+        )
+
+        envelope = _minimal_condition_set(
+            tmp_path,
+            subject=UnresolvedSubject(
+                reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=self._cell(inventory.inventory_sha256, 1)
+            ),
+            categorical_claims=(
+                GroundedCategoricalClaim(
+                    claim_id="diluent",
+                    label_raw=_LABEL_QUOTE,
+                    label_ref=self._cell(inventory.inventory_sha256, 1),
+                    token_raw=_TOKEN_QUOTE,
+                    token_ref=self._cell(inventory.inventory_sha256, 2),
+                ),
+            ),
+        )
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        assert report.checked_char_spans == 0
+        # Every cell comparison disagreed, so none is counted as a check.
+        assert report.checked_table_cells == 0
         assert any(
             finding.ref_path == "<_condition_set_text_pairings>" and finding.category is ReplayOutcome.UNVERIFIABLE
             for finding in report.findings
-        ), f"a replay that re-sliced nothing must say so. findings={report.findings}"
-        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+        ), f"a replay that successfully checked nothing must say so. findings={report.findings}"
+        # A disagreement is a demonstrated failure and outranks everything else.
+        assert report.overall_outcome is ReplayOutcome.FAILED
 
 
 class TestUncertaintyBoundsAreReachedByTheGenericEnumerator:
