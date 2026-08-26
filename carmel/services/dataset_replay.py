@@ -1628,6 +1628,30 @@ def _measured_value_text_pairings(envelope: object) -> Iterator[_TextPairing]:
         )
 
 
+def _label_token_policy(locator: object, fields: tuple[str, str]) -> tuple[str, str] | None:
+    """The ``uncompensated_fields`` a label/token pairing carries, given its locator.
+
+    Returns ``None`` -- meaning the char-span kernel in :func:`_replay_text_pairings`
+    stays SILENT on a non-``CharSpanLocator`` and leaves the verdict to another gate
+    -- ONLY when :func:`_verify_cited_cell_texts` will compare this cell, which is
+    exactly a ``TableCellLocator`` carrying a PRESENT (``str``) inventory citation.
+    That mirrors that gate's own admission test one-for-one (it ``continue``s past
+    every non-``TableCellLocator`` and past a cell whose ``pdf_table_inventory_sha256``
+    is :class:`Absent`, the non-PDF case).
+
+    For every other shape -- a ``BBoxLocator``, an ``XPathLocator``, or a table cell
+    with an ``Absent`` citation -- there is NO compensating gate, so the pairing keeps
+    ``fields`` and the kernel keeps reporting it UNVERIFIABLE. Flipping those to
+    ``None`` would be a silencing, not a correction: text nobody can prove would
+    vanish from the report with no gate having checked it. PR #24 added the cell-text
+    gate but left this policy hard-coded to ``fields`` everywhere; this narrows the
+    flip to precisely the cells that gate covers.
+    """
+    if isinstance(locator, TableCellLocator) and isinstance(locator.pdf_table_inventory_sha256, str):
+        return None
+    return fields
+
+
 def _dataset_text_pairings(envelope: DatasetEnvelope) -> Iterator[_TextPairing]:
     """Enumerate, BY HAND, every grounding pair a :class:`DatasetEnvelope` exposes.
 
@@ -1646,7 +1670,7 @@ def _dataset_text_pairings(envelope: DatasetEnvelope) -> Iterator[_TextPairing]:
                 axis.label_ref.node_id,
                 axis.label_ref.locator,
                 axis.label_raw,
-                uncompensated_fields=("label_ref", "label_raw"),
+                uncompensated_fields=_label_token_policy(axis.label_ref.locator, ("label_ref", "label_raw")),
             )
 
 
@@ -1674,7 +1698,7 @@ def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_Te
             envelope.subject.label_ref.node_id,
             envelope.subject.label_ref.locator,
             envelope.subject.label_raw,
-            uncompensated_fields=("label_ref", "label_raw"),
+            uncompensated_fields=_label_token_policy(envelope.subject.label_ref.locator, ("label_ref", "label_raw")),
         )
     yield from _measured_value_text_pairings(envelope)
     for index, claim in enumerate(envelope.scalar_claims):
@@ -1683,7 +1707,7 @@ def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_Te
             claim.label_ref.node_id,
             claim.label_ref.locator,
             claim.label_raw,
-            uncompensated_fields=("label_ref", "label_raw"),
+            uncompensated_fields=_label_token_policy(claim.label_ref.locator, ("label_ref", "label_raw")),
         )
     for index, categorical_claim in enumerate(envelope.categorical_claims):
         yield _TextPairing(
@@ -1691,14 +1715,14 @@ def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_Te
             categorical_claim.label_ref.node_id,
             categorical_claim.label_ref.locator,
             categorical_claim.label_raw,
-            uncompensated_fields=("label_ref", "label_raw"),
+            uncompensated_fields=_label_token_policy(categorical_claim.label_ref.locator, ("label_ref", "label_raw")),
         )
         yield _TextPairing(
             f"categorical_claims[{index}].token_ref",
             categorical_claim.token_ref.node_id,
             categorical_claim.token_ref.locator,
             categorical_claim.token_raw,
-            uncompensated_fields=("token_ref", "token_raw"),
+            uncompensated_fields=_label_token_policy(categorical_claim.token_ref.locator, ("token_ref", "token_raw")),
         )
     for index, statement in enumerate(envelope.unextracted):
         yield _TextPairing(
@@ -1706,7 +1730,7 @@ def _condition_set_text_pairings(envelope: ConditionSetEnvelope) -> Iterator[_Te
             statement.label_ref.node_id,
             statement.label_ref.locator,
             statement.label_raw,
-            uncompensated_fields=("label_ref", "label_raw"),
+            uncompensated_fields=_label_token_policy(statement.label_ref.locator, ("label_ref", "label_raw")),
         )
 
 
