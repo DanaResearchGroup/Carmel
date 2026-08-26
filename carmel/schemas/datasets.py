@@ -4249,6 +4249,19 @@ class EmbeddedTableInventory(BaseModel):
     run is to have bypassed construction entirely -- and an empty index answers
     every ``has_cell`` with False, which is the fail-closed direction."""
 
+    _cell_text_index: dict[tuple[int, int], str] = PrivateAttr(default_factory=dict)
+    """Maps each ``(row, col)`` to the record's OWN text for that cell, built by
+    T1 in the same loop that built ``_cell_index`` so the two cannot disagree.
+
+    Populated only for cells whose ``"text"`` is a genuine ``str`` -- a cell that
+    omits it, or carries a non-string, is left out, so :meth:`cell_text` answers
+    ``None`` for it (the fail-closed direction). Private and derived for the same
+    reason as ``_cell_index``: it takes no part in serialization, equality, or the
+    content address. It exists so a PRODUCER can enforce that a cell citation it
+    emits names a cell whose whole text equals the whole grounded string -- the
+    settled exact-equality matching contract -- WITHOUT re-parsing ``canonical_json``
+    on every lookup."""
+
     @field_validator("inventory_sha256", "raw_sha256")
     @classmethod
     def _validate_sha256_shape(cls, value: str, info: ValidationInfo) -> str:
@@ -4395,6 +4408,7 @@ class EmbeddedTableInventory(BaseModel):
                 f"is {type(cells).__name__}, not a list, so it describes no grid"
             )
         index: set[tuple[int, int]] = set()
+        text_index: dict[tuple[int, int], str] = {}
         for position, cell in enumerate(cells):
             if not isinstance(cell, dict):
                 raise ValueError(
@@ -4431,11 +4445,20 @@ class EmbeddedTableInventory(BaseModel):
                     "define one value at that position"
                 )
             index.add(position_key)
+            # The record's own text for this cell, captured in the SAME loop so it can
+            # never be read from different bytes than the ordinals were. Only a genuine
+            # str is recorded: a cell that omits "text" or carries a non-string is left
+            # out, and `cell_text` answers None for it -- the fail-closed direction, which
+            # a producer reads as "cannot confirm the exact-equality contract" and refuses.
+            cell_text = cell.get("text")
+            if isinstance(cell_text, str):
+                text_index[position_key] = cell_text
         # Built HERE, in the loop that just proved every ordinal is an integer and unique,
         # so the index and the validation cannot be looking at different bytes. `has_cell`
         # then answers from it instead of re-parsing: a validator's work done once, rather
         # than once per lookup.
         self._cell_index = frozenset(index)
+        self._cell_text_index = text_index
         return self
 
     def has_cell(self, *, row: int, col: int) -> bool:
@@ -4449,6 +4472,27 @@ class EmbeddedTableInventory(BaseModel):
         exactly the input an attacker chooses.
         """
         return (row, col) in self._cell_index
+
+    def cell_text(self, *, row: int, col: int) -> str | None:
+        """This record's OWN text for ``(row, col)``, or ``None`` if it has none.
+
+        Answers from the text index T1 built while validating the same bytes, so
+        it cannot disagree with :meth:`has_cell` or read different bytes than the
+        validator did. ``None`` means the record either does not contain the cell
+        at all or contains it with no genuine string ``"text"`` -- both fail-closed:
+        a producer enforcing the exact-equality matching contract (the whole cell
+        text must equal the whole grounded string) reads ``None`` as "cannot
+        confirm" and REFUSES rather than emitting an unverifiable citation.
+
+        Note the asymmetry with :meth:`has_cell`, and that it is deliberate: a cell
+        can be PRESENT (``has_cell`` True) yet have no readable text here. This
+        schema class never re-derives a grid from a document -- see "SCOPE OF WHAT
+        VALIDATION HERE PROVES" -- so this returns the record's own claimed text and
+        proves nothing about whether that text is what the table actually printed.
+        Only :func:`~carmel.services.pdf_table_record.verify_inventory_record`,
+        holding the real bytes, can establish that.
+        """
+        return self._cell_text_index.get((row, col))
 
 
 class EmbeddedFigureDigitization(BaseModel):

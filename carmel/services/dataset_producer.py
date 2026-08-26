@@ -85,6 +85,7 @@ from carmel.schemas.datasets import (
     SourceNodeKind,
     SourceRef,
     SourceVerification,
+    TableCellLocator,
     TextSpace,
     ValueOrigin,
 )
@@ -1099,13 +1100,25 @@ def _measured_value(
     where: str,
     document_source_context: SourceContext,
     document_glyph_health: GlyphHealth,
+    value_locator: TableCellLocator | None = None,
+    unit_locator: TableCellLocator | None = None,
 ) -> MeasuredValue:
     """Build one grounded :class:`MeasuredValue` from ``spec`` against ``text``.
 
-    Every offset comes from :func:`ground_quote`; ``repairs`` and
-    ``canonical_decimal_value`` are DERIVED from the value quote through the
-    same ``normalize_numeric_span`` call the schema's own validator re-runs
-    (see ``_CONTEXT_FREE_GLYPH_HEALTH``), never asserted independently.
+    ``repairs`` and ``canonical_decimal_value`` are DERIVED from the value quote
+    through the same ``normalize_numeric_span`` call the schema's own validator
+    re-runs (see ``_CONTEXT_FREE_GLYPH_HEALTH``), never asserted independently --
+    this is true wherever the value is LOCATED, because the number is normalized
+    from its printed string, not from its position.
+
+    ``value_locator``/``unit_locator`` let a caller supply an ALREADY-BUILT
+    locator -- a :class:`TableCellLocator` for a datum that came from a table cell
+    rather than running text. When omitted (the default, and the only case the
+    dataset producer uses), each is grounded HERE by :func:`ground_quote` as a
+    character span, byte-for-byte as before. A supplied locator is trusted: the
+    condition-set producer validates a cell citation (the cell exists, its whole
+    text equals the whole quote, no cell is two strings) BEFORE calling this, so
+    the exact-equality contract is enforced once, centrally, not re-derived here.
 
     P1-D: ``document_source_context``/``document_glyph_health`` (the artifact's
     REAL context and glyph health, from :func:`_source_context_for` and
@@ -1117,20 +1130,34 @@ def _measured_value(
     stored, because ``MeasuredValue``'s own validator requires the
     context-free ``repairs`` exactly.
     """
-    value_locator = ground_quote(text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence)
-    # P1: pass the VALUE locator's own span so UNIT's leading-edge digit-glue
-    # exception (see carmel.services.numeric.unit_boundary_violation) can
-    # require the glued digit run to be THIS measurement's own value, not
-    # merely some other clean numeral (e.g. a run id) that happens to sit
-    # before the unit quote.
-    unit_locator = ground_quote(
-        text,
-        spec.unit_quote,
-        role=QuoteRole.UNIT,
-        occurrence=spec.unit_occurrence,
-        value_span=(value_locator.start, value_locator.end),
-        quantity=spec.quantity_kind,
-    )
+    if value_locator is None:
+        char_value_locator = ground_quote(
+            text, spec.value_quote, role=QuoteRole.VALUE, occurrence=spec.value_occurrence
+        )
+        resolved_value_locator: TableCellLocator | CharSpanLocator = char_value_locator
+        # P1: pass the VALUE locator's own span so UNIT's leading-edge digit-glue
+        # exception (see carmel.services.numeric.unit_boundary_violation) can
+        # require the glued digit run to be THIS measurement's own value, not
+        # merely some other clean numeral (e.g. a run id) that happens to sit
+        # before the unit quote.
+        value_span: tuple[int, int] | None = (char_value_locator.start, char_value_locator.end)
+    else:
+        # A cell-located value has no character offsets, so UNIT's digit-glue
+        # exception cannot fire -- value_span=None makes it fail closed, which is
+        # exactly what its docstring says the omitted case does.
+        resolved_value_locator = value_locator
+        value_span = None
+    if unit_locator is None:
+        resolved_unit_locator: TableCellLocator | CharSpanLocator = ground_quote(
+            text,
+            spec.unit_quote,
+            role=QuoteRole.UNIT,
+            occurrence=spec.unit_occurrence,
+            value_span=value_span,
+            quantity=spec.quantity_kind,
+        )
+    else:
+        resolved_unit_locator = unit_locator
     canary = normalize_numeric_span(
         spec.value_quote,
         source_context=document_source_context,
@@ -1176,8 +1203,8 @@ def _measured_value(
         unit_raw=spec.unit_quote,
         unit_normalized=unit_normalized,
         conversion_table_sha256=_ACTIVE.embedded.sha256,
-        value_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=value_locator),
-        unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=unit_locator),
+        value_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_value_locator),
+        unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_unit_locator),
     )
 
 
