@@ -86,7 +86,7 @@ from carmel.services.semantic_deps import (
     current_sha_for,
 )
 from carmel.services.units import TABLE_V1, QuantityKind
-from tests.table_inventory_fixtures import cover_for, inventory_for
+from tests.table_inventory_fixtures import cover_for, inventory_for, make_embedded_inventory
 from tests.test_dataset_replay import (
     MAX_BYTES,
     _store_genuine_extraction_record,
@@ -613,13 +613,23 @@ class TestSupportThatCouldNotEvenBeLocated:
         assert report.total_char_spans == 3
         assert report.checked_char_spans == 3
         assert report.unchecked_char_spans == 0
-        # `evidence_outcome` is VERIFIED here, and that is NOT "everything was
-        # fine": it ranges over CHAR-SPAN quote checks only, and this ref is
-        # not a char span, so it falls outside what that verdict covers. Every
-        # quote that could be compared was compared and matched -- while a
-        # location the envelope cites went unresolved. `overall_outcome` is
-        # the verdict that folds the semantic claim in, and it refuses.
-        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        # Every char-span quote that could be compared was compared and matched
+        # -- there is no failure. `evidence_outcome` is nonetheless UNVERIFIABLE,
+        # and for a reason specific to what this envelope cites: the inventory
+        # the table cell names is over this node's SYNTHETIC text bytes, which
+        # are not a PDF, so replay's grid re-derivation honestly reports
+        # ENGINE_UNAVAILABLE -> UNVERIFIABLE (the table lane is an evidence check
+        # now, and "could not re-derive" is not "verified"). The attribution
+        # ref's location still went unresolved, which `overall_outcome` also
+        # folds in.
+        assert report.evidence_outcome is ReplayOutcome.UNVERIFIABLE
+        assert report.evidence_failures == ()
+        assert any(
+            f.ref_path.startswith("table_inventories[")
+            and f.category is ReplayOutcome.UNVERIFIABLE
+            and "engine_unavailable" in f.reason
+            for f in report.findings
+        )
         assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
         assert claim.gap is SemanticGap.LOCATION_UNRESOLVED
 
@@ -921,27 +931,41 @@ class TestNothingCheckedIsNeverQuietlyClean:
     """
 
     def test_an_envelope_with_no_char_span_pairs_reports_why(self, tmp_path: Path) -> None:
-        table = SourceRef(
-            node_id="paper",
-            locator=TableCellLocator(
-                table_key=CaptionLabelKey(label="Table 1"),
-                row=0,
-                col=1,
-                pdf_table_inventory_sha256=inventory_for(_ROOT_RAW_SHA).inventory_sha256,
-            ),
+        # Two distinct cells, because a cell is atomic and a table-cell citation
+        # names a WHOLE cell: the label and the token are different strings, so
+        # they cannot honestly cite one cell (replay now compares the two). Each
+        # cell says exactly what the ref it grounds says, so there is no content
+        # mismatch -- what this test is about is that NONE of these refs is a
+        # char span, so nothing is re-sliceable.
+        inventory = make_embedded_inventory(
+            raw_sha256=_ROOT_RAW_SHA,
+            cells=((0, 1), (0, 2)),
+            texts={(0, 1): _LABEL_QUOTE, (0, 2): _TOKEN_QUOTE},
         )
+
+        def _cell(col: int) -> SourceRef:
+            return SourceRef(
+                node_id="paper",
+                locator=TableCellLocator(
+                    table_key=CaptionLabelKey(label="Table 1"),
+                    row=0,
+                    col=col,
+                    pdf_table_inventory_sha256=inventory.inventory_sha256,
+                ),
+            )
+
         envelope = _minimal_condition_set(
             tmp_path,
             # The unresolved arm carries no label pair at all, and both
             # categorical refs are table cells, so NOTHING is re-sliceable.
-            subject=UnresolvedSubject(reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=table),
+            subject=UnresolvedSubject(reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=_cell(1)),
             categorical_claims=(
                 GroundedCategoricalClaim(
                     claim_id="diluent",
                     label_raw=_LABEL_QUOTE,
-                    label_ref=table,
+                    label_ref=_cell(1),
                     token_raw=_TOKEN_QUOTE,
-                    token_ref=table,
+                    token_ref=_cell(2),
                 ),
             ),
         )

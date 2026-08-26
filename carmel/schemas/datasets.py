@@ -4491,6 +4491,14 @@ class EmbeddedTableInventory(BaseModel):
         proves nothing about whether that text is what the table actually printed.
         Only :func:`~carmel.services.pdf_table_record.verify_inventory_record`,
         holding the real bytes, can establish that.
+
+        A CONSUMER comparing a stored citation against this reads ``None`` the same
+        fail-closed way, and must keep its two causes apart from a comparison that
+        actually ran: the coordinate is absent from the grid (``has_cell`` False), or
+        it is present but its ``"text"`` was not a string (``has_cell`` True). Both
+        mean *"there is no verbatim string to compare against here"*, which replay
+        surfaces as an INABILITY to compare -- never as a match, and never as a
+        mismatch against ``""``.
         """
         return self._cell_text_index.get((row, col))
 
