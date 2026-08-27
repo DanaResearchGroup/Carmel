@@ -222,7 +222,12 @@ class TestTheFigureLimitIsStatedInTheReport:
         assert len(figure_claims) == 1
         claim = figure_claims[0]
         assert claim.gap is SemanticGap.LOCATION_UNRESOLVED
-        assert claim.claim == env.figure_digitizations[0].digitization_sha256
+        # The claim names the DERIVED value whose support went unchecked -- the series' DIGITIZED
+        # source_form -- never the digitization_sha256 content address (which is not a derived value
+        # and does not identify the recovered coordinates); see
+        # ``test_the_claim_names_a_derived_value_not_the_content_address``.
+        assert claim.claim == "digitized"
+        assert claim.claim != env.figure_digitizations[0].digitization_sha256
         assert "operator attestation replay structurally cannot test" in claim.reason
         # A semantic claim downgrades the overall verdict, exactly as the condition-set
         # attribution claim does -- so a digitized envelope is never VERIFIED overall.
@@ -370,8 +375,40 @@ class TestEveryFailClosedBranchFires:
 
     def test_a_record_that_will_not_reconstruct_is_failed(self) -> None:
         # Address MATCHES (recomputed over the mutated payload), so the parse and address checks
-        # pass; ``from_payload`` then rejects the bumped payload_version. That isolates the
-        # reconstruction branch.
+        # pass; ``from_payload`` then rejects a record whose ``coverage`` is not a FigureCoverage
+        # member. That isolates the reconstruction branch on a payload that is genuinely malformed
+        # at the KNOWN version (``payload_version`` untouched) -- so this keeps testing "the record
+        # is WRONG -> FAILED", the fact it means to pin, rather than the reader's inability to read
+        # an unknown version, which is now a different verdict (see ``test_an_unknown_payload_
+        # version_is_unverifiable_naming_the_version``). Substituting the trigger is honest because
+        # the old ``payload_version = 999`` was only ever a convenient way to reach this branch, not
+        # an assertion about versions; a corrupt ``coverage`` reaches the SAME branch for the reason
+        # the test's name states.
+        env = _valid_envelope()
+        good = env.figure_digitizations[0]
+        payload = json.loads(good.canonical_json)
+        payload["coverage"] = "not-a-real-coverage"
+        canonical = digitization_record_bytes(payload)
+        sha = hashlib.sha256(canonical).hexdigest()
+        broken = EmbeddedFigureDigitization.model_construct(
+            digitization_sha256=sha, raw_sha256=good.raw_sha256, canonical_json=canonical.decode("utf-8")
+        )
+        series = _reconstruct(env.series[0], digitization_sha256=sha)
+        env2 = _reconstruct(env, series=(series,), figure_digitizations=(broken,))
+
+        report = replay_envelope(self._STORE, env2)
+
+        _assert_one(
+            report, path=f"figure_digitizations[{sha!r}]", category=ReplayOutcome.FAILED, marker="does not reconstruct"
+        )
+
+    def test_an_unknown_payload_version_is_unverifiable_naming_the_version(self) -> None:
+        # The pair to the FAILED test above, and the ticket's headline: a record whose ONLY defect
+        # is a payload_version this reader does not know is NOT wrong, merely unreadable here. The
+        # address matches (recomputed over the mutated payload) and the shape is otherwise a legal
+        # version-1 record, so the sole thing ``from_payload`` refuses is the version -- which now
+        # raises ``UnknownPayloadVersion`` and lands UNVERIFIABLE, not FAILED. The reason must NAME
+        # the version, so the report says which shape it could not read.
         env = _valid_envelope()
         good = env.figure_digitizations[0]
         payload = json.loads(good.canonical_json)
@@ -386,8 +423,122 @@ class TestEveryFailClosedBranchFires:
 
         report = replay_envelope(self._STORE, env2)
 
-        _assert_one(
+        finding = _assert_one(
+            report,
+            path=f"figure_digitizations[{sha!r}]",
+            category=ReplayOutcome.UNVERIFIABLE,
+            marker="declares payload_version",
+        )
+        # Naming the version is the whole point: a report that could not name the shape it could not
+        # read would be no better than the plain FAILED it replaces.
+        assert "999" in finding.reason
+        # And it is filed as the reader's admission, never as a charge against the record.
+        assert "newer rather than wrong" in finding.reason
+        # No FAILED "does not reconstruct" leaked out alongside it -- the version arm caught it first.
+        assert not any(
+            f.category is ReplayOutcome.FAILED and "does not reconstruct" in f.reason for f in report.findings
+        )
+
+    def test_a_payload_with_no_version_key_is_failed_and_declares_nothing(self) -> None:
+        # A record whose payload has NO payload_version key at all. The first-cut narrowing read
+        # ``payload.get("payload_version")`` as None, found None != 1, and raised
+        # UnknownPayloadVersion -- reporting a KEYLESS payload as UNVERIFIABLE and, worse, as
+        # "declares payload_version None", a version a payload with no version key never declared.
+        # A payload that declares no version is a MALFORMED record, not a newer one: it falls to the
+        # ordinary shape check, which names the missing key, so the verdict is FAILED and the reason
+        # never claims the record declared a version. This is the pair that proves the boundary was
+        # NARROWED (a keyless payload stays FAILED) rather than moved.
+        env = _valid_envelope()
+        good = env.figure_digitizations[0]
+        payload = json.loads(good.canonical_json)
+        del payload["payload_version"]
+        canonical = digitization_record_bytes(payload)
+        sha = hashlib.sha256(canonical).hexdigest()
+        broken = EmbeddedFigureDigitization.model_construct(
+            digitization_sha256=sha, raw_sha256=good.raw_sha256, canonical_json=canonical.decode("utf-8")
+        )
+        series = _reconstruct(env.series[0], digitization_sha256=sha)
+        env2 = _reconstruct(env, series=(series,), figure_digitizations=(broken,))
+
+        report = replay_envelope(self._STORE, env2)
+
+        finding = _assert_one(
             report, path=f"figure_digitizations[{sha!r}]", category=ReplayOutcome.FAILED, marker="does not reconstruct"
+        )
+        # The shape check names the missing key -- the honest reason -- and never the old overclaim
+        # that the record "declares" a version it has none of.
+        assert "missing keys" in finding.reason and "payload_version" in finding.reason
+        assert "declares payload_version" not in finding.reason
+        # And no UNVERIFIABLE version finding leaked out: a keyless payload is never an unknown VERSION.
+        assert not any(
+            f.category is ReplayOutcome.UNVERIFIABLE and "declares payload_version" in f.reason for f in report.findings
+        )
+
+    def test_a_payload_whose_version_is_the_wrong_type_is_failed(self) -> None:
+        # payload_version present but a STRING "1" -- the same integer spelled as text. This is not a
+        # newer version (a version bump writes a larger INTEGER, it never respells the discriminator);
+        # it is a malformed record, so the verdict is FAILED. The narrowing matters precisely here:
+        # the shape check below PASSES this payload (its key set is exactly right), so without an
+        # explicit type refusal a record whose only defect is a mistyped version would reconstruct
+        # clean and be reported as verified. A version is an ``int`` because ``DIGITIZATION_PAYLOAD_
+        # VERSION`` is one and a version bump only ever raises that integer; a discriminator of a
+        # different type is bytes this reader cannot trust to tell it how to read the rest.
+        env = _valid_envelope()
+        good = env.figure_digitizations[0]
+        payload = json.loads(good.canonical_json)
+        payload["payload_version"] = "1"
+        canonical = digitization_record_bytes(payload)
+        sha = hashlib.sha256(canonical).hexdigest()
+        broken = EmbeddedFigureDigitization.model_construct(
+            digitization_sha256=sha, raw_sha256=good.raw_sha256, canonical_json=canonical.decode("utf-8")
+        )
+        series = _reconstruct(env.series[0], digitization_sha256=sha)
+        env2 = _reconstruct(env, series=(series,), figure_digitizations=(broken,))
+
+        report = replay_envelope(self._STORE, env2)
+
+        finding = _assert_one(
+            report, path=f"figure_digitizations[{sha!r}]", category=ReplayOutcome.FAILED, marker="does not reconstruct"
+        )
+        # A mistyped version is refused as a malformed discriminator, naming the offending type --
+        # never mistaken for an unknown (newer) version.
+        assert "not the integer a version is" in finding.reason
+        assert not any(
+            f.category is ReplayOutcome.UNVERIFIABLE and "declares payload_version" in f.reason for f in report.findings
+        )
+
+    def test_a_boolean_version_does_not_sail_through_as_version_one(self) -> None:
+        # payload_version present as the JSON literal ``true``. ``isinstance(True, int)`` is True and
+        # ``True == DIGITIZATION_PAYLOAD_VERSION`` (both 1), so an int-only gate would let this
+        # OTHERWISE-VALID record reconstruct AS version 1 -- reading a mistyped record as a valid
+        # one. This is why the gate also excludes ``bool``. The defect is invisible to a minimal
+        # probe: ``{"payload_version": True}`` on its own is refused by the key-set check anyway, so
+        # the payload here is a full, valid version-1 record whose ONLY defect is the boolean
+        # version. Removing ``not isinstance(version, bool)`` from ``from_payload`` turns this FAILED
+        # into a silent clean reconstruction, so this test is what pins the exclusion.
+        env = _valid_envelope()
+        good = env.figure_digitizations[0]
+        payload = json.loads(good.canonical_json)
+        assert payload["payload_version"] == 1  # the value True would otherwise compare equal to
+        payload["payload_version"] = True
+        canonical = digitization_record_bytes(payload)
+        sha = hashlib.sha256(canonical).hexdigest()
+        broken = EmbeddedFigureDigitization.model_construct(
+            digitization_sha256=sha, raw_sha256=good.raw_sha256, canonical_json=canonical.decode("utf-8")
+        )
+        series = _reconstruct(env.series[0], digitization_sha256=sha)
+        env2 = _reconstruct(env, series=(series,), figure_digitizations=(broken,))
+
+        report = replay_envelope(self._STORE, env2)
+
+        finding = _assert_one(
+            report, path=f"figure_digitizations[{sha!r}]", category=ReplayOutcome.FAILED, marker="does not reconstruct"
+        )
+        # Refused as a mistyped discriminator, named as a bool -- never accepted as version 1, and
+        # never mistaken for an unknown (newer) version.
+        assert "not the integer a version is" in finding.reason and "bool" in finding.reason
+        assert not any(
+            f.category is ReplayOutcome.UNVERIFIABLE and "declares payload_version" in f.reason for f in report.findings
         )
 
     def test_a_declared_raw_sha256_the_payload_disagrees_with_is_failed(self) -> None:
@@ -752,3 +903,63 @@ class TestFigureClaimAddressesAndGaps:
         # The provenance claim's support names the embedded record carrying the crop identity.
         cited = env.series[0].digitization_sha256
         assert provenance.support_paths == (f"figure_digitizations[{cited!r}]",)
+
+    def test_the_claim_names_a_derived_value_not_the_content_address(self) -> None:
+        """Verifier 4. ``UncheckedSemanticClaim.claim`` must hold the DERIVED value whose support
+        went unchecked -- here the series' recorded DIGITIZED ``source_form`` -- never the
+        ``digitization_sha256`` content address, which is not a derived value and (per the record
+        module) does not even identify the recovered coordinates. Asserted on content, and on the
+        field's hard constraint: it passes through no redaction gate, so it must carry no slice of
+        source text."""
+        env = _valid_envelope()
+
+        report = replay_envelope(Path("/nonexistent-store"), env)
+
+        by_path = {c.claim_path: c for c in report.unchecked_semantic_claims}
+        measurement = by_path["series[0]"]
+        provenance = by_path["series[0].digitization_sha256"]
+        # Both claims name the recovered value's DERIVED classification: the series is DIGITIZED.
+        assert measurement.claim == "digitized"
+        assert provenance.claim == "digitized"
+        # And NOT the content address a first cut used -- the digest names something else entirely.
+        cited = env.series[0].digitization_sha256
+        assert isinstance(cited, str)
+        assert measurement.claim != cited
+        assert cited not in measurement.claim
+        # The redaction-gate constraint, made concrete: no slice of the stored paper text (the one
+        # recorded string this envelope carries, _TEXT) may appear in the ungated claim field.
+        assert measurement.claim not in _TEXT
+        assert _TEXT[:16] not in measurement.claim
+
+
+class TestAnUnrecognisedSourceFormProducesAFinding:
+    """Verifier 5. A ``model_construct`` series whose ``source_form`` is neither a
+    :class:`SourceForm` member nor a recognised member string is one replay cannot classify: the
+    figure joins need it DIGITIZED, the non-digitized citation rule needs it some real non-figure
+    form, and it is neither. Before this fix it took the non-digitized path and, citing nothing,
+    produced NO finding on any axis -- an unclassifiable series waved through in silence. It must
+    now produce a finding saying replay cannot tell what it claims to be."""
+
+    def test_an_unclassifiable_source_form_yields_an_unverifiable_finding(self, tmp_path: Path) -> None:
+        """The honest control (a real non-figure form, properly Absent citation) verifies with no
+        figure finding; the unrecognised form -- the ONLY change -- yields an UNVERIFIABLE finding
+        naming the series. Asserting the split is what pins the fix: on the bug the unrecognised
+        form produced nothing, so a one-sided test would have stayed green."""
+        honest = _char_span_grounded_series_envelope(tmp_path, SourceForm.TEXTUAL)
+        honest_report = replay_envelope(tmp_path, honest)
+        assert honest_report.overall_outcome is ReplayOutcome.VERIFIED
+        assert _figure_findings(honest_report) == [], [f.reason for f in _figure_findings(honest_report)]
+
+        unclassifiable = _char_span_grounded_series_envelope(tmp_path, "marginalia")
+        report = replay_envelope(tmp_path, unclassifiable)
+
+        # ABSENT-on-the-bug: the unfixed lane files no figure finding for this series at all.
+        finding = _assert_one(
+            report, path="series[0]", category=ReplayOutcome.UNVERIFIABLE, marker="no recognised source form"
+        )
+        # It NAMES the series and the offending form, and it is the reader's inability, never a
+        # charge -- so the report is no longer VERIFIED, but nothing is DEMONSTRATED wrong.
+        assert "'s1'" in finding.reason
+        assert "'marginalia'" in finding.reason
+        assert report.overall_outcome is not ReplayOutcome.VERIFIED
+        assert not any(f.category is ReplayOutcome.FAILED for f in _figure_findings(report))

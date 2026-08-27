@@ -252,6 +252,7 @@ from carmel.services.extraction_record import (
 from carmel.services.figure_digitization_record import (
     UNREADABLE_PAYLOAD,
     FigureDigitization,
+    UnknownPayloadVersion,
     compute_digitization_sha,
 )
 from carmel.services.numeric import (
@@ -3074,12 +3075,18 @@ def _verify_cited_cell_texts(
 
 
 def _claims_digitized(source_form: object) -> bool:
-    """Whether ``source_form`` claims to be DIGITIZED, by the SAME value-equality test the schema
-    uses -- deliberately ``==``, never ``is``.
+    """Whether ``source_form`` claims to be DIGITIZED, by the SAME value-equality test the VALUE-REF
+    validator uses -- deliberately ``==``, never ``is``.
 
-    ``SourceForm`` is a ``StrEnum``, so a member equals its own string value, and the schema decides
-    a series IS digitized with ``==`` (:func:`~carmel.schemas.datasets._check_source_form_for_ref`,
-    which then constrains that series' value refs). A series reaching replay through
+    ``SourceForm`` is a ``StrEnum``, so a member equals its own string value, and the value-ref
+    validator this selector mirrors decides a series IS digitized with ``==``
+    (:func:`~carmel.schemas.datasets._check_source_form_for_ref`, which then constrains that series'
+    value refs). It is that validator specifically, not the schema as a whole: the OTHER figure
+    validator, :func:`~carmel.schemas.datasets._validate_series_digitization_citation`, compares
+    ``source_form`` with ``is`` -- safe THERE because a series reaching it has been through
+    ``model_validate`` and its ``source_form`` is already a coerced member, which is exactly the
+    coercion the ``model_construct`` route below skips and this selector must therefore stand in
+    for. A series reaching replay through
     ``model_construct`` -- the case this whole service exists for -- can carry the plain string
     ``"digitized"`` in ``source_form``, and to validation that object IS digitized. Comparing with
     ``is`` here would disagree: identity fails for a plain string, so the figure lane would wave the
@@ -3095,6 +3102,22 @@ def _claims_digitized(source_form: object) -> bool:
     weight, and value equality is the test that does.
     """
     return source_form == SourceForm.DIGITIZED
+
+
+def _recognised_source_form(source_form: object) -> bool:
+    """Whether ``source_form`` equals ANY :class:`SourceForm` member, by the same value-equality
+    :func:`_claims_digitized` uses.
+
+    A ``model_construct`` series carrying the plain string of a real form (``"tabular"``,
+    ``"textual"``, ``"digitized"``) is recognised, exactly as :func:`_claims_digitized` recognises
+    the digitized string. Only a value that is no known form at all -- neither a member nor a
+    member's string -- is unrecognised, and replay cannot then say what that series claims its
+    numbers were read from: neither the figure joins (which need it DIGITIZED) nor the non-digitized
+    citation rule (which needs it some real non-figure form) can be re-derived for it. The caller
+    files that inability as UNVERIFIABLE rather than let the series slip silently down the
+    non-digitized path with no finding on any axis.
+    """
+    return any(source_form == form for form in SourceForm)
 
 
 def _verify_figure_digitizations(
@@ -3196,6 +3219,27 @@ def _verify_figure_digitizations(
         # module so the replayer carries no second idea of what a coherent digitization is.
         try:
             record = FigureDigitization.from_payload(payload)
+        except UnknownPayloadVersion as exc:
+            # The one case in this reconstruction that is the READER's limit, not the record's:
+            # a payload_version this code does not know. Reported UNVERIFIABLE, not FAILED -- an
+            # unrecognised version may be a NEWER record, not a wrong one, and accusing it of a
+            # disagreement no reader here demonstrated is the same overclaim as verifying something
+            # unchecked, merely pointed at the corpus. Caught BEFORE the UNREADABLE_PAYLOAD arm
+            # below on purpose: UnknownPayloadVersion is a ValueError subclass and so is IN that
+            # tuple, so the specific arm must precede the general one or every version mismatch
+            # would fall through to FAILED. The reason names the version, from the exception's own
+            # attribute rather than its formatted message.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"figure digitization {digitization.digitization_sha256!r} declares payload_version "
+                    f"{exc.version!r}, a shape this reader does not know (it reads version {exc.readable_version!r}) "
+                    "-- the record may be newer rather than wrong, so its coverage claim could not be checked here, "
+                    "which is an admission about the reader and not a charge against the record",
+                )
+            )
+            continue
         except UNREADABLE_PAYLOAD as exc:
             findings.append(
                 ReplayFinding(
@@ -3254,6 +3298,27 @@ def _verify_figure_digitizations(
     for index, series in enumerate(envelope.series):
         series_path = f"series[{index}]"
         if not _claims_digitized(series.source_form):
+            if not _recognised_source_form(series.source_form):
+                # A source_form that is neither DIGITIZED nor any other known member (a
+                # model_construct envelope carries whatever it was handed, uncoerced). The two
+                # branches below each rest on knowing what the series CLAIMS -- the figure joins on
+                # its being DIGITIZED, the non-digitized rule on its being some real non-figure form
+                # -- and neither is true here. Replay cannot say what this series claims its numbers
+                # were read from, so it files that inability rather than silently take the
+                # non-digitized path, which would let an unclassifiable series through with no
+                # finding on any axis. UNVERIFIABLE, never FAILED: nothing is DEMONSTRATED wrong,
+                # the check simply could not run -- the module's own line for the two verdicts.
+                findings.append(
+                    ReplayFinding(
+                        category=ReplayOutcome.UNVERIFIABLE,
+                        ref_path=series_path,
+                        reason=f"series {series.series_id!r} has source_form={series.source_form!r}, which is no "
+                        "recognised source form -- neither DIGITIZED nor any other member -- so replay cannot tell "
+                        "what this series claims its numbers were read from, and could re-derive neither the figure "
+                        "joins nor the non-digitized citation rule for it",
+                    )
+                )
+                continue
             # V9's OTHER branch (_validate_series_digitization_citation, datasets.py:6471-6484), the
             # one the DIGITIZED path above is the mirror of: a series that is NOT digitized must cite
             # no figure record at all, and if its citation is Absent that absence must read
@@ -3549,9 +3614,15 @@ def _figure_semantic_claims(envelope: DatasetEnvelope) -> tuple[UncheckedSemanti
     and :attr:`SemanticGap.NO_SUPPORT_OFFERED` where none was: a series (through ``model_construct``)
     with no point ref offers nothing for the measurement gap, and one citing no digitization offers
     no crop for the provenance gap. Distinguishing the two keeps an empty ``support_paths`` off a
-    claim whose gap says support WAS offered, which the claim refuses. ``claim`` is the
-    digitization's content address (or, absent a citation, the series id), carrying no word of the
-    paper, so it never reaches the redaction gate the source text does.
+    claim whose gap says support WAS offered, which the claim refuses. ``claim`` is the series'
+    recorded ``source_form`` -- the derived DIGITIZED classification whose support (the recovered
+    coordinates, and the crop they were cut from) is what these two gaps say went unchecked. That is
+    the derived value :attr:`UncheckedSemanticClaim.claim` is contracted to hold, and it carries no
+    word of the paper, so it never reaches the redaction gate the source text does. It is
+    deliberately NOT the ``digitization_sha256`` a first cut used: a content address is not a derived
+    value, and :mod:`carmel.services.figure_digitization_record` states in as many words that the
+    digest does not identify the recovered coordinates -- so an address there named something other
+    than the value whose support went unchecked.
 
     The selector is :func:`_claims_digitized`, deliberately value-equality: a ``model_construct``
     series carrying the plain string ``"digitized"`` is digitized to the schema, so it earns these
@@ -3562,7 +3633,14 @@ def _figure_semantic_claims(envelope: DatasetEnvelope) -> tuple[UncheckedSemanti
         if not _claims_digitized(series.source_form):
             continue
         citation = series.digitization_sha256
-        claim = citation if isinstance(citation, str) else f"digitized series {series.series_id!r}"
+        # The DERIVED value both gaps below leave unchecked: the series' recorded source_form, the
+        # DIGITIZED classification whose support (the recovered coordinates, and the crop they were
+        # cut from) is exactly what replay structurally cannot test. A recorded enum member, which
+        # is what UncheckedSemanticClaim.claim is contracted to hold, and it carries no word of the
+        # paper. Deliberately NOT the digitization_sha256 a first cut used: a content address is not
+        # a derived value, and the record module states the digest does not identify the recovered
+        # coordinates -- so the address there named something other than the value gone unchecked.
+        claim = str(series.source_form)
 
         measurement_support = _series_value_ref_paths(index, series)
         claims.append(
