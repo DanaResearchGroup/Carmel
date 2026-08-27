@@ -846,6 +846,13 @@ def produce_condition_set_from_artifact(
                 repairs=repairs,
                 cell=spec.label_cell,
             ),
+            # statement_raw stores the SAME quote _ref grounds into statement_ref,
+            # exactly as label_raw stores spec.label_quote above: the document's own
+            # text at the span, which ground_quote guarantees equals text[start:end]
+            # (char span) or which _CellCiter validated equals the whole cell. Storing
+            # the grounded quote and grounding the same quote is what makes replay able
+            # to re-derive and compare it against the source rather than trusting it.
+            statement_raw=spec.statement_quote,
             statement_ref=_ref(
                 text,
                 spec.statement_quote,

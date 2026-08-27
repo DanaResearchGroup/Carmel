@@ -377,11 +377,17 @@ class TestOccurrenceAndCellAreMutuallyExclusive:
 
 
 class TestProduceStoreLoadReplay:
-    """Verifier 5: produce -> store -> load -> replay, reporting BOTH outcomes and the
-    honest LOCATION_UNRESOLVED count -- which is expected non-zero until separately
-    scheduled work teaches replay to check cell locators."""
+    """Verifier 5: produce -> store -> load -> replay, reporting BOTH outcomes.
 
-    def test_the_round_trip_runs_and_the_cell_refs_are_location_unresolved(self, tmp_path: Path) -> None:
+    The "separately scheduled work" this test's docstring once anticipated -- a
+    replayer that checks cell locators -- has landed (PR #24's cell-text gate,
+    then I-028 pairing ``statement_ref`` with ``statement_raw``). So the produced
+    cell refs are now COMPARED against the embedded grid rather than filed as
+    LOCATION_UNRESOLVED. The statement in particular carries its own words now, so
+    it is compared like every label/token, not left as an unchecked meaning.
+    """
+
+    def test_the_round_trip_runs_and_the_cell_refs_are_compared(self, tmp_path: Path) -> None:
         envelope, _ = _full_coverage(tmp_path)
 
         stored = store_condition_set_envelope(tmp_path, envelope)
@@ -390,14 +396,22 @@ class TestProduceStoreLoadReplay:
 
         report = replay_condition_set(tmp_path, loaded)
 
+        # Every cited cell (scalar label/value/unit, categorical label/token, the
+        # unextracted statement's label AND its now-paired statement) is compared
+        # whole-cell against the embedded grid and matches -- 7 cells in all.
+        assert report.checked_table_cells == 7
+        # And NONE of them is filed as an unchecked semantic claim: the statement's
+        # own path in particular is gone from that axis, because its words are
+        # recorded and were compared, not merely located.
+        assert all(claim.claim_path != "unextracted[0]" for claim in report.unchecked_semantic_claims)
         location_unresolved = [
             claim for claim in report.unchecked_semantic_claims if claim.gap is SemanticGap.LOCATION_UNRESOLVED
         ]
-        # The deliverable is stating this honestly, not driving it to zero: every
-        # produced cell ref is UNCHECKED by a replayer that only re-slices char spans.
-        assert len(location_unresolved) > 0
-        # A green evidence_outcome would mean the replayer SKIPPED these locators, not
-        # that it approved them; both outcomes are read and reported, never asserted green.
+        assert location_unresolved == []
+        # Both outcomes are read and reported, never asserted green. evidence_outcome
+        # stays honest about what the SYNTHETIC bytes cannot do -- reproduce the
+        # embedded inventory grid -- which is a separate check from the cell-text
+        # comparison and keeps the overall verdict short of VERIFIED.
         assert report.evidence_outcome is not None
         assert report.overall_outcome is not None
 

@@ -6,15 +6,17 @@ The dataset replayer answers "did every recorded quote come back off disk
 unchanged?". A condition set cannot be replayed by that question alone, because
 not every ``SourceRef`` it carries is PAIRED with a recorded quote.
 
-Of the 14 ref locations in the reachable graph, 11 are grounding PAIRS -- a
-locator beside the verbatim text read there (``label_raw``, ``token_raw``,
-``raw_text``, ``unit_raw``) -- and 3 are not: ``attribution_ref`` supports a
-``ConditionAttribution`` enum, ``UnresolvedSubject.reason_ref`` supports a
-``SubjectRefusalReason`` enum, and ``unextracted[i].statement_ref`` supports
-nothing stored at all, by design. For those three the ref proves a span EXISTS
-and nothing recorded anywhere says that span MEANS the value derived from it.
-That is the rule "grounding proves LOCATION, never MEANING" showing up as a
-shape in the data rather than as a maxim in a docstring.
+Most ref locations in the reachable graph are grounding PAIRS -- a locator
+beside the verbatim text read there (``label_raw``, ``token_raw``, ``raw_text``,
+``unit_raw``, and ``unextracted[i].statement_raw``) -- and only TWO are not:
+``attribution_ref`` supports a ``ConditionAttribution`` enum and
+``UnresolvedSubject.reason_ref`` supports a ``SubjectRefusalReason`` enum. For
+those two the ref proves a span EXISTS and nothing recorded anywhere says that
+span MEANS the value derived from it. (``unextracted[i].statement_ref`` was a
+third such location until ``statement_raw`` recorded the refused statement's own
+words beside it; it is now a pair, checked like any other.) That is the rule
+"grounding proves LOCATION, never MEANING" showing up as a shape in the data
+rather than as a maxim in a docstring.
 
 So a replayer that only checked spans would return VERIFIED for a condition set
 whose every derived value was unsupported by anything a machine could check.
@@ -121,6 +123,9 @@ _SUBJECT_QUOTE = "heat flux burner"
 _ATTRIBUTION_QUOTE = "in our laboratory"
 _LABEL_QUOTE = "diluent"
 _TOKEN_QUOTE = "CO2"
+#: A unique fragment used as an unextracted statement's own words -- the string
+#: an UnextractedConditionStatement.statement_raw carries and replay re-slices.
+_STATEMENT_QUOTE = "0.0123"
 
 
 def _span(quote: str, node_id: str = "paper") -> SourceRef:
@@ -542,39 +547,73 @@ class TestTheUnresolvedSubjectArm:
         assert report.total_char_spans == 4
 
 
-class TestAnUnextractedStatementAddsItsOwnGap:
-    """``statement_ref`` supports nothing stored at all, by design.
-
-    This is what proves the minimal fixture's ``== {"attribution"}`` really
-    was ISOLATING rather than merely true by accident: add a refusal record
-    and a second gap appears at once.
+class TestAnUnextractedStatementIsAComparedCharSpanPair:
+    """``statement_ref`` is now PAIRED with ``statement_raw`` -- the refused
+    statement's own words -- so a char-span-grounded statement is re-sliced from
+    the document bytes and COMPARED, exactly like a label or token, not filed as
+    an unchecked semantic gap (Verifier 2, char-span shape). The minimal
+    fixture's ``== {"attribution"}`` therefore stays true when a refusal record
+    is added: the statement contributes a CHECKED span, not a second gap.
     """
 
-    def test_a_refusal_record_contributes_a_second_semantic_claim(self, tmp_path: Path) -> None:
-        envelope = _minimal_condition_set(
+    def _with_statement(self, tmp_path: Path, statement_raw: str) -> ConditionSetEnvelope:
+        # statement_ref grounds the unique occurrence of _STATEMENT_QUOTE in the
+        # fixture text; statement_raw is what replay re-slices against. Passing a
+        # matching string yields a clean comparison; a corrupted one yields a
+        # FAILED re-slice mismatch.
+        return _minimal_condition_set(
             tmp_path,
             unextracted=(
                 UnextractedConditionStatement(
                     statement_id="phi_range",
                     label_raw=_LABEL_QUOTE,
                     label_ref=_span(_LABEL_QUOTE),
-                    statement_ref=_span(_TOKEN_QUOTE),
+                    statement_raw=statement_raw,
+                    statement_ref=_span(_STATEMENT_QUOTE),
                     reason=UnextractedReason.VALUE_RANGE,
                     quantity_kind=Absent(reason=AbsenceReason.NOT_REPORTED_HERE),
                 ),
             ),
         )
 
+    def test_a_matching_statement_is_re_sliced_and_compared_not_filed_as_a_gap(self, tmp_path: Path) -> None:
+        envelope = self._with_statement(tmp_path, _STATEMENT_QUOTE)
+        walked = {path for path, _ref in iter_source_refs(envelope)}
+        assert "unextracted[0].statement_ref" in walked
+
         report = replay_condition_set(tmp_path, envelope)
 
-        by_path = {claim.claim_path: claim for claim in report.unchecked_semantic_claims}
-        assert set(by_path) == {"attribution", "unextracted[0]"}
-        claim = by_path["unextracted[0]"]
-        assert claim.gap is SemanticGap.SUPPORT_UNRECORDED
-        assert claim.support_paths == ("unextracted[0].statement_ref",)
-        # The nearest derived value the record carries is its refusal reason.
-        assert claim.claim == UnextractedReason.VALUE_RANGE.value
-        assert report.support_only_char_spans == 2
+        # No unchecked semantic claim traces to the statement -- only attribution
+        # remains. Verifier 4 (exactly one of compared / filed) holds: it is
+        # compared, so it is not filed.
+        by_path = {claim.claim_path for claim in report.unchecked_semantic_claims}
+        assert by_path == {"attribution"}
+        assert report.findings == ()
+        assert report.evidence_outcome is ReplayOutcome.VERIFIED
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+        # The minimal fixture checks 3 char spans (subject label + categorical
+        # label/token) with attribution support-only; the statement adds TWO
+        # checked spans (its label_ref AND its now-paired statement_ref), and no
+        # new support-only span -- which is the whole point: statement_ref moved
+        # from support-only to checked.
+        assert report.checked_char_spans == 5
+        assert report.support_only_char_spans == 1
+        assert report.total_char_spans == 6
+
+    def test_a_corrupted_statement_text_fires_a_failed_finding_on_its_own_path(self, tmp_path: Path) -> None:
+        # Verifier 3: the stored words no longer match the span they cite. The
+        # re-slice must catch it -- as a FAILED finding named on the statement's
+        # OWN ref path, not a vague "something is unverifiable".
+        envelope = self._with_statement(tmp_path, _STATEMENT_QUOTE + "_TAMPERED")
+
+        report = replay_condition_set(tmp_path, envelope)
+
+        statement_findings = [f for f in report.findings if f.ref_path == "unextracted[0].statement_ref"]
+        assert len(statement_findings) == 1, report.findings
+        assert statement_findings[0].category is ReplayOutcome.FAILED
+        assert report.evidence_outcome is ReplayOutcome.FAILED
+        # And it is not ALSO filed as an unchecked claim -- exactly one axis.
+        assert all(c.claim_path != "unextracted[0]" for c in report.unchecked_semantic_claims)
 
 
 class TestSupportThatCouldNotEvenBeLocated:

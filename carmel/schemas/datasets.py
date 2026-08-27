@@ -3840,12 +3840,15 @@ class UnextractedConditionStatement(BaseModel):
     makes the record auditable -- a human, or a later extraction pass, can go
     look at the exact span this type declined to turn into a claim.
 
-    Deliberately holds NO parsed contents of the statement -- no range
-    endpoints, no list members, no inequality operator. Parsing a sweep into
-    its endpoints is most of the actual work of SUPPORTING sweeps as claims,
-    which is exactly what this narrow slice defers; a half-parsed record here
-    would be scope creep wearing a refusal's clothes. This type holds the
-    span, not the contents.
+    Holds the statement's verbatim words (``statement_raw``) and their span
+    (``statement_ref``), but NO PARSE of them -- no range endpoints, no list
+    members, no inequality operator. Parsing a sweep into its endpoints is most
+    of the actual work of SUPPORTING sweeps as claims, which is exactly what
+    this narrow slice defers; a half-parsed record here would be scope creep
+    wearing a refusal's clothes. The words are a string the source really prints
+    and an independent reader can re-derive; the parse is the interpretation this
+    type declines to make. This type holds the span and the words, not the
+    parse.
 
     **What this type does NOT prove, stated plainly rather than implied:**
     that ``reason`` is the CORRECT classification of the statement. This
@@ -3866,10 +3869,26 @@ class UnextractedConditionStatement(BaseModel):
     label_ref: SourceRef
     """Provenance for the LABEL. Plain, never :class:`Maybe`: an ungrounded
     label is not a weaker record to keep honestly, it is no record at all."""
+    statement_raw: str = Field(min_length=1)
+    """The refused statement's OWN words, verbatim -- the document's text at
+    ``statement_ref``, exactly as :attr:`label_raw` carries the label's text
+    beside :attr:`label_ref`. This is the string a citation was resolved
+    against, never a repaired or re-spelled form: the producer grounds it with
+    :func:`~carmel.services.dataset_producer.ground_quote`, which guarantees
+    ``text[start:end] == statement_raw`` for a char span and validates whole-cell
+    equality for a table cell, so an independent reader re-derives exactly this
+    string from the source. It is NOT a parse: no range endpoints, no list
+    members, no operator -- just the words (``"0.6-1.0"``, ``"1, 5 and 10 atm"``)
+    the extractor declined to flatten. Its purpose is to let replay COMPARE the
+    refused text against the source rather than merely locate it: without a
+    recorded counterpart beside ``statement_ref``, the text was verified once by
+    the producer and never again by anything independent."""
     statement_ref: SourceRef
     """Provenance for the LOCATED STATEMENT itself. Plain, never
     :class:`Maybe`: this is what makes the record auditable -- a refusal
-    that doesn't say WHERE is indistinguishable from a guess."""
+    that doesn't say WHERE is indistinguishable from a guess. Paired with
+    :attr:`statement_raw` (the words read at this span), so replay checks the
+    text as a grounding pair, not merely as a located-but-unexplained span."""
     reason: UnextractedReason
     quantity_kind: Maybe[QuantityKind]
     """What quantity the statement appears to concern, where the extractor
@@ -5551,6 +5570,7 @@ def _unextracted_condition_statement_identity_payload(
         "statement_id": statement.statement_id,
         "label_raw": statement.label_raw,
         "label_ref": _source_ref_identity_payload(statement.label_ref),
+        "statement_raw": statement.statement_raw,
         "statement_ref": _source_ref_identity_payload(statement.statement_ref),
         "reason": statement.reason.value,
         "quantity_kind": _project_maybe(statement.quantity_kind, lambda kind: kind.value),
@@ -5800,7 +5820,7 @@ _CONDITION_SET_ENVELOPE_TYPE = "condition_set"
 """``envelope_type`` value emitted by
 :meth:`ConditionSetEnvelope.identity_payload`."""
 
-_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 3
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 4
 """The one envelope-projection version this module can parse. A payload
 carrying any other version was projected by code this module has never
 seen, so parsing it here could only produce a silently reinterpreted
@@ -5825,6 +5845,15 @@ Version history:
    be told so. Nothing has been stored under any version (the branch is
    unreleased and no runtime constructs an envelope), so re-addressing every
    projection carries no migration cost.
+4. :attr:`UnextractedConditionStatement.statement_raw` added -- the refused
+   statement's own verbatim words, projected beside its ``statement_ref`` so a
+   condition set's ``unextracted`` payload now carries the string as well as the
+   span. This changes only the CONDITION-SET shape, but the version is a single
+   shared projection-schema number, so a :class:`DatasetEnvelope` -- whose own
+   shape is unchanged, since it carries no ``unextracted`` -- also stamps 4, by
+   the same rule entry 3 records: the projection MODULE changed, and a consumer
+   keyed on this number must be told. Nothing has been stored under any version,
+   so re-addressing every projection still carries no migration cost.
 
 A version-1 payload is REFUSED here, never migrated. Refusing is the whole
 reason this key exists: a payload written under a projection this code has

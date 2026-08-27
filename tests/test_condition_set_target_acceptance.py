@@ -11,15 +11,20 @@ or is not byte-for-byte the measured document.
 **What this module asserts is the TRUE replay outcome of the honest artifact, not a target
 outcome driven green.** Two facts a reader must hold:
 
-* ``overall_outcome`` is UNVERIFIABLE and always will be for any condition set: the four
-  range statements carry an UncheckedSemanticClaim each (nothing recorded says what
-  ``0.6-1.0`` MEANS -- an UnextractedConditionStatement stores no statement string), and the
-  attribution char span is support-only. That is the honest headline.
+* ``overall_outcome`` is UNVERIFIABLE and always will be for any condition set: the
+  attribution char span is support-only -- nothing recorded says what
+  ``ConditionAttribution.OWN_EXPERIMENT`` MEANS, so it carries the one remaining
+  UncheckedSemanticClaim. The four range statements no longer do: each now stores its own
+  words verbatim in ``UnextractedConditionStatement.statement_raw`` (``"0.6-1.0"`` and the
+  rest), so replay COMPARES that text whole-cell against the re-derived grid rather than
+  filing it as an unchecked meaning. The refusal that stays is the parse -- nothing here says
+  what ``0.6-1.0`` decomposes into -- not the words, which are now recorded and checked.
 * ``evidence_outcome`` is VERIFIED -- and NOT hollow. The subject names the paper's apparatus
-  ("heat flux method"), so one real char span is re-sliced; all 26 table-cell claim refs are
-  content-compared against the re-derived grid; and the embedded inventory reproduces against
-  the raw bytes. The PR #24 false positive that used to report every cell UNVERIFIABLE is
-  fixed narrowly (see :mod:`tests.test_condition_set_replay_cell_policy`).
+  ("heat flux method"), so one real char span is re-sliced; all 26 table-cell claim refs --
+  the 9 categorical label/token pairs AND all four unextracted statements' label + statement
+  cells -- are content-compared against the re-derived grid; and the embedded inventory
+  reproduces against the raw bytes. The PR #24 false positive that used to report every cell
+  UNVERIFIABLE is fixed narrowly (see :mod:`tests.test_condition_set_replay_cell_policy`).
 
 The 25 degree-C temperature row is deliberately NOT stored: the unit is absent from both
 lanes (zero U+00B0 in the extracted text, and no cell equals "degC"), so it cannot ground a
@@ -265,18 +270,23 @@ class TestTheFirstStoredConditionSet:
         assert env.scalar_claims == ()  # temperature is not laundered into a scalar
         assert {s.label_raw for s in env.unextracted} == {"φ", "P(atm)"}
 
-        # The statement STRING itself is not stored on the record (the producer validates
-        # statement_quote at write time then discards it -- which is exactly why replay
-        # cannot compare it, see the replay-outcome test). The range lives only in the cell
-        # the statement_ref points at, so read it back through the embedded grid.
-        resolved = set()
+        # The statement's OWN words are now on the record, verbatim, in statement_raw --
+        # read the four ranges straight off the record, not reconstructed through the
+        # embedded grid. (statement_ref still points at the same cell, and replay compares
+        # statement_raw whole-cell against that grid; the equality is asserted below and by
+        # the replay-outcome test, but the RANGE itself no longer requires a grid lookup to
+        # recover -- that was the amnesia this record used to carry.)
+        from_record = {statement.statement_raw for statement in env.unextracted}
+        assert from_record == {"0.6–1.0", "0.5–0.7", "1–9", "1–8"}
+
         for statement in env.unextracted:
             assert statement.reason is UnextractedReason.VALUE_RANGE
             assert isinstance(statement.label_ref.locator, TableCellLocator)
             locator = statement.statement_ref.locator
             assert isinstance(locator, TableCellLocator)
-            resolved.add(embedded.cell_text(row=locator.row, col=locator.col))
-        assert resolved == {"0.6–1.0", "0.5–0.7", "1–9", "1–8"}
+            # The recorded words ARE the cited cell's text, exactly and whole -- which is
+            # what lets replay compare them without the whole-cell rule laundering a fragment.
+            assert statement.statement_raw == embedded.cell_text(row=locator.row, col=locator.col)
 
     def test_the_embedded_inventory_reproduces_against_the_raw_bytes(self, tmp_path: Path) -> None:
         """Clause 4 (property asserted): ``verify_inventory_record`` re-derives the embedded
@@ -305,11 +315,19 @@ class TestTheFirstStoredConditionSet:
           false positive is fixed), no cell text disagrees, the grid reproduces, and one
           real char span (the subject label) is re-sliced -- so it is not the hollow
           "checked nothing" VERIFIED the brief warned about.
-        * ``overall_outcome`` is UNVERIFIABLE: the headline verdict, downgraded by the
-          unchecked semantic claims below.
-        * ``unchecked_semantic_claims`` is EXACTLY the attribution span plus the four range
-          statements -- no entry traces back to a scalar/categorical claim's own ref, which
-          is what would mean a table cell went uncompared.
+        * ``overall_outcome`` is UNVERIFIABLE: the headline verdict, downgraded by the ONE
+          unchecked semantic claim below.
+        * ``unchecked_semantic_claims`` is EXACTLY the attribution span -- and nothing else.
+          The four range statements USED to appear here (each an UnextractedConditionStatement
+          with no stored words); now that ``statement_raw`` records their text, replay compares
+          it whole-cell and files no semantic gap for them. No entry traces back to a
+          scalar/categorical claim's own ref either, which is what would mean a table cell went
+          uncompared.
+        * Per-statement consistency (Verifier 4): each unextracted statement is COMPARED (its
+          statement_ref cell is checked) and is NOT also filed as an unchecked claim -- exactly
+          one of the two, asserted directly below.
+        * All 26 table cells are compared and matched (up from 22: the four statement cells now
+          count), while the char-span count is unchanged.
         * ``attempted_refutations`` is empty: there is no scalar claim (the temperature
           could not be grounded), so no table-grounded StitchGate refutation arises.
         """
@@ -328,11 +346,22 @@ class TestTheFirstStoredConditionSet:
         gaps = {(claim.claim_path, claim.gap) for claim in report.unchecked_semantic_claims}
         assert gaps == {
             ("attribution", SemanticGap.SUPPORT_UNRECORDED),
-            ("unextracted[0]", SemanticGap.LOCATION_UNRESOLVED),
-            ("unextracted[1]", SemanticGap.LOCATION_UNRESOLVED),
-            ("unextracted[2]", SemanticGap.LOCATION_UNRESOLVED),
-            ("unextracted[3]", SemanticGap.LOCATION_UNRESOLVED),
         }
+
+        # Verifier 4, asserted directly: for every unextracted statement, exactly one of
+        # "compared" (its statement_ref cell is in the checked count) or "filed as an unchecked
+        # claim" holds -- here every statement is compared and none is filed.
+        semantic_statement_paths = {
+            claim.claim_path
+            for claim in report.unchecked_semantic_claims
+            if claim.claim_path.startswith("unextracted[")
+        }
+        assert semantic_statement_paths == set()
+
+        # The four statement cells are among the 26 compared-and-matched (was 22 before the
+        # words were recorded), and the single real char span is still re-sliced.
+        assert report.checked_table_cells == 26
+        assert report.checked_char_spans == 1
         assert report.attempted_refutations == ()
 
     def test_the_temperature_cells_survive_in_the_grid_but_are_uncited(self, tmp_path: Path) -> None:

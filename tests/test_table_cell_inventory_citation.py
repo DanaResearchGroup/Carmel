@@ -156,6 +156,7 @@ def _envelope_with_refs(
                 statement_id="phi",
                 label_raw="equivalence ratio",
                 label_ref=statement_ref,
+                statement_raw="0.6-1.0",
                 statement_ref=statement_ref,
                 reason=UnextractedReason.VALUE_RANGE,
                 quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
