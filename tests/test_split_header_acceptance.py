@@ -18,22 +18,27 @@ table. It is not a spanning row: removing the header reveals no hidden column, a
 any one data row leaves the rest still filling the gap. The refined guard (leave-one-out)
 admits it, and this is the page the measurement was taken on.
 
-**i005 amends the expectation on this exact page, and this module records the amendment
+**Three tickets amended the expectation on this exact page; this module records the arc
 rather than deleting it.** When i032 landed the column-guard fix, this box stopped refusing
 at ``column_structure_unresolved`` -- and returned a COMPLETE 92-cell grid whose first data
-row read ``L;u67.2`` where the page prints ``67.2``. That was not a success: a header unit
-subscript at ``y=729.52`` was rejected by its true parent on height ratio and folded into the
-data row 16 pt below, corrupting a cited flame speed inside a grid with ``refusals == ()`` --
-the silent-corruption class this codebase exists to refuse (measured in report R-018 on the
-campaign PM). i005's row-partition barrier refuses that fold, upstream of the column guard, so
-this box now REFUSES ``affix_crosses_row_partition`` and carries no cell at all.
+row read ``L;u67.2`` where the page prints ``67.2``. That was not a success: the header's
+DEEPEST unit subscripts at ``y=729.52`` could not reach their header line at ``y=731.79``
+(the intermediate subscript ``S`` at ``y=730.43`` sits between them, so the line was not their
+index-neighbour) and folded 16 pt DOWN into the data row instead, corrupting a cited flame
+speed inside a grid with ``refusals == ()`` -- the silent-corruption class this codebase
+exists to refuse (measured in report R-018 on the campaign PM). i005's row-partition barrier
+refused that fold, upstream of the column guard, containing the corruption as an honest refusal.
+i007 CURES it: its lift pass reaches through the intermediate subscript to the true header
+line, so the deepest subscripts fold UP into the header (ratio 0.70, already inside the gate --
+the constant never moved), and the box returns a COMPLETE 92-cell grid whose phi=0.5 row reads
+``67.2``, correctly, with ``refusals == ()``.
 
-The column-guard admission i032 proved is UNCHANGED and still covered -- synthetically, by
-``test_a_split_header_label_gap_the_data_bridges_is_not_refused`` in ``test_pdf_tables`` --
-because the affix barrier is upstream of the column guard and short-circuits it on this one
-real page, which happens to carry both structures. The two features cannot both be
-demonstrated by one box on this table: the split header and the corrupting fold share the
-same header row.
+So this one real page now demonstrates BOTH features at once: the split-header column-guard
+admission (a COMPLETE grid rather than ``column_structure_unresolved``) AND the correct affix
+fold (``67.2``, not ``L;u67.2``). The synthetic
+``test_a_split_header_label_gap_the_data_bridges_is_not_refused`` in ``test_pdf_tables`` still
+covers the column guard directly; here the two structures, which share the same header row, are
+shown resolving together on real ink.
 """
 
 from __future__ import annotations
@@ -45,7 +50,7 @@ import pytest
 
 from carmel.paths import default_workspaces_root
 from carmel.services.pdf_fragments import FragmentExtraction, extract_fragments
-from carmel.services.pdf_tables import ClaimedFootprint, InventoryRefusalReason, build_inventory
+from carmel.services.pdf_tables import ClaimedFootprint, build_inventory
 from tests.pypdf_gate import require_pypdf
 
 #: Runtime-read, never shipped.
@@ -101,21 +106,36 @@ def _target_extraction() -> FragmentExtraction:
     return extraction
 
 
-def test_the_split_header_table_refuses_its_corrupting_affix_fold() -> None:
-    """On the page it was measured on, the table refuses -- and refuses for the RIGHT reason.
+def test_the_split_header_table_extracts_a_correct_grid() -> None:
+    """On the page it was measured on, the table extracts -- COMPLETE, and CORRECT.
 
-    Before i005, this box returned a complete 23x4 / 92-cell grid with ``refusals == ()``
-    whose first data row read ``L;u67.2``: a header unit subscript folded 16 pt down into it.
-    i005's row-partition barrier catches that fold, so the box now refuses
-    ``affix_crosses_row_partition`` and carries no cell. The reason is asserted by IDENTITY,
-    not merely that the tuple is non-empty: it proves the affix barrier fired, and in
-    particular that the refusal is NOT ``column_structure_unresolved`` (which is what this same
-    box returns on ``main``, before i032's column-guard fix) -- so i032's admission of the
-    split header is intact and it is i005's barrier, upstream of it, that now refuses."""
+    Before i005 this box returned a complete 23x4 / 92-cell grid with ``refusals == ()`` whose
+    first data row read ``L;u67.2``: the header's deepest unit subscripts folded 16 pt down into
+    it. i005's barrier contained that as a refusal; i007's lift cures it by folding those
+    subscripts UP into their header line. So the box again returns a COMPLETE grid -- proving
+    i032's split-header admission is intact and NOT ``column_structure_unresolved`` -- but now
+    the phi=0.5 flame speed reads ``67.2``, not ``L;u67.2``. The structural counts are the same
+    92-cell / 23-row / 4-column grid i032 first produced; the difference this ticket makes is in
+    the one corrupted cell, so that is asserted on its text, not merely on the count. The header
+    subscripts are asserted to live in the HEADER row (where ``S_L``/``u_{S_L}`` belong), not in
+    any data row."""
     inventory = build_inventory(_target_extraction(), _TABLE_1)
 
-    assert tuple(r.reason for r in inventory.refusals) == (InventoryRefusalReason.AFFIX_CROSSES_ROW_PARTITION,), [
-        (r.reason, r.detail) for r in inventory.refusals
-    ]
-    assert inventory.cells == ()
-    assert not inventory.complete
+    assert inventory.refusals == (), [(r.reason, r.detail) for r in inventory.refusals]
+    assert inventory.complete
+    assert len(inventory.rows) == 23
+    assert len({cell.col for cell in inventory.cells}) == 4
+    assert len(inventory.cells) == 92
+
+    phi_half = next(
+        row
+        for row in inventory.rows
+        if any(c.text == "0.5" and c.col == 0 for c in inventory.cells if c.row == row.ordinal)
+    )
+    flame_speed = next(c.text for c in inventory.cells if c.row == phi_half.ordinal and c.col == 1)
+    assert flame_speed == "67.2"  # the cured value, on the exact cell that was corrupted
+    # The subscripts did not vanish -- they folded into the HEADER row, not a data row.
+    data_texts = [c.text for c in inventory.cells if c.row == phi_half.ordinal]
+    assert all("L;u" not in t for t in data_texts)
+    header_row = inventory.rows[0]
+    assert any("L;u" in c.text for c in inventory.cells if c.row == header_row.ordinal)

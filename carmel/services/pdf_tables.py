@@ -86,36 +86,31 @@ COLUMN_VALLEY_PT = 6.0
 #: shape test, not a size test -- ``font_height`` is the RENDERED height, so it survives
 #: the ``Tf /F1 1`` trap that makes ``font_size`` a constant 1.0 across the corpus.
 #:
-#: **The asymmetry that chose this VALUE is refuted, so 0.75 is currently unjustified
-#: rather than justified.** The argument was that being wrong permissively is far worse
-#: than being wrong strictly, because merging a genuinely short ROW renumbers everything
-#: beneath it silently while failing to merge an affix only produces a visibly wrong row
-#: count. The second half is false, and with it the asymmetry.
+#: **The value 0.75 stays, because the ratio axis has no daylight to move it onto -- and
+#: the header-subscript corruption once blamed on this constant was misdiagnosed.** The old
+#: story here was that ``10.1115-1.4007737`` p4's subscript band at ``y=729.52`` (rendered
+#: ``font_height`` 5.60) was rejected by its true parent on height ratio and so adopted the
+#: data row 15.98 pt below, printing the flame speed ``L;u67.2`` where the page reads 67.2.
+#: Re-derived at this tip, that is wrong about the parent: the deepest subscripts at 729.52
+#: belong to the HEADER LINE at ``y=731.79`` (``font_height`` 8.00), and ``5.60 / 8.00 =
+#: 0.70`` is already inside 0.75 -- the line was never rejecting them. What sat between them
+#: was the intermediate subscript ``S`` at ``y=730.43`` (the ``S`` of ``u_{S_L}``), so the
+#: header line was not the deepest glyph's INDEX-neighbour and pass 1 never offered it as a
+#: parent. That is a nested-affix-stack defect, cured structurally by the lift pass in
+#: :func:`_merge_affix_bands`, not by this ratio.
 #:
-#: Measured at this tip on ``10.1115-1.4007737`` p4 Table 1, banding the box
-#: ``x 311.0-555.0``, ``y 520.0-740.0``: the subscript band at ``y=729.52`` has
-#: ``font_height`` 5.60 and its true parent at ``y=730.43`` has 5.33, so
-#: ``5.60 <= 0.75 * 5.33 = 4.00`` is False and the real parent is REJECTED -- the strict
-#: direction, behaving as designed. The orphaned subscript then satisfies the data row
-#: 15.98 pt below (``font_height`` 8.00, ``5.60 <= 6.00``) and folds into that instead.
-#: The merge returns 23 rows and NO refusal, and the phi=0.5 row reads
-#: ``'0.5L;u67.2L7.110.6'``: the laminar flame speed is inventoried as ``L;u67.2``
-#: where the page prints 67.2 cm/s. So the strict direction does not surface as a wrong
-#: row count -- it silently corrupts a cell's TEXT, which is the same failure class the
-#: permissive direction was feared for. Rejecting the true parent is precisely what frees
-#: the affix to adopt a wrong one.
-#:
-#: Scope of that measurement, stated because it is easy to over-read: the corrupted row is
-#: real in the derivation, but no caller receives it as COMPLETE on this table at this tip.
-#: 256 boxes swept over that region return 144 ``column_structure_unresolved``, 64
-#: ``footprint_insane``, 48 ``orphaned_band_above_the_box`` and ZERO complete inventories --
-#: an unrelated later check happens to catch this one, which is not the same as the affix
-#: logic being safe.
-#:
-#: Choosing the value is therefore reopened and tracked separately; do not change it here,
-#: because the corpus it would be measured against is under work in flight. What survives
-#: unaffected is :attr:`InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND` rather than a
-#: proximity tie-break: that is a decision about arbitrariness, not about this number.
+#: The within-partition separation the fix's safety turns on was measured, re-deriving the
+#: prior report's two-population method over all corpus adjacent (affix, parent) pairs
+#: (``probes/measure_within_partition.py``). Restricting to pairs that share a row partition
+#: does NOT open daylight on the ratio: on a morphology-only ground truth (decoupled from
+#: displacement, so the restriction is not circular) the affix/separate-line ratio ranges
+#: still overlap across ``[0.353, 2.831]`` and the best single cut misclassifies 14.0%
+#: (6934 pairs) -- WORSE than the unrestricted 10.8% (11879 pairs). So there is no measured
+#: value to move to, in either direction; the partition barrier, not a threshold, is what
+#: separates an affix from a line. The lift never widens the gate: it reuses this exact
+#: ``<=`` against the true same-partition parent, so it can only rescue a fold the barrier
+#: would otherwise refuse. What also survives unchanged is
+#: :attr:`InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND` rather than a proximity tie-break.
 AFFIX_HEIGHT_RATIO = 0.75
 
 #: How much closer one neighbour must be than the other before the affix band's parent is
@@ -1054,13 +1049,47 @@ def _merge_affix_bands(
             )
         parents.append(index - 1 if fits_above else index + 1 if fits_below else None)
 
+    # The lift pass. A nested affix stack -- a sub-subscript below a subscript below its line --
+    # defeats the index-adjacent parent search: the deepest glyph's ONLY index-neighbour on the
+    # parent's side is the intermediate affix, which is shorter than it (ratio > 1, not
+    # affix-shaped) and horizontally offset (not adjacent), so pass 1 finds no same-row parent
+    # and falls to the wrong row across a partition. The measured case is
+    # ``10.1115-1.4007737`` p4: the header's deepest unit subscripts at y=729.524 (``L``/``u``)
+    # sit below the intermediate subscript ``S`` at y=730.431, whose own parent is the header
+    # line at y=731.792 -- one printed row, one partition. Their height ratio to that true
+    # header line is 0.70, already inside AFFIX_HEIGHT_RATIO; the obstruction is purely that the
+    # line is not their index-neighbour. So, ONLY for a band whose pass-1 parent lands across a
+    # partition boundary (exactly the folds the barrier below would refuse), reach through an
+    # intervening SAME-PARTITION affix neighbour to its parent, and retarget there when this
+    # band is itself affix-shaped-and-adjacent to that parent and it shares this partition. The
+    # gate is unchanged (same ``_looks_like_affix``/``_is_adjacent_to``, same partition), so a
+    # lift can only convert a would-be cross-row refusal into a fold WITHIN the row -- never
+    # move a fold that already stayed in its row, and never fold a separately-printed line,
+    # which by construction lies in a different partition. A band with no such intervening affix
+    # (a lone subscript whose only parent is genuinely a row away -- the raw corruption) is left
+    # untouched and refused below.
+    for index, parent in enumerate(parents):
+        if parent is None or partitions[parent] == partitions[index]:
+            continue
+        for neighbour in (index - 1, index + 1):
+            if not 0 <= neighbour < len(bands) or partitions[neighbour] != partitions[index]:
+                continue
+            grandparent = parents[neighbour]
+            if grandparent is None or partitions[grandparent] != partitions[index]:
+                continue
+            band = bands[index][1]
+            if _looks_like_affix(band, bands[grandparent][1]) and _is_adjacent_to(band, bands[grandparent][1]):
+                parents[index] = grandparent
+                break
+
     # The row-partition barrier. A parent was decided above by shape and adjacency alone,
     # which cannot tell the true parent one line up from a wrong one a row down when the
     # true parent is rejected on height ratio -- the measured 729.52 -> 713.54 fold. The
     # partition, derived from the raw bands before any of this ran, says which bands share a
     # printed row; a decided parent in another partition is a fold across a row boundary and
-    # refuses. Checked before the chain rule below so the message names the row crossing
-    # rather than the incidental chain it might also form.
+    # refuses (unless the lift pass above reattached it to its true same-partition parent).
+    # Checked before the chain rule below so the message names the row crossing rather than the
+    # incidental chain it might also form.
     for index, parent in enumerate(parents):
         if parent is not None and partitions[parent] != partitions[index]:
             return [], InventoryRefusal(

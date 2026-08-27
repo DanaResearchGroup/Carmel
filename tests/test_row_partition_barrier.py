@@ -111,43 +111,80 @@ def _geometric_parent(bands: list[tuple[float, list[TextFragment]]], index: int)
 
 
 # --------------------------------------------------------------------------------------------
-# Verifier clause 1: the corrupting fold refuses, by the SPECIFIC reason.
+# Verifier clauses 3 + 4: the true parent claims its affix, the box extracts a CORRECT grid,
+# and the specific corrupting fold (729.524 -> 713.537) can never come back.
 # --------------------------------------------------------------------------------------------
 
 
-def test_repro_box_refuses_by_the_named_reason_not_the_corrupted_value() -> None:
-    """Clause 1, pinning the REFUSE arm (not the value-reads-67.2 arm).
+def test_repro_box_extracts_a_correct_grid_after_the_true_parent_claims_its_affix() -> None:
+    """The cure to the barrier's containment: the box now yields a correct grid, not a refusal.
 
-    The design refuses because the affix band's only geometric parent is a row away: there is
-    no same-partition parent to fold into, and folding across is what corrupts the cell. So the
-    honest post-fix outcome is a refusal, and this test pins its IDENTITY -- not that the tuple
-    is non-empty. Other guards on this page refuse for unrelated reasons
-    (``ORPHANED_BAND_ABOVE_THE_BOX``, ``STRADDLING_FRAGMENT_AT_THE_BOX_EDGE``,
-    ``COLUMN_STRUCTURE_UNRESOLVED``); asserting the exact single-element tuple proves it is the
-    barrier that fired and could not be satisfied by code this branch did not write.
+    ``before`` (annotated from raw geometry, so it survives even after the fix): the deepest
+    header subscripts at ``y=729.524`` are affix-shaped and, by index-neighbour search alone,
+    their only fitting parent is the first DATA row at ``y=713.537`` -- a fold across a
+    partition boundary. That fold is exactly what once printed the flame speed ``L;u67.2``
+    where the page reads ``67.2``, and what the i005 barrier refused. The intermediate subscript
+    ``S`` at ``y=730.431`` sits between them; the TRUE parent is the header line at ``y=731.792``
+    (same partition), which the deepest subscripts are affix-shaped-and-adjacent to at ratio
+    0.70 -- already inside the gate.
 
-    Before/after, shown together: the ``before`` fold is annotated from raw geometry -- the
-    affix band's geometric parent is the data row across a partition boundary -- and the
-    ``after`` is that ``build_inventory`` refuses with ``AFFIX_CROSSES_ROW_PARTITION`` and
-    inventories no cell reading ``L;u67.2``.
+    ``after``: the lift pass reaches through the intermediate subscript to that header line, so
+    the box returns a COMPLETE grid with ``refusals == ()``, and the phi=0.5 flame-speed cell
+    reads ``67.2`` EXACTLY. Asserted on the cell text, not merely on the absence of a refusal --
+    an empty grid also has no refusal and no ``67.2``.
     """
     extraction = _load(_FOLD_DOC, _FOLD_SHA256)
 
-    # `before`, annotated from raw bands: the band at 729.524 is affix-shaped, its geometric
-    # parent is the data row at 713.537, and that parent is in a DIFFERENT partition.
+    # `before`, from raw bands: the index-neighbour fold WOULD send 729.524 across a partition
+    # into the data row at 713.537. This is the corruption the fix must never reintroduce.
     bands = _bands(_in_footprint(extraction, _REPRO_BOX))
     partitions = _row_partitions(bands)
     affix = next(i for i, (y, _b) in enumerate(bands) if round(y, 3) == 729.524)
     data_row = next(i for i, (y, _b) in enumerate(bands) if round(y, 3) == 713.537)
-    assert _geometric_parent(bands, affix) == data_row  # the fold that WOULD happen
-    assert partitions[affix] != partitions[data_row]  # and it crosses a row boundary
+    header_line = next(i for i, (y, _b) in enumerate(bands) if round(y, 3) == 731.792)
+    assert _geometric_parent(bands, affix) == data_row  # index-neighbour fold crosses...
+    assert partitions[affix] != partitions[data_row]  # ...a row-partition boundary, and...
+    assert partitions[affix] == partitions[header_line]  # ...the true parent shares the row.
 
-    # `after`: the barrier refuses with the specific reason, and the corruption never reaches
-    # a cell.
+    # `after`: the true parent claims its affix and the grid is correct.
     inventory = build_inventory(extraction, _REPRO_BOX)
-    assert tuple(r.reason for r in inventory.refusals) == (InventoryRefusalReason.AFFIX_CROSSES_ROW_PARTITION,)
+    assert inventory.refusals == ()  # clause 3: no refusal at all
+    assert len(inventory.cells) > 0  # clause 3: NOT an empty grid masquerading as success
+    assert inventory.complete
+
+    phi_half = next(
+        row
+        for row in inventory.rows
+        if any(c.text == "0.5" and c.col == 0 for c in inventory.cells if c.row == row.ordinal)
+    )
+    flame_speed = next(c.text for c in inventory.cells if c.row == phi_half.ordinal and c.col == 1)
+    assert flame_speed == "67.2"  # clause 3: the exact cured value
+
+    # clause 4: the specific corruption is gone -- no DATA row carries the header's subscripts,
+    # and the affix folded UP into its header line rather than DOWN into the data row.
     assert all("L;u67.2" not in cell.text for cell in inventory.cells)
-    assert inventory.cells == ()  # a refused inventory carries no cells at all
+    data_texts = [c.text for c in inventory.cells if c.row == phi_half.ordinal]
+    assert all("L;u" not in t for t in data_texts)
+
+
+def test_the_lifted_fold_lands_on_the_header_line_not_the_data_row() -> None:
+    """Clause 4 at the merge, on real ink: the 729.524 fold lands on 731.792, never 713.537.
+
+    The barrier prevents the DOWNWARD corruption; this pins the UPWARD cure by identity. At the
+    merge level (no column/caption guards in the way) the affix band at ``y=729.524`` must fold
+    into the header line at ``y=731.792`` -- its folded baseline recorded on THAT row -- and no
+    row at ``y=713.537`` may carry it. A test that only checked ``refusals == ()`` would pass on
+    a fold that landed anywhere; this asserts the destination."""
+    extraction = _load(_FOLD_DOC, _FOLD_SHA256)
+    bands = _bands(_in_footprint(extraction, _REPRO_BOX))
+    merged, refusal = _merge_affix_bands(bands)
+    assert refusal is None
+
+    def folded_into(target_y: float) -> list[float]:
+        return next([round(f, 3) for f in folded] for y, _members, folded in merged if round(y, 3) == target_y)
+
+    assert 729.524 in folded_into(731.792)  # the affix folded UP into its header line
+    assert 729.524 not in folded_into(713.537)  # and NOT down into the phi=0.5 data row
 
 
 # --------------------------------------------------------------------------------------------
@@ -218,6 +255,42 @@ def test_merge_folds_within_a_partition_and_refuses_across_one() -> None:
         (92.0, [_frag("124.4", 53.0, 70.0, 92.0, 8.0)]),
     ]
     _merged, refusal = _merge_affix_bands(across)
+    assert refusal is not None
+    assert refusal.reason is InventoryRefusalReason.AFFIX_CROSSES_ROW_PARTITION
+
+
+def test_lift_bridges_a_nested_affix_stack_but_only_through_a_real_affix() -> None:
+    """The lift pass, pinned as a matched pair -- clause 4 (it fires) and clause 6 (it does not).
+
+    A nested affix stack: a header line ``Head`` (h 8.0), its subscript ``s`` (h 5.0, an affix
+    of the line), and a DEEPER sub-subscript ``x`` (h 6.0) whose only index-neighbours are that
+    intermediate subscript above (shorter than it -- not affix-shaped) and a data row ``D`` a
+    full pitch below in a DIFFERENT partition. Index-neighbour search sends ``x`` down into
+    ``D`` across the boundary; the lift reaches through the intermediate affix ``s`` to the true
+    header line and folds ``x`` there instead. So both deep glyphs land on the header row and
+    the merge does not refuse.
+
+    The negative control swaps the intermediate affix for a NON-affix separate line ``abc``
+    (h 7.0: not affix-shaped against the header, and ``x`` is not affix-shaped against it). Now
+    there is no genuine affix to bridge through, so the lift MUST NOT fire: ``x``'s only fitting
+    parent is the data row across the partition, and the barrier refuses -- exactly as it did
+    before this change. The lift bridges a nested subscript, never a separately-printed line."""
+    head = (100.0, [_frag("Head", 50.0, 70.0, 100.0, 8.0)])
+    data_row = (90.0, [_frag("12.3", 50.0, 70.0, 90.0, 8.0)])  # different partition, one pitch down
+    deep = (98.2, [_frag("x", 55.0, 58.0, 98.2, 6.0)])
+
+    # Clause 4: with a real intermediate subscript, the deep glyph lifts to the header line.
+    subscript = (99.0, [_frag("s", 55.0, 58.0, 99.0, 5.0)])
+    merged, refusal = _merge_affix_bands([head, subscript, deep, data_row])
+    assert refusal is None
+    header_folded = next(folded for y, _m, folded in merged if y == 100.0)
+    assert sorted(header_folded) == [98.2, 99.0]  # BOTH the subscript and the sub-subscript
+    assert [y for y, _m, folded in merged if folded and y == 90.0] == []  # nothing folded into D
+
+    # Clause 6: swap the intermediate affix for a separate non-affix line; the lift cannot
+    # bridge, and the deep glyph's only parent is across the partition -> refuse, not fold.
+    plain_line = (99.0, [_frag("abc", 55.0, 64.0, 99.0, 7.0)])
+    _merged, refusal = _merge_affix_bands([head, plain_line, deep, data_row])
     assert refusal is not None
     assert refusal.reason is InventoryRefusalReason.AFFIX_CROSSES_ROW_PARTITION
 
