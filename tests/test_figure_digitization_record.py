@@ -29,11 +29,17 @@ import pytest
 from carmel.services import figure_digitization_record
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.figure_digitization_record import (
+    DIGITIZATION_IDENTITY_KEYS,
+    DIGITIZATION_IDENTITY_VERSION,
     DIGITIZATION_PAYLOAD_KEYS,
     DIGITIZATION_PAYLOAD_VERSION,
     UNREADABLE_PAYLOAD,
+    AxisCalibration,
+    AxisScale,
     CensusUnavailable,
     CensusUnavailableReason,
+    DigitizationIdentity,
+    DigitizedPoint,
     FigureCoverage,
     FigureDigitization,
     MarkerCensus,
@@ -41,8 +47,11 @@ from carmel.services.figure_digitization_record import (
     MarkerOmissionReason,
     PlotRegion,
     census_of,
+    compute_digitization_identity,
     compute_digitization_sha,
     coverage_of,
+    digitization_identity_bytes,
+    digitization_identity_payload,
     digitization_record_bytes,
     digitization_record_payload,
     is_auditable,
@@ -916,3 +925,252 @@ class TestCanonicalizationDoesNotDriftFromTheTableLane:
         from carmel.services.figure_digitization_record import _IDENTIFIER_RE  # noqa: PLC0415
 
         assert _IDENTIFIER_RE.pattern == _IDENTIFIER_PATTERN.pattern
+
+
+# The identity address (half 1): what the claim address deliberately cannot answer.
+
+CALIBRATION = (
+    AxisCalibration(
+        axis_id="x", scale=AxisScale.LINEAR, pixel_low=72.0, pixel_high=520.0, value_low=0.0, value_high=10.0
+    ),
+    AxisCalibration(
+        axis_id="y", scale=AxisScale.LOG10, pixel_low=100.0, pixel_high=640.0, value_low=1.0, value_high=1000.0
+    ),
+)
+
+
+def one_point_record(**overrides: Any) -> FigureDigitization:
+    """A minimal COMPLETE record recovering a single point -- the smallest claim an identity can bind."""
+    return digitization(
+        coverage=FigureCoverage.COMPLETE,
+        census=MarkerCensus(detected=1),
+        recovered=1,
+        omissions=(),
+        **overrides,
+    )
+
+
+def identity(**overrides: Any) -> DigitizationIdentity:
+    """A valid identity over :func:`one_point_record`: one recovered point, two calibrated axes."""
+    fields: dict[str, Any] = {
+        "record": one_point_record(),
+        "recovered_points": (DigitizedPoint(x=413.0, y=201.5),),
+        "calibration": CALIBRATION,
+        "producer": "operator:agd",
+    }
+    fields.update(overrides)
+    return DigitizationIdentity(**fields)
+
+
+def identity_sha(record_identity: DigitizationIdentity) -> str:
+    return compute_digitization_identity(digitization_identity_payload(record_identity))
+
+
+class TestTheIdentityAddressNamesTheDigitization:
+    """Half 1: an address that answers 'is this the SAME digitization?', not only the claim."""
+
+    def test_two_identities_differing_in_one_recovered_point_have_different_addresses(self) -> None:
+        """Verifier 1: identical in claim, census, ledger and region, differing in one point."""
+        base = identity()
+        moved = identity(recovered_points=(DigitizedPoint(x=413.0, y=202.5),))
+        # The CLAIM is identical -- the record is the same one_point_record, so the claim address
+        # collides exactly as TestTheAddressNamesTheClaimNotTheDigitization pins it does.
+        assert (
+            digitization_identity_payload(base)["claim_sha256"] == digitization_identity_payload(moved)["claim_sha256"]
+        )
+        # The IDENTITY is not: one recovered coordinate moved, so the identity address moves too.
+        assert identity_sha(base) != identity_sha(moved)
+
+    def test_two_genuinely_identical_identities_share_one_address(self) -> None:
+        """Verifier 2: nothing incidental (timestamp, object identity) is folded in.
+
+        Built from independently-constructed but equal parts, so a share here cannot be a shared
+        object reference -- it is content addressing.
+        """
+        first = DigitizationIdentity(
+            record=one_point_record(),
+            recovered_points=(DigitizedPoint(x=413.0, y=201.5),),
+            calibration=(
+                AxisCalibration(
+                    axis_id="x",
+                    scale=AxisScale.LINEAR,
+                    pixel_low=72.0,
+                    pixel_high=520.0,
+                    value_low=0.0,
+                    value_high=10.0,
+                ),
+                AxisCalibration(
+                    axis_id="y",
+                    scale=AxisScale.LOG10,
+                    pixel_low=100.0,
+                    pixel_high=640.0,
+                    value_low=1.0,
+                    value_high=1000.0,
+                ),
+            ),
+            producer="operator:agd",
+        )
+        second = DigitizationIdentity(
+            record=one_point_record(),
+            recovered_points=(DigitizedPoint(x=413.0, y=201.5),),
+            calibration=(
+                AxisCalibration(
+                    axis_id="x",
+                    scale=AxisScale.LINEAR,
+                    pixel_low=72.0,
+                    pixel_high=520.0,
+                    value_low=0.0,
+                    value_high=10.0,
+                ),
+                AxisCalibration(
+                    axis_id="y",
+                    scale=AxisScale.LOG10,
+                    pixel_low=100.0,
+                    pixel_high=640.0,
+                    value_low=1.0,
+                    value_high=1000.0,
+                ),
+            ),
+            producer="operator:agd",
+        )
+        assert first is not second
+        assert identity_sha(first) == identity_sha(second)
+
+    def test_a_different_calibration_changes_the_address(self) -> None:
+        """Same points, same producer, same claim -- a re-read under a different mapping is a
+        different digitization."""
+        rescaled = identity(
+            calibration=(
+                replace(CALIBRATION[0], value_high=11.0),
+                CALIBRATION[1],
+            )
+        )
+        assert identity_sha(identity()) != identity_sha(rescaled)
+
+    def test_a_different_producer_changes_the_address(self) -> None:
+        """An attestation is who made it as much as what it says."""
+        assert identity_sha(identity()) != identity_sha(identity(producer="operator:xyz"))
+
+    def test_a_different_claim_changes_the_address(self) -> None:
+        """The claim is bound by its address, so a claim difference (here the crop) still moves the
+        identity even when points, calibration and producer are held fixed."""
+        other_crop = identity(record=one_point_record(figure_crop_sha256="c" * 64))
+        assert identity_sha(identity()) != identity_sha(other_crop)
+
+    def test_the_payload_is_exactly_the_identity_key_set(self) -> None:
+        payload = digitization_identity_payload(identity())
+        assert set(payload) == set(DIGITIZATION_IDENTITY_KEYS)
+        assert payload["identity_version"] == DIGITIZATION_IDENTITY_VERSION
+        assert payload["claim_sha256"] == compute_digitization_sha(digitization_record_payload(one_point_record()))
+
+    def test_the_bytes_are_the_shared_canonicalization(self) -> None:
+        """One addressing rule, not a third: the identity bytes are canonical_json_bytes' output."""
+        payload = digitization_identity_payload(identity())
+        assert digitization_identity_bytes(payload) == canonical_json_bytes(payload)
+
+    def test_coordinates_are_spelled_as_hex_floats_not_decimals(self) -> None:
+        """The identity coordinates use the same ``float.hex`` spelling geometry uses everywhere."""
+        payload = digitization_identity_payload(identity())
+        assert payload["recovered_points"][0]["x"] == (413.0).hex()
+        assert payload["calibration"][0]["value_high"] == (10.0).hex()
+
+
+class TestTheIdentityRefusesAnIncoherentDigitization:
+    """Every construction invariant on the identity and its parts, each with its marker phrase."""
+
+    def test_point_count_must_match_the_claim(self) -> None:
+        with pytest.raises(ValueError, match="exactly the points its claim describes"):
+            identity(recovered_points=())
+
+    def test_calibration_may_not_be_empty(self) -> None:
+        with pytest.raises(ValueError, match="calibration is empty"):
+            identity(calibration=())
+
+    def test_calibration_axes_must_be_distinct(self) -> None:
+        with pytest.raises(ValueError, match="duplicate axis_id"):
+            identity(calibration=(CALIBRATION[0], replace(CALIBRATION[1], axis_id="x")))
+
+    def test_calibration_must_be_sorted_by_axis_id(self) -> None:
+        with pytest.raises(ValueError, match="sorted ascending by axis_id"):
+            identity(calibration=(CALIBRATION[1], CALIBRATION[0]))
+
+    def test_producer_must_be_non_empty_and_stripped(self) -> None:
+        with pytest.raises(ValueError, match="producer must be non-empty"):
+            identity(producer="  ")
+
+    def test_producer_must_be_a_string(self) -> None:
+        with pytest.raises(ValueError, match="producer must be a string"):
+            identity(producer=7)
+
+    def test_record_must_be_a_figure_digitization(self) -> None:
+        with pytest.raises(ValueError, match="record must be a FigureDigitization"):
+            identity(record=object())
+
+    def test_recovered_points_must_be_a_tuple(self) -> None:
+        with pytest.raises(ValueError, match="recovered_points must be a tuple"):
+            identity(recovered_points=[DigitizedPoint(x=1.0, y=2.0)])
+
+    def test_recovered_points_entries_must_be_points(self) -> None:
+        with pytest.raises(ValueError, match=r"recovered_points\[0\] must be a DigitizedPoint"):
+            identity(recovered_points=((413.0, 201.5),))
+
+    def test_calibration_must_be_a_tuple(self) -> None:
+        with pytest.raises(ValueError, match="calibration must be a tuple"):
+            identity(calibration=list(CALIBRATION))
+
+    def test_calibration_entries_must_be_axis_calibrations(self) -> None:
+        with pytest.raises(ValueError, match=r"calibration\[0\] must be an AxisCalibration"):
+            identity(calibration=("x",))
+
+    def test_a_point_coordinate_must_be_a_finite_float(self) -> None:
+        with pytest.raises(ValueError, match="non-finite coordinate"):
+            DigitizedPoint(x=float("nan"), y=2.0)
+        with pytest.raises(ValueError, match="must be a float"):
+            DigitizedPoint(x=1, y=2.0)
+
+    def test_a_calibration_anchor_must_be_a_finite_float(self) -> None:
+        with pytest.raises(ValueError, match="non-finite coordinate"):
+            AxisCalibration(
+                axis_id="x",
+                scale=AxisScale.LINEAR,
+                pixel_low=float("inf"),
+                pixel_high=520.0,
+                value_low=0.0,
+                value_high=10.0,
+            )
+
+    def test_a_calibration_axis_id_must_be_an_identifier(self) -> None:
+        with pytest.raises(ValueError, match="axis_id must be a lowercase identifier"):
+            AxisCalibration(
+                axis_id="X", scale=AxisScale.LINEAR, pixel_low=72.0, pixel_high=520.0, value_low=0.0, value_high=10.0
+            )
+
+    def test_a_calibration_scale_must_be_an_axis_scale(self) -> None:
+        with pytest.raises(ValueError, match="scale must be an AxisScale"):
+            AxisCalibration(
+                axis_id="x", scale="linear", pixel_low=72.0, pixel_high=520.0, value_low=0.0, value_high=10.0
+            )
+
+    def test_calibration_anchors_must_name_two_distinct_pixels(self) -> None:
+        with pytest.raises(ValueError, match="two anchors at one pixel"):
+            AxisCalibration(
+                axis_id="x", scale=AxisScale.LINEAR, pixel_low=72.0, pixel_high=72.0, value_low=0.0, value_high=10.0
+            )
+
+    def test_calibration_anchors_must_name_two_distinct_values(self) -> None:
+        with pytest.raises(ValueError, match="mapped to one value is not a calibration"):
+            AxisCalibration(
+                axis_id="x", scale=AxisScale.LINEAR, pixel_low=72.0, pixel_high=520.0, value_low=5.0, value_high=5.0
+            )
+
+
+class TestTheIdentityDocumentsWhichQuestionItAnswers:
+    """The two addresses must not be mistaken for each other -- pinned at both points of use."""
+
+    def test_the_claim_address_still_points_a_reader_at_the_identity(self) -> None:
+        assert compute_digitization_sha.__doc__ is not None
+        assert "compute_digitization_identity" in compute_digitization_sha.__doc__
+
+    def test_the_identity_address_states_what_it_addresses(self) -> None:
+        assert compute_digitization_identity.__doc__ is not None
+        assert "ADDRESSES IS THE DIGITIZATION, NOT ONLY THE CLAIM" in compute_digitization_identity.__doc__

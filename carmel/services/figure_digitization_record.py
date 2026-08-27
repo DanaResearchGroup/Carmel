@@ -75,28 +75,42 @@ ledger it, and if a record of "we saw this and ruled it out" is wanted, that is 
 fact about the crop -- a different subject, needing a different structure, which this record does
 not carry and this module does not define.
 
-THE ADDRESS NAMES THE CLAIM, NEVER THE DIGITIZATION. This is the sharpest limit in the module
-and the easiest to misread, because a content address usually identifies the thing it is
-computed over. Here it does not. The hashed payload holds a series id, a crop identity, a plot
-region, a coverage claim, a census total, a recovered COUNT and an omission ledger -- and not
-one recovered coordinate. So two genuinely different digitizations of the same figure that
-happen to agree on all of that (different curve fitting, different axis calibration, a different
-digitizer, therefore different points) produce IDENTICAL bytes and collide on one address.
-:func:`compute_digitization_sha` repeats this at the point of use, and
-``TestTheAddressNamesTheClaimNotTheDigitization`` pins the collision as a tested fact rather
-than leaving it a warning nobody checks.
+TWO ADDRESSES, TWO QUESTIONS. This module computes two content addresses over one digitization,
+and confusing them is the sharpest available mistake:
 
-The consequence a caller must hold on to: this address deduplicates and cites CLAIMS. Two
-records at one address mean two producers said the same thing about coverage; they never mean
-the two recovered the same data. What would have to carry a digitization's own identity is a
-digest over the produced :class:`~carmel.schemas.datasets.Series`' canonical points, plus the
-axis calibration that mapped pixels to coordinates, plus the identity of the engine that did it.
-None of the three can be added yet, and not for want of will: ``Series`` has no content address
-(``_series_identity_payload`` addresses an ENVELOPE and is bound to that envelope's
-identity-payload versioning), while calibration and engine identity have no producer to come
-from, because the digitizer does not exist. Inventing a canonicalization for them here would be
-the second addressing rule this module exists to avoid. When the digitizer lands, this payload
-gains those fields and :data:`DIGITIZATION_PAYLOAD_VERSION` goes to 2.
+- :func:`compute_digitization_sha` -- THE CLAIM ADDRESS -- names the COVERAGE CLAIM and nothing
+  else. Its payload holds a series id, a crop identity, a plot region, a coverage claim, a census
+  total, a recovered COUNT and an omission ledger -- and not one recovered coordinate. So two
+  genuinely different digitizations of the same figure that agree on all of that (different curve
+  fitting, different axis calibration, a different operator, therefore different points) produce
+  IDENTICAL bytes and collide on one address. That collision is deliberate and UNCHANGED by this
+  module's identity address: :func:`compute_digitization_sha` repeats it at the point of use, and
+  ``TestTheAddressNamesTheClaimNotTheDigitization`` pins it as a tested fact. Use the claim
+  address to deduplicate and to CITE claims -- two records at one address mean two producers said
+  the same thing about coverage -- never as evidence the two recovered the same data.
+
+- :func:`compute_digitization_identity` -- THE IDENTITY ADDRESS -- names the DIGITIZATION. It
+  hashes the claim address together with the recovered points, the pixel-to-data calibration and
+  the producer, so two attestations of one figure that agree on coverage but differ in a single
+  recovered coordinate, in the calibration used, or in who produced them get DIFFERENT identity
+  addresses -- while two byte-identical attestations get the SAME one, because nothing incidental
+  (no timestamp, no object identity) is folded in. This is the address to ask "is this the same
+  digitization?" of, and the one that detects a re-attestation as a change;
+  ``TestTheIdentityAddressNamesTheDigitization`` pins that it separates exactly what the claim
+  address collides. Figure values in this project are operator ATTESTATIONS rather than re-derived
+  measurements, so the producer is part of a digitization's identity: an attestation is who made
+  it as much as what it says.
+
+Why a second address and not a widened one: the claim address is already the citation and dedup
+key wired through :class:`~carmel.schemas.datasets.Series`,
+:class:`~carmel.schemas.datasets.EmbeddedFigureDigitization` and the envelope validators, and its
+collision-on-points is a tested contract those depend on. Folding points into it would change what
+every stored citation addresses and silently invalidate every value already filed at one of those
+addresses. So the identity is additive: the claim address keeps its exact meaning and
+:data:`DIGITIZATION_PAYLOAD_VERSION` stays 1; the identity sits beside it under its own
+:data:`DIGITIZATION_IDENTITY_VERSION`. The identity is NOT yet a citation surface -- nothing
+embeds or resolves it -- because wiring figure verification into replay is a separate, later
+ticket; today it is the address a caller computes to compare two digitizations.
 
 **Canonicalization is the table lane's, not a second one.**
 :func:`~carmel.services.dataset_store.canonical_json_bytes` produces the bytes and the address
@@ -120,10 +134,16 @@ from typing import Any
 from carmel.services.dataset_store import canonical_json_bytes
 
 __all__ = [
+    "DIGITIZATION_IDENTITY_KEYS",
+    "DIGITIZATION_IDENTITY_VERSION",
     "DIGITIZATION_PAYLOAD_KEYS",
     "DIGITIZATION_PAYLOAD_VERSION",
+    "AxisCalibration",
+    "AxisScale",
     "CensusUnavailable",
     "CensusUnavailableReason",
+    "DigitizationIdentity",
+    "DigitizedPoint",
     "FigureCoverage",
     "FigureDigitization",
     "MarkerCensus",
@@ -133,8 +153,11 @@ __all__ = [
     "PlotRegion",
     "UNREADABLE_PAYLOAD",
     "census_of",
+    "compute_digitization_identity",
     "compute_digitization_sha",
     "coverage_of",
+    "digitization_identity_bytes",
+    "digitization_identity_payload",
     "digitization_record_bytes",
     "digitization_record_payload",
     "is_auditable",
@@ -169,6 +192,27 @@ DIGITIZATION_PAYLOAD_KEYS: frozenset[str] = frozenset(
         "raw_sha256",
         "recovered",
         "series_id",
+    }
+)
+
+#: Bumped whenever the IDENTITY payload's SHAPE changes, independently of the CLAIM payload's
+#: :data:`DIGITIZATION_PAYLOAD_VERSION`. The two are versioned apart on purpose: the claim address
+#: and the identity address answer different questions (see the module docstring), so a shape
+#: change to one must never force a reader of the other to say it cannot read a record it can.
+DIGITIZATION_IDENTITY_VERSION = 1
+
+#: Exactly the top-level keys a version-``DIGITIZATION_IDENTITY_VERSION`` identity payload has.
+#:
+#: EXACT rather than "at least these", for the same reason :data:`DIGITIZATION_PAYLOAD_KEYS` is:
+#: the identity address is over the canonical bytes, so a stray key is a field the address covers
+#: and nothing reads. Pinned against a real built payload by the tests.
+DIGITIZATION_IDENTITY_KEYS: frozenset[str] = frozenset(
+    {
+        "calibration",
+        "claim_sha256",
+        "identity_version",
+        "producer",
+        "recovered_points",
     }
 )
 
@@ -1006,8 +1050,10 @@ def compute_digitization_sha(payload: Mapping[str, Any]) -> str:
     on series id, crop, region, coverage, census and ledger hash to the SAME value while holding
     different points. Use this to deduplicate and to cite coverage claims; never as evidence
     that two producers recovered the same data, and never as a change detector for a
-    re-digitization. See the module docstring for what would have to be folded in to make it one
-    and why none of it can be yet.
+    re-digitization. To ask "is this the SAME digitization?" -- which the recovered points, the
+    calibration and the producer settle and this address cannot -- use
+    :func:`compute_digitization_identity` instead; see the module docstring for the two-addresses
+    split and why this one keeps its meaning unchanged.
     """
     return hashlib.sha256(digitization_record_bytes(payload)).hexdigest()
 
@@ -1089,3 +1135,258 @@ def payload_unreadable_reason(payload: Mapping[str, Any]) -> str | None:
     except UNREADABLE_PAYLOAD as exc:
         return repr(exc)
     return None
+
+
+# --------------------------------------------------------------------------------------------
+# The identity address: what the claim address deliberately cannot answer.
+#
+# Everything above addresses a CLAIM about coverage. Everything below addresses the DIGITIZATION
+# itself -- the recovered points, the calibration that mapped pixels to data coordinates, and the
+# producer who attested them. The two are kept apart, not merged: see the module docstring's
+# "TWO ADDRESSES, TWO QUESTIONS" for why the claim address must not gain these fields.
+# --------------------------------------------------------------------------------------------
+
+
+class AxisScale(StrEnum):
+    """How one axis's pixel positions map to data values.
+
+    Carried so the identity distinguishes two digitizations that read the same pixels off the
+    same crop under different axis interpretations -- a log axis mistaken for linear recovers
+    entirely different data from identical marker positions, and the identity must not call those
+    the same digitization. This record does not EVALUATE the mapping (it renders no pixel to a
+    value); it carries which mapping the operator attested, so a change to it changes the address.
+    """
+
+    LINEAR = "linear"
+    LOG10 = "log10"
+
+
+@dataclass(frozen=True)
+class DigitizedPoint:
+    """One recovered coordinate, in the figure's own DATA space.
+
+    This is the thing the claim address has no field for and this identity exists to fold in: two
+    attestations of one figure that agree on coverage but disagree here are different digitizations,
+    and only an address that hashes these can tell them apart. Coordinates are guarded exactly as
+    :class:`MarkerOmission`'s are -- a non-finite or non-``float`` value is refused at construction,
+    not discovered at serialization -- because a point that can be BUILT and not hashed is one that
+    reaches an identity computation and crashes it.
+    """
+
+    x: float
+    y: float
+
+    def __post_init__(self) -> None:
+        _require_coordinate(self.x, where="DigitizedPoint.x")
+        _require_coordinate(self.y, where="DigitizedPoint.y")
+
+
+@dataclass(frozen=True)
+class AxisCalibration:
+    """One axis's attested pixel-to-data mapping, pinned by two reference anchors.
+
+    ``pixel_low``/``value_low`` and ``pixel_high``/``value_high`` are two points on the axis whose
+    pixel positions and data values the operator read off; together with :attr:`scale` they define
+    the mapping the digitization used. This record CARRIES the calibration for identity; it does
+    not interpret it, so it enforces only that the anchors are finite and distinct enough to name
+    two points rather than one -- validating a log axis's sign or an anchor's plausibility would be
+    a second measurement this attestation-only record does not make.
+
+    The two anchors must not coincide on either coordinate: a pixel range collapsed to one point,
+    or a data range collapsed to one value, is not a calibration, and admitting it would let a
+    degenerate mapping stand in the identity as if it were a real one.
+    """
+
+    axis_id: str
+    scale: AxisScale
+    pixel_low: float
+    pixel_high: float
+    value_low: float
+    value_high: float
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.axis_id, str) or not _IDENTIFIER_RE.fullmatch(self.axis_id):
+            raise ValueError(
+                f"AxisCalibration.axis_id must be a lowercase identifier (^[a-z][a-z0-9_]*$), got {self.axis_id!r}"
+            )
+        if not isinstance(self.scale, AxisScale):
+            raise ValueError(
+                f"AxisCalibration({self.axis_id!r}).scale must be an AxisScale, got "
+                f"{type(self.scale).__name__} {self.scale!r}"
+            )
+        for name, value in (
+            ("pixel_low", self.pixel_low),
+            ("pixel_high", self.pixel_high),
+            ("value_low", self.value_low),
+            ("value_high", self.value_high),
+        ):
+            _require_coordinate(value, where=f"AxisCalibration({self.axis_id!r}).{name}")
+        if self.pixel_low == self.pixel_high:
+            raise ValueError(
+                f"AxisCalibration({self.axis_id!r}): pixel_low and pixel_high are both "
+                f"{self.pixel_low!r} -- two anchors at one pixel name no mapping"
+            )
+        if self.value_low == self.value_high:
+            raise ValueError(
+                f"AxisCalibration({self.axis_id!r}): value_low and value_high are both "
+                f"{self.value_low!r} -- a pixel range mapped to one value is not a calibration"
+            )
+
+
+@dataclass(frozen=True)
+class DigitizationIdentity:
+    """A digitization's own identity: the claim, plus the data it stands for and who made it.
+
+    The claim address (:func:`compute_digitization_sha`) answers "did two producers say the same
+    thing about coverage?". This answers "is this the SAME digitization?" -- and it must, because
+    figure values in this project are operator ATTESTATIONS, and two operators attesting one figure
+    are precisely who will agree on coverage and differ on the points. An address that could not
+    tell them apart would make "which digitization produced this value" unanswerable and a
+    re-attestation undetectable.
+
+    So the identity binds three things the claim address omits, on top of the claim itself:
+
+    - :attr:`recovered_points` -- the actual data coordinates. Exactly :attr:`FigureDigitization.recovered`
+      of them (D-I1): the identity must account for the points the claim SAYS were recovered, no
+      more and no fewer, or it is an identity for a different digitization than the claim describes.
+    - :attr:`calibration` -- the pixel-to-data mapping, one entry per axis, so a re-reading under a
+      different calibration is a different identity even when it happens to land the same points.
+    - :attr:`producer` -- who or what attested them. An attestation is who made it as much as what
+      it says, so a different producer is a different digitization.
+
+    The claim is bound by its ADDRESS rather than re-embedded, so the identity differs whenever the
+    claim differs (series id, crop, region, coverage, census, ledger) OR any of the three above
+    differ. Nothing incidental is folded in -- no timestamp, no object identity -- so two
+    byte-identical attestations share one identity address, which is the property that makes the
+    address a stable name rather than a per-construction nonce.
+
+    NOT a citation surface. Nothing embeds or resolves this yet: wiring figure verification into
+    replay is a separate, later ticket. Today it is the structure a caller builds to COMPARE two
+    digitizations, via :func:`compute_digitization_identity`.
+    """
+
+    record: FigureDigitization
+    recovered_points: tuple[DigitizedPoint, ...]
+    calibration: tuple[AxisCalibration, ...]
+    producer: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.record, FigureDigitization):
+            raise ValueError(
+                f"DigitizationIdentity.record must be a FigureDigitization, got {type(self.record).__name__}"
+            )
+        if not isinstance(self.recovered_points, tuple):
+            raise ValueError(
+                f"DigitizationIdentity.recovered_points must be a tuple, got "
+                f"{type(self.recovered_points).__name__} -- a list is mutable and this identity is an address"
+            )
+        for position, point in enumerate(self.recovered_points):
+            if not isinstance(point, DigitizedPoint):
+                raise ValueError(
+                    f"DigitizationIdentity.recovered_points[{position}] must be a DigitizedPoint, got "
+                    f"{type(point).__name__} {point!r}"
+                )
+        # D-I1: the identity accounts for exactly the points the claim says were recovered. A
+        # claim that recovered ten points and an identity carrying nine is an identity for a
+        # different digitization than its own claim describes, and the address would silently name
+        # that mismatch instead of refusing it.
+        if len(self.recovered_points) != self.record.recovered:
+            raise ValueError(
+                f"DigitizationIdentity: the claim says recovered={self.record.recovered} but the identity "
+                f"carries {len(self.recovered_points)} recovered point(s) -- an identity must account for "
+                "exactly the points its claim describes"
+            )
+        if not isinstance(self.calibration, tuple):
+            raise ValueError(
+                f"DigitizationIdentity.calibration must be a tuple, got {type(self.calibration).__name__} -- "
+                "a list is mutable and this identity is an address"
+            )
+        for position, axis in enumerate(self.calibration):
+            if not isinstance(axis, AxisCalibration):
+                raise ValueError(
+                    f"DigitizationIdentity.calibration[{position}] must be an AxisCalibration, got "
+                    f"{type(axis).__name__} {axis!r}"
+                )
+        # D-I2: a digitization recovered data coordinates, and a coordinate has no meaning without
+        # an axis mapping. An empty calibration is an identity that cannot say what its points mean.
+        if not self.calibration:
+            raise ValueError(
+                "DigitizationIdentity.calibration is empty -- a recovered coordinate without an axis "
+                "calibration names no data value, so an identity for one cannot omit it"
+            )
+        seen: set[str] = set()
+        for axis in self.calibration:
+            if axis.axis_id in seen:
+                raise ValueError(
+                    f"DigitizationIdentity: duplicate axis_id {axis.axis_id!r} in calibration -- one axis, "
+                    "calibrated twice, makes 'which mapping does this axis use' ill-defined"
+                )
+            seen.add(axis.axis_id)
+        # Sorted for the same reason the omission ledger is (D6): the identity is an address, and an
+        # unordered collection would give one calibration as many addresses as it has permutations.
+        if list(self.calibration) != sorted(self.calibration, key=lambda axis: axis.axis_id):
+            raise ValueError(
+                "DigitizationIdentity.calibration must be sorted ascending by axis_id, or one calibration "
+                "has as many content addresses as it has permutations"
+            )
+        if not isinstance(self.producer, str):
+            raise ValueError(f"DigitizationIdentity.producer must be a string, got {type(self.producer).__name__}")
+        if not self.producer or self.producer != self.producer.strip():
+            raise ValueError(
+                "DigitizationIdentity.producer must be non-empty and free of surrounding whitespace, got "
+                f"{self.producer!r} -- an unnamed producer is not who attested this"
+            )
+
+
+def _calibration_payload(axis: AxisCalibration) -> dict[str, Any]:
+    return {
+        "axis_id": axis.axis_id,
+        "pixel_high": _pt(axis.pixel_high),
+        "pixel_low": _pt(axis.pixel_low),
+        "scale": axis.scale.value,
+        "value_high": _pt(axis.value_high),
+        "value_low": _pt(axis.value_low),
+    }
+
+
+def digitization_identity_payload(identity: DigitizationIdentity) -> dict[str, Any]:
+    """The full stored form of one digitization's identity, ready for :func:`canonical_json_bytes`.
+
+    The claim is bound by its ADDRESS (``claim_sha256``), not re-embedded: the identity differs
+    whenever the claim differs, without duplicating the claim's fields, and the claim address keeps
+    its own separate meaning. The recovered points are hashed in the order given -- order is the
+    attested sequence, part of what the operator recorded, not incidental -- and the calibration is
+    already sorted by ``axis_id`` at construction. Coordinates are spelled with :func:`_pt`, the
+    one coordinate spelling this module and the table lane share.
+    """
+    return {
+        "calibration": [_calibration_payload(axis) for axis in identity.calibration],
+        "claim_sha256": compute_digitization_sha(digitization_record_payload(identity.record)),
+        "identity_version": DIGITIZATION_IDENTITY_VERSION,
+        "producer": identity.producer,
+        "recovered_points": [{"x": _pt(point.x), "y": _pt(point.y)} for point in identity.recovered_points],
+    }
+
+
+def digitization_identity_bytes(payload: Mapping[str, Any]) -> bytes:
+    """The exact byte form of one identity: what its address is over.
+
+    One definition, canonicalized by :func:`canonical_json_bytes` exactly as the claim payload is,
+    so a claim address and an identity address are addressed by one rule and not two.
+    """
+    return canonical_json_bytes(dict(payload))
+
+
+def compute_digitization_identity(payload: Mapping[str, Any]) -> str:
+    """This digitization's identity address: the sha256 of its canonical identity bytes.
+
+    WHAT THIS ADDRESSES IS THE DIGITIZATION, NOT ONLY THE CLAIM. Unlike
+    :func:`compute_digitization_sha`, this folds in the recovered points, the calibration and the
+    producer, so two attestations of one figure that agree on coverage but differ in a single
+    recovered coordinate, in the calibration used, or in who produced them get DIFFERENT addresses
+    -- while two byte-identical attestations get the SAME one, because nothing incidental is folded
+    in. Use this to ask "is this the same digitization?" and to detect a re-attestation as a
+    change; use :func:`compute_digitization_sha` to deduplicate and cite coverage CLAIMS. See the
+    module docstring's "TWO ADDRESSES, TWO QUESTIONS" for the split.
+    """
+    return hashlib.sha256(digitization_identity_bytes(payload)).hexdigest()
