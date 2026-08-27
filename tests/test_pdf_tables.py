@@ -120,6 +120,18 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
         frag("2", 127.0, 130.0, 110.0, font_height=AFFIX_HEIGHT),
         frag("O", 122.0, 127.0, 105.0),
     )
+    # A small header symbol at 120.0 is TOO SHORT to claim the affix at 119.0 on the height
+    # ratio (5.0 > 0.75*5.0), so the affix is rejected by the row it shares a printed line
+    # with and adopts the full-height data row 9 pt below instead. The affix's ink overlaps
+    # the header symbol's (same partition) but not the data row's (a partition boundary), so
+    # the fold crosses one and refuses -- the synthetic twin of the measured 729.52 -> 713.54
+    # corruption, carrying no corpus text.
+    affix_across_a_row_boundary = (
+        CAPTION,
+        frag("s", 53.0, 58.0, 120.0, font_height=AFFIX_HEIGHT),
+        frag("2", 58.0, 61.0, 119.0, font_height=AFFIX_HEIGHT),
+        frag("124.4", 53.0, 70.0, 110.0),
+    )
     return [
         (FragmentExtraction(lossy=True, status=FragmentAvailability.ENGINE_ABSENT), footprint()),
         (extraction_of(*simple_grid(), lossy=True, truncated=True), footprint()),
@@ -127,6 +139,7 @@ def _EVERY_REFUSAL_SCENARIO() -> list[tuple[FragmentExtraction, ClaimedFootprint
         (extraction_of(*simple_grid()), footprint(caption_baseline_y=1000.0, y_top=999.0)),
         (extraction_of(*simple_grid()), footprint(y_top=140.0)),
         (extraction_of(*equidistant_affix), footprint()),
+        (extraction_of(*affix_across_a_row_boundary), footprint()),
         (
             extraction_of(
                 CAPTION,

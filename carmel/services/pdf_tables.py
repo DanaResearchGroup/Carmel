@@ -86,36 +86,31 @@ COLUMN_VALLEY_PT = 6.0
 #: shape test, not a size test -- ``font_height`` is the RENDERED height, so it survives
 #: the ``Tf /F1 1`` trap that makes ``font_size`` a constant 1.0 across the corpus.
 #:
-#: **The asymmetry that chose this VALUE is refuted, so 0.75 is currently unjustified
-#: rather than justified.** The argument was that being wrong permissively is far worse
-#: than being wrong strictly, because merging a genuinely short ROW renumbers everything
-#: beneath it silently while failing to merge an affix only produces a visibly wrong row
-#: count. The second half is false, and with it the asymmetry.
+#: **The value 0.75 stays, because the ratio axis has no daylight to move it onto -- and
+#: the header-subscript corruption once blamed on this constant was misdiagnosed.** The old
+#: story here was that ``10.1115-1.4007737`` p4's subscript band at ``y=729.52`` (rendered
+#: ``font_height`` 5.60) was rejected by its true parent on height ratio and so adopted the
+#: data row 15.98 pt below, printing the flame speed ``L;u67.2`` where the page reads 67.2.
+#: Re-derived at this tip, that is wrong about the parent: the deepest subscripts at 729.52
+#: belong to the HEADER LINE at ``y=731.79`` (``font_height`` 8.00), and ``5.60 / 8.00 =
+#: 0.70`` is already inside 0.75 -- the line was never rejecting them. What sat between them
+#: was the intermediate subscript ``S`` at ``y=730.43`` (the ``S`` of ``u_{S_L}``), so the
+#: header line was not the deepest glyph's INDEX-neighbour and pass 1 never offered it as a
+#: parent. That is a nested-affix-stack defect, cured structurally by the lift pass in
+#: :func:`_merge_affix_bands`, not by this ratio.
 #:
-#: Measured at this tip on ``10.1115-1.4007737`` p4 Table 1, banding the box
-#: ``x 311.0-555.0``, ``y 520.0-740.0``: the subscript band at ``y=729.52`` has
-#: ``font_height`` 5.60 and its true parent at ``y=730.43`` has 5.33, so
-#: ``5.60 <= 0.75 * 5.33 = 4.00`` is False and the real parent is REJECTED -- the strict
-#: direction, behaving as designed. The orphaned subscript then satisfies the data row
-#: 15.98 pt below (``font_height`` 8.00, ``5.60 <= 6.00``) and folds into that instead.
-#: The merge returns 23 rows and NO refusal, and the phi=0.5 row reads
-#: ``'0.5L;u67.2L7.110.6'``: the laminar flame speed is inventoried as ``L;u67.2``
-#: where the page prints 67.2 cm/s. So the strict direction does not surface as a wrong
-#: row count -- it silently corrupts a cell's TEXT, which is the same failure class the
-#: permissive direction was feared for. Rejecting the true parent is precisely what frees
-#: the affix to adopt a wrong one.
-#:
-#: Scope of that measurement, stated because it is easy to over-read: the corrupted row is
-#: real in the derivation, but no caller receives it as COMPLETE on this table at this tip.
-#: 256 boxes swept over that region return 144 ``column_structure_unresolved``, 64
-#: ``footprint_insane``, 48 ``orphaned_band_above_the_box`` and ZERO complete inventories --
-#: an unrelated later check happens to catch this one, which is not the same as the affix
-#: logic being safe.
-#:
-#: Choosing the value is therefore reopened and tracked separately; do not change it here,
-#: because the corpus it would be measured against is under work in flight. What survives
-#: unaffected is :attr:`InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND` rather than a
-#: proximity tie-break: that is a decision about arbitrariness, not about this number.
+#: The within-partition separation the fix's safety turns on was measured, re-deriving the
+#: prior report's two-population method over all corpus adjacent (affix, parent) pairs
+#: (``probes/measure_within_partition.py``). Restricting to pairs that share a row partition
+#: does NOT open daylight on the ratio: on a morphology-only ground truth (decoupled from
+#: displacement, so the restriction is not circular) the affix/separate-line ratio ranges
+#: still overlap across ``[0.353, 2.831]`` and the best single cut misclassifies 14.0%
+#: (6934 pairs) -- WORSE than the unrestricted 10.8% (11879 pairs). So there is no measured
+#: value to move to, in either direction; the partition barrier, not a threshold, is what
+#: separates an affix from a line. The lift never widens the gate: it reuses this exact
+#: ``<=`` against the true same-partition parent, so it can only rescue a fold the barrier
+#: would otherwise refuse. What also survives unchanged is
+#: :attr:`InventoryRefusalReason.AMBIGUOUS_AFFIX_BAND` rather than a proximity tie-break.
 AFFIX_HEIGHT_RATIO = 0.75
 
 #: How much closer one neighbour must be than the other before the affix band's parent is
@@ -393,6 +388,32 @@ class InventoryRefusalReason(StrEnum):
     extends past its parent band's rightmost base glyph, so no interiority test can
     reach it. Letting it fall through to become a row of its own would renumber every
     row beneath it while every cell value stayed correct."""
+
+    AFFIX_CROSSES_ROW_PARTITION = "affix_crosses_row_partition"
+    """A candidate affix band's only parent sits in a DIFFERENT raw row partition.
+
+    A subscript and its true parent share a printed line, so their rendered ink boxes
+    overlap vertically; two separate table rows are held apart by whitespace and their ink
+    boxes do not. :func:`_row_partitions` cuts the raw bands into partitions on exactly that
+    overlap -- upstream of any fold, reading only ``baseline_y`` and ``font_height``, never a
+    cell value, a column bound or a row count -- and a fold that the affix logic would send
+    ACROSS one of those cuts is refused here instead of performed.
+
+    The parent is PRESENT and geometrically admissible here, which is what separates this
+    from both affix siblings: :attr:`UNATTACHABLE_AFFIX_BAND` has no parent at all, and
+    :attr:`AMBIGUOUS_AFFIX_BAND` has two equally-near ones. This band has a single fitting
+    parent and the fault is only that it lies a row away -- so it needs its own member, and a
+    test can pin THIS reason by identity rather than being satisfied by any refusal at all.
+
+    Measured on ``10.1115-1.4007737`` p4: the header's unit subscripts at ``y=729.52`` are
+    rejected by their true parent on height ratio and then satisfy the first data row 15.99 pt
+    below, folding a header fragment into it so the laminar flame speed prints ``L;u67.2``
+    where the page reads ``67.2``. On the tree carrying the column-guard fix that box returns a
+    COMPLETE 92-cell grid with ``refusals == ()`` -- a silent corruption. The fold crosses the
+    partition between the header cluster and that data row, so it refuses here with no distance
+    threshold: the two axes a threshold could live on (height ratio, displacement) are both
+    measured dead across the corpus, and for the dominant single-glyph affix class the label
+    IS the displacement, so any cut on it is circular. The partition is not on that axis."""
 
     UNMAPPED_MEMBER = "unmapped_member"
     """A fragment inside the footprint has unmapped glyphs. Its text is a MARKER, not a
@@ -928,6 +949,58 @@ def _looks_like_affix(band: list[TextFragment], neighbour: list[TextFragment]) -
     return max(f.font_height for f in band) <= AFFIX_HEIGHT_RATIO * reference
 
 
+def _row_partitions(bands: list[tuple[float, list[TextFragment]]]) -> list[int]:
+    """Cut the RAW bands into row partitions by vertical ink overlap.
+
+    This is the barrier the affix merge folds against, and its whole value is that it is
+    derived from the raw bands ``_bands(inside)`` produced -- BEFORE any fold. Asking the
+    post-merge rows whether a fold crossed a boundary would be asking the corrupted output
+    to police the corruption; a structure the fold has not yet touched cannot be labelled
+    by the candidate fold, so the circular-labelling trap does not arise. It reads only
+    ``baseline_y`` and ``font_height`` and NOTHING else: not cell text, not column bounds,
+    not a row count, not a known table value.
+
+    Two bands are the same partition when their rendered ink boxes overlap vertically. A
+    band's ink box is ``[min baseline, max (baseline + font_height)]`` over its fragments:
+    ``font_height`` is the RENDERED height (it survives the ``Tf /F1 1`` trap that pins
+    ``font_size`` at 1.0), so this is the visible extent of the ink, not a nominal size. A
+    subscript or superscript is a small glyph RAISED or LOWERED to sit within its line's
+    band, so its ink overlaps the parent line's ink; two separate table rows are held apart
+    by leading, so their ink boxes do not touch. That is a structural relation, not a
+    distance cut -- there is no constant to tune and no threshold on the axis (height ratio,
+    displacement) that the corpus measured dead.
+
+    Single-linkage along the descending-baseline order ``_bands`` already returns, at the
+    same granularity its own clustering uses: consecutive bands join when their boxes
+    overlap. Because the boxes are ordered by baseline, non-consecutive overlap without a
+    consecutive bridge does not occur in practice, and single-linkage is the conservative
+    reading either way -- it can only MERGE partitions (weakening the barrier toward the
+    pre-existing behaviour), never split a real row in two and refuse a genuine fold.
+
+    Failure modes are decided here, not discovered downstream:
+
+    * A single printed row is one partition, so a fold inside it never crosses and the affix
+      attaches by the existing shape-and-adjacency signal exactly as before -- there is no
+      inter-row boundary to cross, and inventing one would refuse a legal fold.
+    * A multi-line header or a stacked cell reads as SEPARATE partitions, because its lines
+      do not overlap. This module models no rowspan and no multi-line logical cell, so a
+      fold reaching across those lines is refused rather than silently merged -- the safe
+      result the structure cannot otherwise justify.
+    """
+    if not bands:
+        return []
+    partitions = [0]
+    prev_lo = min(f.baseline_y for f in bands[0][1])
+    prev_hi = max(f.baseline_y + f.font_height for f in bands[0][1])
+    for _y, band in bands[1:]:
+        lo = min(f.baseline_y for f in band)
+        hi = max(f.baseline_y + f.font_height for f in band)
+        overlaps = min(prev_hi, hi) > max(prev_lo, lo)
+        partitions.append(partitions[-1] if overlaps else partitions[-1] + 1)
+        prev_lo, prev_hi = lo, hi
+    return partitions
+
+
 def _merge_affix_bands(
     bands: list[tuple[float, list[TextFragment]]],
 ) -> tuple[list[tuple[float, list[TextFragment], list[float]]], InventoryRefusal | None]:
@@ -937,7 +1010,15 @@ def _merge_affix_bands(
     recorded (the folded baselines travel on the row) rather than performed silently, and
     a band interior to BOTH neighbours refuses: choosing by proximity would change the
     cell text and the row count together, with nothing downstream looking wrong.
+
+    A fold may attach only WITHIN a raw row partition (:func:`_row_partitions`, derived from
+    these same bands before any fold): a decided parent in a different partition means the
+    affix logic picked a parent a row away -- the header-subscript-into-first-data-row
+    corruption -- and that refuses rather than folds. The partition is computed here, from
+    the unmerged ``bands`` argument, so the barrier is genuinely upstream of the merge and
+    not the post-merge rows re-policing themselves.
     """
+    partitions = _row_partitions(bands)
     # Pass 1: decide each band's parent WITHOUT mutating anything. A band is its own row
     # (parent None) unless it is affix-shaped and interior to exactly one neighbour.
     parents: list[int | None] = []
@@ -967,6 +1048,55 @@ def _merge_affix_bands(
                 f"an affix-shaped band at y={y} is adjacent to neither neighbouring band",
             )
         parents.append(index - 1 if fits_above else index + 1 if fits_below else None)
+
+    # The lift pass. A nested affix stack -- a sub-subscript below a subscript below its line --
+    # defeats the index-adjacent parent search: the deepest glyph's ONLY index-neighbour on the
+    # parent's side is the intermediate affix, which is shorter than it (ratio > 1, not
+    # affix-shaped) and horizontally offset (not adjacent), so pass 1 finds no same-row parent
+    # and falls to the wrong row across a partition. The measured case is
+    # ``10.1115-1.4007737`` p4: the header's deepest unit subscripts at y=729.524 (``L``/``u``)
+    # sit below the intermediate subscript ``S`` at y=730.431, whose own parent is the header
+    # line at y=731.792 -- one printed row, one partition. Their height ratio to that true
+    # header line is 0.70, already inside AFFIX_HEIGHT_RATIO; the obstruction is purely that the
+    # line is not their index-neighbour. So, ONLY for a band whose pass-1 parent lands across a
+    # partition boundary (exactly the folds the barrier below would refuse), reach through an
+    # intervening SAME-PARTITION affix neighbour to its parent, and retarget there when this
+    # band is itself affix-shaped-and-adjacent to that parent and it shares this partition. The
+    # gate is unchanged (same ``_looks_like_affix``/``_is_adjacent_to``, same partition), so a
+    # lift can only convert a would-be cross-row refusal into a fold WITHIN the row -- never
+    # move a fold that already stayed in its row, and never fold a separately-printed line,
+    # which by construction lies in a different partition. A band with no such intervening affix
+    # (a lone subscript whose only parent is genuinely a row away -- the raw corruption) is left
+    # untouched and refused below.
+    for index, parent in enumerate(parents):
+        if parent is None or partitions[parent] == partitions[index]:
+            continue
+        for neighbour in (index - 1, index + 1):
+            if not 0 <= neighbour < len(bands) or partitions[neighbour] != partitions[index]:
+                continue
+            grandparent = parents[neighbour]
+            if grandparent is None or partitions[grandparent] != partitions[index]:
+                continue
+            band = bands[index][1]
+            if _looks_like_affix(band, bands[grandparent][1]) and _is_adjacent_to(band, bands[grandparent][1]):
+                parents[index] = grandparent
+                break
+
+    # The row-partition barrier. A parent was decided above by shape and adjacency alone,
+    # which cannot tell the true parent one line up from a wrong one a row down when the
+    # true parent is rejected on height ratio -- the measured 729.52 -> 713.54 fold. The
+    # partition, derived from the raw bands before any of this ran, says which bands share a
+    # printed row; a decided parent in another partition is a fold across a row boundary and
+    # refuses (unless the lift pass above reattached it to its true same-partition parent).
+    # Checked before the chain rule below so the message names the row crossing rather than the
+    # incidental chain it might also form.
+    for index, parent in enumerate(parents):
+        if parent is not None and partitions[parent] != partitions[index]:
+            return [], InventoryRefusal(
+                InventoryRefusalReason.AFFIX_CROSSES_ROW_PARTITION,
+                f"a band at y={bands[index][0]} would fold across a row-partition boundary "
+                f"into a band at y={bands[parent][0]}",
+            )
 
     # A chain of affixes (an affix whose parent is itself an affix) is not a shape this
     # module can resolve into a row, and following the chain would let one ambiguous band
