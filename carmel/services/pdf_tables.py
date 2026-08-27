@@ -318,15 +318,24 @@ class InventoryRefusalReason(StrEnum):
     this module cannot read their geometry."""
 
     COLUMN_STRUCTURE_UNRESOLVED = "column_structure_unresolved"
-    """A row's own occupied blocks outnumber the columns derived across all rows.
+    """A row's ink BRIDGED a column boundary the rest of the table has, erasing it.
 
     Columns come from ALIGNED emptiness -- an x-strip empty in EVERY row -- so a single
     row spanning the table's width erases every boundary beneath it. Measured on a
     fixture: a spanning header collapsed three columns into one, merged three separate
-    cells into ``xyz`` at ``col=0``, and reported ``complete``. The inconsistency is
-    cheap to see (some row alone resolves more blocks than the union does) and refusing
-    on it is the only honest answer, because the column structure genuinely is not
-    derivable from aligned emptiness once a row spans."""
+    cells into ``xyz`` at ``col=0``, and reported ``complete``. The column structure
+    genuinely is not derivable from aligned emptiness once such a row spans.
+
+    The signature is NOT merely "some row resolves more blocks than the union does" --
+    that same inequality also holds for a header whose unit label is split from its
+    symbol by a gap the DATA rows bridge (``S`` ... ``(cm/s)`` over ``67.2``), where the
+    union is CORRECT and nothing was erased. :func:`build_inventory` separates them two
+    ways. Leave-one-out catches a boundary a SINGLE row erased -- removing that row
+    REVEALS a column the whole table hid, and the detail names it. Corroboration catches
+    a boundary TWO OR MORE rows erased together, which no single removal reveals: a union
+    column that at least two different rows each split into their own blocks was merged
+    across a real boundary. A split-header row trips neither -- removing it reveals
+    nothing, and only it splits its value column while the data fills it whole."""
 
     UNSPLITTABLE_SPANNING_FRAGMENT = "unsplittable_spanning_fragment"
     """A fragment's glyphs land in more than one derived column and no safe split exists.
@@ -1582,13 +1591,71 @@ def build_inventory(extraction: FragmentExtraction, footprint: ClaimedFootprint)
             )
         )
     bounds = _column_bounds(rows_raw)
-    for baseline_y, members, _ in rows_raw:
-        own = _column_bounds([(baseline_y, members, [])])
-        if len(own) > len(bounds):
+    # The OLD guard refused whenever a row's OWN column blocks -- the bounds derived from that
+    # one row's ink alone -- outnumbered the bounds derived from the union of ALL rows. That
+    # one predicate answered two different questions, and only one of them means the column
+    # structure is genuinely unresolvable. It is stated below in a form a later reader can
+    # check against a page.
+    #
+    #  * A boundary-DESTROYING (spanning) row -- the guard's real quarry: its ink covers an
+    #    x-strip that the OTHER rows leave blank, so unioning it in ERASES a column boundary
+    #    the rest of the table has. Columns come from ALIGNED emptiness, so once such a row
+    #    spans, the union under-counts the columns and every downstream cell is untrustworthy
+    #    (the documented collapse: three cells merged into `xyz` at col=0, reported complete).
+    #  * A row with an extra INTERNAL gap the rest of the table FILLS -- a header whose unit
+    #    label is split from its symbol (`S` then a gap then `(cm/s)`) by a space the data
+    #    rows bridge with a single value (`67.2`, `124.4`). Here the union is CORRECT; the
+    #    header simply is not the row that defines the columns. Refusing it loses a whole
+    #    extractable table for a structure that was never in doubt.
+    #
+    # Both are answered by asking who DREW a boundary the union lacks, not merely who has more
+    # blocks than it: a boundary is real when the ink establishing it belongs to the rest of
+    # the table, spurious when it belongs only to the one row that shows it.
+    #
+    # (1) A boundary a SINGLE row erased shows up under leave-one-out: removing that row from
+    #     the union REVEALS a column the whole table hid. Name it -- the row whose removal
+    #     un-hides a column is the one that erased it. A split-header row reveals nothing when
+    #     removed, because its extra blocks are internal gaps other rows already fill.
+    for index, (baseline_y, _members, _folded) in enumerate(rows_raw):
+        revealed = _column_bounds([row for i, row in enumerate(rows_raw) if i != index])
+        if len(revealed) > len(bounds):
             return refused(
                 InventoryRefusal(
                     InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED,
-                    f"the row at y={baseline_y} resolves {len(own)} blocks where the table resolves {len(bounds)}",
+                    f"removing the row at y={baseline_y} reveals {len(revealed)} columns where the "
+                    f"table union resolves {len(bounds)}: its ink bridged a boundary the rest of "
+                    f"the table has, so the column structure cannot be derived",
+                )
+            )
+
+    # (2) A boundary that TWO OR MORE rows bridge TOGETHER is invisible to (1): removing any
+    #     one leaves the others still bridging, so no single removal reveals the column -- yet
+    #     the collapse is just as real (two spanning rows merge three cells into `xyz` exactly
+    #     as one does). Corroboration, not removal, catches it: a union column that at least
+    #     TWO different rows each break into two or more of their own blocks was merged across
+    #     a boundary the table draws, and cannot be derived. This is count-INSENSITIVE -- it
+    #     turns on two rows agreeing that the column splits, never on how many rows erased it,
+    #     so three collective bridgers are caught no differently from two. A split header does
+    #     NOT trip it: only the header splits its value column, the data rows fill it whole.
+    splitters_by_column: dict[int, list[float]] = {}
+    for baseline_y, members, folded in rows_raw:
+        pieces_here: dict[int, int] = {}
+        for left, right in _column_bounds([(baseline_y, members, folded)]):
+            col = _block_of(left, right, bounds)
+            if col is not None:
+                pieces_here[col] = pieces_here.get(col, 0) + 1
+        for col, pieces in pieces_here.items():
+            if pieces >= 2:
+                splitters_by_column.setdefault(col, []).append(baseline_y)
+    for col, ys in splitters_by_column.items():
+        if len(ys) >= 2:
+            left, right = bounds[col]
+            return refused(
+                InventoryRefusal(
+                    InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED,
+                    f"{len(ys)} rows (e.g. y={ys[0]}, y={ys[1]}) each split the single column the "
+                    f"union merged across x=[{left}, {right}]: rows bridging a shared boundary "
+                    f"collapse the column structure, which cannot be derived",
                 )
             )
 

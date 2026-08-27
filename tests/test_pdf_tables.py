@@ -1013,6 +1013,151 @@ class TestTheFootprintIsAClaimAndTheAnchorIsWhatPinsIt:
         assert inventory.cells == ()
         assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
 
+    def test_the_spanning_row_itself_is_named_as_the_boundary_destroyer(self) -> None:
+        """One predicate answered two questions; this pins the answer to the RIGHT one.
+
+        A boundary-destroying (spanning) row and a header split by an internal label gap
+        BOTH produce a row whose own blocks (the bounds from that one row's ink) outnumber
+        the union's. The guard separates them by leave-one-out: it refuses only when removing
+        some row REVEALS a column the table hid, and it NAMES that row. Here the spanning
+        header at ``y=134.5`` bridges
+        three real columns (established by three data rows); removing it un-hides them.
+        Asserting the reason alone is not enough -- a split-header regression would also
+        refuse SOMETHING -- so this asserts the leave-one-out detail names the spanner and
+        the column count it erased.
+        """
+        fragments = (
+            CAPTION,
+            frag("a wide spanning header", 53.0, 280.0, 134.5),
+            frag("x", 53.0, 60.0, 120.0),
+            frag("y", 122.0, 130.0, 120.0),
+            frag("z", 227.0, 240.0, 120.0),
+            frag("x", 53.0, 60.0, 110.0),
+            frag("y", 122.0, 130.0, 110.0),
+            frag("z", 227.0, 240.0, 110.0),
+            frag("x", 53.0, 60.0, 100.0),
+            frag("y", 122.0, 130.0, 100.0),
+            frag("z", 227.0, 240.0, 100.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+        detail = inventory.refusals[0].detail
+        assert "removing the row at y=134.5" in detail
+        assert "reveals 3 columns where the table union resolves 1" in detail
+
+    def test_two_rows_bridging_the_same_boundary_are_refused(self) -> None:
+        """The collective-bridging hole leave-one-out alone leaves open. TWO full-width rows
+        bridge the same three columns; removing EITHER leaves the other still bridging, so
+        no single removal reveals a hidden column and leave-one-out is blind. The collapse is
+        identical to one spanner's -- three data cells merged into ``xyz`` at ``col=0`` --
+        and must still be refused. Corroboration catches it: two data rows each split the one
+        column the union merged, so the boundary is real. Pinned to the specific reason and
+        to the collective detail so a regression to the single-spanner-only guard fails here.
+        """
+        fragments = (
+            CAPTION,
+            frag("a wide spanning header", 53.0, 280.0, 134.5),
+            frag("another wide spanner", 53.0, 280.0, 128.0),
+            frag("x", 53.0, 60.0, 121.0),
+            frag("y", 122.0, 130.0, 121.0),
+            frag("z", 227.0, 240.0, 121.0),
+            frag("x", 53.0, 60.0, 112.0),
+            frag("y", 122.0, 130.0, 112.0),
+            frag("z", 227.0, 240.0, 112.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.cells == ()
+        assert inventory.complete is False
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+        detail = inventory.refusals[0].detail
+        assert "each split the single column the union merged" in detail
+        assert "y=121" in detail and "y=112" in detail
+
+    def test_three_rows_bridging_the_same_boundary_are_refused(self) -> None:
+        """The count-insensitivity check the two-row case cannot make on its own. THREE
+        full-width rows now bridge the same columns. A detector keyed on the modal per-row
+        column count would flip here -- three bridgers outnumber two data rows and the modal
+        count becomes the collapsed one -- and admit the collapse. Corroboration does not
+        count bridgers; it asks whether two rows DRAW the boundary, and the two data rows
+        still do, so the refusal is unchanged from the two-row case.
+        """
+        fragments = (
+            CAPTION,
+            frag("a wide spanning header", 53.0, 280.0, 140.0),
+            frag("another wide spanner", 53.0, 280.0, 134.5),
+            frag("a third wide spanner", 53.0, 280.0, 128.0),
+            frag("x", 53.0, 60.0, 121.0),
+            frag("y", 122.0, 130.0, 121.0),
+            frag("z", 227.0, 240.0, 121.0),
+            frag("x", 53.0, 60.0, 112.0),
+            frag("y", 122.0, 130.0, 112.0),
+            frag("z", 227.0, 240.0, 112.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+        assert "each split the single column the union merged" in inventory.refusals[0].detail
+
+    def test_a_split_header_label_gap_the_data_bridges_is_not_refused(self) -> None:
+        """The false refusal this guard's refinement removes. A header prints its symbol
+        ``S`` then, after a gap wider than a column valley, its unit ``(cm/s)`` -- two
+        blocks -- while every data row bridges that gap with a single value (``67.2``).
+        The header alone resolves three blocks (label, ``S``, ``(cm/s)``) where the table
+        resolves two, the OLD signature of a spanning row. But removing the header reveals
+        NO hidden column, and removing any single data row leaves the others still filling
+        the gap, so no row destroyed a boundary: the union is correct and the table must
+        extract. The two header pieces land in one value cell, ``S(cm/s)``.
+        """
+        rows: list[TextFragment] = [
+            CAPTION,
+            frag("phi", 53.0, 57.0, 134.5),
+            frag("S", 120.0, 128.0, 134.5),
+            frag("(cm/s)", 150.0, 180.0, 134.5),
+        ]
+        for i in range(3):
+            y = 120.0 - 10.0 * i
+            rows.append(frag(f"0.{i}", 53.0, 60.0, y))
+            rows.append(frag("67.2", 122.0, 178.0, y))
+
+        inventory = build_inventory(extraction_of(*rows), footprint())
+
+        assert inventory.refusals == ()
+        assert len(inventory.column_bounds) == 2
+        assert inventory.complete
+        header_value_cells = [c.text for c in inventory.cells if c.row == 0 and c.col == 1]
+        assert header_value_cells == ["S(cm/s)"]
+
+    def test_a_single_data_row_split_header_stays_fail_closed(self) -> None:
+        """The boundary of the refinement, pinned so it is a decision and not an accident.
+
+        With exactly ONE data row, ``S (cm/s)`` over a single ``67.2`` is genuinely
+        ambiguous -- two label columns with one value, or one column -- because no second
+        row establishes that the gap is really filled. Removing the lone data row leaves
+        the header re-splitting into three blocks, so leave-one-out sees a revealed column
+        and refuses. That is the fail-CLOSED direction, and it is correct: a column
+        structure one row cannot corroborate is not derivable.
+        """
+        fragments = (
+            CAPTION,
+            frag("phi", 53.0, 57.0, 134.5),
+            frag("S", 120.0, 128.0, 134.5),
+            frag("(cm/s)", 150.0, 180.0, 134.5),
+            frag("0.5", 53.0, 60.0, 120.0),
+            frag("67.2", 122.0, 178.0, 120.0),
+        )
+
+        inventory = build_inventory(extraction_of(*fragments), footprint())
+
+        assert inventory.cells == ()
+        assert [r.reason for r in inventory.refusals] == [InventoryRefusalReason.COLUMN_STRUCTURE_UNRESOLVED]
+
     def test_a_rotated_fragment_inside_the_box_refuses(self) -> None:
         inventory = build_inventory(
             extraction_of(*simple_grid(), frag("sideways", 100.0, 110.0, 100.0, rotated=True)),
