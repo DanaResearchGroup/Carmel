@@ -1076,10 +1076,11 @@ class MeasurementSpec:
     loudly even though no spec, malformed or not, can ever succeed -- and
     hand it to the producer, and the producer will refuse it every time,
     reporting it back only by count (see :func:`_describe_count`).
-    Restoring this interaction needs something that can first emit a
-    ``TABLE_CELL`` locator (a table parser) or a ``FIGURE_CROP`` node (a
-    figure digitizer); until then this class is schema + refusal apparatus,
-    not a live parameter object.
+    This class stays dormant permanently: the char-span route it feeds is
+    closed for good (a char span cannot ground a series value), and the now-live
+    tabular producer takes its OWN specs
+    (:mod:`carmel.services.tabular_dataset_producer`), never a MeasurementSpec.
+    It remains schema + refusal apparatus, not a live parameter object.
     """
 
     axis_id: str
@@ -1666,7 +1667,7 @@ def produce_envelope_from_artifact(
     value_origin: ValueOrigin,
     measurements: tuple[MeasurementSpec, ...],
 ) -> DatasetEnvelope:
-    """REFUSED: this runtime cannot honestly produce a dataset envelope.
+    """REFUSED: this CHAR-SPAN entry point cannot honestly produce a dataset envelope.
 
     P0-c. This function used to build a fully validated
     :class:`DatasetEnvelope` -- authenticate ``raw.bin``, select the one
@@ -1701,15 +1702,20 @@ def produce_envelope_from_artifact(
     assembler reads as an available capability, which is the same trap as
     :class:`~carmel.agents.tools.extract.TextSection`'s documented-but-never-
     emitted ``caption``/``table`` labels. Git holds the previous
-    implementation; a future ``TABULAR``/``DIGITIZED`` producer will not want
-    its char-span assembly anyway.
+    implementation; the ``TABULAR`` producer that now exists did not want its
+    char-span assembly anyway.
 
-    HOW TO RESTORE DATASET PRODUCTION. Something must first be able to emit a
-    ``TABLE_CELL`` locator (a table parser) or a ``FIGURE_CROP`` node (a figure
-    digitizer). Until then no producer can construct any
-    :class:`DatasetEnvelope`, and the dataset slice is schema + replay +
-    storage only. For a prose-local SCALAR statement -- the honest thing
-    running text CAN support -- use
+    THE TABULAR ROUTE IS RESTORED. Dataset production needed something able to
+    emit a ``TABLE_CELL`` locator (a table parser) or a ``FIGURE_CROP`` node (a
+    figure digitizer). The table parser now exists
+    (:func:`carmel.services.pdf_tables.build_inventory`), so a series read from a
+    TABLE is produced by
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
+    which locates every data-point value at a table cell. The DIGITIZED (figure)
+    route still has no producer. THIS entry point stays refused regardless: it can
+    only locate a value as a char span, which cannot ground a series value (V7),
+    and no future producer will want that char-span assembly. For a prose-local
+    SCALAR statement -- the honest thing running text CAN support -- use
     :func:`~carmel.services.condition_set_producer.produce_condition_set_from_artifact`.
     Note that a :class:`ConditionSetEnvelope` holds CONDITIONS, not
     observables, so a genuinely prose-stated observable has no home today; a
@@ -1738,7 +1744,10 @@ def produce_envelope_from_artifact(
         "figure's axis ticks extract as ordinary body prose and ground perfectly (series_id="
         f"{series_id!r}, {len(measurements)} spec(s), value_origin={value_origin.value!r}). "
         "This is a limit of what this runtime can prove, not a claim that prose never states a "
-        "series. Series data needs TABULAR (a table parser) or DIGITIZED (a figure digitizer), "
-        "neither of which exists yet; a prose-local scalar statement belongs in a "
+        "series. The TABULAR route is now restored -- a table parser emits TABLE_CELL locators, so "
+        "a series read from a table is produced by "
+        "tabular_dataset_producer.produce_tabular_envelope_from_artifact; the DIGITIZED (figure) "
+        "route still has no producer. This char-span entry point stays refused because a char span "
+        "cannot ground a series value; a prose-local scalar statement belongs in a "
         "ConditionSetEnvelope via produce_condition_set_from_artifact"
     )
