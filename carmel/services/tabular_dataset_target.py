@@ -233,11 +233,28 @@ def _cell_of(embedded: EmbeddedTableInventory, row: int, col: int) -> TableCellG
 def build_axes(embedded: EmbeddedTableInventory) -> tuple[TabularAxisSpec, TabularAxisSpec]:
     """The series' two axes, grounded against the embedded inventory."""
     return (
-        # phi is dimensionless and its column prints no unit; the header decodes
-        # to "/" (symbol-font phi). Rather than launder a "-" unit the boundary
-        # guard rightly refuses, or assert EQUIVALENCE_RATIO through the glyph
-        # corruption, it is recorded as OTHER with the verbatim header as its
-        # unit -- the schema's honest "quantity this table does not model" state.
+        # phi is recorded as OTHER, NOT EQUIVALENCE_RATIO, and this is the honest
+        # encoding -- re-derived against the real document (I058), not a fallback
+        # nobody rechecked. What the coordinate IS *is* groundable: the table caption
+        # reads "range of equivalence ratios" and the nomenclature defines the symbol
+        # as "phi = equivalence ratio", so a LABEL naming the quantity has a real home
+        # in the prose. The blocker is the UNIT. phi is dimensionless and its column
+        # prints no unit token at all -- the header cell decodes to "/" (symbol-font
+        # phi), and the word "dimensionless", a bracketed "[-]"/"(-)", and a bare "1"
+        # appear nowhere near the column. The units table admits exactly one unit for
+        # EQUIVALENCE_RATIO -- base "1", aliases "-" and "dimensionless" -- and the
+        # real header "/" is not among them, so declaring EQUIVALENCE_RATIO makes the
+        # producer's boundary gate refuse the "/" the column actually prints
+        # (test_declaring_equivalence_ratio_is_refused_against_the_printed_header).
+        # The only way to pass the gate is to hand it "-"/"1"/"dimensionless" -- none
+        # of which this column prints -- i.e. to ground a token that is NOT this
+        # column's unit. Grounding proves LOCATION, never MEANING, so that would be a
+        # fabricated unit, the exact class this project refuses; the gate checks
+        # normalizability, not that the token is phi's unit, so the refusal to launder
+        # is an encoder judgment the gate cannot make for us. OTHER with the verbatim
+        # header is therefore correct: the schema's honest "quantity this table does
+        # not model" state. test_the_phi_coordinate_stays_other_for_want_of_a_printed_
+        # unit pins this outcome and fails if it silently flips back.
         TabularAxisSpec(
             axis_id="phi",
             role=AxisRole.COORDINATE,

@@ -43,23 +43,29 @@ from pathlib import Path
 import pytest
 
 from carmel.schemas.datasets import (
+    AxisRole,
     DatasetEnvelope,
     EmbeddedTableInventory,
     TableCellLocator,
     ValueOrigin,
 )
+from carmel.services import units
 from carmel.services.condition_set_producer import TableCellGrounding
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
+from carmel.services.dataset_producer import DatasetProducerError
 from carmel.services.dataset_replay import ReplayOutcome, replay_envelope, replay_stored_dataset
 from carmel.services.tabular_dataset_producer import (
+    TabularAxisSpec,
     TabularDatasetProducerError,
     TabularPointSpec,
     TabularPointValueSpec,
     produce_tabular_envelope_from_artifact,
 )
 from carmel.services.tabular_dataset_target import (
+    PHI_HEADER,
     TARGET_CAMPAIGN,
     TARGET_DOCUMENT_SHA256,
+    TARGET_ROWS,
     TARGET_TABLE_KEY,
     TARGET_WORKSPACES_ROOTS,
     build_axes,
@@ -74,6 +80,8 @@ from tests.pypdf_gate import require_pypdf
 _DOCUMENT_SHA256 = TARGET_DOCUMENT_SHA256
 _TABLE_KEY = TARGET_TABLE_KEY
 _axes = build_axes
+_PHI_HEADER = PHI_HEADER
+_ROWS = TARGET_ROWS
 _embedded_inventory = build_embedded_inventory
 _produce = build_envelope
 
@@ -112,6 +120,84 @@ class TestTheFirstStoredTabularSeries:
         env = _produce(workspace, _embedded_inventory(raw))
         stored = store_dataset_envelope(workspace, env)
         assert load_dataset_envelope(workspace, stored.sha256) == env
+
+    def test_the_phi_coordinate_stays_other_for_want_of_a_printed_unit(self, tmp_path: Path) -> None:
+        """I058. The coordinate axis is recorded as OTHER, and this is the honest
+        outcome, not a defect to be fixed by declaring EQUIVALENCE_RATIO. What the
+        coordinate IS is groundable in prose (caption "range of equivalence ratios";
+        nomenclature "phi = equivalence ratio"), but its UNIT is not: phi is
+        dimensionless and this column prints no unit token, so the only unit strings
+        the units table admits for EQUIVALENCE_RATIO ("1"/"-"/"dimensionless") appear
+        nowhere near it. Declaring EQUIVALENCE_RATIO would require grounding a unit the
+        column never printed -- a fabricated meaning grounding cannot support. This
+        pins OTHER so the question is not reopened a third time; it fails the moment
+        the coordinate is silently re-tagged."""
+        workspace, raw = _staged_workspace(tmp_path)
+        env = _produce(workspace, _embedded_inventory(raw))
+        phi = next(axis for axis in env.series[0].axes if axis.axis_id == "phi")
+        assert phi.role is AxisRole.COORDINATE
+        assert phi.quantity_kind is units.QuantityKind.OTHER
+        # The verbatim corrupted header is carried as the label AND the unit -- the
+        # honest "this table does not model this quantity" state, not a laundered one.
+        assert phi.label_raw == _PHI_HEADER
+        for point in env.series[0].points:
+            for coord in point.coordinates:
+                if coord.axis_id != "phi":
+                    continue
+                assert coord.value.unit_ref is not None
+                # Not just present -- carrying the ACTUAL corrupted header, not a
+                # laundered "1"/"-"/"dimensionless": pins that a fabricated-unit
+                # regression (silently swapping in a groomed spelling) would fail
+                # here, not just at the axis-level label_raw check above.
+                assert coord.value.unit_raw == _PHI_HEADER
+                assert coord.value.unit_normalized == _PHI_HEADER
+
+    def test_declaring_equivalence_ratio_is_refused_against_the_printed_header(self, tmp_path: Path) -> None:
+        """I058, executable. The mechanical reason EQUIVALENCE_RATIO is unreachable:
+        grounding its unit at the real header cell -- the only unit this column prints
+        -- makes the producer's boundary gate refuse, because "/" (symbol-font phi) is
+        not a known unit or alias of equivalence_ratio. This is the boundary guard
+        working as intended; the fix is NOT to weaken it, and the honest encoding is
+        OTHER. Pinning the refusal keeps a later "just switch it to EQUIVALENCE_RATIO"
+        from looking free."""
+        workspace, raw = _staged_workspace(tmp_path)
+        embedded = _embedded_inventory(raw)
+
+        def cell(row: int, col: int) -> TableCellGrounding:
+            return _cell_of(embedded, row, col)
+
+        phi_as_equivalence_ratio = TabularAxisSpec(
+            axis_id="phi",
+            role=AxisRole.COORDINATE,
+            quantity_kind=units.QuantityKind.EQUIVALENCE_RATIO,
+            label_quote=_PHI_HEADER,
+            unit_quote=_PHI_HEADER,
+            label_cell=cell(0, 0),
+            unit_cell=cell(0, 0),
+        )
+        _, s_l_axis = _axes(embedded)
+        points = tuple(
+            TabularPointSpec(
+                point_id=f"r{row:02d}",
+                values=(
+                    TabularPointValueSpec(axis_id="phi", value_quote=phi, cell=cell(row, 0)),
+                    TabularPointValueSpec(axis_id="s_l", value_quote=s_l, cell=cell(row, 1)),
+                ),
+            )
+            for row, phi, s_l in _ROWS
+        )
+        with pytest.raises(DatasetProducerError, match="not a known unit or alias") as excinfo:
+            produce_tabular_envelope_from_artifact(
+                workspace,
+                sha256=_DOCUMENT_SHA256,
+                series_id="flame_speed_sweep",
+                value_origin=ValueOrigin.EXPERIMENTAL,
+                axes=(phi_as_equivalence_ratio, s_l_axis),
+                points=points,
+            )
+        message = str(excinfo.value)
+        assert "equivalence_ratio" in message
+        assert repr(_PHI_HEADER) in message
 
     def test_every_data_point_value_is_a_table_cell(self, tmp_path: Path) -> None:
         workspace, raw = _staged_workspace(tmp_path)
