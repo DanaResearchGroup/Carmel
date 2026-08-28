@@ -243,6 +243,28 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    store_condition_set = subparsers.add_parser(
+        "store-condition-set",
+        help="Produce and durably store the registered condition set, and export it for reading",
+        description=(
+            "Run the condition-set production path for real: authenticate the one registered "
+            "source document in the operator's workspace, derive its table grid, assemble the "
+            "condition-set envelope, and store it in the workspace's condition-set store -- then "
+            "write a human-readable text export of the stored conditions into the workspace's "
+            "reports/ dir. The document is discovered the same way the acceptance test discovers "
+            "it; pass --workspaces to name an explicit workspaces root instead."
+        ),
+    )
+    store_condition_set.add_argument(
+        "--workspaces",
+        type=Path,
+        default=None,
+        help=(
+            "Parent workspaces directory holding the campaign that stores the document. "
+            "Default: discover it under the packaged default root or ~/runs/carmel/workspaces."
+        ),
+    )
+
     return parser
 
 
@@ -1131,6 +1153,67 @@ def _cmd_store_tabular_dataset(workspaces: Path | None) -> int:
     return 0
 
 
+def _cmd_store_condition_set(workspaces: Path | None) -> int:
+    """Produce and durably store the registered condition set, then export it.
+
+    Thin wrapper: the whole vertical slice -- discovery, authentication, grid
+    derivation, envelope assembly through the production producer, and the
+    durable store -- lives in :mod:`carmel.services.condition_set_target`. A
+    refusal (the document is absent, its bytes are not the measured document, the
+    grid refuses, or a producer guard declines) is reported to stderr and stops;
+    it is never routed around. If the envelope stores durably but the
+    human-readable export cannot be written, that too is reported to stderr --
+    naming the stored artifact so the data is never reported as lost -- and exits
+    non-zero. The honest replay outcome of the stored artifact is UNVERIFIABLE
+    overall with VERIFIED evidence, by design.
+    """
+    from carmel.services.condition_set_producer import ConditionSetProducerError
+    from carmel.services.condition_set_target import (
+        TARGET_CAMPAIGN,
+        ConditionSetTargetError,
+        locate_target_workspace,
+        produce_and_store_target,
+        render_condition_set_text,
+        write_condition_set_export,
+    )
+
+    if workspaces is not None:
+        workspace = workspaces.expanduser() / TARGET_CAMPAIGN
+    else:
+        discovered = locate_target_workspace()
+        if discovered is None:
+            print(
+                "The registered source document is not stored in any known workspace. "
+                "Pass --workspaces <root> to name the parent of the campaign that holds it.",
+                file=sys.stderr,
+            )
+            return 1
+        workspace = discovered
+
+    try:
+        stored = produce_and_store_target(workspace)
+    except (ConditionSetTargetError, ConditionSetProducerError) as exc:
+        print(f"Refusing to store the condition set: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        export_path = write_condition_set_export(workspace, stored)
+    except OSError as exc:
+        print(
+            f"Stored the condition set envelope durably at {stored.path} (sha256 {stored.sha256}), "
+            f"but could not write the human-readable export: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Stored condition set    : {stored.path}")
+    print(f"Content address (sha256): {stored.sha256}")
+    print(f"Human-readable export   : {export_path}")
+    print()
+    print(render_condition_set_text(stored.envelope), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and dispatch to the appropriate command.
 
@@ -1184,6 +1267,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "store-tabular-dataset":
         return _cmd_store_tabular_dataset(args.workspaces)
+
+    if args.command == "store-condition-set":
+        return _cmd_store_condition_set(args.workspaces)
 
     parser.print_help()
     return 1
