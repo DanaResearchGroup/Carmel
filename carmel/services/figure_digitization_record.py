@@ -152,6 +152,7 @@ __all__ = [
     "MarkerOmissionReason",
     "PlotRegion",
     "UNREADABLE_PAYLOAD",
+    "UnknownPayloadVersion",
     "census_of",
     "compute_digitization_identity",
     "compute_digitization_sha",
@@ -251,6 +252,35 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 #: ``tests/test_embedded_figure_digitization.py::TestTheRefusalSurfaceHasNoUndocumentedEscapes``,
 #: which states what that sweep does and does not reach.
 UNREADABLE_PAYLOAD: tuple[type[Exception], ...] = (KeyError, OverflowError, TypeError, ValueError)
+
+
+class UnknownPayloadVersion(ValueError):
+    """A payload declares a ``payload_version`` this reader does not know how to read.
+
+    A :class:`ValueError` subclass ON PURPOSE, so it stays inside :data:`UNREADABLE_PAYLOAD`:
+    every existing caller that refuses an unreadable payload -- :func:`payload_unreadable_reason`,
+    and :class:`carmel.schemas.datasets.EmbeddedFigureDigitization`'s refusal of a record before it
+    is ever embedded or cited -- must keep refusing an unknown-version record exactly as before,
+    because refusing to guess at a shape it does not know is the whole point of the version. What
+    the subclass ADDS is a fact ONE caller can act on separately: an unknown version is the reader
+    admitting "I cannot read this shape", never a charge that the record is WRONG. Those are
+    different facts (see :data:`DIGITIZATION_PAYLOAD_VERSION`), and
+    :mod:`carmel.services.dataset_replay` reads the distinction to report a version it cannot read
+    as UNVERIFIABLE rather than FAILED -- so a record that may merely be newer is never accused of
+    a falsification no reader here earned.
+
+    Carries the offending ``version`` and the ``readable_version`` as attributes so a caller can
+    name the version in its own report without re-parsing the message.
+    """
+
+    def __init__(self, version: object, readable_version: int) -> None:
+        self.version = version
+        self.readable_version = readable_version
+        super().__init__(
+            f"payload_version {version!r} is not the readable version {readable_version!r} "
+            "-- a reader that does not know a shape must not guess at it"
+        )
+
 
 #: Discriminator values for the two arms of :data:`MarkerCount` in the stored payload.
 #:
@@ -878,10 +908,19 @@ class FigureDigitization:
         construction is held to, D1 through D9.
 
         Raises:
-            ValueError: If the payload is not a readable version-
-                :data:`DIGITIZATION_PAYLOAD_VERSION` record, or if the record it describes
-                violates any construction invariant. Both are ``ValueError`` because both mean
-                the same thing to a caller: these bytes are not a record.
+            UnknownPayloadVersion: Only if ``payload_version`` is GENUINELY DECLARED -- present,
+                an ``int`` (not a ``bool``), and different from :data:`DIGITIZATION_PAYLOAD_VERSION`.
+                That record may be NEWER rather than wrong, so this is the reader's admission "I
+                cannot read this shape". A ``ValueError`` subclass, so a caller that treats every
+                unreadable payload alike is unaffected -- but a caller that wants to tell "I cannot
+                read this shape" apart from "this record is wrong" can, because the two are
+                different facts and only this one is the reader's admission. A version key that is
+                absent, or present but of a type a version cannot be, is NOT this: it is a malformed
+                record, refused below as an ordinary ``ValueError``.
+            ValueError: If the record the payload describes violates any construction invariant, if
+                the payload is not a version-:data:`DIGITIZATION_PAYLOAD_VERSION` object at all, or
+                if it declares a ``payload_version`` of the wrong type. These mean the same thing to
+                a caller: these bytes are not a record.
             TypeError: If a field holds a type the reconstruction cannot use at all.
             OverflowError: If a stored coordinate is a hex float naming a magnitude no ``float``
                 can hold -- ``float.fromhex`` raises this instead of refusing the string.
@@ -899,11 +938,34 @@ class FigureDigitization:
             # is, and for the same reason.
             raise ValueError(f"a digitization record payload is {type(payload).__name__}, not an object")
         version = payload.get("payload_version")
-        if version != DIGITIZATION_PAYLOAD_VERSION:
+        if isinstance(version, int) and not isinstance(version, bool):
+            # A GENUINELY DECLARED version: present, and of the type a version is. Only a
+            # different one of those is an unknown SHAPE -- the reader admitting "I cannot read
+            # this, it may be newer than me", reported UNVERIFIABLE downstream, never a charge that
+            # the record is wrong. `bool` is excluded because `isinstance(True, int)` and
+            # `True == 1`: without excluding it a `payload_version` of `true` would sail through
+            # this gate AS version 1, reading a mistyped record as a valid one. Same reasoning, and
+            # the same spelling, as :func:`_require_count`.
+            if version != DIGITIZATION_PAYLOAD_VERSION:
+                raise UnknownPayloadVersion(version, DIGITIZATION_PAYLOAD_VERSION)
+        elif "payload_version" in payload:
+            # PRESENT but not the type a version is (a string "1", a float, a bool, an explicit
+            # null). This is a MALFORMED record, not a newer one: a version bump writes a larger
+            # integer, it never respells the one field that tells a reader how to read the rest. A
+            # reader that cannot trust that field's type has bytes it cannot read as a record at
+            # all, so it says the record is WRONG (FAILED, via `UNREADABLE_PAYLOAD`), never that it
+            # might merely be newer. Refused HERE rather than left to the shape check below, which
+            # would PASS an otherwise-legal record whose only defect is a mistyped version, letting
+            # a broken record reconstruct clean.
             raise ValueError(
-                f"payload_version {version!r} is not the readable version {DIGITIZATION_PAYLOAD_VERSION!r} "
-                "-- a reader that does not know a shape must not guess at it"
+                f"'payload_version' is {type(version).__name__} {version!r}, not the integer a "
+                "version is -- a mistyped discriminator is a malformed record, not a newer one"
             )
+        # ABSENT entirely: not declared, so there is nothing to call an unknown VERSION. Left to
+        # the shape check below, which refuses it as a reconstruction failure naming the missing
+        # 'payload_version' key -- FAILED, and a reason that never claims the record declared a
+        # version it did not (the overclaim the earlier `payload.get(...) != VERSION` short-circuit
+        # made, reporting a keyless payload as "declares payload_version None").
         keys = set(payload)
         if keys != set(DIGITIZATION_PAYLOAD_KEYS):
             unexpected = sorted(keys - DIGITIZATION_PAYLOAD_KEYS)
