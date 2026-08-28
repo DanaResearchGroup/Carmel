@@ -47,22 +47,29 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from carmel.agents.bridge import AgentTool, CarmelAgent, ModelProtocol
 from carmel.agents.budget import BudgetLedger
 from carmel.schemas.datasets import (
+    AxisRole,
     ConditionAttribution,
     SubjectRefusalReason,
     UnextractedReason,
+    ValueOrigin,
 )
 from carmel.services.units import QuantityKind
 
 __all__ = [
     "EXTRACTION_SYSTEM_PROMPT",
     "ExtractionProposal",
+    "ProposedAxisUnit",
     "ProposedCategoricalCondition",
     "ProposedDeviceClass",
+    "ProposedHeaderUnit",
     "ProposedObservable",
+    "ProposedProseUnit",
     "ProposedScalarCondition",
     "ProposedSubject",
+    "ProposedTabularAxis",
     "ProposedUnextractedCondition",
     "ProposedUnresolvedSubject",
+    "TabularSeriesProposal",
     "build_extraction_agent",
 ]
 
@@ -151,17 +158,23 @@ class ProposedUnextractedCondition(BaseModel):
 
 
 class ProposedObservable(BaseModel):
-    """A STUB channel for a proposed series/observable, deliberately un-assembled.
+    """A STUB channel for an observable proposed INTO A CONDITION SET, still refused.
 
-    Series (observable) production is refused by this runtime unconditionally today
-    (:func:`carmel.services.dataset_producer.produce_envelope_from_artifact` raises
-    always -- a char span in running text cannot ground a series data point), and the
-    assembly path is being restored in parallel work. This field exists so an
-    observable has an OBVIOUS place in the proposal the day that path lands, and so the
-    schema states the boundary rather than hiding it. Until then,
+    A char span in running text cannot ground a series data point, so an observable has
+    no home in a :class:`~carmel.schemas.datasets.ConditionSetEnvelope` -- a condition
+    set records scalars, tokens and refusals, never a located series. This field exists
+    so such a mis-placed observable has an OBVIOUS place to land and be refused, rather
+    than being silently dropped:
     :func:`carmel.services.proposal_intake.condition_set_from_proposal` REFUSES a
-    proposal that carries any observable -- it does not silently drop them, because a
-    silently dropped observation and a refused one are different facts.
+    proposal that carries any observable, because a dropped observation and a refused one
+    are different facts.
+
+    A TABULAR series read from a table now HAS an assembly path -- but it is a
+    DIFFERENT envelope (:class:`~carmel.schemas.datasets.DatasetEnvelope`) reached by a
+    DIFFERENT proposal (:class:`TabularSeriesProposal`) and carrier
+    (:func:`carmel.services.proposal_intake.tabular_series_from_proposal`), because a
+    series is located in a grid, not in prose. This stub is the condition-set side's
+    honest refusal, not that path.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -171,6 +184,115 @@ class ProposedObservable(BaseModel):
     note: str = Field(default="", max_length=500)
     """Free-text note for the human who will wire assembly, e.g. which figure or table
     the observable was read from. Never grounded, never stored -- advisory only."""
+
+
+class ProposedProseUnit(BaseModel):
+    """An axis whose unit is written in the paper's PROSE, grounded as a char span.
+
+    ``unit_quote`` is the unit token as printed somewhere in the running text (e.g.
+    ``"cm/s"`` for a laminar flame speed whose column header carries only the symbol).
+    The producer grounds it against the document text exactly as any other char-span
+    quote, ``unit_occurrence`` disambiguating a repeat. Maps onto
+    ``TabularAxisSpec(unit_quote=..., unit_occurrence=...)`` -- a char-span unit, no cell.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["prose"] = "prose"
+    unit_quote: str = Field(min_length=1)
+    unit_occurrence: Occurrence | None = None
+
+
+class ProposedHeaderUnit(BaseModel):
+    """An axis whose unit is its OWN printed column header, not a separate token.
+
+    The honest home for a dimensionless-ish coordinate whose column prints only a
+    symbol (e.g. an equivalence-ratio column headed ``phi`` / a decoded ``"/"`` glyph):
+    there is no separate unit token to ground, so the resolver grounds the unit at the
+    SAME header cell it grounds the label at, and the axis's ``quantity_kind`` should be
+    the honest "quantity this table does not model" (``QuantityKind.OTHER``). The model
+    asserts only THAT the unit is the header, never WHICH cell that is -- the resolver
+    derives the header cell from the grid.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["header"] = "header"
+
+
+ProposedAxisUnit = Annotated[
+    ProposedProseUnit | ProposedHeaderUnit,
+    Field(discriminator="kind"),
+]
+"""How an axis's unit is grounded: a prose char-span token, or the axis's own header
+cell. Tagged by ``kind`` so a proposal must commit to which it is."""
+
+
+class ProposedTabularAxis(BaseModel):
+    """One proposed axis of a tabular series: what its column is CALLED, and what it MEANS.
+
+    ``header_quote`` is the column header EXACTLY as printed -- the ONLY spatial thing
+    the model asserts. The resolver
+    (:func:`carmel.services.tabular_series_resolver.resolve_tabular_series`) matches it,
+    whole-cell against whole-cell, to locate the column; a header matching no column is
+    refused, and one matching several is refused rather than picked. The model never
+    names a row or a column ordinal: it names the column by its printed text, and code
+    finds where that text lives.
+
+    ``role`` and ``quantity_kind`` are the model's SEMANTIC assertions -- what the column
+    is (a coordinate vs an observation) and what physical quantity it holds. Grounding
+    proves location, never meaning, so these are recorded unverified exactly as
+    ``TabularAxisSpec`` already records the caller's.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    axis_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    role: AxisRole
+    quantity_kind: QuantityKind
+    header_quote: str = Field(min_length=1)
+    unit: ProposedAxisUnit
+
+
+class TabularSeriesProposal(BaseModel):
+    """The agent's structured output for ONE tabular series read from ONE stored table.
+
+    Everything here is UNTRUSTED. What it deliberately does NOT carry is the whole point
+    of the bridge: there is NO row, NO column ordinal, and NO list of points or tuples
+    anywhere in this schema or its ``axes``. The model contributes only WHICH table
+    (``table_label``, checked against the caller-supplied grid) and, per axis, WHAT the
+    column is CALLED (``header_quote``) and what it means. Every cell address and every
+    point-to-cell join is derived by
+    :func:`carmel.services.tabular_series_resolver.resolve_tabular_series` from the
+    caller-supplied grid -- the join being the document's own row -- so the model can
+    assert neither a coordinate the document does not support nor a tuple the document
+    does not print.
+
+    ``artifact_sha256`` names WHICH held document; constrained to a digest so a
+    hallucinated handle fails validation immediately.
+    :func:`carmel.services.proposal_intake.tabular_series_from_proposal` carries the
+    whole object to a stored :class:`~carmel.schemas.datasets.DatasetEnvelope`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    table_label: str = Field(min_length=1)
+    """The table the agent NAMES, as its printed caption label (e.g. ``"Table 1"``). The
+    carrier refuses unless it equals the caller-supplied grid's ``table_key.label`` -- a
+    model naming a different table than the one whose grid was supplied is a
+    mis-selection, refused before any cell is resolved."""
+    series_id: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    value_origin: ValueOrigin
+    """HOW the numbers were produced, as ASSERTED by the agent (experimental /
+    simulation / derived) -- recorded unverified, like ``attribution`` on the
+    condition-set side."""
+    axes: list[ProposedTabularAxis] = Field(min_length=2)
+    """At least one COORDINATE and one OBSERVATION are required by ``Series`` itself; the
+    ``min_length=2`` floor is the cheapest early signal, the real check is the producer's."""
+    done: bool = True
+    """The agent's self-stop signal, accepted but not acted on -- see
+    :attr:`ExtractionProposal.done`."""
 
 
 class ProposedDeviceClass(BaseModel):
