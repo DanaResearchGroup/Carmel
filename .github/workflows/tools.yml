@@ -1,10 +1,27 @@
 name: Tools
 
+# WHEN THIS LANE RUNS, and why not on every pull request. The job is
+# `continue-on-error: true` at the job level (see the BEST-EFFORT header below),
+# so it has never been able to block a pull request — running it on every PR
+# bought no gate, only a long and frequently-red advisory wait. Measured on one
+# day: 26 minutes warm, and a cold run died after 114 minutes without finishing
+# the install step; two PRs on the same base differed only in which ran first
+# and so in which found the caches populated. The caches are keyed on the cloned
+# upstream SHAs (see the cache steps below), so they go cold whenever upstream
+# moves — the slow path is a recurring condition, not a one-off. So the lane is
+# off the per-PR trigger. The signal is not lost, only deferred: nightly, plus
+# every push to mainline (a merge is the moment an integration break is cheapest
+# to attribute, and it keeps the caches warm for the nightly run), plus on
+# demand from the Actions tab.
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Nightly. The time is arbitrary and deliberately off the hour and off
+    # :00/:30 — every project reaches for those and they collide on the shared
+    # runner fleet. (UTC; GitHub cron is always UTC.)
+    - cron: "37 2 * * *"
 
 # Deliberately NOT cancel-in-progress, unlike the CI workflow. This lane builds
 # the whole chemistry stack; cancelling it part-way throws away the work AND
@@ -25,14 +42,16 @@ concurrency:
 # Consequence, stated so nobody mistakes it: because continue-on-error sits at
 # the JOB level, everything in this lane — including the "must not skip" JUnit
 # gates on the real T3/ARC execution tests — is visible-but-advisory. A genuine
-# T3/ARC failure shows red on this job but cannot block a PR. That is a
-# deliberate trade: the alternative, a blocking assertion that the real ARC
-# subprocess launched, cannot be had cheaply — any real ARC launch needs the
-# full t3_env build above, so a separate blocking job would re-run the exact
-# heavy, flaky install chain this posture exists to keep out of the required
-# lanes. (The fast, blocking CI workflow already covers the adapters' mocked
-# launch paths.) When this lane is trusted enough to block, remove the
-# job-level continue-on-error rather than adding a parallel gate.
+# T3/ARC failure shows red on this job but cannot block anything: the lane no
+# longer runs on pull requests at all (see the trigger comment above), and even
+# on a push to mainline the job-level continue-on-error keeps its result off the
+# required lanes. That is a deliberate trade: the alternative, a blocking
+# assertion that the real ARC subprocess launched, cannot be had cheaply — any
+# real ARC launch needs the full t3_env build above, so a separate blocking job
+# would re-run the exact heavy, flaky install chain this posture exists to keep
+# out of the required lanes. (The fast, blocking CI workflow already covers the
+# adapters' mocked launch paths.) When this lane is trusted enough to block,
+# remove the job-level continue-on-error rather than adding a parallel gate.
 #
 # THREE conda environments, because the tools' python requirements are mutually
 # exclusive and no single environment can satisfy them:
