@@ -36,6 +36,7 @@ from typing import Any
 from carmel.services.dataset_store import canonical_json_bytes
 
 __all__ = [
+    "MAX_MEMBER_CELL_COUNT",
     "MEMBER_INVENTORY_PAYLOAD_KEYS",
     "MEMBER_INVENTORY_PAYLOAD_VERSION",
     "MemberCell",
@@ -44,6 +45,7 @@ __all__ = [
     "MemberCellReplayOutcome",
     "MemberInventoryVerification",
     "MemberInventoryVerificationStatus",
+    "MemberTableTooLarge",
     "MemberTableUnreadable",
     "cell_text_from_payload",
     "compute_member_inventory_sha",
@@ -80,9 +82,44 @@ MEMBER_INVENTORY_PAYLOAD_KEYS: frozenset[str] = frozenset(
 
 _SHEET_TAB_SUFFIXES = (".tsv", ".tab")
 
+#: The most cells (fields) a single member's grid may hold before it is refused, unread.
+#: Bounded because the archive's byte caps bound only what is WRITTEN to disk, not the
+#: in-memory object graph the parse builds from it: :func:`read_delimited_member` holds
+#: one frozen :class:`MemberCell` per field, so a member that is legal under every byte
+#: cap -- up to ``archive_unpack.MAX_MEMBER_UNCOMPRESSED_BYTES`` (256 MiB) of tiny
+#: delimited fields -- expands into hundreds of millions of objects and dies by allocator
+#: rather than by refusal. An OOM is the one outcome a fail-closed lane must not have: it
+#: yields no reason code and no receipt.
+#:
+#: The axis the byte caps leave unbounded is the OBJECT-GRAPH overhead, and this cap holds
+#: it. Each cell is a :class:`MemberCell` (the instance, its ``__dict__``, two ``int``
+#: positions, and the field ``str``): ~232 bytes for DISTINCT fields -- the realistic case
+#: for numeric tabular data -- measured with ``tracemalloc`` on CPython 3.14. (Identical
+#: fields share one ``str`` and cost only ~120 bytes, which is why measuring on empty or
+#: repeated fields undercounts; the honest figure is the distinct-field one.) 4_000_000 *
+#: ~232 bytes ~= 0.87 GiB, within the whole archive's on-disk budget
+#: (``MAX_TOTAL_UNCOMPRESSED_BYTES``, 1 GiB). This is the component the byte caps do not
+#: bound; without this cap it is unbounded -- ~30 GiB for a 256 MiB member of tiny fields,
+#: an OOM. The remaining component -- the decoded ``str`` plus the field strings -- is the
+#: FIELD CONTENT, which the 256 MiB per-member byte cap already bounds to ~0.5 GiB; a
+#: member whose fields are long enough to also approach that byte cap therefore peaks
+#: higher than 0.87 GiB (measured ~1.7 GiB total at 4M cells of 50-char distinct fields, a
+#: 194 MiB member), but that additive term is the byte cap's domain and is bounded there,
+#: not by this one. Its cost is a false refusal of any delimited member with more than four
+#: million fields -- at a realistic >=8 bytes per genuine field that is >32 MB of dense
+#: tabular data, far larger than any table this lane reads.
+MAX_MEMBER_CELL_COUNT = 4_000_000
+
 
 class MemberTableUnreadable(ValueError):
     """The member's bytes could not be read as delimited text (e.g. not UTF-8)."""
+
+
+class MemberTableTooLarge(ValueError):
+    """The member decodes as delimited text but its grid exceeds
+    :data:`MAX_MEMBER_CELL_COUNT` fields -- too large to hold in memory as one
+    :class:`MemberCell` per cell. Refused while accumulating, before the crossing
+    allocation, so the process is never taken down by the allocator instead."""
 
 
 @dataclass(frozen=True)
@@ -131,8 +168,16 @@ def read_delimited_member(data: bytes, *, sheet_name: str) -> MemberCellInventor
     stdlib :mod:`csv` reader under the excel dialect, so quoting and embedded newlines
     are honoured deterministically.
 
+    The grid is bounded at :data:`MAX_MEMBER_CELL_COUNT` fields, checked as each cell is
+    reached and BEFORE the crossing cell is built, so a member whose field count would
+    exhaust memory is refused rather than allowed to take the process down by allocator.
+    The decode itself is not separately bounded: it produces one ``str`` within a small
+    constant factor of the member's byte size, which the archive's per-member byte cap
+    already holds; the object COUNT is the axis that byte cap does not bound.
+
     Raises:
         MemberTableUnreadable: If the bytes are not valid UTF-8.
+        MemberTableTooLarge: If the grid exceeds :data:`MAX_MEMBER_CELL_COUNT` fields.
     """
     try:
         text = data.decode("utf-8-sig")
@@ -153,6 +198,10 @@ def read_delimited_member(data: bytes, *, sheet_name: str) -> MemberCellInventor
         row_count = row_index + 1
         col_count = max(col_count, len(row))
         for col_index, field in enumerate(row):
+            if len(cells) >= MAX_MEMBER_CELL_COUNT:
+                raise MemberTableTooLarge(
+                    f"member {sheet_name!r} exceeds {MAX_MEMBER_CELL_COUNT} cells; refused unread"
+                )
             cells.append(MemberCell(row=row_index, col=col_index, text=field))
     return MemberCellInventory(
         sheet_name=sheet_name,

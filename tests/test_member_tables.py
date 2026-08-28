@@ -12,7 +12,10 @@ import json
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from carmel.schemas.datasets import EmbeddedMemberTableInventory
+from carmel.services import member_table_record
 from carmel.services.archive_unpack import ArchiveUnpackRefusalReason
 from carmel.services.member_table_record import MemberCellReplayOutcome, replay_member_cell
 from carmel.services.member_tables import (
@@ -84,6 +87,27 @@ def test_tabulated_but_non_utf8_member_is_recorded_unreadable(tmp_path: Path) ->
     assert harvest.inventories == ()
     assert len(harvest.read_refusals) == 1
     assert harvest.read_refusals[0].reason is MemberReadRefusalReason.UNREADABLE
+
+
+def test_oversize_member_is_recorded_and_does_not_stop_the_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A member legal under every archive byte cap but over the parse's cell cap is refused
+    # with TOO_MANY_CELLS, and the archive keeps processing -- a later member that fits is
+    # still read, matching what the total-size cap already documents for itself. The cap is
+    # lowered here only so the test need not build eight million cells.
+    monkeypatch.setattr(member_table_record, "MAX_MEMBER_CELL_COUNT", 6)
+    over = b"a,b,c\n1,2,3\n4,5,6\n"  # 9 cells > cap
+    fits = b"x,y\n1,2\n"  # 4 cells <= cap
+    harvest = unpack_and_embed_member_tables(
+        _zip(("big.csv", over), ("ok.csv", fits)),
+        tmp_path / "extract",
+    )
+
+    assert [i.member_sha256 for i in harvest.inventories] == [hashlib.sha256(fits).hexdigest()]
+    assert len(harvest.read_refusals) == 1
+    assert harvest.read_refusals[0].reason is MemberReadRefusalReason.TOO_MANY_CELLS
+    assert harvest.read_refusals[0].member_display_path == "big.csv"
 
 
 def test_archive_refusals_are_carried_through_the_harvest(tmp_path: Path) -> None:
