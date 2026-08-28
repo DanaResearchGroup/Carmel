@@ -3130,23 +3130,24 @@ class Coordinate(BaseModel):
     constant that could be absent is not actually constant for the series --
     either case belongs to :class:`Observation` instead.
 
-    DORMANT: nothing in this runtime constructs a ``Coordinate`` today.
-    ``produce_envelope_from_artifact``
-    (:mod:`carmel.services.dataset_producer`) is the only producer and it
-    refuses unconditionally -- see its docstring for the full argument. In
+    PARTLY LIVE: a ``Coordinate`` is now constructed from a TABLE by
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
+    whose values are ``TABLE_CELL`` locators; the CHAR-SPAN route stays refused.
+    The char-span ``produce_envelope_from_artifact``
+    (:mod:`carmel.services.dataset_producer`) still refuses
+    unconditionally -- see its docstring for the full argument. In
     outline: this runtime can only locate a value with a
     :class:`CharSpanLocator` into extracted running text, and
     :meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`
-    (V8) refuses a char span as the source of a series value, which a
+    (V7) refuses a char span as the source of a series value, which a
     ``Coordinate`` always is. What makes a ``Coordinate`` specifically
     dormant rather than merely unused: even though its own field shape
     (a required, never-absent :class:`MeasuredValue`) is exactly right for a
     locating axis value, there is still no way to prove that the coordinate
     and the observation it locates come from the same structured row --
-    that proof needs a ``TABLE_CELL`` or ``FIGURE_CROP`` locator, neither of
-    which exists yet. This class stays as the schema a future table parser
-    or figure digitizer will fill, and the replayer/validators already
-    exercise it.
+    that proof needs a ``TABLE_CELL`` or ``FIGURE_CROP`` locator. The
+    ``TABLE_CELL`` one now exists, so the tabular producer fills this class;
+    the ``FIGURE_CROP`` one does not. The replayer/validators exercise it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -3179,10 +3180,12 @@ class Observation(BaseModel):
     reasoned state rather than a bare ``None`` or an omitted slot (also see
     S9 on :class:`Series`, which requires the slot to exist regardless).
 
-    DORMANT: nothing in this runtime constructs an ``Observation`` today.
-    ``produce_envelope_from_artifact``
-    (:mod:`carmel.services.dataset_producer`) is the only producer and it
-    refuses unconditionally -- see its docstring for the full argument. What
+    PARTLY LIVE: an ``Observation`` is now constructed from a TABLE by
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
+    whose values are ``TABLE_CELL`` locators; the CHAR-SPAN route stays refused.
+    The char-span ``produce_envelope_from_artifact``
+    (:mod:`carmel.services.dataset_producer`) still refuses
+    unconditionally -- see its docstring for the full argument. What
     makes an ``Observation`` specifically dormant: it is the field V7
     (:meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`)
     is actually about -- an observation's ``value`` is the series VALUE that
@@ -3191,9 +3194,9 @@ class Observation(BaseModel):
     never proves it pairs with the coordinate that locates the same point.
     The ``Maybe``-typed absence handling above is real schema machinery, not
     dead flexibility -- it is exercised by the replayer and by V7 itself --
-    but nothing can populate a real ``Observation`` until something emits a
-    ``TABLE_CELL`` locator (a table parser) or a ``FIGURE_CROP`` node (a
-    figure digitizer).
+    and the tabular producer now populates a real ``Observation`` via a
+    ``TABLE_CELL`` locator (the table parser); a ``FIGURE_CROP`` node (a
+    figure digitizer) does not yet exist.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -3237,19 +3240,21 @@ class DataPoint(BaseModel):
     """One located point of a :class:`Series`: its coordinates, its
     observations, and an optional per-point composition override.
 
-    DORMANT: nothing in this runtime constructs a ``DataPoint`` today.
-    ``produce_envelope_from_artifact``
-    (:mod:`carmel.services.dataset_producer`) is the only producer and it
-    refuses unconditionally -- see its docstring for the full argument. A
+    PARTLY LIVE: a ``DataPoint`` is now constructed from a TABLE by
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
+    whose values are ``TABLE_CELL`` locators; the CHAR-SPAN route stays refused.
+    The char-span ``produce_envelope_from_artifact``
+    (:mod:`carmel.services.dataset_producer`) still refuses
+    unconditionally -- see its docstring for the full argument. A
     ``DataPoint`` is specifically the object that ASSERTS the pairing V7
     (:meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`)
     says this runtime cannot prove: bundling one or more :class:`Coordinate`
     values with one or more :class:`Observation` values into a single
     ``point_id`` is exactly the "structured row" claim that a char span into
-    running text carries no evidence for. This class stays as the schema a
-    future table parser (emitting ``TABLE_CELL`` locators) or figure
-    digitizer (emitting ``FIGURE_CROP`` nodes) will fill, and the replayer
-    already exercises it.
+    running text carries no evidence for. The table parser (emitting
+    ``TABLE_CELL`` locators) now fills this class via the tabular producer; a
+    figure digitizer (emitting ``FIGURE_CROP`` nodes) does not yet exist. The
+    replayer exercises it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -3282,21 +3287,23 @@ class Series(BaseModel):
     rather than as N independent, uncorrelated :class:`MeasuredValue`
     fragments with no shared structure tying them together as one dataset.
 
-    DORMANT: nothing in this runtime constructs a ``Series`` today.
-    ``produce_envelope_from_artifact``
-    (:mod:`carmel.services.dataset_producer`) is the only producer and it
-    refuses unconditionally -- see its docstring for the full argument. In
+    PARTLY LIVE: a ``Series`` is now constructed from a TABLE by
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
+    whose values are ``TABLE_CELL`` locators; the CHAR-SPAN route stays refused.
+    The char-span ``produce_envelope_from_artifact``
+    (:mod:`carmel.services.dataset_producer`) still refuses
+    unconditionally -- see its docstring for the full argument. In
     outline: this runtime can only locate a value with a
     :class:`CharSpanLocator` into extracted running text, and
     :meth:`DatasetEnvelope._validate_no_char_span_grounds_a_series_value`
-    (V8) rejects a char span as the source of a series VALUE. A ``Series``
+    (V7) rejects a char span as the source of a series VALUE. A ``Series``
     is precisely the aggregate that makes that structural claim -- it
     asserts a fixed axis schema and a set of points that instantiate it, and
     running text carries no row structure from which that pairing could be
-    proven, no matter how many points are declared. This class stays as the
-    schema a future table parser (``TABLE_CELL`` locators) or figure
-    digitizer (``FIGURE_CROP`` nodes) will fill, and the replayer and
-    validators already exercise it.
+    proven, no matter how many points are declared. The table parser
+    (``TABLE_CELL`` locators) now fills this class via the tabular producer; a
+    figure digitizer (``FIGURE_CROP`` nodes) does not yet exist. The replayer
+    and validators exercise it.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -6706,11 +6713,13 @@ class DatasetEnvelope(BaseModel):
     the false confidence of a "passing" test that in fact pins some other
     validator's message.
 
-    DORMANT: nothing in this runtime constructs a ``DatasetEnvelope`` today.
+    PARTLY LIVE: a ``DatasetEnvelope`` is now constructed from a TABLE by
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
+    whose series values are ``TABLE_CELL`` locators. The CHAR-SPAN
     ``produce_envelope_from_artifact``
-    (:mod:`carmel.services.dataset_producer`) is the only producer, and it
-    refuses unconditionally -- read its docstring for the full argument,
-    which this note only summarizes. This runtime can only locate a value
+    (:mod:`carmel.services.dataset_producer`) still refuses
+    unconditionally -- read its docstring for the full argument,
+    which this note only summarizes. That char-span route can only locate a value
     with a :class:`CharSpanLocator` into extracted running text, and V7
     below (:meth:`_validate_no_char_span_grounds_a_series_value`) rejects a
     char span as the source of a series VALUE, because a series asserts a
@@ -6719,13 +6728,14 @@ class DatasetEnvelope(BaseModel):
     every series this producer could emit is grounded by char spans alone,
     V7 closes the only route this runtime has to a populated ``series``
     field, and ``series`` is required with ``min_length=1`` (see its field
-    docstring above) -- so no ``DatasetEnvelope`` is constructible at all,
-    not merely one with an empty dataset. To make this live, something must
-    first emit a ``TABLE_CELL`` locator (a table parser) or a
-    ``FIGURE_CROP`` node (a figure digitizer). Until then this class is
-    retained as schema + replay + refusal apparatus: the replayer and every
-    validator below still exercise it, and it is the schema a future
-    producer will fill, not dead code to delete.
+    docstring above) -- so the CHAR-SPAN route reaches no populated
+    ``series`` field at all. The TABULAR route is open: the table parser
+    emits ``TABLE_CELL`` locators, so
+    :func:`carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`
+    constructs a populated ``DatasetEnvelope`` from a table. The DIGITIZED
+    (figure) route still needs a ``FIGURE_CROP`` digitizer that does not
+    exist. The replayer and every validator below exercise this class, and
+    the tabular producer now fills it -- not dead code, and no longer dormant.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
