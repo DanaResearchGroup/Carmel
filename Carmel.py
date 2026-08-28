@@ -221,6 +221,28 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    store_tabular = subparsers.add_parser(
+        "store-tabular-dataset",
+        help="Produce and durably store the registered tabular dataset, and export it for reading",
+        description=(
+            "Run the tabular production path for real: authenticate the one registered source "
+            "document in the operator's workspace, derive its table grid, assemble the TABULAR "
+            "series, and store the envelope in the workspace's dataset store -- then write a "
+            "human-readable text export of the stored series into the workspace's reports/ dir. "
+            "The document is discovered the same way the acceptance test discovers it; pass "
+            "--workspaces to name an explicit workspaces root instead."
+        ),
+    )
+    store_tabular.add_argument(
+        "--workspaces",
+        type=Path,
+        default=None,
+        help=(
+            "Parent workspaces directory holding the campaign that stores the document. "
+            "Default: discover it under the packaged default root or ~/runs/carmel/workspaces."
+        ),
+    )
+
     return parser
 
 
@@ -1050,6 +1072,65 @@ def _cmd_requests(
     return 0
 
 
+def _cmd_store_tabular_dataset(workspaces: Path | None) -> int:
+    """Produce and durably store the registered tabular dataset, then export it.
+
+    Thin wrapper: the whole vertical slice -- discovery, authentication, grid
+    derivation, series assembly through the production producer, and the durable
+    store -- lives in :mod:`carmel.services.tabular_dataset_target`. A refusal
+    (the document is absent, its bytes are not the measured document, the grid
+    refuses, or a producer guard declines) is reported to stderr and stops; it is
+    never routed around. If the envelope stores durably but the human-readable
+    export cannot be written, that too is reported to stderr -- naming the stored
+    artifact so the data is never reported as lost -- and exits non-zero.
+    """
+    from carmel.services.dataset_producer import DatasetProducerError
+    from carmel.services.tabular_dataset_target import (
+        TARGET_CAMPAIGN,
+        TabularDatasetTargetError,
+        locate_target_workspace,
+        produce_and_store_target,
+        render_series_text,
+        write_series_export,
+    )
+
+    if workspaces is not None:
+        workspace = workspaces.expanduser() / TARGET_CAMPAIGN
+    else:
+        discovered = locate_target_workspace()
+        if discovered is None:
+            print(
+                "The registered source document is not stored in any known workspace. "
+                "Pass --workspaces <root> to name the parent of the campaign that holds it.",
+                file=sys.stderr,
+            )
+            return 1
+        workspace = discovered
+
+    try:
+        stored = produce_and_store_target(workspace)
+    except (TabularDatasetTargetError, DatasetProducerError) as exc:
+        print(f"Refusing to store the tabular dataset: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        export_path = write_series_export(workspace, stored)
+    except OSError as exc:
+        print(
+            f"Stored the dataset envelope durably at {stored.path} (sha256 {stored.sha256}), "
+            f"but could not write the human-readable export: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Stored dataset envelope : {stored.path}")
+    print(f"Content address (sha256): {stored.sha256}")
+    print(f"Human-readable export   : {export_path}")
+    print()
+    print(render_series_text(stored.envelope), end="")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse arguments and dispatch to the appropriate command.
 
@@ -1100,6 +1181,9 @@ def main(argv: list[str] | None = None) -> int:
             all_artifacts=args.all,
             apply=args.apply,
         )
+
+    if args.command == "store-tabular-dataset":
+        return _cmd_store_tabular_dataset(args.workspaces)
 
     parser.print_help()
     return 1

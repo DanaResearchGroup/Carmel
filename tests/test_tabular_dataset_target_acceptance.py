@@ -9,6 +9,12 @@ speed S_L in cm/s (67.2 ... 110.1). This module reads that grid through
 :func:`carmel.services.pdf_tables.build_inventory`, grounds every phi and S_L
 value at its cell, and produces a ``source_form=TABULAR`` :class:`Series`.
 
+The table footprint, rows, headers, axes, and points are defined ONCE, in
+:mod:`carmel.services.tabular_dataset_target`, and imported here: this test and
+the durable production entry point (``carmel store-tabular-dataset``) build the
+same dataset from the same source. This module still stages into a throw-away
+``tmp_path``; the durable entry point writes into the operator's real workspace.
+
 Corpus-gated exactly like :mod:`tests.test_condition_set_target_acceptance`: the
 paper is non-redistributable, so it is read from the operator's corpus store at
 runtime and every test SKIPS -- never passes -- when the document (or its store)
@@ -36,89 +42,44 @@ from pathlib import Path
 
 import pytest
 
-from carmel.paths import default_workspaces_root
 from carmel.schemas.datasets import (
-    AxisRole,
-    CaptionLabelKey,
     DatasetEnvelope,
     EmbeddedTableInventory,
     TableCellLocator,
     ValueOrigin,
 )
-from carmel.services import units
 from carmel.services.condition_set_producer import TableCellGrounding
 from carmel.services.dataset_bridge import load_dataset_envelope, store_dataset_envelope
 from carmel.services.dataset_replay import ReplayOutcome, replay_envelope, replay_stored_dataset
-from carmel.services.dataset_store import canonical_json_bytes
-from carmel.services.pdf_fragments import extract_fragments
-from carmel.services.pdf_table_record import inventory_record_payload
-from carmel.services.pdf_tables import ClaimedFootprint, build_inventory
 from carmel.services.tabular_dataset_producer import (
-    TabularAxisSpec,
     TabularDatasetProducerError,
     TabularPointSpec,
     TabularPointValueSpec,
     produce_tabular_envelope_from_artifact,
 )
+from carmel.services.tabular_dataset_target import (
+    TARGET_CAMPAIGN,
+    TARGET_DOCUMENT_SHA256,
+    TARGET_TABLE_KEY,
+    TARGET_WORKSPACES_ROOTS,
+    build_axes,
+    build_embedded_inventory,
+    build_envelope,
+    locate_target_workspace,
+)
 from tests.pypdf_gate import require_pypdf
 
-_DOCUMENT_SHA256 = "c2be41381e3c55671af2912a46d5ce703c0f56cea9dadfba8789e7417059155a"
-_DOCUMENT_SUBPATH = "live-syngas/evidence/literature"
-_WORKSPACES_ROOTS = (default_workspaces_root(), Path.home() / "runs/carmel/workspaces")
-
-#: The registered footprint measured by tests.test_split_header_acceptance.
-_TABLE_1 = ClaimedFootprint(
-    page=4,
-    x_start=305.0,
-    x_end=555.0,
-    y_top=745.0,
-    y_bottom=520.0,
-    caption_text="rangeofequivalenceratios",
-    caption_x_start=311.981,
-    caption_baseline_y=750.274,
-)
-_TABLE_KEY = CaptionLabelKey(label="Table 1")
-
-#: (row, phi, S_L) for the 22 data rows -- rows 1..22 of the grid; row 0 is the
-#: header. Pinned as the PRECONDITION the build asserts on (and re-derives), not
-#: a golden byte.
-_ROWS = (
-    (1, "0.5", "67.2"),
-    (2, "0.6", "96.5"),
-    (3, "0.7", "124.4"),
-    (4, "0.8", "169.9"),
-    (5, "0.9", "194.0"),
-    (6, "1.0", "218.0"),
-    (7, "1.1", "236.7"),
-    (8, "1.2", "254.9"),
-    (9, "1.3", "267.4"),
-    (10, "1.4", "275.0"),
-    (11, "1.5", "280.3"),
-    (12, "1.6", "282.8"),
-    (13, "1.7", "283.8"),
-    (14, "1.8", "282.9"),
-    (15, "1.9", "280.3"),
-    (16, "2.0", "278.9"),
-    (17, "2.5", "249.1"),
-    (18, "3.0", "217.4"),
-    (19, "3.5", "187.6"),
-    (20, "4.0", "158.7"),
-    (21, "4.5", "133.0"),
-    (22, "5.0", "110.1"),
-)
-
-#: The verbatim header cell texts -- symbol-font phi decodes to "/", and the
-#: flame-speed header carries its subscript fold. Recorded as-is (grounding
-#: proves location, never meaning).
-_PHI_HEADER = "/"
-_S_L_HEADER = "S0L;u(cm/s)"
+# The single-definition module owns the spec; these thin aliases keep this
+# module's test bodies (and their assertions) reading against the same names.
+_DOCUMENT_SHA256 = TARGET_DOCUMENT_SHA256
+_TABLE_KEY = TARGET_TABLE_KEY
+_axes = build_axes
+_embedded_inventory = build_embedded_inventory
+_produce = build_envelope
 
 
-def _locate_workspace() -> Path | None:
-    for root in _WORKSPACES_ROOTS:
-        if (root / _DOCUMENT_SUBPATH / _DOCUMENT_SHA256 / "raw.bin").exists():
-            return root / _DOCUMENT_SUBPATH.split("/")[0]
-    return None
+def _cell_of(embedded: EmbeddedTableInventory, row: int, col: int) -> TableCellGrounding:
+    return TableCellGrounding(table_key=_TABLE_KEY, row=row, col=col, inventory=embedded)
 
 
 def _staged_workspace(tmp_path: Path) -> tuple[Path, bytes]:
@@ -130,9 +91,9 @@ def _staged_workspace(tmp_path: Path) -> tuple[Path, bytes]:
     operator's real workspace.
     """
     require_pypdf()
-    source = _locate_workspace()
+    source = locate_target_workspace()
     if source is None:
-        roots = ", ".join(str(r / _DOCUMENT_SUBPATH) for r in _WORKSPACES_ROOTS)
+        roots = ", ".join(str(r / TARGET_CAMPAIGN / "evidence" / "literature") for r in TARGET_WORKSPACES_ROOTS)
         pytest.skip(f"target corpus store is not present under any of: {roots}")
     src_dir = source / "evidence" / "literature" / _DOCUMENT_SHA256
     raw = (src_dir / "raw.bin").read_bytes()
@@ -143,79 +104,6 @@ def _staged_workspace(tmp_path: Path) -> tuple[Path, bytes]:
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_dir, dest_dir)
     return tmp_path, raw
-
-
-def _embedded_inventory(raw: bytes) -> EmbeddedTableInventory:
-    inventory = build_inventory(extract_fragments(raw), _TABLE_1)
-    assert inventory.refusals == (), f"the target grid refused: {inventory.refusals}"
-    assert inventory.complete and len(inventory.cells) == 92
-    payload = inventory_record_payload(inventory, raw_sha256=_DOCUMENT_SHA256)
-    canonical = canonical_json_bytes(payload).decode("utf-8")
-    return EmbeddedTableInventory(
-        inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        raw_sha256=_DOCUMENT_SHA256,
-        canonical_json=canonical,
-    )
-
-
-def _cell_of(embedded: EmbeddedTableInventory, row: int, col: int) -> TableCellGrounding:
-    return TableCellGrounding(table_key=_TABLE_KEY, row=row, col=col, inventory=embedded)
-
-
-def _axes(embedded: EmbeddedTableInventory) -> tuple[TabularAxisSpec, TabularAxisSpec]:
-    return (
-        # phi is dimensionless and its column prints no unit; the header decodes
-        # to "/" (symbol-font phi). Rather than launder a "-" unit the boundary
-        # guard rightly refuses, or assert EQUIVALENCE_RATIO through the glyph
-        # corruption, it is recorded as OTHER with the verbatim header as its
-        # unit -- the schema's honest "quantity this table does not model" state.
-        TabularAxisSpec(
-            axis_id="phi",
-            role=AxisRole.COORDINATE,
-            quantity_kind=units.QuantityKind.OTHER,
-            label_quote=_PHI_HEADER,
-            unit_quote=_PHI_HEADER,
-            label_cell=_cell_of(embedded, 0, 0),
-            unit_cell=_cell_of(embedded, 0, 0),
-        ),
-        # The flame speed IS modelled: VELOCITY, cm/s. The unit "cm/s" is written
-        # in the running prose, so it is grounded there as a char span (V4/V7
-        # constrain only the value ref); its printed header is grounded at its cell.
-        TabularAxisSpec(
-            axis_id="s_l",
-            role=AxisRole.OBSERVATION,
-            quantity_kind=units.QuantityKind.VELOCITY,
-            label_quote=_S_L_HEADER,
-            unit_quote="cm/s",
-            label_cell=_cell_of(embedded, 0, 1),
-            unit_occurrence=1,
-        ),
-    )
-
-
-def _produce(workspace: Path, embedded: EmbeddedTableInventory) -> DatasetEnvelope:
-    def cell(row: int, col: int) -> TableCellGrounding:
-        return _cell_of(embedded, row, col)
-
-    axes = _axes(embedded)
-    points = tuple(
-        TabularPointSpec(
-            point_id=f"r{row:02d}",
-            values=(
-                TabularPointValueSpec(axis_id="phi", value_quote=phi, cell=cell(row, 0)),
-                TabularPointValueSpec(axis_id="s_l", value_quote=s_l, cell=cell(row, 1)),
-            ),
-        )
-        for row, phi, s_l in _ROWS
-    )
-    return produce_tabular_envelope_from_artifact(
-        workspace,
-        sha256=_DOCUMENT_SHA256,
-        series_id="flame_speed_sweep",
-        value_origin=ValueOrigin.EXPERIMENTAL,
-        axes=axes,
-        points=points,
-    )
 
 
 class TestTheFirstStoredTabularSeries:
