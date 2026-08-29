@@ -13,11 +13,13 @@ import json
 
 import pytest
 
+from carmel.services import member_table_record
 from carmel.services.member_table_record import (
     MEMBER_INVENTORY_PAYLOAD_KEYS,
     MEMBER_INVENTORY_PAYLOAD_VERSION,
     MemberCellReplayOutcome,
     MemberInventoryVerificationStatus,
+    MemberTableTooLarge,
     MemberTableUnreadable,
     cell_text_from_payload,
     compute_member_inventory_sha,
@@ -64,6 +66,26 @@ def test_tsv_is_read_with_a_tab_delimiter() -> None:
 def test_non_utf8_member_is_unreadable() -> None:
     with pytest.raises(MemberTableUnreadable):
         read_delimited_member(b"a,b\n\xff\xfe,2\n", sheet_name="bad.csv")
+
+
+def test_member_over_the_cell_cap_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A member that is trivially legal under every archive byte cap (a handful of bytes)
+    # but whose field count crosses the parse's cell cap. The cap is lowered here only so
+    # the test need not build eight million cells; the mechanism is the production one.
+    monkeypatch.setattr(member_table_record, "MAX_MEMBER_CELL_COUNT", 6)
+    with pytest.raises(MemberTableTooLarge) as exc_info:
+        read_delimited_member(b"a,b,c\n1,2,3\n4,5,6\n", sheet_name="big.csv")  # 9 cells > 6
+    assert "6 cells" in str(exc_info.value)
+
+
+def test_member_at_the_cell_cap_is_admitted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Exactly at the cap is read (the check refuses the cell that would CROSS it); one
+    # more cell is refused. So the change is a bound, not a blanket rejection.
+    monkeypatch.setattr(member_table_record, "MAX_MEMBER_CELL_COUNT", 6)
+    inventory = read_delimited_member(b"a,b,c\n1,2,3\n", sheet_name="fits.csv")  # 6 cells == cap
+    assert len(inventory.cells) == 6
+    with pytest.raises(MemberTableTooLarge):
+        read_delimited_member(b"a,b,c\n1,2,3\nx\n", sheet_name="over.csv")  # 7 cells > cap
 
 
 def test_record_addresses_to_its_own_sha() -> None:

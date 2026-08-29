@@ -26,6 +26,7 @@ from pathlib import Path
 from carmel.schemas.datasets import EmbeddedMemberTableInventory
 from carmel.services.archive_unpack import ArchiveRefusal, unpack_archive
 from carmel.services.member_table_record import (
+    MemberTableTooLarge,
     MemberTableUnreadable,
     compute_member_inventory_sha,
     member_inventory_record_bytes,
@@ -60,6 +61,14 @@ class MemberReadRefusalReason(StrEnum):
     UNREADABLE = "unreadable"
     """The member has a tabulated extension but its bytes are not valid delimited text
     (e.g. not UTF-8)."""
+
+    TOO_MANY_CELLS = "too_many_cells"
+    """The member is valid delimited text but its grid exceeds
+    :data:`~carmel.services.member_table_record.MAX_MEMBER_CELL_COUNT` fields -- too many
+    :class:`~carmel.services.member_table_record.MemberCell` objects to hold in memory. It
+    was extracted safely and is legal under every archive byte cap; the cap it crosses is
+    the in-memory object count the byte caps do not bound. Refused before the allocation,
+    so it is a recorded outcome rather than an OOM."""
 
 
 @dataclass(frozen=True)
@@ -134,6 +143,14 @@ def unpack_and_embed_member_tables(archive_bytes: bytes, extraction_root: Path) 
                 MemberReadRefusal(
                     member_display_path=member.member_display_path,
                     reason=MemberReadRefusalReason.UNREADABLE,
+                    detail=str(exc),
+                )
+            )
+        except MemberTableTooLarge as exc:
+            read_refusals.append(
+                MemberReadRefusal(
+                    member_display_path=member.member_display_path,
+                    reason=MemberReadRefusalReason.TOO_MANY_CELLS,
                     detail=str(exc),
                 )
             )
