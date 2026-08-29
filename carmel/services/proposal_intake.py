@@ -30,11 +30,14 @@ from carmel.agents.extraction_agent import (
     ExtractionProposal,
     ProposedCategoricalCondition,
     ProposedDeviceClass,
+    ProposedHeaderUnit,
     ProposedScalarCondition,
+    ProposedTabularAxis,
     ProposedUnextractedCondition,
     ProposedUnresolvedSubject,
+    TabularSeriesProposal,
 )
-from carmel.schemas.datasets import ConditionSetEnvelope
+from carmel.schemas.datasets import CaptionLabelKey, ConditionSetEnvelope, DatasetEnvelope, EmbeddedTableInventory
 from carmel.services.condition_set_producer import (
     CategoricalConditionSpec,
     DeviceClassSpec,
@@ -47,12 +50,15 @@ from carmel.services.extraction_record import (
     CurrentSelectionKind,
     select_current_extraction,
 )
+from carmel.services.tabular_dataset_producer import produce_tabular_envelope_from_artifact
+from carmel.services.tabular_series_resolver import AxisHeaderIntent, resolve_tabular_series
 
 __all__ = [
     "ProposalIntakeError",
     "build_extraction_prompt",
     "condition_set_from_proposal",
     "current_extraction_text",
+    "tabular_series_from_proposal",
 ]
 
 
@@ -268,10 +274,10 @@ def condition_set_from_proposal(
         ids = sorted(observable.observable_id for observable in proposal.observables)
         raise ProposalIntakeError(
             f"proposal for artifact {proposal.artifact_sha256!r} carries {len(ids)} observable(s) "
-            f"{ids!r}, which this runtime cannot ground: a char span in running text cannot ground a "
-            "series data point (produce_envelope_from_artifact refuses unconditionally), and no "
-            "series assembler exists yet. Refusing the proposal rather than silently dropping the "
-            "observations -- a dropped observation and a refused one are different facts"
+            f"{ids!r}, which do not belong in a condition set: a series is located in a grid, not in "
+            "prose, so it is a DatasetEnvelope, not a ConditionSetEnvelope. Propose a table's series as "
+            "a TabularSeriesProposal to tabular_series_from_proposal. Refusing the proposal rather than "
+            "silently dropping the observations -- a dropped observation and a refused one are different facts"
         )
     return produce_condition_set_from_artifact(
         workspace_root,
@@ -283,4 +289,125 @@ def condition_set_from_proposal(
         scalars=tuple(_scalar_spec(s) for s in proposal.scalars),
         categoricals=tuple(_categorical_spec(c) for c in proposal.categoricals),
         unextracted=tuple(_unextracted_spec(u) for u in proposal.unextracted),
+    )
+
+
+def _axis_intent(proposed: ProposedTabularAxis) -> AxisHeaderIntent:
+    """Map one proposed axis to the resolver's schema-free intent.
+
+    The only translation is the unit's two forms and the occurrence base: a
+    header-cell unit carries no prose quote, and a prose unit's 1-based occurrence
+    is converted to the grounder's 0-based index HERE, at the one proposal -> spec
+    boundary, exactly as :func:`_to_zero_based` documents for the condition path.
+    """
+    if isinstance(proposed.unit, ProposedHeaderUnit):
+        return AxisHeaderIntent(
+            axis_id=proposed.axis_id,
+            role=proposed.role,
+            quantity_kind=proposed.quantity_kind,
+            header_quote=proposed.header_quote,
+            prose_unit_quote=None,
+            prose_unit_occurrence=None,
+            unit_is_header=True,
+        )
+    return AxisHeaderIntent(
+        axis_id=proposed.axis_id,
+        role=proposed.role,
+        quantity_kind=proposed.quantity_kind,
+        header_quote=proposed.header_quote,
+        prose_unit_quote=proposed.unit.unit_quote,
+        prose_unit_occurrence=_to_zero_based(proposed.unit.unit_occurrence),
+        unit_is_header=False,
+    )
+
+
+def tabular_series_from_proposal(
+    workspace_root: Path,
+    proposal: TabularSeriesProposal,
+    *,
+    expected_sha256: str,
+    table_key: CaptionLabelKey,
+    inventory: EmbeddedTableInventory,
+) -> DatasetEnvelope:
+    """Translate a validated tabular proposal into a produced, replayable series.
+
+    The tabular counterpart of :func:`condition_set_from_proposal`, and shaped the
+    same way: it adds NO grounding and NO cell address of its own. The agent named a
+    table and, per axis, a column-header quote;
+    :func:`~carmel.services.tabular_series_resolver.resolve_tabular_series` turns those
+    into cell-addressed, same-row tuples over the CALLER-SUPPLIED grid, and the
+    UNCHANGED :func:`~carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`
+    grounds and validates them. A proposal the grid does not support surfaces as the
+    resolver's or the producer's own refusal, propagated unchanged.
+
+    Two preconditions this carrier owns, both before any cell is resolved:
+
+    * ``proposal.artifact_sha256`` must equal ``expected_sha256`` -- the sha the
+      caller already holds and prompted the agent with. Same reason as the condition
+      path: the sha is a selector the untrusted model fills, and a model choosing a
+      different held document could yield a valid, replayable series attributed to the
+      wrong paper.
+    * ``proposal.table_label`` must equal ``table_key.label``. The agent NAMES a
+      table; the caller SUPPLIES that table's grid (table discovery is out of scope).
+      A model naming a different table than the grid supplied is a mis-selection, and
+      resolving its headers against the wrong grid would ground a series into a table
+      the agent did not mean. ``inventory.raw_sha256`` is checked to equal
+      ``expected_sha256`` too, so the supplied grid describes the prompted document.
+
+    Args:
+        workspace_root: Workspace root holding the content-addressed store.
+        proposal: The agent's validated tabular output.
+        expected_sha256: The sha256 of the document the caller prompted with; the
+            authority ``proposal.artifact_sha256`` must equal.
+        table_key: The caller-supplied identity of the table whose grid is
+            ``inventory`` -- its ``label`` must equal ``proposal.table_label``.
+        inventory: The caller-supplied grid (from table discovery, out of scope
+            here), embedded verbatim so the produced series resolves from its own
+            bytes at replay.
+
+    Returns:
+        A fully validated :class:`~carmel.schemas.datasets.DatasetEnvelope`.
+
+    Raises:
+        ProposalIntakeError: ``artifact_sha256`` differs from ``expected_sha256``,
+            ``table_label`` differs from ``table_key.label``, or the grid describes a
+            different document.
+        TabularSeriesResolutionError: A header resolves to no column or several, the
+            headers do not share one row, or a row is ambiguously data/furniture.
+        TabularDatasetProducerError / DatasetProducerError / QuoteGroundingError:
+            The producer refused a resolved spec (a dishonest cell, an unparseable
+            value, an unknown unit, an absent prose unit quote, ...).
+    """
+    if proposal.artifact_sha256 != expected_sha256:
+        raise ProposalIntakeError(
+            f"proposal artifact_sha256={proposal.artifact_sha256!r} does not match the document the caller "
+            f"prompted with, expected_sha256={expected_sha256!r}. artifact_sha256 is a selector the untrusted "
+            "model fills; a mismatch means the model chose a DIFFERENT held document, which could yield a "
+            "valid, replayable series attributed to the wrong paper. Refusing before resolving any cell"
+        )
+    if proposal.table_label != table_key.label:
+        raise ProposalIntakeError(
+            f"proposal names table {proposal.table_label!r} but the caller supplied the grid for table "
+            f"{table_key.label!r}. The agent names the table and the caller supplies its grid; a model naming "
+            "a different table would have its headers resolved against the wrong grid. Refusing before "
+            "resolving any cell"
+        )
+    if inventory.raw_sha256 != expected_sha256:
+        raise ProposalIntakeError(
+            f"the supplied grid was derived from document {inventory.raw_sha256!r}, not the prompted document "
+            f"{expected_sha256!r} -- the grid describes a different paper than the one the proposal grounds "
+            "against. Refusing before resolving any cell"
+        )
+    resolved = resolve_tabular_series(
+        table_key=table_key,
+        inventory=inventory,
+        axes=tuple(_axis_intent(axis) for axis in proposal.axes),
+    )
+    return produce_tabular_envelope_from_artifact(
+        workspace_root,
+        sha256=proposal.artifact_sha256,
+        series_id=proposal.series_id,
+        value_origin=proposal.value_origin,
+        axes=resolved.axes,
+        points=resolved.points,
     )

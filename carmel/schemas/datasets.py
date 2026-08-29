@@ -4533,6 +4533,26 @@ class EmbeddedTableInventory(BaseModel):
         """
         return self._cell_text_index.get((row, col))
 
+    def grid_cells(self) -> tuple[tuple[int, int, str | None], ...]:
+        """Every ``(row, col, text)`` this record's grid contains, sorted by ``(row, col)``.
+
+        ``text`` is the cell's own recorded string, or ``None`` where the record
+        carries no genuine string for it -- the SAME fail-closed meaning as
+        :meth:`cell_text`. Answers from the two indexes T1 built while validating
+        these same bytes, so it can never disagree with :meth:`has_cell` or
+        :meth:`cell_text`, and it re-parses nothing.
+
+        This exists for a deterministic RESOLVER that must locate a column by its
+        printed header text and then walk the grid's rows -- see
+        :mod:`carmel.services.tabular_series_resolver`. It is read-only and, like
+        everything else on this class, proves NOTHING about whether the grid is
+        real: it returns the record's own claimed ordinals and text (see "SCOPE OF
+        WHAT VALIDATION HERE PROVES"). Only
+        :func:`~carmel.services.pdf_table_record.verify_inventory_record`, holding
+        the raw bytes, can establish that.
+        """
+        return tuple((row, col, self._cell_text_index.get((row, col))) for row, col in sorted(self._cell_index))
+
 
 class EmbeddedMemberTableInventory(BaseModel):
     """One tabulated supplementary member's inventory record, embedded VERBATIM so a

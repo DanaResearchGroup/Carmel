@@ -133,6 +133,7 @@ __all__ = [
     "QuoteGroundingError",
     "TextLaneMisdecodeError",
     "ground_quote",
+    "is_bare_numeral_value",
     "produce_envelope_from_artifact",
 ]
 
@@ -1135,6 +1136,45 @@ def _current_repair_dependency() -> SemanticDependencyUse:
         content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
         input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
+
+
+def is_bare_numeral_value(text: str) -> bool:
+    """Whether ``text`` is a bare numeral this producer would STORE as a value.
+
+    Factored out of :func:`_measured_value`'s own acceptance so a caller deciding
+    whether a table cell holds a data value -- as opposed to a unit row, a
+    footnote, a sub-heading or a blank separator -- uses the producer's OWN
+    predicate rather than a second copy of the numeral grammar that could drift
+    from it. Used by :mod:`carmel.services.tabular_series_resolver` to tell a data
+    row (a bare numeral in every resolved column) from furniture (a numeral in
+    none) and to REFUSE the ambiguous in-between (a numeral in some).
+
+    Context-free ON PURPOSE: it runs ``normalize_numeric_span`` with
+    ``SourceContext.OPERATOR_RAW`` and the always-healthy
+    ``_CONTEXT_FREE_GLYPH_HEALTH`` -- exactly the call
+    :func:`_measured_value` makes to derive the STORED ``canonical_decimal_value``,
+    and exactly the one ``MeasuredValue``'s own validator re-runs. So a cell this
+    admits is one the producer will normalize and canonicalize. The producer's
+    additional P1-D quarantine canary runs the SAME normalization under the
+    document's REAL glyph health, which can only ADD refusals; a cell this admits
+    that the canary later rejects surfaces as a loud ``DatasetProducerError`` at
+    production, never as a silently-wrong stored value. This predicate is
+    therefore permissive-then-fail-closed, which is the safe direction: it never
+    calls a value "data" and stores something unparseable, it can only be
+    over-eager and get refused downstream.
+    """
+    normalized = normalize_numeric_span(
+        text,
+        source_context=SourceContext.OPERATOR_RAW,
+        glyph_health=_CONTEXT_FREE_GLYPH_HEALTH,
+    )
+    if isinstance(normalized, Unresolvable):
+        return False
+    try:
+        canonical_decimal(normalized.text)
+    except CanonicalDecimalError:
+        return False
+    return True
 
 
 class _ValueQuoteSpec(Protocol):
