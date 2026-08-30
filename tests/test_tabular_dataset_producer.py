@@ -432,3 +432,157 @@ class TestHappyPathOverSyntheticArtifact:
         require_pypdf()
         env = self._build(tmp_path)
         assert isinstance(env.composition, Absent)
+
+
+class TestSeriesLevelTableProvenanceBoundary:
+    """Document, and pin, WHERE the fabricated-join refusal stops.
+
+    ``_reject_incoherent_join`` is a PER-POINT guard: it proves each point's
+    values sit in one table, one row -- one record the document asserts. It says
+    nothing across points, so a SERIES may draw different points from different
+    tables while every point stays internally coherent. These tests record that
+    the producer ACCEPTS such a series today, and that this is the deliberate
+    boundary, not an oversight:
+
+    * A series is already constrained at SERIES level by
+      :meth:`DatasetEnvelope._validate_series_single_root_artifact` (V5), but only
+      to one root ARTIFACT (paper) -- V5's own docstring records that finer,
+      within-paper heterogeneity is a legitimate, expected shape, not a
+      fabrication signal, so it stops at that granularity by design.
+    * :attr:`DatasetEnvelope.conversion_tables` records that "mixed-table use
+      within one envelope/series" is a provenance SMELL to be surfaced and scored
+      by M-D3's trust computation, NOT corruption to be refused here.
+
+    Crucially, a multi-table series is not always wrong, and the two legitimate
+    shapes are indistinguishable from a fabricated stitch at THIS layer:
+    a page-break continuation (one caption, two footprints -> two inventories,
+    :meth:`test_same_caption_two_inventory_series_is_accepted`) and a single sweep
+    tabulated across two captioned tables (two ``table_key``s,
+    :meth:`test_cross_caption_two_table_series_is_accepted`) both look exactly like
+    a corrupt cross-table join. Separating them needs the same "declared
+    cross-table join key" capability the per-point guard names as an unbuilt
+    future -- so no sound HARD refusal exists here yet, and none is added. A guard
+    that keyed on ``table_key`` equality would false-refuse the sweep-split case;
+    one that keyed on inventory equality would false-refuse the page-break case.
+    """
+
+    def _two_point_series(self, tmp_path: Path, key0: CaptionLabelKey, key1: CaptionLabelKey) -> DatasetEnvelope:
+        from tests.test_dataset_replay import _store_synthetic_artifact
+
+        stored = _store_synthetic_artifact(tmp_path, _TEXT)
+        # Two DISTINCT inventories (different cell texts -> different sha256): each
+        # point is internally same-table, same-row, so each passes the per-point guard.
+        inventory0 = make_embedded_inventory(
+            raw_sha256=stored.sha256, cells=((1, 0), (1, 1)), texts={(1, 0): "1023", (1, 1): "0.4"}
+        )
+        inventory1 = make_embedded_inventory(
+            raw_sha256=stored.sha256, cells=((1, 0), (1, 1)), texts={(1, 0): "1073", (1, 1): "0.6"}
+        )
+        axes = (
+            TabularAxisSpec(
+                axis_id="temperature",
+                role=AxisRole.COORDINATE,
+                quantity_kind=units.QuantityKind.TEMPERATURE,
+                label_quote="Temperature",
+                unit_quote="K",
+            ),
+            TabularAxisSpec(
+                axis_id="velocity",
+                role=AxisRole.OBSERVATION,
+                quantity_kind=units.QuantityKind.VELOCITY,
+                label_quote="velocity",
+                unit_quote="cm/s",
+            ),
+        )
+        points = (
+            TabularPointSpec(
+                point_id="p0",
+                values=(
+                    TabularPointValueSpec(
+                        axis_id="temperature",
+                        value_quote="1023",
+                        cell=TableCellGrounding(table_key=key0, row=1, col=0, inventory=inventory0),
+                    ),
+                    TabularPointValueSpec(
+                        axis_id="velocity",
+                        value_quote="0.4",
+                        cell=TableCellGrounding(table_key=key0, row=1, col=1, inventory=inventory0),
+                    ),
+                ),
+            ),
+            TabularPointSpec(
+                point_id="p1",
+                values=(
+                    TabularPointValueSpec(
+                        axis_id="temperature",
+                        value_quote="1073",
+                        cell=TableCellGrounding(table_key=key1, row=1, col=0, inventory=inventory1),
+                    ),
+                    TabularPointValueSpec(
+                        axis_id="velocity",
+                        value_quote="0.6",
+                        cell=TableCellGrounding(table_key=key1, row=1, col=1, inventory=inventory1),
+                    ),
+                ),
+            ),
+        )
+        return produce_tabular_envelope_from_artifact(
+            tmp_path,
+            sha256=stored.sha256,
+            series_id="s1",
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            axes=axes,
+            points=points,
+        )
+
+    def test_cross_caption_two_table_series_is_accepted(self, tmp_path: Path) -> None:
+        """The hole, concretely: points from two DIFFERENTLY captioned tables,
+        each point internally coherent, are stitched into one series -- and the
+        producer accepts it. The series silently claims 'Table 1' and 'Table 2'
+        are one measurement sweep. Both cited cells are real, so replay is green.
+        This is currently ACCEPTED; the guard is per-point, not per-series."""
+        require_pypdf()
+        env = self._two_point_series(tmp_path, CaptionLabelKey(label="Table 1"), CaptionLabelKey(label="Table 2"))
+        series = env.series[0]
+        assert series.source_form is SourceForm.TABULAR
+        assert len(series.points) == 2
+        # Two distinct inventories, each embedded -- the two points are grounded
+        # in two different tables, and nothing at series level refuses it.
+        assert len(env.table_inventories) == 2
+        # The specific finding this test exists to catch: if the producer ever
+        # normalised/overwrote table_key while still emitting two inventories,
+        # the counts above would stay green with no series-level distinction
+        # left to see. Pin the two DISTINCT captions by name, one per point.
+        expected_keys = {"p0": CaptionLabelKey(label="Table 1"), "p1": CaptionLabelKey(label="Table 2")}
+        for point in series.points:
+            for slot in (*point.coordinates, *point.observations):
+                locator = slot.value.value_ref.locator
+                assert isinstance(locator, TableCellLocator)
+                assert locator.table_key == expected_keys[point.point_id]
+
+    def test_same_caption_two_inventory_series_is_accepted(self, tmp_path: Path) -> None:
+        """The legitimate case a naive guard would false-refuse: one caption
+        'Table 1' continued across a page break is registered as two footprints
+        and two inventories. A series reading a point from each half is CORRECT,
+        and is accepted -- so any series-level rule must admit it."""
+        require_pypdf()
+        key = CaptionLabelKey(label="Table 1")
+        env = self._two_point_series(tmp_path, key, key)
+        assert len(env.series[0].points) == 2
+        assert len(env.table_inventories) == 2
+        # The legitimate case's own fingerprint: BOTH points cite the SAME
+        # table_key ("Table 1") -- unlike the cross-caption test -- but two
+        # DIFFERENT inventory sha256s, i.e. two real footprints behind one
+        # caption. If the producer ever renamed/normalised table_key away
+        # from what was passed in, this would still catch it; if it ever
+        # collapsed the two footprints onto one inventory, the sha256 check
+        # below would catch that instead of only the inventory count.
+        inventory_shas: dict[str, set[str]] = {}
+        for point in env.series[0].points:
+            for slot in (*point.coordinates, *point.observations):
+                locator = slot.value.value_ref.locator
+                assert isinstance(locator, TableCellLocator)
+                assert locator.table_key == key
+                inventory_shas.setdefault(point.point_id, set()).add(locator.pdf_table_inventory_sha256)
+        assert inventory_shas["p0"] and inventory_shas["p1"]
+        assert inventory_shas["p0"].isdisjoint(inventory_shas["p1"])
