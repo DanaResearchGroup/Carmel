@@ -103,6 +103,112 @@ class TestProduceAndStoreTarget:
         reloaded = load_dataset_envelope(workspace, stored.sha256)
         assert render_series_text(reloaded) == render_series_text(stored.envelope)
 
+    def test_render_reads_the_table_label_and_page_from_the_envelope_not_the_module_constants(
+        self, tmp_path: Path
+    ) -> None:
+        # A stored envelope pins its OWN header facts. If a future edit changes
+        # TARGET_TABLE_KEY/TARGET_TABLE_FOOTPRINT, an envelope stored under the old
+        # values must still render with the OLD label and page -- never today's
+        # constants -- or render_series_text's "cannot drift from what was grounded"
+        # is a lie. Build an envelope citing a table under a label and page that
+        # deliberately differ from both module constants, and prove the render shows
+        # the envelope's facts, not the constants'. (Sibling of the condition-set
+        # target's identically-named test.)
+        import hashlib
+
+        from carmel.schemas.datasets import (
+            AxisRole,
+            CaptionLabelKey,
+            EmbeddedTableInventory,
+            ValueOrigin,
+        )
+        from carmel.services import units
+        from carmel.services.condition_set_producer import TableCellGrounding
+        from carmel.services.dataset_store import canonical_json_bytes
+        from carmel.services.pdf_fragments import extract_fragments
+        from carmel.services.pdf_table_record import inventory_record_payload
+        from carmel.services.pdf_tables import build_inventory
+        from carmel.services.tabular_dataset_producer import (
+            TabularAxisSpec,
+            TabularPointSpec,
+            TabularPointValueSpec,
+            produce_tabular_envelope_from_artifact,
+        )
+        from carmel.services.tabular_dataset_target import (
+            PHI_HEADER,
+            S_L_HEADER,
+            TARGET_ROWS,
+            TARGET_SERIES_ID,
+            TARGET_TABLE_FOOTPRINT,
+            TARGET_TABLE_KEY,
+        )
+
+        workspace = _stage_campaign(tmp_path) / TARGET_CAMPAIGN
+        raw = read_target_raw(workspace)
+
+        # Derive against the REAL footprint (which anchors correctly against the
+        # document), then relabel the page in the resulting record --
+        # EmbeddedTableInventory validates only the record's OWN self-coherence, not
+        # that it matches a real PDF page, which is exactly what lets a stored
+        # envelope's cited page differ honestly from today's constants.
+        inventory = build_inventory(extract_fragments(raw), TARGET_TABLE_FOOTPRINT)
+        payload = inventory_record_payload(inventory, raw_sha256=TARGET_DOCUMENT_SHA256)
+        payload["footprint"]["page"] = 99
+        canonical_json = canonical_json_bytes(payload).decode("utf-8")
+        embedded = EmbeddedTableInventory(
+            inventory_sha256=hashlib.sha256(canonical_json.encode("utf-8")).hexdigest(),
+            raw_sha256=TARGET_DOCUMENT_SHA256,
+            canonical_json=canonical_json,
+        )
+        differing_key = CaptionLabelKey(label="Table 99 (test double)")
+
+        def cell(row: int, col: int) -> TableCellGrounding:
+            return TableCellGrounding(table_key=differing_key, row=row, col=col, inventory=embedded)
+
+        axes = (
+            TabularAxisSpec(
+                axis_id="phi",
+                role=AxisRole.COORDINATE,
+                quantity_kind=units.QuantityKind.OTHER,
+                label_quote=PHI_HEADER,
+                unit_quote=PHI_HEADER,
+                label_cell=cell(0, 0),
+                unit_cell=cell(0, 0),
+            ),
+            TabularAxisSpec(
+                axis_id="s_l",
+                role=AxisRole.OBSERVATION,
+                quantity_kind=units.QuantityKind.VELOCITY,
+                label_quote=S_L_HEADER,
+                unit_quote="cm/s",
+                label_cell=cell(0, 1),
+                unit_occurrence=1,
+            ),
+        )
+        points = tuple(
+            TabularPointSpec(
+                point_id=f"r{row:02d}",
+                values=(
+                    TabularPointValueSpec(axis_id="phi", value_quote=phi, cell=cell(row, 0)),
+                    TabularPointValueSpec(axis_id="s_l", value_quote=s_l, cell=cell(row, 1)),
+                ),
+            )
+            for row, phi, s_l in TARGET_ROWS
+        )
+        envelope = produce_tabular_envelope_from_artifact(
+            workspace,
+            sha256=TARGET_DOCUMENT_SHA256,
+            series_id=TARGET_SERIES_ID,
+            value_origin=ValueOrigin.EXPERIMENTAL,
+            axes=axes,
+            points=points,
+        )
+
+        text = render_series_text(envelope)
+        assert "Source table   : Table 99 (test double), page 99" in text
+        assert TARGET_TABLE_KEY.label not in text
+        assert f"page {TARGET_TABLE_FOOTPRINT.page}" not in text
+
 
 class TestStoreTabularDatasetCommand:
     def test_it_stores_exports_and_prints_the_table(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
