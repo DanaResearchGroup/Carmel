@@ -202,12 +202,16 @@ def read_target_raw(workspace_root: Path) -> bytes:
 
     Raises:
         ConditionSetTargetError: The document is not stored under
-            ``workspace_root``, or its stored bytes are not the measured document.
+            ``workspace_root``, its stored bytes cannot be read, or they are not
+            the measured document.
     """
     raw_path = _raw_path(workspace_root)
     if not raw_path.exists():
         raise ConditionSetTargetError(f"target document is not stored under {workspace_root}: no {raw_path}")
-    raw = raw_path.read_bytes()
+    try:
+        raw = raw_path.read_bytes()
+    except OSError as exc:
+        raise ConditionSetTargetError(f"cannot read the stored raw.bin at {raw_path}: {exc}") from exc
     actual = hashlib.sha256(raw).hexdigest()
     if actual != TARGET_DOCUMENT_SHA256:
         raise ConditionSetTargetError(

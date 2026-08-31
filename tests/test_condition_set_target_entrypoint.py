@@ -261,3 +261,20 @@ class TestFailClosedPreconditions:
         (raw_dir / "raw.bin").write_bytes(b"not the measured document")
         with pytest.raises(ConditionSetTargetError, match="not the measured"):
             read_target_raw(tmp_path)
+
+    def test_read_target_raw_refuses_when_the_bytes_cannot_be_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # raw.bin is present (passes the exists() check) but reading it fails: an
+        # unreadable document is a named refusal, not a raw OSError traceback.
+        # Sibling of the tabular target's identically-named test.
+        raw_dir = tmp_path / "evidence" / "literature" / TARGET_DOCUMENT_SHA256
+        raw_dir.mkdir(parents=True)
+        (raw_dir / "raw.bin").write_bytes(b"")
+
+        def _boom(self: Path, *args: object, **kwargs: object) -> bytes:
+            raise OSError("disk gone")
+
+        monkeypatch.setattr(Path, "read_bytes", _boom)
+        with pytest.raises(ConditionSetTargetError, match="cannot read the stored raw.bin"):
+            read_target_raw(tmp_path)
