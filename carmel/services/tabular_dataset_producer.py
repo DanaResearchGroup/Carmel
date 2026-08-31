@@ -74,6 +74,7 @@ from carmel.schemas.datasets import (
     Series,
     SourceForm,
     SourceRef,
+    UnitProvenance,
     ValueOrigin,
 )
 from carmel.services import units
@@ -167,11 +168,19 @@ class TabularAxisSpec:
     role: AxisRole
     quantity_kind: units.QuantityKind
     label_quote: str
-    unit_quote: str
+    unit_quote: str = ""
     label_occurrence: int | None = None
     unit_occurrence: int | None = None
     label_cell: TableCellGrounding | None = None
     unit_cell: TableCellGrounding | None = None
+    unit_not_printed: bool = False
+    """Declare this axis's dimensionless unit WITHOUT a printed token (I-060).
+    Permitted for EQUIVALENCE_RATIO ONLY -- refused for every other quantity in
+    ``__post_init__``. When set, ``unit_quote``/``unit_cell``/``unit_occurrence``
+    must all be empty/None: there is no printed unit to quote or cite, so the
+    produced value carries ``unit_provenance=NOT_PRINTED_IN_SOURCE`` with
+    ``unit_raw``/``unit_ref`` Absent. The LABEL must still be groundable (a
+    grounded label is required to declare the quantity at all)."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.role, AxisRole):
@@ -193,6 +202,36 @@ class TabularAxisSpec:
             label=(self.label_occurrence, self.label_cell),
             unit=(self.unit_occurrence, self.unit_cell),
         )
+        if self.unit_not_printed:
+            # I-060, gated NARROWLY. The schema re-checks the quantity, but the
+            # refusal is stated here too so a caller learns it at construction,
+            # against the spec it wrote, rather than only when the envelope
+            # validates.
+            if self.quantity_kind is not units.QuantityKind.EQUIVALENCE_RATIO:
+                raise TabularDatasetProducerError(
+                    f"TabularAxisSpec.unit_not_printed is permitted for "
+                    f"quantity_kind={units.QuantityKind.EQUIVALENCE_RATIO.value!r} ONLY, not "
+                    f"{self.quantity_kind.value!r}: equivalence ratio is the sole dimensionless "
+                    "quantity whose unit carries no scale; the fraction kinds scale %/ppm to 1, so "
+                    "declaring one without a printed unit would silently rescale a stored magnitude"
+                )
+            if self.unit_quote or self.unit_cell is not None or self.unit_occurrence is not None:
+                raise TabularDatasetProducerError(
+                    "TabularAxisSpec.unit_not_printed says the source printed no unit token, so "
+                    f"unit_quote must be empty and unit_cell/unit_occurrence None; got "
+                    f"unit_quote={self.unit_quote!r}, unit_cell={self.unit_cell!r}, "
+                    f"unit_occurrence={self.unit_occurrence!r}"
+                )
+            if not self.label_quote:
+                raise TabularDatasetProducerError(
+                    "TabularAxisSpec.unit_not_printed requires a groundable label_quote: the quantity "
+                    "may only be declared where a label naming it is genuinely groundable in the document"
+                )
+        elif not self.unit_quote:
+            raise TabularDatasetProducerError(
+                "TabularAxisSpec.unit_quote must be non-empty unless unit_not_printed is set: every "
+                "printed-unit axis grounds a unit token"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -505,6 +544,9 @@ def produce_tabular_envelope_from_artifact(
                 document_glyph_repairs=repairs,
                 value_locator=_cell_locator(value.cell),
                 unit_locator=_cell_locator(axis.unit_cell) if axis.unit_cell is not None else None,
+                unit_provenance=(
+                    UnitProvenance.NOT_PRINTED_IN_SOURCE if axis.unit_not_printed else UnitProvenance.PRINTED_IN_SOURCE
+                ),
             )
             # This producer reads no per-point uncertainty from the table. That is
             # a NOT_EXTRACTED_YET refusal, never an assertion the paper reported

@@ -45,6 +45,7 @@ from carmel.schemas.datasets import (
     UncertaintyBasis,
     UncertaintyKind,
     UncertaintyScale,
+    UnitProvenance,
     XPathLocator,
 )
 from carmel.services import semantic_deps
@@ -2389,4 +2390,82 @@ class TestPypdfVersionAbsenceReasonIsConstrained:
                 extractor_code_sha256=SHA_C,
                 identity_payload_version="2",
                 pypdf_version=Absent(reason=reason),
+            )
+
+
+class TestUnitProvenanceNotPrinted:
+    """I060. A MeasuredValue may mark its unit not-printed-in-source, but ONLY for
+    EQUIVALENCE_RATIO -- the sole dimensionless quantity whose unit carries no
+    scale. The three sibling dimensionless kinds are refused, because the table
+    scales their %/ppm spellings to 1 and asserting an un-printed "1" for one of
+    them would silently rescale a stored magnitude by 100x or 1e6x.
+    """
+
+    def _not_printed_kwargs(self) -> dict[str, object]:
+        return {
+            "raw_text": "1.0",
+            "canonical_decimal_value": "1.0",
+            "conversion_table_sha256": TABLE_V1.sha256,
+            "repairs": (),
+            "repair_dependency": _CURRENT_REPAIR_DEPENDENCY,
+            "value_ref": _bbox_ref(),
+            "unit_provenance": UnitProvenance.NOT_PRINTED_IN_SOURCE,
+            "unit_raw": Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            "unit_ref": Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            "unit_normalized": "1",
+        }
+
+    def test_permitted_for_equivalence_ratio(self) -> None:
+        mv = MeasuredValue(quantity_kind=QuantityKind.EQUIVALENCE_RATIO, **self._not_printed_kwargs())  # type: ignore[arg-type]
+        assert mv.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE
+        assert isinstance(mv.unit_raw, Absent)
+        assert isinstance(mv.unit_ref, Absent)
+        assert mv.unit_normalized == "1"
+
+    def test_refused_for_mole_fraction(self) -> None:
+        with pytest.raises(ValidationError, match="permitted for quantity_kind='equivalence_ratio' ONLY"):
+            MeasuredValue(quantity_kind=QuantityKind.MOLE_FRACTION, **self._not_printed_kwargs())  # type: ignore[arg-type]
+
+    def test_refused_for_mass_fraction(self) -> None:
+        with pytest.raises(ValidationError, match="permitted for quantity_kind='equivalence_ratio' ONLY"):
+            MeasuredValue(quantity_kind=QuantityKind.MASS_FRACTION, **self._not_printed_kwargs())  # type: ignore[arg-type]
+
+    def test_refused_for_relative_uncertainty(self) -> None:
+        with pytest.raises(ValidationError, match="permitted for quantity_kind='equivalence_ratio' ONLY"):
+            MeasuredValue(quantity_kind=QuantityKind.RELATIVE_UNCERTAINTY, **self._not_printed_kwargs())  # type: ignore[arg-type]
+
+    def test_not_printed_requires_absent_unit_raw(self) -> None:
+        kwargs = self._not_printed_kwargs()
+        kwargs["unit_raw"] = "1"  # a fabricated printed token
+        with pytest.raises(ValidationError, match="requires unit_raw to be Absent"):
+            MeasuredValue(quantity_kind=QuantityKind.EQUIVALENCE_RATIO, **kwargs)  # type: ignore[arg-type]
+
+    def test_not_printed_requires_absent_unit_ref(self) -> None:
+        kwargs = self._not_printed_kwargs()
+        kwargs["unit_ref"] = _table_ref()
+        with pytest.raises(ValidationError, match="requires unit_ref to be Absent"):
+            MeasuredValue(quantity_kind=QuantityKind.EQUIVALENCE_RATIO, **kwargs)  # type: ignore[arg-type]
+
+    def test_not_printed_requires_unit_normalized_one(self) -> None:
+        kwargs = self._not_printed_kwargs()
+        kwargs["unit_normalized"] = "-"
+        with pytest.raises(ValidationError, match="requires unit_normalized == '1'"):
+            MeasuredValue(quantity_kind=QuantityKind.EQUIVALENCE_RATIO, **kwargs)  # type: ignore[arg-type]
+
+    def test_printed_still_requires_present_unit_raw_and_ref(self) -> None:
+        # The class's "a value whose unit has no independent provenance cannot be
+        # constructed" invariant is preserved for the ordinary printed case: an
+        # Absent unit_raw with the default PRINTED_IN_SOURCE is refused.
+        with pytest.raises(ValidationError, match="requires unit_raw and unit_ref"):
+            MeasuredValue(
+                raw_text="1.0",
+                canonical_decimal_value="1.0",
+                quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+                conversion_table_sha256=TABLE_V1.sha256,
+                repairs=(),
+                repair_dependency=_CURRENT_REPAIR_DEPENDENCY,
+                value_ref=_bbox_ref(),
+                unit_raw=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                unit_ref=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+                unit_normalized="1",
             )

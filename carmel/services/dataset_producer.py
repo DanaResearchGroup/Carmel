@@ -87,6 +87,7 @@ from carmel.schemas.datasets import (
     SourceVerification,
     TableCellLocator,
     TextSpace,
+    UnitProvenance,
     ValueOrigin,
 )
 from carmel.schemas.literature import StoredArtifact
@@ -1219,8 +1220,18 @@ def _measured_value(
     document_glyph_repairs: tuple[GlyphRepair, ...] = (),
     value_locator: TableCellLocator | None = None,
     unit_locator: TableCellLocator | None = None,
+    unit_provenance: UnitProvenance = UnitProvenance.PRINTED_IN_SOURCE,
 ) -> MeasuredValue:
     """Build one grounded :class:`MeasuredValue` from ``spec`` against ``text``.
+
+    ``unit_provenance`` is :attr:`UnitProvenance.PRINTED_IN_SOURCE` in every
+    ordinary call: the unit is grounded from ``spec.unit_quote`` exactly as
+    before. :attr:`UnitProvenance.NOT_PRINTED_IN_SOURCE` (I-060, EQUIVALENCE_RATIO
+    only) says the source printed NO unit token, so no unit is grounded or
+    normalized at all: ``unit_raw`` and ``unit_ref`` are recorded :class:`Absent`
+    and ``unit_normalized`` is the dimensionless base ``"1"``. The schema's own
+    ``_validate_unit_provenance`` re-checks all of this, so a caller cannot use
+    this path to smuggle an un-printed unit onto any other quantity.
 
     ``repairs`` and ``canonical_decimal_value`` are DERIVED from the value quote
     through the same ``normalize_numeric_span`` call the schema's own validator
@@ -1268,18 +1279,20 @@ def _measured_value(
         # exactly what its docstring says the omitted case does.
         resolved_value_locator = value_locator
         value_span = None
-    if unit_locator is None:
-        resolved_unit_locator: TableCellLocator | CharSpanLocator = ground_quote(
-            text,
-            spec.unit_quote,
-            role=QuoteRole.UNIT,
-            occurrence=spec.unit_occurrence,
-            value_span=value_span,
-            quantity=spec.quantity_kind,
-            repairs=document_glyph_repairs,
-        )
-    else:
-        resolved_unit_locator = unit_locator
+    resolved_unit_locator: TableCellLocator | CharSpanLocator | None = None
+    if unit_provenance is UnitProvenance.PRINTED_IN_SOURCE:
+        if unit_locator is None:
+            resolved_unit_locator = ground_quote(
+                text,
+                spec.unit_quote,
+                role=QuoteRole.UNIT,
+                occurrence=spec.unit_occurrence,
+                value_span=value_span,
+                quantity=spec.quantity_kind,
+                repairs=document_glyph_repairs,
+            )
+        else:
+            resolved_unit_locator = unit_locator
     canary = normalize_numeric_span(
         spec.value_quote,
         source_context=document_source_context,
@@ -1309,24 +1322,40 @@ def _measured_value(
             f"value quote {spec.value_quote!r} for {where} repaired to "
             f"{normalized.text!r}, which is not a valid canonical decimal string: {exc}"
         ) from exc
-    try:
-        unit_normalized = units.normalize_unit(spec.quantity_kind, spec.unit_quote, table=_ACTIVE.table)
-    except units.UnknownUnitError as exc:
-        raise DatasetProducerError(
-            f"unit quote {spec.unit_quote!r} for {where} is not a known unit or alias "
-            f"of quantity_kind={spec.quantity_kind.value!r} in TABLE_V1: {exc}"
-        ) from exc
+    unit_raw: str | Absent
+    unit_ref: SourceRef | Absent
+    if unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+        # The source printed no unit token (I-060, EQUIVALENCE_RATIO only): nothing
+        # to normalize, quote, or cite. The schema's _validate_unit_provenance
+        # re-checks the quantity gate and the "1" base, so this path cannot smuggle
+        # an un-printed unit onto any other kind.
+        unit_raw = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        unit_ref = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        unit_normalized = "1"
+    else:
+        try:
+            unit_normalized = units.normalize_unit(spec.quantity_kind, spec.unit_quote, table=_ACTIVE.table)
+        except units.UnknownUnitError as exc:
+            raise DatasetProducerError(
+                f"unit quote {spec.unit_quote!r} for {where} is not a known unit or alias "
+                f"of quantity_kind={spec.quantity_kind.value!r} in TABLE_V1: {exc}"
+            ) from exc
+        unit_raw = spec.unit_quote
+        # resolved_unit_locator is set for every PRINTED_IN_SOURCE value above.
+        assert resolved_unit_locator is not None
+        unit_ref = SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_unit_locator)
     return MeasuredValue(
         raw_text=spec.value_quote,
         canonical_decimal_value=canonical,
         repairs=normalized.repairs,
         repair_dependency=_current_repair_dependency(),
         quantity_kind=spec.quantity_kind,
-        unit_raw=spec.unit_quote,
+        unit_provenance=unit_provenance,
+        unit_raw=unit_raw,
         unit_normalized=unit_normalized,
         conversion_table_sha256=_ACTIVE.embedded.sha256,
         value_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_value_locator),
-        unit_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_unit_locator),
+        unit_ref=unit_ref,
     )
 
 

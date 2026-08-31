@@ -59,7 +59,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 
-from carmel.schemas.datasets import CharSpanLocator, GroundedScalarClaim
+from carmel.schemas.datasets import Absent, CharSpanLocator, GroundedScalarClaim
 from carmel.services.numeric import NUMERAL_CANDIDATE_RE, unit_boundary_violation
 from carmel.services.units import TABLE_V1, ConversionTable, QuantityKind
 
@@ -256,7 +256,18 @@ def refute_stitched_claim(
     envelope, which is the residue P0-c left and this deliberately does not
     repeat.
     """
-    refs = (claim.label_ref, claim.value.value_ref, claim.value.unit_ref)
+    unit_ref = claim.value.unit_ref
+    if isinstance(unit_ref, Absent):
+        # I060: the claim's unit was not printed in the source (unit_ref Absent),
+        # so there is no unit span to stitch against a label. The gate cannot run.
+        return StitchGateUnrunnable(
+            reason=(
+                "value.unit_ref is Absent -- the claim's unit was not printed in the source, so "
+                "there is no unit character span to read. The stitching gate did not run for this "
+                "claim and its label/value association is UNCHECKED"
+            )
+        )
+    refs = (claim.label_ref, claim.value.value_ref, unit_ref)
     names = ("label_ref", "value.value_ref", "value.unit_ref")
 
     spans: list[CharSpanLocator] = []

@@ -21,7 +21,7 @@ from pathlib import Path
 import pytest
 
 import Carmel
-from carmel.services.dataset_replay import replay_stored_dataset
+from carmel.services.dataset_replay import ReplayOutcome, replay_stored_dataset
 from carmel.services.dataset_store import DATASET_STORE_DIR
 from carmel.services.tabular_dataset_target import (
     TARGET_CAMPAIGN,
@@ -68,10 +68,17 @@ class TestProduceAndStoreTarget:
         assert stored.path.exists()
         assert stored.path == workspace / DATASET_STORE_DIR / f"{stored.sha256}.json"
 
-        # It replays green from disk: every cited cell re-derived, zero failures.
+        # It replays from disk: every cited cell re-derived, zero failures. Since
+        # I060 the phi coordinate declares EQUIVALENCE_RATIO with its unit
+        # not-printed, so 45 cells are cited (down from 68 under OTHER "/"), and the
+        # header bridge is filed as an UncheckedSemanticClaim -- overall_outcome
+        # stays UNVERIFIABLE, never VERIFIED, so declaring the coordinate never
+        # laundered a better verdict.
         report = replay_stored_dataset(workspace, stored.sha256)
         assert report.evidence_failures == ()
-        assert report.checked_table_cells == 68
+        assert report.checked_table_cells == 45
+        assert report.overall_outcome is ReplayOutcome.UNVERIFIABLE
+        assert len(report.unchecked_semantic_claims) == 1
 
     def test_the_export_shows_the_actual_numbers(self, tmp_path: Path) -> None:
         workspace = _stage_campaign(tmp_path) / TARGET_CAMPAIGN
