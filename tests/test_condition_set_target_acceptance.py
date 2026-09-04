@@ -31,6 +31,12 @@ lanes (zero U+00B0 in the extracted text, and no cell equals "degC"), so it cann
 scalar's required ``unit_quote``; and no ``UnextractedReason`` honestly classifies a clean
 single value, so it is not laundered into a range either. Its two "25" cells stay in the
 inventory grid, uncited -- visible, not smuggled.
+
+The reusable specification (footprint, table key, the 9 categoricals, the 4 ranges, the
+subject and attribution quotes, and the ``_produce``/``_embedded_inventory`` builders) now
+lives in :mod:`carmel.services.condition_set_target`, the durable production entry point, so
+this test and ``carmel store-condition-set`` build the same envelope from ONE definition. The
+names below alias that single source; the assertions are unchanged.
 """
 
 from __future__ import annotations
@@ -42,13 +48,10 @@ from pathlib import Path
 
 import pytest
 
-from carmel.paths import default_workspaces_root
 from carmel.schemas.datasets import (
-    CaptionLabelKey,
     CharSpanLocator,
     ConditionAttribution,
     DeviceClassDeclaration,
-    EmbeddedTableInventory,
     TableCellLocator,
     UnextractedReason,
 )
@@ -58,13 +61,41 @@ from carmel.services.condition_set_bridge import (
     store_condition_set_envelope,
 )
 from carmel.services.condition_set_producer import (
-    CategoricalConditionSpec,
     ConditionSetProducerError,
     DeviceClassSpec,
     ScalarConditionSpec,
     TableCellGrounding,
-    UnextractedConditionSpec,
     produce_condition_set_from_artifact,
+)
+from carmel.services.condition_set_target import (
+    ATTRIBUTION_QUOTE as _ATTRIBUTION_QUOTE,
+)
+from carmel.services.condition_set_target import (
+    SUBJECT_OCCURRENCE as _SUBJECT_OCCURRENCE,
+)
+from carmel.services.condition_set_target import (
+    SUBJECT_QUOTE as _SUBJECT_QUOTE,
+)
+from carmel.services.condition_set_target import (
+    TARGET_CAMPAIGN as _WORKSPACE_SUBPATH,
+)
+from carmel.services.condition_set_target import (
+    TARGET_DOCUMENT_SHA256 as _DOCUMENT_SHA256,
+)
+from carmel.services.condition_set_target import (
+    TARGET_TABLE_KEY as _TABLE_KEY,
+)
+from carmel.services.condition_set_target import (
+    TARGET_WORKSPACES_ROOTS as _WORKSPACES_ROOTS,
+)
+from carmel.services.condition_set_target import (
+    build_embedded_inventory as _embedded_inventory,
+)
+from carmel.services.condition_set_target import (
+    build_envelope as _produce,
+)
+from carmel.services.condition_set_target import (
+    locate_target_workspace,
 )
 from carmel.services.dataset_producer import (
     TextLaneMisdecodeError,
@@ -76,45 +107,12 @@ from carmel.services.dataset_replay import (
     SemanticGap,
     replay_stored_condition_set,
 )
-from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.numeric import QuoteRole
-from carmel.services.pdf_fragments import extract_fragments
 from carmel.services.pdf_table_record import (
     InventoryVerificationStatus,
-    inventory_record_payload,
     verify_inventory_record,
 )
-from carmel.services.pdf_tables import ClaimedFootprint, build_inventory
 from tests.pypdf_gate import require_pypdf
-
-_DOCUMENT_SHA256 = "9c59f1c6924f73d3c8f190b3e14b93cb889d1f6c6fb867e51d900a0f4b2cf84b"
-_WORKSPACE_SUBPATH = "live-syngas"
-_INBOX_SUBPATH = "literature_requests/inbox/10.1016-j.ijhydene.2013.10.164.pdf"
-_WORKSPACES_ROOTS = (default_workspaces_root(), Path.home() / "runs/carmel/workspaces")
-
-#: The registered whole-table footprint -- this project's own box claim, identical to the
-#: one :mod:`tests.test_target_table_acceptance` measured the 9x3/20-cell result under.
-WHOLE_TABLE = ClaimedFootprint(
-    page=4,
-    x_start=50.0,
-    x_end=290.0,
-    y_top=145.0,
-    y_bottom=45.0,
-    caption_text="Table1–Measurementconditions.",
-    caption_x_start=53.0,
-    caption_baseline_y=148.8,
-)
-
-_TABLE_KEY = CaptionLabelKey(label="Table 1")
-
-
-def _locate_workspace() -> Path | None:
-    """The workspace whose content-addressed store holds the target document, or None."""
-    for root in _WORKSPACES_ROOTS:
-        workspace = root / _WORKSPACE_SUBPATH
-        if (workspace / "evidence" / "literature" / _DOCUMENT_SHA256 / "raw.bin").exists():
-            return workspace
-    return None
 
 
 def _staged_workspace(tmp_path: Path) -> tuple[Path, bytes]:
@@ -126,7 +124,7 @@ def _staged_workspace(tmp_path: Path) -> tuple[Path, bytes]:
     real workspace.
     """
     require_pypdf()
-    source = _locate_workspace()
+    source = locate_target_workspace()
     if source is None:
         roots = ", ".join(str(r / _WORKSPACE_SUBPATH) for r in _WORKSPACES_ROOTS)
         pytest.skip(f"target corpus store is not present under any of: {roots}")
@@ -139,88 +137,6 @@ def _staged_workspace(tmp_path: Path) -> tuple[Path, bytes]:
     dest_dir.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src_dir, dest_dir)
     return tmp_path, raw
-
-
-def _embedded_inventory(raw: bytes) -> tuple[EmbeddedTableInventory, dict]:
-    inventory = build_inventory(extract_fragments(raw), WHOLE_TABLE)
-    assert inventory.refusals == (), f"the target grid refused: {inventory.refusals}"
-    payload = inventory_record_payload(inventory, raw_sha256=_DOCUMENT_SHA256)
-    canonical = canonical_json_bytes(payload).decode("utf-8")
-    embedded = EmbeddedTableInventory(
-        inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
-        raw_sha256=_DOCUMENT_SHA256,
-        canonical_json=canonical,
-    )
-    return embedded, payload
-
-
-#: (claim_id, label, token, label_row, label_col, token_row, token_col) for the 9 genuine
-#: categorical cells: Fuel across both columns, then every Oxidizer cell.
-_CATEGORICALS = (
-    ("cat0_fuel_c1", "Fuel", "H2/CO(50:50%)", 0, 0, 0, 1),
-    ("cat1_fuel_c2", "Fuel", "H2/CO(85:15%)", 0, 0, 0, 2),
-    ("cat2_oxidizer_r1c1", "Oxidizer", "Air", 1, 0, 1, 1),
-    ("cat3_oxidizer_r2c1", "Oxidizer", "O2/N2(15:85%)", 1, 0, 2, 1),
-    ("cat4_oxidizer_r2c2", "Oxidizer", "O2/N2(15:85%)", 1, 0, 2, 2),
-    ("cat5_oxidizer_r3c1", "Oxidizer", "O2/N2(10:90%)", 1, 0, 3, 1),
-    ("cat6_oxidizer_r3c2", "Oxidizer", "O2/He(12:88%)", 1, 0, 3, 2),
-    ("cat7_oxidizer_r4c1", "Oxidizer", "O2/He(10:90%)", 1, 0, 4, 1),
-    ("cat8_oxidizer_r5c1", "Oxidizer", "O2/He(12.5:87.5%)", 1, 0, 5, 1),
-)
-
-#: (statement_id, label, statement, quantity_kind, label_row, label_col, stmt_row, stmt_col)
-#: for the four ranges the extractor REFUSES to reduce to a single value.
-_RANGES = (
-    ("unx0_phi_c1", "φ", "0.6–1.0", units.QuantityKind.EQUIVALENCE_RATIO, 6, 0, 6, 1),
-    ("unx1_phi_c2", "φ", "0.5–0.7", units.QuantityKind.EQUIVALENCE_RATIO, 6, 0, 6, 2),
-    ("unx2_pressure_c1", "P(atm)", "1–9", units.QuantityKind.PRESSURE, 8, 0, 8, 1),
-    ("unx3_pressure_c2", "P(atm)", "1–8", units.QuantityKind.PRESSURE, 8, 0, 8, 2),
-)
-
-#: The apparatus is named unambiguously and repeatedly ("heat flux method (HFM)"); occurrence
-#: 3 is "...using the heat flux method at elevated pressure", the authors' own measurements.
-#: The 'fl' is the ligature U+FB02, verbatim as the extraction yields it.
-_SUBJECT_QUOTE = "heat ﬂux method"
-_SUBJECT_OCCURRENCE = 3
-#: "were conducted" appears exactly once -- "Experiments were conducted at elevated pressure".
-_ATTRIBUTION_QUOTE = "were conducted"
-
-
-def _produce(workspace: Path, embedded: EmbeddedTableInventory):
-    def cell(row: int, col: int) -> TableCellGrounding:
-        return TableCellGrounding(table_key=_TABLE_KEY, row=row, col=col, inventory=embedded)
-
-    categoricals = tuple(
-        CategoricalConditionSpec(
-            claim_id=cid,
-            label_quote=label,
-            token_quote=token,
-            label_cell=cell(lr, lc),
-            token_cell=cell(tr, tc),
-        )
-        for cid, label, token, lr, lc, tr, tc in _CATEGORICALS
-    )
-    unextracted = tuple(
-        UnextractedConditionSpec(
-            statement_id=sid,
-            label_quote=label,
-            statement_quote=statement,
-            reason=UnextractedReason.VALUE_RANGE,
-            quantity_kind=qk,
-            label_cell=cell(lr, lc),
-            statement_cell=cell(sr, sc),
-        )
-        for sid, label, statement, qk, lr, lc, sr, sc in _RANGES
-    )
-    return produce_condition_set_from_artifact(
-        workspace,
-        sha256=_DOCUMENT_SHA256,
-        attribution=ConditionAttribution.OWN_EXPERIMENT,
-        attribution_quote=_ATTRIBUTION_QUOTE,
-        subject=DeviceClassSpec(label_quote=_SUBJECT_QUOTE, label_occurrence=_SUBJECT_OCCURRENCE),
-        categoricals=categoricals,
-        unextracted=unextracted,
-    )
 
 
 class TestTheFirstStoredConditionSet:
