@@ -35,6 +35,7 @@ from carmel.services.member_table_record import (
 )
 
 __all__ = [
+    "EmbeddedMemberTableInventory",
     "MemberReadRefusal",
     "MemberReadRefusalReason",
     "MemberTableHarvest",

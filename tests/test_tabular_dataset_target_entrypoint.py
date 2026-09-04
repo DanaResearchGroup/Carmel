@@ -256,6 +256,44 @@ class TestProduceAndStoreTarget:
             assert label == good_label, canonical
             assert page == "unknown", canonical
 
+    def test_render_shows_the_exact_page_the_envelope_carries_not_a_fabricated_one(self, tmp_path: Path) -> None:
+        # The SUCCESS path: the helper's docstring promises the render shows the page the
+        # stored envelope actually cites, never a module constant and never an invented
+        # value. The sibling "..._not_the_module_constants" test only proves the page is
+        # not the CONSTANT, and does it with a substring assertion -- "page 99" is a
+        # substring of "page 999", so a helper that reads the inventory and then fabricates
+        # the page slips through it. Pin the page EXACTLY here. Build a real envelope, then
+        # swap its inventories for coherent copies carrying a DIFFERENT page (99, not the
+        # constant 4), keeping each inventory_sha256 so the citations still resolve; the
+        # render must show that page, exactly, on its own line.
+        import json
+
+        from carmel.schemas.datasets import EmbeddedTableInventory
+        from carmel.services.tabular_dataset_target import TARGET_TABLE_FOOTPRINT, TARGET_TABLE_KEY
+
+        workspace = _stage_campaign(tmp_path) / TARGET_CAMPAIGN
+        envelope = produce_and_store_target(workspace).envelope
+
+        distinct_page = TARGET_TABLE_FOOTPRINT.page + 95
+        assert distinct_page != TARGET_TABLE_FOOTPRINT.page  # or the two sources are indistinguishable
+
+        def _with_page(inv: EmbeddedTableInventory) -> EmbeddedTableInventory:
+            payload = json.loads(inv.canonical_json)
+            payload["footprint"]["page"] = distinct_page
+            return EmbeddedTableInventory.model_construct(
+                inventory_sha256=inv.inventory_sha256,
+                raw_sha256=inv.raw_sha256,
+                canonical_json=json.dumps(payload),
+            )
+
+        relabelled = tuple(_with_page(inv) for inv in envelope.table_inventories)
+        envelope = envelope.model_copy(update={"table_inventories": relabelled})
+
+        text = render_series_text(envelope)
+        source_line = next(line for line in text.splitlines() if line.startswith("Source table"))
+        assert source_line == f"Source table   : {TARGET_TABLE_KEY.label}, page {distinct_page}"
+        assert f"page {TARGET_TABLE_FOOTPRINT.page}" not in text  # never the module constant
+
 
 class TestStoreTabularDatasetCommand:
     def test_it_stores_exports_and_prints_the_table(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
