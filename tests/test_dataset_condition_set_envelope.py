@@ -102,6 +102,9 @@ def _node(node_id: str = "paper", parent_node_id: str | None = None) -> SourceNo
         glyph_health=_NO_GLYPH_HEALTH,
         verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         crop_region=_NO_CROP_REGION,
+        document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        if is_root
+        else Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
     )
 
 
@@ -499,6 +502,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         claim = _scalar_claim(
             label_ref=_table_ref("paper_a"),
@@ -540,6 +544,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         with pytest.raises(ValidationError, match="root artifact"):
             _envelope(
@@ -585,6 +590,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         with pytest.raises(ValidationError, match="root artifact"):
             _envelope(
@@ -628,6 +634,7 @@ class TestTheWholeEnvelopeIsGroundedUnderOneRootArtifact:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         with pytest.raises(ValidationError, match="root artifact"):
             _envelope(
@@ -725,6 +732,7 @@ class TestSharedProvenanceValidatorsAreWiredThroughThisClass:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         with pytest.raises(ValidationError, match="decorative provenance"):
             _envelope(source_graph=_graph(_node(), orphan))

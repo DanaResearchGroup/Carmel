@@ -165,6 +165,9 @@ def _node(
         # never collide under I9 -- see `_crop_region` in
         # tests/test_dataset_graph_and_envelope.py for the same reasoning.
         crop_region=_bbox(frame=_frame(render_fingerprint=f"fp-{node_id}")) if is_crop else _NO_CROP_REGION,
+        document_kind=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+        if kind == SourceNodeKind.SI_MEMBER
+        else Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
 
 
@@ -286,6 +289,7 @@ def _extracted_paper_graph(node_id: str = "paper") -> SourceGraph:
                     _extraction_binding(parent_raw_sha256=SHA_A, extracted_text_sha256=SHA_B)
                 ),
                 crop_region=_NO_CROP_REGION,
+                document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             ),
         )
     )

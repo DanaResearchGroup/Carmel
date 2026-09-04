@@ -178,6 +178,7 @@ def _store_pdf_node(tmp_path: Path) -> SourceNode:
         glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
 
 
@@ -367,6 +368,7 @@ def _store_jats_node(tmp_path: Path) -> SourceNode:
         glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
 
 

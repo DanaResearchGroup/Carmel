@@ -265,6 +265,7 @@ class TestFigureChecksNeverLaunderVerified:
                 x1="300",
                 y1="700",
             ),
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
 
     def _on_disk_digitized_envelope(self, tmp_path: Path) -> DatasetEnvelope:
