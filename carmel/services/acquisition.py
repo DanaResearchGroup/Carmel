@@ -36,11 +36,13 @@ import re
 from collections.abc import Iterable, Sequence
 from datetime import UTC, date, datetime
 from pathlib import Path
+from typing import Protocol
 from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
 from carmel.agents.tools.extract import ExtractedText, extract_text
+from carmel.agents.tools.fetch import FetchError, FetchToolProtocol
 from carmel.logger import get_logger
 from carmel.paths import normalize_path
 from carmel.schemas.acquisition import (
@@ -49,6 +51,8 @@ from carmel.schemas.acquisition import (
     AcquisitionReason,
     AcquisitionRequest,
     AcquisitionStatus,
+    SupplementAcquisitionResult,
+    SupplementaryCandidate,
     SupplementaryFile,
 )
 from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
@@ -229,14 +233,67 @@ def host_is_admissible(url: str, additional_hosts: Iterable[str] = ()) -> bool:
     Returns:
         True if the URL's host is, or is a subdomain of, an admissible host.
     """
+    return _host_matches_suffix(url, (*DEFAULT_ADMISSIBLE_HOSTS, *additional_hosts))
+
+
+def _host_matches_suffix(url: str, allowed_hosts: Iterable[str]) -> bool:
+    """Registrable-suffix host match, fail-closed -- the shared core of both host gates.
+
+    Anything that does not parse, carries no host, or matches no allowed suffix is
+    refused. Matching is on the suffix, never a substring: ``els-cdn.com`` matches
+    ``ars.els-cdn.com`` but NOT ``els-cdn.com.evil.net``, which a substring test would
+    wave through. Extracted so :func:`host_is_admissible` (evidence-store admission) and
+    :func:`supplement_host_is_fetchable` (automatic fetch) share ONE matcher and can only
+    ever differ in their host list, never in how a host is compared.
+    """
     try:
         host = (urlsplit(url).hostname or "").lower().strip(".")
     except ValueError:
         return False
     if not host:
         return False
-    allowed = {h.lower().strip(".") for h in (*DEFAULT_ADMISSIBLE_HOSTS, *additional_hosts) if h}
+    allowed = {h.lower().strip(".") for h in allowed_hosts if h}
     return any(host == entry or host.endswith("." + entry) for entry in allowed)
+
+
+#: Hosts Carmel will AUTOMATICALLY FETCH a supplementary file from, with no human in the
+#: loop. This is deliberately NOT :data:`DEFAULT_ADMISSIBLE_HOSTS`, and the difference is
+#: the point of the operator's ruling.
+#:
+#: :data:`DEFAULT_ADMISSIBLE_HOSTS` answers "may a document from this host ENTER THE
+#: EVIDENCE STORE automatically" -- an identity/impersonation control, satisfied by ~40
+#: publisher and resolver hosts. This list answers a different question: "may Carmel
+#: DOWNLOAD a supplement from this host without asking a human". Reusing the broad
+#: admission list here would point an automated retriever at paywalled publisher
+#: endpoints (sciencedirect.com, wiley.com, acs.org, ...) that do not serve these files
+#: openly -- which is how an institution's IP gets blocked, and the narrowness this list
+#: enforces is exactly what prevents it. Anything not listed here is PROPOSED to a human,
+#: never fetched.
+#:
+#: First entry: the open Elsevier supplementary CDN, which serves these files without a
+#: paywall (verified by HTTP HEAD, not assumed). Kept as data, not a literal buried in a
+#: function, and matched by the same registrable-suffix rule as the admission list
+#: (:func:`_host_matches_suffix`), so ``ars.els-cdn.com`` also covers any subdomain of it.
+DEFAULT_SUPPLEMENT_FETCH_HOSTS: frozenset[str] = frozenset({"ars.els-cdn.com"})
+
+
+def supplement_host_is_fetchable(url: str, additional_hosts: Iterable[str] = ()) -> bool:
+    """Whether a supplementary file at ``url`` may be fetched automatically.
+
+    Fail-closed like :func:`host_is_admissible`, and built on the same suffix matcher, but
+    over the narrow :data:`DEFAULT_SUPPLEMENT_FETCH_HOSTS` list rather than the broad
+    admission list. ``additional_hosts`` is the operator's extension point (a lab mirror,
+    an institutional open CDN); there is deliberately no switch that disables the check,
+    because "fetch from anywhere" is the configuration this exists to prevent.
+
+    Args:
+        url: The resolved supplementary-file URL.
+        additional_hosts: Extra fetch-allowlisted hosts from configuration.
+
+    Returns:
+        True if the URL's host is, or is a subdomain of, an allowlisted fetch host.
+    """
+    return _host_matches_suffix(url, (*DEFAULT_SUPPLEMENT_FETCH_HOSTS, *additional_hosts))
 
 
 _TITLE_STOPWORDS = frozenset(
@@ -1032,6 +1089,308 @@ def _receive_supplementary(workspace_root: Path, path: Path, parent: Acquisition
     )
     logger.info("received supplementary file %s for %s (held, not ingested)", path.name, parent.slug)
     return True
+
+
+class SupplementAcquisitionError(ValueError):
+    """Base for every typed refusal or failure on the supplement fetch path.
+
+    A :class:`ValueError` like the queue's other domain refusals
+    (:class:`ManifestUnreadable`, :class:`AlreadyAcquired`), so a caller can fail closed on
+    one type and the CLI turns it into a clean non-zero exit rather than a traceback.
+    """
+
+
+class SupplementHostNotAllowlisted(SupplementAcquisitionError):
+    """The resolved host is not on the supplement-fetch allowlist, so the file is PROPOSED,
+    never fetched.
+
+    This is the guard the whole ruling rests on. It is raised BEFORE any network call, so a
+    non-allowlisted host is never even contacted, and it is a distinct type from
+    :class:`SupplementFetchFailed` so that "we refused to try" can never be read as "we
+    tried and the network failed".
+    """
+
+    def __init__(self, host: str, url: str) -> None:
+        super().__init__(f"host {host!r} is not on the supplement-fetch allowlist; {url!r} is proposed, not fetched")
+        self.host = host
+        self.url = url
+
+
+class SupplementFetchFailed(SupplementAcquisitionError):
+    """The fetch itself failed -- network error, HTTP error, truncated/short read, SSRF
+    rejection, missing consent, or an over-cap response -- so nothing was staged.
+
+    Carries the HTTP ``status`` when the failure was a response (as
+    :class:`carmel.agents.tools.fetch.FetchError` does), for the same paywall-vs-broken-link
+    distinction the manual queue already draws.
+    """
+
+    def __init__(self, url: str, detail: str, *, status: int | None = None) -> None:
+        super().__init__(f"supplement fetch failed for {url!r}: {detail}")
+        self.url = url
+        self.status = status
+
+
+class SupplementReceiptMismatch(SupplementAcquisitionError):
+    """The bytes staged on disk do not hash to the digest the receipt records.
+
+    A receipt that is never checked against reality is decoration. This refuses the fetch
+    rather than leave bytes whose provenance claim is already false; the caller removes the
+    staged file before this propagates.
+    """
+
+    def __init__(self, url: str, expected_sha256: str, actual_sha256: str) -> None:
+        super().__init__(
+            f"receipt hash mismatch for {url!r}: receipt records {expected_sha256}, staged bytes hash {actual_sha256}"
+        )
+        self.url = url
+        self.expected_sha256 = expected_sha256
+        self.actual_sha256 = actual_sha256
+
+
+_UNSAFE_FILENAME_CHARS_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_supplement_filename(name: str) -> str:
+    """Reduce a resolver- or publisher-supplied filename to a safe basename.
+
+    The staged path is ``supplementary/<sha256>/<original_filename>`` built by string
+    join, so a name carrying a path separator or a ``..`` segment would traverse out of
+    the staging directory. This drops any directory component and collapses everything
+    outside ``[A-Za-z0-9._-]`` to ``_``, then guards the degenerate cases (empty, or
+    all-dots like ``.``/``..``) by falling back to a fixed name. Mirrors the traversal
+    defence the queue already relies on for a request's ``slug`` (see
+    :data:`_VALID_SLUG_RE`), applied here to a name the operator never typed.
+    """
+    base = Path(name).name  # drop any directory component (".."/absolute paths collapse away)
+    cleaned = _UNSAFE_FILENAME_CHARS_RE.sub("_", base).strip("._")
+    return cleaned or "supplement"
+
+
+def _verify_staged_hash(staged: Path, expected_sha256: str, *, url: str) -> None:
+    """Refuse unless the bytes on disk hash to ``expected_sha256`` (the receipt's digest).
+
+    The load-bearing check behind the receipt: it is what makes the receipt's hash an
+    assertion about reality rather than decoration.
+
+    Raises:
+        SupplementReceiptMismatch: when the staged bytes do not match the receipt.
+    """
+    actual = hashlib.sha256(staged.read_bytes()).hexdigest()
+    if actual != expected_sha256:
+        raise SupplementReceiptMismatch(url=url, expected_sha256=expected_sha256, actual_sha256=actual)
+
+
+def _remove_staged(staged: Path) -> None:
+    """Roll back a staged supplement and its now-empty ``<sha256>`` directory.
+
+    Used when a fetch cannot complete cleanly (hash mismatch, or a receipt that could not
+    be written), so no bytes of unrecorded origin are ever left behind. Best-effort: a
+    cleanup failure is logged, never raised over the original error.
+    """
+    try:
+        staged.unlink(missing_ok=True)
+        parent = staged.parent
+        if parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+    except OSError as exc:
+        logger.warning("could not remove staged supplement %s during rollback: %s", staged, exc)
+
+
+def fetch_supplement(
+    workspace_root: Path,
+    parent_slug: str,
+    candidate: SupplementaryCandidate,
+    *,
+    fetch: FetchToolProtocol,
+    max_bytes: int,
+    additional_fetch_hosts: Iterable[str] = (),
+) -> SupplementaryFile:
+    """Fetch ONE allowlisted supplementary file, stage it, and record its receipt.
+
+    The fetch path, end to end and fail-closed:
+
+    1. Refuse (:class:`SupplementHostNotAllowlisted`) BEFORE any network call unless the
+       candidate's host is on the supplement-fetch allowlist -- the guard the whole ruling
+       rests on. A non-allowlisted host is never contacted.
+    2. Fetch through the injected ``fetch`` tool. Any failure it raises
+       (:class:`carmel.agents.tools.fetch.FetchError` -- network error, HTTP error,
+       truncated read, SSRF rejection, missing consent) becomes
+       :class:`SupplementFetchFailed`, and nothing is written: no partial file is ever
+       presented as success.
+    3. Re-check the allowlist against the POST-REDIRECT ``final_url``. The fetch tool
+       follows redirects (re-validating SSRF per hop) but knows nothing of this allowlist,
+       so a redirect could otherwise carry the bytes off it. Bytes from a host the
+       allowlist would refuse are refused here too, before anything is staged.
+    4. Stage the bytes at ``supplementary/<sha256>/<safe-name>`` and VERIFY the staged
+       bytes hash to the fetch's digest (:func:`_verify_staged_hash`); a mismatch removes
+       the file and raises :class:`SupplementReceiptMismatch`.
+    5. Record the receipt (:class:`SupplementaryFile` with ``source_url`` set) on the
+       parent request and save the manifest. If the manifest cannot be saved, the staged
+       bytes are removed before the error propagates -- bytes on disk with no recorded
+       origin are exactly the unprovenanced state this path exists to prevent.
+
+    Idempotent: a file already recorded on the parent (same digest and staged name) is
+    returned without re-writing, mirroring :func:`_receive_supplementary`.
+
+    Returns:
+        The :class:`SupplementaryFile` receipt recorded on the parent request.
+
+    Raises:
+        SupplementHostNotAllowlisted: the requested or post-redirect host is not on the
+            allowlist.
+        SupplementFetchFailed: the fetch failed, or the response is over ``max_bytes``.
+        SupplementReceiptMismatch: the staged bytes do not match the receipt digest.
+        SupplementAcquisitionError: no request with ``parent_slug`` exists, or the receipt
+            could not be written.
+    """
+    if not supplement_host_is_fetchable(candidate.url, additional_fetch_hosts):
+        host = (urlsplit(candidate.url).hostname or "").lower().strip(".")
+        raise SupplementHostNotAllowlisted(host, candidate.url)
+
+    try:
+        artifact, data = fetch.fetch(candidate.url)
+    except FetchError as exc:
+        raise SupplementFetchFailed(candidate.url, str(exc), status=exc.status) from exc
+
+    if not supplement_host_is_fetchable(artifact.final_url, additional_fetch_hosts):
+        final_host = (urlsplit(artifact.final_url).hostname or "").lower().strip(".")
+        raise SupplementHostNotAllowlisted(final_host, artifact.final_url)
+
+    if len(data) > max_bytes:
+        raise SupplementFetchFailed(candidate.url, f"response is over the {max_bytes} byte cap")
+
+    manifest = load_manifest(workspace_root)
+    parent = next((request for request in manifest.requests if request.slug == parent_slug), None)
+    if parent is None:
+        raise SupplementAcquisitionError(f"no queued request with slug {parent_slug!r} to attach a supplement to")
+
+    digest = hashlib.sha256(data).hexdigest()
+    safe_name = _safe_supplement_filename(candidate.believed_filename)
+    existing = next(
+        (si for si in parent.supplementary if si.sha256 == digest and si.original_filename == safe_name),
+        None,
+    )
+    if existing is not None:
+        return existing  # Already fetched on an earlier pass; the receipt stands.
+
+    staged = supplementary_dir(workspace_root) / digest / safe_name
+    staged.parent.mkdir(parents=True, exist_ok=True)
+    write_bytes(staged, data)
+
+    try:
+        _verify_staged_hash(staged, artifact.sha256, url=candidate.url)
+    except SupplementReceiptMismatch:
+        _remove_staged(staged)
+        raise
+
+    receipt = SupplementaryFile(
+        sha256=digest,
+        original_filename=safe_name,
+        parent_slug=parent.slug,
+        content_type=_sniff_content_type(data),
+        received_at=artifact.fetched_at,
+        size_bytes=len(data),
+        staged_path=_staged_supplementary_path(digest, safe_name),
+        ordinal=None,
+        source_url=artifact.final_url,
+    )
+    parent.supplementary.append(receipt)
+    try:
+        save_manifest(workspace_root, manifest)
+    except OSError as exc:
+        _remove_staged(staged)
+        raise SupplementAcquisitionError(
+            f"fetched {candidate.url!r} but could not write its receipt ({exc}); staged bytes removed"
+        ) from exc
+
+    logger.info(
+        "fetched supplementary file %s for %s from %s (held, not ingested)",
+        safe_name,
+        parent.slug,
+        artifact.final_url,
+    )
+    return receipt
+
+
+def propose_supplements(
+    candidates: Sequence[SupplementaryCandidate],
+    *,
+    additional_fetch_hosts: Iterable[str] = (),
+) -> list[SupplementaryCandidate]:
+    """Return the candidates that must be PROPOSED to a human rather than fetched.
+
+    A candidate is proposable exactly when its host is NOT on the supplement-fetch
+    allowlist. This performs no network I/O of any kind -- it only reads each candidate's
+    host -- so the propose path is actionable (it names the URLs and what each file is
+    believed to be) with nothing fetched, which is the ruling's default outcome.
+    """
+    hosts = tuple(additional_fetch_hosts)
+    return [candidate for candidate in candidates if not supplement_host_is_fetchable(candidate.url, hosts)]
+
+
+class SupplementaryResolverProtocol(Protocol):
+    """Structural type for a read-only DOI -> supplementary-URL resolver.
+
+    Resolution is metadata work (reading a publisher landing page or API) and is permitted
+    for ANY host, unlike the fetch, which is confined to the allowlist. It is injected --
+    like :class:`carmel.agents.tools.fetch.FetchToolProtocol` -- so the propose/fetch split
+    can be exercised with a local double and a concrete, publisher-specific resolver added
+    later without changing this module. No concrete resolver ships in this pass.
+    """
+
+    def resolve(self, request: AcquisitionRequest) -> list[SupplementaryCandidate]: ...
+
+
+def resolve_supplements(
+    request: AcquisitionRequest, resolver: SupplementaryResolverProtocol
+) -> list[SupplementaryCandidate]:
+    """Resolve a queued request's supplementary-file candidates (read-only, any host).
+
+    A thin, honest seam over the injected ``resolver`` -- it exists so the resolve step has
+    a name and a test, and so the propose/fetch split has a defined input, not to do
+    resolution itself. Returns whatever candidates the resolver names, unfiltered by the
+    allowlist: the allowlist governs FETCHING, never resolving.
+    """
+    return resolver.resolve(request)
+
+
+def acquire_supplements(
+    workspace_root: Path,
+    parent_slug: str,
+    candidates: Sequence[SupplementaryCandidate],
+    *,
+    fetch: FetchToolProtocol,
+    max_bytes: int,
+    additional_fetch_hosts: Iterable[str] = (),
+) -> SupplementAcquisitionResult:
+    """Route each resolved candidate: fetch it if allowlisted, else propose it.
+
+    The ruling made operational -- allowlisted hosts are fetched (each with a receipt),
+    every other candidate is returned as a proposal for a human, and nothing outside the
+    allowlist is ever contacted. A hard fetch failure on an allowlisted candidate
+    (:class:`SupplementFetchFailed`, :class:`SupplementReceiptMismatch`) propagates -- fail
+    closed -- but every receipt already written stays durable, because
+    :func:`fetch_supplement` saves the manifest per file.
+    """
+    hosts = tuple(additional_fetch_hosts)
+    fetched: list[SupplementaryFile] = []
+    proposed: list[SupplementaryCandidate] = []
+    for candidate in candidates:
+        if supplement_host_is_fetchable(candidate.url, hosts):
+            fetched.append(
+                fetch_supplement(
+                    workspace_root,
+                    parent_slug,
+                    candidate,
+                    fetch=fetch,
+                    max_bytes=max_bytes,
+                    additional_fetch_hosts=hosts,
+                )
+            )
+        else:
+            proposed.append(candidate)
+    return SupplementAcquisitionResult(fetched=fetched, proposed=proposed)
 
 
 def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRequest]:

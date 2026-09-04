@@ -167,6 +167,63 @@ class SupplementaryFile(BaseModel):
     """The ``<n>`` from a ``<slug>.si.<n>.<ext>`` drop (the nth of several SI files for
     one paper); ``None`` for the unnumbered ``<slug>.si.<ext>`` form. Deterministic from
     ``original_filename``, so this too is backfilled exactly for older records."""
+    source_url: str | None = None
+    """The URL these bytes were automatically fetched from, set only when this file was
+    acquired by :func:`carmel.services.acquisition.fetch_supplement` rather than dropped
+    by a human.
+
+    This is what turns the record into a *fetch receipt*. A stored number's provenance
+    must not come to rest on an unrecorded network transaction: together with
+    :attr:`received_at` (the fetch timestamp) and :attr:`sha256` (the digest of the bytes
+    actually staged), this field records where an automatic fetch's bytes came from, so
+    the fetch is admissible at all. ``None`` for a human-dropped file, whose provenance
+    is the operator's own act of dropping it.
+
+    Optional-with-a-default, so a manifest written before this field existed still loads
+    unchanged (an omitted ``source_url`` reads back as ``None``): no version bump or
+    migration is required (see :data:`CURRENT_ACQUISITION_MANIFEST_VERSION`)."""
+
+
+class SupplementaryCandidate(BaseModel):
+    """A resolved supplementary-file URL for one paper, before any fetch decision.
+
+    Produced by the read-only resolve step (from a DOI, determine the publisher's
+    supplementary-file URLs) and consumed by the propose/fetch split. A candidate is a
+    CLAIM about a file that exists at a URL -- it is never the bytes themselves, and
+    constructing one performs no network I/O. The propose path renders it for an operator
+    to fetch by hand; the fetch path acts on it only when its host is on the
+    supplement-fetch allowlist.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1)
+    """Where the supplementary file is served. Every fetch decision -- the allowlist
+    check most of all -- is made against this URL's host."""
+    believed_filename: str = Field(min_length=1)
+    """What the file is believed to be named (e.g. ``mmc1.xlsx``), best-effort from the
+    URL path or the publisher's metadata. Never used as a filesystem path directly: the
+    fetch path sanitises it to a safe basename first (see
+    :func:`carmel.services.acquisition._safe_supplement_filename`)."""
+    believed_kind: str = ""
+    """A human label for what the file is believed to contain (e.g. ``"spreadsheet"``),
+    for the operator's benefit in a proposal. Never trusted for any decision."""
+    note: str = ""
+    """Free-form provenance note from the resolver -- which metadata source named this
+    URL -- carried through to the operator in a proposal."""
+
+    @field_validator("url")
+    @classmethod
+    def _reject_unsafe_url_scheme(cls, value: str) -> str:
+        """Reject any scheme but http/https at the boundary, exactly as
+        :meth:`AcquisitionRequest._reject_unsafe_url_scheme` does for ``landing_url``: a
+        resolver-authored (hence possibly attacker-influenced) ``url`` reaches both an
+        operator dashboard ``href`` and, when allowlisted, a real fetch, so
+        ``javascript:``/``data:``/``file:`` must never survive construction."""
+        scheme = urlsplit(value).scheme.lower()
+        if scheme not in ALLOWED_LANDING_URL_SCHEMES:
+            raise ValueError(f"candidate url scheme {scheme!r} is not allowed; must be http or https")
+        return value
 
 
 class AcquisitionRequest(BaseModel):
@@ -238,3 +295,22 @@ class AcquisitionManifest(BaseModel):
 
     version: int = CURRENT_ACQUISITION_MANIFEST_VERSION
     requests: list[AcquisitionRequest] = Field(default_factory=list)
+
+
+class SupplementAcquisitionResult(BaseModel):
+    """Outcome of resolving one paper's supplements under the propose/fetch ruling.
+
+    Every resolved candidate ends up in exactly one list: :attr:`fetched` for the ones an
+    allowlisted host let Carmel retrieve automatically (each carrying its receipt), and
+    :attr:`proposed` for the ones a human must obtain because their host is not on the
+    fetch allowlist. Nothing outside the allowlist is ever contacted to produce this.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    fetched: list[SupplementaryFile] = Field(default_factory=list)
+    """Receipts for supplements automatically fetched from an allowlisted host."""
+    proposed: list[SupplementaryCandidate] = Field(default_factory=list)
+    """Supplements a human must obtain: their host is not on the fetch allowlist. Each
+    names its URL and what the file is believed to be, so the proposal is actionable on
+    its own."""
