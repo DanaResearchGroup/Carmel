@@ -262,7 +262,9 @@ def build_axes(embedded: EmbeddedTableInventory) -> tuple[TabularAxisSpec, Tabul
         # not-printed-in-source: unit_raw/unit_ref Absent, unit_normalized "1",
         # unit_provenance NOT_PRINTED_IN_SOURCE, a first-class stored fact. The
         # LABEL is grounded in the caption "range of equivalence ratios" (a char
-        # span, occurrence 2), which proves the phrase is in the document but NOT
+        # span, occurrence 1 -- 0-based, the SECOND of the phrase's three
+        # occurrences, the Table 1 caption; see PHI_LABEL_OCCURRENCE above), which
+        # proves the phrase is in the document but NOT
         # that THIS column carries the quantity -- so replay files the header
         # bridge as an UncheckedSemanticClaim and overall_outcome can never reach
         # VERIFIED by having dropped the unit. This is permitted for equivalence
