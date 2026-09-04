@@ -52,7 +52,9 @@ class CellSpec:
     merge: tuple[int, int] | None = None
 
 
-CellValue = "str | CellSpec | None"
+#: One cell as a test spells it: a bare string (stored as a shared string), an explicit
+#: :class:`CellSpec`, or ``None`` for an absent cell in a sparse row.
+type CellValue = str | CellSpec | None
 
 
 def _col_letter(col: int) -> str:

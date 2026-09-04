@@ -122,6 +122,12 @@ _R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 #: The namespace of the package relationships file that resolves those ids to part names.
 _PKG_REL = "{http://schemas.openxmlformats.org/package/2006/relationships}"
 
+#: The relationship ``Type`` a ``<sheet>``'s ``r:id`` MUST resolve to. ``workbook.xml.rels`` carries
+#: relationships to many part kinds (styles, the shared string table, a theme ...); only one is a
+#: worksheet. A ``<sheet>`` pointing at any other Type is structurally malformed, not an empty sheet,
+#: so resolution is filtered to this Type -- see :func:`_worksheet_parts`.
+_WORKSHEET_REL_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+
 #: The workbook part that names the worksheets and, crucially, their ORDER.
 _WORKBOOK_PART = "xl/workbook.xml"
 
@@ -315,7 +321,11 @@ def _worksheet_parts(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
     for rel in relationships.findall(f"{_PKG_REL}Relationship"):
         rid = rel.get("Id")
         target = rel.get("Target")
-        if rid is not None and target is not None:
+        # Only WORKSHEET relationships may back a <sheet>. A rel of any other Type (styles, the
+        # shared string table, a theme) is not a worksheet, so it is not admitted as a resolution
+        # target -- a <sheet> pointing at one then resolves to no worksheet part and is refused,
+        # rather than being parsed as a worksheet and misread as an empty sheet.
+        if rid is not None and target is not None and rel.get("Type") == _WORKSHEET_REL_TYPE:
             # Targets are relative to the workbook part's directory (``xl/``); an absolute target
             # ("/xl/worksheets/sheet1.xml") is anchored at the package root instead.
             targets[rid] = target[1:] if target.startswith("/") else f"xl/{target}"
@@ -325,7 +335,9 @@ def _worksheet_parts(archive: zipfile.ZipFile) -> list[tuple[str, str]]:
         rid = sheet.get(f"{_R}id")
         name = sheet.get("name", "")
         if rid is None or rid not in targets:
-            raise XlsxWorkbookUnreadable(f"<sheet name={name!r}> has relationship id {rid!r} that resolves to no part")
+            raise XlsxWorkbookUnreadable(
+                f"<sheet name={name!r}> has relationship id {rid!r} that resolves to no worksheet part"
+            )
         parts.append((targets[rid], name))
     return parts
 
@@ -394,6 +406,11 @@ def _merged_anchors(sheet: ElementTree.Element) -> dict[tuple[int, int], tuple[i
             raise XlsxWorkbookUnreadable(f"mergeCell ref {ref!r} is not a range")
         start, end = ref.split(":", 1)
         (r0, c0), (r1, c1) = _ref_to_row_col(start), _ref_to_row_col(end)
+        # A well-formed range names its top-left first and bottom-right second. A reversed range
+        # (end above or left of start) would yield a zero or negative span -- a fabricated,
+        # meaningless merge -- so it is refused rather than recorded as a degenerate anchor.
+        if r1 < r0 or c1 < c0:
+            raise XlsxWorkbookUnreadable(f"mergeCell ref {ref!r} has its end before its start")
         anchors[(r0, c0)] = (r1 - r0 + 1, c1 - c0 + 1)
     return anchors
 
@@ -471,7 +488,7 @@ def read_xlsx_sheet(xlsx_bytes: bytes, *, sheet_index: int) -> XlsxSheetInventor
                     col_span=col_span,
                 )
             )
-            row_count = max(row_count, row + 1)
+            row_count = max(row_count, row + row_span)
             col_count = max(col_count, col + col_span)
     if not cells:
         raise XlsxEmptySheet(f"worksheet {sheet_index} ({sheet_name!r}) holds no cell with a value or formula")

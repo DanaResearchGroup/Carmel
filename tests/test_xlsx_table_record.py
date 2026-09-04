@@ -273,6 +273,16 @@ def test_a_merge_survives_replay() -> None:
     assert verification.status is XlsxInventoryVerificationStatus.REPRODUCED
 
 
+def test_row_count_covers_the_rows_a_merge_spans() -> None:
+    # A label merged DOWN three rows (row_span=3) is the only tall content. row_count must cover the
+    # rows the merge actually spans (3), not just the anchor's own row (1) -- mirroring col_count,
+    # which already accounts for col_span. Undercounting would claim fewer rows than the grid holds.
+    rows = [[CellSpec("Fuel", kind="shared", merge=(3, 1))]]
+    inventory = read_xlsx_sheet(xlsx_bytes([rows]), sheet_index=0)
+    assert inventory.cells[0].row_span == 3
+    assert inventory.row_count == 3
+
+
 # --- typed refusals -------------------------------------------------------------------
 
 
@@ -306,8 +316,44 @@ def test_a_sheet_relationship_that_resolves_to_no_part_is_unreadable() -> None:
     workbook = workbook_part([("S", "rIdMissing")])
     rels = f'<Relationships xmlns="{PKG_REL_NS}"></Relationships>'
     data = xlsx_with_parts({"xl/workbook.xml": workbook, "xl/_rels/workbook.xml.rels": rels})
-    with pytest.raises(XlsxWorkbookUnreadable, match="resolves to no part"):
+    with pytest.raises(XlsxWorkbookUnreadable, match="resolves to no worksheet part"):
         read_xlsx_sheet(data, sheet_index=0)
+
+
+def test_a_sheet_pointing_at_a_non_worksheet_relationship_is_unreadable() -> None:
+    # A <sheet> whose r:id resolves to a relationship that is NOT a worksheet (here the shared
+    # string table). The target is a real part but not a worksheet, so the sheet resolves to no
+    # worksheet part and is refused -- rather than being parsed as a worksheet, finding no
+    # <sheetData>, and being misclassified as an empty sheet.
+    non_worksheet_rel = (
+        f'<Relationships xmlns="{PKG_REL_NS}">'
+        f'<Relationship Id="rId1" '
+        f'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" '
+        f'Target="sharedStrings.xml"/></Relationships>'
+    )
+    parts = {
+        "xl/workbook.xml": workbook_part([("S", "rId1")]),
+        "xl/_rels/workbook.xml.rels": non_worksheet_rel,
+        "xl/sharedStrings.xml": f'<sst xmlns="{S_NS}" count="0" uniqueCount="0"></sst>',
+    }
+    with pytest.raises(XlsxWorkbookUnreadable, match="resolves to no worksheet part"):
+        read_xlsx_sheet(xlsx_with_parts(parts), sheet_index=0)
+
+
+def test_a_reversed_merge_range_is_unreadable() -> None:
+    # A mergeCell whose end is before its start (C1:A1). Left unchecked it yields a negative column
+    # span -- a fabricated merge -- so it is refused as malformed rather than recorded.
+    inner = (
+        '<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>H</t></is></c></row></sheetData>'
+        '<mergeCells count="1"><mergeCell ref="C1:A1"/></mergeCells>'
+    )
+    parts = {
+        "xl/workbook.xml": workbook_part([("S", "rId1")]),
+        "xl/_rels/workbook.xml.rels": rels_part([("rId1", "worksheets/sheet1.xml")]),
+        "xl/worksheets/sheet1.xml": worksheet_part(inner),
+    }
+    with pytest.raises(XlsxWorkbookUnreadable, match="end before its start"):
+        read_xlsx_sheet(xlsx_with_parts(parts), sheet_index=0)
 
 
 def test_a_malformed_cell_reference_is_unreadable() -> None:
