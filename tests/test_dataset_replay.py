@@ -59,6 +59,7 @@ from carmel.schemas.datasets import (
     TableCellLocator,
     TableKeyKind,
     TextSpace,
+    UnitProvenance,
     ValueOrigin,
     XPathLocator,
 )
@@ -1036,6 +1037,88 @@ class TestVerifyMeasuredValueUnitBoundary:
         )
         assert finding.category is ReplayOutcome.UNVERIFIABLE
         assert "OTHER" in finding.reason
+
+
+class TestVerifyNotPrintedUnitContradiction:
+    """A value marked ``NOT_PRINTED_IN_SOURCE`` while still CARRYING a
+    ``unit_raw`` or a ``unit_ref`` is a self-contradiction the schema forbids at
+    construction. Replay does not trust the schema to have run -- these inputs
+    are built via ``model_construct``, exactly as a corrupted/forged record
+    would arrive -- so the not-printed branch must re-assert its OWN invariant
+    (``unit_raw`` and ``unit_ref`` both ``Absent``) rather than replaying the
+    contradiction as a silent ``None`` that reads as "checked and clean". This
+    mirrors the printed branch, which already refuses an ``Absent`` token rather
+    than dereferencing it.
+
+    The verdict is ``FAILED``, not ``UNVERIFIABLE``: the invariant check runs to
+    completion and returns a definite negative -- nothing is missing that stops
+    it from running (contrast the printed branch's ``Absent`` token, whose
+    absence removes the normalization check's input and so is genuinely
+    unverifiable). ``unit_raw`` is ``verify_measured_value_unit``'s concern;
+    ``unit_ref`` is ``verify_measured_value_unit_boundary``'s -- each function
+    guards the field it owns.
+    """
+
+    @staticmethod
+    def _repair_dependency() -> SemanticDependencyUse:
+        return SemanticDependencyUse(
+            dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+            input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+
+    @staticmethod
+    def _dummy_ref() -> SourceRef:
+        return SourceRef(
+            node_id="paper",
+            locator=CharSpanLocator(kind=LocatorKind.CHAR_SPAN, text_space=TextSpace.EXTRACTED_TEXT, start=0, end=4),
+        )
+
+    def _not_printed_value(self, *, unit_raw: object, unit_ref: object) -> MeasuredValue:
+        return MeasuredValue.model_construct(
+            raw_text="1.0",
+            canonical_decimal_value="1.0",
+            repairs=(),
+            repair_dependency=self._repair_dependency(),
+            quantity_kind=QuantityKind.EQUIVALENCE_RATIO,
+            unit_provenance=UnitProvenance.NOT_PRINTED_IN_SOURCE,
+            unit_raw=unit_raw,
+            unit_normalized="1",
+            conversion_table_sha256=TABLE_V1.sha256,
+            value_ref=self._dummy_ref(),
+            unit_ref=unit_ref,
+        )
+
+    def test_not_printed_carrying_unit_raw_is_failed(self) -> None:
+        value = self._not_printed_value(
+            unit_raw="1",  # a printed token a not-printed value must never carry
+            unit_ref=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+        finding = verify_measured_value_unit("dummy.path", value)
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert finding.ref_path == "dummy.path.unit_raw"
+
+    def test_not_printed_carrying_unit_ref_is_failed(self) -> None:
+        value = self._not_printed_value(
+            unit_raw=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            unit_ref=self._dummy_ref(),  # a locator a not-printed value has no token to cite
+        )
+        finding = verify_measured_value_unit_boundary("dummy.path", value, {})
+        assert finding is not None
+        assert finding.category is ReplayOutcome.FAILED
+        assert finding.ref_path == "dummy.path.unit_ref"
+
+    def test_well_formed_not_printed_value_still_passes_both_checks(self) -> None:
+        # unit_raw/unit_ref both Absent, unit_normalized "1": the legitimate
+        # equivalence-ratio not-printed value. Neither new guard may turn it into
+        # a finding.
+        value = self._not_printed_value(
+            unit_raw=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            unit_ref=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+        assert verify_measured_value_unit("dummy.path", value) is None
+        assert verify_measured_value_unit_boundary("dummy.path", value, {}) is None
 
 
 class TestVerifyMeasuredValueValueBoundary:
