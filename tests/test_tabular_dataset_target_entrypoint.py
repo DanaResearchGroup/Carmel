@@ -209,6 +209,53 @@ class TestProduceAndStoreTarget:
         assert TARGET_TABLE_KEY.label not in text
         assert f"page {TARGET_TABLE_FOOTPRINT.page}" not in text
 
+    def test_stored_table_reference_degrades_the_page_to_unknown_on_a_corrupt_embedded_inventory(
+        self, tmp_path: Path
+    ) -> None:
+        # _stored_table_reference's docstring promises the page falls back to
+        # "unknown" rather than crash. EmbeddedTableInventory's T1 validator makes a
+        # malformed canonical_json impossible to CONSTRUCT, so a corrupt inventory can
+        # only reach the renderer through a validation-bypassed / partially
+        # constructed envelope -- exactly what we build here with model_construct
+        # (T1-bypassing) plus a non-revalidating model_copy. Feed each distinct way
+        # the "footprint"."page" read can break; the label the envelope cited must
+        # still come back, and the page must degrade to "unknown", never a traceback.
+        from carmel.schemas.datasets import EmbeddedTableInventory
+        from carmel.services.tabular_dataset_target import (
+            TARGET_CAMPAIGN,
+            _stored_table_reference,
+        )
+        from carmel.services.tabular_dataset_target import (
+            produce_and_store_target as _produce,
+        )
+
+        workspace = _stage_campaign(tmp_path) / TARGET_CAMPAIGN
+        envelope = _produce(workspace).envelope
+
+        # Control: the well-formed path reads a real, non-"unknown" page. If the guard
+        # ever swallowed the good case, this assertion catches it.
+        good_label, good_page = _stored_table_reference(envelope)
+        assert good_page != "unknown"
+
+        malformations = (
+            "{not valid json",  # json.JSONDecodeError: unparseable
+            "{}",  # KeyError: parseable, but no "footprint"
+            '{"footprint": []}',  # TypeError: parseable, wrong shape (["page"] on a list)
+        )
+        for canonical in malformations:
+            corrupt = tuple(
+                EmbeddedTableInventory.model_construct(
+                    inventory_sha256=inv.inventory_sha256,
+                    raw_sha256=inv.raw_sha256,
+                    canonical_json=canonical,
+                )
+                for inv in envelope.table_inventories
+            )
+            broken = envelope.model_copy(update={"table_inventories": corrupt})
+            label, page = _stored_table_reference(broken)
+            assert label == good_label, canonical
+            assert page == "unknown", canonical
+
 
 class TestStoreTabularDatasetCommand:
     def test_it_stores_exports_and_prints_the_table(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

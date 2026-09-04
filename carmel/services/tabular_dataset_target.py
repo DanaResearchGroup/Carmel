@@ -373,7 +373,14 @@ def _stored_table_reference(envelope: DatasetEnvelope) -> tuple[str, str]:
 
     Falls back to ``"unknown"`` for both, exactly like the ``raw_sha256``
     fallback in the render, for an envelope with no PDF table-cell citation to
-    read either fact from.
+    read either fact from. The PAGE alone degrades to ``"unknown"`` -- the label
+    stays the one actually cited -- when a cited inventory's ``canonical_json``
+    cannot be read for a page. ``EmbeddedTableInventory``'s T1 validator makes
+    that impossible for any inventory that passed construction (it rejects
+    unparseable, ``footprint``-less, or wrong-shaped canonical JSON outright), so
+    it can only arise from a validation-bypassed or partially constructed
+    envelope; the render path stays total rather than raising an untyped
+    traceback into a caller that does not expect one.
     """
     for _, ref in iter_source_refs(envelope):
         locator = ref.locator
@@ -384,7 +391,16 @@ def _stored_table_reference(envelope: DatasetEnvelope) -> tuple[str, str]:
         if isinstance(locator.pdf_table_inventory_sha256, str):
             for inventory in envelope.table_inventories:
                 if inventory.inventory_sha256 == locator.pdf_table_inventory_sha256:
-                    page = json.loads(inventory.canonical_json)["footprint"]["page"]
+                    try:
+                        page = json.loads(inventory.canonical_json)["footprint"]["page"]
+                    except json.JSONDecodeError, KeyError, TypeError:
+                        # Unreachable for a validated inventory -- T1 above rejects
+                        # every malformation this expression could trip on -- so this
+                        # only fires for a validation-bypassed envelope. Degrade the
+                        # page to "unknown" (the same honest fallback as an
+                        # unresolvable citation) rather than crash the render path,
+                        # which the project's fail-closed contract forbids.
+                        page = "unknown"
                     break
         return label, str(page)
     return "unknown", "unknown"
