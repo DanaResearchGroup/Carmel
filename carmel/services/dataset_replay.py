@@ -2517,6 +2517,26 @@ def verify_measured_value_unit(path: str, value: MeasuredValue) -> ReplayFinding
             f"silently re-checked against something else: {exc}",
         )
     if value.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+        # A not-printed value must carry NO unit token (I-060): its ``unit_raw`` is
+        # Absent. A stored value declaring not-printed while CARRYING a ``unit_raw``
+        # contradicts its own provenance -- the schema forbids it, but replay does
+        # not trust the schema to have run and owes a verdict about broken input,
+        # not silence that reads as "checked and clean". This is the mirror of the
+        # printed branch below, which refuses an Absent token rather than
+        # dereferencing it. FAILED, not UNVERIFIABLE: this invariant check runs to
+        # completion and returns a definite negative -- nothing is missing that
+        # stops it running (contrast the printed branch's Absent token, whose
+        # absence removes the normalization check's input).
+        if not isinstance(value.unit_raw, Absent):
+            return ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=f"{path}.unit_raw",
+                reason=f"unit_raw={value.unit_raw!r} is present while unit_provenance="
+                f"{value.unit_provenance.value!r} -- a not-printed value carries no unit token (the "
+                "source printed none), so this record contradicts its own provenance",
+                expected="Absent",
+                actual=repr(value.unit_raw),
+            )
         # The source printed no unit token (I-060), so there is no ``unit_raw`` to
         # re-normalize. What IS re-verifiable is that the recorded
         # ``unit_normalized`` is the recorded table's own dimensionless base for
@@ -2664,6 +2684,21 @@ def verify_measured_value_unit_boundary(
     """
     node_problems = node_problems or {}
     if value.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+        # A not-printed value cites NO unit location (I-060): its ``unit_ref`` is
+        # Absent. A stored value declaring not-printed while CARRYING a ``unit_ref``
+        # contradicts its own provenance -- the schema forbids it, but replay does
+        # not trust the schema to have run. This mirrors the printed branch below,
+        # which refuses an Absent unit_ref rather than replaying it silently.
+        # FAILED, not UNVERIFIABLE: the invariant runs to completion and returns a
+        # definite negative, nothing prevents it from running.
+        if not isinstance(value.unit_ref, Absent):
+            return ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=f"{path}.unit_ref",
+                reason=f"unit_ref is present while unit_provenance={value.unit_provenance.value!r} -- "
+                "a not-printed value cites no unit location (the source printed no token to cite), so "
+                "this record contradicts its own provenance",
+            )
         # The source printed no unit token (I-060): there is no unit_ref locator
         # and no unit span for a boundary/admission gate to re-run against. This
         # is not a check that could not run -- there is genuinely nothing to
