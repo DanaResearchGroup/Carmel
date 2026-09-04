@@ -28,6 +28,7 @@ generalising to other papers is a separate ticket, not this one.
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,7 +41,9 @@ from carmel.schemas.datasets import (
     EmbeddedTableInventory,
     MeasuredValue,
     Series,
+    TableCellLocator,
     ValueOrigin,
+    iter_source_refs,
 )
 from carmel.services import units
 from carmel.services.condition_set_producer import TableCellGrounding
@@ -354,15 +357,69 @@ def _measured_or_none(value: MeasuredValue | Absent) -> MeasuredValue | None:
     return None if isinstance(value, Absent) else value
 
 
+def _stored_table_reference(envelope: DatasetEnvelope) -> tuple[str, str]:
+    """Read the table label and source page the envelope itself cites.
+
+    Walks every :class:`~carmel.schemas.datasets.SourceRef` reachable in the
+    envelope (the same choke point V1 validates every ref through) for the
+    first ``TableCellLocator`` naming a ``CaptionLabelKey``, then reads the
+    page from the embedded inventory its ``pdf_table_inventory_sha256`` names.
+    Both facts are read from the STORED envelope, never a module constant, so
+    a previously stored envelope renders with ITS OWN label and page even if
+    ``TARGET_TABLE_KEY``/``TARGET_TABLE_FOOTPRINT`` are edited later -- the
+    drift :func:`render_series_text`'s docstring promises is impossible. This
+    is the sibling of
+    :func:`carmel.services.condition_set_target._stored_table_reference`.
+
+    Falls back to ``"unknown"`` for both, exactly like the ``raw_sha256``
+    fallback in the render, for an envelope with no PDF table-cell citation to
+    read either fact from. The PAGE alone degrades to ``"unknown"`` -- the label
+    stays the one actually cited -- when a cited inventory's ``canonical_json``
+    cannot be read for a page. ``EmbeddedTableInventory``'s T1 validator makes
+    that impossible for any inventory that passed construction (it rejects
+    unparseable, ``footprint``-less, or wrong-shaped canonical JSON outright), so
+    it can only arise from a validation-bypassed or partially constructed
+    envelope; the render path stays total rather than raising an untyped
+    traceback into a caller that does not expect one.
+    """
+    for _, ref in iter_source_refs(envelope):
+        locator = ref.locator
+        if not (isinstance(locator, TableCellLocator) and isinstance(locator.table_key, CaptionLabelKey)):
+            continue
+        label = locator.table_key.label
+        page: object = "unknown"
+        if isinstance(locator.pdf_table_inventory_sha256, str):
+            for inventory in envelope.table_inventories:
+                if inventory.inventory_sha256 == locator.pdf_table_inventory_sha256:
+                    try:
+                        page = json.loads(inventory.canonical_json)["footprint"]["page"]
+                    except json.JSONDecodeError, KeyError, TypeError:
+                        # Unreachable for a validated inventory -- T1 above rejects
+                        # every malformation this expression could trip on -- so this
+                        # only fires for a validation-bypassed envelope. Degrade the
+                        # page to "unknown" (the same honest fallback as an
+                        # unresolvable citation) rather than crash the render path,
+                        # which the project's fail-closed contract forbids.
+                        page = "unknown"
+                    break
+        return label, str(page)
+    return "unknown", "unknown"
+
+
 def render_series_text(envelope: DatasetEnvelope) -> str:
     """Render the stored series as a human-readable text table.
 
     Derived entirely from ``envelope`` so it cannot drift from what was grounded:
     a header identifying the source document, the table, and each axis, then one
-    row per data point with the coordinate, the observation, and their units.
+    row per data point with the coordinate, the observation, and their units. The
+    table label and page are read from the envelope's own citations via
+    :func:`_stored_table_reference`, not from ``TARGET_TABLE_KEY`` /
+    ``TARGET_TABLE_FOOTPRINT``, so an envelope stored under old constants renders
+    with the facts it was grounded under.
     """
     series: Series = envelope.series[0]
     raw_sha256 = envelope.table_inventories[0].raw_sha256 if envelope.table_inventories else "unknown"
+    table_label, table_page = _stored_table_reference(envelope)
 
     # One representative unit per axis, to name the unit each column is measured in
     # (every point on an axis shares that unit).
@@ -382,7 +439,7 @@ def render_series_text(envelope: DatasetEnvelope) -> str:
     lines: list[str] = [
         f"Dataset series : {series.series_id}",
         f"Source document: sha256 {raw_sha256}",
-        f"Source table   : {TARGET_TABLE_KEY.label}, page {TARGET_TABLE_FOOTPRINT.page}",
+        f"Source table   : {table_label}, page {table_page}",
         f"Source form    : {series.source_form.value}",
         f"Value origin   : {series.value_origin.value}",
         "",
