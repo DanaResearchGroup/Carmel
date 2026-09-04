@@ -46,3 +46,5 @@ nav:
   - Installation: installation.md
   - Architecture: architecture.md
   - Development: development.md
+  - Investigations:
+      - "I-062 dimensionless coordinate census": investigations/i062-dimensionless-coordinate-census.md
