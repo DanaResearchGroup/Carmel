@@ -229,6 +229,7 @@ from carmel.schemas.datasets import (
     TableCellLocator,
     Uncertainty,
     UncertaintyKind,
+    UnitProvenance,
     UnresolvedSubject,
     _iter_series_point_value_refs,
     iter_measured_values,
@@ -1670,6 +1671,13 @@ def _measured_value_text_pairings(envelope: object) -> Iterator[_TextPairing]:
     """
     for path, value in iter_measured_values(envelope):
         yield _TextPairing(f"{path}.value_ref", value.value_ref.node_id, value.value_ref.locator, value.raw_text)
+        # A value whose unit was NOT printed in the source (I-060) has no
+        # unit_ref and no unit_raw to pair -- there is no located token to
+        # re-slice. The header-bridge semantic claim, not a text pairing, is what
+        # records that its quantity is unproven; yielding an empty pairing here
+        # would invent a grounding the source never made.
+        if isinstance(value.unit_ref, Absent) or isinstance(value.unit_raw, Absent):
+            continue
         # unit_raw is short, controlled-vocabulary text (unit symbols and
         # aliases) -- never excerpted prose -- so it is always left literal
         # regardless of reveal_text; see check_char_spans's own docstring.
@@ -1901,7 +1909,16 @@ def _quantity_kind_claim(path: str, value: MeasuredValue) -> UncheckedSemanticCl
     Where several kinds accept the same spelling it establishes nothing, and
     the report must say so rather than let a table lookup that could not
     fail read as a check that passed.
+
+    Returns ``None`` for a NOT_PRINTED_IN_SOURCE value (I-060): there is no
+    ``unit_raw`` spelling to look up at all, and the quantity's unproven-ness is
+    already carried by the axis-level header-bridge claim
+    (:func:`_dataset_axis_bridge_claims`). Filing a per-value claim here too would
+    double-count the same gap.
     """
+    if value.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE or isinstance(value.unit_raw, Absent):
+        return None
+    unit_raw = value.unit_raw
     try:
         table = units.table_for_sha(value.conversion_table_sha256)
     except units.UnknownConversionTableError:
@@ -1918,7 +1935,7 @@ def _quantity_kind_claim(path: str, value: MeasuredValue) -> UncheckedSemanticCl
             "conversion table, so whether the recorded unit spelling pins this quantity kind "
             "cannot be decided at all; no ref supports the choice independently",
         )
-    admitting = _kinds_admitting_unit(table, value.unit_raw)
+    admitting = _kinds_admitting_unit(table, unit_raw)
     if len(admitting) < 2:
         return None
     candidates = ", ".join(kind.value for kind in admitting)
@@ -1926,7 +1943,7 @@ def _quantity_kind_claim(path: str, value: MeasuredValue) -> UncheckedSemanticCl
         claim_path=f"{path}.quantity_kind",
         claim=_claim_text(value.quantity_kind),
         gap=SemanticGap.NO_SUPPORT_OFFERED,
-        reason=f"unit_raw={value.unit_raw!r} is admitted by {len(admitting)} quantity kinds in the "
+        reason=f"unit_raw={unit_raw!r} is admitted by {len(admitting)} quantity kinds in the "
         f"recorded conversion table {value.conversion_table_sha256!r} ({candidates}), so the unit "
         "does not pin the quantity, and no ref supports the recorded choice: MeasuredValue grounds "
         "its number and its unit, never its quantity kind",
@@ -2499,13 +2516,43 @@ def verify_measured_value_unit(path: str, value: MeasuredValue) -> ReplayFinding
             f"table it RECORDS, never against 'the current table', so this is refused rather than "
             f"silently re-checked against something else: {exc}",
         )
+    if value.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+        # The source printed no unit token (I-060), so there is no ``unit_raw`` to
+        # re-normalize. What IS re-verifiable is that the recorded
+        # ``unit_normalized`` is the recorded table's own dimensionless base for
+        # this quantity -- a check that still runs and can still FAIL if a stored
+        # value's ``unit_normalized`` was tampered away from "1".
+        base = table.base_unit(value.quantity_kind)
+        if base != value.unit_normalized:
+            return ReplayFinding(
+                category=ReplayOutcome.FAILED,
+                ref_path=f"{path}.unit_normalized",
+                reason=f"unit_normalized={value.unit_normalized!r} disagrees with the recorded table's "
+                f"base unit {base!r} for the not-printed dimensionless quantity_kind="
+                f"{value.quantity_kind.value!r}",
+                expected=base,
+                actual=value.unit_normalized,
+            )
+        return None
+    unit_raw = value.unit_raw
+    if isinstance(unit_raw, Absent):
+        # A printed-unit value with no recorded token is a contradiction the
+        # schema forbids, but replay owes a verdict about broken input, not a
+        # traceback: report it rather than dereference an Absent.
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=f"{path}.unit_raw",
+            reason=f"unit_raw is Absent while unit_provenance={value.unit_provenance.value!r} is not "
+            "not_printed_in_source -- a printed-unit value must carry its token, so its normalization "
+            "cannot be re-verified",
+        )
     try:
-        expected_unit_normalized = units.normalize_unit(value.quantity_kind, value.unit_raw, table=table)
+        expected_unit_normalized = units.normalize_unit(value.quantity_kind, unit_raw, table=table)
     except units.UnknownUnitError as exc:
         return ReplayFinding(
             category=ReplayOutcome.FAILED,
             ref_path=f"{path}.unit_raw",
-            reason=f"unit_raw={value.unit_raw!r} is not a known unit or alias of quantity_kind="
+            reason=f"unit_raw={unit_raw!r} is not a known unit or alias of quantity_kind="
             f"{value.quantity_kind.value!r} in the RECORDED conversion table "
             f"{value.conversion_table_sha256!r}: {exc}",
         )
@@ -2514,7 +2561,7 @@ def verify_measured_value_unit(path: str, value: MeasuredValue) -> ReplayFinding
             category=ReplayOutcome.FAILED,
             ref_path=f"{path}.unit_normalized",
             reason=f"unit_normalized={value.unit_normalized!r} disagrees with the recorded table's "
-            f"own normalization of unit_raw={value.unit_raw!r} for quantity_kind="
+            f"own normalization of unit_raw={unit_raw!r} for quantity_kind="
             f"{value.quantity_kind.value!r}, which is {expected_unit_normalized!r}",
             expected=expected_unit_normalized,
             actual=value.unit_normalized,
@@ -2616,9 +2663,28 @@ def verify_measured_value_unit_boundary(
     every early return above is paired with a named finding.
     """
     node_problems = node_problems or {}
+    if value.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+        # The source printed no unit token (I-060): there is no unit_ref locator
+        # and no unit span for a boundary/admission gate to re-run against. This
+        # is not a check that could not run -- there is genuinely nothing to
+        # check, and verify_measured_value_unit has already re-verified the
+        # dimensionless base. What the not-printed value does NOT establish -- that
+        # this column carries the quantity -- is carried by the header-bridge
+        # UncheckedSemanticClaim, not by a boundary finding here.
+        return None
+    path_ref = f"{path}.unit_ref"
+    if isinstance(value.unit_ref, Absent):
+        # A printed-unit value with no unit_ref is a contradiction the schema
+        # forbids; report rather than dereference an Absent.
+        return ReplayFinding(
+            category=ReplayOutcome.UNVERIFIABLE,
+            ref_path=path_ref,
+            reason=f"unit_ref is Absent while unit_provenance={value.unit_provenance.value!r} is not "
+            "not_printed_in_source -- a printed-unit value must cite its token's location, so the "
+            "boundary/admission gate has nothing to re-run",
+        )
     unit_node_id = value.unit_ref.node_id
     unit_locator = value.unit_ref.locator
-    path_ref = f"{path}.unit_ref"
 
     if not isinstance(unit_locator, CharSpanLocator):
         # Every other SourceLocator kind (bbox, table cell, xpath) has no
@@ -3586,6 +3652,105 @@ def _series_value_ref_paths(index: int, series: Series) -> tuple[str, ...]:
     return tuple(paths)
 
 
+def _axis_label_is_own_column_header(axis_label_locator: object, value_columns: set[tuple[str | None, int]]) -> bool:
+    """Is an axis's label grounded at its OWN column's printed header cell?
+
+    True only when the label locator is a :class:`TableCellLocator` sitting in the
+    SAME table (inventory) and SAME column as every one of the axis's value cells
+    -- structurally attached to the column, so the header names the quantity
+    directly. Any other shape -- a char span into running prose (a caption or
+    nomenclature), a cell in a different column or table, or values that are not
+    all cells of one column -- is NOT the column's own header, so the label proves
+    the phrase is in the document but not that THIS column carries the quantity.
+    """
+    if not isinstance(axis_label_locator, TableCellLocator):
+        return False
+    inventory = (
+        axis_label_locator.pdf_table_inventory_sha256
+        if isinstance(axis_label_locator.pdf_table_inventory_sha256, str)
+        else None
+    )
+    label_column = (inventory, axis_label_locator.col)
+    # The label must belong to the one column the axis's values all sit in.
+    return value_columns == {label_column}
+
+
+def _dataset_axis_bridge_claims(
+    envelope: DatasetEnvelope,
+    text_by_node_id: Mapping[str, str],
+    node_problems: Mapping[str, ReplayFinding],
+) -> tuple[UncheckedSemanticClaim, ...]:
+    """The header-bridge obligation an EQUIVALENCE_RATIO axis declared without a
+    printed unit imposes (I-060).
+
+    A dimensionless coordinate whose unit the source never printed is declared
+    EQUIVALENCE_RATIO on the strength of a LABEL grounded in the document. When
+    that label sits at the column's own printed header cell, the header names the
+    quantity directly and nothing is inferred. When it is grounded DISTALLY --
+    the flame-speed table's caption "range of equivalence ratios", or the
+    nomenclature "phi = equivalence ratio" -- grounding proves the phrase appears
+    in the document, NEVER that THIS column is that quantity. That inferential
+    step, the "header bridge", is filed here as an unchecked claim rather than
+    passed off as evidence: it is exactly the load-bearing rule that grounding
+    proves LOCATION, never MEANING, and it is why declaring the quantity can never
+    push a report to VERIFIED -- an :class:`UncheckedSemanticClaim` forces
+    ``overall_outcome`` to UNVERIFIABLE.
+
+    Scoped narrowly to the axes that actually take this route (EQUIVALENCE_RATIO,
+    every value not-printed): an ordinary printed-unit axis grounds its label the
+    same way and is untouched here.
+    """
+    claims: list[UncheckedSemanticClaim] = []
+    for series in envelope.series:
+        for axis in series.axes:
+            if axis.quantity_kind is not QuantityKind.EQUIVALENCE_RATIO:
+                continue
+            values: list[MeasuredValue] = [
+                coordinate.value
+                for point in series.points
+                for coordinate in point.coordinates
+                if coordinate.axis_id == axis.axis_id
+            ]
+            # An observation's value is a Maybe (a point may record no datum); a
+            # not-printed unit is a property of a present MeasuredValue, so an Absent
+            # observation value contributes nothing here.
+            values += [
+                observation.value
+                for point in series.points
+                for observation in point.observations
+                if observation.axis_id == axis.axis_id and not isinstance(observation.value, Absent)
+            ]
+            if not values or not all(value.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE for value in values):
+                continue
+            value_columns = {
+                (
+                    locator.pdf_table_inventory_sha256 if isinstance(locator.pdf_table_inventory_sha256, str) else None,
+                    locator.col,
+                )
+                for value in values
+                if isinstance(locator := value.value_ref.locator, TableCellLocator)
+            }
+            if _axis_label_is_own_column_header(axis.label_ref.locator, value_columns):
+                # The label IS the column's own header cell: the header names the
+                # quantity directly, so there is no bridge to record.
+                continue
+            axis_path = f"series[{series.series_id!r}].axes[{axis.axis_id!r}]"
+            claims.append(
+                UncheckedSemanticClaim(
+                    claim_path=f"{axis_path}.quantity_kind",
+                    claim=_claim_text(axis.quantity_kind),
+                    gap=_semantic_ref_gap(axis.label_ref, text_by_node_id, node_problems),
+                    reason="the axis label is grounded in the document but NOT at this column's own "
+                    "printed header cell (the unit was not printed, so the quantity rests on a distal "
+                    "label -- a caption or nomenclature phrase); that proves the phrase appears in the "
+                    "document, never that THIS column carries equivalence ratio, so the header bridge "
+                    "is an unchecked claim, not evidence",
+                    support_paths=(f"{axis_path}.label_ref",),
+                )
+            )
+    return tuple(claims)
+
+
 def _figure_semantic_claims(envelope: DatasetEnvelope) -> tuple[UncheckedSemanticClaim, ...]:
     """Two :class:`UncheckedSemanticClaim`\\ s per DIGITIZED series: the two DISTINCT ceilings a
     coherent figure citation cannot pass, each machine-visible at its own ``claim_path``.
@@ -3771,7 +3936,11 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # The figure lane's claim about MEANING that replay structurally cannot test -- one per
     # DIGITIZED series, folded onto the SAME semantic axis as the derived-value claims, so a
     # digitized envelope's overall_outcome is UNVERIFIABLE by design and never launders VERIFIED.
-    semantic_claims = _derived_value_claims(envelope, uncertainty_sites) + _figure_semantic_claims(envelope)
+    semantic_claims = (
+        _derived_value_claims(envelope, uncertainty_sites)
+        + _figure_semantic_claims(envelope)
+        + _dataset_axis_bridge_claims(envelope, text_by_node_id, node_problems)
+    )
 
     # The table lane, made to mean something: every embedded inventory's grid
     # re-derived from the document's own bytes (T-cell replay), and every

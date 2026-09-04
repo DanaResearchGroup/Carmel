@@ -58,6 +58,8 @@ from carmel.services.tabular_dataset_producer import (
 
 __all__ = [
     "PHI_HEADER",
+    "PHI_LABEL_OCCURRENCE",
+    "PHI_LABEL_QUOTE",
     "S_L_HEADER",
     "TARGET_CAMPAIGN",
     "TARGET_DOCUMENT_SHA256",
@@ -139,9 +141,22 @@ TARGET_ROWS: tuple[tuple[int, str, str], ...] = (
 
 #: The verbatim header cell texts -- symbol-font phi decodes to "/", and the
 #: flame-speed header carries its subscript fold. Recorded as-is (grounding proves
-#: location, never meaning).
+#: location, never meaning). PHI_HEADER is the ACTUAL printed header; it names no
+#: quantity and prints no unit, which is why the phi axis's label is grounded at
+#: the caption instead (see below) and its unit is marked not-printed-in-source.
 PHI_HEADER = "/"
 S_L_HEADER = "S0L;u(cm/s)"
+
+#: The phi axis LABEL, grounded as a char span in running prose (I-060). The
+#: column header "/" names no quantity, but the table's caption reads "range of
+#: equivalence ratios" -- the phrase that identifies the coordinate. It occurs
+#: THREE times in this document; Table 1's caption is the SECOND (it sits
+#: immediately before this table's flame-speed header at char offset 19877), so
+#: the occurrence is pinned as ``1`` (``ground_quote``'s occurrence is 0-based).
+#: Grounding it proves the phrase is in the document, NOT that this column is that
+#: quantity -- the header bridge replay files as an unchecked claim.
+PHI_LABEL_QUOTE = "range of equivalence ratios"
+PHI_LABEL_OCCURRENCE = 1
 
 #: The grid is 23 rows (one header + 22 data) by 4 columns.
 _EXPECTED_CELL_COUNT = 92
@@ -233,36 +248,31 @@ def _cell_of(embedded: EmbeddedTableInventory, row: int, col: int) -> TableCellG
 def build_axes(embedded: EmbeddedTableInventory) -> tuple[TabularAxisSpec, TabularAxisSpec]:
     """The series' two axes, grounded against the embedded inventory."""
     return (
-        # phi is recorded as OTHER, NOT EQUIVALENCE_RATIO, and this is the honest
-        # encoding -- re-derived against the real document (I058), not a fallback
-        # nobody rechecked. What the coordinate IS *is* groundable: the table caption
-        # reads "range of equivalence ratios" and the nomenclature defines the symbol
-        # as "phi = equivalence ratio", so a LABEL naming the quantity has a real home
-        # in the prose. The blocker is the UNIT. phi is dimensionless and its column
-        # prints no unit token at all -- the header cell decodes to "/" (symbol-font
-        # phi), and the word "dimensionless", a bracketed "[-]"/"(-)", and a bare "1"
-        # appear nowhere near the column. The units table admits exactly one unit for
-        # EQUIVALENCE_RATIO -- base "1", aliases "-" and "dimensionless" -- and the
-        # real header "/" is not among them, so declaring EQUIVALENCE_RATIO makes the
-        # producer's boundary gate refuse the "/" the column actually prints
-        # (test_declaring_equivalence_ratio_is_refused_against_the_printed_header).
-        # The only way to pass the gate is to hand it "-"/"1"/"dimensionless" -- none
-        # of which this column prints -- i.e. to ground a token that is NOT this
-        # column's unit. Grounding proves LOCATION, never MEANING, so that would be a
-        # fabricated unit, the exact class this project refuses; the gate checks
-        # normalizability, not that the token is phi's unit, so the refusal to launder
-        # is an encoder judgment the gate cannot make for us. OTHER with the verbatim
-        # header is therefore correct: the schema's honest "quantity this table does
-        # not model" state. test_the_phi_coordinate_stays_other_for_want_of_a_printed_
-        # unit pins this outcome and fails if it silently flips back.
+        # phi is EQUIVALENCE_RATIO, declared WITHOUT a printed unit (I-060). It was
+        # OTHER "/" until this ticket, because its column prints no dimensionless
+        # unit token and the units table admits only "1"/"-"/"dimensionless" for
+        # EQUIVALENCE_RATIO -- none of which this column prints. Rather than fall
+        # back to OTHER (a coordinate a reader cannot tell is an equivalence ratio)
+        # or launder the corrupted header "/" into "1" (a fabricated unit this
+        # project refuses -- and the units test still guards against a "/"->"1"
+        # alias), the axis declares the quantity and marks the unit
+        # not-printed-in-source: unit_raw/unit_ref Absent, unit_normalized "1",
+        # unit_provenance NOT_PRINTED_IN_SOURCE, a first-class stored fact. The
+        # LABEL is grounded in the caption "range of equivalence ratios" (a char
+        # span, occurrence 2), which proves the phrase is in the document but NOT
+        # that THIS column carries the quantity -- so replay files the header
+        # bridge as an UncheckedSemanticClaim and overall_outcome can never reach
+        # VERIFIED by having dropped the unit. This is permitted for equivalence
+        # ratio ONLY: it is the sole dimensionless quantity whose unit carries no
+        # scale, so declaring "1" rescales nothing (the fraction kinds scale
+        # %/ppm -> 1, so the same move would corrupt their magnitudes).
         TabularAxisSpec(
             axis_id="phi",
             role=AxisRole.COORDINATE,
-            quantity_kind=units.QuantityKind.OTHER,
-            label_quote=PHI_HEADER,
-            unit_quote=PHI_HEADER,
-            label_cell=_cell_of(embedded, 0, 0),
-            unit_cell=_cell_of(embedded, 0, 0),
+            quantity_kind=units.QuantityKind.EQUIVALENCE_RATIO,
+            label_quote=PHI_LABEL_QUOTE,
+            label_occurrence=PHI_LABEL_OCCURRENCE,
+            unit_not_printed=True,
         ),
         # The flame speed IS modelled: VELOCITY, cm/s. The unit "cm/s" is written
         # in the running prose, so it is grounded there as a char span (V4/V7

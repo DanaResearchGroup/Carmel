@@ -187,6 +187,7 @@ __all__ = [
     "UncertaintyScale",
     "UnextractedConditionStatement",
     "UnextractedReason",
+    "UnitProvenance",
     "UnresolvedSubject",
     "ValueOrigin",
     "XPathLocator",
@@ -2216,6 +2217,44 @@ class SemanticDependencyUse(BaseModel):
         return self
 
 
+class UnitProvenance(StrEnum):
+    """Whether this value's unit was PRINTED in the source, or is a declared
+    dimensionless unit the source never printed at all.
+
+    A first-class stored fact, never an absence and never a comment: requirement
+    I-060 is that a reader of the stored data must be able to tell a unit that was
+    NEVER PRINTED from one merely unrecorded. The absence of ``unit_raw`` cannot
+    carry that distinction on its own -- an absence says "not here", not "the
+    source printed nothing" -- so this marker states it explicitly.
+    """
+
+    PRINTED_IN_SOURCE = "printed_in_source"
+    """The ordinary, universal case: the unit was printed in the document and is
+    grounded by ``unit_raw`` (the verbatim token) and ``unit_ref`` (its location).
+    Every value in the corpus is this unless it is the one narrow exception
+    below."""
+
+    NOT_PRINTED_IN_SOURCE = "not_printed_in_source"
+    """The source printed NO unit token for this value, and the dimensionless unit
+    is asserted from the quantity alone. Permitted for
+    :attr:`~carmel.services.units.QuantityKind.EQUIVALENCE_RATIO` ONLY -- the sole
+    dimensionless quantity whose canonical unit (``"1"``) carries no SCALE, so
+    asserting it rescales nothing. The contrast is load-bearing and is the whole
+    reason this is not a class-wide dimensionless exemption: the conversion table
+    scales ``%`` -> ``1`` by 0.01 and ``ppm`` -> ``1`` by 1e-6 for MOLE_FRACTION,
+    MASS_FRACTION and RELATIVE_UNCERTAINTY, so declaring one of THOSE without a
+    printed unit would silently rescale a stored magnitude by 100x or 1,000,000x.
+    "Carries no information" and "carries no scale" are different claims;
+    equivalence ratio is safe on the second, not the first.
+
+    In this state ``unit_raw`` and ``unit_ref`` are :class:`Absent` -- there is no
+    printed token to quote and no location to cite -- and ``unit_normalized`` is
+    the quantity's dimensionless base unit ``"1"``. That the column IS this
+    quantity is NOT established by this marker: it is a separate unchecked claim
+    replay files (the header bridge), because grounding a label proves LOCATION,
+    never MEANING."""
+
+
 class MeasuredValue(BaseModel):
     """A single numeric fact, bound to its unit with independently-verifiable provenance.
 
@@ -2361,8 +2400,21 @@ class MeasuredValue(BaseModel):
     binding SOUND rather than decorative. ``QuantityKind.OTHER`` is the
     honest state for a quantity this table deliberately does not model; it
     permits identity conversion only (see :mod:`carmel.services.units`)."""
-    unit_raw: str = Field(min_length=1)
-    """The unit exactly as printed in the source."""
+    unit_provenance: UnitProvenance = UnitProvenance.PRINTED_IN_SOURCE
+    """Whether the unit was PRINTED in the source (the default, universal case) or
+    is a dimensionless unit the source never printed
+    (:attr:`UnitProvenance.NOT_PRINTED_IN_SOURCE`, EQUIVALENCE_RATIO only). A
+    first-class field, not an inference from ``unit_raw`` being absent -- see the
+    enum's own docstring. Enforced below: NOT_PRINTED_IN_SOURCE requires
+    ``quantity_kind == EQUIVALENCE_RATIO``, ``unit_raw``/``unit_ref`` both
+    :class:`Absent`, and ``unit_normalized == "1"``; PRINTED_IN_SOURCE requires
+    both present, exactly as before this field existed."""
+    unit_raw: Maybe[str]
+    """The unit exactly as printed in the source, or :class:`Absent` when
+    ``unit_provenance`` is :attr:`UnitProvenance.NOT_PRINTED_IN_SOURCE` (the
+    source printed no unit token). A present value must be non-empty -- enforced
+    below rather than by ``Field(min_length=1)``, which a ``Maybe`` union does not
+    reliably apply to its ``str`` member."""
     unit_normalized: str = Field(min_length=1)
     """The recorded table's canonical SPELLING of ``unit_raw`` -- the SAME
     physical unit, never a converted target. ``"°C"`` normalizes to ``"C"``,
@@ -2381,9 +2433,14 @@ class MeasuredValue(BaseModel):
     table, a new sha) instead of a silent reinterpretation."""
     value_ref: SourceRef
     """Provenance for the NUMBER. Required -- see class docstring."""
-    unit_ref: SourceRef
-    """Provenance for the UNIT, independent of ``value_ref``. Required -- see
-    class docstring."""
+    unit_ref: Maybe[SourceRef]
+    """Provenance for the UNIT, independent of ``value_ref``. Present in the
+    ordinary case; :class:`Absent` when ``unit_provenance`` is
+    :attr:`UnitProvenance.NOT_PRINTED_IN_SOURCE`, because a unit the source never
+    printed has no location to cite. The class docstring's "both are required"
+    invariant is preserved for every PRINTED_IN_SOURCE value (enforced below); it
+    is the not-printed marker, not a silent omission, that relaxes it for the one
+    narrow dimensionless case."""
 
     @field_validator("conversion_table_sha256")
     @classmethod
@@ -2505,6 +2562,68 @@ class MeasuredValue(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_unit_provenance(self) -> MeasuredValue:
+        """Enforce the ``unit_provenance`` contract, gated NARROWLY to equivalence
+        ratio (I-060).
+
+        The whole safety of declaring a dimensionless unit the source never
+        printed rests on this gate. :attr:`UnitProvenance.NOT_PRINTED_IN_SOURCE`
+        is allowed ONLY for :attr:`~carmel.services.units.QuantityKind.EQUIVALENCE_RATIO`,
+        whose canonical unit ``"1"`` carries no scale. The three sibling
+        dimensionless kinds -- MOLE_FRACTION, MASS_FRACTION, RELATIVE_UNCERTAINTY --
+        are refused here, because their conversion table scales ``%``/``ppm`` to
+        ``1`` and asserting an un-printed ``"1"`` for one of them would silently
+        rescale a stored magnitude. In the not-printed state ``unit_raw`` and
+        ``unit_ref`` MUST be :class:`Absent` (there is nothing to quote or cite)
+        and ``unit_normalized`` MUST be the dimensionless base ``"1"``. In the
+        ordinary PRINTED_IN_SOURCE state both MUST be present and ``unit_raw``
+        non-empty -- restoring, exactly, the "a value whose unit has no
+        independent provenance cannot be constructed" invariant the class
+        docstring states.
+        """
+        unit_raw_absent = isinstance(self.unit_raw, Absent)
+        unit_ref_absent = isinstance(self.unit_ref, Absent)
+        if self.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+            if self.quantity_kind is not QuantityKind.EQUIVALENCE_RATIO:
+                raise ValueError(
+                    f"unit_provenance={self.unit_provenance.value!r} is permitted for "
+                    f"quantity_kind={QuantityKind.EQUIVALENCE_RATIO.value!r} ONLY, not "
+                    f"{self.quantity_kind.value!r}: equivalence ratio is the sole dimensionless "
+                    "quantity whose unit '1' carries no scale, so asserting an unprinted unit "
+                    "rescales nothing; the table scales %/ppm to 1 for the fraction kinds, so "
+                    "declaring one of those without a printed unit would silently rescale a "
+                    "stored magnitude"
+                )
+            if not unit_raw_absent:
+                raise ValueError(
+                    f"unit_provenance={self.unit_provenance.value!r} requires unit_raw to be Absent "
+                    f"(the source printed no unit token), not {self.unit_raw!r}"
+                )
+            if not unit_ref_absent:
+                raise ValueError(
+                    f"unit_provenance={self.unit_provenance.value!r} requires unit_ref to be Absent "
+                    "(a unit the source never printed has no location to cite)"
+                )
+            if self.unit_normalized != "1":
+                raise ValueError(
+                    f"unit_provenance={self.unit_provenance.value!r} requires unit_normalized == '1' "
+                    f"(the dimensionless base unit of equivalence ratio), not {self.unit_normalized!r}"
+                )
+        else:
+            if unit_raw_absent or unit_ref_absent:
+                raise ValueError(
+                    f"unit_provenance={self.unit_provenance.value!r} requires unit_raw and unit_ref "
+                    "to be present: a value whose unit has no independent provenance cannot be "
+                    "constructed (the not-printed marker, not a silent omission, is the only path to "
+                    "an absent unit)"
+                )
+            # Narrowed by the guard above: not Absent, so a str.
+            assert isinstance(self.unit_raw, str)
+            if not self.unit_raw.strip():
+                raise ValueError("unit_raw must be a non-empty, non-blank unit token when it is present")
+        return self
+
+    @model_validator(mode="after")
     def _validate_unit_normalization_against_the_recorded_table(self) -> MeasuredValue:
         """Reject a ``unit_normalized`` that is not the RECORDED table's own answer.
 
@@ -2528,6 +2647,25 @@ class MeasuredValue(BaseModel):
                 f"against 'the current table', so an unresolvable sha is refused rather than silently "
                 f"re-interpreted: {exc}"
             ) from exc
+        if self.unit_provenance is UnitProvenance.NOT_PRINTED_IN_SOURCE:
+            # No printed ``unit_raw`` to normalize (guaranteed Absent by
+            # _validate_unit_provenance). ``unit_normalized`` was already pinned
+            # to "1" there; the remaining check is that "1" IS the recorded
+            # table's dimensionless base for equivalence ratio, so an edited table
+            # that ever moved that base surfaces as a migration here rather than a
+            # silent reinterpretation.
+            base = table.base_unit(self.quantity_kind)
+            if self.unit_normalized != base:
+                raise ValueError(
+                    f"unit_normalized={self.unit_normalized!r} disagrees with the recorded table's "
+                    f"base unit {base!r} for quantity_kind={self.quantity_kind.value!r}; a not-printed "
+                    "dimensionless unit is the quantity's base unit, never asserted independently"
+                )
+            return self
+        # Past the not-printed early return above, _validate_unit_provenance (which
+        # runs first) has already guaranteed a present str unit_raw for a printed
+        # value; narrow it for the type checker.
+        assert isinstance(self.unit_raw, str)
         try:
             expected = units.normalize_unit(self.quantity_kind, self.unit_raw, table=table)
         except units.UnknownUnitError as exc:
@@ -5641,11 +5779,12 @@ def _measured_value_identity_payload(value: MeasuredValue) -> dict[str, Any]:
         "repairs": list(value.repairs),
         "repair_dependency": _semantic_dependency_use_identity_payload(value.repair_dependency),
         "quantity_kind": value.quantity_kind.value,
-        "unit_raw": value.unit_raw,
+        "unit_provenance": value.unit_provenance.value,
+        "unit_raw": _project_maybe(value.unit_raw),
         "unit_normalized": value.unit_normalized,
         "conversion_table_sha256": value.conversion_table_sha256,
         "value_ref": _source_ref_identity_payload(value.value_ref),
-        "unit_ref": _source_ref_identity_payload(value.unit_ref),
+        "unit_ref": _project_maybe(value.unit_ref, _source_ref_identity_payload),
     }
 
 
@@ -6021,7 +6160,7 @@ _CONDITION_SET_ENVELOPE_TYPE = "condition_set"
 """``envelope_type`` value emitted by
 :meth:`ConditionSetEnvelope.identity_payload`."""
 
-_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 4
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 5
 """The one envelope-projection version this module can parse. A payload
 carrying any other version was projected by code this module has never
 seen, so parsing it here could only produce a silently reinterpreted
@@ -6055,6 +6194,26 @@ Version history:
    the same rule entry 3 records: the projection MODULE changed, and a consumer
    keyed on this number must be told. Nothing has been stored under any version,
    so re-addressing every projection still carries no migration cost.
+5. :attr:`MeasuredValue.unit_provenance` added, and
+   :attr:`MeasuredValue.unit_raw`/:attr:`~MeasuredValue.unit_ref` made
+   ``Maybe`` (I-060): a dimensionless coordinate may now DECLARE
+   ``quantity_kind=EQUIVALENCE_RATIO`` with the unit marked not-printed-in-source
+   instead of falling back to ``OTHER`` with a corrupted header. This changes the
+   projected shape of EVERY ``MeasuredValue`` -- the new ``unit_provenance`` key,
+   and ``unit_raw``/``unit_ref`` now projected through the absence machinery --
+   so BOTH a :class:`DatasetEnvelope` (series values) and a
+   :class:`ConditionSetEnvelope` (scalar-claim values) re-address at 5, by the
+   same shared-number rule entries 3 and 4 record.
+
+   Unlike entries 3 and 4, the "nothing has been stored, so re-addressing carries
+   no migration cost" premise is NO LONGER TRUE, and that was checked rather than
+   assumed: a live workspace holds a v4 dataset (the flagship flame-speed sweep)
+   AND a v4 condition set. The bump ORPHANS both -- the version gate below refuses
+   to LOAD a v4 payload, fail-closed, so old bytes are refused rather than
+   silently reinterpreted, which is the behaviour this key exists to produce. The
+   operator authorised the bump knowing this; neither artifact is migrated or
+   deleted (re-producing them under 5 is a separate, explicit run), so the
+   orphaning is an accepted, recorded consequence, never a silent one.
 
 A version-1 payload is REFUSED here, never migrated. Refusing is the whole
 reason this key exists: a payload written under a projection this code has

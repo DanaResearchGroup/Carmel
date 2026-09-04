@@ -254,7 +254,7 @@ class TestAValidDigitizedEnvelope:
         payload = envelope.identity_payload()
         reparsed = DatasetEnvelope.from_identity_payload(payload)
         assert canonical_json_bytes(reparsed.identity_payload()) == canonical_json_bytes(payload)
-        assert payload["identity_payload_version"] == 4
+        assert payload["identity_payload_version"] == 5
         assert payload["series"][0]["digitization_sha256"] == envelope.series[0].digitization_sha256
         assert len(payload["figure_digitizations"]) == 1
 

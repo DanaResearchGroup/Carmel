@@ -410,22 +410,27 @@ class TestNormalizeUnit:
             normalize_unit(QuantityKind.MASS_FRACTION, "ppmv", table=TABLE_V1)
 
     def test_equivalence_ratio_admits_only_the_dimensionless_tokens(self) -> None:
-        # I058: what the units module accepts for the dimensionless coordinate.
-        # Base "1" and the two dimensionless spellings normalize; ANYTHING else is
-        # unknown. This is the vocabulary a groundable phi unit must fall within --
-        # and none of these tokens is printed near the flame-speed table's phi
-        # column, which is why that axis stays OTHER (see
+        # I058, still pinned under I060: what the units module accepts for the
+        # dimensionless coordinate. Base "1" and the two dimensionless spellings
+        # normalize; ANYTHING else is unknown. This vocabulary is UNCHANGED by the
+        # I060 declare-without-a-printed-unit path -- that path grounds no unit
+        # token at all (unit_raw Absent, unit_normalized the base "1"), so it adds
+        # no new admitted spelling here. The three printed spellings still appear
+        # nowhere near the flame-speed table's phi column, which is exactly why that
+        # axis declares its unit not-printed rather than grounding one of them (see
         # tests.test_tabular_dataset_target_acceptance).
         assert normalize_unit(QuantityKind.EQUIVALENCE_RATIO, "1", table=TABLE_V1) == "1"
         assert normalize_unit(QuantityKind.EQUIVALENCE_RATIO, "-", table=TABLE_V1) == "1"
         assert normalize_unit(QuantityKind.EQUIVALENCE_RATIO, "dimensionless", table=TABLE_V1) == "1"
 
     def test_equivalence_ratio_rejects_the_corrupted_phi_header(self) -> None:
-        # I058, the guard against laundering: the symbol-font phi header decodes to
-        # "/", which is NOT an equivalence-ratio unit. This must keep raising -- if a
-        # later change adds a "/"-to-"1" alias to make the flagship axis look tidy,
-        # that is exactly the fabricated unit this project refuses, and this test
-        # fails to say so.
+        # I058, still pinned under I060 -- the guard against laundering: the
+        # symbol-font phi header decodes to "/", which is NOT an equivalence-ratio
+        # unit. This must keep raising. I060 lets the flagship axis look tidy the
+        # HONEST way (declare the quantity, mark the unit not-printed), which is
+        # precisely NOT adding a "/"-to-"1" alias; if a later change adds one to
+        # groom the header into a unit, that is the fabricated unit this project
+        # refuses, and this test fails to say so.
         with pytest.raises(UnknownUnitError, match="known units"):
             normalize_unit(QuantityKind.EQUIVALENCE_RATIO, "/", table=TABLE_V1)
 
