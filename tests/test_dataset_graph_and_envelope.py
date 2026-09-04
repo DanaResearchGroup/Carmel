@@ -321,6 +321,11 @@ def _node(
         glyph_health=glyph_health,
         verification=_verification_for(extraction),
         crop_region=crop_region,
+        # Undeclared: only an SI_MEMBER has a document_kind to leave open
+        # (NOT_EXTRACTED_YET); every other kind must state NOT_APPLICABLE.
+        document_kind=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+        if kind == SourceNodeKind.SI_MEMBER
+        else Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
 
 

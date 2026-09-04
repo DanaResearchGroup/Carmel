@@ -170,6 +170,7 @@ __all__ = [
     "RootSidecarVerification",
     "SemanticDependencyUse",
     "Series",
+    "SiMemberDocumentKind",
     "SourceForm",
     "SourceGraph",
     "SourceLocator",
@@ -500,6 +501,49 @@ class SourceNodeKind(StrEnum):
     JATS_XML = "jats_xml"
     SI_MEMBER = "si_member"
     FIGURE_CROP = "figure_crop"
+
+
+class SiMemberDocumentKind(StrEnum):
+    """The kind of document a supplementary-information member IS, once that
+    has been determined -- the fact that lets the schema tell a ``.docx`` from
+    a ``.pdf`` from an ``.xlsx`` and DECIDE where it used to REFUSE.
+
+    :class:`SourceNodeKind` deliberately carries a single ``SI_MEMBER`` value
+    covering a csv, an xlsx, a PDF, and a Word document all alike (see that
+    enum, and the "SI_MEMBER too broad" gap documented on
+    :data:`_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS`): the node kind says an
+    artifact came out of an archive, never what medium it is. That single
+    kind is why two validators had to REFUSE a caption-labelled SI-member
+    cell both ways -- a PDF cell has fragment geometry an inventory can
+    describe, a word-processor cell does not, and the node kind could not
+    tell them apart. This enum is that missing distinction, declared as a
+    first-class stored fact rather than sniffed from a filename suffix or the
+    bytes.
+
+    Exactly three members, and the split is load-bearing for BOTH validators
+    to agree (V3 and V8): a ``PDF`` and a ``WORD_PROCESSOR`` document are
+    RENDERED, carry PRINTED CAPTIONS, and have no workbook sheets; a
+    ``SPREADSHEET`` has workbook SHEETS and no printed captions. The two
+    rendered kinds are kept distinct rather than merged because a PDF cell
+    CAN have fragment geometry a cell inventory describes while a
+    word-processor cell cannot -- the very distinction V8 turns on.
+    """
+
+    PDF = "pdf"
+    """A rendered PDF supplementary member. Its cells CAN carry PDF fragment
+    geometry, so a cell inventory over it is meaningful in principle -- though
+    verifying one is follow-on work (see
+    :func:`_validate_table_cell_inventory_citation`)."""
+
+    WORD_PROCESSOR = "word_processor"
+    """A word-processor document (e.g. ``.docx``). Rendered and caption-bearing
+    like a PDF, but its cells have NO PDF fragment geometry a cell inventory
+    could describe -- the case V8 now ACCEPTS with an absent citation."""
+
+    SPREADSHEET = "spreadsheet"
+    """A spreadsheet (e.g. ``.xlsx``/``.csv``). Carries workbook SHEETS and no
+    printed captions, so a ``MemberSheetKey`` addresses it and a
+    ``CaptionLabelKey`` does not (V3)."""
 
 
 class ArchiveOrigin(BaseModel):
@@ -1019,6 +1063,30 @@ class SourceNode(BaseModel):
     ``Maybe``-typed with no default, for the same "no unreasoned absence"
     reasoning as ``origin``/``extraction``/``glyph_health`` above. WHICH
     absences are legal is decided by I7, not by this field."""
+    document_kind: Maybe[SiMemberDocumentKind]
+    """WHICH kind of document a ``SI_MEMBER`` node IS -- a PDF, a
+    word-processor document, or a spreadsheet (see
+    :class:`SiMemberDocumentKind`). Meaningful ONLY for an ``SI_MEMBER``;
+    forbidden (``Absent(NOT_APPLICABLE)``) for every other kind, exactly as
+    ``origin`` is (see :meth:`_validate_document_kind`, below).
+
+    A DECLARED value is a first-class stored fact, projected into the node's
+    identity: it is what lets :func:`_validate_table_cell_inventory_citation`
+    (V8) and :func:`_validate_locator_kind_compatibility` (V3) DECIDE a
+    caption-labelled SI-member cell where a single ``SI_MEMBER`` kind forced
+    them to REFUSE. It is DELIBERATELY never inferred from a filename suffix
+    or the member's bytes -- both are author-controlled and the whole point
+    is a fact the schema can stand behind, not a guess it sniffed.
+
+    ``Maybe``-typed with no default, for the same "no unreasoned absence"
+    reasoning as ``origin``/``extraction`` above, and -- like ``extraction``
+    -- NOT inferable from ``kind``: an SI member HAS a document kind whether
+    or not we have determined it, so an undeclared member is an explicit
+    ``Absent(reason=NOT_EXTRACTED_YET)`` (the honest "the document has a kind,
+    we have not determined which"), never a silent default and never
+    ``NOT_APPLICABLE`` (which would falsely claim the concept does not apply
+    to a document). WHICH absences are legal is decided by
+    :meth:`_validate_document_kind`, not by this field."""
 
     @model_validator(mode="after")
     def _validate_verification_binds_to_extraction(self) -> SourceNode:
@@ -1066,6 +1134,66 @@ class SourceNode(BaseModel):
                 f"node {self.node_id!r} has kind={self.kind.value!r}, which cannot carry a concrete "
                 "ArchiveOrigin -- only an SI_MEMBER node can, since only an SI_MEMBER node was ever "
                 "extracted from an archive; origin must be Absent(...) here"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_document_kind(self) -> SourceNode:
+        """``document_kind`` is meaningful ONLY for an ``SI_MEMBER``, and its
+        absence reason is PINNED so the conditional projection's inverse can
+        restore the exact marker from ``kind`` alone.
+
+        This is stricter than :meth:`_validate_origin_only_for_si_member`
+        above, which only forbids a non-``SI_MEMBER`` from carrying a concrete
+        value and leaves the absence reason free. Here the reason is
+        load-bearing: :data:`_CONDITIONALLY_PROJECTED_FIELDS` omits
+        ``document_kind`` whenever it is ``Absent`` and
+        :func:`_restore_unprojected_document_kinds` reconstructs the marker
+        from the payload's ``kind`` -- so an unpinned reason would not
+        round-trip. Exactly as I7 pins ``crop_region``'s reason to
+        ``NOT_APPLICABLE``, this pins ``document_kind``'s two legal absences:
+
+        - ``kind != SI_MEMBER``: the concept does not apply (a paper PDF, a
+          JATS document, a figure crop are not supplementary members with a
+          media type to declare), so ``document_kind`` MUST be
+          ``Absent(reason=NOT_APPLICABLE)``. A concrete value, or an ``Absent``
+          with any other reason, is refused.
+        - ``kind == SI_MEMBER``: the member IS a document with a kind, so the
+          value is EITHER a concrete :class:`SiMemberDocumentKind` (declared)
+          OR ``Absent(reason=NOT_EXTRACTED_YET)`` (undeclared: the document has
+          a kind, we have not determined which). ``NOT_APPLICABLE`` is refused
+          because it would falsely claim the concept does not apply to a
+          document, and every other absence reason is refused for the same
+          "unreasoned absence" reason the field's ``Maybe`` typing exists to
+          prevent.
+        """
+        if self.kind != SourceNodeKind.SI_MEMBER:
+            if not isinstance(self.document_kind, Absent):
+                raise ValueError(
+                    f"node {self.node_id!r} has kind={self.kind.value!r}, which cannot carry a "
+                    "concrete SiMemberDocumentKind -- only an SI_MEMBER node IS a supplementary "
+                    "document with a media type to declare; document_kind must be "
+                    f"Absent(reason={AbsenceReason.NOT_APPLICABLE.value!r}) here, not "
+                    f"{self.document_kind!r}"
+                )
+            if self.document_kind.reason != AbsenceReason.NOT_APPLICABLE:
+                raise ValueError(
+                    f"node {self.node_id!r} has kind={self.kind.value!r}, for which document_kind "
+                    f"does not apply, so it must be Absent(reason="
+                    f"{AbsenceReason.NOT_APPLICABLE.value!r}) -- reason "
+                    f"{self.document_kind.reason.value!r} would claim some other absence for a "
+                    "concept that simply does not apply to this kind"
+                )
+            return self
+        if isinstance(self.document_kind, Absent) and self.document_kind.reason != AbsenceReason.NOT_EXTRACTED_YET:
+            raise ValueError(
+                f"node {self.node_id!r} is an SI_MEMBER, which IS a document with a kind, so an "
+                "undeclared document_kind must be Absent(reason="
+                f"{AbsenceReason.NOT_EXTRACTED_YET.value!r}) -- reason "
+                f"{self.document_kind.reason.value!r} is wrong: {AbsenceReason.NOT_APPLICABLE.value!r} "
+                "would falsely claim the concept does not apply to a document, and any other reason "
+                "invents an absence the schema does not stand behind; declare a concrete "
+                "SiMemberDocumentKind or leave it NOT_EXTRACTED_YET"
             )
         return self
 
@@ -5427,17 +5555,22 @@ against those node kinds is already required by
 :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS` to exclude ``FIGURE_CROP``, so
 that exclusion is not repeated here.
 
-``SI_MEMBER`` compatible with BOTH key kinds is a known remaining gap, not an
-oversight: today ``SI_MEMBER`` is a single ``SourceNodeKind`` covering a csv,
-an xlsx, a PDF, and a zip member all alike, so this table cannot yet tell
-"this SI member is a spreadsheet, so only MEMBER_SHEET makes sense against
-it" from "this SI member is a rendered document, so only CAPTION_LABEL makes
-sense against it" -- both keys are accepted against SI_MEMBER because the
-node kind itself does not yet distinguish those cases. M-E (SI retrieval) is
-the closer for this gap -- that is the milestone where an SI member's media
-type first becomes known at all: once an SI member's actual media type is
-represented, this table can narrow to reject a ``MEMBER_SHEET`` key against
-an SI member that is not actually a spreadsheet.
+``SI_MEMBER`` compatible with BOTH key kinds is what this STATIC table can
+say, because ``SI_MEMBER`` is a single ``SourceNodeKind`` covering a csv, an
+xlsx, a PDF, and a zip member all alike -- the table keyed on node kind alone
+cannot tell "this SI member is a spreadsheet, so only MEMBER_SHEET makes
+sense against it" from "this SI member is a rendered document, so only
+CAPTION_LABEL makes sense against it".
+
+I-075 closes that gap for a member that DECLARES its
+:attr:`SourceNode.document_kind`: :func:`_validate_locator_kind_compatibility`
+reads this table AND then, for a declared member, rejects a ``MEMBER_SHEET``
+key against a non-spreadsheet and a ``CAPTION_LABEL`` key against a
+spreadsheet. So the gap now stays open ONLY for members that declare nothing
+-- both keys are still accepted against an undeclared ``SI_MEMBER`` here,
+where V8 refuses a caption cell both ways. The table itself stays as-is
+(keyed on node kind, it cannot express document kind); the narrowing lives in
+the validator that also holds the node's declared value.
 """
 
 assert set(_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS) == set(TableKeyKind), (
@@ -5698,6 +5831,26 @@ def _addresses_a_crop_region(node: SourceNode) -> bool:
     return not isinstance(node.crop_region, Absent)
 
 
+def _declares_a_document_kind(node: SourceNode) -> bool:
+    """Whether ``node``'s projection carries a ``document_kind`` key -- the
+    projection-side predicate for that field's entry in
+    :data:`_CONDITIONALLY_PROJECTED_FIELDS`, and the single place the
+    PROJECTION side of that decision is made. Its exact parallel is
+    :func:`_addresses_a_crop_region`, and the same reasoning applies verbatim.
+
+    Asks the VALUE, not the kind, and that is the whole point.
+    ":meth:`SourceNode._validate_document_kind` decides WHICH absences are
+    legal" is that validator's rule; restating it here as
+    ``node.kind == SI_MEMBER`` would make a second, hand-maintained copy of
+    it. Reading the value makes this a CONSEQUENCE of the validator rather
+    than a duplicate: whatever it admits as a declared kind, this projects,
+    and an ``Absent`` (of either legal reason) is omitted. The parse side
+    makes the mirror decision separately and off ``kind`` because it has no
+    value to read; see :func:`_restore_unprojected_document_kinds`.
+    """
+    return not isinstance(node.document_kind, Absent)
+
+
 def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "node_id": node.node_id,
@@ -5737,6 +5890,27 @@ def _source_node_identity_payload(node: SourceNode) -> dict[str, Any]:
     # round trip is byte-exact for every node kind.
     if _addresses_a_crop_region(node):
         payload["crop_region"] = _project_maybe(node.crop_region, _bbox_identity_payload)
+    # The second CONDITIONAL key, registered in _CONDITIONALLY_PROJECTED_FIELDS
+    # and following the crop_region precedent above exactly. Emitted when this
+    # node DECLARES a document kind, omitted otherwise.
+    #
+    # A declared kind is identity-bearing: V3 and V8 branch on it (a declared
+    # word-processor member's caption-labelled cell is ACCEPTED where a PDF's
+    # or an undeclared member's is refused), so an envelope declaring
+    # word_processor must not address like one that declares pdf or declares
+    # nothing. When it is Absent -- NOT_APPLICABLE for a non-SI node,
+    # NOT_EXTRACTED_YET for an undeclared SI member -- the marker is a
+    # kind-determined CONSTANT (_validate_document_kind admits exactly one
+    # reason per kind), so folding it into the address would add zero
+    # distinguishing bits at the price of re-addressing every node.
+    #
+    # When the predicate holds the value is always a concrete
+    # SiMemberDocumentKind, so its .value (a plain string) is the payload; the
+    # inverse (_restore_unprojected_document_kinds) reconstructs the omitted
+    # Absent marker from the payload's kind before validation, and the round
+    # trip is byte-exact.
+    if _declares_a_document_kind(node):
+        payload["document_kind"] = _project_maybe(node.document_kind, lambda kind: kind.value)
     return payload
 
 
@@ -6089,6 +6263,20 @@ _CONDITIONALLY_PROJECTED_FIELDS: Mapping[tuple[str, str], tuple[Callable[[Any], 
         "let an envelope citing one figure address like an envelope citing "
         "another.",
     ),
+    ("SourceNode", "document_kind"): (
+        _declares_a_document_kind,
+        "Identity-bearing for an SI_MEMBER that DECLARES its kind -- V3 and V8 "
+        "branch on it, so an envelope declaring word_processor must not address "
+        "like one declaring pdf or one declaring nothing -- and a "
+        "kind-determined CONSTANT otherwise. _validate_document_kind admits "
+        "exactly one absence per node kind (NOT_APPLICABLE off an SI_MEMBER, "
+        "NOT_EXTRACTED_YET on an undeclared SI_MEMBER), so projecting the "
+        "absent marker would fold that constant into the content address: no "
+        "envelope becomes distinguishable, while every stored envelope "
+        "re-addresses, including the ones that declare nothing. Emitting it "
+        "only when a concrete kind is declared keeps exactly the declarations "
+        "that separate two members apart.",
+    ),
 }
 """``(model_name, field_name) -> (is_projected_for, reason)`` registry of
 fields the projection emits for SOME instances of a model and omits for
@@ -6111,9 +6299,10 @@ completeness walk stayed green and the pins did not.
 
 Every conditional key needs an INVERSE, because ``from_identity_payload``
 hands its payload straight to pydantic and these fields are required with no
-default: see :func:`_restore_unprojected_crop_regions`, which restores the
-one entry here. A conditional projection without an inverse is a payload
-that projects cleanly and cannot be parsed back.
+default: see :func:`_restore_unprojected_crop_regions` for ``crop_region``
+and :func:`_restore_unprojected_document_kinds` for ``document_kind``, each
+restoring its own entry here. A conditional projection without an inverse is
+a payload that projects cleanly and cannot be parsed back.
 
 THE TWO SIDES ARE NOT ONE PIECE OF CODE, and for this entry they are not
 even written against the same thing. The projection side asks the VALUE
@@ -6160,7 +6349,7 @@ _CONDITION_SET_ENVELOPE_TYPE = "condition_set"
 """``envelope_type`` value emitted by
 :meth:`ConditionSetEnvelope.identity_payload`."""
 
-_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 5
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 6
 """The one envelope-projection version this module can parse. A payload
 carrying any other version was projected by code this module has never
 seen, so parsing it here could only produce a silently reinterpreted
@@ -6214,6 +6403,26 @@ Version history:
    operator authorised the bump knowing this; neither artifact is migrated or
    deleted (re-producing them under 5 is a separate, explicit run), so the
    orphaning is an accepted, recorded consequence, never a silent one.
+6. :attr:`SourceNode.document_kind` added (I-075): a supplementary-member node
+   (``SI_MEMBER``) may now DECLARE whether it is a PDF, a word-processor
+   document, or a spreadsheet (:class:`SiMemberDocumentKind`), which is what
+   lets V8 and V3 DECIDE a caption-labelled SI-member cell where a single
+   ``SI_MEMBER`` kind forced them to refuse. Projected CONDITIONALLY like
+   ``crop_region`` -- emitted only when a concrete kind is declared, omitted
+   when the kind-determined absence holds (``NOT_APPLICABLE`` off a non-SI
+   node, ``NOT_EXTRACTED_YET`` on an undeclared SI member), with the marker
+   restored from the payload's ``kind`` by
+   :func:`_restore_unprojected_document_kinds`. This changes only the NODE
+   shape, but the version is a single shared projection-schema number, so BOTH
+   a :class:`DatasetEnvelope` and a :class:`ConditionSetEnvelope` stamp 6, by
+   the same rule entries 3-5 record.
+
+   The migration reality here differs from entry 5's and was checked, not
+   assumed: the two v4 artifacts entry 5 names were ALREADY orphaned by the v5
+   gate and remain the only stored envelopes anywhere; NOTHING is stored at v5.
+   So this 5->6 bump orphans nothing NEW -- re-addressing every projection
+   carries no additional migration cost, and no artifact changes state that
+   entry 5 did not already change.
 
 A version-1 payload is REFUSED here, never migrated. Refusing is the whole
 reason this key exists: a payload written under a projection this code has
@@ -6361,6 +6570,77 @@ def _restore_unprojected_crop_regions(rehydrated: dict[str, Any]) -> dict[str, A
     restored = [
         {**node, "crop_region": Absent(reason=AbsenceReason.NOT_APPLICABLE)}
         if isinstance(node, dict) and "crop_region" not in node and node.get("kind") != SourceNodeKind.FIGURE_CROP.value
+        else node
+        for node in nodes
+    ]
+    return {**rehydrated, "source_graph": {**graph, "nodes": restored}}
+
+
+def _restore_unprojected_document_kinds(rehydrated: dict[str, Any]) -> dict[str, Any]:
+    """Put back the ``document_kind`` marker that
+    :func:`_source_node_identity_payload` omits for a node that DECLARES no
+    kind -- the explicit inverse of the ``("SourceNode", "document_kind")``
+    entry in :data:`_CONDITIONALLY_PROJECTED_FIELDS`, run by both
+    ``from_identity_payload`` classmethods between rehydration and
+    ``model_validate``, and the exact structural twin of
+    :func:`_restore_unprojected_crop_regions` above.
+
+    THIS SIDE AND THE PROJECTION SIDE ARE NOT ONE PIECE OF CODE, and must
+    move together. The projection side derives its condition from the field's
+    VALUE (see :func:`_declares_a_document_kind`) and cannot be reused here,
+    because this runs on a payload dict before validation, where the value it
+    would consult is precisely the marker that is missing. ``kind`` is the
+    only signal left in those bytes, so this guard KEYS ON ``kind`` -- a
+    second, hand-maintained statement of :meth:`SourceNode._validate_document_kind`'s
+    rule. The two are named together in
+    :data:`_CONDITIONALLY_PROJECTED_FIELDS`'s docstring as the pair that
+    drifts together; the cost of their drifting is an error-message downgrade
+    (a ``Field required`` in place of a targeted message), never a wrong
+    address.
+
+    Needed because ``SourceNode.document_kind`` is required with NO default:
+    a payload that legitimately omits the key would otherwise fail with
+    ``Field required``, so the projection would be unparseable by its own
+    inverse. Restoring exactly what the projection dropped -- rather than
+    giving the field a pydantic default -- is the point: a default would also
+    swallow a payload that omits the key on a declared member, silently
+    manufacturing an "undeclared" fact the author never recorded.
+
+    The restored reason is fully determined by the payload's own ``kind``,
+    which is why this is a restoration and not an inference:
+    :meth:`SourceNode._validate_document_kind` admits exactly ``NOT_APPLICABLE``
+    off a non-SI node and exactly ``NOT_EXTRACTED_YET`` on an SI member, so a
+    node whose payload omits ``document_kind``:
+
+    - with ``kind == "si_member"`` had an undeclared SI member, restored to
+      ``Absent(NOT_EXTRACTED_YET)``;
+    - with any other ``kind`` had the concept not apply, restored to
+      ``Absent(NOT_APPLICABLE)``.
+
+    A node that DOES carry the key, and anything not shaped like a node list,
+    is left untouched -- a present declaration passes straight through, and a
+    malformed payload still fails where it would have failed, with its own
+    error rather than one manufactured here. A node carrying the key with a
+    mismatched shape validates only if it is self-consistent and then fails
+    the caller's byte-for-byte round-trip, because re-projecting drops the
+    key again: the projection shape stays canonical.
+    """
+    graph = rehydrated.get("source_graph")
+    if not isinstance(graph, dict):
+        return rehydrated
+    nodes = graph.get("nodes")
+    if not isinstance(nodes, list):
+        return rehydrated
+    restored = [
+        {
+            **node,
+            "document_kind": Absent(
+                reason=AbsenceReason.NOT_EXTRACTED_YET
+                if node.get("kind") == SourceNodeKind.SI_MEMBER.value
+                else AbsenceReason.NOT_APPLICABLE
+            ),
+        }
+        if isinstance(node, dict) and "document_kind" not in node
         else node
         for node in nodes
     ]
@@ -6536,8 +6816,14 @@ def _validate_locator_kind_compatibility(envelope: _SourceGraphEnvelope) -> None
     a concept meaningless against anything but an ``SI_MEMBER`` -- while
     a ``CaptionLabelKey`` names a printed caption, meaningless against a
     node that carries no rendered caption at all. See
-    :data:`_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS` for the compatibility
-    table and its documented remaining gap (``SI_MEMBER`` too broad).
+    :data:`_TABLE_KEY_KIND_COMPATIBLE_NODE_KINDS` for the static compatibility
+    table, which keeps BOTH keys compatible with ``SI_MEMBER`` (it cannot
+    express media type). I-075 adds a third axis below for a member that
+    DECLARES its :attr:`SourceNode.document_kind`: a ``MemberSheetKey`` needs a
+    spreadsheet's workbook sheets, a ``CaptionLabelKey`` needs a rendered
+    document's printed caption. The "``SI_MEMBER`` too broad" gap that table
+    documents thus CLOSES for declared members and stays open only for
+    undeclared ones (where V8 still refuses a caption cell both ways).
     """
     for path, ref in iter_source_refs(envelope):
         node = envelope.source_graph.node(ref.node_id)
@@ -6559,6 +6845,28 @@ def _validate_locator_kind_compatibility(envelope: _SourceGraphEnvelope) -> None
                     f"{table_key_kind.value!r} may only target nodes of kind "
                     f"{sorted(kind.value for kind in compatible_table_key_kinds)!r}"
                 )
+            # I-075: the static map above cannot express document kind, so it keeps BOTH
+            # table keys compatible with SI_MEMBER -- the "SI_MEMBER too broad" gap, which
+            # stays open for members that declare nothing. For a member that DOES declare
+            # its document_kind, close the gap here: a MemberSheetKey needs workbook sheets
+            # (only a spreadsheet has them) and a CaptionLabelKey needs a printed caption
+            # (a spreadsheet has none). This runs before V8, so a spreadsheet caption cell
+            # is stopped here and never reaches V8's finer PDF/word-processor distinction.
+            if node.kind is SourceNodeKind.SI_MEMBER and not isinstance(node.document_kind, Absent):
+                document_kind = node.document_kind
+                is_spreadsheet = document_kind is SiMemberDocumentKind.SPREADSHEET
+                if table_key_kind is TableKeyKind.MEMBER_SHEET and not is_spreadsheet:
+                    raise ValueError(
+                        f"SourceRef at {path!r} uses table_key kind={table_key_kind.value!r} against "
+                        f"{document_kind.value!r} SI_MEMBER node {node.node_id!r}, but a MemberSheetKey names a "
+                        "workbook sheet and only a spreadsheet has sheets"
+                    )
+                if table_key_kind is TableKeyKind.CAPTION_LABEL and is_spreadsheet:
+                    raise ValueError(
+                        f"SourceRef at {path!r} uses table_key kind={table_key_kind.value!r} against "
+                        f"{document_kind.value!r} SI_MEMBER node {node.node_id!r}, but a CaptionLabelKey names a "
+                        "printed caption and a spreadsheet has none"
+                    )
 
 
 def _validate_char_span_requires_extraction(envelope: _SourceGraphEnvelope) -> None:
@@ -6626,32 +6934,48 @@ def _validate_table_cell_inventory_citation(envelope: _SourceGraphEnvelope) -> N
     * ``SI_MEMBER`` + :class:`MemberSheetKey`: MUST be
       ``Absent(NOT_APPLICABLE)``. A workbook SHEET has no fragment geometry,
       structurally.
-    * ``SI_MEMBER`` + :class:`CaptionLabelKey`: REFUSED BOTH WAYS. An SI member
-      may be a PDF (whose cells CAN have an inventory) or a ``.docx`` (whose
-      cells cannot), and :class:`SourceNodeKind` cannot tell them apart -- the
-      gap :func:`_validate_locator_kind_matches_node_kind` already documents as
-      "``SI_MEMBER`` too broad". Absent is refused because ``NOT_APPLICABLE``
-      would persist a claim nothing checked; present is refused because
-      nothing here can check it either.
+    * ``SI_MEMBER`` + :class:`CaptionLabelKey`: now BRANCHES on the member's
+      declared :attr:`SourceNode.document_kind` (I-075) -- the media type the
+      node kind alone could never carry, the gap
+      :func:`_validate_locator_kind_compatibility` documents as "``SI_MEMBER``
+      too broad":
 
-      This case was first written to ACCEPT a present citation, on the argument
-      that it SELF-CERTIFIES: the checks below require the embedded record's
-      ``raw_sha256`` to equal this node's ``sha256``, and only a PDF yields an
-      inventory, so the envelope was said to PROVE the member is a PDF. That
-      argument is false, and the refutation is worth keeping because it is easy
-      to re-derive: :class:`EmbeddedTableInventory` never re-derives the grid
-      from the document's bytes -- see its "SCOPE OF WHAT VALIDATION HERE
-      PROVES" -- so the whole payload, ``raw_sha256`` included, is author-
-      controlled. Anyone can assert a grid over a ``.docx``'s digest. Matching
-      digests prove only that the author NAMED this node, never that a PDF
-      parser ever ran on it. Only :func:`~carmel.services.pdf_table_record.
-      verify_inventory_record`, holding the real bytes, can establish that.
+      - declared ``WORD_PROCESSOR``: a word-processor cell has NO PDF fragment
+        geometry, so ``Absent(NOT_APPLICABLE)`` is the true absence and is
+        ACCEPTED (the case this change opens); any other absence reason, and a
+        present citation, are refused exactly as any non-PDF node is.
+      - declared ``PDF``: STAYS refused both ways, as strictly as the
+        undeclared case was before. A PDF cell DOES have fragment geometry, so
+        ``NOT_APPLICABLE`` is false; and a present citation cannot be verified
+        here because :class:`EmbeddedTableInventory` never re-derives the grid
+        from the document's bytes (see its "SCOPE OF WHAT VALIDATION HERE
+        PROVES") -- the whole payload, ``raw_sha256`` included, is
+        author-controlled, so citing one asserts a grid rather than
+        establishing it. Only :func:`~carmel.services.pdf_table_record.
+        verify_inventory_record`, holding the real bytes, can establish that;
+        SI-member PDF-inventory verification is follow-on work.
+      - UNDECLARED (``Absent(NOT_EXTRACTED_YET)``): STAYS refused both ways,
+        and the message KEEPS the "this schema cannot tell which" explanation
+        -- still literally true, because the member has not declared whether it
+        is a PDF or a word-processor document. This is the guard the whole
+        change rests on: an undeclared member must never pass as a declared
+        one.
+      - declared ``SPREADSHEET``: refused upstream by
+        :func:`_validate_locator_kind_compatibility` (V3 runs before V8), which
+        rejects a caption key against a spreadsheet; V8 refuses it too if
+        reached, never letting it silently pass.
 
-    Widening the last case later -- once a node can state its own media type --
-    only ever ACCEPTS more, so it needs no migration of anything already
-    written. That is what makes refusing the reversible choice here: a false
-    ``NOT_APPLICABLE``, or a citation admitted on a guarantee no code provides,
-    would both persist claims nothing checked.
+    This case was first written to ACCEPT a present citation, on the argument
+    that it SELF-CERTIFIES: the checks below require the embedded record's
+    ``raw_sha256`` to equal this node's ``sha256``, and only a PDF yields an
+    inventory, so the envelope was said to PROVE the member is a PDF. That
+    argument is false, and the refutation is worth keeping because it is easy
+    to re-derive: the payload is author-controlled, so matching digests prove
+    only that the author NAMED this node, never that a PDF parser ever ran on
+    it. A DECLARED document kind is a different thing entirely -- a first-class
+    stored fact the author stands behind, projected into the node's identity --
+    which is why it, and not a self-certifying citation, is what lets this arm
+    decide.
     """
     embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
     for path, ref in iter_source_refs(envelope):
@@ -6660,7 +6984,14 @@ def _validate_table_cell_inventory_citation(envelope: _SourceGraphEnvelope) -> N
             continue
         node = envelope.source_graph.node(ref.node_id)
         citation = locator.pdf_table_inventory_sha256
-        undecidable = node.kind is SourceNodeKind.SI_MEMBER and locator.table_key.kind is TableKeyKind.CAPTION_LABEL
+        # I-075: the caption-labelled SI-member case, which a single SI_MEMBER
+        # kind forced this validator to REFUSE both ways, now BRANCHES on the
+        # member's declared document_kind. All of its sub-cases are decided
+        # inside the two `is_si_caption` blocks below -- each either accepts
+        # (only a declared word-processor with the true absence) or raises with
+        # a message naming the REAL reason -- so none fall through to the
+        # generic non-PDF arms.
+        is_si_caption = node.kind is SourceNodeKind.SI_MEMBER and locator.table_key.kind is TableKeyKind.CAPTION_LABEL
         requires_citation = node.kind is SourceNodeKind.PAPER_PDF
 
         if isinstance(citation, Absent):
@@ -6670,12 +7001,37 @@ def _validate_table_cell_inventory_citation(envelope: _SourceGraphEnvelope) -> N
                     f"pdf_table_inventory_sha256 is Absent ({citation.reason.value!r}) -- a PDF table cell "
                     "must cite the inventory that defines its grid, and no absence reason is legal here"
                 )
-            if undecidable:
+            if is_si_caption:
+                document_kind = node.document_kind
+                if isinstance(document_kind, Absent):
+                    raise ValueError(
+                        f"SourceRef at {path!r} locates a caption-labelled table cell in SI_MEMBER node "
+                        f"{node.node_id!r} with pdf_table_inventory_sha256 Absent ({citation.reason.value!r}) "
+                        "-- the member has not declared its document_kind, so an SI member may be a PDF or a "
+                        "word-processor document and this schema cannot tell which; absence here would record "
+                        "a claim nothing checked. Declare document_kind to decide it."
+                    )
+                if document_kind is SiMemberDocumentKind.WORD_PROCESSOR:
+                    if citation.reason is AbsenceReason.NOT_APPLICABLE:
+                        continue
+                    raise ValueError(
+                        f"SourceRef at {path!r} locates a caption-labelled cell in word-processor SI_MEMBER "
+                        f"node {node.node_id!r} with pdf_table_inventory_sha256 Absent "
+                        f"({citation.reason.value!r}) -- a word-processor cell has no PDF fragment geometry, so "
+                        f"its only true absence is {AbsenceReason.NOT_APPLICABLE.value!r}"
+                    )
+                if document_kind is SiMemberDocumentKind.PDF:
+                    raise ValueError(
+                        f"SourceRef at {path!r} locates a caption-labelled cell in PDF SI_MEMBER node "
+                        f"{node.node_id!r} with pdf_table_inventory_sha256 Absent ({citation.reason.value!r}) "
+                        f"-- a PDF cell HAS fragment geometry, so {AbsenceReason.NOT_APPLICABLE.value!r} is "
+                        "false; verifying an SI-member PDF's cell inventory is follow-on work, so this cell "
+                        "cannot yet be grounded either way"
+                    )
                 raise ValueError(
-                    f"SourceRef at {path!r} locates a caption-labelled table cell in SI_MEMBER node "
-                    f"{node.node_id!r} with pdf_table_inventory_sha256 Absent ({citation.reason.value!r}) -- "
-                    "an SI member may be a PDF or a word-processor document and this schema cannot tell "
-                    "which, so absence here would record a claim nothing checked"
+                    f"SourceRef at {path!r} locates a caption-labelled cell in spreadsheet SI_MEMBER node "
+                    f"{node.node_id!r} -- a spreadsheet has no printed captions, so this should have been "
+                    "refused upstream by _validate_locator_kind_compatibility (V3); it is refused here too"
                 )
             if citation.reason is not AbsenceReason.NOT_APPLICABLE:
                 raise ValueError(
@@ -6686,16 +7042,36 @@ def _validate_table_cell_inventory_citation(envelope: _SourceGraphEnvelope) -> N
                 )
             continue
 
-        if undecidable:
+        if is_si_caption:
             # Checked BEFORE the generic non-PDF rejection so the message names the real
-            # reason: this node MIGHT have fragment geometry, and that is exactly the
-            # problem -- nothing in this envelope can establish whether it does.
+            # reason for THIS member's declared kind rather than the old "cannot tell which".
+            document_kind = node.document_kind
+            if isinstance(document_kind, Absent):
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a caption-labelled table cell in SI_MEMBER node "
+                    f"{node.node_id!r} and cites pdf_table_inventory_sha256={citation!r}, but the member has "
+                    "not declared its document_kind -- an SI member may be a PDF or a word-processor document "
+                    "and this schema cannot tell which; an embedded record's raw_sha256 is author-controlled, "
+                    "so citing one asserts the member is a PDF rather than establishing it"
+                )
+            if document_kind is SiMemberDocumentKind.PDF:
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a caption-labelled cell in PDF SI_MEMBER node "
+                    f"{node.node_id!r} and cites pdf_table_inventory_sha256={citation!r}, but an embedded "
+                    "record's raw_sha256 is author-controlled, so citing one asserts a grid over this PDF "
+                    "rather than establishing it; SI-member PDF-inventory verification is follow-on work"
+                )
+            if document_kind is SiMemberDocumentKind.WORD_PROCESSOR:
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a caption-labelled cell in word-processor SI_MEMBER node "
+                    f"{node.node_id!r} and cites pdf_table_inventory_sha256={citation!r}, but a word-processor "
+                    "cell has no PDF fragment geometry a cell inventory could ever describe"
+                )
             raise ValueError(
-                f"SourceRef at {path!r} locates a caption-labelled table cell in SI_MEMBER node "
-                f"{node.node_id!r} and cites pdf_table_inventory_sha256={citation!r}, but an SI member may "
-                "be a PDF or a word-processor document and this schema cannot tell which -- an embedded "
-                "record's raw_sha256 is author-controlled, so citing one asserts the member is a PDF "
-                "rather than establishing it"
+                f"SourceRef at {path!r} locates a caption-labelled cell in spreadsheet SI_MEMBER node "
+                f"{node.node_id!r} and cites pdf_table_inventory_sha256={citation!r} -- a spreadsheet has no "
+                "printed captions, so this should have been refused upstream by "
+                "_validate_locator_kind_compatibility (V3); it is refused here too"
             )
 
         if not requires_citation:
@@ -7639,8 +8015,10 @@ class DatasetEnvelope(BaseModel):
         _check_identity_payload_discriminator(
             payload, expected_envelope_type=_DATASET_ENVELOPE_TYPE, class_name=cls.__name__
         )
-        rehydrated = _restore_unprojected_crop_regions(
-            _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+        rehydrated = _restore_unprojected_document_kinds(
+            _restore_unprojected_crop_regions(
+                _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+            )
         )
         try:
             parsed = cls.model_validate(rehydrated)
@@ -8008,8 +8386,10 @@ class ConditionSetEnvelope(BaseModel):
         _check_identity_payload_discriminator(
             payload, expected_envelope_type=_CONDITION_SET_ENVELOPE_TYPE, class_name=cls.__name__
         )
-        rehydrated = _restore_unprojected_crop_regions(
-            _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+        rehydrated = _restore_unprojected_document_kinds(
+            _restore_unprojected_crop_regions(
+                _strip_identity_payload_discriminator(_rehydrate_identity_payload(payload))
+            )
         )
         if isinstance(rehydrated, dict) and "subject" in rehydrated:
             rehydrated = {**rehydrated, "subject": _rehydrate_condition_subject(rehydrated["subject"])}

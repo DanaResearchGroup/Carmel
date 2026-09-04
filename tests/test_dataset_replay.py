@@ -1729,6 +1729,7 @@ class TestIndependentNodeVerificationOutcomeCategories:
             glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
             verification=_verification_for(Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)),
             crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         text, finding, problem_is_text_only = _independently_verify_node_text(
             tmp_path, node, _load_and_check_raw_bin(tmp_path, node)
@@ -2212,6 +2213,7 @@ class TestReplayEnvelopeMixedTextAndBBoxNodes:
                 x1="300",
                 y1="700",
             ),
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
         graph = loaded.source_graph.model_copy(update={"nodes": (*loaded.source_graph.nodes, crop)})
         frame = CoordinateFrame(

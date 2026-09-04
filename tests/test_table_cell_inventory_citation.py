@@ -40,6 +40,7 @@ from carmel.schemas.datasets import (
     DeviceClassDeclaration,
     EmbeddedTableInventory,
     MemberSheetKey,
+    SiMemberDocumentKind,
     SourceGraph,
     SourceNode,
     SourceNodeKind,
@@ -66,7 +67,21 @@ OTHER_SHA = "d" * 64
 _NOT_APPLICABLE = Absent(reason=AbsenceReason.NOT_APPLICABLE)
 
 
-def _node(node_id: str, kind: SourceNodeKind, sha256: str, parent_node_id: str | None = None) -> SourceNode:
+def _node(
+    node_id: str,
+    kind: SourceNodeKind,
+    sha256: str,
+    parent_node_id: str | None = None,
+    document_kind: SiMemberDocumentKind | Absent | None = None,
+) -> SourceNode:
+    if document_kind is None:
+        # Default: undeclared for an SI member (the pre-I-075 shape), not
+        # applicable for anything else. A test that cares passes it explicitly.
+        document_kind = (
+            Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+            if kind is SourceNodeKind.SI_MEMBER
+            else Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        )
     return SourceNode(
         node_id=node_id,
         kind=kind,
@@ -84,6 +99,7 @@ def _node(node_id: str, kind: SourceNodeKind, sha256: str, parent_node_id: str |
         # no TableCellLocator may target one), and I7 accepts only
         # NOT_APPLICABLE on every other kind.
         crop_region=_NOT_APPLICABLE,
+        document_kind=document_kind,
     )
 
 
@@ -132,7 +148,9 @@ def _cell_ref(node_id: str, citation: object, *, sheet: bool = False, row: int =
 
 
 def _envelope_with_refs(
-    refs: tuple[SourceRef, SourceRef], inventories: tuple[EmbeddedTableInventory, ...]
+    refs: tuple[SourceRef, SourceRef],
+    inventories: tuple[EmbeddedTableInventory, ...],
+    graph: SourceGraph | None = None,
 ) -> ConditionSetEnvelope:
     """The smallest envelope that can carry TWO distinct table-cell refs.
 
@@ -140,10 +158,14 @@ def _envelope_with_refs(
     is a MeasuredValue), so the only thing under test is the citation. The two
     refs go to different slots so both are reachable by ``iter_source_refs``,
     which is what lets a test cite two inventories at once.
+
+    ``graph`` overrides the auto-built one, so a test can supply an SI member
+    that DECLARES its ``document_kind`` (the map-built graph is always
+    undeclared).
     """
     subject_ref, statement_ref = refs
     return ConditionSetEnvelope(
-        source_graph=_graph_for_ids((subject_ref.node_id, statement_ref.node_id)),
+        source_graph=graph if graph is not None else _graph_for_ids((subject_ref.node_id, statement_ref.node_id)),
         conversion_tables=(),
         table_inventories=inventories,
         subject=DeviceClassDeclaration(label_raw="shock tube", label_ref=subject_ref),
@@ -165,10 +187,38 @@ def _envelope_with_refs(
     )
 
 
-def _envelope(ref: SourceRef, inventories: tuple[EmbeddedTableInventory, ...]) -> ConditionSetEnvelope:
+def _envelope(
+    ref: SourceRef,
+    inventories: tuple[EmbeddedTableInventory, ...],
+    graph: SourceGraph | None = None,
+) -> ConditionSetEnvelope:
     """The smallest envelope that can carry one table-cell ref, used everywhere
     a single ref is the whole point."""
-    return _envelope_with_refs((ref, ref), inventories)
+    return _envelope_with_refs((ref, ref), inventories, graph=graph)
+
+
+def _declared_si_graph(document_kind: SiMemberDocumentKind) -> SourceGraph:
+    """A ``paper`` root plus an ``si`` member that DECLARES ``document_kind`` --
+    the graph the map-built ``_graph_for("si")`` cannot produce (it always
+    leaves the member undeclared)."""
+    return SourceGraph(
+        nodes=(
+            _node("paper", SourceNodeKind.PAPER_PDF, PAPER_SHA),
+            _node("si", SourceNodeKind.SI_MEMBER, SI_SHA, parent_node_id="paper", document_kind=document_kind),
+        )
+    )
+
+
+def _declared_si_envelope(
+    document_kind: SiMemberDocumentKind,
+    citation: object,
+    inventories: tuple[EmbeddedTableInventory, ...] = (),
+    *,
+    sheet: bool = False,
+) -> ConditionSetEnvelope:
+    """The one-ref envelope over an SI member that declares ``document_kind``."""
+    ref = _cell_ref("si", citation, sheet=sheet)
+    return _envelope(ref, inventories, graph=_declared_si_graph(document_kind))
 
 
 class TestAPdfTableCellMustNameItsGrid:
@@ -242,9 +292,10 @@ class TestACellWithNoPdfGeometryMayNotCiteOne:
 
 
 class TestAnUndecidableSiMemberFailsClosed:
-    """An SI member may be a PDF or a ``.docx`` and ``SourceNodeKind`` cannot
-    say which -- the gap ``_validate_locator_kind_matches_node_kind`` already
-    documents as "SI_MEMBER too broad"."""
+    """An UNDECLARED SI member may be a PDF or a ``.docx`` and ``SourceNodeKind``
+    cannot say which -- the gap ``_validate_locator_kind_compatibility`` documents
+    as "SI_MEMBER too broad", which I-075 closes only once the member DECLARES its
+    ``document_kind`` (see ``TestADeclaredSiMemberDecidesItsCaptionCell`` below)."""
 
     def test_a_caption_labelled_si_cell_may_not_be_absent(self) -> None:
         with pytest.raises(ValidationError) as excinfo:
@@ -272,6 +323,105 @@ class TestAnUndecidableSiMemberFailsClosed:
         with pytest.raises(ValidationError) as excinfo:
             _envelope(_cell_ref("si", inventory.inventory_sha256), (inventory,))
         assert "asserts the member is a PDF rather than establishing it" in str(excinfo.value)
+
+
+class TestADeclaredSiMemberDecidesItsCaptionCell:
+    """I-075 (V8): once an SI member DECLARES its ``document_kind``, the
+    caption-labelled cell that ``SourceNodeKind`` alone forced ``_validate_
+    table_cell_inventory_citation`` to refuse both ways can be DECIDED. A
+    declared word-processor member's cell with no PDF geometry is accepted;
+    a declared PDF and an undeclared member stay exactly as refused as before.
+    """
+
+    def test_a_word_processor_caption_cell_with_no_citation_is_accepted(self) -> None:
+        """The case this whole change opens: a ``.docx`` cell has no PDF
+        fragment geometry, so ``Absent(NOT_APPLICABLE)`` is its true absence
+        and the envelope is ACCEPTED rather than refused for 'cannot tell'."""
+        envelope = _declared_si_envelope(SiMemberDocumentKind.WORD_PROCESSOR, _NOT_APPLICABLE)
+        assert envelope.table_inventories == ()
+
+    @pytest.mark.parametrize("reason", [r for r in AbsenceReason if r is not AbsenceReason.NOT_APPLICABLE])
+    def test_a_word_processor_caption_cell_with_any_other_absence_is_refused(self, reason: AbsenceReason) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(SiMemberDocumentKind.WORD_PROCESSOR, Absent(reason=reason))
+        assert "its only true absence is 'not_applicable'" in str(excinfo.value)
+
+    def test_a_word_processor_caption_cell_that_cites_an_inventory_is_refused(self) -> None:
+        """A word-processor cell has no PDF fragment geometry a cell inventory
+        could describe, so citing one is refused exactly as the JATS/workbook
+        non-PDF cases are -- even when the record is coherent and embedded."""
+        inventory = make_embedded_inventory(raw_sha256=SI_SHA, cells=((0, 0),))
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(SiMemberDocumentKind.WORD_PROCESSOR, inventory.inventory_sha256, (inventory,))
+        assert "no PDF fragment geometry a cell inventory could ever describe" in str(excinfo.value)
+
+    @pytest.mark.parametrize("reason", list(AbsenceReason))
+    def test_a_pdf_caption_cell_is_refused_absent_for_every_reason(self, reason: AbsenceReason) -> None:
+        """A declared PDF stays refused BOTH ways: a PDF cell HAS fragment
+        geometry, so NOT_APPLICABLE is false, and verifying an SI-member PDF's
+        inventory is follow-on work -- so no absence reason grounds it."""
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(SiMemberDocumentKind.PDF, Absent(reason=reason))
+        message = str(excinfo.value)
+        assert "a PDF cell HAS fragment geometry" in message
+        assert "follow-on work" in message
+
+    def test_a_pdf_caption_cell_that_cites_an_inventory_is_refused(self) -> None:
+        """The present arm for a declared PDF: an embedded record's
+        ``raw_sha256`` is author-controlled, so citing one asserts a grid over
+        the PDF rather than establishing it -- refused, and NOT for the old
+        'cannot tell which' reason (we CAN tell: it is a PDF)."""
+        inventory = make_embedded_inventory(raw_sha256=SI_SHA, cells=((0, 0),))
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(SiMemberDocumentKind.PDF, inventory.inventory_sha256, (inventory,))
+        message = str(excinfo.value)
+        assert "SI-member PDF-inventory verification is follow-on work" in message
+        assert "cannot tell which" not in message
+
+    def test_the_undeclared_message_still_says_cannot_tell_which(self) -> None:
+        """The guard the change rests on: an UNDECLARED member is refused with
+        the 'cannot tell which' explanation intact, so it can never pass as a
+        declared word-processor member does."""
+        with pytest.raises(ValidationError) as excinfo:
+            _envelope(_cell_ref("si", _NOT_APPLICABLE), ())
+        assert "cannot tell which" in str(excinfo.value)
+
+
+class TestDocumentKindDeclarationSharpensLocatorCompatibility:
+    """I-075 (V3): the sibling ``_validate_locator_kind_compatibility`` narrows
+    for a DECLARED member so the two validators agree -- a MemberSheetKey needs
+    a spreadsheet's sheets, a CaptionLabelKey needs a rendered document's
+    printed caption. V3 runs before V8, so a spreadsheet caption cell is stopped
+    here, never reaching V8's finer PDF/word-processor distinction."""
+
+    @pytest.mark.parametrize("declared", [SiMemberDocumentKind.WORD_PROCESSOR, SiMemberDocumentKind.PDF])
+    def test_a_sheet_key_against_a_non_spreadsheet_member_is_refused(self, declared: SiMemberDocumentKind) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(declared, _NOT_APPLICABLE, sheet=True)
+        assert "only a spreadsheet has sheets" in str(excinfo.value)
+
+    def test_a_sheet_key_against_a_spreadsheet_member_is_accepted(self) -> None:
+        envelope = _declared_si_envelope(SiMemberDocumentKind.SPREADSHEET, _NOT_APPLICABLE, sheet=True)
+        assert envelope.table_inventories == ()
+
+    def test_a_caption_key_against_a_spreadsheet_member_is_refused_by_v3(self) -> None:
+        """Refused upstream by the sibling, with ITS message -- a spreadsheet
+        has no printed captions -- not V8's."""
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(SiMemberDocumentKind.SPREADSHEET, _NOT_APPLICABLE)
+        message = str(excinfo.value)
+        assert "a spreadsheet has none" in message
+        assert "cannot tell which" not in message
+
+    def test_a_caption_key_against_a_pdf_member_passes_v3_and_is_refused_by_v8(self) -> None:
+        """The layering: V3 lets a caption key through against a rendered
+        document, and V8 is the one that refuses a PDF caption cell -- so the
+        message is V8's PDF message, not a V3 compatibility refusal."""
+        with pytest.raises(ValidationError) as excinfo:
+            _declared_si_envelope(SiMemberDocumentKind.PDF, _NOT_APPLICABLE)
+        message = str(excinfo.value)
+        assert "a PDF cell HAS fragment geometry" in message
+        assert "only a spreadsheet has sheets" not in message
 
 
 class TestACitationMustResolveToTheRightGridOfTheRightDocument:

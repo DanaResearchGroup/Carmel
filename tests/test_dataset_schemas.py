@@ -35,6 +35,7 @@ from carmel.schemas.datasets import (
     RawArtifactVerification,
     RootSidecarVerification,
     SemanticDependencyUse,
+    SiMemberDocumentKind,
     SourceNode,
     SourceNodeKind,
     SourceRef,
@@ -204,7 +205,14 @@ def _node(
     origin: ArchiveOrigin | Absent = _NO_ORIGIN,
     extraction: ExtractionBinding | Absent = _NO_EXTRACTION,
     glyph_health: GlyphHealthAssessment | Absent = _NO_GLYPH_HEALTH,
+    document_kind: SiMemberDocumentKind | Absent | None = None,
 ) -> SourceNode:
+    if document_kind is None:
+        document_kind = (
+            Absent(reason=AbsenceReason.NOT_EXTRACTED_YET)
+            if kind == SourceNodeKind.SI_MEMBER
+            else Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        )
     return SourceNode(
         node_id=node_id,
         kind=kind,
@@ -214,6 +222,7 @@ def _node(
         glyph_health=glyph_health,
         verification=_verification_for(extraction),
         crop_region=_NO_CROP_REGION,
+        document_kind=document_kind,
     )
 
 
@@ -404,6 +413,55 @@ class TestAbsenceStates:
         assert holder.field.reason == AbsenceReason.NOT_EXTRACTED_YET
 
 
+class TestDocumentKindValidator:
+    """``SourceNode._validate_document_kind`` (I-075): ``document_kind`` is
+    meaningful only for an ``SI_MEMBER``, and its absence reason is PINNED so
+    the conditional projection's inverse can restore it from ``kind`` alone."""
+
+    @pytest.mark.parametrize("kind", [SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML])
+    def test_a_non_member_node_may_not_declare_a_document_kind(self, kind: SourceNodeKind) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _node(node_id="n", kind=kind, sha256=SHA_A, document_kind=SiMemberDocumentKind.PDF)
+        assert "cannot carry a concrete SiMemberDocumentKind" in str(excinfo.value)
+
+    @pytest.mark.parametrize("reason", [r for r in AbsenceReason if r is not AbsenceReason.NOT_APPLICABLE])
+    def test_a_non_member_absent_document_kind_must_be_not_applicable(self, reason: AbsenceReason) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _node(node_id="n", kind=SourceNodeKind.PAPER_PDF, sha256=SHA_A, document_kind=Absent(reason=reason))
+        assert "must be Absent(reason='not_applicable')" in str(excinfo.value)
+
+    def test_a_non_member_not_applicable_document_kind_is_accepted(self) -> None:
+        node = _node(
+            node_id="n",
+            kind=SourceNodeKind.PAPER_PDF,
+            sha256=SHA_A,
+            document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        )
+        assert isinstance(node.document_kind, Absent)
+        assert node.document_kind.reason == AbsenceReason.NOT_APPLICABLE
+
+    @pytest.mark.parametrize("reason", [r for r in AbsenceReason if r is not AbsenceReason.NOT_EXTRACTED_YET])
+    def test_a_member_absent_document_kind_must_be_not_extracted_yet(self, reason: AbsenceReason) -> None:
+        with pytest.raises(ValidationError) as excinfo:
+            _node(node_id="si", kind=SourceNodeKind.SI_MEMBER, sha256=SHA_B, document_kind=Absent(reason=reason))
+        assert "must be Absent(reason='not_extracted_yet')" in str(excinfo.value)
+
+    def test_a_member_undeclared_document_kind_is_accepted(self) -> None:
+        node = _node(
+            node_id="si",
+            kind=SourceNodeKind.SI_MEMBER,
+            sha256=SHA_B,
+            document_kind=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        )
+        assert isinstance(node.document_kind, Absent)
+        assert node.document_kind.reason == AbsenceReason.NOT_EXTRACTED_YET
+
+    @pytest.mark.parametrize("declared", list(SiMemberDocumentKind))
+    def test_a_member_may_declare_any_concrete_document_kind(self, declared: SiMemberDocumentKind) -> None:
+        node = _node(node_id="si", kind=SourceNodeKind.SI_MEMBER, sha256=SHA_B, document_kind=declared)
+        assert node.document_kind is declared
+
+
 class TestCoordinateFrameAndBBox:
     def test_bbox_requires_frame(self) -> None:
         with pytest.raises(ValidationError):
@@ -522,6 +580,7 @@ class TestSourceGraph:
                 glyph_health=_NO_GLYPH_HEALTH,
                 verification=_verification_for(_NO_EXTRACTION),
                 crop_region=_NO_CROP_REGION,
+                document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             )
 
     def test_source_node_rejects_trailing_newline_in_sha256(self) -> None:
@@ -551,6 +610,7 @@ class TestSourceGraph:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=_verification_for(_NO_EXTRACTION),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         )
         assert member.parent_node_id == "paper"
 
@@ -569,6 +629,7 @@ class TestSourceGraph:
             glyph_health=_NO_GLYPH_HEALTH,
             verification=_verification_for(_NO_EXTRACTION),
             crop_region=_NO_CROP_REGION,
+            document_kind=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
         )
         assert isinstance(member.origin, ArchiveOrigin)
         assert member.origin.archive_sha256 == SHA_A
@@ -588,6 +649,7 @@ class TestSourceGraph:
                 glyph_health=_NO_GLYPH_HEALTH,
                 verification=_verification_for(_NO_EXTRACTION),
                 crop_region=_NO_CROP_REGION,
+                document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             )
 
     def test_extraction_binding_rejects_bad_hex(self) -> None:
@@ -728,6 +790,7 @@ class TestSourceGraph:
                 glyph_health=_NO_GLYPH_HEALTH,
                 verification=_verification_for(_extraction_binding(parent_raw_sha256=SHA_B)),
                 crop_region=_NO_CROP_REGION,
+                document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             )
 
     def test_glyph_health_assessment_rejects_wrong_dependency_id(self) -> None:
