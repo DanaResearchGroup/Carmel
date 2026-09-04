@@ -210,30 +210,36 @@ def _document_xml_bytes(docx_bytes: bytes) -> bytes:
         archive = zipfile.ZipFile(io.BytesIO(docx_bytes))
     except zipfile.BadZipFile as exc:
         raise OoxmlDocumentUnreadable(f"not a readable .docx (ZIP) package: {exc}") from exc
-    try:
-        info = archive.getinfo(_DOCUMENT_PART)
-    except KeyError as exc:
-        raise OoxmlDocumentUnreadable(
-            f"package has no {_DOCUMENT_PART!r} part, so it is not a WordprocessingML document"
-        ) from exc
-    # The declared size is a hint, not a guarantee -- a crafted entry can under-declare it,
-    # so the bounded read below is what actually holds memory. Refusing an over-declared
-    # entry first just avoids reading one whose header already admits it is too large.
-    if info.file_size > MAX_OOXML_DOCUMENT_XML_BYTES:
-        raise OoxmlDocumentUnreadable(
-            f"{_DOCUMENT_PART} declares {info.file_size} uncompressed bytes, over the "
-            f"{MAX_OOXML_DOCUMENT_XML_BYTES} cap; refused unread"
-        )
-    try:
-        with archive.open(info) as part:
-            data = part.read(MAX_OOXML_DOCUMENT_XML_BYTES + 1)
-    except (zipfile.BadZipFile, OSError, EOFError) as exc:
-        raise OoxmlDocumentUnreadable(f"{_DOCUMENT_PART} could not be decompressed: {exc}") from exc
-    if len(data) > MAX_OOXML_DOCUMENT_XML_BYTES:
-        raise OoxmlDocumentUnreadable(
-            f"{_DOCUMENT_PART} expands past the {MAX_OOXML_DOCUMENT_XML_BYTES} byte cap; refused unread"
-        )
-    return data
+    # Hold the archive in a context manager so its handle is closed on EVERY path out --
+    # the refusals below and the return alike -- rather than leaked to the collector. Same
+    # pattern archive_unpack.unpack_archive already follows: construct inside the try that
+    # catches a bad ZIP, then `with archive:` over the body.
+    with archive:
+        try:
+            info = archive.getinfo(_DOCUMENT_PART)
+        except KeyError as exc:
+            raise OoxmlDocumentUnreadable(
+                f"package has no {_DOCUMENT_PART!r} part, so it is not a WordprocessingML document"
+            ) from exc
+        # The declared size is a hint, not a guarantee -- a crafted entry can under-declare
+        # it, so the bounded read below is what actually holds memory. Refusing an
+        # over-declared entry first just avoids reading one whose header already admits it
+        # is too large.
+        if info.file_size > MAX_OOXML_DOCUMENT_XML_BYTES:
+            raise OoxmlDocumentUnreadable(
+                f"{_DOCUMENT_PART} declares {info.file_size} uncompressed bytes, over the "
+                f"{MAX_OOXML_DOCUMENT_XML_BYTES} cap; refused unread"
+            )
+        try:
+            with archive.open(info) as part:
+                data = part.read(MAX_OOXML_DOCUMENT_XML_BYTES + 1)
+        except (zipfile.BadZipFile, OSError, EOFError) as exc:
+            raise OoxmlDocumentUnreadable(f"{_DOCUMENT_PART} could not be decompressed: {exc}") from exc
+        if len(data) > MAX_OOXML_DOCUMENT_XML_BYTES:
+            raise OoxmlDocumentUnreadable(
+                f"{_DOCUMENT_PART} expands past the {MAX_OOXML_DOCUMENT_XML_BYTES} byte cap; refused unread"
+            )
+        return data
 
 
 def _parse_document_body(docx_bytes: bytes) -> ElementTree.Element:

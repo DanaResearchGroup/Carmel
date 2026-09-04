@@ -57,6 +57,19 @@ def test_harvest_raises_for_a_wholly_unreadable_document() -> None:
         embed_ooxml_tables(b"not a zip at all")
 
 
+def test_document_unreadable_is_catchable_through_the_production_module() -> None:
+    # embed_ooxml_tables documents that it raises OoxmlDocumentUnreadable on a document-level
+    # failure. A caller must be able to catch that THROUGH this production-path module --
+    # importing it from here, not reaching into the core reader -- and it must be the very
+    # same class the reader raises, so the catch actually composes.
+    import carmel.services.ooxml_tables as ooxml_tables
+
+    assert "OoxmlDocumentUnreadable" in ooxml_tables.__all__
+    assert ooxml_tables.OoxmlDocumentUnreadable is OoxmlDocumentUnreadable
+    with pytest.raises(ooxml_tables.OoxmlDocumentUnreadable):
+        ooxml_tables.embed_ooxml_tables(b"not a zip at all")
+
+
 def test_harvest_of_a_tableless_document_is_empty_without_refusals() -> None:
     harvest = embed_ooxml_tables(docx_bytes([]))
     assert harvest.inventories == ()

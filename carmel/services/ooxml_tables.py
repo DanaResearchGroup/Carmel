@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from carmel.services.ooxml_table_record import (
+    OoxmlDocumentUnreadable,
     OoxmlNestedTable,
     OoxmlTableTooLarge,
     compute_ooxml_inventory_sha,
@@ -35,8 +36,13 @@ from carmel.services.ooxml_table_record import (
     read_ooxml_table,
 )
 
+# ``OoxmlDocumentUnreadable`` is re-exported, not merely imported for typing: it is the
+# document-level failure ``embed_ooxml_tables`` propagates (its docstring says so), so a
+# caller must be able to catch it THROUGH this production-path module without reaching into
+# the core reader -- exactly as member_tables surfaces its own unreadable exception.
 __all__ = [
     "EmbeddedOoxmlTable",
+    "OoxmlDocumentUnreadable",
     "OoxmlReadRefusal",
     "OoxmlReadRefusalReason",
     "OoxmlTableHarvest",

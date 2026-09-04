@@ -18,6 +18,15 @@ _W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 CellValue = "str | CellSpec"
 
+#: Sentinel for :attr:`CellSpec.v_merge` asking the builder to emit a BARE ``<w:vMerge/>``
+#: -- no ``w:val`` at all. This is the spelling Word writes for a vertical-merge
+#: CONTINUATION in the wild, and it is a distinct input path from an explicit
+#: ``w:val="continue"``: the reader (:func:`carmel.services.ooxml_table_record._row_merge`)
+#: reads a present ``w:vMerge`` whose ``w:val`` is absent OR anything other than ``"restart"``
+#: as a continuation, so the two spellings reach the same ``"continue"`` verdict by
+#: different routes. Both must be exercised for the continuation branch to be watched.
+BARE_VMERGE = "\x00bare-vmerge\x00"
+
 
 @dataclass(frozen=True)
 class CellSpec:
@@ -35,9 +44,14 @@ def _cell_xml(cell: CellValue) -> str:
     props = []
     if spec.grid_span is not None:
         props.append(f"<w:gridSpan w:val={quoteattr(str(spec.grid_span))}/>")
-    if spec.v_merge is not None:
-        # "continue" is expressed by a bare <w:vMerge/> in the wild; carry it as an
-        # explicit val too so both spellings are exercised somewhere.
+    if spec.v_merge == BARE_VMERGE:
+        # A continuation as Word actually writes it: a bare <w:vMerge/> with no w:val.
+        props.append("<w:vMerge/>")
+    elif spec.v_merge is not None:
+        # The explicit spelling: w:val="restart" for the origin, w:val="continue" for a
+        # continuation. The bare form above is the other spelling of a continuation; both
+        # are exercised, so the reader's "any non-restart val (or none) is a continuation"
+        # branch is watched on both routes rather than only the explicit one.
         props.append(f"<w:vMerge w:val={quoteattr(spec.v_merge)}/>")
     tc_pr = f"<w:tcPr>{''.join(props)}</w:tcPr>" if props else ""
     return f"<w:tc>{tc_pr}<w:p><w:r><w:t>{escape(spec.text)}</w:t></w:r></w:p></w:tc>"

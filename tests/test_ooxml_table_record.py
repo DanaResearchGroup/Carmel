@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import zipfile
 
 import pytest
 
@@ -35,7 +36,7 @@ from carmel.services.ooxml_table_record import (
     replay_ooxml_cell,
     verify_ooxml_inventory_record,
 )
-from tests.ooxml_fixtures import CellSpec, docx_bytes, docx_without_document_part
+from tests.ooxml_fixtures import BARE_VMERGE, CellSpec, document_xml, docx_bytes, docx_without_document_part
 
 _SIMPLE = [
     [["phi", "Su (cm/s)"], ["0.40", "9.08"], ["0.45", "13.73"]],
@@ -72,6 +73,27 @@ def test_a_blank_cell_is_a_present_cell_with_empty_text() -> None:
     inventory = read_ooxml_table(docx_bytes([[["", "x"]]]), table_index=0)
     texts = {(c.row, c.col): c.text for c in inventory.cells}
     assert texts == {(0, 0): "", (0, 1): "x"}
+
+
+def test_reading_closes_the_docx_zip_archive(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An unclosed ZipFile over an in-memory BytesIO leaks no OS handle and so emits no
+    # ResourceWarning -- the tell is the archive object's own state: a closed ZipFile has
+    # ``fp is None``. Spy on construction, read a document, and assert the archive was
+    # closed on the way out, the same discipline archive_unpack.unpack_archive keeps.
+    data = docx_bytes(_SIMPLE)
+    constructed: list[zipfile.ZipFile] = []
+    real_zipfile = ooxml_table_record.zipfile.ZipFile
+
+    def _spy(*args: object, **kwargs: object) -> zipfile.ZipFile:
+        archive = real_zipfile(*args, **kwargs)
+        constructed.append(archive)
+        return archive
+
+    monkeypatch.setattr(ooxml_table_record.zipfile, "ZipFile", _spy)
+    read_ooxml_table(data, table_index=0)
+
+    assert constructed, "reading a .docx constructed no ZipFile to close"
+    assert constructed[-1].fp is None, "the .docx ZIP archive was left open after the read"
 
 
 # --- addressing and byte-replay -------------------------------------------------------
@@ -148,6 +170,31 @@ def test_vertical_merge_is_represented_not_fabricated() -> None:
         (2, 1): ("", "continue"),
         (3, 1): ("", "continue"),
     }
+
+
+def test_a_bare_vmerge_continuation_is_read_as_continue_not_a_fabricated_join() -> None:
+    # A vertical-merge continuation as Word actually writes it: a bare <w:vMerge/> with no
+    # w:val, distinct from the explicit w:val="continue" the test above exercises. The
+    # reader must read it as a continuation that keeps its OWN blank text -- the origin's
+    # value ("H") is never fabricated downward into it. This is the failure mode the whole
+    # merged-cell path exists to prevent, on the spelling the corpus files actually use.
+    tables = [
+        [
+            ["phi", "Method"],
+            ["0.40", CellSpec(text="H", v_merge="restart")],
+            ["0.45", CellSpec(text="", v_merge=BARE_VMERGE)],
+        ]
+    ]
+    document = document_xml(tables)
+    # The fixture really emits the bare spelling for the continuation -- not the explicit-val
+    # one -- so this test covers the reader's absent-val branch rather than re-covering
+    # w:val="continue". (The origin above still carries its own w:val="restart".)
+    assert "<w:vMerge/>" in document
+    assert 'w:vMerge w:val="continue"' not in document
+
+    inventory = read_ooxml_table(docx_bytes(tables), table_index=0)
+    continuation = next(c for c in inventory.cells if c.row == 2 and c.col == 1)
+    assert (continuation.text, continuation.row_merge) == ("", "continue")
 
 
 def test_horizontal_span_advances_the_grid_column_and_records_its_extent() -> None:
