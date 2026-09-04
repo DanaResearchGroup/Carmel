@@ -41,6 +41,9 @@ from carmel.services.acquisition import (
 
 ALLOWLISTED_URL = "https://ars.els-cdn.com/content/image/1-s2.0-x/mmc1.xlsx"
 PAYWALLED_URL = "https://www.sciencedirect.com/science/article/pii/x/mmc1.xlsx"
+# A URL whose IPv6 literal host is unterminated: urlsplit() raises ValueError on it, which
+# is exactly the malformed input a host gate must fail closed on rather than crash over.
+MALFORMED_URL = "http://[::1/content/mmc1.xlsx"
 XLSX_BYTES = b"PK\x03\x04 not really an xlsx, just bytes with a receipt"
 
 
@@ -336,6 +339,79 @@ class TestRedirectOffAllowlistIsRefused:
         assert _staged_files(tmp_path) == []
 
 
+# -------------------------------------------- malformed URL fails closed, not crashed
+
+
+class TestMalformedUrlIsRefusedNotCrashed:
+    """Finding 1 (I-074): a URL that makes ``urlsplit`` raise must leave the guard by its
+    own typed refusal, not by an untyped ``ValueError`` escaping the message-building path.
+    Both call sites are covered. Note the asymmetry the reviewer half-anticipated: the
+    pre-fetch site reads ``candidate.url``, which ``SupplementaryCandidate`` already ran
+    through ``urlsplit`` at construction (so a malformed value cannot normally reach it --
+    ``test_the_schema_rejects_a_malformed_candidate_url`` pins that first line of defence);
+    the post-redirect site reads ``artifact.final_url``, an UNVALIDATED ``str`` from the
+    injected fetch tool, which is the genuinely reachable crash. A malformed URL is an
+    UNKNOWN host, and unknown means refused -- never permitted, never a crash a caller
+    cannot tell apart from a network failure.
+    """
+
+    def test_the_schema_rejects_a_malformed_candidate_url(self) -> None:
+        """The first line of defence for the pre-fetch site: the candidate's own url
+        validator runs urlsplit at construction, so a malformed url never even becomes a
+        candidate. This is WHY the pre-fetch bare-urlsplit was not a live crash -- the fix
+        there is defence in depth against this guard ever being bypassed."""
+        with pytest.raises(ValueError):  # pydantic ValidationError is a ValueError
+            SupplementaryCandidate(url=MALFORMED_URL, believed_filename="mmc1.xlsx")
+
+    def test_a_malformed_entry_url_is_refused_not_crashed_even_if_the_schema_is_bypassed(self, tmp_path: Path) -> None:
+        """Pre-fetch site (~acquisition.py:1250), defence in depth. ``model_construct``
+        bypasses validation to build the candidate the schema would reject, proving
+        ``fetch_supplement`` itself refuses typed rather than crashing -- it does not lean on
+        a distant invariant for its own crash-safety."""
+        parent = _seed_request(tmp_path)
+        fetch = _NeverCalledFetch()
+        candidate = SupplementaryCandidate.model_construct(
+            url=MALFORMED_URL, believed_filename="mmc1.xlsx", believed_kind="", note=""
+        )
+
+        with pytest.raises(SupplementHostNotAllowlisted) as caught:
+            fetch_supplement(tmp_path, parent.slug, candidate, fetch=fetch, max_bytes=10_000_000)
+
+        # Typed, and distinct from a fetch/network failure.
+        assert not isinstance(caught.value, SupplementFetchFailed)
+        # It names what it could (the URL) and could not (the host is empty, not guessed).
+        assert caught.value.host == ""
+        assert caught.value.url == MALFORMED_URL
+        assert "not on the supplement-fetch allowlist" in str(caught.value)
+        assert fetch.calls == []  # never contacted
+        assert _staged_files(tmp_path) == []
+
+    def test_a_malformed_post_redirect_url_is_refused_with_a_typed_error(self, tmp_path: Path) -> None:
+        """Post-redirect site (~acquisition.py:1257). The entry host is allowlisted, but the
+        fetch tool reports a malformed final_url; the second gate must refuse it typed, not
+        crash, and stage nothing."""
+        parent = _seed_request(tmp_path)
+        fetch = _CannedFetch(XLSX_BYTES, final_url=MALFORMED_URL)
+        candidate = SupplementaryCandidate(url=ALLOWLISTED_URL, believed_filename="mmc1.xlsx")
+
+        with pytest.raises(SupplementHostNotAllowlisted) as caught:
+            fetch_supplement(tmp_path, parent.slug, candidate, fetch=fetch, max_bytes=10_000_000)
+
+        assert not isinstance(caught.value, SupplementFetchFailed)
+        assert caught.value.host == ""
+        assert caught.value.url == MALFORMED_URL
+        assert _staged_files(tmp_path) == []  # bytes were fetched but never staged
+        assert load_manifest(tmp_path).requests[0].supplementary == []
+
+    def test_a_malformed_url_is_never_treated_as_allowlisted(self) -> None:
+        """The failure mode worse than the crash: a careless fix that turns the parse error
+        into a permissive fallback. The gate must return False for an unparseable URL, so a
+        malformed host can never be fetched from."""
+        assert not supplement_host_is_fetchable(MALFORMED_URL)
+        # Even the operator extension point cannot make an unparseable URL fetchable.
+        assert not supplement_host_is_fetchable(MALFORMED_URL, ["ars.els-cdn.com"])
+
+
 # ------------------------------------------- receipt-write failure rolls back bytes
 
 
@@ -375,10 +451,34 @@ class TestSafeSupplementFilename:
             ("..", "supplement"),
             ("", "supplement"),
             ("weird name (1).xlsx", "weird_name_1_.xlsx"),
+            # Finding 2 (I-074): an embedded NUL is a hostile/malformed name the resolver
+            # never typed. On Python 3.14 ``Path(name).name`` does NOT raise on it (the
+            # reviewer's premise held on older CPython, not this runtime), and the unsafe-char
+            # regex collapses the NUL to ``_`` regardless -- so the function's job, a safe
+            # basename, is done with no exception. These pin that so a refactor cannot
+            # silently reintroduce a raise.
+            ("a\x00b", "a_b"),
+            ("\x00", "supplement"),
+            ("..\x00/etc\x00", "etc"),
+            ("mmc1\x00.xlsx", "mmc1_.xlsx"),
         ],
     )
     def test_it_reduces_to_a_safe_basename(self, given: str, expected: str) -> None:
         assert _safe_supplement_filename(given) == expected
+
+    def test_an_embedded_nul_filename_stages_safely_end_to_end(self, tmp_path: Path) -> None:
+        """Finding 2, at the boundary that matters: a NUL-bearing publisher filename must
+        stage under a sanitised name with no NUL reaching the filesystem, not raise."""
+        parent = _seed_request(tmp_path)
+        candidate = SupplementaryCandidate(url=ALLOWLISTED_URL, believed_filename="mmc1\x00.xlsx")
+
+        receipt = fetch_supplement(
+            tmp_path, parent.slug, candidate, fetch=_CannedFetch(XLSX_BYTES), max_bytes=10_000_000
+        )
+
+        assert "\x00" not in receipt.original_filename
+        assert receipt.original_filename == "mmc1_.xlsx"
+        assert (tmp_path / receipt.staged_path).is_file()
 
     def test_a_traversing_filename_stays_inside_the_staging_dir(self, tmp_path: Path) -> None:
         parent = _seed_request(tmp_path)

@@ -236,6 +236,21 @@ def host_is_admissible(url: str, additional_hosts: Iterable[str] = ()) -> bool:
     return _host_matches_suffix(url, (*DEFAULT_ADMISSIBLE_HOSTS, *additional_hosts))
 
 
+def _url_host(url: str) -> str:
+    """The normalized (lowercased, dot-stripped) host of ``url``, or ``""`` if unparseable.
+
+    ``urlsplit`` raises :class:`ValueError` on some malformed inputs -- a bad IPv6 literal
+    like ``http://[::1`` is the canonical one -- so any caller that needs the host, whether
+    to gate on it or merely to name it in a refusal, must funnel through here rather than
+    calling ``urlsplit`` bare. A URL that cannot be parsed has no host, which is exactly what
+    a fail-closed gate treats as "not allowlisted": an unknown host, never a permitted one.
+    """
+    try:
+        return (urlsplit(url).hostname or "").lower().strip(".")
+    except ValueError:
+        return ""
+
+
 def _host_matches_suffix(url: str, allowed_hosts: Iterable[str]) -> bool:
     """Registrable-suffix host match, fail-closed -- the shared core of both host gates.
 
@@ -246,10 +261,7 @@ def _host_matches_suffix(url: str, allowed_hosts: Iterable[str]) -> bool:
     :func:`supplement_host_is_fetchable` (automatic fetch) share ONE matcher and can only
     ever differ in their host list, never in how a host is compared.
     """
-    try:
-        host = (urlsplit(url).hostname or "").lower().strip(".")
-    except ValueError:
-        return False
+    host = _url_host(url)
     if not host:
         return False
     allowed = {h.lower().strip(".") for h in allowed_hosts if h}
@@ -1245,8 +1257,11 @@ def fetch_supplement(
             could not be written.
     """
     if not supplement_host_is_fetchable(candidate.url, additional_fetch_hosts):
-        host = (urlsplit(candidate.url).hostname or "").lower().strip(".")
-        raise SupplementHostNotAllowlisted(host, candidate.url)
+        # _url_host, not a bare urlsplit: the gate above already refused (a malformed URL
+        # fails closed to "not fetchable"), and re-parsing here to name the host must not
+        # crash that typed refusal into an untyped ValueError. An unparseable URL yields
+        # host "" -- refused, never a partial name that reads as a real host.
+        raise SupplementHostNotAllowlisted(_url_host(candidate.url), candidate.url)
 
     try:
         artifact, data = fetch.fetch(candidate.url)
@@ -1254,8 +1269,9 @@ def fetch_supplement(
         raise SupplementFetchFailed(candidate.url, str(exc), status=exc.status) from exc
 
     if not supplement_host_is_fetchable(artifact.final_url, additional_fetch_hosts):
-        final_host = (urlsplit(artifact.final_url).hostname or "").lower().strip(".")
-        raise SupplementHostNotAllowlisted(final_host, artifact.final_url)
+        # Same reasoning as the pre-fetch site: name the post-redirect host through the
+        # ValueError-safe extractor so a malformed final_url is refused, not crashed.
+        raise SupplementHostNotAllowlisted(_url_host(artifact.final_url), artifact.final_url)
 
     if len(data) > max_bytes:
         raise SupplementFetchFailed(candidate.url, f"response is over the {max_bytes} byte cap")
