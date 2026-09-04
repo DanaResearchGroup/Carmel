@@ -44,7 +44,6 @@ table -- generalising to other papers is a separate ticket, not this one.
 from __future__ import annotations
 
 import hashlib
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -56,12 +55,11 @@ from carmel.schemas.datasets import (
     ConditionSetEnvelope,
     DeviceClassDeclaration,
     EmbeddedTableInventory,
-    TableCellLocator,
     UnextractedReason,
     UnresolvedSubject,
-    iter_source_refs,
 )
 from carmel.services import units
+from carmel.services._envelope_render import stored_table_reference as _stored_table_reference
 from carmel.services.condition_set_bridge import store_condition_set_envelope
 from carmel.services.condition_set_producer import (
     CategoricalConditionSpec,
@@ -329,37 +327,6 @@ def produce_and_store_target(workspace_root: Path) -> StoredTargetConditionSet:
     envelope = build_envelope(workspace_root, embedded)
     stored: StoredDataset = store_condition_set_envelope(workspace_root, envelope)
     return StoredTargetConditionSet(sha256=stored.sha256, path=stored.path, envelope=envelope)
-
-
-def _stored_table_reference(envelope: ConditionSetEnvelope) -> tuple[str, str]:
-    """Read the table label and source page the envelope itself cites.
-
-    Walks every :class:`~carmel.schemas.datasets.SourceRef` reachable in the
-    envelope (the same choke point V1 validates every ref through) for the
-    first ``TableCellLocator`` naming a ``CaptionLabelKey``, then reads the
-    page from the embedded inventory its ``pdf_table_inventory_sha256`` names.
-    Both facts are read from the STORED envelope, never a module constant, so
-    a previously stored envelope renders with ITS OWN label and page even if
-    ``TARGET_TABLE_KEY``/``TARGET_TABLE_FOOTPRINT`` are edited later -- the
-    drift the docstring above already promised was impossible.
-
-    Falls back to ``"unknown"`` for both, exactly like the ``raw_sha256``
-    fallback below, for an envelope with no PDF table-cell citation to read
-    either fact from.
-    """
-    for _, ref in iter_source_refs(envelope):
-        locator = ref.locator
-        if not (isinstance(locator, TableCellLocator) and isinstance(locator.table_key, CaptionLabelKey)):
-            continue
-        label = locator.table_key.label
-        page: object = "unknown"
-        if isinstance(locator.pdf_table_inventory_sha256, str):
-            for inventory in envelope.table_inventories:
-                if inventory.inventory_sha256 == locator.pdf_table_inventory_sha256:
-                    page = json.loads(inventory.canonical_json)["footprint"]["page"]
-                    break
-        return label, str(page)
-    return "unknown", "unknown"
 
 
 def render_condition_set_text(envelope: ConditionSetEnvelope) -> str:
