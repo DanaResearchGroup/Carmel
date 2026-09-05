@@ -168,6 +168,7 @@ def _envelope_with_refs(
         source_graph=graph if graph is not None else _graph_for_ids((subject_ref.node_id, statement_ref.node_id)),
         conversion_tables=(),
         table_inventories=inventories,
+        ooxml_table_inventories=(),
         subject=DeviceClassDeclaration(label_raw="shock tube", label_ref=subject_ref),
         attribution=ConditionAttribution.OWN_EXPERIMENT,
         attribution_ref=subject_ref,

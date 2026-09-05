@@ -447,7 +447,10 @@ class TestCellGroundingIsRefusedAgainstANonPdfNode:
             )
 
         message = str(excinfo.value)
-        assert "not PAPER_PDF" in message
+        # The gate now admits a declared word-processor SI_MEMBER root too (I-054), so its
+        # message names both legal kinds; a JATS node is still neither and stays refused.
+        assert "PAPER_PDF" in message
+        assert "word-processor SI_MEMBER" in message
         assert "jats_xml" in message  # the actual node kind is named, not just the expected one
         assert "Absent sha" in message  # the reason the refusal is correct, not incidental
 

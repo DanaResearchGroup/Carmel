@@ -218,6 +218,7 @@ from carmel.schemas.datasets import (
     ConditionSetEnvelope,
     DatasetEnvelope,
     DeviceClassDeclaration,
+    EmbeddedOoxmlTableInventory,
     EmbeddedTableInventory,
     MeasuredValue,
     RootSidecarVerification,
@@ -262,6 +263,10 @@ from carmel.services.numeric import (
     find_numeral_extent,
     has_clean_token_boundary,
     unit_boundary_violation,
+)
+from carmel.services.ooxml_table_record import (
+    OoxmlInventoryVerificationStatus,
+    verify_ooxml_inventory_record,
 )
 from carmel.services.pdf_table_record import (
     InventoryVerificationStatus,
@@ -1710,6 +1715,11 @@ def _label_token_policy(locator: object, fields: tuple[str, str]) -> tuple[str, 
     flip to precisely the cells that gate covers.
     """
     if isinstance(locator, TableCellLocator) and isinstance(locator.pdf_table_inventory_sha256, str):
+        return None
+    # The OOXML (.docx) lane mirrors the PDF one exactly: a table cell carrying a PRESENT
+    # ooxml_table_inventory_sha256 is compared by _verify_cited_ooxml_cell_texts, so the
+    # char-span kernel stays silent and leaves the verdict to that gate.
+    if isinstance(locator, TableCellLocator) and isinstance(locator.ooxml_table_inventory_sha256, str):
         return None
     return fields
 
@@ -3175,6 +3185,140 @@ def _verify_cited_cell_texts(
     return _CellTextVerification(checked=checked, findings=tuple(findings))
 
 
+#: OOXML-lane counterpart to :data:`_INVENTORY_STATUS_TO_OUTCOME`. The ``.docx`` reader needs
+#: no external engine (no pypdf), so its verification has no ENGINE_UNAVAILABLE member; the four
+#: it does have map the same way -- a re-derivation that disagrees is a FAILED, an unreadable
+#: embedded payload is UNVERIFIABLE.
+_OOXML_INVENTORY_STATUS_TO_OUTCOME: dict[OoxmlInventoryVerificationStatus, ReplayOutcome] = {
+    OoxmlInventoryVerificationStatus.MISMATCHED: ReplayOutcome.FAILED,
+    OoxmlInventoryVerificationStatus.SOURCE_MISMATCH: ReplayOutcome.FAILED,
+    OoxmlInventoryVerificationStatus.PAYLOAD_UNREADABLE: ReplayOutcome.UNVERIFIABLE,
+}
+
+
+def _verify_embedded_ooxml_inventories(
+    ooxml_table_inventories: tuple[EmbeddedOoxmlTableInventory, ...],
+    raw_bytes_by_sha: Mapping[str, bytes],
+) -> list[ReplayFinding]:
+    """Re-derive every embedded OOXML inventory's grid from the document's raw bytes.
+
+    The OOXML-lane counterpart to :func:`_verify_embedded_inventories`. Iterates the EMBEDDED
+    collection (unique by ``inventory_sha256`` and, by T4b/T5b, exactly the set any ref cites),
+    re-reads each ``.docx`` from the hash-verified bytes the replay loop already holds, and
+    reports a grid that does not reproduce. An inventory whose document has no hash-verified
+    bytes in hand is an inability to re-derive, reported UNVERIFIABLE rather than passed over.
+    """
+    findings: list[ReplayFinding] = []
+    for inventory in ooxml_table_inventories:
+        ref_path = f"ooxml_table_inventories[{inventory.inventory_sha256!r}]"
+        raw = raw_bytes_by_sha.get(inventory.source_sha256)
+        if raw is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"inventory {inventory.inventory_sha256!r} names document "
+                    f"{inventory.source_sha256!r}, but no hash-verified raw bytes for that document are in "
+                    "hand (its raw.bin is missing or tampered -- reported against the node), so its grid "
+                    "could not be re-derived",
+                )
+            )
+            continue
+        # The embedded payload already parsed and self-cohered through T1 at envelope
+        # validation, so json.loads cannot honestly fail here; guarded only so a
+        # corrupted-in-memory object degrades to UNVERIFIABLE rather than an escaping crash.
+        try:
+            payload = json.loads(inventory.canonical_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=ref_path,
+                    reason=f"embedded inventory {inventory.inventory_sha256!r} canonical_json does not "
+                    f"parse, so its grid could not be re-derived: {exc!r}",
+                )
+            )
+            continue
+        result = verify_ooxml_inventory_record(payload, raw)
+        if result.status is OoxmlInventoryVerificationStatus.REPRODUCED:
+            continue
+        # REPRODUCED returned above, so status is always a mapped non-success member; the
+        # subscript raises rather than defaulting if a future member is left unmapped.
+        category = _OOXML_INVENTORY_STATUS_TO_OUTCOME[result.status]
+        findings.append(
+            ReplayFinding(
+                category=category,
+                ref_path=ref_path,
+                reason=f"re-deriving the grid of inventory {inventory.inventory_sha256!r} from document "
+                f"{inventory.source_sha256!r} reported {result.status.value!r}: {result.detail}",
+            )
+        )
+    return findings
+
+
+def _verify_cited_ooxml_cell_texts(
+    pairings: Iterable[_TextPairing],
+    ooxml_embedded_by_sha: Mapping[str, EmbeddedOoxmlTableInventory],
+) -> _CellTextVerification:
+    """Compare each OOXML-table-cell-grounded verbatim text against the cell it cites.
+
+    The OOXML-lane counterpart to :func:`_verify_cited_cell_texts`, with the identical
+    whole-cell exact-equality contract: a disagreement is FAILED and names row, column and both
+    strings; a cell with no comparable string is UNVERIFIABLE; only the exact match increments
+    ``checked``. It reads ``ooxml_table_inventory_sha256`` and resolves against the OOXML
+    carrier, so a PDF-cited cell (handled by the PDF gate) is passed over here.
+    """
+    checked = 0
+    findings: list[ReplayFinding] = []
+    for pairing in pairings:
+        locator = pairing.locator
+        if not isinstance(locator, TableCellLocator):
+            continue
+        citation = locator.ooxml_table_inventory_sha256
+        if not isinstance(citation, str):
+            # Absent OOXML citation (a PDF or non-cell cell) -- no .docx grid here to compare.
+            continue
+        inventory = ooxml_embedded_by_sha.get(citation)
+        if inventory is None:
+            # V8b makes every present citation resolve to an embedded inventory, so this is
+            # defensive: report inability rather than assume.
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=pairing.path,
+                    reason=f"cites ooxml inventory {citation!r}, which this envelope does not embed, so its "
+                    "cell text could not be compared",
+                )
+            )
+            continue
+        cell = inventory.cell_text(row=locator.row, col=locator.col)
+        if cell is None:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.UNVERIFIABLE,
+                    ref_path=pairing.path,
+                    reason=f"cites row={locator.row}, col={locator.col} in ooxml inventory {citation!r}, whose "
+                    "grid records no comparable text at that cell",
+                )
+            )
+            continue
+        if cell != pairing.expected:
+            findings.append(
+                ReplayFinding(
+                    category=ReplayOutcome.FAILED,
+                    ref_path=pairing.path,
+                    reason=f"cites row={locator.row}, col={locator.col} in ooxml inventory {citation!r}, whose "
+                    f"cell text {cell!r} is not the recorded text {pairing.expected!r} -- a table-cell "
+                    "citation names a whole cell, and the value's text is not what that cell says",
+                    expected=pairing.expected,
+                    actual=cell,
+                )
+            )
+            continue
+        checked += 1
+    return _CellTextVerification(checked=checked, findings=tuple(findings))
+
+
 def _claims_digitized(source_form: object) -> bool:
     """Whether ``source_form`` claims to be DIGITIZED, by the SAME value-equality test the VALUE-REF
     validator uses -- deliberately ``==``, never ``is``.
@@ -3984,6 +4128,13 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
     cell_verification = _verify_cited_cell_texts(_dataset_text_pairings(envelope), embedded_by_sha)
 
+    # The OOXML (.docx) table lane, made to mean the same thing: every embedded OOXML
+    # inventory's grid re-derived from the document's own bytes, and every OOXML-table-cell-
+    # grounded value's text compared against the cell it cites.
+    ooxml_embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.ooxml_table_inventories}
+    ooxml_inventory_findings = _verify_embedded_ooxml_inventories(envelope.ooxml_table_inventories, raw_bytes_by_sha)
+    ooxml_cell_verification = _verify_cited_ooxml_cell_texts(_dataset_text_pairings(envelope), ooxml_embedded_by_sha)
+
     # The figure lane, re-derived: every embedded digitization's address re-hashed, its record
     # reconstructed, and V9's series-record-crop joins re-walked from the envelope. Findings only,
     # NO ``checked`` count -- a coherent figure citation is not a reproduced measurement, so it
@@ -3998,6 +4149,8 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         + uncertainty_reconciliation
         + tuple(inventory_findings)
         + cell_verification.findings
+        + tuple(ooxml_inventory_findings)
+        + ooxml_cell_verification.findings
         + tuple(figure_findings)
     )
 
@@ -4009,7 +4162,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
     # grounded entirely at table cells re-slices zero char spans yet may have
     # matched every one of its cells, so a re-sliced char span is no longer the
     # only thing that counts as "checked something".
-    if checked == 0 and cell_verification.checked == 0:
+    if checked == 0 and cell_verification.checked == 0 and ooxml_cell_verification.checked == 0:
         all_findings = all_findings + (
             ReplayFinding(
                 category=ReplayOutcome.UNVERIFIABLE,
@@ -4033,7 +4186,7 @@ def replay_envelope(workspace_root: Path, envelope: DatasetEnvelope, *, reveal_t
         findings=all_findings,
         unchecked_store_claims=tuple(unchecked_store_claims),
         unchecked_semantic_claims=semantic_claims,
-        checked_table_cells=cell_verification.checked,
+        checked_table_cells=cell_verification.checked + ooxml_cell_verification.checked,
     )
 
 
@@ -4376,6 +4529,11 @@ def replay_condition_set(
     embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.table_inventories}
     inventory_findings = _verify_embedded_inventories(envelope.table_inventories, raw_bytes_by_sha)
     cell_verification = _verify_cited_cell_texts(_condition_set_text_pairings(envelope), embedded_by_sha)
+    ooxml_embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.ooxml_table_inventories}
+    ooxml_inventory_findings = _verify_embedded_ooxml_inventories(envelope.ooxml_table_inventories, raw_bytes_by_sha)
+    ooxml_cell_verification = _verify_cited_ooxml_cell_texts(
+        _condition_set_text_pairings(envelope), ooxml_embedded_by_sha
+    )
     all_findings = (
         tuple(pair_findings)
         + tuple(unit_findings)
@@ -4386,6 +4544,8 @@ def replay_condition_set(
         + stitching.findings
         + tuple(inventory_findings)
         + cell_verification.findings
+        + tuple(ooxml_inventory_findings)
+        + ooxml_cell_verification.findings
     )
 
     # A replay that verified NOTHING must never report VERIFIED -- same rule as
@@ -4394,7 +4554,7 @@ def replay_condition_set(
     # shape of this codebase's first real stored artifact) re-slices zero paired
     # char spans yet may have matched every one of its cells, so the guard now
     # tests both kinds of check, not char spans alone.
-    if checked == 0 and cell_verification.checked == 0:
+    if checked == 0 and cell_verification.checked == 0 and ooxml_cell_verification.checked == 0:
         all_findings = all_findings + (
             ReplayFinding(
                 category=ReplayOutcome.UNVERIFIABLE,
@@ -4418,7 +4578,7 @@ def replay_condition_set(
         unchecked_semantic_claims=semantic_claims,
         attempted_refutations=stitching.attempts,
         support_only_char_spans=support_only_char_spans,
-        checked_table_cells=cell_verification.checked,
+        checked_table_cells=cell_verification.checked + ooxml_cell_verification.checked,
     )
 
 
