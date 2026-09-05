@@ -307,6 +307,15 @@ _REACTION_ARROW = re.compile(r"<=>|=>|<=|⇌|⟶|→")
 #: enough that a stray numeric footnote or one malformed row does not flip a column.
 _COLUMN_MAJORITY = 0.6
 
+#: A header row is predominantly filled and predominantly non-numeric; a data row is
+#: predominantly numeric (:data:`_COLUMN_MAJORITY`). These fractions are what separate a header
+#: from the two things real supplements put above it -- a merged title/composition banner (one
+#: filled cell, the rest empty, so low fill) and the numeric data below -- structurally, with no
+#: lexical whitelist of quantity words. They are the row-shape counterpart of the header-vs-data
+#: split, and the reason the classifier no longer assumes the header is ``grid[0]``.
+_HEADER_MIN_FILL = 0.5
+_HEADER_MAX_NUMERIC = 0.5
+
 
 def _looks_numeric(text: str) -> bool:
     return bool(_NUMBER.match(text.strip()))
@@ -325,6 +334,78 @@ def _dense_grid(view: TableView) -> list[list[str]]:
         if 0 <= row < view.row_count and 0 <= col < view.col_count:
             grid[row][col] = text
     return grid
+
+
+def _row_profile(row: list[str], col_count: int) -> tuple[float, int, float]:
+    """``(fill, numeric_count, numeric_fraction)`` for one grid row.
+
+    ``fill`` is the share of the row's columns that are non-empty; ``numeric_fraction`` is the
+    share of the NON-EMPTY cells that are bare numbers. A banner scores low ``fill`` (one cell
+    filled, the rest empty); a data row scores high ``numeric_fraction``; a header scores high
+    ``fill`` and low ``numeric_fraction``.
+    """
+    nonempty = [cell for cell in row if cell.strip()]
+    if col_count <= 0 or not nonempty:
+        return 0.0, 0, 0.0
+    numeric = sum(1 for cell in nonempty if _looks_numeric(cell))
+    return len(nonempty) / col_count, numeric, numeric / len(nonempty)
+
+
+def _is_data_like(row: list[str], col_count: int) -> bool:
+    """A row that is predominantly numbers -- the shape of a data row, not a header or banner."""
+    _, numeric, numeric_fraction = _row_profile(row, col_count)
+    return numeric >= 2 and numeric_fraction >= _COLUMN_MAJORITY
+
+
+def _is_header_like(row: list[str], col_count: int) -> bool:
+    """A row that is predominantly filled and predominantly non-numeric -- the shape of a header,
+    which a one-cell title/composition banner (low fill) and a data row (high numeric share) are
+    not."""
+    fill, _, numeric_fraction = _row_profile(row, col_count)
+    nonempty = sum(1 for cell in row if cell.strip())
+    return nonempty >= 2 and fill >= _HEADER_MIN_FILL and numeric_fraction < _HEADER_MAX_NUMERIC
+
+
+def _select_header_row(grid: list[list[str]], col_count: int) -> tuple[int | None, int, str]:
+    """Choose which grid row is the header, structurally, and say why.
+
+    Real supplements routinely precede the header with a merged title banner, an author list or
+    a composition label, so the header is NOT reliably ``grid[0]``. Returns
+    ``(header_row, data_start, reason)``: ``header_row`` is the grid row read as the header (or
+    ``None`` when nothing above the data is header-shaped), ``data_start`` is the first grid row
+    treated as data, and ``reason`` is the evidence string reported to a human so the choice can
+    be overruled from the report alone.
+
+    The rule, stated so someone could disagree with it: find the first data-like row (the top of
+    the numeric block); the header is the NEAREST header-shaped row above it -- predominantly
+    filled and predominantly non-numeric, which a one-cell banner is not. If no data-like row
+    exists there is no numeric block to anchor the header/data split against, so fall back to
+    ``grid[0]`` as the header -- preserving the pre-structural behaviour, NOT asserting the table
+    is unmeasured: the row-independent signals (a monotone sweep over a value column, a caption
+    unit token) can still reach ``MEASURED`` from the rows below. If a data block
+    exists but nothing above it is header-shaped, report ``None`` and start the data at the
+    block: the unit and ``±`` signals (which read the header) are then unavailable, and the
+    verdict falls back to the row-independent signals -- a monotone sweep -- or to ``UNDECIDED``,
+    never a guess toward measured. Position is never hard-coded in either direction: the header
+    is wherever the row shapes put it, not row 0 and not row 3.
+    """
+    first_data = next((i for i, row in enumerate(grid) if _is_data_like(row, col_count)), None)
+    if first_data is None:
+        return 0, 1, "no data-like row found; row 0 read as the header"
+    for i in range(first_data - 1, -1, -1):
+        if _is_header_like(grid[i], col_count):
+            return (
+                i,
+                i + 1,
+                f"row {i} read as the header: the nearest predominantly-filled, predominantly-non-numeric "
+                f"row above the data block that starts at row {first_data}",
+            )
+    return (
+        None,
+        first_data,
+        f"no header row found above the data block starting at row {first_data} "
+        "(no predominantly-filled, predominantly-non-numeric row); unit/± signals unavailable",
+    )
 
 
 def _numeric_columns(data_rows: list[list[str]], col_count: int) -> set[int]:
@@ -374,16 +455,19 @@ def _reaction_key_ground(data_rows: list[list[str]], value_cols: set[int], col_c
     return None
 
 
-def _formula_ground(view: TableView, value_cols: set[int], data_rows: list[list[str]]) -> Ground | None:
-    # Data rows begin at grid row 1 (row 0 is the header), so a data row's grid row is its
-    # index in `data_rows` plus 1 -- the offset that lines `formula_cells` up with the grid.
+def _formula_ground(
+    view: TableView, value_cols: set[int], data_rows: list[list[str]], data_start: int
+) -> Ground | None:
+    # The data block begins at grid row `data_start` (the row after the selected header, which
+    # is not always row 1), so a data row's grid row is its index in `data_rows` plus
+    # `data_start` -- the offset that lines `formula_cells` up with the grid.
     for col in sorted(value_cols):
         backed = 0
         total = 0
         for data_index, row in enumerate(data_rows):
             if col < len(row) and row[col].strip():
                 total += 1
-                if (data_index + 1, col) in view.formula_cells:
+                if (data_index + data_start, col) in view.formula_cells:
                     backed += 1
         if total >= 2 and backed / total >= _COLUMN_MAJORITY:
             return Ground(
@@ -438,11 +522,14 @@ def _unit_and_uncertainty_grounds(header: list[str], caption: str | None) -> lis
 def classify_table(view: TableView) -> TableClassification:
     """Classify one table's grid as measured experimental data, not, or undecided.
 
-    Reads only ``view`` -- the grid, and the caption where the lane exposed one. The decision
-    is ordered so the strongest structural facts settle it first: a table with too few rows or
-    no numeric column cannot be data; a mechanism listing or a computed sheet is not data
-    however numeric; a grid printing units, ``±`` or a monotone sweep IS data; and a numeric
-    grid printing none of those is honestly undecided rather than guessed.
+    Reads only ``view`` -- the grid, and the caption where the lane exposed one. The header row
+    is chosen structurally by :func:`_select_header_row` (NOT assumed to be ``grid[0]``: real
+    supplements bury it under a title/composition banner), and the row it read is reported in
+    the grounds so a human can overrule it. The decision is then ordered so the strongest
+    structural facts settle it first: a table with too few rows or no numeric column cannot be
+    data; a mechanism listing or a computed sheet is not data however numeric; a grid printing
+    units, ``±`` or a monotone sweep IS data; and a numeric grid printing none of those is
+    honestly undecided rather than guessed.
     """
     grid = _dense_grid(view)
     if view.row_count < 2 or not grid:
@@ -457,8 +544,9 @@ def classify_table(view: TableView) -> TableClassification:
             ),
         )
 
-    header = grid[0]
-    data_rows = grid[1:]
+    header_row, data_start, header_reason = _select_header_row(grid, view.col_count)
+    header = grid[header_row] if header_row is not None else []
+    data_rows = grid[data_start:]
     value_cols = _numeric_columns(data_rows, view.col_count)
 
     if not value_cols:
@@ -475,7 +563,9 @@ def classify_table(view: TableView) -> TableClassification:
 
     grounds: list[Ground] = [
         Ground(
-            SignalKind.NUMERIC_VALUE_COLUMN, Polarity.NEUTRAL, f"columns {sorted(value_cols)} are predominantly numeric"
+            SignalKind.NUMERIC_VALUE_COLUMN,
+            Polarity.NEUTRAL,
+            f"columns {sorted(value_cols)} are predominantly numeric; {header_reason}",
         )
     ]
 
@@ -484,7 +574,7 @@ def classify_table(view: TableView) -> TableClassification:
         grounds.append(reaction)
         return TableClassification(DataVerdict.NOT_MEASURED, tuple(grounds))
 
-    formula = _formula_ground(view, value_cols, data_rows)
+    formula = _formula_ground(view, value_cols, data_rows, data_start)
     if formula is not None:
         grounds.append(formula)
         return TableClassification(DataVerdict.NOT_MEASURED, tuple(grounds))
