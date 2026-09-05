@@ -193,6 +193,104 @@ def test_undecided_bare_coefficient_grid_states_what_it_would_need() -> None:
     assert any("unit" in n for n in result.needed)
 
 
+# --- footnote markers are not units (I-080) ------------------------------------------------
+
+
+@pytest.mark.parametrize("marker", ["(a)", "(b)", "(i)"])
+def test_footnote_marker_only_signal_stays_undecided(marker: str) -> None:
+    """The I-080 bug: a parenthesized footnote marker matches the unit-token *shape* but is not
+    a real unit. On a non-monotone numeric grid whose ONLY positive signal is such a marker, the
+    verdict must stay UNDECIDED, not flip to MEASURED. The value column is deliberately
+    non-monotone (3.4, 1.1, 2.9) and the key column non-numeric, so the marker is the sole
+    candidate positive -- this fixture reddens against the pre-fix code, which grounds the
+    unit-token signal on shape alone and returns MEASURED here."""
+    view = _view(
+        [
+            ["Term", f"Coefficient {marker}"],
+            ["alpha", "3.4"],
+            ["beta", "1.1"],
+            ["gamma", "2.9"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.UNDECIDED
+    assert not any(g.kind is SignalKind.UNIT_TOKEN_IN_HEADER for g in result.grounds)
+    assert any(g.kind is SignalKind.NUMERIC_GRID_WITHOUT_QUANTITY for g in result.grounds)
+
+
+def test_caption_footnote_marker_does_not_fire_unit_signal() -> None:
+    """The same grounding applies to the caption lane: a caption whose only parenthesized token
+    is a footnote marker prints no unit, so a non-monotone numeric grid stays UNDECIDED."""
+    view = _view(
+        [
+            ["Term", "Coefficient"],
+            ["alpha", "3.4"],
+            ["beta", "1.1"],
+            ["gamma", "2.9"],
+        ],
+        caption="Fitted coefficients for the reduced model (a)",
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.UNDECIDED
+    assert not any(g.kind is SignalKind.UNIT_TOKEN_IN_CAPTION for g in result.grounds)
+
+
+@pytest.mark.parametrize("unit", ["(cm/s)", "(K)", "(s)", "(m)", "(C)", "(L)", "(Pa)", "(atm)"])
+def test_real_unit_tokens_still_measured(unit: str) -> None:
+    """Real units keep firing the signal, single-letter ones (K, s, m, C, L) included -- these
+    are members of the project's conversion vocabulary. The grid is non-monotone so the unit
+    token is the only positive signal, isolating that the unit -- not a sweep -- carries it."""
+    view = _view(
+        [
+            ["Term", f"Quantity {unit}"],
+            ["alpha", "3.4"],
+            ["beta", "1.1"],
+            ["gamma", "2.9"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.MEASURED
+    header_grounds = [g for g in result.grounds if g.kind is SignalKind.UNIT_TOKEN_IN_HEADER]
+    assert header_grounds and unit in header_grounds[0].detail
+
+
+def test_real_unit_found_when_a_marker_precedes_it_in_the_same_cell() -> None:
+    """A header cell can carry both a footnote marker and a real unit (``S (a) (cm/s)``). The
+    signal must scan past the marker to the real unit rather than stopping at the first
+    parenthesized token, which the pre-fix single-``search`` code would have accepted as a unit
+    anyway but the shape-rejecting fix must not now drop."""
+    view = _view(
+        [
+            ["Term", "S (a) (cm/s)"],
+            ["alpha", "3.4"],
+            ["beta", "1.1"],
+            ["gamma", "2.9"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.MEASURED
+    header_grounds = [g for g in result.grounds if g.kind is SignalKind.UNIT_TOKEN_IN_HEADER]
+    assert header_grounds and "(cm/s)" in header_grounds[0].detail
+
+
+def test_unit_outside_corpus_vocabulary_does_not_fire_alone() -> None:
+    """The named trade: a real SI unit outside this syngas/LBV corpus's vocabulary (``(N)``,
+    force) is not in the conversion table, so it does not fire the unit-token signal. On a
+    non-monotone grid it stays UNDECIDED -- the safe direction, since the pipeline could not
+    ground newtons anyway. Recorded as a test so the trade is explicit, not silent."""
+    view = _view(
+        [
+            ["Term", "Force (N)"],
+            ["alpha", "3.4"],
+            ["beta", "1.1"],
+            ["gamma", "2.9"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.UNDECIDED
+    assert not any(g.kind is SignalKind.UNIT_TOKEN_IN_HEADER for g in result.grounds)
+
+
 # --- filename / index independence ---------------------------------------------------------
 
 
