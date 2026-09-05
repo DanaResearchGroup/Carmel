@@ -496,6 +496,7 @@ def _envelope_with_series(
         series=series,
         conversion_tables=(_embedded_table_v1(),),
         table_inventories=cover_for(series, composition),
+        ooxml_table_inventories=(),
         figure_digitizations=figure_digitizations,
     )
 
@@ -1503,6 +1504,7 @@ class TestFunctionalRealisticSeries:
             series=(series,),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=cover_for((series,)),
+            ooxml_table_inventories=(),
             figure_digitizations=(),
         )
 

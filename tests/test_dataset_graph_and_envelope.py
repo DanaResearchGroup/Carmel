@@ -546,6 +546,7 @@ def _envelope_with_value_ref_locator(
         series=(_fully_populated_series("unit-root", raw_sha256=SHA_D),),
         conversion_tables=(_embedded_table_v1(),),
         table_inventories=cover_for(composition, (_fully_populated_series("unit-root", raw_sha256=SHA_D),)),
+        ooxml_table_inventories=(),
         figure_digitizations=(),
     )
 
@@ -760,6 +761,7 @@ def _fully_populated_envelope(
         series=(_fully_populated_series("paper"),),
         conversion_tables=conversion_tables if conversion_tables is not None else (_embedded_table_v1(),),
         table_inventories=cover_for(composition, (_fully_populated_series("paper"),)),
+        ooxml_table_inventories=(),
         figure_digitizations=(),
     )
 
@@ -898,6 +900,7 @@ def _envelope_citing_two_tables(conversion_tables: tuple[EmbeddedConversionTable
         series=(_fully_populated_series("paper"),),
         conversion_tables=conversion_tables,
         table_inventories=cited_inventories(SHA_A),
+        ooxml_table_inventories=(),
         figure_digitizations=(),
     )
 
@@ -2014,6 +2017,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
         msg = str(excinfo.value)
@@ -2040,6 +2044,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
         msg = str(excinfo.value)
@@ -2060,6 +2065,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
         msg = str(excinfo.value)
@@ -2081,6 +2087,7 @@ class TestDatasetEnvelopeRefsResolve:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
         msg = str(excinfo.value)
@@ -2109,6 +2116,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 series=(_fully_populated_series("paper"),),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
 
@@ -2191,6 +2199,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
             series=(series_referencing_crop_only,),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=(),
+            ooxml_table_inventories=(),
             figure_digitizations=(embedded_digitization,),
         )
         assert envelope.source_graph.node("paper").parent_node_id is None
@@ -2227,6 +2236,7 @@ class TestDatasetEnvelopeNoDecorativeNodes:
                 series=(),
                 conversion_tables=(),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
 
@@ -2297,6 +2307,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
                 series=(series,),
                 conversion_tables=(_embedded_table_v1(),),
                 table_inventories=cited_inventories(SHA_A),
+                ooxml_table_inventories=(),
                 figure_digitizations=(),
             )
         msg = str(excinfo.value)
@@ -2362,6 +2373,7 @@ class TestDatasetEnvelopeSeriesSingleRootArtifact:
             series=(series,),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=cited_inventories(SHA_A),
+            ooxml_table_inventories=(),
             figure_digitizations=(),
         )
         assert len(envelope.series) == 1
@@ -2598,6 +2610,7 @@ class TestFunctionalRealisticEnvelope:
             series=(_fully_populated_series("paper"),),
             conversion_tables=(_embedded_table_v1(),),
             table_inventories=cover_for(composition, (_fully_populated_series("paper"),)),
+            ooxml_table_inventories=(),
             figure_digitizations=(),
         )
 
