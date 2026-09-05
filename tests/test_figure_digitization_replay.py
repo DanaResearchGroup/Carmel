@@ -726,6 +726,7 @@ def _char_span_grounded_series_envelope(tmp_path: Path, source_form: object) -> 
         series=(series,),
         conversion_tables=(_ACTIVE.embedded,),
         table_inventories=(),
+        ooxml_table_inventories=(),
         figure_digitizations=(),
     )
 

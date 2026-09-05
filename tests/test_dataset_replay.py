@@ -380,6 +380,7 @@ def _tabular_envelope_from_artifact(
         series=(series,),
         conversion_tables=(_ACTIVE.embedded,),
         table_inventories=(inventory,),
+        ooxml_table_inventories=(),
         figure_digitizations=(),
     )
 

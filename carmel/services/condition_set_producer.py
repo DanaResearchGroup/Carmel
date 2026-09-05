@@ -76,10 +76,12 @@ from carmel.schemas.datasets import (
     ConditionAttribution,
     ConditionSetEnvelope,
     DeviceClassDeclaration,
+    EmbeddedOoxmlTableInventory,
     EmbeddedTableInventory,
     GroundedCategoricalClaim,
     GroundedScalarClaim,
     MemberSheetKey,
+    SiMemberDocumentKind,
     SourceNode,
     SourceNodeKind,
     SourceRef,
@@ -188,7 +190,7 @@ class TableCellGrounding:
     table_key: CaptionLabelKey | MemberSheetKey
     row: int
     col: int
-    inventory: EmbeddedTableInventory
+    inventory: EmbeddedTableInventory | EmbeddedOoxmlTableInventory
 
     def __post_init__(self) -> None:
         if not isinstance(self.table_key, (CaptionLabelKey, MemberSheetKey)):
@@ -196,11 +198,12 @@ class TableCellGrounding:
                 f"TableCellGrounding.table_key={self.table_key!r} must be a CaptionLabelKey or "
                 f"MemberSheetKey, not {type(self.table_key).__name__}"
             )
-        if not isinstance(self.inventory, EmbeddedTableInventory):
+        if not isinstance(self.inventory, (EmbeddedTableInventory, EmbeddedOoxmlTableInventory)):
             raise ConditionSetProducerError(
-                f"TableCellGrounding.inventory must be an EmbeddedTableInventory, not "
-                f"{type(self.inventory).__name__} -- the producer embeds it and reads the cell's own "
-                "text from it, so a stand-in that only carries a sha would defeat the exact-equality check"
+                f"TableCellGrounding.inventory must be an EmbeddedTableInventory (PDF lane) or "
+                f"EmbeddedOoxmlTableInventory (OOXML lane), not {type(self.inventory).__name__} -- the "
+                "producer embeds it and reads the cell's own text from it, so a stand-in that only "
+                "carries a sha would defeat the exact-equality check"
             )
         for name, value in (("row", self.row), ("col", self.col)):
             # bool is an int subclass; a `True` row is a caller typo, never ordinal 1.
@@ -392,12 +395,23 @@ class UnresolvedSubjectSpec:
 def _cell_locator(cell: TableCellGrounding) -> TableCellLocator:
     """The ordinal-only :class:`TableCellLocator` for one validated cell grounding.
 
-    Always carries a resolvable ``pdf_table_inventory_sha256`` -- the embedded
-    inventory's own address -- never :class:`Absent`: an absent sha is a citation
-    nothing can resolve, and a produced cell citation must be resolvable from the
-    envelope's own bytes. The grounding this is built from is validated by
-    :class:`_CellCiter` first, so building the locator here is pure assembly.
+    Carries a resolvable inventory citation -- the embedded inventory's own address --
+    on the field that matches the inventory's lane: ``pdf_table_inventory_sha256`` for
+    the PDF lane, ``ooxml_table_inventory_sha256`` for the OOXML (``.docx``) lane. The
+    OTHER field is set to the honest ``Absent(NOT_APPLICABLE)`` (a PDF cell has no
+    WordprocessingML grid, and vice versa), never left as a stand-in citation. An absent
+    sha is a citation nothing can resolve, so the LANE'S OWN field is never absent. The
+    grounding this is built from is validated by :class:`_CellCiter` first, so building
+    the locator here is pure assembly.
     """
+    if isinstance(cell.inventory, EmbeddedOoxmlTableInventory):
+        return TableCellLocator(
+            table_key=cell.table_key,
+            row=cell.row,
+            col=cell.col,
+            pdf_table_inventory_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+            ooxml_table_inventory_sha256=cell.inventory.inventory_sha256,
+        )
     return TableCellLocator(
         table_key=cell.table_key,
         row=cell.row,
@@ -429,6 +443,7 @@ class _CellCiter:
     def __init__(self, node: SourceNode) -> None:
         self._node = node
         self._inventories: dict[str, EmbeddedTableInventory] = {}
+        self._ooxml_inventories: dict[str, EmbeddedOoxmlTableInventory] = {}
 
     def validate(self, requests: tuple[tuple[str, str, TableCellGrounding], ...]) -> None:
         """Refuse any request that cannot become an honest citation; record the rest.
@@ -441,14 +456,21 @@ class _CellCiter:
         """
         if not requests:
             return
-        if self._node.kind is not SourceNodeKind.PAPER_PDF:
+        node_is_pdf = self._node.kind is SourceNodeKind.PAPER_PDF
+        node_is_word_processor = (
+            self._node.kind is SourceNodeKind.SI_MEMBER
+            and self._node.document_kind is SiMemberDocumentKind.WORD_PROCESSOR
+        )
+        if not node_is_pdf and not node_is_word_processor:
             owners = sorted({owner for owner, _, _ in requests})
             raise ConditionSetProducerError(
                 f"cell grounding requested by {owners} but the artifact's root node is "
-                f"{self._node.kind.value!r}, not PAPER_PDF -- only a PDF node's cells have the fragment "
-                "geometry a table inventory describes, and only there may a locator carry a resolvable "
-                "pdf_table_inventory_sha256. Grounding a cell against any other node kind would require an "
-                "Absent sha, which is a citation nothing can resolve and this producer never emits"
+                f"{self._node.kind.value!r}, which is neither a PAPER_PDF nor a declared word-processor "
+                "SI_MEMBER -- only a PDF node's cells carry the fragment geometry a table inventory "
+                "describes (a resolvable pdf_table_inventory_sha256), and only a declared word-processor "
+                "SI_MEMBER's cells carry a WordprocessingML grid (a resolvable "
+                "ooxml_table_inventory_sha256). Grounding a cell against any other node kind would require "
+                "an Absent sha, which is a citation nothing can resolve and this producer never emits"
             )
         # A single cell cannot honestly be two different strings. Checked across the
         # whole batch first so the value-and-unit-share-a-cell spec is refused with
@@ -466,10 +488,26 @@ class _CellCiter:
                 )
         for owner, quote, cell in requests:
             inventory = cell.inventory
-            if inventory.raw_sha256 != self._node.sha256:
+            if isinstance(inventory, EmbeddedOoxmlTableInventory):
+                if not node_is_word_processor:
+                    raise ConditionSetProducerError(
+                        f"{owner}: cell grounding cites an OOXML inventory {inventory.inventory_sha256!r}, but "
+                        f"the artifact's root node is {self._node.kind.value!r}, not a declared word-processor "
+                        "SI_MEMBER -- a WordprocessingML grid an OOXML inventory describes exists only there"
+                    )
+                document_sha = inventory.source_sha256
+            else:
+                if not node_is_pdf:
+                    raise ConditionSetProducerError(
+                        f"{owner}: cell grounding cites a PDF inventory {inventory.inventory_sha256!r}, but "
+                        f"the artifact's root node is {self._node.kind.value!r}, not PAPER_PDF -- the PDF "
+                        "fragment geometry a table inventory describes exists only there"
+                    )
+                document_sha = inventory.raw_sha256
+            if document_sha != self._node.sha256:
                 raise ConditionSetProducerError(
                     f"{owner}: cell grounding cites inventory {inventory.inventory_sha256!r}, whose grid was "
-                    f"derived from document {inventory.raw_sha256!r}, but the artifact's node is "
+                    f"derived from document {document_sha!r}, but the artifact's node is "
                     f"{self._node.sha256!r} -- the grid describes a different document than the one grounded here"
                 )
             if not inventory.has_cell(row=cell.row, col=cell.col):
@@ -492,12 +530,20 @@ class _CellCiter:
                     "whole grounded string exactly (no substring, prefix or normalisation), or a value of '8' "
                     "could cite a cell reading '1-8'"
                 )
-            self._inventories[inventory.inventory_sha256] = inventory
+            if isinstance(inventory, EmbeddedOoxmlTableInventory):
+                self._ooxml_inventories[inventory.inventory_sha256] = inventory
+            else:
+                self._inventories[inventory.inventory_sha256] = inventory
 
     def table_inventories(self) -> tuple[EmbeddedTableInventory, ...]:
-        """Every cited inventory, deduplicated by sha and sorted -- exactly what
+        """Every cited PDF inventory, deduplicated by sha and sorted -- exactly what
         the envelope's T4 exact-cover and T5 sort-order validators require."""
         return tuple(sorted(self._inventories.values(), key=lambda inventory: inventory.inventory_sha256))
+
+    def ooxml_table_inventories(self) -> tuple[EmbeddedOoxmlTableInventory, ...]:
+        """Every cited OOXML (``.docx``) inventory, deduplicated by sha and sorted --
+        the OOXML-lane counterpart to :meth:`table_inventories`, for T4b/T5b."""
+        return tuple(sorted(self._ooxml_inventories.values(), key=lambda inventory: inventory.inventory_sha256))
 
 
 def _ref(
@@ -884,6 +930,7 @@ def produce_condition_set_from_artifact(
         # inventory nothing cites for the same reason conversion_tables above refuses a
         # decorative table.
         table_inventories=citer.table_inventories(),
+        ooxml_table_inventories=citer.ooxml_table_inventories(),
         subject=resolved_subject,
         attribution=attribution,
         attribution_ref=_ref(

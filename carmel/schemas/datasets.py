@@ -114,6 +114,10 @@ from carmel.services.numeric import (
     Unresolvable,
     normalize_numeric_span,
 )
+from carmel.services.ooxml_table_record import (
+    OOXML_INVENTORY_PAYLOAD_KEYS,
+    OOXML_INVENTORY_PAYLOAD_VERSION,
+)
 from carmel.services.pdf_table_record import (
     INVENTORY_PAYLOAD_KEYS,
     INVENTORY_PAYLOAD_VERSION,
@@ -155,6 +159,7 @@ __all__ = [
     "EmbeddedConversionTable",
     "EmbeddedFigureDigitization",
     "EmbeddedMemberTableInventory",
+    "EmbeddedOoxmlTableInventory",
     "EmbeddedTableInventory",
     "ExtractedTextVerification",
     "ExtractionBinding",
@@ -1505,16 +1510,34 @@ class TableCellLocator(BaseModel):
     ``Absent`` can still have an inventory. Treating a missing extraction as
     "no inventory applies" would make exactly that node the bypass."""
 
-    @field_validator("pdf_table_inventory_sha256")
+    ooxml_table_inventory_sha256: Maybe[str] = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+    """The content address of the OOXML (``.docx``) cell inventory that DEFINES the
+    grid ``row``/``col`` index into for a WORD_PROCESSOR ``SI_MEMBER`` node -- i.e. the
+    ``inventory_sha256`` computed by
+    :func:`carmel.services.ooxml_table_record.compute_ooxml_inventory_sha`, embedded as an
+    :class:`EmbeddedOoxmlTableInventory` in ``ooxml_table_inventories``. It is the OOXML-lane
+    counterpart to ``pdf_table_inventory_sha256`` and is NAMED ``ooxml_``-specifically for the
+    same anti-laundering reason: a WordprocessingML cell has no PDF fragment geometry, and the
+    PDF field means only "a grid derived from PDF text fragments".
+
+    Unlike ``pdf_table_inventory_sha256``, this field carries a DEFAULT of
+    ``Absent(NOT_APPLICABLE)``. That is a deliberate divergence, not a lapse of the "no
+    unreasoned absence" rule: this field is added to a locator type already constructed at
+    ~40 live PDF/JATS/CSV call sites, for none of which an OOXML grid can exist, so
+    ``NOT_APPLICABLE`` is the STRUCTURALLY forced absence rather than an unexamined one. WHICH
+    absences are legal remains enforced at envelope level by
+    :func:`_validate_table_cell_inventory_citation`; the default only spares those sites from
+    restating a fact the envelope validator already checks, and lets an OOXML citation be added
+    without a v6-era locator having to opt out of a lane it predates."""
+
+    @field_validator("pdf_table_inventory_sha256", "ooxml_table_inventory_sha256")
     @classmethod
-    def _validate_inventory_sha256_shape(cls, value: Maybe[str]) -> Maybe[str]:
+    def _validate_inventory_sha256_shape(cls, value: Maybe[str], info: ValidationInfo) -> Maybe[str]:
         # fullmatch, never match: `$` also matches just BEFORE a trailing newline, so
         # match would let "a" * 64 + "\n" through -- same reasoning as
         # EmbeddedConversionTable._validate_sha256_shape.
         if isinstance(value, str) and not _SHA256_RE.fullmatch(value):
-            raise ValueError(
-                f"TableCellLocator.pdf_table_inventory_sha256 {value!r} is not 64 lowercase hex characters"
-            )
+            raise ValueError(f"TableCellLocator.{info.field_name} {value!r} is not 64 lowercase hex characters")
         return value
 
 
@@ -4989,6 +5012,190 @@ class EmbeddedMemberTableInventory(BaseModel):
         return self._cell_text_index.get((row, col))
 
 
+class EmbeddedOoxmlTableInventory(BaseModel):
+    """One word-processor (``.docx``) table's inventory record, embedded VERBATIM so a
+    consumer holding only the envelope's bytes can see the grid a ``CaptionLabelKey`` cell
+    in a WORD_PROCESSOR SI_MEMBER node indexes into -- without the evidence store, and
+    without re-deriving anything.
+
+    The OOXML-lane counterpart to :class:`EmbeddedMemberTableInventory`. Its record is
+    produced and re-derived by :mod:`carmel.services.ooxml_table_record`, from the document's
+    OWN bytes rather than from PDF text fragments or a CSV member. It is a separate type on
+    purpose, for the same reason the member type is: the PDF record is PDF-shaped (``footprint``
+    page geometry, ``column_bounds``) and a WordprocessingML grid has no page geometry, so
+    forcing a ``.docx`` table through the PDF type would mean weakening the very validators
+    that make a PDF citation honest. It keys on ``source_sha256`` + ``table_index`` (the
+    document's bytes and which top-level table), where the member type keys on ``member_sha256``
+    + ``sheet_name``.
+
+    SCOPE OF WHAT VALIDATION HERE PROVES -- read before trusting an inventory. Exactly as for
+    :class:`EmbeddedMemberTableInventory`, T1 proves canonical self-coherence, self-addressing,
+    replay-readability (readable version, exact key set, matching ``source_sha256``, integer
+    unique cell ordinals) and NOTHING about whether the grid corresponds to any real document.
+    ``source_sha256`` matching a node's ``sha256`` proves the author NAMED that document, never
+    that a ``.docx`` reader ever ran on it -- the payload is author-controlled. What closes that
+    gap is :func:`carmel.services.ooxml_table_record.verify_ooxml_inventory_record`, which
+    re-reads the document's raw bytes; schema validation deliberately does NOT call it, so an
+    envelope's validity never depends on the filesystem it is validated on.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inventory_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the sha256 of ``canonical_json``'s bytes (T1),
+    i.e. :func:`~carmel.services.ooxml_table_record.compute_ooxml_inventory_sha`."""
+
+    source_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the document these bytes were derived from. Declared
+    redundantly with the payload's own ``source_sha256`` (T1 requires them equal) so the
+    join to :attr:`SourceNode.sha256` can be made without parsing JSON."""
+
+    canonical_json: str = Field(min_length=1, max_length=_MAX_EMBEDDED_CANONICAL_JSON_LENGTH)
+    """The inventory record's canonical JSON, verbatim, as a str. Bounded for the same
+    resource-exhaustion reason as :attr:`EmbeddedTableInventory.canonical_json`, and it
+    binds harder here too: the record carries one entry per CELL."""
+
+    _cell_index: frozenset[tuple[int, int]] = PrivateAttr(default=frozenset())
+    """Every ``(row, col)`` the record's grid contains, built by T1. Private and derived;
+    an empty default answers every ``has_cell`` False, the fail-closed direction."""
+
+    _cell_text_index: dict[tuple[int, int], str] = PrivateAttr(default_factory=dict)
+    """Maps each ``(row, col)`` to the record's own text, built by T1 in the same loop as
+    ``_cell_index`` so the two cannot disagree."""
+
+    @field_validator("inventory_sha256", "source_sha256")
+    @classmethod
+    def _validate_sha256_shape(cls, value: str, info: ValidationInfo) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory.{info.field_name} {value!r} is not 64 lowercase hex characters"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_canonical_json_coheres(self) -> EmbeddedOoxmlTableInventory:
+        """T1: ``canonical_json`` must be the canonical rendering of an OOXML inventory record
+        that addresses to ``inventory_sha256``, names ``source_sha256``, is of a readable
+        version, has exactly the record's key set, names a non-negative ``table_index``, and
+        whose cells are unique integer-addressed. Mirrors
+        :meth:`EmbeddedMemberTableInventory._validate_canonical_json_coheres`.
+        """
+        try:
+            parsed = json.loads(self.canonical_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json "
+                f"does not parse as JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json is "
+                f"not a JSON object, it decodes to {type(parsed).__name__}"
+            )
+        recanonicalized = canonical_json_bytes(parsed)
+        if recanonicalized != self.canonical_json.encode("utf-8"):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json is "
+                "not the canonical rendering of what it decodes to -- re-serializing through "
+                "canonical_json_bytes produced different bytes"
+            )
+        actual = hashlib.sha256(recanonicalized).hexdigest()
+        if actual != self.inventory_sha256:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json's "
+                f"bytes hash to {actual!r}, so this record does not live at the address it claims"
+            )
+        version = parsed.get("payload_version")
+        if version != OOXML_INVENTORY_PAYLOAD_VERSION:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): payload_version "
+                f"{version!r} is not the readable version {OOXML_INVENTORY_PAYLOAD_VERSION!r}"
+            )
+        keys = set(parsed)
+        if keys != set(OOXML_INVENTORY_PAYLOAD_KEYS):
+            unexpected = sorted(keys - OOXML_INVENTORY_PAYLOAD_KEYS)
+            missing = sorted(OOXML_INVENTORY_PAYLOAD_KEYS - keys)
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): the record is not "
+                f"the shape of a version-{OOXML_INVENTORY_PAYLOAD_VERSION} inventory (unexpected keys "
+                f"{unexpected!r}, missing keys {missing!r}), so it could never be replayed against the document "
+                "it names"
+            )
+        declared_source = parsed.get("source_sha256")
+        if declared_source != self.source_sha256:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): the record names "
+                f"document {declared_source!r}, not the declared source_sha256 {self.source_sha256!r}"
+            )
+        table_index = parsed.get("table_index")
+        # `isinstance(True, int)` is True, so bool must be excluded explicitly.
+        if not isinstance(table_index, int) or isinstance(table_index, bool) or table_index < 0:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): table_index "
+                f"{table_index!r} is not a non-negative integer, so the record names no table"
+            )
+        cells = parsed["cells"]
+        if not isinstance(cells, list):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's "
+                f"'cells' is {type(cells).__name__}, not a list, so it describes no grid"
+            )
+        index: set[tuple[int, int]] = set()
+        text_index: dict[tuple[int, int], str] = {}
+        for position, cell in enumerate(cells):
+            if not isinstance(cell, dict):
+                raise ValueError(
+                    f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                    f"cells[{position}] is {type(cell).__name__}, not an object"
+                )
+            for axis in ("row", "col"):
+                ordinal = cell.get(axis)
+                # `isinstance(True, int)` is True, so bool must be excluded explicitly.
+                if not isinstance(ordinal, int) or isinstance(ordinal, bool):
+                    raise ValueError(
+                        f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                        f"cells[{position}][{axis!r}] is {ordinal!r}, which is not an integer ordinal"
+                    )
+            position_key = (cell["row"], cell["col"])
+            if position_key in index:
+                raise ValueError(
+                    f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                    f"cells[{position}] repeats the coordinate (row={cell['row']}, col={cell['col']}), so the "
+                    "record does not define one value at that position"
+                )
+            index.add(position_key)
+            cell_text = cell.get("text")
+            if isinstance(cell_text, str):
+                text_index[position_key] = cell_text
+        self._cell_index = frozenset(index)
+        self._cell_text_index = text_index
+        return self
+
+    def has_cell(self, *, row: int, col: int) -> bool:
+        """Whether this record's grid actually contains ``(row, col)``. Answers from the
+        index T1 built while validating the same bytes, so a bool masquerading as an
+        ordinal cannot satisfy a lookup."""
+        return (row, col) in self._cell_index
+
+    def cell_text(self, *, row: int, col: int) -> str | None:
+        """This record's OWN text for ``(row, col)``, or ``None`` if it has none. Proves
+        nothing about whether that text is what the document printed -- only
+        :func:`~carmel.services.ooxml_table_record.verify_ooxml_inventory_record`,
+        holding the real bytes, can establish that."""
+        return self._cell_text_index.get((row, col))
+
+    def grid_cells(self) -> tuple[tuple[int, int, str | None], ...]:
+        """Every ``(row, col, text)`` this record's grid contains, sorted by ``(row, col)``.
+
+        ``text`` is the cell's own recorded string, or ``None`` where the record carries no
+        genuine string for it -- the SAME fail-closed meaning as :meth:`cell_text`. Answers
+        from the indexes T1 built while validating these same bytes, so it can never disagree
+        with :meth:`has_cell` or :meth:`cell_text`, and it re-parses nothing. Exists for a
+        deterministic RESOLVER that locates a column by its printed header text and then walks
+        the grid's rows (see :mod:`carmel.services.tabular_series_resolver`)."""
+        return tuple((row, col, self._cell_text_index.get((row, col))) for row, col in sorted(self._cell_index))
+
+
 class EmbeddedFigureDigitization(BaseModel):
     """One figure digitization's own canonical record JSON, embedded VERBATIM so a consumer
     holding only these bytes can see how COMPLETE the digitized series actually is -- without
@@ -5730,6 +5937,10 @@ def _source_locator_identity_payload(
             # store. _project_maybe renders Absent through the same `__absent__` marker
             # _rehydrate_identity_payload already round-trips.
             "pdf_table_inventory_sha256": _project_maybe(locator.pdf_table_inventory_sha256),
+            # Projected for the same reason as the PDF sha above: two locators differing ONLY
+            # in which OOXML inventory they cite are different claims about which .docx grid
+            # justified the cell.
+            "ooxml_table_inventory_sha256": _project_maybe(locator.ooxml_table_inventory_sha256),
         }
     if isinstance(locator, XPathLocator):
         return {"kind": locator.kind.value, "xpath": locator.xpath}
@@ -6049,6 +6260,14 @@ def _embedded_table_inventory_identity_payload(inventory: EmbeddedTableInventory
     }
 
 
+def _embedded_ooxml_table_inventory_identity_payload(inventory: EmbeddedOoxmlTableInventory) -> dict[str, Any]:
+    return {
+        "inventory_sha256": inventory.inventory_sha256,
+        "source_sha256": inventory.source_sha256,
+        "canonical_json": inventory.canonical_json,
+    }
+
+
 def _embedded_figure_digitization_identity_payload(digitization: EmbeddedFigureDigitization) -> dict[str, Any]:
     return {
         "digitization_sha256": digitization.digitization_sha256,
@@ -6349,7 +6568,7 @@ _CONDITION_SET_ENVELOPE_TYPE = "condition_set"
 """``envelope_type`` value emitted by
 :meth:`ConditionSetEnvelope.identity_payload`."""
 
-_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 6
+_SUPPORTED_IDENTITY_PAYLOAD_VERSION = 7
 """The one envelope-projection version this module can parse. A payload
 carrying any other version was projected by code this module has never
 seen, so parsing it here could only produce a silently reinterpreted
@@ -6674,6 +6893,9 @@ class _SourceGraphEnvelope(Protocol):
 
     @property
     def table_inventories(self) -> tuple[EmbeddedTableInventory, ...]: ...
+
+    @property
+    def ooxml_table_inventories(self) -> tuple[EmbeddedOoxmlTableInventory, ...]: ...
 
 
 # SHARED-PROVENANCE-VALIDATORS: the seven helpers below implement provenance logic that reads
@@ -7186,6 +7408,125 @@ def _validate_table_inventories_sorted(envelope: _SourceGraphEnvelope) -> None:
         raise ValueError("table_inventories must be sorted ascending by inventory_sha256")
 
 
+def _validate_table_cell_ooxml_inventory_citation(envelope: _SourceGraphEnvelope) -> None:
+    """V8b: the OOXML-lane counterpart to V8 (:func:`_validate_table_cell_inventory_citation`).
+
+    A ``TableCellLocator``'s ``ooxml_table_inventory_sha256`` may be PRESENT only for a
+    caption-labelled cell in a DECLARED word-processor ``SI_MEMBER`` node -- the only place a
+    WordprocessingML grid exists -- and when present must resolve to an
+    :class:`EmbeddedOoxmlTableInventory` this envelope embeds, whose record NAMES this node's
+    document and contains the located cell. Every other node kind, and an undeclared or
+    non-word-processor ``SI_MEMBER``, must carry ``Absent(NOT_APPLICABLE)``.
+
+    Like V8, this proves NAMING and self-coherence, never byte-derivation: the embedded record's
+    ``source_sha256`` is author-controlled, so matching it to the node's ``sha256`` proves the
+    author NAMED this document, not that a ``.docx`` reader ever ran on it. Only
+    :func:`~carmel.services.ooxml_table_record.verify_ooxml_inventory_record`, holding the real
+    bytes at replay, establishes that -- exactly the PDF lane's split between schema and replay.
+    """
+    embedded_by_sha = {inventory.inventory_sha256: inventory for inventory in envelope.ooxml_table_inventories}
+    for path, ref in iter_source_refs(envelope):
+        locator = ref.locator
+        if not isinstance(locator, TableCellLocator):
+            continue
+        citation = locator.ooxml_table_inventory_sha256
+        node = envelope.source_graph.node(ref.node_id)
+
+        if isinstance(citation, Absent):
+            if citation.reason is not AbsenceReason.NOT_APPLICABLE:
+                raise ValueError(
+                    f"SourceRef at {path!r} locates a table cell in {node.kind.value!r} node "
+                    f"{node.node_id!r} with ooxml_table_inventory_sha256 Absent "
+                    f"({citation.reason.value!r}) -- the only true absence for a cell with no "
+                    f"WordprocessingML grid is {AbsenceReason.NOT_APPLICABLE.value!r}"
+                )
+            continue
+
+        is_word_processor_caption = (
+            node.kind is SourceNodeKind.SI_MEMBER
+            and locator.table_key.kind is TableKeyKind.CAPTION_LABEL
+            and node.document_kind is SiMemberDocumentKind.WORD_PROCESSOR
+        )
+        if not is_word_processor_caption:
+            raise ValueError(
+                f"SourceRef at {path!r} locates a table cell in {node.kind.value!r} node "
+                f"{node.node_id!r} and cites ooxml_table_inventory_sha256={citation!r}, but only a "
+                "caption-labelled cell in a declared word-processor SI_MEMBER node has a "
+                "WordprocessingML grid an OOXML inventory could describe"
+            )
+
+        inventory = embedded_by_sha.get(citation)
+        if inventory is None:
+            raise ValueError(
+                f"SourceRef at {path!r} cites ooxml_table_inventory_sha256={citation!r}, which this "
+                "envelope does not embed -- a citation resolvable only against an evidence store makes "
+                "the envelope's meaning depend on the machine replaying it"
+            )
+        if inventory.source_sha256 != node.sha256:
+            raise ValueError(
+                f"SourceRef at {path!r} cites inventory {citation!r}, whose record was derived from "
+                f"document {inventory.source_sha256!r}, but its node {node.node_id!r} has "
+                f"sha256={node.sha256!r} -- the grid describes a different document than the one the "
+                "locator targets"
+            )
+        if not inventory.has_cell(row=locator.row, col=locator.col):
+            raise ValueError(
+                f"SourceRef at {path!r} locates row={locator.row}, col={locator.col} in inventory "
+                f"{citation!r}, whose grid has no such cell -- a citation that resolves to a real "
+                "inventory of the right document can still name a cell that grid never derived"
+            )
+
+
+def _validate_ooxml_table_inventories_cover_cited_inventories(envelope: _SourceGraphEnvelope) -> None:
+    """T4b: ``ooxml_table_inventories`` must cover EXACTLY the OOXML inventories cited by the
+    ``TABLE_CELL`` locators reachable in this envelope -- no fewer, no more. The OOXML-lane
+    counterpart to T4 (:func:`_validate_table_inventories_cover_cited_inventories`); its "no
+    fewer" half is reported per-ref by V8b, its "no more" half rejects unearned provenance."""
+    cited = {
+        ref.locator.ooxml_table_inventory_sha256
+        for _, ref in iter_source_refs(envelope)
+        if isinstance(ref.locator, TableCellLocator) and isinstance(ref.locator.ooxml_table_inventory_sha256, str)
+    }
+    embedded = {inventory.inventory_sha256 for inventory in envelope.ooxml_table_inventories}
+    missing = cited - embedded
+    if missing:
+        raise ValueError(
+            f"ooxml_table_inventories is missing inventory(ies) {sorted(missing)!r} cited by a "
+            "TableCellLocator -- every cited OOXML inventory must be embedded"
+        )
+    decorative = embedded - cited
+    if decorative:
+        raise ValueError(
+            f"ooxml_table_inventories embeds decorative inventory(ies) {sorted(decorative)!r} that no "
+            "TableCellLocator cites -- an embedded record nothing needs is unearned provenance"
+        )
+
+
+def _validate_ooxml_table_inventories_no_duplicate_sha256(envelope: _SourceGraphEnvelope) -> None:
+    """``ooxml_table_inventories`` must not embed the same ``inventory_sha256`` twice -- the
+    OOXML counterpart to :func:`_validate_table_inventories_no_duplicate_sha256`, closing the
+    same set-vs-multiset gap between T4b (set cover) and T5b (adjacent-pair sort)."""
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for inventory in envelope.ooxml_table_inventories:
+        if inventory.inventory_sha256 in seen:
+            duplicates.add(inventory.inventory_sha256)
+        seen.add(inventory.inventory_sha256)
+    if duplicates:
+        raise ValueError(
+            f"ooxml_table_inventories embeds duplicate inventory_sha256(s) {sorted(duplicates)!r} -- each "
+            "cited inventory must be embedded exactly once"
+        )
+
+
+def _validate_ooxml_table_inventories_sorted(envelope: _SourceGraphEnvelope) -> None:
+    """T5b: ``ooxml_table_inventories`` must be sorted ascending by ``inventory_sha256`` so
+    exactly one addressable representation exists. Same idiom as T5."""
+    expected = tuple(sorted(envelope.ooxml_table_inventories, key=lambda inventory: inventory.inventory_sha256))
+    if envelope.ooxml_table_inventories != expected:
+        raise ValueError("ooxml_table_inventories must be sorted ascending by inventory_sha256")
+
+
 def _validate_series_digitization_citation(envelope: DatasetEnvelope) -> None:
     """V9: every ``DIGITIZED`` :class:`Series` must cite a figure digitization
     this envelope actually embeds, whose record is about THAT series, over THAT
@@ -7521,6 +7862,19 @@ class DatasetEnvelope(BaseModel):
     REQUIRES it: ``source_form=TABULAR`` demands a ``TABLE_CELL`` locator).
     Embedding on the condition-set side alone would leave this class as the
     bypass surface for the whole citation rule."""
+    ooxml_table_inventories: tuple[EmbeddedOoxmlTableInventory, ...]
+    """Every OOXML (``.docx``) cell inventory cited (by
+    :attr:`TableCellLocator.ooxml_table_inventory_sha256`) by any :class:`SourceRef`
+    reachable in this envelope, embedded verbatim -- see
+    :class:`EmbeddedOoxmlTableInventory`, and the OOXML arms of V8/T4/T5 for the invariants.
+
+    The OOXML lane's counterpart to :attr:`table_inventories`, present on both this envelope
+    and :class:`ConditionSetEnvelope` for the same reason a word-processor SI_MEMBER cell can
+    ground a :class:`Series` point OR a condition-set claim: embedding on one side alone would
+    leave the other as the bypass surface. Required with no default, exactly like the PDF,
+    member-CSV and figure carriers -- a stored dataset's bytes must be self-contained, and the
+    empty tuple (the common case, for a PDF/JATS/spreadsheet dataset that cites no ``.docx``
+    grid) is stated explicitly, never defaulted."""
     figure_digitizations: tuple[EmbeddedFigureDigitization, ...]
     """Every figure digitization cited (by :attr:`Series.digitization_sha256`)
     by any ``DIGITIZED`` :class:`Series` in this envelope, embedded verbatim --
@@ -7649,6 +8003,30 @@ class DatasetEnvelope(BaseModel):
     def _validate_table_inventories_sorted(self) -> DatasetEnvelope:
         """T5: see :func:`_validate_table_inventories_sorted`."""
         _validate_table_inventories_sorted(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_table_cell_ooxml_inventory_citation(self) -> DatasetEnvelope:
+        """V8b: see :func:`_validate_table_cell_ooxml_inventory_citation`."""
+        _validate_table_cell_ooxml_inventory_citation(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ooxml_table_inventories_cover_cited_inventories(self) -> DatasetEnvelope:
+        """T4b: see :func:`_validate_ooxml_table_inventories_cover_cited_inventories`."""
+        _validate_ooxml_table_inventories_cover_cited_inventories(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ooxml_table_inventories_no_duplicate_sha256(self) -> DatasetEnvelope:
+        """See :func:`_validate_ooxml_table_inventories_no_duplicate_sha256`."""
+        _validate_ooxml_table_inventories_no_duplicate_sha256(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ooxml_table_inventories_sorted(self) -> DatasetEnvelope:
+        """T5b: see :func:`_validate_ooxml_table_inventories_sorted`."""
+        _validate_ooxml_table_inventories_sorted(self)
         return self
 
     @model_validator(mode="after")
@@ -7906,6 +8284,10 @@ class DatasetEnvelope(BaseModel):
             "table_inventories": [
                 _embedded_table_inventory_identity_payload(inventory) for inventory in self.table_inventories
             ],
+            "ooxml_table_inventories": [
+                _embedded_ooxml_table_inventory_identity_payload(inventory)
+                for inventory in self.ooxml_table_inventories
+            ],
             "figure_digitizations": [
                 _embedded_figure_digitization_identity_payload(digitization)
                 for digitization in self.figure_digitizations
@@ -8095,6 +8477,11 @@ class ConditionSetEnvelope(BaseModel):
     reachable in this envelope, embedded verbatim -- same contract and same
     V8/T4/T5 validators as :attr:`DatasetEnvelope.table_inventories`. Empty
     exactly when no reachable locator cites one."""
+    ooxml_table_inventories: tuple[EmbeddedOoxmlTableInventory, ...]
+    """Every OOXML (``.docx``) cell inventory cited by any :class:`TableCellLocator`
+    reachable in this envelope, embedded verbatim -- same contract and same
+    V8b/T4b/T5b validators as :attr:`DatasetEnvelope.ooxml_table_inventories`. Empty
+    exactly when no reachable locator cites one."""
     subject: DeviceClassDeclaration | UnresolvedSubject
     """The required subject SUM -- see the class docstring for why this is
     a sum and why the declaration arm is class-level. Projected TAGGED (see
@@ -8228,6 +8615,30 @@ class ConditionSetEnvelope(BaseModel):
         return self
 
     @model_validator(mode="after")
+    def _validate_table_cell_ooxml_inventory_citation(self) -> ConditionSetEnvelope:
+        """V8b: see :func:`_validate_table_cell_ooxml_inventory_citation`."""
+        _validate_table_cell_ooxml_inventory_citation(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ooxml_table_inventories_cover_cited_inventories(self) -> ConditionSetEnvelope:
+        """T4b: see :func:`_validate_ooxml_table_inventories_cover_cited_inventories`."""
+        _validate_ooxml_table_inventories_cover_cited_inventories(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ooxml_table_inventories_no_duplicate_sha256(self) -> ConditionSetEnvelope:
+        """See :func:`_validate_ooxml_table_inventories_no_duplicate_sha256`."""
+        _validate_ooxml_table_inventories_no_duplicate_sha256(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_ooxml_table_inventories_sorted(self) -> ConditionSetEnvelope:
+        """T5b: see :func:`_validate_ooxml_table_inventories_sorted`."""
+        _validate_ooxml_table_inventories_sorted(self)
+        return self
+
+    @model_validator(mode="after")
     def _validate_holds_at_least_one_record(self) -> ConditionSetEnvelope:
         """C1: at least one entry across ``scalar_claims`` +
         ``categorical_claims`` + ``unextracted`` COMBINED -- refusals COUNT.
@@ -8328,6 +8739,10 @@ class ConditionSetEnvelope(BaseModel):
             ],
             "table_inventories": [
                 _embedded_table_inventory_identity_payload(inventory) for inventory in self.table_inventories
+            ],
+            "ooxml_table_inventories": [
+                _embedded_ooxml_table_inventory_identity_payload(inventory)
+                for inventory in self.ooxml_table_inventories
             ],
             "subject": _condition_subject_identity_payload(self.subject),
             "attribution": self.attribution.value,
