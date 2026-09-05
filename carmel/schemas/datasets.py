@@ -107,6 +107,10 @@ from carmel.services.member_table_record import (
     MEMBER_INVENTORY_PAYLOAD_KEYS,
     MEMBER_INVENTORY_PAYLOAD_VERSION,
 )
+from carmel.services.ooxml_table_record import (
+    OOXML_INVENTORY_PAYLOAD_KEYS,
+    OOXML_INVENTORY_PAYLOAD_VERSION,
+)
 from carmel.services.numeric import (
     REPAIR_NAMES,
     GlyphHealth,
@@ -155,6 +159,7 @@ __all__ = [
     "EmbeddedConversionTable",
     "EmbeddedFigureDigitization",
     "EmbeddedMemberTableInventory",
+    "EmbeddedOoxmlTableInventory",
     "EmbeddedTableInventory",
     "ExtractedTextVerification",
     "ExtractionBinding",
@@ -4987,6 +4992,190 @@ class EmbeddedMemberTableInventory(BaseModel):
         :func:`~carmel.services.member_table_record.verify_member_inventory_record`,
         holding the real bytes, can establish that."""
         return self._cell_text_index.get((row, col))
+
+
+class EmbeddedOoxmlTableInventory(BaseModel):
+    """One word-processor (``.docx``) table's inventory record, embedded VERBATIM so a
+    consumer holding only the envelope's bytes can see the grid a ``CaptionLabelKey`` cell
+    in a WORD_PROCESSOR SI_MEMBER node indexes into -- without the evidence store, and
+    without re-deriving anything.
+
+    The OOXML-lane counterpart to :class:`EmbeddedMemberTableInventory`. Its record is
+    produced and re-derived by :mod:`carmel.services.ooxml_table_record`, from the document's
+    OWN bytes rather than from PDF text fragments or a CSV member. It is a separate type on
+    purpose, for the same reason the member type is: the PDF record is PDF-shaped (``footprint``
+    page geometry, ``column_bounds``) and a WordprocessingML grid has no page geometry, so
+    forcing a ``.docx`` table through the PDF type would mean weakening the very validators
+    that make a PDF citation honest. It keys on ``source_sha256`` + ``table_index`` (the
+    document's bytes and which top-level table), where the member type keys on ``member_sha256``
+    + ``sheet_name``.
+
+    SCOPE OF WHAT VALIDATION HERE PROVES -- read before trusting an inventory. Exactly as for
+    :class:`EmbeddedMemberTableInventory`, T1 proves canonical self-coherence, self-addressing,
+    replay-readability (readable version, exact key set, matching ``source_sha256``, integer
+    unique cell ordinals) and NOTHING about whether the grid corresponds to any real document.
+    ``source_sha256`` matching a node's ``sha256`` proves the author NAMED that document, never
+    that a ``.docx`` reader ever ran on it -- the payload is author-controlled. What closes that
+    gap is :func:`carmel.services.ooxml_table_record.verify_ooxml_inventory_record`, which
+    re-reads the document's raw bytes; schema validation deliberately does NOT call it, so an
+    envelope's validity never depends on the filesystem it is validated on.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    inventory_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the sha256 of ``canonical_json``'s bytes (T1),
+    i.e. :func:`~carmel.services.ooxml_table_record.compute_ooxml_inventory_sha`."""
+
+    source_sha256: str = Field(min_length=1)
+    """64 lowercase hex characters -- the document these bytes were derived from. Declared
+    redundantly with the payload's own ``source_sha256`` (T1 requires them equal) so the
+    join to :attr:`SourceNode.sha256` can be made without parsing JSON."""
+
+    canonical_json: str = Field(min_length=1, max_length=_MAX_EMBEDDED_CANONICAL_JSON_LENGTH)
+    """The inventory record's canonical JSON, verbatim, as a str. Bounded for the same
+    resource-exhaustion reason as :attr:`EmbeddedTableInventory.canonical_json`, and it
+    binds harder here too: the record carries one entry per CELL."""
+
+    _cell_index: frozenset[tuple[int, int]] = PrivateAttr(default=frozenset())
+    """Every ``(row, col)`` the record's grid contains, built by T1. Private and derived;
+    an empty default answers every ``has_cell`` False, the fail-closed direction."""
+
+    _cell_text_index: dict[tuple[int, int], str] = PrivateAttr(default_factory=dict)
+    """Maps each ``(row, col)`` to the record's own text, built by T1 in the same loop as
+    ``_cell_index`` so the two cannot disagree."""
+
+    @field_validator("inventory_sha256", "source_sha256")
+    @classmethod
+    def _validate_sha256_shape(cls, value: str, info: ValidationInfo) -> str:
+        if not _SHA256_RE.fullmatch(value):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory.{info.field_name} {value!r} is not 64 lowercase hex characters"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_canonical_json_coheres(self) -> EmbeddedOoxmlTableInventory:
+        """T1: ``canonical_json`` must be the canonical rendering of an OOXML inventory record
+        that addresses to ``inventory_sha256``, names ``source_sha256``, is of a readable
+        version, has exactly the record's key set, names a non-negative ``table_index``, and
+        whose cells are unique integer-addressed. Mirrors
+        :meth:`EmbeddedMemberTableInventory._validate_canonical_json_coheres`.
+        """
+        try:
+            parsed = json.loads(self.canonical_json)
+        except (json.JSONDecodeError, RecursionError) as exc:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json "
+                f"does not parse as JSON: {exc}"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json is "
+                f"not a JSON object, it decodes to {type(parsed).__name__}"
+            )
+        recanonicalized = canonical_json_bytes(parsed)
+        if recanonicalized != self.canonical_json.encode("utf-8"):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json is "
+                "not the canonical rendering of what it decodes to -- re-serializing through "
+                "canonical_json_bytes produced different bytes"
+            )
+        actual = hashlib.sha256(recanonicalized).hexdigest()
+        if actual != self.inventory_sha256:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): canonical_json's "
+                f"bytes hash to {actual!r}, so this record does not live at the address it claims"
+            )
+        version = parsed.get("payload_version")
+        if version != OOXML_INVENTORY_PAYLOAD_VERSION:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): payload_version "
+                f"{version!r} is not the readable version {OOXML_INVENTORY_PAYLOAD_VERSION!r}"
+            )
+        keys = set(parsed)
+        if keys != set(OOXML_INVENTORY_PAYLOAD_KEYS):
+            unexpected = sorted(keys - OOXML_INVENTORY_PAYLOAD_KEYS)
+            missing = sorted(OOXML_INVENTORY_PAYLOAD_KEYS - keys)
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): the record is not "
+                f"the shape of a version-{OOXML_INVENTORY_PAYLOAD_VERSION} inventory (unexpected keys "
+                f"{unexpected!r}, missing keys {missing!r}), so it could never be replayed against the document "
+                "it names"
+            )
+        declared_source = parsed.get("source_sha256")
+        if declared_source != self.source_sha256:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): the record names "
+                f"document {declared_source!r}, not the declared source_sha256 {self.source_sha256!r}"
+            )
+        table_index = parsed.get("table_index")
+        # `isinstance(True, int)` is True, so bool must be excluded explicitly.
+        if not isinstance(table_index, int) or isinstance(table_index, bool) or table_index < 0:
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): table_index "
+                f"{table_index!r} is not a non-negative integer, so the record names no table"
+            )
+        cells = parsed["cells"]
+        if not isinstance(cells, list):
+            raise ValueError(
+                f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): the record's "
+                f"'cells' is {type(cells).__name__}, not a list, so it describes no grid"
+            )
+        index: set[tuple[int, int]] = set()
+        text_index: dict[tuple[int, int], str] = {}
+        for position, cell in enumerate(cells):
+            if not isinstance(cell, dict):
+                raise ValueError(
+                    f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                    f"cells[{position}] is {type(cell).__name__}, not an object"
+                )
+            for axis in ("row", "col"):
+                ordinal = cell.get(axis)
+                # `isinstance(True, int)` is True, so bool must be excluded explicitly.
+                if not isinstance(ordinal, int) or isinstance(ordinal, bool):
+                    raise ValueError(
+                        f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                        f"cells[{position}][{axis!r}] is {ordinal!r}, which is not an integer ordinal"
+                    )
+            position_key = (cell["row"], cell["col"])
+            if position_key in index:
+                raise ValueError(
+                    f"EmbeddedOoxmlTableInventory(inventory_sha256={self.inventory_sha256!r}): "
+                    f"cells[{position}] repeats the coordinate (row={cell['row']}, col={cell['col']}), so the "
+                    "record does not define one value at that position"
+                )
+            index.add(position_key)
+            cell_text = cell.get("text")
+            if isinstance(cell_text, str):
+                text_index[position_key] = cell_text
+        self._cell_index = frozenset(index)
+        self._cell_text_index = text_index
+        return self
+
+    def has_cell(self, *, row: int, col: int) -> bool:
+        """Whether this record's grid actually contains ``(row, col)``. Answers from the
+        index T1 built while validating the same bytes, so a bool masquerading as an
+        ordinal cannot satisfy a lookup."""
+        return (row, col) in self._cell_index
+
+    def cell_text(self, *, row: int, col: int) -> str | None:
+        """This record's OWN text for ``(row, col)``, or ``None`` if it has none. Proves
+        nothing about whether that text is what the document printed -- only
+        :func:`~carmel.services.ooxml_table_record.verify_ooxml_inventory_record`,
+        holding the real bytes, can establish that."""
+        return self._cell_text_index.get((row, col))
+
+    def grid_cells(self) -> tuple[tuple[int, int, str | None], ...]:
+        """Every ``(row, col, text)`` this record's grid contains, sorted by ``(row, col)``.
+
+        ``text`` is the cell's own recorded string, or ``None`` where the record carries no
+        genuine string for it -- the SAME fail-closed meaning as :meth:`cell_text`. Answers
+        from the indexes T1 built while validating these same bytes, so it can never disagree
+        with :meth:`has_cell` or :meth:`cell_text`, and it re-parses nothing. Exists for a
+        deterministic RESOLVER that locates a column by its printed header text and then walks
+        the grid's rows (see :mod:`carmel.services.tabular_series_resolver`)."""
+        return tuple((row, col, self._cell_text_index.get((row, col))) for row, col in sorted(self._cell_index))
 
 
 class EmbeddedFigureDigitization(BaseModel):
