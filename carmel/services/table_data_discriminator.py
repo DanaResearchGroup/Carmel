@@ -30,8 +30,10 @@ accident.
 **The signals, stated as a position someone can disagree with.** A measured experimental
 table is a grid whose columns carry numbers under headers that name a physical quantity and
 its unit, usually with a swept independent variable and often an uncertainty. So the positive
-evidence is structural and printed: a **unit token** in a header or caption (a parenthesized
-``(cm/s)``, ``(K)``), an **uncertainty marker** (``±``), or a **monotone numeric sweep** down
+evidence is structural and printed: a **unit token** in a header or caption -- a parenthesized
+spelling the project's own unit vocabulary actually recognizes (``(cm/s)``, ``(K)``), which a
+footnote marker like ``(a)`` or ``(i)`` is not -- an **uncertainty marker** (``±``), or a
+**monotone numeric sweep** down
 a column (an independent variable stepped through its range). The negative evidence is equally
 structural: **reaction row keys** (``H + O2 <=> OH + O``) mark a mechanism listing, whose
 Arrhenius columns are numbers but not measurements; **formula-backed cells** (a spreadsheet
@@ -43,7 +45,17 @@ none of the negative ones -- a bare coefficient dump with no units -- the honest
 The signal set is deliberately a vocabulary of STRUCTURE (parentheses, ``±``, monotonicity,
 reaction arrows, formulas), not a whitelist of quantity names. A whitelist of "good" header
 words would be the hard-coded label this module refuses on principle, and would silently fail
-on every quantity nobody listed.
+on every quantity nobody listed. The unit-token signal is the one exception, and a deliberate
+one: a parenthesized letter-token is a candidate on structure alone, but is accepted only if
+its spelling is in the project's real, versioned unit-conversion vocabulary
+(:func:`carmel.services.units.known_unit_spellings`). That is not a whitelist of quantity
+*names* -- it is the exact closed set of unit spellings the extraction pipeline validates every
+stored value against, so a token it does not contain is a unit this project could not ground
+anyway. Grounding here is what stops a footnote marker (``(a)``, ``(b)``, ``(i)``) from
+manufacturing a ``MEASURED`` verdict; the cost is that a real unit outside this corpus's
+vocabulary (``(N)``, ``(J)``, ``(W)``, ``(V)``) does not fire the signal either, which is the
+safe direction -- the grid stays ``UNDECIDED`` (left for a human) rather than being called data
+the pipeline cannot convert.
 """
 
 from __future__ import annotations
@@ -53,6 +65,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
+
+from carmel.services.units import TABLE_V1, known_unit_spellings
 
 __all__ = [
     "DataVerdict",
@@ -266,9 +280,23 @@ def table_view_from_pdf_payload(payload: Mapping[str, Any]) -> TableView:
 #: every verdict. Classification asks only "is this cell a bare number", which this answers.
 _NUMBER = re.compile(r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$")
 
-#: A parenthesized token that contains a letter: a unit like ``(cm/s)`` or ``(K)``. A
-#: parenthesized pure number (``(1)``, a footnote mark) is not a unit and does not match.
+#: A parenthesized token that contains a letter: the *candidate* for a unit like ``(cm/s)`` or
+#: ``(K)``. A parenthesized pure number (``(1)``, a footnote mark) is not a unit and does not
+#: match. Containing a letter is necessary but NOT sufficient: ``(a)``, ``(b)`` and ``(i)`` are
+#: footnote markers that match this pattern too, so every candidate is checked against the
+#: project's real unit vocabulary (:data:`_KNOWN_UNITS`) before it is accepted as a unit token.
 _UNIT_TOKEN = re.compile(r"\(([^()]*[A-Za-z][^()]*)\)")
+
+#: The project's real, versioned unit vocabulary: exactly the spellings the conversion table
+#: (:data:`carmel.services.units.TABLE_V1`) can ground and convert. Grounding the unit-token
+#: signal here -- rather than in the shape of the parenthesized token -- is what separates a
+#: real unit from a footnote marker: ``(cm/s)``, ``(K)``, ``(s)``, ``(m)``, ``(C)`` and ``(L)``
+#: are members; ``(a)``, ``(b)`` and ``(i)`` are not. It is deliberately NOT a whitelist of
+#: "good" quantity names (which the module refuses on principle); it is the same closed, real
+#: vocabulary the extraction pipeline validates every stored value against. A token this set
+#: does not contain is a unit this project could not ground anyway, so declining to call its
+#: grid "measured" keeps the verdict's promise scoped to data the pipeline can actually handle.
+_KNOWN_UNITS = known_unit_spellings(TABLE_V1)
 
 #: Reaction arrows, the unambiguous mark of a mechanism row. ``=`` alone is not enough (a
 #: header may read ``x=1``); an arrow, or an ``=`` beside a ``+``, is.
@@ -366,24 +394,39 @@ def _formula_ground(view: TableView, value_cols: set[int], data_rows: list[list[
     return None
 
 
+def _recognized_unit_token(text: str) -> str | None:
+    """The first parenthesized token in ``text`` whose inner spelling is a real unit, or None.
+
+    Every parenthesized letter-token is a candidate; a candidate is accepted only if its inner
+    spelling (whitespace-stripped) is in :data:`_KNOWN_UNITS`, the project's real conversion
+    vocabulary. This rejects footnote markers (``(a)``, ``(b)``, ``(i)``) while accepting real
+    units, single-letter ones included. Scanning every candidate -- not just the first -- means
+    a real unit is still found when a marker precedes it in the same cell (``(a) S (cm/s)``).
+    """
+    for match in _UNIT_TOKEN.finditer(text):
+        if match.group(1).strip() in _KNOWN_UNITS:
+            return match.group(0)
+    return None
+
+
 def _unit_and_uncertainty_grounds(header: list[str], caption: str | None) -> list[Ground]:
     grounds: list[Ground] = []
     for cell in header:
-        match = _UNIT_TOKEN.search(cell)
-        if match:
+        token = _recognized_unit_token(cell)
+        if token is not None:
             grounds.append(
                 Ground(
                     SignalKind.UNIT_TOKEN_IN_HEADER,
                     Polarity.MEASURED,
-                    f"header cell {cell!r} prints unit {match.group(0)!r}",
+                    f"header cell {cell!r} prints unit {token!r}",
                 )
             )
             break
     if caption:
-        match = _UNIT_TOKEN.search(caption)
-        if match:
+        token = _recognized_unit_token(caption)
+        if token is not None:
             grounds.append(
-                Ground(SignalKind.UNIT_TOKEN_IN_CAPTION, Polarity.MEASURED, f"caption prints unit {match.group(0)!r}")
+                Ground(SignalKind.UNIT_TOKEN_IN_CAPTION, Polarity.MEASURED, f"caption prints unit {token!r}")
             )
     for cell in header:
         if "±" in cell:

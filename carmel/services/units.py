@@ -125,6 +125,7 @@ __all__ = [
     "UnknownQuantityUnitPairError",
     "UnknownUnitError",
     "convert",
+    "known_unit_spellings",
     "normalize_unit",
     "table_for_sha",
 ]
@@ -946,6 +947,31 @@ def table_for_sha(sha256: str) -> ConversionTable:
         raise UnknownConversionTableError(
             f"no conversion table known for sha256 {sha256!r}; known tables: {sorted(TABLES_BY_SHA)!r}"
         ) from None
+
+
+def known_unit_spellings(table: ConversionTable) -> frozenset[str]:
+    """Every unit spelling ``table`` recognizes, across all quantities and aliases.
+
+    The union of :meth:`ConversionTable.known_units` over every modeled quantity
+    with every alias spelling (both ``raw`` and ``normalized``). This is the
+    project's real, versioned unit vocabulary -- the exact closed set of tokens
+    it can ground and convert -- offered as a membership set for a caller that
+    must ask "is this string a unit?" *without knowing the quantity in advance*
+    (e.g. :mod:`carmel.services.table_data_discriminator`, reading a raw header).
+
+    Spellings are returned verbatim, with no case folding: ``K`` (kelvin) is a
+    member and ``k`` is not, exactly as :func:`normalize_unit` treats them. A
+    token absent here is not a unit this project can handle -- classifying a
+    grid as measured on the strength of such a token would promise data the
+    conversion machinery cannot ground.
+    """
+    spellings: set[str] = set()
+    for quantity in QuantityKind:
+        spellings |= table.known_units(quantity)
+    for alias in table.aliases:
+        spellings.add(alias.raw)
+        spellings.add(alias.normalized)
+    return frozenset(spellings)
 
 
 def normalize_unit(quantity: QuantityKind, unit_raw: str, *, table: ConversionTable) -> str:

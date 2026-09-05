@@ -36,6 +36,7 @@ from carmel.services.units import (
     UnknownQuantityUnitPairError,
     UnknownUnitError,
     convert,
+    known_unit_spellings,
     normalize_unit,
     table_for_sha,
 )
@@ -708,3 +709,35 @@ class TestTableIsRequiredNotDefaulted:
             convert(  # type: ignore[call-arg]
                 "1.23", quantity=QuantityKind.PRESSURE, from_unit="atm", to_unit="Pa"
             )
+
+
+class TestKnownUnitSpellings:
+    """``known_unit_spellings`` exposes the table's full recognized vocabulary as one set, for
+    callers (the table-data discriminator) that must ask "is this a unit?" without a quantity."""
+
+    def test_contains_base_units_across_quantities(self) -> None:
+        spellings = known_unit_spellings(TABLE_V1)
+        for quantity in QuantityKind:
+            assert TABLE_V1.known_units(quantity) <= spellings
+
+    def test_contains_alias_spellings(self) -> None:
+        spellings = known_unit_spellings(TABLE_V1)
+        for alias in TABLE_V1.aliases:
+            assert alias.raw in spellings
+            assert alias.normalized in spellings
+
+    def test_real_units_are_members_single_letters_included(self) -> None:
+        spellings = known_unit_spellings(TABLE_V1)
+        for unit in ("cm/s", "K", "s", "m", "C", "L", "Pa", "atm", "bar"):
+            assert unit in spellings
+
+    def test_footnote_markers_are_not_members(self) -> None:
+        spellings = known_unit_spellings(TABLE_V1)
+        for marker in ("a", "b", "i"):
+            assert marker not in spellings
+
+    def test_no_case_folding(self) -> None:
+        """``K`` is kelvin and a member; ``k`` is not, matching normalize_unit's no-fold rule."""
+        spellings = known_unit_spellings(TABLE_V1)
+        assert "K" in spellings
+        assert "k" not in spellings
