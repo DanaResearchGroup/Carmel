@@ -586,5 +586,6 @@ def produce_tabular_envelope_from_artifact(
         # Exactly the inventories this build's TABLE_CELL locators cite -- collected,
         # deduplicated and sorted by _CellCiter, never a store lookup at replay time.
         table_inventories=citer.table_inventories(),
+        ooxml_table_inventories=citer.ooxml_table_inventories(),
         figure_digitizations=(),
     )

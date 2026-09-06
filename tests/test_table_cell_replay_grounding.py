@@ -269,6 +269,7 @@ def _condition_set(inventory: EmbeddedTableInventory, value: MeasuredValue, node
         source_graph=SourceGraph(nodes=(node,)),
         conversion_tables=(_ACTIVE.embedded,),
         table_inventories=(inventory,),
+        ooxml_table_inventories=(),
         subject=UnresolvedSubject(reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=_cell_ref(0, 0, inventory)),
         attribution=ConditionAttribution.OWN_EXPERIMENT,
         attribution_ref=_cell_ref(0, 0, inventory),
@@ -330,6 +331,7 @@ def _dataset(inventory: EmbeddedTableInventory, value: MeasuredValue, node: Sour
         series=(series,),
         conversion_tables=(_ACTIVE.embedded,),
         table_inventories=(inventory,),
+        ooxml_table_inventories=(),
         figure_digitizations=(),
     )
 
@@ -554,6 +556,7 @@ class TestANonPdfTableCellIsNeitherComparedNorFlagged:
             source_graph=SourceGraph(nodes=(node,)),
             conversion_tables=(_ACTIVE.embedded,),
             table_inventories=(),  # every cell here cites Absent, so none is embedded
+            ooxml_table_inventories=(),
             subject=UnresolvedSubject(reason=SubjectRefusalReason.DEVICE_UNNAMED, reason_ref=_jats_cell_ref(0, 0)),
             attribution=ConditionAttribution.OWN_EXPERIMENT,
             attribution_ref=_jats_cell_ref(0, 0),

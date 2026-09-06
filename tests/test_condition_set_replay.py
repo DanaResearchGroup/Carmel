@@ -327,6 +327,7 @@ def _minimal_condition_set(tmp_path: Path, **kwargs: object) -> ConditionSetEnve
         "table_inventories",
         cover_for(*(value for key, value in defaults.items() if key != "source_graph")),
     )
+    defaults.setdefault("ooxml_table_inventories", ())
     return ConditionSetEnvelope(**defaults)  # type: ignore[arg-type]
 
 

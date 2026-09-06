@@ -276,6 +276,7 @@ def _envelope(**kwargs: object) -> ConditionSetEnvelope:
         "table_inventories",
         cover_for(*(value for key, value in defaults.items() if key != "source_graph")),
     )
+    defaults.setdefault("ooxml_table_inventories", ())
     return ConditionSetEnvelope(**defaults)  # type: ignore[arg-type]
 
 
