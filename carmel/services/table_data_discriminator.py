@@ -19,6 +19,21 @@ Wiring a discovered answer in place of the hand-pinned key is deliberately NOT d
 this project refuses ungroundable claims on principle. Every verdict here names the specific
 cell, column or caption bytes it read, so a human can overrule it from the report alone.
 
+**Why each ground names its columns.** The verdict's unit of analysis is the table; the data's
+is the column. A supplement routinely publishes a model-versus-experiment overlay in one grid,
+and a table-level ``MEASURED`` that rests entirely on the independent coordinate -- a
+``Distance (cm)`` unit token and a monotone sweep, both in column 0 -- vouches for nothing about
+the value columns beside it, yet a reader trusting the grounds would ground the wrong columns.
+So every ground carries the column(s) it read (:attr:`Ground.columns`), and the classification
+exposes :attr:`TableClassification.measured_columns`: "the verdict rests entirely on the
+x-axis" is then a set operation a caller runs, not a phrase a human must notice. A sweep in the
+index column is evidence that the table HAS an independent coordinate; it is not evidence that
+any *value* column is measured, and the two no longer share a table-level verdict without
+saying which columns they mean. This does NOT try to separate experiment columns from model
+columns by name: that would need a quantity-name whitelist (or the table's positional layout),
+both of which this module refuses -- see the STRUCTURE-not-names paragraph below. It reports
+which columns each *structural* signal covers, and leaves the rest honestly uncovered.
+
 **What it reads, and what it refuses to read.** It reads the GRID -- the cell texts, their
 row/column positions, and (where the lane exposes it) the table's caption. It never reads a
 filename, a ZIP member path, a table index, a sheet ordinal, or any hard-coded label: those
@@ -129,8 +144,9 @@ class SignalKind(StrEnum):
     and fitted coefficients do not carry."""
 
     MONOTONE_NUMERIC_SWEEP = "monotone_numeric_sweep"
-    """A value column steps monotonically through a range across the data rows -- the
-    signature of a controlled independent variable."""
+    """A column steps monotonically through a range across the data rows -- the signature of a
+    controlled independent variable. Scoped to that column: it vouches for the swept coordinate,
+    not for the value columns beside it, which do not step and are not covered by it."""
 
     NUMERIC_VALUE_COLUMN = "numeric_value_column"
     """At least one column is predominantly numeric over the data rows. Necessary for
@@ -158,23 +174,63 @@ class SignalKind(StrEnum):
 
 @dataclass(frozen=True)
 class Ground:
-    """One piece of evidence a verdict rests on: which signal fired, which way it pulls, and
-    the exact bytes it read. ``detail`` quotes the cell, column or caption text so an auditor
-    can find it in the document."""
+    """One piece of evidence a verdict rests on: which signal fired, which way it pulls, the
+    exact bytes it read, and the column(s) it read them in. ``detail`` quotes the cell, column
+    or caption text so an auditor can find it in the document."""
 
     kind: SignalKind
     polarity: Polarity
     detail: str
+    columns: tuple[int, ...] = ()
+    """The grid column(s) this ground is evidence ABOUT, left-to-right. Empty means the ground
+    is a property of the whole table, not of any one column -- a caption unit token, a
+    too-few-rows or no-numeric-column refusal. A column-scoped ground is what lets a caller
+    check *mechanically* which columns a verdict's evidence actually covers: "the verdict rests
+    entirely on the index column" becomes a set operation over :attr:`columns`, not a phrase a
+    human has to notice inside :attr:`detail`. A monotone sweep or unit token on the swept
+    coordinate scopes to that coordinate's column and says nothing about the value columns
+    beside it -- the two are not the same evidence."""
 
 
 @dataclass(frozen=True)
 class TableClassification:
-    """A verdict for one table, with everything needed to overrule it from the report alone."""
+    """A verdict for one table, with everything needed to overrule it from the report alone.
+
+    The verdict is still table-level, but its evidence is column-attributable: a mixed sheet
+    whose index column carries every positive signal and whose value columns carry none is a
+    ``MEASURED`` verdict whose :attr:`measured_columns` is just the index -- a fact a consumer
+    reads off the structure rather than inferring from prose.
+    """
 
     verdict: DataVerdict
     grounds: tuple[Ground, ...]
     needed: tuple[str, ...] = ()
     """For :attr:`DataVerdict.UNDECIDED`, what would settle the question. Empty otherwise."""
+
+    @property
+    def measured_columns(self) -> tuple[int, ...]:
+        """Columns carrying at least one ``MEASURED``-polarity ground, ascending.
+
+        The mechanical form of "which columns is this verdict measured about". A ``MEASURED``
+        verdict whose ``measured_columns`` is a subset of the table's index columns is measured
+        only about its independent coordinate, not about any value column -- exactly the case
+        this per-column scoping exists to make visible instead of hiding behind a table-level
+        ``measured``.
+        """
+        cols = {c for g in self.grounds if g.polarity is Polarity.MEASURED for c in g.columns}
+        return tuple(sorted(cols))
+
+    @property
+    def unmeasured_columns(self) -> tuple[int, ...]:
+        """Columns carrying at least one ``NOT_MEASURED``-polarity ground, ascending.
+
+        A reaction-key or formula column names itself here today. The structure is the home a
+        future negative *value-column* signal (a physically impossible value) drops into
+        without a schema change -- a column demonstrably not measured is expressible in the same
+        ground it always was, not bolted on later.
+        """
+        cols = {c for g in self.grounds if g.polarity is Polarity.NOT_MEASURED for c in g.columns}
+        return tuple(sorted(cols))
 
 
 @dataclass(frozen=True)
@@ -421,6 +477,12 @@ def _numeric_columns(data_rows: list[list[str]], col_count: int) -> set[int]:
 
 
 def _monotone_sweep_ground(data_rows: list[list[str]], value_cols: set[int]) -> Ground | None:
+    """The table's independent coordinate: the first column that steps monotonically across the
+    data rows. Scoped to that column alone -- a sweep in column 0 is evidence that column 0 is a
+    controlled coordinate, and evidence about no value column beside it. Reporting only the
+    first (leftmost) monotone column keeps the signal what property 2 names it -- *an*
+    independent coordinate -- rather than every column that happens to run monotone, which a
+    short ratio or legend run does too without being data."""
     for col in sorted(value_cols):
         values = [float(row[col]) for row in data_rows if col < len(row) and _looks_numeric(row[col].strip())]
         if len(values) < 3:
@@ -433,6 +495,7 @@ def _monotone_sweep_ground(data_rows: list[list[str]], value_cols: set[int]) -> 
                 SignalKind.MONOTONE_NUMERIC_SWEEP,
                 Polarity.MEASURED,
                 f"column {col} steps {direction}: {values[0]} .. {values[-1]} over {len(values)} rows",
+                columns=(col,),
             )
     return None
 
@@ -451,6 +514,7 @@ def _reaction_key_ground(data_rows: list[list[str]], value_cols: set[int], col_c
                 SignalKind.REACTION_ROW_KEYS,
                 Polarity.NOT_MEASURED,
                 f"column {col} holds reactions, e.g. {example!r}",
+                columns=(col,),
             )
     return None
 
@@ -474,6 +538,7 @@ def _formula_ground(
                 SignalKind.FORMULA_CELLS,
                 Polarity.NOT_MEASURED,
                 f"column {col}: {backed}/{total} value cells are spreadsheet formulas",
+                columns=(col,),
             )
     return None
 
@@ -494,8 +559,16 @@ def _recognized_unit_token(text: str) -> str | None:
 
 
 def _unit_and_uncertainty_grounds(header: list[str], caption: str | None) -> list[Ground]:
+    """Header/caption positive grounds, each scoped to the column it read.
+
+    Unlike the pre-scoping code, which reported only the FIRST header cell to print a unit, this
+    emits one :attr:`SignalKind.UNIT_TOKEN_IN_HEADER` ground per column whose header carries a
+    recognized unit -- so ``measured_columns`` names every column a unit vouches for, not just
+    the leftmost. A caption unit is a property of the table, not of any column, so it scopes to
+    ``columns=()``. The ``±`` marker is likewise reported per column.
+    """
     grounds: list[Ground] = []
-    for cell in header:
+    for col, cell in enumerate(header):
         token = _recognized_unit_token(cell)
         if token is not None:
             grounds.append(
@@ -503,19 +576,25 @@ def _unit_and_uncertainty_grounds(header: list[str], caption: str | None) -> lis
                     SignalKind.UNIT_TOKEN_IN_HEADER,
                     Polarity.MEASURED,
                     f"header cell {cell!r} prints unit {token!r}",
+                    columns=(col,),
                 )
             )
-            break
     if caption:
         token = _recognized_unit_token(caption)
         if token is not None:
             grounds.append(
                 Ground(SignalKind.UNIT_TOKEN_IN_CAPTION, Polarity.MEASURED, f"caption prints unit {token!r}")
             )
-    for cell in header:
+    for col, cell in enumerate(header):
         if "±" in cell:
-            grounds.append(Ground(SignalKind.UNCERTAINTY_MARKER, Polarity.MEASURED, f"header cell {cell!r} prints ±"))
-            break
+            grounds.append(
+                Ground(
+                    SignalKind.UNCERTAINTY_MARKER,
+                    Polarity.MEASURED,
+                    f"header cell {cell!r} prints ±",
+                    columns=(col,),
+                )
+            )
     return grounds
 
 
@@ -566,6 +645,7 @@ def classify_table(view: TableView) -> TableClassification:
             SignalKind.NUMERIC_VALUE_COLUMN,
             Polarity.NEUTRAL,
             f"columns {sorted(value_cols)} are predominantly numeric; {header_reason}",
+            columns=tuple(sorted(value_cols)),
         )
     ]
 
