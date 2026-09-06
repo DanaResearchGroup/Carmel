@@ -82,6 +82,7 @@ from carmel.schemas.datasets import (
     GroundedScalarClaim,
     MemberSheetKey,
     SiMemberDocumentKind,
+    SourceGraph,
     SourceNode,
     SourceNodeKind,
     SourceRef,
@@ -96,8 +97,10 @@ from carmel.services.dataset_producer import (
     _ACTIVE,
     _ROOT_NODE_ID,
     DatasetProducerError,
+    _authenticate_supplement_node,
     _measured_value,
     _prepare_grounding,
+    _supplement_node_id,
     ground_quote,
 )
 from carmel.services.numeric import GlyphHealth, QuoteRole, SourceContext
@@ -425,10 +428,21 @@ class _CellCiter:
 
     Holds the target node and enforces, ACROSS ALL cells requested in one build:
 
-    * the node is a ``PAPER_PDF`` -- only there does a cell have the fragment
-      geometry an inventory describes, and only there may a locator carry a
-      resolvable ``pdf_table_inventory_sha256``. Any other node kind would demand
-      an ``Absent`` sha, which this producer never emits;
+    * the node is a ``PAPER_PDF`` (for a PDF inventory) or an ``SI_MEMBER`` whose
+      ``document_kind`` is ``WORD_PROCESSOR`` (for an OOXML one) -- only there does a
+      cell carry the fragment geometry or the WordprocessingML grid an inventory
+      describes, and only there may a locator carry a resolvable
+      ``pdf_table_inventory_sha256`` / ``ooxml_table_inventory_sha256``. Anything else
+      would demand an ``Absent`` sha, which this producer never emits.
+
+      A PDF or spreadsheet ``SI_MEMBER`` is **deliberately** refused here today, and the
+      refusal names its ``document_kind``.
+      :data:`~carmel.services.dataset_producer._CONTENT_TYPE_TO_SI_MEMBER_DOCUMENT_KIND`
+      maps all three kinds, so :func:`_resolve_cell_citations` can mint a node whose
+      ``document_kind`` is ``PDF`` or ``SPREADSHEET`` -- minting a node FOR a document is
+      a different question from being able to cite a cell INSIDE it. Citing one needs a
+      table inventory derived from that non-root document, which nothing builds yet, so
+      the combination fails closed rather than emitting a citation nothing can resolve;
     * one cell is never asked to be two different strings (the ``TableCellLocator``
       has no sub-cell addressing, so a value and its unit sharing a cell is
       unrepresentable and must be refused, not laundered);
@@ -463,14 +477,26 @@ class _CellCiter:
         )
         if not node_is_pdf and not node_is_word_processor:
             owners = sorted({owner for owner, _, _ in requests})
+            # Name the document_kind, not just the node kind. An SI_MEMBER minted for a PDF
+            # or spreadsheet supplement lands here, and reporting only kind='si_member'
+            # would read as a contradiction ("an SI_MEMBER is not an SI_MEMBER") instead of
+            # naming the one field that actually decided the refusal.
+            declared = getattr(self._node.document_kind, "value", None)
+            described = (
+                f"an SI_MEMBER whose document_kind is {declared!r}"
+                if self._node.kind is SourceNodeKind.SI_MEMBER and declared is not None
+                else f"of kind {self._node.kind.value!r}"
+            )
             raise ConditionSetProducerError(
-                f"cell grounding requested by {owners} but the artifact's root node is "
-                f"{self._node.kind.value!r}, which is neither a PAPER_PDF nor a declared word-processor "
+                f"cell grounding requested by {owners} but the cited document's node is "
+                f"{described}, which is neither a PAPER_PDF nor a declared word-processor "
                 "SI_MEMBER -- only a PDF node's cells carry the fragment geometry a table inventory "
                 "describes (a resolvable pdf_table_inventory_sha256), and only a declared word-processor "
                 "SI_MEMBER's cells carry a WordprocessingML grid (a resolvable "
-                "ooxml_table_inventory_sha256). Grounding a cell against any other node kind would require "
-                "an Absent sha, which is a citation nothing can resolve and this producer never emits"
+                "ooxml_table_inventory_sha256). Citing a cell in a PDF or spreadsheet supplement would "
+                "need a table inventory derived from that non-root document, which nothing builds yet; "
+                "grounding against it anyway would require an Absent sha, which is a citation nothing "
+                "can resolve and this producer never emits"
             )
         # A single cell cannot honestly be two different strings. Checked across the
         # whole batch first so the value-and-unit-share-a-cell spec is refused with
@@ -492,7 +518,7 @@ class _CellCiter:
                 if not node_is_word_processor:
                     raise ConditionSetProducerError(
                         f"{owner}: cell grounding cites an OOXML inventory {inventory.inventory_sha256!r}, but "
-                        f"the artifact's root node is {self._node.kind.value!r}, not a declared word-processor "
+                        f"the cited document's node is {self._node.kind.value!r}, not a declared word-processor "
                         "SI_MEMBER -- a WordprocessingML grid an OOXML inventory describes exists only there"
                     )
                 document_sha = inventory.source_sha256
@@ -500,7 +526,7 @@ class _CellCiter:
                 if not node_is_pdf:
                     raise ConditionSetProducerError(
                         f"{owner}: cell grounding cites a PDF inventory {inventory.inventory_sha256!r}, but "
-                        f"the artifact's root node is {self._node.kind.value!r}, not PAPER_PDF -- the PDF "
+                        f"the cited document's node is {self._node.kind.value!r}, not PAPER_PDF -- the PDF "
                         "fragment geometry a table inventory describes exists only there"
                     )
                 document_sha = inventory.raw_sha256
@@ -546,6 +572,140 @@ class _CellCiter:
         return tuple(sorted(self._ooxml_inventories.values(), key=lambda inventory: inventory.inventory_sha256))
 
 
+def _document_sha_of(inventory: EmbeddedTableInventory | EmbeddedOoxmlTableInventory) -> str:
+    """The sha256 of the DOCUMENT an embedded inventory's grid was derived from.
+
+    The PDF lane records it as ``raw_sha256`` and the OOXML lane as ``source_sha256``;
+    both name the bytes the grid came out of. This is the key that ties a cell citation
+    to the source-graph node whose ``sha256`` must equal it (schema V8/V8b)."""
+    if isinstance(inventory, EmbeddedOoxmlTableInventory):
+        return inventory.source_sha256
+    return inventory.raw_sha256
+
+
+@dataclass(frozen=True)
+class _ResolvedCitations:
+    """The graph, cited inventories, and node-id resolution for one build's cell citations.
+
+    Produced by :func:`_resolve_cell_citations`. ``graph`` is the root graph extended
+    with one ``SI_MEMBER`` child per NON-root document a cell cites; ``node_id_for``
+    maps a validated cell grounding to the id of the node its citation must name. For a
+    build with no cell groundings, or one whose cells all cite the root, ``graph`` IS the
+    root graph and every id resolves to the root -- so the char-span and PDF-root paths
+    stay byte-identical to before this lane existed.
+    """
+
+    graph: SourceGraph
+    node_id_by_document_sha: dict[str, str]
+    pdf_inventories: tuple[EmbeddedTableInventory, ...]
+    ooxml_inventories: tuple[EmbeddedOoxmlTableInventory, ...]
+
+    def node_id_for(self, cell: TableCellGrounding) -> str:
+        """The source-graph node id the citation for ``cell`` must name."""
+        return self.node_id_by_document_sha[_document_sha_of(cell.inventory)]
+
+    def table_inventories(self) -> tuple[EmbeddedTableInventory, ...]:
+        """Every cited PDF inventory, deduplicated by sha and sorted -- for T4/T5."""
+        return self.pdf_inventories
+
+    def table_ooxml_inventories(self) -> tuple[EmbeddedOoxmlTableInventory, ...]:
+        """Every cited OOXML inventory, deduplicated by sha and sorted -- for T4b/T5b."""
+        return self.ooxml_inventories
+
+
+def _resolve_cell_citations(
+    workspace_root: Path,
+    root_graph: SourceGraph,
+    requests: tuple[tuple[str, str, TableCellGrounding], ...],
+) -> _ResolvedCitations:
+    """Resolve every cell grounding to a source-graph node, authenticating supplements.
+
+    A cell grounding cites a document by the sha256 its inventory's grid was derived
+    from (:func:`_document_sha_of`). That document must be a node in the graph before a
+    reference may name it. This function discovers every NON-root document cited,
+    authenticates its stored bytes, and mints exactly one word-processor/spreadsheet/PDF
+    ``SI_MEMBER`` child node for it (:func:`_authenticate_supplement_node`), parented on
+    the root. The node id is DERIVED from the sha, so a caller never names a node; a
+    document with no stored artifact is refused here as an unknown node, because none can
+    honestly be built for it.
+
+    Each cited document's groundings are then validated as one batch by a
+    :class:`_CellCiter` over that document's node -- the same single-node authority as
+    before, selected by the cited document instead of assumed to be the root. This is
+    where a cell cited against a node of the wrong kind, or an OOXML inventory cited
+    against the root PDF, is refused with :class:`_CellCiter`'s existing typed messages.
+    """
+    root = root_graph.node(_ROOT_NODE_ID)
+    # Seed the sha->node maps from EVERY node the incoming graph already holds, not the root
+    # alone: a caller may hand us a graph that already carries the SI_MEMBER for a sha a cited
+    # cell derives from, and that node must be REUSED, not re-minted. Re-minting would append a
+    # second node under the same sha-derived id, and the `(*root_graph.nodes, *supplements)`
+    # construction below would then carry it twice -- SourceGraph's I1 rejects the duplicate
+    # with an untyped ValidationError. Root stays authoritative for its own sha.
+    nodes_by_sha: dict[str, SourceNode] = {root.sha256: root}
+    node_id_by_sha: dict[str, str] = {root.sha256: root.node_id}
+    for node in root_graph.nodes:
+        if node.node_id == _ROOT_NODE_ID:
+            continue
+        # A reused non-root node bypasses _authenticate_supplement_node's mint-time id check, so
+        # hold the same invariant here: an SI_MEMBER for a sha is named supplement:<sha>, never a
+        # caller-chosen name. The root is exempt -- it is legitimately "paper", not sha-derived.
+        expected_node_id = _supplement_node_id(node.sha256)
+        if node.node_id != expected_node_id:
+            raise ConditionSetProducerError(
+                f"incoming source graph holds node {node.node_id!r} for document {node.sha256!r}, but a "
+                f"non-root node for that document must be named {expected_node_id!r} (an SI_MEMBER id is "
+                "derived from its sha, never a caller-supplied name)"
+            )
+        nodes_by_sha.setdefault(node.sha256, node)
+        node_id_by_sha.setdefault(node.sha256, node.node_id)
+    supplements: list[SourceNode] = []
+    for owner, _quote, cell in requests:
+        document_sha = _document_sha_of(cell.inventory)
+        if document_sha in nodes_by_sha:
+            continue
+        try:
+            node = _authenticate_supplement_node(
+                workspace_root,
+                sha256=document_sha,
+                node_id=_supplement_node_id(document_sha),
+                parent_node_id=root.node_id,
+            )
+        except DatasetProducerError as exc:
+            raise ConditionSetProducerError(
+                f"{owner}: cell grounding cites inventory {cell.inventory.inventory_sha256!r}, whose grid was "
+                f"derived from document {document_sha!r}, but no source-graph node could be built for it: {exc}"
+            ) from exc
+        nodes_by_sha[document_sha] = node
+        node_id_by_sha[document_sha] = node.node_id
+        supplements.append(node)
+    # EXTEND the incoming graph -- preserve every node it already held and append the
+    # supplements -- rather than rebuilding it from (root, *supplements), which would
+    # silently drop any non-root node the caller had already put in the graph. `root` is
+    # itself one of `root_graph.nodes`, so it is carried through exactly once. On the
+    # no-supplements path root_graph passes through untouched, and on a single-node root
+    # graph the produced tuple is (root, *supplements) as before -- byte-identical.
+    graph = SourceGraph(nodes=(*root_graph.nodes, *supplements)) if supplements else root_graph
+    requests_by_sha: dict[str, list[tuple[str, str, TableCellGrounding]]] = {}
+    for request in requests:
+        requests_by_sha.setdefault(_document_sha_of(request[2].inventory), []).append(request)
+    pdf_inventories: dict[str, EmbeddedTableInventory] = {}
+    ooxml_inventories: dict[str, EmbeddedOoxmlTableInventory] = {}
+    for document_sha, group in requests_by_sha.items():
+        citer = _CellCiter(nodes_by_sha[document_sha])
+        citer.validate(tuple(group))
+        for pdf_inventory in citer.table_inventories():
+            pdf_inventories[pdf_inventory.inventory_sha256] = pdf_inventory
+        for ooxml_inventory in citer.ooxml_table_inventories():
+            ooxml_inventories[ooxml_inventory.inventory_sha256] = ooxml_inventory
+    return _ResolvedCitations(
+        graph=graph,
+        node_id_by_document_sha=node_id_by_sha,
+        pdf_inventories=tuple(sorted(pdf_inventories.values(), key=lambda inventory: inventory.inventory_sha256)),
+        ooxml_inventories=tuple(sorted(ooxml_inventories.values(), key=lambda inventory: inventory.inventory_sha256)),
+    )
+
+
 def _ref(
     text: str,
     quote: str,
@@ -553,13 +713,17 @@ def _ref(
     role: QuoteRole,
     occurrence: int | None,
     repairs: tuple[GlyphRepair, ...],
+    citations: _ResolvedCitations,
     cell: TableCellGrounding | None = None,
 ) -> SourceRef:
     """Ground ``quote`` and wrap the locator as a ``SourceRef``.
 
     When ``cell`` is given the quote is located at a table cell (already validated
-    by :class:`_CellCiter`); otherwise it is searched in ``text`` as a character
-    span, byte-for-byte as before -- the char-span path is unchanged.
+    by :class:`_CellCiter`), and the ref names the node ``citations`` resolved the
+    cell's document to -- the root for a PDF-root cell, the ``SI_MEMBER`` child for a
+    supplement cell. Otherwise the quote is searched in ``text`` as a character span
+    and the ref names the root, byte-for-byte as before: a char span indexes the
+    root's grounded text, which is the only text this producer holds.
 
     ``repairs`` is keyword-only and REQUIRED (no default): it is this producer's half
     of the lane seam -- the table lane's in-force glyph repairs for the document
@@ -570,7 +734,7 @@ def _ref(
     at the call, not a quiet regression.
     """
     if cell is not None:
-        return SourceRef(node_id=_ROOT_NODE_ID, locator=_cell_locator(cell))
+        return SourceRef(node_id=citations.node_id_for(cell), locator=_cell_locator(cell))
     return SourceRef(
         node_id=_ROOT_NODE_ID,
         locator=ground_quote(text, quote, role=role, occurrence=occurrence, repairs=repairs),
@@ -679,6 +843,7 @@ def _scalar_claim(
     document_source_context: SourceContext,
     document_glyph_health: GlyphHealth,
     document_glyph_repairs: tuple[GlyphRepair, ...],
+    citations: _ResolvedCitations,
 ) -> GroundedScalarClaim:
     """One :class:`GroundedScalarClaim`, cell- or char-grounded per its spec.
 
@@ -701,6 +866,7 @@ def _scalar_claim(
             role=QuoteRole.LABEL,
             occurrence=spec.label_occurrence,
             repairs=document_glyph_repairs,
+            citations=citations,
             cell=spec.label_cell,
         ),
         value=_measured_value(
@@ -712,6 +878,8 @@ def _scalar_claim(
             document_glyph_repairs=document_glyph_repairs,
             value_locator=_cell_locator(spec.value_cell) if spec.value_cell is not None else None,
             unit_locator=_cell_locator(spec.unit_cell) if spec.unit_cell is not None else None,
+            value_node_id=(citations.node_id_for(spec.value_cell) if spec.value_cell is not None else _ROOT_NODE_ID),
+            unit_node_id=(citations.node_id_for(spec.unit_cell) if spec.unit_cell is not None else _ROOT_NODE_ID),
         ),
         # This producer reads no uncertainty from the document. That is a
         # NOT_EXTRACTED_YET refusal, not an assertion that the paper stated
@@ -813,14 +981,17 @@ def produce_condition_set_from_artifact(
     repairs = grounding.glyph_repairs
 
     # The single authority on cell citations. Every cell grounding requested across
-    # every spec is validated as ONE batch here -- before any ref is built -- so a
-    # cell that does not exist, whose text differs from its quote, or that a value and
-    # a unit both claim, is refused with the clearest message, and the inventories the
-    # envelope must embed are collected exactly once. The subject and attribution are
-    # deliberately NOT cell-groundable: they are the set's provenance frame, not a
-    # datum read out of a grid.
-    citer = _CellCiter(grounding.graph.node(_ROOT_NODE_ID))
-    citer.validate(_cell_grounding_requests(scalars, categoricals, unextracted))
+    # every spec is validated -- before any ref is built -- so a cell that does not
+    # exist, whose text differs from its quote, or that a value and a unit both claim,
+    # is refused with the clearest message, and the inventories the envelope must embed
+    # are collected exactly once. This ALSO resolves which source-graph node each cell
+    # cites: a cell in the root document names the root, a cell in a word-processor
+    # supplement names the SI_MEMBER child _resolve_cell_citations authenticated and
+    # added to the graph. The subject and attribution are deliberately NOT
+    # cell-groundable: they are the set's provenance frame, not a datum read out of a grid.
+    citations = _resolve_cell_citations(
+        workspace_root, grounding.graph, _cell_grounding_requests(scalars, categoricals, unextracted)
+    )
 
     resolved_subject: DeviceClassDeclaration | UnresolvedSubject
     if isinstance(subject, DeviceClassSpec):
@@ -832,6 +1003,7 @@ def produce_condition_set_from_artifact(
                 role=QuoteRole.LABEL,
                 occurrence=subject.label_occurrence,
                 repairs=repairs,
+                citations=citations,
             ),
         )
     else:
@@ -843,6 +1015,7 @@ def produce_condition_set_from_artifact(
                 role=QuoteRole.LABEL,
                 occurrence=subject.reason_occurrence,
                 repairs=repairs,
+                citations=citations,
             ),
         )
 
@@ -853,6 +1026,7 @@ def produce_condition_set_from_artifact(
             document_source_context=grounding.document_source_context,
             document_glyph_health=grounding.document_glyph_health,
             document_glyph_repairs=repairs,
+            citations=citations,
         )
         for spec in scalars
     )
@@ -866,6 +1040,7 @@ def produce_condition_set_from_artifact(
                 role=QuoteRole.LABEL,
                 occurrence=spec.label_occurrence,
                 repairs=repairs,
+                citations=citations,
                 cell=spec.label_cell,
             ),
             token_raw=spec.token_quote,
@@ -875,6 +1050,7 @@ def produce_condition_set_from_artifact(
                 role=QuoteRole.VALUE,
                 occurrence=spec.token_occurrence,
                 repairs=repairs,
+                citations=citations,
                 cell=spec.token_cell,
             ),
         )
@@ -890,6 +1066,7 @@ def produce_condition_set_from_artifact(
                 role=QuoteRole.LABEL,
                 occurrence=spec.label_occurrence,
                 repairs=repairs,
+                citations=citations,
                 cell=spec.label_cell,
             ),
             # statement_raw stores the SAME quote _ref grounds into statement_ref,
@@ -905,6 +1082,7 @@ def produce_condition_set_from_artifact(
                 role=QuoteRole.VALUE,
                 occurrence=spec.statement_occurrence,
                 repairs=repairs,
+                citations=citations,
                 cell=spec.statement_cell,
             ),
             reason=spec.reason,
@@ -916,7 +1094,10 @@ def produce_condition_set_from_artifact(
     )
 
     return ConditionSetEnvelope(
-        source_graph=grounding.graph,
+        # The root graph, extended by _resolve_cell_citations with one SI_MEMBER child
+        # per non-root document a cell cites. Identical to grounding.graph when no cell
+        # cites a supplement, keeping the char-span and PDF-root paths byte-identical.
+        source_graph=citations.graph,
         # Only a MeasuredValue cites a conversion table, so a condition set that
         # resolved no scalar claims must embed NONE: the schema refuses a
         # decorative table as "unearned provenance", and it is right to. A
@@ -929,12 +1110,17 @@ def produce_condition_set_from_artifact(
         # a pure char-span condition set byte-identical to before: T4 refuses a decorative
         # inventory nothing cites for the same reason conversion_tables above refuses a
         # decorative table.
-        table_inventories=citer.table_inventories(),
-        ooxml_table_inventories=citer.ooxml_table_inventories(),
+        table_inventories=citations.table_inventories(),
+        ooxml_table_inventories=citations.table_ooxml_inventories(),
         subject=resolved_subject,
         attribution=attribution,
         attribution_ref=_ref(
-            text, attribution_quote, role=QuoteRole.LABEL, occurrence=attribution_occurrence, repairs=repairs
+            text,
+            attribution_quote,
+            role=QuoteRole.LABEL,
+            occurrence=attribution_occurrence,
+            repairs=repairs,
+            citations=citations,
         ),
         scalar_claims=scalar_claims,
         categorical_claims=categorical_claims,
