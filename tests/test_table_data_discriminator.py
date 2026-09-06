@@ -85,6 +85,82 @@ def test_measured_via_monotone_sweep_and_caption_unit() -> None:
     assert SignalKind.UNIT_TOKEN_IN_CAPTION in kinds
 
 
+# --- column-scoped grounds (I-085) ---------------------------------------------------------
+
+
+def test_measured_verdict_on_index_column_alone_does_not_claim_a_value_column() -> None:
+    """The defect this ticket exists to catch: a model-vs-experiment overlay whose ONLY unit
+    token and ONLY monotone sweep live in the index column (``Distance (cm)``). The value
+    columns -- a species mole fraction and its ppm reading -- carry no unit token and do not
+    step monotonically.
+
+    Pre-fix this was a bare ``MEASURED`` that licensed the value columns by silence. The verdict
+    stays ``MEASURED`` (its independent coordinate is real, and refusing the sheet is the next
+    ticket's negative signal, not this one), but ``measured_columns`` must name column 0 ALONE:
+    a consumer can now check mechanically that no value column is claimed measured on this
+    evidence, rather than reading it out of a ``detail`` string.
+    """
+    view = _view(
+        [
+            ["Distance (cm)", "Mole_fraction_NO ()", "NO ppm"],
+            ["0.1", "0.004", "284"],
+            ["0.2", "0.009", "628"],
+            ["0.3", "0.002", "73"],
+            ["0.4", "0.051", "3613"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.MEASURED
+    # Every positive ground is scoped to the index column; none touches a value column.
+    measured_grounds = [g for g in result.grounds if g.polarity is Polarity.MEASURED]
+    assert measured_grounds
+    assert all(g.columns == (0,) for g in measured_grounds)
+    assert result.measured_columns == (0,)
+    # The value columns (1 = mole fraction, 2 = ppm) are NOT claimed measured on this evidence.
+    assert 1 not in result.measured_columns
+    assert 2 not in result.measured_columns
+
+
+def test_unit_tokens_on_value_columns_are_each_named() -> None:
+    """When a unit token DOES sit on a value column, that column is named -- the scoping credits
+    every column a unit vouches for, not just the leftmost. Here ``Temperature (K)`` at column 1
+    is a real unit on a value column, so column 1 joins the index column 0 in
+    ``measured_columns``; the unlabelled ``NO ppm`` at column 2 does not."""
+    view = _view(
+        [
+            ["Distance (cm)", "Temperature (K)", "NO ppm"],
+            ["0.1", "450", "284"],
+            ["0.2", "450", "628"],
+            ["0.3", "450", "73"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.MEASURED
+    unit_cols = {c for g in result.grounds if g.kind is SignalKind.UNIT_TOKEN_IN_HEADER for c in g.columns}
+    assert unit_cols == {0, 1}
+    assert 2 not in result.measured_columns
+
+
+def test_reaction_key_column_is_named_in_unmeasured_columns() -> None:
+    """A negative per-column ground names its column too: a mechanism listing's reaction-key
+    column appears in ``unmeasured_columns``, so the same structure that carries "measured
+    about column X" carries "not measured about column Y" -- the home a future negative
+    value-column signal drops into without a schema change."""
+    view = _view(
+        [
+            ["Reaction", "A", "n", "Ea"],
+            ["H + O2 <=> OH + O", "1.2e14", "0.0", "16800"],
+            ["OH + H2 <=> H2O + H", "2.2e13", "0.0", "5150"],
+            ["O + H2 <=> OH + H", "5.1e04", "2.7", "6290"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.NOT_MEASURED
+    reaction_grounds = [g for g in result.grounds if g.kind is SignalKind.REACTION_ROW_KEYS]
+    assert reaction_grounds and reaction_grounds[0].columns == (0,)
+    assert 0 in result.unmeasured_columns
+
+
 # --- not measured (clear negatives) --------------------------------------------------------
 
 
