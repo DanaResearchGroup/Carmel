@@ -291,6 +291,90 @@ def test_unit_outside_corpus_vocabulary_does_not_fire_alone() -> None:
     assert not any(g.kind is SignalKind.UNIT_TOKEN_IN_HEADER for g in result.grounds)
 
 
+# --- the header is not always row 0 (I-084) ------------------------------------------------
+
+
+def test_measured_header_hidden_under_a_merged_banner_row() -> None:
+    """Direction 1 -- a shock-tube-shaped table whose row 0 is a merged composition banner
+    (one filled cell, the rest empty) and whose real unit header sits on row 1. Modeled on the
+    corpus ``proci.2020.06.268`` supplement, where row 0 is ``Mixture 1 (H2/CO/Ar)`` and row 1
+    is ``Run | T1 (K) | P5 (bar) | tign (us)``.
+
+    Against the pre-I-084 code this reaches MEASURED only by luck -- via the monotone run-index
+    column -- with the ``(K)``/``(bar)`` unit tokens on row 1 never read, so
+    ``UNIT_TOKEN_IN_HEADER`` never fires. The fix must read row 1 as the header and credit the
+    unit, and must report which row it read."""
+    view = _view(
+        [
+            ["Mixture 1 (H2/CO/Ar)", "", "", ""],
+            ["Run", "T1 (K)", "P5 (bar)", "tign (us)"],
+            ["1", "1200", "2.1", "820"],
+            ["2", "1300", "2.2", "540"],
+            ["3", "1400", "2.3", "310"],
+            ["4", "1500", "2.4", "190"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.MEASURED
+    kinds = {g.kind for g in result.grounds}
+    # Pre-fix this is absent: the banner on row 0 is read as the header and carries no unit.
+    assert SignalKind.UNIT_TOKEN_IN_HEADER in kinds
+    unit_ground = next(g for g in result.grounds if g.kind is SignalKind.UNIT_TOKEN_IN_HEADER)
+    assert "T1 (K)" in unit_ground.detail
+    # The selected header row is reported so a human can overrule it from the grounds alone.
+    assert any("row 1 read as the header" in g.detail for g in result.grounds)
+
+
+def test_measured_header_several_rows_down_under_title_and_authors() -> None:
+    """Direction 2 -- a speciation-workbook shape whose row 0 is a title, row 1 an author list,
+    row 2 blank, and the real unit header on row 3. Modeled on the corpus ``cej.2023.144577``
+    supplement (title/authors above; the ``T(K)`` header several rows down). The data below is
+    deliberately NON-monotone in every column, so no sweep can rescue the verdict -- the ONLY
+    positive evidence is the unit token on row 3.
+
+    Against the pre-I-084 code the header is forced to row 0 (the title), no unit token is
+    found and no column sweeps, so the verdict is a false UNDECIDED. The fix must read row 3
+    and reach MEASURED on the unit it names."""
+    view = _view(
+        [
+            ["Supplementary data for a flow-tube speciation study", "", ""],
+            ["A. Author, B. Author, C. Author", "", ""],
+            ["", "", ""],
+            ["Distance (cm)", "Temperature (K)", "Mole fraction"],
+            ["0.5", "480", "0.012"],
+            ["1.5", "735", "0.008"],
+            ["1.0", "610", "0.031"],
+            ["2.0", "812", "0.020"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.MEASURED
+    kinds = {g.kind for g in result.grounds}
+    assert SignalKind.MONOTONE_NUMERIC_SWEEP not in kinds  # no sweep rescue: pins the header read
+    assert SignalKind.UNIT_TOKEN_IN_HEADER in kinds
+    unit_ground = next(g for g in result.grounds if g.kind is SignalKind.UNIT_TOKEN_IN_HEADER)
+    assert "Distance (cm)" in unit_ground.detail
+    assert any("row 3 read as the header" in g.detail for g in result.grounds)
+
+
+def test_no_header_row_above_data_reports_it_and_does_not_guess_measured() -> None:
+    """When a numeric data block has no header-shaped row above it (a bare title banner, then
+    numbers), the classifier must NOT invent a header. It reports that no header row was found
+    -- so unit and ± signals are unavailable -- and rests only on the row-independent signals.
+    Here the columns are non-monotone, so the honest verdict is UNDECIDED, never a guess."""
+    view = _view(
+        [
+            ["Coefficient dump (run 3)", "", ""],
+            ["3.1", "0.7", "2.2"],
+            ["1.4", "0.9", "1.1"],
+            ["2.8", "0.2", "3.0"],
+        ]
+    )
+    result = classify_table(view)
+    assert result.verdict is DataVerdict.UNDECIDED
+    assert any("no header row found above the data block" in g.detail for g in result.grounds)
+
+
 # --- filename / index independence ---------------------------------------------------------
 
 
