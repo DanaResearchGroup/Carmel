@@ -80,6 +80,7 @@ from carmel.schemas.datasets import (
     RawArtifactVerification,
     RootSidecarVerification,
     SemanticDependencyUse,
+    SiMemberDocumentKind,
     SourceGraph,
     SourceNode,
     SourceNodeKind,
@@ -1220,6 +1221,8 @@ def _measured_value(
     document_glyph_repairs: tuple[GlyphRepair, ...] = (),
     value_locator: TableCellLocator | None = None,
     unit_locator: TableCellLocator | None = None,
+    value_node_id: str = _ROOT_NODE_ID,
+    unit_node_id: str = _ROOT_NODE_ID,
     unit_provenance: UnitProvenance = UnitProvenance.PRINTED_IN_SOURCE,
 ) -> MeasuredValue:
     """Build one grounded :class:`MeasuredValue` from ``spec`` against ``text``.
@@ -1247,6 +1250,16 @@ def _measured_value(
     condition-set producer validates a cell citation (the cell exists, its whole
     text equals the whole quote, no cell is two strings) BEFORE calling this, so
     the exact-equality contract is enforced once, centrally, not re-derived here.
+
+    ``value_node_id``/``unit_node_id`` name the source-graph node each ref cites.
+    Both default to :data:`_ROOT_NODE_ID`, which is the only value the dataset
+    producer ever uses (it grounds against a single root document) and which keeps
+    the running-text path byte-identical. The condition-set producer passes the id
+    of the NON-root ``SI_MEMBER`` node a table cell was cited from, so a cell
+    grounded in a word-processor supplement names that child, never the root. The
+    schema's V1 refuses any id absent from the graph and V8b refuses one whose
+    ``sha256`` differs from the cited inventory's document, so a wrong id here
+    cannot pass construction.
 
     P1-D: ``document_source_context``/``document_glyph_health`` (the artifact's
     REAL context and glyph health, from :func:`_source_context_for` and
@@ -1343,7 +1356,7 @@ def _measured_value(
         unit_raw = spec.unit_quote
         # resolved_unit_locator is set for every PRINTED_IN_SOURCE value above.
         assert resolved_unit_locator is not None
-        unit_ref = SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_unit_locator)
+        unit_ref = SourceRef(node_id=unit_node_id, locator=resolved_unit_locator)
     return MeasuredValue(
         raw_text=spec.value_quote,
         canonical_decimal_value=canonical,
@@ -1354,7 +1367,7 @@ def _measured_value(
         unit_raw=unit_raw,
         unit_normalized=unit_normalized,
         conversion_table_sha256=_ACTIVE.embedded.sha256,
-        value_ref=SourceRef(node_id=_ROOT_NODE_ID, locator=resolved_value_locator),
+        value_ref=SourceRef(node_id=value_node_id, locator=resolved_value_locator),
         unit_ref=unit_ref,
     )
 
@@ -1374,6 +1387,100 @@ _CONTENT_TYPE_TO_NODE_KIND: dict[str, SourceNodeKind] = {
     "application/xml": SourceNodeKind.JATS_XML,
     "text/xml": SourceNodeKind.JATS_XML,
 }
+
+#: Maps a stored SI-member artifact's ``content_type`` to the
+#: :class:`SiMemberDocumentKind` the node may honestly declare. DERIVED from the
+#: store's own recorded metadata, never asserted by a caller: a producer building
+#: an ``SI_MEMBER`` child reads the artifact's ``content_type`` and looks the kind
+#: up here, so no code path lets a caller name a document_kind the bytes do not
+#: back. An unrecognised content_type fails closed in
+#: :func:`_authenticate_supplement_node` rather than guessing a kind, exactly as
+#: ``_CONTENT_TYPE_TO_NODE_KIND`` does for the root.
+_CONTENT_TYPE_TO_SI_MEMBER_DOCUMENT_KIND: dict[str, SiMemberDocumentKind] = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": (SiMemberDocumentKind.WORD_PROCESSOR),
+    "application/pdf": SiMemberDocumentKind.PDF,
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": SiMemberDocumentKind.SPREADSHEET,
+}
+
+
+def _supplement_node_id(sha256: str) -> str:
+    """The one derivation of an SI-member node id from its document sha256.
+
+    The id of a supplement node is a LABEL derived from the sha, never a name a
+    caller invents (see :func:`_authenticate_supplement_node`). Having a single
+    function own that derivation is what lets the authenticator check a caller's
+    id against the store-derived one without the two spellings drifting apart.
+    """
+    return f"supplement:{sha256}"
+
+
+def _authenticate_supplement_node(
+    workspace_root: Path, *, sha256: str, node_id: str, parent_node_id: str
+) -> SourceNode:
+    """Authenticate a stored SI-member document and build its ``SI_MEMBER`` child node.
+
+    Used by a producer that must cite a table cell in a NON-root document (a
+    word-processor ``.docx`` supplement, today): the cited document has to be a real
+    node in the graph before a reference may name it, and this is the ONE place that
+    node is minted. The bytes at ``sha256`` are re-read and re-hashed
+    (:func:`_authenticate_raw_bytes_and_read_source_metadata`), so the node's
+    ``sha256`` is a fact about the store, never a caller's assertion; the
+    ``document_kind`` is looked up from the artifact's recorded ``content_type`` via
+    :data:`_CONTENT_TYPE_TO_SI_MEMBER_DOCUMENT_KIND`, never taken from a caller. The
+    node carries no extraction: a word-processor cell's text is re-derived at replay
+    from the ``.docx`` bytes through the embedded OOXML inventory, not from an
+    extracted-text record, so ``extraction``/``verification``/``glyph_health`` are the
+    honest ``Absent`` a text-free node states (SourceNode's validator binds
+    ``verification`` to ``extraction``, and replay excludes a missing extraction from
+    findings for a node no ``CharSpanLocator`` targets).
+
+    The ``node_id`` is a LABEL derived from the ``sha256`` (:func:`_supplement_node_id`),
+    never a name a caller invents, and this function ENFORCES that: a ``node_id`` that is
+    not the sha-derived one is refused below, so two callers can never mint inconsistent
+    ids for one document's node -- the same doctrine that has this function re-read and
+    re-hash the bytes rather than trust the caller's ``sha256``. ``parent_node_id`` is the
+    root article; SourceGraph's I4 requires an ``SI_MEMBER`` to be parented on a
+    PAPER_PDF/JATS_XML root.
+
+    Raises:
+        DatasetProducerError: The ``node_id`` is not the sha-derived label; the artifact is
+            absent or its raw bytes no longer hash to ``sha256`` (raised by the shared
+            authentication helper); or its ``content_type`` maps to no
+            ``SiMemberDocumentKind`` this producer may honestly assert.
+    """
+    expected_node_id = _supplement_node_id(sha256)
+    if node_id != expected_node_id:
+        raise DatasetProducerError(
+            f"supplement node_id={node_id!r} is not the label derived from the document sha256 "
+            f"(required {expected_node_id!r}); the id of an SI_MEMBER node is a fact derived from its "
+            "sha, never a caller-supplied name, so a node cannot be minted under a different id"
+        )
+    content_type, _root_sidecar_claim = _authenticate_raw_bytes_and_read_source_metadata(workspace_root, sha256)
+    document_kind = _CONTENT_TYPE_TO_SI_MEMBER_DOCUMENT_KIND.get(content_type)
+    if document_kind is None:
+        raise DatasetProducerError(
+            f"supplement {sha256!r} has content_type={content_type!r}, which does not map to any "
+            f"SiMemberDocumentKind this producer may honestly assert (recognised: "
+            f"{sorted(_CONTENT_TYPE_TO_SI_MEMBER_DOCUMENT_KIND)}); refusing to guess the document kind"
+        )
+    return SourceNode(
+        node_id=node_id,
+        kind=SourceNodeKind.SI_MEMBER,
+        sha256=sha256,
+        parent_node_id=parent_node_id,
+        # This producer authenticates the member's bytes but tracks no archive it was
+        # unpacked from, so origin is the honest NOT_APPLICABLE rather than an invented
+        # ArchiveOrigin. Only an SI_MEMBER may carry a concrete origin; none is asserted.
+        origin=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+        document_kind=document_kind,
+        # No extracted-text record is read for a supplement whose cells are re-derived
+        # from its own bytes; the verification tier binds to extraction, so it too is
+        # Absent (see docstring).
+        extraction=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        glyph_health=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+        verification=Absent(reason=AbsenceReason.NOT_EXTRACTED_YET),
+    )
 
 
 def _authenticate_raw_bytes_and_read_source_metadata(
