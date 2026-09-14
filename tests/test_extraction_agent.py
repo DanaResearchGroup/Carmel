@@ -18,13 +18,15 @@ from carmel.agents.extraction_agent import (
     EXTRACTION_SYSTEM_PROMPT,
     ExtractionProposal,
     ProposedDeviceClass,
+    ProposedHeaderUnit,
     ProposedScalarCondition,
+    ProposedTabularAxis,
     ProposedUnresolvedSubject,
     build_extraction_agent,
 )
 from carmel.agents.models import MockModel
 from carmel.config import AgentBudgetConfig
-from carmel.schemas.datasets import SubjectRefusalReason
+from carmel.schemas.datasets import AxisRole, SubjectRefusalReason
 from carmel.services.units import QuantityKind
 
 _SHA = "a" * 64
@@ -148,3 +150,28 @@ class TestExtractionProposalSchema:
         proposal = ExtractionProposal.model_validate(_proposal_dict())
         assert proposal.observables == []
         assert proposal.done is True
+
+
+class TestProposedTabularAxisRole:
+    """The proposal may declare only the two supported axis roles. AxisRole has a
+    third member, CONSTANT, that the producer cannot file from a proposal (it hardcodes
+    constants=() and trips the Series S5 invariant with a ValidationError that is NOT a
+    per-candidate refusal). The schema refuses it at the boundary, so a model cannot
+    emit what the pipeline cannot hold -- rather than the persona merely asking nicely."""
+
+    @pytest.mark.parametrize("role", [AxisRole.COORDINATE, AxisRole.OBSERVATION])
+    def test_a_supported_role_is_accepted(self, role: AxisRole) -> None:
+        axis = ProposedTabularAxis(
+            axis_id="x", role=role, quantity_kind=QuantityKind.OTHER, header_quote="h", unit=ProposedHeaderUnit()
+        )
+        assert axis.role is role
+
+    def test_the_constant_role_is_refused_at_the_schema(self) -> None:
+        with pytest.raises(ValidationError, match="only coordinate or observation"):
+            ProposedTabularAxis(
+                axis_id="x",
+                role=AxisRole.CONSTANT,
+                quantity_kind=QuantityKind.OTHER,
+                header_quote="h",
+                unit=ProposedHeaderUnit(),
+            )

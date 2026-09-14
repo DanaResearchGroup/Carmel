@@ -26,6 +26,7 @@ from carmel.services.dataset_replay import ReplayOutcome, replay_condition_set
 from carmel.services.proposal_intake import (
     ProposalIntakeError,
     build_extraction_prompt,
+    build_tabular_series_prompt,
     condition_set_from_proposal,
     current_extraction_text,
 )
@@ -344,4 +345,48 @@ class TestTheOccurrenceSelectorAgreesEndToEnd:
             assert body.startswith(text)
             # The only permitted addition is a single newline to put the end marker on
             # its own line, and only when the text does not already end one.
+            assert len(body) - len(text) == (0 if text.endswith("\n") else 1)
+
+
+class TestBuildTabularSeriesPrompt:
+    """The tabular prompt's safety contract, asserted directly on ``user_prompt`` --
+    the intake tests drive canned MockModel responses and never inspect the prompt, so
+    without these a dropped grid/document marker or an injected character would stay
+    green while a live model lost the ability to quote groundable headers and units."""
+
+    def test_it_embeds_the_sha_label_grid_and_document_between_markers(self) -> None:
+        prompt = build_tabular_series_prompt(
+            artifact_sha256="b" * 64,
+            table_label="Table 1",
+            grid_text="row 0 col 0: phi",
+            document_text="the flame speed is 67.2 cm/s",
+        )
+        assert "b" * 64 in prompt
+        assert "Table 1" in prompt
+        assert "row 0 col 0: phi" in prompt
+        assert "the flame speed is 67.2 cm/s" in prompt
+        assert "<<<GRID>>>" in prompt and "<<<END GRID>>>" in prompt
+        assert "<<<DOCUMENT>>>" in prompt and "<<<END DOCUMENT>>>" in prompt
+
+    def test_the_grid_block_adds_no_character_the_grid_does_not_carry(self) -> None:
+        """Everything between the GRID markers is the rendered grid, byte for byte, plus
+        at most one newline to put the end marker on its own line -- the agent is told to
+        quote a header only from inside those markers, character for character."""
+        for grid in ("row 0 col 0: h", "row 0 col 0: h\n", "a\\b", ""):
+            prompt = build_tabular_series_prompt(
+                artifact_sha256="b" * 64, table_label="T", grid_text=grid, document_text="d"
+            )
+            body = prompt.split("<<<GRID>>>\n", 1)[1].rsplit("<<<END GRID>>>", 1)[0]
+            assert body.startswith(grid)
+            assert len(body) - len(grid) == (0 if grid.endswith("\n") else 1)
+
+    def test_the_document_block_adds_no_character_the_text_does_not_carry(self) -> None:
+        """The same boundary discipline as ``build_extraction_prompt``: nothing is added
+        inside the DOCUMENT markers except the single end-marker newline."""
+        for text in ("t", "t\n", "line one\nline two", ""):
+            prompt = build_tabular_series_prompt(
+                artifact_sha256="b" * 64, table_label="T", grid_text="g", document_text=text
+            )
+            body = prompt.split("<<<DOCUMENT>>>\n", 1)[1].rsplit("<<<END DOCUMENT>>>", 1)[0]
+            assert body.startswith(text)
             assert len(body) - len(text) == (0 if text.endswith("\n") else 1)
