@@ -265,6 +265,33 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    report_tables = subparsers.add_parser(
+        "report-tables",
+        help="Run the geometric table lane over ANY stored document and report per-candidate outcomes",
+        description=(
+            "Take an arbitrary stored document by its raw_sha256 -- no hard-coded identity -- and "
+            "carry it through the geometric table lane: authenticate the stored bytes, extract "
+            "fragments (carrying lossiness honestly), propose table regions, build an inventory "
+            "per proposal, and classify each. A grid the classifier calls MEASURED over a "
+            "non-lossy extraction has its inventory record stored and PROVED to replay off disk; "
+            "every other candidate is reported with a typed refusal that names the step and the "
+            "document, and the other candidates are still carried. A tabular dataset SERIES is "
+            "NOT produced: that step needs per-column axis semantics the classifier does not "
+            "supply, so it is deferred, not faked."
+        ),
+    )
+    report_tables.add_argument(
+        "--workspace",
+        type=Path,
+        required=True,
+        help="Workspace root holding evidence/literature/<raw_sha256>/ and receiving any stored record.",
+    )
+    report_tables.add_argument(
+        "--sha",
+        required=True,
+        help="raw_sha256 of the stored document to run the table lane over.",
+    )
+
     return parser
 
 
@@ -1094,6 +1121,65 @@ def _cmd_requests(
     return 0
 
 
+def _cmd_report_tables(workspace: Path, sha: str) -> int:
+    """Run the geometric table lane over one arbitrary stored document and report it.
+
+    Thin wrapper over :func:`carmel.services.general_table_report.report_document_tables`.
+    A whole-document failure is a typed error reported to stderr with a non-zero exit; it
+    is never routed around. Those are the conditions under which no honest per-candidate
+    work is possible at all: the sha is malformed, the document's bytes are absent, they
+    do not hash to the requested sha, or the store promoted a record to an address other
+    than the one just verified (a store-integrity failure that impugns the whole store).
+
+    Everything a single candidate can do wrong is reported PER CANDIDATE and exits zero,
+    never raised -- including a MEASURED grid whose staged record does not replay off
+    disk, which is a ``REPLAY_REFUSED`` outcome rather than a whole-document failure. That
+    record lived only in a torn-down staging workspace and never reached the real store,
+    so the other candidates are still carried: a document where one grid yields and
+    another refuses yields the first and reports the second.
+
+    A document that yields nothing storable is NOT a failure either: a clear report of
+    nothing, with a typed reason per candidate, exits zero -- refusing to store is a
+    legitimate outcome, and lowering a threshold to manufacture output is exactly what
+    this project exists to prevent.
+    """
+    from carmel.services.general_table_report import (
+        GeneralTableReportError,
+        report_document_tables,
+    )
+
+    try:
+        report = report_document_tables(workspace.expanduser(), sha)
+    except GeneralTableReportError as exc:
+        print(f"Refusing to report tables for {sha}: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Document        : {report.raw_sha256}")
+    print(f"Extraction      : lossy={report.extraction_lossy} status={report.extraction_status.value}")
+    if report.extraction_unavailable:
+        print(f"                  extraction unavailable: {report.extraction_unavailable_detail}")
+    print(f"Candidates      : {len(report.outcomes)} ({len(report.stored)} stored, {len(report.refused)} refused)")
+    print()
+    for outcome in report.outcomes:
+        print(f"[{outcome.status.value.upper()}] {outcome.candidate}")
+        if outcome.verdict is not None:
+            print(f"    classifier verdict: {outcome.verdict.value}")
+        if outcome.proposal_refusal_reason is not None:
+            print(f"    proposal refusal  : {outcome.proposal_refusal_reason.value}")
+        if outcome.detail:
+            print(f"    {outcome.detail}")
+        for ground in outcome.grounds:
+            print(f"    ground: {ground.kind.value} [{ground.polarity.value}] -- {ground.detail}")
+        for want in outcome.needed:
+            print(f"    needed: {want}")
+        if outcome.stored_inventory_sha256 is not None:
+            print(f"    stored inventory sha256: {outcome.stored_inventory_sha256}")
+        if outcome.series_deferred is not None:
+            print(f"    series deferred: {outcome.series_deferred}")
+        print()
+    return 0
+
+
 def _cmd_store_tabular_dataset(workspaces: Path | None) -> int:
     """Produce and durably store the registered tabular dataset, then export it.
 
@@ -1264,6 +1350,9 @@ def main(argv: list[str] | None = None) -> int:
             all_artifacts=args.all,
             apply=args.apply,
         )
+
+    if args.command == "report-tables":
+        return _cmd_report_tables(args.workspace, args.sha)
 
     if args.command == "store-tabular-dataset":
         return _cmd_store_tabular_dataset(args.workspaces)
