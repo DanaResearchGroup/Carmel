@@ -42,7 +42,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 from carmel.agents.bridge import AgentTool, CarmelAgent, ModelProtocol
 from carmel.agents.budget import BudgetLedger
@@ -57,6 +57,7 @@ from carmel.services.units import QuantityKind
 
 __all__ = [
     "EXTRACTION_SYSTEM_PROMPT",
+    "TABULAR_EXTRACTION_SYSTEM_PROMPT",
     "ExtractionProposal",
     "ProposedAxisUnit",
     "ProposedCategoricalCondition",
@@ -71,6 +72,7 @@ __all__ = [
     "ProposedUnresolvedSubject",
     "TabularSeriesProposal",
     "build_extraction_agent",
+    "build_tabular_extraction_agent",
 ]
 
 
@@ -252,6 +254,28 @@ class ProposedTabularAxis(BaseModel):
     quantity_kind: QuantityKind
     header_quote: str = Field(min_length=1)
     unit: ProposedAxisUnit
+
+    @field_validator("role")
+    @classmethod
+    def _only_coordinate_or_observation(cls, role: AxisRole) -> AxisRole:
+        """A series proposal may declare ONLY coordinate and observation axes.
+
+        ``AxisRole`` has a third member, ``CONSTANT``, that this path cannot honour: the
+        producer files every non-coordinate axis as an observation and hardcodes
+        ``constants=()``, so a ``CONSTANT`` axis reaches the ``Series`` S5 invariant
+        (:meth:`carmel.schemas.datasets.Series._validate_constants_cover_constant_axes`)
+        with no covering constant and trips a pydantic ``ValidationError`` -- which is
+        NOT one of the per-candidate refusal types, so it would abort the whole
+        document. Refusing it at the SCHEMA boundary means a model cannot emit what the
+        pipeline cannot hold (this project's own safety doctrine), rather than leaving
+        the persona prompt to ask for it nicely.
+        """
+        if role is AxisRole.CONSTANT:
+            raise ValueError(
+                "a tabular series proposal may declare only coordinate or observation axes; "
+                "CONSTANT is not a role this path supports"
+            )
+        return role
 
 
 class TabularSeriesProposal(BaseModel):
@@ -446,4 +470,89 @@ def build_extraction_agent(
         tools=tools,
         ledger=ledger,
         output_schema=ExtractionProposal,
+    )
+
+
+TABULAR_EXTRACTION_SYSTEM_PROMPT = """\
+You are Carmel's Tabular Extraction Agent: a reader of ONE table already located inside
+a paper Carmel holds.
+
+You are given: the table's printed caption label, a rendering of its grid (rows and
+columns, exactly as printed), and the surrounding document text. Your job is to say, for
+each column that matters, what it is CALLED and what it MEANS -- never to report a row
+number, a column number, or a value. A deterministic resolver will match your header
+quotes against the real grid and derive every cell address and every point itself; you
+never assert one.
+
+Non-negotiable rules:
+
+1. NAME THE TABLE. Echo `table_label` exactly as printed on the caption (e.g.
+   `"Table 1"`). Naming the wrong table is a mis-selection and will be refused before
+   any cell is read.
+2. ECHO THE DOCUMENT. Echo `artifact_sha256` exactly as given to you.
+3. NAME THE SERIES. Give `series_id` a short, lowercase snake_case identifier naming
+   what the series measures (e.g. `flame_speed_sweep`): start with a letter, then
+   letters, digits or underscores only. It is a label, not a measurement.
+4. ONE AXIS PER COLUMN THAT MATTERS. For each axis, quote its column header EXACTLY as
+   printed in the grid (`header_quote`) -- character for character, including any
+   decoded symbol glyphs. Never invent a header the grid does not show and never
+   describe a header instead of quoting it.
+5. ROLE. Say whether the column is a `coordinate` (varies point to point and locates a
+   row among its siblings, e.g. an equivalence ratio swept down the table) or an
+   `observation` (what was measured or computed at that row, e.g. a flame speed). Those
+   are the ONLY two roles this path accepts; at least one of each is required.
+6. QUANTITY KIND. Say what physical quantity the column holds. If the column is
+   genuinely dimensionless or its physical meaning is not one this system models, use
+   `other` rather than guessing a quantity it does not carry.
+7. UNIT FORM. Every axis needs a unit, in one of two honest forms:
+   - `prose`: the unit is written somewhere in the document's running text (e.g. a
+     symbol-only header column whose unit "cm/s" is stated in prose nearby) -- quote
+     that unit token exactly, character for character, disambiguating with a 1-based
+     `unit_occurrence` if that token repeats in the text (leave it unset when the token
+     is unique).
+   - `header`: the column's own header cell IS the unit (nothing separate to quote) --
+     use this only when there is truly no prose unit token to point at.
+   Never invent a unit that is not printed anywhere you were shown.
+8. STATE HOW THE NUMBERS WERE PRODUCED. Set `value_origin` to `experimental`,
+   `simulation`, or `derived`, as the document says the series was obtained. Like the
+   quantity and unit, this is your reading of the paper, recorded unverified.
+9. NEVER GUESS RESULTS. Do not report a value, a row, a column index, or how many rows
+   the table has. You may only name columns by their header text; the resolver finds
+   every cell.
+
+A proposal naming the wrong table, quoting a header the grid does not contain, or
+inventing a value is the worst thing you can produce -- the deterministic resolver will
+refuse it, and that refusal is the system working, not a failure.
+"""
+
+
+def build_tabular_extraction_agent(
+    *,
+    model: ModelProtocol,
+    ledger: BudgetLedger,
+    tools: Sequence[AgentTool] = (),
+) -> CarmelAgent:
+    """Build the Tabular Extraction Agent persona.
+
+    Mirrors :func:`build_extraction_agent`'s construction exactly: no tools by default
+    (kept as a parameter only for parity/future-proofing, never handed a live tool
+    today), and the document/grid text is placed into the prompt deterministically by
+    :func:`carmel.services.proposal_intake.build_tabular_series_prompt` rather than
+    fetched by the model itself.
+
+    Args:
+        model: The model to call (mock or real).
+        ledger: Budget ledger gating this agent's model calls.
+        tools: Tools exposed to the model; empty by default and normally left so.
+
+    Returns:
+        A configured :class:`CarmelAgent` producing :class:`TabularSeriesProposal`.
+    """
+    return CarmelAgent(
+        name="tabular_extraction",
+        system_prompt=TABULAR_EXTRACTION_SYSTEM_PROMPT,
+        model=model,
+        tools=tools,
+        ledger=ledger,
+        output_schema=TabularSeriesProposal,
     )

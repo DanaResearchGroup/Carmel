@@ -24,6 +24,7 @@ import pytest
 
 from carmel.services import general_table_report as gtr
 from carmel.services import pdf_table_record
+from carmel.services.dataset_bridge import UnstorableDatasetEnvelopeError
 from carmel.services.evidence import artifact_dir
 from carmel.services.general_table_report import (
     CandidateStatus,
@@ -355,3 +356,157 @@ class TestStoredRecordMustReplay:
 
         assert any(o.status is CandidateStatus.REPLAY_REFUSED for o in report.outcomes)
         assert list(stage_parent.iterdir()) == []
+
+
+# --- optional series step (BUILD ITEM 4) ------------------------------------------------------
+
+_SERIES_DOCUMENT_TEXT = "Flame speeds were measured in cm/s across the sweep reported in Table 1."
+
+
+def _series_proposal(*, sha256: str, table_label: str = "Table 1") -> dict[str, object]:
+    """A MockModel response matching ``_measured_grid``'s two columns verbatim."""
+    return {
+        "artifact_sha256": sha256,
+        "table_label": table_label,
+        "series_id": "flame_speed_sweep",
+        "value_origin": "experimental",
+        "axes": [
+            {
+                "axis_id": "phi",
+                "role": "coordinate",
+                "quantity_kind": "other",
+                "header_quote": "phi",
+                "unit": {"kind": "header"},
+            },
+            {
+                "axis_id": "s_l",
+                "role": "observation",
+                "quantity_kind": "velocity",
+                "header_quote": "S (cm/s)",
+                "unit": {"kind": "prose", "unit_quote": "cm/s", "unit_occurrence": 1},
+            },
+        ],
+    }
+
+
+def _place_measured_document(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Inject the measured grid and store a REAL artifact (through
+    ``evidence.store_artifact``, with a genuine extraction record) for
+    ``_SERIES_DOCUMENT_TEXT`` -- the series step's producer requires a full stored
+    artifact (``meta.json`` and all), not just a bare ``raw.bin``, and
+    ``current_extraction_text`` separately requires a genuine extraction record."""
+    from tests.test_dataset_producer import _store_synthetic_artifact
+
+    _inject(monkeypatch, _extraction(*_measured_grid()))
+    return _store_synthetic_artifact(tmp_path, _SERIES_DOCUMENT_TEXT).sha256
+
+
+def _series_agent(responses: list[object]):  # noqa: ANN201
+    from carmel.agents.budget import BudgetLedger
+    from carmel.agents.extraction_agent import build_tabular_extraction_agent
+    from carmel.agents.models import MockModel
+    from carmel.config import AgentBudgetConfig
+
+    ledger = BudgetLedger(AgentBudgetConfig())  # type: ignore[call-arg]
+    return build_tabular_extraction_agent(model=MockModel(responses=responses), ledger=ledger)
+
+
+class TestSeriesAgentWiring:
+    def test_no_series_agent_leaves_the_stored_outcome_unchanged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default ``series_agent=None`` -- behaviour byte-unchanged from before Build
+        Item 4: no new fields populated, the deferred note still present."""
+        sha = _place_measured_document(tmp_path, monkeypatch)
+        report = report_document_tables(tmp_path, sha)
+
+        assert len(report.outcomes) == 1
+        outcome = report.outcomes[0]
+        assert outcome.status is CandidateStatus.STORED
+        assert outcome.series_deferred is not None
+        assert outcome.series_dataset_sha256 is None
+
+    def test_a_measured_candidate_becomes_series_stored(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        sha = _place_measured_document(tmp_path, monkeypatch)
+        agent = _series_agent([_series_proposal(sha256=sha)])
+
+        report = report_document_tables(tmp_path, sha, series_agent=agent)
+
+        assert len(report.outcomes) == 1
+        outcome = report.outcomes[0]
+        assert outcome.status is CandidateStatus.SERIES_STORED
+        assert outcome.series_dataset_sha256 is not None
+        assert outcome.stored
+
+    def test_a_schema_invalid_agent_response_yields_series_refused_not_a_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One candidate's series step must never abort the document -- a
+        schema-invalid response (AgentBridgeError) is caught and typed, not raised."""
+        sha = _place_measured_document(tmp_path, monkeypatch)
+        agent = _series_agent([{"not": "a valid tabular series proposal"}])
+
+        report = report_document_tables(tmp_path, sha, series_agent=agent)
+
+        assert len(report.outcomes) == 1
+        outcome = report.outcomes[0]
+        assert outcome.status is CandidateStatus.SERIES_REFUSED
+        assert outcome.detail
+        assert outcome.series_dataset_sha256 is None
+        # The underlying inventory record is still stored -- the series step is additive.
+        assert not _no_record_written(tmp_path, sha)
+
+    def test_a_failing_series_store_yields_series_refused_not_a_raise(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FINDING B. The intake owns the SINGLE dataset store (a second, unprotected
+        store used to sit outside the per-candidate try). A store that refuses the
+        envelope is this candidate's refusal, not a document abort: its
+        ``UnstorableDatasetEnvelopeError`` is in the per-candidate catch set, so the
+        candidate becomes SERIES_REFUSED while its grid record stays stored and the
+        document still returns."""
+        sha = _place_measured_document(tmp_path, monkeypatch)
+        agent = _series_agent([_series_proposal(sha256=sha)])
+
+        def _refuse_store(*_args: object, **_kwargs: object) -> object:
+            raise UnstorableDatasetEnvelopeError("simulated store refusal")
+
+        monkeypatch.setattr("carmel.services.tabular_series_intake.store_dataset_envelope", _refuse_store)
+
+        report = report_document_tables(tmp_path, sha, series_agent=agent)
+
+        assert len(report.outcomes) == 1
+        outcome = report.outcomes[0]
+        assert outcome.status is CandidateStatus.SERIES_REFUSED
+        assert outcome.series_dataset_sha256 is None
+        assert not _no_record_written(tmp_path, sha)  # the grid record is still stored
+
+
+class TestSeriesPartialYield:
+    def test_one_candidate_series_stores_while_another_series_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """VERIFIER ITEM 6. Page 1's measured grid gets a matching proposal and becomes
+        SERIES_STORED; page 2's measured grid (a second copy of the same shape, so it too
+        classifies MEASURED and is offered to the agent) gets a schema-invalid response and
+        becomes SERIES_REFUSED. Both are reported; the document never raises."""
+        from tests.test_dataset_producer import _store_synthetic_artifact
+
+        _inject(monkeypatch, _extraction(*_measured_grid(page=1), *_measured_grid(page=2)))
+        sha = _store_synthetic_artifact(tmp_path, _SERIES_DOCUMENT_TEXT).sha256
+
+        agent = _series_agent(
+            [
+                _series_proposal(sha256=sha),
+                {"not": "a valid tabular series proposal"},
+            ]
+        )
+
+        report = report_document_tables(tmp_path, sha, series_agent=agent)
+
+        by_page = {o.page: o for o in report.outcomes}
+        assert by_page[1].status is CandidateStatus.SERIES_STORED
+        assert by_page[2].status is CandidateStatus.SERIES_REFUSED
+        assert by_page[1].series_dataset_sha256 is not None
+        assert by_page[2].series_dataset_sha256 is None
+        assert len(report.stored) == 1  # SERIES_STORED counts as stored; SERIES_REFUSED does not

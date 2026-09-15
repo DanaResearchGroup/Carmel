@@ -30,8 +30,8 @@ pieces honestly allow:
 **Every judgement here is already made by a function that exists.** This module adds no
 heuristic, no ruled-line detection, no quantity-name matching. It is wiring.
 
-**What it deliberately does NOT do: produce a tabular dataset SERIES.** The final
-envelope producer
+**The tabular dataset SERIES step is OPTIONAL, gated on a supplied ``series_agent``.**
+The final envelope producer
 (:func:`~carmel.services.tabular_dataset_producer.produce_tabular_envelope_from_artifact`,
 and the bridge :func:`~carmel.services.proposal_intake.tabular_series_from_proposal`)
 requires the caller to ASSERT, per column, an axis ``role`` (independent coordinate vs
@@ -40,11 +40,19 @@ dependent observation), a ``quantity_kind``, a grounded ``unit_quote`` and the s
 whole-grid (MEASURED / NOT_MEASURED / UNDECIDED), and while its grounds name which
 columns are numeric or sweep, they bind no quantity, no unit and no axis role to a
 column -- by design, since quantity-name matching is a thing the classifier refuses on
-principle. So a storable SERIES cannot be synthesized from the classifier's output by
-wiring alone; on a MEASURED grid this path stores the replayable GRID and records that
-the series step is DEFERRED, pending a source of per-column axis semantics (the
-extraction agent's ``TabularSeriesProposal``, or a hand-authored spec as the two pinned
-paths use). That deferral is honest and is NOT a refusal to store: the grid IS stored.
+principle. So those per-column semantics come from the extraction agent, not from wiring:
+
+* With ``series_agent=None`` (the default), this path stops at the stored, replayable
+  GRID and records the series step DEFERRED (:data:`_SERIES_DEFERRED`), pending a source
+  of per-column axis semantics. That deferral is honest and is NOT a refusal to store:
+  the grid IS stored.
+* With a ``series_agent`` supplied, each MEASURED-and-stored grid is additionally carried
+  through :func:`~carmel.services.tabular_series_intake.series_from_classified_grid` --
+  which prompts the agent for a ``TabularSeriesProposal``, resolves it against the grid,
+  and stores the series only after it replays -- becoming
+  :attr:`CandidateStatus.SERIES_STORED` or, on any per-candidate refusal,
+  :attr:`CandidateStatus.SERIES_REFUSED`. Never a raise: one grid's series refusal never
+  aborts the document.
 
 Failure is closed. A document whose bytes are absent or do not authenticate raises
 :class:`GeneralTableReportError` and processes no candidate. Everything else is
@@ -67,6 +75,11 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from carmel.agents.bridge import AgentBridgeError, CarmelAgent
+from carmel.schemas.datasets import CaptionLabelKey, EmbeddedTableInventory
+from carmel.services.dataset_bridge import UnstorableDatasetEnvelopeError
+from carmel.services.dataset_producer import DatasetProducerError, QuoteGroundingError
+from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.evidence import artifact_dir
 from carmel.services.pdf_fragments import (
     FragmentAvailability,
@@ -74,6 +87,7 @@ from carmel.services.pdf_fragments import (
     extract_fragments,
 )
 from carmel.services.pdf_table_proposer import (
+    CAPTION_HEADING,
     ProposalRefusalReason,
     ProposedTable,
     propose_tables,
@@ -83,12 +97,16 @@ from carmel.services.pdf_table_store import (
     store_inventory_record,
     verify_stored_inventory,
 )
+from carmel.services.proposal_intake import ProposalIntakeError, current_extraction_text
 from carmel.services.table_data_discriminator import (
     DataVerdict,
     Ground,
+    TableClassification,
     classify_table,
     table_view_from_pdf_payload,
 )
+from carmel.services.tabular_series_intake import TabularSeriesIntakeError, series_from_classified_grid
+from carmel.services.tabular_series_resolver import TabularSeriesResolutionError
 
 __all__ = [
     "CandidateOutcome",
@@ -152,6 +170,20 @@ class CandidateStatus(StrEnum):
     candidates. The typed reason (including the verifier's outcome) is in
     :attr:`CandidateOutcome.detail`."""
 
+    SERIES_STORED = "series_stored"
+    """A STORED grid additionally carried through :func:`series_from_classified_grid`
+    (only attempted when a ``series_agent`` is supplied): the agent's proposal resolved,
+    the resulting dataset envelope replayed cleanly off disk, and it was stored. The
+    dataset's address is in :attr:`CandidateOutcome.series_dataset_sha256`; the grid's
+    own inventory record is still recorded on :attr:`CandidateOutcome.stored_inventory_sha256`."""
+
+    SERIES_REFUSED = "series_refused"
+    """A STORED grid was offered to a supplied ``series_agent`` but the series step was
+    refused -- typed and per-candidate, never a raise, so this candidate's underlying
+    grid stays stored (:attr:`CandidateOutcome.stored_inventory_sha256` is still set) and
+    the rest of the document is unaffected. The typed reason is in
+    :attr:`CandidateOutcome.detail`."""
+
 
 @dataclass(frozen=True, slots=True)
 class CandidateOutcome:
@@ -160,8 +192,11 @@ class CandidateOutcome:
     Exactly one of two shapes is populated: a geometric refusal (``status`` is
     :attr:`CandidateStatus.PROPOSAL_REFUSED`, ``proposal_refusal_reason`` set,
     ``verdict`` is ``None``) or a proposed-and-classified grid (``verdict`` set). A
-    STORED outcome additionally carries ``stored_inventory_sha256`` and, always for a
-    measured grid, ``series_deferred`` explaining why the lane stops at the grid.
+    STORED outcome additionally carries ``stored_inventory_sha256``. The MEASURED-grid
+    series step then depends on whether a ``series_agent`` was supplied: without one,
+    ``series_deferred`` explains why the lane stops at the grid; with one, the grid is
+    carried on and the outcome becomes ``SERIES_STORED`` (with ``series_dataset_sha256``
+    set) or ``SERIES_REFUSED`` (with the typed reason in ``detail``).
     """
 
     candidate: str
@@ -175,10 +210,11 @@ class CandidateOutcome:
     needed: tuple[str, ...] = ()
     stored_inventory_sha256: str | None = None
     series_deferred: str | None = None
+    series_dataset_sha256: str | None = None
 
     @property
     def stored(self) -> bool:
-        return self.status is CandidateStatus.STORED
+        return self.status in (CandidateStatus.STORED, CandidateStatus.SERIES_STORED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,6 +277,47 @@ def _label(page: int, caption_fragment: str) -> str:
     return f"page {page}, caption {caption_fragment!r}"
 
 
+#: The series step must never abort the document (see the module docstring's "closed
+#: failure" promise, extended per-candidate to the series step). Every exception the
+#: series bridge and the agent call itself can raise for an honest, typed reason on ONE
+#: candidate is caught here and turned into :attr:`CandidateStatus.SERIES_REFUSED`;
+#: nothing else is caught, so a genuine bug still surfaces.
+_SERIES_REFUSAL_EXCEPTIONS = (
+    TabularSeriesIntakeError,
+    AgentBridgeError,
+    ProposalIntakeError,
+    TabularSeriesResolutionError,
+    DatasetProducerError,
+    QuoteGroundingError,
+    # The intake owns the single dataset store; a store that refuses the envelope
+    # (UnstorableDatasetEnvelopeError) is this candidate's refusal, not a document abort.
+    UnstorableDatasetEnvelopeError,
+)
+
+
+def _caption_label_key(caption_fragment: str) -> CaptionLabelKey | None:
+    """Derive the table label the series agent must echo, from the proposer's caption.
+
+    Only the ``"Table N"`` heading text is used -- never fabricated. A candidate whose
+    caption fragment carries no such heading (the table_label friction) has no usable
+    key, and the caller must report that as a typed refusal rather than inventing one.
+
+    Args:
+        caption_fragment: :attr:`CandidateOutcome.caption_fragment` for the candidate.
+
+    Returns:
+        The :class:`CaptionLabelKey` naming the table, or ``None`` if the caption
+        carries no ``"Table N"`` heading.
+    """
+    match = CAPTION_HEADING.match(caption_fragment)
+    if match is None:
+        return None
+    label = " ".join(match.group(0).split())
+    if not label:
+        return None
+    return CaptionLabelKey(label=label)
+
+
 def _classify_and_maybe_store(
     workspace_root: Path,
     staging_root: Path,
@@ -248,6 +325,7 @@ def _classify_and_maybe_store(
     proposal: ProposedTable,
     *,
     max_bytes: int,
+    series_agent: CarmelAgent | None = None,
 ) -> CandidateOutcome:
     """Classify one proposed grid and, only if honestly warranted, store it.
 
@@ -339,16 +417,100 @@ def _classify_and_maybe_store(
             f"promoted inventory {inventory_sha256} for {raw_sha256} is not the staged-and-verified "
             f"address {staged_sha256}; refusing to report a value whose replay was not proven"
         )
+    if series_agent is None:
+        return CandidateOutcome(
+            candidate=label,
+            page=page,
+            caption_fragment=proposal.caption_fragment,
+            status=CandidateStatus.STORED,
+            detail="inventory record stored and proved to replay off disk",
+            verdict=verdict,
+            grounds=classification.grounds,
+            stored_inventory_sha256=inventory_sha256,
+            series_deferred=_SERIES_DEFERRED,
+        )
+
+    series_status, series_detail, series_dataset_sha256 = _attempt_series_step(
+        workspace_root,
+        raw_sha256=raw_sha256,
+        proposal=proposal,
+        payload=payload,
+        classification=classification,
+        series_agent=series_agent,
+    )
     return CandidateOutcome(
         candidate=label,
         page=page,
         caption_fragment=proposal.caption_fragment,
-        status=CandidateStatus.STORED,
-        detail="inventory record stored and proved to replay off disk",
+        status=series_status,
+        detail=series_detail,
         verdict=verdict,
         grounds=classification.grounds,
         stored_inventory_sha256=inventory_sha256,
-        series_deferred=_SERIES_DEFERRED,
+        series_dataset_sha256=series_dataset_sha256,
+    )
+
+
+def _attempt_series_step(
+    workspace_root: Path,
+    *,
+    raw_sha256: str,
+    proposal: ProposedTable,
+    payload: object,
+    classification: TableClassification,
+    series_agent: CarmelAgent,
+) -> tuple[CandidateStatus, str, str | None]:
+    """Drive one STORED candidate's grid through :func:`series_from_classified_grid`.
+
+    Never raises: every honest, typed refusal from the series bridge or the agent call
+    itself is caught and reported as :attr:`CandidateStatus.SERIES_REFUSED` on THIS
+    candidate alone, so one grid's series refusal can never abort the document (the same
+    partial-yield discipline the module docstring promises for every other step).
+
+    Args:
+        workspace_root: The real workspace to store the resulting dataset envelope in.
+        raw_sha256: The document's authenticated sha256.
+        proposal: The candidate's proposed table, already classified MEASURED.
+        payload: The inventory record payload already computed for this candidate
+            (``inventory_record_payload(proposal.inventory, raw_sha256=raw_sha256)``).
+        classification: The candidate's :class:`TableClassification`.
+        series_agent: The extraction agent driving the series proposal.
+
+    Returns:
+        A ``(status, detail, series_dataset_sha256)`` triple: ``SERIES_STORED`` with the
+        dataset's sha256, or ``SERIES_REFUSED`` with a typed detail and no sha256.
+    """
+    table_key = _caption_label_key(proposal.caption_fragment)
+    if table_key is None:
+        return (
+            CandidateStatus.SERIES_REFUSED,
+            f"caption {proposal.caption_fragment!r} carries no 'Table N' heading; refusing to "
+            "fabricate a table label for the series agent",
+            None,
+        )
+    canonical = canonical_json_bytes(payload).decode("utf-8")
+    embedded_inventory = EmbeddedTableInventory(
+        inventory_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        raw_sha256=raw_sha256,
+        canonical_json=canonical,
+    )
+    try:
+        document_text = current_extraction_text(workspace_root, raw_sha256)
+        stored = series_from_classified_grid(
+            workspace_root,
+            agent=series_agent,
+            expected_sha256=raw_sha256,
+            table_key=table_key,
+            inventory=embedded_inventory,
+            classification=classification,
+            document_text=document_text,
+        )
+    except _SERIES_REFUSAL_EXCEPTIONS as exc:
+        return (CandidateStatus.SERIES_REFUSED, f"series step refused: {exc}", None)
+    return (
+        CandidateStatus.SERIES_STORED,
+        "inventory record stored, and the agent-proposed series stored and proved to replay off disk",
+        stored.sha256,
     )
 
 
@@ -357,6 +519,7 @@ def report_document_tables(
     raw_sha256: str,
     *,
     max_bytes: int | None = None,
+    series_agent: CarmelAgent | None = None,
 ) -> DocumentTableReport:
     """Carry one arbitrary document through the geometric table lane.
 
@@ -369,6 +532,14 @@ def report_document_tables(
         max_bytes: Cap on the ``raw.bin`` size for the off-disk replay check. Defaults
             to the exact size of the authenticated bytes -- the honest bound, since the
             replay verifies against the very file just read.
+        series_agent: Optional extraction agent. When ``None`` (the default), behaviour
+            is byte-unchanged from before this parameter existed: every STORED candidate
+            keeps :attr:`CandidateOutcome.series_deferred` set and no series step runs.
+            When supplied, every MEASURED-and-stored candidate is additionally carried
+            through :func:`~carmel.services.tabular_series_intake.series_from_classified_grid`,
+            becoming :attr:`CandidateStatus.SERIES_STORED` or
+            :attr:`CandidateStatus.SERIES_REFUSED` -- never a raise, so one candidate's
+            series refusal can never abort the document.
 
     Returns:
         A :class:`DocumentTableReport`: one :class:`CandidateOutcome` per proposed table
@@ -424,6 +595,7 @@ def report_document_tables(
                         raw_sha256,
                         proposal,
                         max_bytes=replay_cap,
+                        series_agent=series_agent,
                     )
                 )
         finally:
