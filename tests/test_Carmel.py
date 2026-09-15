@@ -795,7 +795,72 @@ class TestRequestsCommand:
         assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"]) == 0
         out = capsys.readouterr().out
         assert "ACCEPTED" in out
-        assert "1 accepted, 0 rejected" in out
+        assert "1 accepted, 0 rejected, 0 ignored" in out
+        assert "IGNORED" not in out
+
+    def test_collect_makes_an_ignored_drop_caller_visible_and_exits_nonzero(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The defect this fixes: a file matching no queued request used to be dropped
+        on a log-only branch that never reached the exit code, so the command could exit
+        0 having ignored the operator's input. The filename AND the reason must appear in
+        the command's OWN output (not just a log record), and the exit code must be
+        non-zero."""
+        cid, ws = self._campaign_with_request(tmp_path)
+        from carmel.services.acquisition import inbox_dir
+
+        inbox = inbox_dir(ws)
+        inbox.mkdir(parents=True, exist_ok=True)
+        (inbox / "mystery-supplement.txt").write_text("unrecognised bytes\n", encoding="utf-8")
+
+        from Carmel import main
+
+        exit_code = main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"])
+        out = capsys.readouterr().out
+
+        assert exit_code != 0
+        assert "IGNORED" in out
+        assert "mystery-supplement.txt" in out
+        assert "no queued request" in out
+        assert "1 ignored" in out
+        assert "Nothing new in the inbox" not in out
+
+    def test_collect_does_not_exit_zero_when_only_unparseable_files_join_a_fulfilled_queue(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """The scenario that hid the bug for ten days: every queued request is already
+        fulfilled, so nothing changes, and the only new files are unparseable. Exiting 0
+        here reports success for a sweep that silently skipped the operator's input."""
+        cid, ws = self._campaign_with_request(tmp_path)
+        from carmel.services.acquisition import drop_path_for, inbox_dir, pending_requests
+
+        slug = pending_requests(ws)[0].slug
+        drop = drop_path_for(ws, slug, suffix=".txt")
+        drop.parent.mkdir(parents=True, exist_ok=True)
+        drop.write_text(
+            _matching_body(
+                "Abstract: we report ignition delay times.\n",
+                title="Shock tube study of ammonia oxidation ignition delay times",
+                doi="10.1016/j.test.2019.01.001",
+            ),
+            encoding="utf-8",
+        )
+
+        from Carmel import main
+
+        assert main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"]) == 0
+        capsys.readouterr()
+
+        # The request is now fulfilled; only unparseable files remain to be swept.
+        (inbox_dir(ws) / "left-behind.txt").write_text("unrecognised bytes\n", encoding="utf-8")
+
+        exit_code = main(["requests", "--campaign", cid, "--workspaces", str(tmp_path), "--collect"])
+        out = capsys.readouterr().out
+
+        assert exit_code != 0
+        assert "IGNORED" in out
+        assert "left-behind.txt" in out
+        assert "Nothing new in the inbox" not in out
 
     def test_collect_rejects_a_wrong_dropped_file(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         cid, ws = self._campaign_with_request(tmp_path)

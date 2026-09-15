@@ -37,6 +37,7 @@ from carmel.schemas.literature import ArtifactProvenance, StoredArtifact
 from carmel.services import acquisition, acquisition_recipe
 from carmel.services.acquisition import (
     AlreadyAcquired,
+    InboxIgnoreReason,
     ManifestUnreadable,
     _looks_like_full_article,
     _sniff_content_type,
@@ -53,6 +54,7 @@ from carmel.services.acquisition import (
     requests_dir,
     save_manifest,
     slug_for,
+    sweep_inbox,
 )
 from carmel.services.evidence import artifact_dir
 from tests.pypdf_gate import require_pypdf
@@ -615,6 +617,89 @@ class TestCollectInbox:
 
     def test_no_inbox_directory_is_not_an_error(self, tmp_path: Path) -> None:
         assert collect_inbox(tmp_path, max_bytes=10_000_000) == []
+
+    def test_sweep_reports_a_no_match_file_as_ignored(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """A file whose stem names no queued request is not merely left on disk: the
+        sweep RETURNS it as ignored, so a caller can surface it instead of leaving the
+        only evidence in a log line."""
+        _drop(tmp_path, "some-unrelated-file", "content")
+
+        outcome = sweep_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert outcome.changed == []
+        assert [item.filename for item in outcome.ignored] == ["some-unrelated-file.txt"]
+        assert outcome.ignored[0].reason is InboxIgnoreReason.NO_QUEUED_REQUEST
+        assert "no queued request" in outcome.ignored[0].detail
+
+    def test_sweep_distinguishes_a_supplement_whose_parent_is_not_queued(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """`<slug>.si.<ext>` for a slug that is not queued reads very differently from a
+        plain no-match -- the operator's next move is to queue THAT paper -- so it gets
+        its own reason."""
+        (inbox_dir(tmp_path) / "no-such-paper.si.zip").write_bytes(ZIP_BYTES)
+
+        outcome = sweep_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert outcome.changed == []
+        assert [item.filename for item in outcome.ignored] == ["no-such-paper.si.zip"]
+        assert outcome.ignored[0].reason is InboxIgnoreReason.SUPPLEMENT_PARENT_ABSENT
+        assert "no-such-paper" in outcome.ignored[0].detail
+
+    def test_sweep_reports_an_oversized_supplement_as_ignored(self, tmp_path: Path, queued: AcquisitionRequest) -> None:
+        """A supplement for a genuinely queued paper that is over the size cap is left
+        untouched -- and must still reach the caller, not vanish into a log line."""
+        (inbox_dir(tmp_path) / f"{queued.slug}.si.zip").write_bytes(ZIP_BYTES)
+
+        outcome = sweep_inbox(tmp_path, max_bytes=10)
+
+        assert outcome.changed == []
+        assert [item.filename for item in outcome.ignored] == [f"{queued.slug}.si.zip"]
+        assert outcome.ignored[0].reason is InboxIgnoreReason.SUPPLEMENT_REFUSED
+        assert "cap" in outcome.ignored[0].detail
+
+    def test_sweep_leaves_ignored_empty_when_a_good_file_is_admitted(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        _drop(tmp_path, queued.slug, _matching_body("Abstract: measurements follow.\n"))
+
+        outcome = sweep_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert outcome.ignored == []
+        assert [request.status for request in outcome.changed] == [AcquisitionStatus.FULFILLED]
+
+    def test_sweep_reports_unparseable_files_even_when_every_request_is_fulfilled(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """The exact case that hid the bug for ten days: the queued paper is already in
+        the store, so nothing CHANGES, but new unparseable files were dropped. The sweep
+        must not come back empty -- the ignored files are the whole point."""
+        _drop(tmp_path, queued.slug, _matching_body("Abstract: measurements follow.\n"))
+        assert sweep_inbox(tmp_path, max_bytes=10_000_000).changed  # first run fulfils it
+
+        _drop(tmp_path, "left-behind-one", "content")
+        _drop(tmp_path, "left-behind-two", "content")
+
+        outcome = sweep_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert outcome.changed == []
+        assert sorted(item.filename for item in outcome.ignored) == [
+            "left-behind-one.txt",
+            "left-behind-two.txt",
+        ]
+
+    def test_sweep_does_not_report_an_already_received_supplement_as_ignored(
+        self, tmp_path: Path, queued: AcquisitionRequest
+    ) -> None:
+        """A supplement re-dropped after it was already staged is held, not ignored: it
+        must not be flagged as skipped input."""
+        (inbox_dir(tmp_path) / f"{queued.slug}.si.zip").write_bytes(ZIP_BYTES)
+        assert sweep_inbox(tmp_path, max_bytes=10_000_000).changed  # first receipt
+
+        outcome = sweep_inbox(tmp_path, max_bytes=10_000_000)
+
+        assert outcome.changed == []
+        assert outcome.ignored == []
 
 
 def _source(tmp_path: Path, name: str, body: str) -> Path:

@@ -34,7 +34,9 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -1050,8 +1052,25 @@ def _staged_supplementary_path(sha256: str, original_filename: str) -> str:
     return f"{REQUESTS_DIR}/{SUPPLEMENTARY_DIR}/{sha256}/{original_filename}"
 
 
-def _receive_supplementary(workspace_root: Path, path: Path, parent: AcquisitionRequest, *, max_bytes: int) -> bool:
-    """Record and stage one dropped supplementary file. Mutates ``parent`` on success.
+class SupplementReceipt(StrEnum):
+    """Outcome of trying to receive one dropped supplementary file.
+
+    ``RECEIVED`` and ``ALREADY_HELD`` are both benign: the file is (now, or from an
+    earlier sweep) held on the parent request. ``OVER_CAP`` and ``UNREADABLE`` are
+    refusals the caller must surface -- a dropped file the operator supplied that was
+    left untouched, which is exactly the silent-ignore the sweep must not hide.
+    """
+
+    RECEIVED = "received"
+    ALREADY_HELD = "already_held"
+    OVER_CAP = "over_cap"
+    UNREADABLE = "unreadable"
+
+
+def _receive_supplementary(
+    workspace_root: Path, path: Path, parent: AcquisitionRequest, *, max_bytes: int
+) -> tuple[SupplementReceipt, str]:
+    """Record and stage one dropped supplementary file. Mutates ``parent`` on receipt.
 
     Received-and-held ONLY: no text extraction, no identity check, no evidence-store
     artifact. Carmel cannot process these formats yet, so admitting them as evidence
@@ -1060,28 +1079,29 @@ def _receive_supplementary(workspace_root: Path, path: Path, parent: Acquisition
     is recorded on the parent request, where the README surfaces it.
 
     Returns:
-        True when ``parent`` changed (a new receipt was recorded); False when the file
-        was already received, over the cap, or unreadable -- in every case the dropped
-        file itself is left untouched.
+        The :class:`SupplementReceipt` outcome and a human detail (empty unless the
+        outcome is a refusal). ``parent`` is mutated only on ``RECEIVED``; in every
+        other case the dropped file itself is left untouched.
     """
     # Same stat-before-read discipline as _admit_one: an oversized file must be
     # refused without being pulled into memory, and the post-read re-check closes the
     # window in which it can grow past the cap.
+    over_cap = f"is over the {max_bytes} byte cap; it was left untouched"
     try:
         if path.stat().st_size > max_bytes:
             logger.warning("supplementary file %s is over the %d byte cap; leaving it untouched", path.name, max_bytes)
-            return False
+            return SupplementReceipt.OVER_CAP, over_cap
         data = path.read_bytes()
     except OSError as exc:
         logger.warning("could not read supplementary file %s: %s", path.name, exc)
-        return False
+        return SupplementReceipt.UNREADABLE, f"could not be read: {exc}"
     if len(data) > max_bytes:
         logger.warning("supplementary file %s is over the %d byte cap; leaving it untouched", path.name, max_bytes)
-        return False
+        return SupplementReceipt.OVER_CAP, over_cap
 
     digest = hashlib.sha256(data).hexdigest()
     if any(si.sha256 == digest and si.original_filename == path.name for si in parent.supplementary):
-        return False  # Already received on an earlier sweep; nothing to change.
+        return SupplementReceipt.ALREADY_HELD, ""  # Already received on an earlier sweep; nothing to change.
 
     staged = supplementary_dir(workspace_root) / digest / path.name
     staged.parent.mkdir(parents=True, exist_ok=True)
@@ -1100,7 +1120,7 @@ def _receive_supplementary(workspace_root: Path, path: Path, parent: Acquisition
         )
     )
     logger.info("received supplementary file %s for %s (held, not ingested)", path.name, parent.slug)
-    return True
+    return SupplementReceipt.RECEIVED, ""
 
 
 class SupplementAcquisitionError(ValueError):
@@ -1409,8 +1429,52 @@ def acquire_supplements(
     return SupplementAcquisitionResult(fetched=fetched, proposed=proposed)
 
 
-def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRequest]:
-    """Admit verified dropped papers into the evidence store.
+class InboxIgnoreReason(StrEnum):
+    """Why a dropped inbox file was left untouched by a sweep.
+
+    Each reason is a DIFFERENT operator move, which is why they are distinguished
+    rather than folded into one "ignored" bucket: a name that matches no queued request
+    needs the request queued (or the name checked); a name that reads as supplementary
+    information for a paper that is not queued needs THAT paper queued first; a
+    supplement that was refused (over the size cap, or unreadable) needs the file itself
+    fixed. None of these is a log line: every one reaches the caller.
+    """
+
+    NO_QUEUED_REQUEST = "no_queued_request"
+    SUPPLEMENT_PARENT_ABSENT = "supplement_parent_absent"
+    SUPPLEMENT_REFUSED = "supplement_refused"
+
+
+@dataclass(frozen=True)
+class IgnoredInboxFile:
+    """One inbox file a sweep left untouched, with enough for the operator to act.
+
+    ``detail`` is a ready-to-print sentence; ``reason`` is the machine-readable class.
+    """
+
+    filename: str
+    reason: InboxIgnoreReason
+    detail: str
+
+
+@dataclass(frozen=True)
+class CollectOutcome:
+    """The full result of one inbox sweep.
+
+    ``changed`` carries the requests whose state changed (admitted, rejected, or a
+    request that only received a supplementary file) -- the same list
+    :func:`collect_inbox` returns. ``ignored`` carries every file the sweep left
+    untouched, so a caller can report an ignored drop and refuse to exit 0 on it. A file
+    that matched an already-FULFILLED request is neither changed nor ignored: the
+    operator's intent for it is already satisfied, so it appears in neither list.
+    """
+
+    changed: list[AcquisitionRequest] = field(default_factory=list)
+    ignored: list[IgnoredInboxFile] = field(default_factory=list)
+
+
+def sweep_inbox(workspace_root: Path, *, max_bytes: int) -> CollectOutcome:
+    """Admit verified dropped papers into the evidence store, reporting ignored files.
 
     Each file in the inbox is matched to a request by filename stem, extracted, and
     identity-checked. Only files that pass are stored (with
@@ -1421,21 +1485,28 @@ def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRe
     supplementary information for the request ``<slug>``: it is received and held (see
     :func:`_receive_supplementary`), never identity-checked or admitted as evidence.
 
+    A file the sweep cannot act on -- one whose stem names no queued request, one that
+    reads as supplementary information for a paper that is not queued, or a supplement
+    refused for being over the cap or unreadable -- is left untouched on disk AND
+    recorded in :attr:`CollectOutcome.ignored`, so the caller can surface it rather than
+    leaving the only evidence in a log record.
+
     Args:
         workspace_root: Root of the campaign workspace.
         max_bytes: Hard cap on a single artifact's size.
 
     Returns:
-        The requests whose state changed during this sweep (including a request that
-        only received a supplementary file).
+        A :class:`CollectOutcome` carrying the requests whose state changed and the
+        files the sweep ignored.
     """
     inbox = inbox_dir(workspace_root)
     if not inbox.is_dir():
-        return []
+        return CollectOutcome()
 
     manifest = load_manifest(workspace_root)
     by_slug = {request.slug: request for request in manifest.requests}
     changed: list[AcquisitionRequest] = []
+    ignored: list[IgnoredInboxFile] = []
 
     for path in sorted(inbox.iterdir()):
         if not path.is_file() or path.name.startswith("."):
@@ -1446,11 +1517,41 @@ def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRe
             si_slug = _si_parent_slug(stem)
             parent = by_slug.get(si_slug) if si_slug is not None else None
             if parent is not None:
-                received = _receive_supplementary(workspace_root, path, parent, max_bytes=max_bytes)
-                if received and all(existing is not parent for existing in changed):
+                receipt, detail = _receive_supplementary(workspace_root, path, parent, max_bytes=max_bytes)
+                if receipt is SupplementReceipt.RECEIVED and all(existing is not parent for existing in changed):
                     changed.append(parent)
+                elif receipt in (SupplementReceipt.OVER_CAP, SupplementReceipt.UNREADABLE):
+                    ignored.append(
+                        IgnoredInboxFile(
+                            filename=path.name,
+                            reason=InboxIgnoreReason.SUPPLEMENT_REFUSED,
+                            detail=f"supplementary file {detail}",
+                        )
+                    )
+                continue
+            if si_slug is not None:
+                logger.warning(
+                    "dropped file %s reads as supplementary information for %r, which is not a "
+                    "queued request; leaving it untouched",
+                    path.name,
+                    si_slug,
+                )
+                ignored.append(
+                    IgnoredInboxFile(
+                        filename=path.name,
+                        reason=InboxIgnoreReason.SUPPLEMENT_PARENT_ABSENT,
+                        detail=f"reads as supplementary information for {si_slug!r}, which is not a queued request",
+                    )
+                )
                 continue
             logger.warning("dropped file %s matches no queued request; leaving it untouched", path.name)
+            ignored.append(
+                IgnoredInboxFile(
+                    filename=path.name,
+                    reason=InboxIgnoreReason.NO_QUEUED_REQUEST,
+                    detail="matches no queued request -- its filename names no paper Carmel is waiting for",
+                )
+            )
             continue
         if request.status == AcquisitionStatus.FULFILLED:
             continue
@@ -1466,7 +1567,18 @@ def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRe
 
     if changed:
         save_manifest(workspace_root, manifest)
-    return changed
+    return CollectOutcome(changed=changed, ignored=ignored)
+
+
+def collect_inbox(workspace_root: Path, *, max_bytes: int) -> list[AcquisitionRequest]:
+    """The requests whose state changed during one inbox sweep.
+
+    Thin view over :func:`sweep_inbox` for callers that act only on admissions (the
+    literature run's auto-collect, and existing tests). Callers that must surface an
+    ignored drop -- notably ``carmel requests --collect`` -- use :func:`sweep_inbox`,
+    which additionally reports :attr:`CollectOutcome.ignored`.
+    """
+    return sweep_inbox(workspace_root, max_bytes=max_bytes).changed
 
 
 def _sniff_content_type(data: bytes) -> str:
