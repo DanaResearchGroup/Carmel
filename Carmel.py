@@ -83,7 +83,12 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Sweep every file already dropped into the inbox directory and admit or reject "
-            "each one, instead of admitting a single file with --add."
+            "each one, instead of admitting a single file with --add. A file the sweep cannot "
+            "act on -- one matching no queued request, or a supplement whose paper is not queued "
+            "or that is over the size cap -- is reported as IGNORED with the reason, and left "
+            "untouched. Exit code is non-zero if any dropped file was rejected OR ignored, so a "
+            "sweep that silently skipped the operator's input can never look like a success; 0 "
+            "only when the inbox was empty, or every file was admitted or already held."
         ),
     )
     requests_cmd.add_argument(
@@ -998,11 +1003,11 @@ def _cmd_requests(
         AlreadyAcquired,
         ManifestUnreadable,
         admit_file,
-        collect_inbox,
         drop_path_for,
         inbox_dir,
         pending_requests,
         reason_phrase,
+        sweep_inbox,
     )
     from carmel.services.campaigns import find_campaign_workspace
 
@@ -1042,18 +1047,18 @@ def _cmd_requests(
 
     if collect:
         try:
-            changed = collect_inbox(ws, max_bytes=max_bytes)
+            outcome = sweep_inbox(ws, max_bytes=max_bytes)
         except ManifestUnreadable as exc:
             print(f"Could not read the acquisition manifest: {exc}")
             print("Fix or restore the file above before retrying -- it was left untouched.")
             return 1
-        if not changed:
+        if not outcome.changed and not outcome.ignored:
             print("Nothing new in the inbox.")
             print(f"Drop papers into: {inbox_dir(ws)}")
             return 0
         accepted = 0
         rejected = 0
-        for request in changed:
+        for request in outcome.changed:
             if request.status == AcquisitionStatus.FULFILLED:
                 accepted += 1
                 print(f"ACCEPTED  {request.title}")
@@ -1062,8 +1067,17 @@ def _cmd_requests(
                 print(f"REJECTED  {request.title}")
             print(f"          {request.identity_note}")
             print()
-        print(f"{accepted} accepted, {rejected} rejected")
-        return 1 if rejected else 0
+        for item in outcome.ignored:
+            # A file the operator just dropped that the sweep could not act on. Surfaced
+            # HERE, in the command's own output and (below) its exit code -- never left
+            # to the log level that hid this for ten days.
+            print(f"IGNORED   {item.filename}")
+            print(f"          {item.detail}")
+            print()
+        print(f"{accepted} accepted, {rejected} rejected, {len(outcome.ignored)} ignored")
+        # An ignored file is a refusal that must reach the caller: exiting 0 on it would
+        # report success for a sweep that silently skipped the operator's input.
+        return 1 if (rejected or outcome.ignored) else 0
 
     if add is not None:
         if add.is_dir():
