@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     # Type-only: keeps this module importable without eagerly pulling the schema
     # package at CLI start-up, matching how every other symbol here is imported
     # inside the function that uses it.
+    from carmel.agents.bridge import CarmelAgent
     from carmel.schemas import Campaign
 
 
@@ -280,9 +281,10 @@ def create_parser() -> argparse.ArgumentParser:
             "per proposal, and classify each. A grid the classifier calls MEASURED over a "
             "non-lossy extraction has its inventory record stored and PROVED to replay off disk; "
             "every other candidate is reported with a typed refusal that names the step and the "
-            "document, and the other candidates are still carried. A tabular dataset SERIES is "
-            "NOT produced: that step needs per-column axis semantics the classifier does not "
-            "supply, so it is deferred, not faked."
+            "document, and the other candidates are still carried. By default the tabular dataset "
+            "SERIES step is DEFERRED, not faked: no model call is made. Pass --extract-series (with "
+            "--config) to additionally drive each MEASURED grid through the extraction agent into a "
+            "stored, replayable dataset series; that path fails closed on missing configuration."
         ),
     )
     report_tables.add_argument(
@@ -295,6 +297,22 @@ def create_parser() -> argparse.ArgumentParser:
         "--sha",
         required=True,
         help="raw_sha256 of the stored document to run the table lane over.",
+    )
+    report_tables.add_argument(
+        "--extract-series",
+        action="store_true",
+        help=(
+            "OPT-IN: after storing each MEASURED grid's inventory record, additionally drive it "
+            "through the tabular extraction agent to produce and store a replayable dataset SERIES. "
+            "Off by default -- without it the command makes no model call, needs no credentials, and "
+            "behaves exactly as before. Requires --config naming the agent's model, provider, and budget."
+        ),
+    )
+    report_tables.add_argument(
+        "--config",
+        type=Path,
+        default=None,
+        help="Carmel config file whose [agents] section builds the extraction agent for --extract-series.",
     )
 
     return parser
@@ -1135,7 +1153,82 @@ def _cmd_requests(
     return 0
 
 
-def _cmd_report_tables(workspace: Path, sha: str) -> int:
+def _build_series_agent(config_path: Path | None) -> tuple[CarmelAgent | None, str]:
+    """Construct the tabular extraction agent for ``--extract-series`` from a config file.
+
+    Reuses the SAME model-construction path the ``literature`` command uses -- there is no
+    second, parallel way to build a model in this codebase: :func:`carmel.agents.models.build_model`
+    for the model, :class:`carmel.agents.budget.BudgetLedger` for the ledger (with the machine-wide
+    daily cost ledger path, exactly as :func:`carmel.services.literature.build_deps` does), and
+    :func:`carmel.agents.extraction_agent.build_tabular_extraction_agent` for the persona.
+
+    Fails CLOSED: returns ``(None, message)`` -- never a partially-built agent and never a raise --
+    for every missing-configuration condition, so the caller can emit a clean non-zero exit that
+    names what is missing and how to supply it. Returns ``(agent, "")`` only when a real model was
+    built.
+
+    Args:
+        config_path: The ``--config`` file, or ``None`` if the flag was omitted.
+
+    Returns:
+        ``(agent, "")`` on success, or ``(None, reason)`` naming the missing piece.
+    """
+    if config_path is None:
+        return None, (
+            "--extract-series needs a model: pass --config <FILE> whose [agents] section names "
+            "the model, provider, and budget (the same config the `literature` command takes)"
+        )
+    import yaml
+
+    from carmel.agents.bridge import AgentBridgeError
+    from carmel.agents.budget import BudgetLedger
+    from carmel.agents.extraction_agent import build_tabular_extraction_agent
+    from carmel.agents.models import build_model
+    from carmel.config import load_config
+    from carmel.paths import default_daily_ledger_path
+
+    try:
+        agents = load_config(config_path).agents
+    except (OSError, ValueError, yaml.YAMLError) as exc:
+        return None, f"cannot load --config {config_path}: {exc}"
+    if agents is None:
+        return None, (
+            f"--config {config_path} has no [agents] section; --extract-series needs one naming "
+            "the model, provider, and budget"
+        )
+    try:
+        model = build_model(agents)
+    except AgentBridgeError as exc:
+        return None, f"cannot construct the extraction model from --config {config_path}: {exc}"
+    ledger = BudgetLedger(agents.budget, daily_ledger_path=default_daily_ledger_path())
+    return build_tabular_extraction_agent(model=model, ledger=ledger), ""
+
+
+def _count_series_points(workspace: Path, dataset_sha256: str) -> int | None:
+    """Best-effort total data-point count for a stored dataset, or ``None`` if unreadable.
+
+    Reads the content-addressed, already-stored dataset and sums points across its series.
+    Purely for the human-readable report: any failure degrades to ``None`` (report the address
+    without a count) rather than breaking a report of work that genuinely succeeded.
+    """
+    try:
+        from carmel.schemas.datasets import DatasetEnvelope
+        from carmel.services.dataset_store import load_dataset
+
+        envelope = DatasetEnvelope.from_identity_payload(load_dataset(workspace, dataset_sha256))
+        return sum(len(series.points) for series in envelope.series)
+    except Exception:  # noqa: BLE001 -- a display nicety must never break the report
+        return None
+
+
+def _cmd_report_tables(
+    workspace: Path,
+    sha: str,
+    *,
+    extract_series: bool = False,
+    config: Path | None = None,
+    series_agent: CarmelAgent | None = None,
+) -> int:
     """Run the geometric table lane over one arbitrary stored document and report it.
 
     Thin wrapper over :func:`carmel.services.general_table_report.report_document_tables`.
@@ -1156,16 +1249,47 @@ def _cmd_report_tables(workspace: Path, sha: str) -> int:
     nothing, with a typed reason per candidate, exits zero -- refusing to store is a
     legitimate outcome, and lowering a threshold to manufacture output is exactly what
     this project exists to prevent.
+
+    ``--extract-series`` is OPT-IN. Without it (the default) NO model is constructed and no
+    model call is made: behaviour is byte-for-byte what it was before this flag existed, so a
+    corpus-scale batch run stays free and credential-free. With it, the tabular extraction
+    agent is built from ``config`` and passed as ``series_agent`` so each MEASURED-and-stored
+    grid is additionally carried through the series step. Missing configuration (no config, no
+    model, no credentials) fails CLOSED with a typed message and a clean non-zero exit -- never
+    a silent fall back to no-agent mode, which would report "no series produced" for a run the
+    user explicitly asked to produce series. A per-candidate series refusal never aborts the
+    document (the underlying function's isolation guarantee, preserved here); only a budget
+    guard tripping mid-run stops the whole run, and that too is a clean non-zero exit.
+
+    ``series_agent`` is a test-injection seam: when provided (with ``extract_series=True``) it is
+    used directly and ``config`` is not read, letting tests drive the path with a MockModel-backed
+    agent carrying canned responses. Production always leaves it ``None`` and builds from ``config``.
     """
+    from carmel.agents.budget import BudgetExceededError
     from carmel.services.general_table_report import (
         GeneralTableReportError,
         report_document_tables,
     )
 
+    agent: CarmelAgent | None = None
+    if extract_series:
+        if series_agent is not None:
+            agent = series_agent
+        else:
+            agent, reason = _build_series_agent(config)
+            if agent is None:
+                print(f"Refusing to extract series for {sha}: {reason}", file=sys.stderr)
+                return 2
+
     try:
-        report = report_document_tables(workspace.expanduser(), sha)
+        report = report_document_tables(workspace.expanduser(), sha, series_agent=agent)
     except GeneralTableReportError as exc:
         print(f"Refusing to report tables for {sha}: {exc}", file=sys.stderr)
+        return 1
+    except BudgetExceededError as exc:
+        # The budget guard tripped mid-run. Fail closed with a clean, named non-zero exit
+        # rather than a traceback; inventory records stored before the trip stay stored.
+        print(f"Series extraction stopped for {sha}: budget guard refused further spend ({exc})", file=sys.stderr)
         return 1
 
     print(f"Document        : {report.raw_sha256}")
@@ -1188,9 +1312,17 @@ def _cmd_report_tables(workspace: Path, sha: str) -> int:
             print(f"    needed: {want}")
         if outcome.stored_inventory_sha256 is not None:
             print(f"    stored inventory sha256: {outcome.stored_inventory_sha256}")
+        if outcome.series_dataset_sha256 is not None:
+            points = _count_series_points(workspace.expanduser(), outcome.series_dataset_sha256)
+            suffix = f" ({points} data point{'s' if points != 1 else ''})" if points is not None else ""
+            print(f"    stored series sha256   : {outcome.series_dataset_sha256}{suffix}")
         if outcome.series_deferred is not None:
             print(f"    series deferred: {outcome.series_deferred}")
         print()
+
+    if agent is not None:
+        usage = agent.ledger.usage()
+        print(f"Model spend     : {usage.model_calls} call(s), {usage.tokens} token(s), ${usage.cost_usd:.6f}")
     return 0
 
 
@@ -1366,7 +1498,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.command == "report-tables":
-        return _cmd_report_tables(args.workspace, args.sha)
+        return _cmd_report_tables(
+            args.workspace,
+            args.sha,
+            extract_series=args.extract_series,
+            config=args.config,
+        )
 
     if args.command == "store-tabular-dataset":
         return _cmd_store_tabular_dataset(args.workspaces)
