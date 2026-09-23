@@ -4,7 +4,7 @@
 """Pin what replay does when a stored artifact cites a SUPERSEDED geometry composite.
 
 The fragment-geometry lane in :mod:`carmel.services.semantic_deps` has been
-superseded thirteen times, and a durable dataset artifact that records the
+superseded fourteen times, and a durable dataset artifact that records the
 composite it was produced under now exists on disk. From here a geometry change
 can move the numbers under an artifact that is already stored and already cited,
 so what replay does in that case is a contract, not a hypothetical.
@@ -122,7 +122,7 @@ class TestTheHalvesLocalizeTheMove:
     def test_every_superseded_row_localizes_and_the_borrowed_half_never_moved(self) -> None:
         """The composite is worth its cost only if it can attribute the move.
 
-        All thirteen supersessions are own-half changes in ``pdf_fragments`` --
+        All fifteen supersessions are own-half changes in ``pdf_fragments`` --
         no borrowed name's behaviour in ``extract.py`` ever moved -- and the
         registry can say so for each, without recomputing anything.
         """
@@ -133,7 +133,7 @@ class TestTheHalvesLocalizeTheMove:
             if definition.dependency_id == sd.FRAGMENT_GEOMETRY_DEPENDENCY_ID and not definition.is_current
         ]
 
-        assert len(superseded) == 13
+        assert len(superseded) == 15
         assert all(self._moved_halves(sha, current) == ("own",) for sha in superseded)
 
 
