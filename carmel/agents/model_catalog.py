@@ -24,8 +24,11 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import urllib.error
 import urllib.request
+from collections.abc import Iterable
+from dataclasses import dataclass
 from enum import StrEnum
 
 from carmel.config import AgentProvider
@@ -36,9 +39,14 @@ logger = get_logger("agents.model_catalog")
 __all__ = [
     "AUTO_PREFIX",
     "AutoFamily",
+    "OpenRouterModelInfo",
     "auto_model_name",
+    "fetch_openrouter_catalogue",
+    "free_openrouter_model_ids",
     "is_auto_model_name",
+    "parse_openrouter_catalogue",
     "rank_family_candidates",
+    "rank_free_nemotron_candidates",
     "resolve_model_ladder",
 ]
 
@@ -55,6 +63,17 @@ class AutoFamily(StrEnum):
 
     GEMINI_FLASH = "gemini-flash"
     GEMINI_PRO = "gemini-pro"
+    NEMOTRON_FREE = "nemotron-free"
+
+
+#: The provider whose catalogue each family is resolved against. A family is a set of
+#: provider-specific ids, so resolving it against another provider's catalogue would
+#: either match nothing or fall back to a static ladder of ids that provider never serves.
+_FAMILY_PROVIDERS: dict[AutoFamily, AgentProvider] = {
+    AutoFamily.GEMINI_FLASH: AgentProvider.GOOGLE,
+    AutoFamily.GEMINI_PRO: AgentProvider.GOOGLE,
+    AutoFamily.NEMOTRON_FREE: AgentProvider.OPENROUTER,
+}
 
 
 def auto_model_name(family: AutoFamily) -> str:
@@ -99,16 +118,66 @@ _STATIC_FALLBACK_LADDERS: dict[AutoFamily, tuple[str, ...]] = {
 #: anything else must name a concrete model, and says so rather than guessing.
 _CATALOGUE_URLS: dict[AgentProvider, str] = {
     AgentProvider.GOOGLE: "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200",
+    AgentProvider.OPENROUTER: "https://openrouter.ai/api/v1/models",
 }
+
+#: OpenRouter marks its zero-cost variants with this id suffix.
+OPENROUTER_FREE_SUFFIX = ":free"
+
+#: Context window the OpenRouter DEV default is chosen for. Candidates at or above it are
+#: preferred; if none reaches it, the largest-context free Nemotron is used instead.
+_NEMOTRON_TARGET_CONTEXT = 1_000_000
 
 _MAX_LADDER = 4
 _CATALOGUE_TIMEOUT_S = 30.0
+
+#: How long a read of OpenRouter's catalogue is trusted. Free status is a PRICE, and a
+#: price can change mid-process; a model that starts charging must stop counting as
+#: free within this bound rather than for the life of the process.
+_OPENROUTER_CATALOGUE_TTL_S = 600.0
 
 #: Process-lifetime cache keyed by provider. The catalogue changes on the order of weeks,
 #: while a single campaign builds several agents, so re-listing per agent would add
 #: latency and a failure mode for no benefit. NOT keyed by api key: the value cached is a
 #: list of public model names, and the key never enters it.
 _catalogue_cache: dict[AgentProvider, tuple[str, ...]] = {}
+
+
+@dataclass(frozen=True)
+class OpenRouterModelInfo:
+    """One entry of OpenRouter's public model catalogue, reduced to what Carmel uses.
+
+    Attributes:
+        model_id: The OpenRouter model id (e.g. ``"vendor/model:free"``).
+        context_length: Advertised context window in tokens, or None if not reported.
+        zero_priced: True only when both the prompt and completion prices are the
+            literal string ``"0"``. A missing or unparseable price is NOT zero.
+    """
+
+    model_id: str
+    context_length: int | None
+    zero_priced: bool
+
+    @property
+    def is_free(self) -> bool:
+        """Return True if the catalogue prices this model at zero AND its id says ``:free``.
+
+        Both are required: the suffix alone is only a naming convention, and a zero price
+        alone could be a promotional rate on a paid id that silently ends.
+        """
+        return self.zero_priced and self.model_id.endswith(OPENROUTER_FREE_SUFFIX)
+
+
+#: Cache of OpenRouter's catalogue as ``(catalogue, read_at)``, trusted for
+#: ``_OPENROUTER_CATALOGUE_TTL_S``. Only a SUCCESSFUL read is cached, so a network blip
+#: does not pin "nothing is free"; an EXPIRED entry is never reused, even when the
+#: refetch fails, so a stale "free" can never outlive the TTL.
+_openrouter_catalogue_cache: list[tuple[tuple[OpenRouterModelInfo, ...], float]] = []
+
+
+def _clock() -> float:
+    """Return the monotonic time the catalogue TTL is measured on; patched in tests."""
+    return time.monotonic()
 
 
 def _version_key(match: re.Match[str]) -> tuple[int, int]:
@@ -142,6 +211,84 @@ def rank_family_candidates(model_names: object, family: AutoFamily) -> list[str]
     return [name for _, name in matched]
 
 
+def parse_openrouter_catalogue(payload: object) -> tuple[OpenRouterModelInfo, ...]:
+    """Parse the JSON body of ``GET /api/v1/models`` into catalogue entries. Never raises.
+
+    Pure and offline, like :func:`rank_family_candidates`: whether a model counts as free
+    decides whether a DEV run may call it, so the rule is tested against recorded payloads.
+    Malformed entries are skipped rather than guessed at.
+
+    Args:
+        payload: The decoded JSON response.
+
+    Returns:
+        One entry per well-formed catalogue item; empty for a malformed payload.
+    """
+    if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+        return ()
+    entries: list[OpenRouterModelInfo] = []
+    for item in payload["data"]:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]:
+            continue
+        pricing = item.get("pricing")
+        zero_priced = isinstance(pricing, dict) and pricing.get("prompt") == "0" and pricing.get("completion") == "0"
+        context = item.get("context_length")
+        context_length = context if isinstance(context, int) and not isinstance(context, bool) else None
+        entries.append(OpenRouterModelInfo(item["id"], context_length, zero_priced))
+    return tuple(entries)
+
+
+def free_openrouter_model_ids(catalogue: Iterable[OpenRouterModelInfo]) -> frozenset[str]:
+    """Return the ids of every model in ``catalogue`` that is free by both tests."""
+    return frozenset(entry.model_id for entry in catalogue if entry.is_free)
+
+
+def rank_free_nemotron_candidates(catalogue: Iterable[OpenRouterModelInfo]) -> list[str]:
+    """Return free NVIDIA Nemotron ids, largest context window first.
+
+    Candidates reaching :data:`_NEMOTRON_TARGET_CONTEXT` sort ahead of the rest by
+    construction, so when none does the head of the list is simply the largest free
+    Nemotron. Ties are broken by id so the result is deterministic.
+    """
+    candidates = [
+        entry
+        for entry in catalogue
+        if entry.is_free and entry.model_id.startswith("nvidia/") and "nemotron" in entry.model_id.lower()
+    ]
+    candidates.sort(key=lambda entry: (entry.context_length or 0, entry.model_id), reverse=True)
+    return [entry.model_id for entry in candidates]
+
+
+def fetch_openrouter_catalogue() -> tuple[OpenRouterModelInfo, ...]:
+    """Read OpenRouter's public model catalogue, cached for a bounded TTL. Never raises.
+
+    The endpoint needs no key, so none is sent. Returns an empty tuple on any failure;
+    unlike the Gemini path there is no static fallback, because a model that cannot be
+    shown to be free must be refused rather than assumed free. For the same reason a
+    failed refetch after the TTL fails CLOSED: the expired entry is dropped, not reused.
+
+    Same consent and budget reasoning as :func:`_fetch_catalogue`: reached only from
+    ``build_model`` after its consent check, against a fixed URL, with a small
+    provider-bounded body.
+    """
+    now = _clock()
+    if _openrouter_catalogue_cache:
+        catalogue, read_at = _openrouter_catalogue_cache[0]
+        if now - read_at < _OPENROUTER_CATALOGUE_TTL_S:
+            return catalogue
+        _openrouter_catalogue_cache.clear()
+    request = urllib.request.Request(_CATALOGUE_URLS[AgentProvider.OPENROUTER])
+    try:
+        with urllib.request.urlopen(request, timeout=_CATALOGUE_TIMEOUT_S) as response:  # noqa: S310 - fixed https URL
+            payload = json.loads(response.read())
+    except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        logger.warning("could not read the openrouter model catalogue (%s)", type(exc).__name__)
+        return ()
+    catalogue = parse_openrouter_catalogue(payload)
+    _openrouter_catalogue_cache.append((catalogue, now))
+    return catalogue
+
+
 def _fetch_catalogue(provider: AgentProvider, api_key: str) -> tuple[str, ...]:
     """List model ids the provider will generate content with. Never raises.
 
@@ -172,7 +319,7 @@ def _fetch_catalogue(provider: AgentProvider, api_key: str) -> tuple[str, ...]:
     reasoning above no longer holds.
     """
     url = _CATALOGUE_URLS.get(provider)
-    if url is None:
+    if url is None or provider == AgentProvider.OPENROUTER:
         return ()
 
     request = urllib.request.Request(url, headers={"x-goog-api-key": api_key})
@@ -215,10 +362,11 @@ def resolve_model_ladder(model_name: str, provider: AgentProvider, api_key: str)
         Model ids in preference order, newest first, capped at a handful of fallbacks.
 
     Raises:
-        ValueError: If ``model_name`` names a family that does not exist, or requests
-            ``auto:`` resolution for a provider with no known catalogue endpoint. Both
-            are configuration errors, and both fail loudly rather than resolving to some
-            arbitrary model the operator did not ask for.
+        ValueError: If ``model_name`` names a family that does not exist, requests
+            ``auto:`` resolution for a provider with no known catalogue endpoint or for a
+            family that provider does not serve, or names the OpenRouter free family
+            while its catalogue lists no free Nemotron. All fail loudly rather than
+            resolving to some arbitrary model the operator did not ask for.
     """
     if not is_auto_model_name(model_name):
         return [model_name]
@@ -235,6 +383,15 @@ def resolve_model_ladder(model_name: str, provider: AgentProvider, api_key: str)
             f"provider {provider.value!r} does not support {AUTO_PREFIX!r} model resolution; "
             "set agents.model_name to a concrete model id for this provider"
         )
+
+    if _FAMILY_PROVIDERS[family] != provider:
+        raise ValueError(
+            f"model family {model_name!r} is served by {_FAMILY_PROVIDERS[family].value!r}, not "
+            f"{provider.value!r}; set agents.model_name to a concrete model id for this provider"
+        )
+
+    if family == AutoFamily.NEMOTRON_FREE:
+        return _resolve_free_nemotron(model_name)
 
     if provider not in _catalogue_cache:
         _catalogue_cache[provider] = _fetch_catalogue(provider, api_key)
@@ -254,6 +411,24 @@ def resolve_model_ladder(model_name: str, provider: AgentProvider, api_key: str)
     return ladder[:_MAX_LADDER]
 
 
+def _resolve_free_nemotron(model_name: str) -> list[str]:
+    """Resolve the OpenRouter free-Nemotron family against the live catalogue.
+
+    Raises:
+        ValueError: If the catalogue is unreadable or lists no free Nemotron. There is
+            deliberately no static fallback: a pinned id could not be shown to be free.
+    """
+    ladder = rank_free_nemotron_candidates(fetch_openrouter_catalogue())
+    if not ladder:
+        raise ValueError(
+            f"cannot resolve {model_name!r}: the OpenRouter catalogue is unreachable or lists no "
+            "free Nemotron model; set agents.model_name to a concrete ':free' model id"
+        )
+    logger.info("resolved %s to %r (fallbacks: %r)", model_name, ladder[0], ladder[1:_MAX_LADDER])
+    return ladder[:_MAX_LADDER]
+
+
 def clear_catalogue_cache() -> None:
     """Drop the cached provider catalogues. For tests and long-lived processes."""
     _catalogue_cache.clear()
+    _openrouter_catalogue_cache.clear()

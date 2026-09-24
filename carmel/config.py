@@ -143,6 +143,7 @@ class AgentProvider(StrEnum):
     GOOGLE = "google"
     OPENAI = "openai"
     DEEPSEEK = "deepseek"
+    OPENROUTER = "openrouter"
 
 
 class SearchProvider(StrEnum):
@@ -211,6 +212,18 @@ DEFAULT_TIER_MODELS: dict[ModelTier, str] = {
     ModelTier.DEV: "auto:gemini-flash",
     ModelTier.PROD: "auto:gemini-pro",
 }
+
+#: Per-provider overrides of :data:`DEFAULT_TIER_MODELS`, consulted first. OpenRouter's
+#: DEV default is a FAMILY for the same reason the Gemini tiers are: free-model ids come
+#: and go, so the concrete ``:free`` id is resolved from the live catalogue at build time
+#: rather than pinned here.
+DEFAULT_PROVIDER_TIER_MODELS: dict[tuple[AgentProvider, ModelTier], str] = {
+    (AgentProvider.OPENROUTER, ModelTier.DEV): "auto:nemotron-free",
+}
+
+#: Attribution OpenRouter shows for Carmel's traffic (``HTTP-Referer`` / ``X-Title``).
+DEFAULT_OPENROUTER_APP_URL = "https://github.com/DanaResearchGroup/Carmel"
+DEFAULT_OPENROUTER_APP_TITLE = "Carmel"
 
 
 class AgentBudgetConfig(BaseModel):
@@ -410,6 +423,10 @@ class AgentConfig(BaseModel):
     the key alone. Never hardcoded, never logged. See
     :meth:`resolved_elsevier_insttoken`.
     """
+    openrouter_app_url: str = DEFAULT_OPENROUTER_APP_URL
+    """``HTTP-Referer`` attribution header sent on every OpenRouter call."""
+    openrouter_app_title: str = DEFAULT_OPENROUTER_APP_TITLE
+    """``X-Title`` attribution header sent on every OpenRouter call."""
     external_provider_consent: bool = False
     literature_at_campaign_start: bool = True
     budget: AgentBudgetConfig = Field(default_factory=AgentBudgetConfig)
@@ -443,8 +460,10 @@ class AgentConfig(BaseModel):
         return self
 
     def resolved_model_name(self) -> str:
-        """Return model_name if set, else the tier's default model."""
-        return self.model_name or DEFAULT_TIER_MODELS[self.tier]
+        """Return model_name if set, else the provider's tier default, else the tier's default."""
+        if self.model_name:
+            return self.model_name
+        return DEFAULT_PROVIDER_TIER_MODELS.get((self.provider, self.tier), DEFAULT_TIER_MODELS[self.tier])
 
     def resolved_unpaywall_email(self) -> str | None:
         """The Unpaywall contact email: config field first, then the environment.
