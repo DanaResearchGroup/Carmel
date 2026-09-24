@@ -13,21 +13,25 @@ the first time the lane has been measured over a real corpus.
 python -m carmel.tools.corpus_table_survey \
   --workspace <scratch>/ws \
   --out docs/i102/corpus_survey_results_n300_seed0.jsonl \
-  --root "/home/alon/Dropbox/Work/Papers/_2 Post" \
-  --root "/home/alon/Dropbox/Work/Papers/_2021" \
-  --root "/home/alon/Dropbox/Work/Papers/_2022" \
-  --root "/home/alon/Dropbox/Work/Papers/_2023" \
-  --root "/home/alon/Dropbox/Work/Papers/_2024" \
-  --root "/home/alon/Dropbox/Work/Papers/_2025" \
-  --root "/home/alon/Dropbox/Work/Papers/_2026" \
+  --root "$CORPUS_ROOT/_2 Post" \
+  --root "$CORPUS_ROOT/_2021" \
+  --root "$CORPUS_ROOT/_2022" \
+  --root "$CORPUS_ROOT/_2023" \
+  --root "$CORPUS_ROOT/_2024" \
+  --root "$CORPUS_ROOT/_2025" \
+  --root "$CORPUS_ROOT/_2026" \
   --sample-size 300 --seed 0 --prune-unstored
 ```
 
+`$CORPUS_ROOT` is the operator's own local paper library; set it to wherever that lives.
+
 The committed `corpus_survey_results_n300_seed0.jsonl` is the raw per-document output
 (one `DocumentRow` JSON per line). The sample is deterministic given the same corpus,
-size, and seed. Absolute paths and paper filenames appear in the results file; they are
-the operator's own and carry no document bytes or extracted text — caption fragments are
-capped at 48 characters and every `detail` string is pure fragment geometry.
+size, and seed. Each row's identity is an opaque `doc_id` (a content sha256, never an
+absolute path or a paper's filename) — no full extracted text is stored anywhere in the
+file. `caption_fragment` is a short excerpt of real extracted text, capped at 48
+characters, and every `detail` string is bounded lane diagnostics (geometry and
+classifier messages), not document content.
 
 ## Probe answers (established by running, not reading)
 
