@@ -56,6 +56,7 @@ from carmel.services.tabular_series_resolver import AxisHeaderIntent, resolve_ta
 __all__ = [
     "ProposalIntakeError",
     "build_extraction_prompt",
+    "build_tabular_series_prompt",
     "condition_set_from_proposal",
     "current_extraction_text",
     "tabular_series_from_proposal",
@@ -127,6 +128,55 @@ def build_extraction_prompt(*, objective: str, artifact_sha256: str, text: str) 
         # ground a quote whose visible words match perfectly. The end marker is put on
         # its own line only when `text` does not already end one.
         f"{text}" + ("" if text.endswith("\n") else "\n") + "<<<END DOCUMENT>>>\n"
+    )
+
+
+def build_tabular_series_prompt(
+    *,
+    artifact_sha256: str,
+    table_label: str,
+    grid_text: str,
+    document_text: str,
+) -> str:
+    """The user prompt for one tabular-extraction pass over one held table.
+
+    Mirrors :func:`build_extraction_prompt`'s marker discipline exactly: the grid and
+    the document text are embedded verbatim, deterministically, because the Tabular
+    Extraction Agent has no tool to fetch either. ``grid_text`` is built by the CALLER
+    from ``inventory.grid_cells()`` (this function invents no rendering of its own) and
+    ``document_text`` must be the same current-extraction text the producer will later
+    ground prose units against (:func:`current_extraction_text`) -- the agent's prose
+    unit quotes are only groundable if it read the very bytes the grounder checks.
+
+    Args:
+        artifact_sha256: The held document's sha256; the agent must echo it into
+            ``TabularSeriesProposal.artifact_sha256``.
+        table_label: The table's printed caption label (e.g. ``"Table 1"``); the agent
+            must echo it into ``TabularSeriesProposal.table_label``.
+        grid_text: A rendering of the table's grid cells, built by the caller from
+            ``inventory.grid_cells()``.
+        document_text: The document's current-extraction text, embedded verbatim -- not
+            one character is added inside the markers (see the body).
+
+    Returns:
+        The user prompt string.
+    """
+    return (
+        f"Document sha256 (echo this exactly into artifact_sha256): {artifact_sha256}\n\n"
+        f"Table label (echo this exactly into table_label): {table_label}\n\n"
+        "The table's grid follows between the markers. Quote a column header ONLY from "
+        "within these markers, character for character.\n"
+        "<<<GRID>>>\n"
+        f"{grid_text}" + ("" if grid_text.endswith("\n") else "\n") + "<<<END GRID>>>\n\n"
+        "The full text of the surrounding document follows between the markers. Quote a "
+        "prose unit token ONLY from within these markers, character for character.\n"
+        "<<<DOCUMENT>>>\n"
+        # NO separator is added after `document_text`, for the same reason as
+        # build_extraction_prompt: an extra newline here would sit INSIDE the markers
+        # the agent is told to quote from, and could let a model copy a character the
+        # stored extraction text does not contain. The end marker is put on its own
+        # line only when `document_text` does not already end one.
+        f"{document_text}" + ("" if document_text.endswith("\n") else "\n") + "<<<END DOCUMENT>>>\n"
     )
 
 
