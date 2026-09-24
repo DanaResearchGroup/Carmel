@@ -1598,14 +1598,14 @@ class TestLossRecordsWhatWasLost:
         built = 0
         real_engine = mod._engine()
         assert real_engine is not None
-        resolve_font, params_cls, content_stream = real_engine
+        resolve_font, params_cls, content_stream, font_cls = real_engine
 
         def _counting_params(*args, **kwargs):
             nonlocal built
             built += 1
             return params_cls(*args, **kwargs)
 
-        monkeypatch.setattr(mod, "_engine", lambda: (resolve_font, _counting_params, content_stream))
+        monkeypatch.setattr(mod, "_engine", lambda: (resolve_font, _counting_params, content_stream, font_cls))
         monkeypatch.setattr(mod, "MAX_PDF_FRAGMENTS", 3)
         groups = " ".join(f"BT /F1 10 Tf 72 {700 - i} Td ({i}) Tj ET" for i in range(60))
         result = extract_fragments(_one_page_pdf(groups))

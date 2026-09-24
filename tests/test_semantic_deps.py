@@ -111,6 +111,8 @@ _HISTORICALLY_SHIPPED_SHAS = frozenset(
         "d7778b247fb41a981732199c82946a07c2e0bcd13fce3a1ed804f747ec4a0446",
         "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647",
         "a78b91b48047c149a61d95ac24e8665d9775ee56d8f26651955bbaee3ce822d1",
+        "ff46a870fb617b20a328f2ef9546d882aec633965c1cc2fc3c4a533dabbd8c5d",
+        "2af29eed4a2c9cf17b08f70590f8bbecb0cee8aba87370f00119758154ba2b74",
     }
 )
 
@@ -1238,7 +1240,14 @@ def test_synthetic_extraction_surface_sha_is_stable_under_a_docstring_only_edit(
 #   compute_dependency_sha(inspect.getsource(pdf_fragments), ["extract_fragments"])
 # This is the half that moves when fragment GEOMETRY changes.
 _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
-_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "3320c940bc597e39a73659a0d42aba5a23a1293e3be4950ce20bd3d7cd97dae0"
+# SUPERSEDED -- the FOURTEENTH own. The FIFTEENTH follows a form XObject instead of refusing
+# it, so its own component moved with the closure's source.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V14 = "3320c940bc597e39a73659a0d42aba5a23a1293e3be4950ce20bd3d7cd97dae0"
+# SUPERSEDED -- the FIFTEENTH own. It followed a form XObject's operators but started the
+# recursive walk from a bare _TextState(), forgetting the caller's /ca and /CA. The SIXTEENTH
+# inherits fill_alpha/stroke_alpha into the child walk, so its own component moved again.
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V15 = "b4e21f79974bb77d5f4bed49953d6d98b157227a81562dd2b96770c43c0b06df"
+_PINNED_FRAGMENT_GEOMETRY_OWN_SHA256 = "2b5e067fde9c14a743b2d7272e42a3b572424a1544b33589366925da04efe4e4"
 
 # The SUPERSEDED first entry, pinned so the append-only contract is checked against a real
 # historical row rather than only asserted in prose. Its own component moved when
@@ -1336,7 +1345,13 @@ _PINNED_FRAGMENT_GEOMETRY_SHA256_V12 = "d7778b247fb41a981732199c82946a07c2e0bcd1
 # GlyphMapping.UNRESOLVED_IMPOSTOR so an outline-unpinned impostor refuses downstream.
 _PINNED_FRAGMENT_GEOMETRY_OWN_SHA256_V13 = "72f8f9a2de5d9a905daa1f088266d0e71b6850181538572f582ec5e27e5052b5"
 _PINNED_FRAGMENT_GEOMETRY_SHA256_V13 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3b991afa467d298647"
-_PINNED_FRAGMENT_GEOMETRY_SHA256 = "a78b91b48047c149a61d95ac24e8665d9775ee56d8f26651955bbaee3ce822d1"
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V14 = "a78b91b48047c149a61d95ac24e8665d9775ee56d8f26651955bbaee3ce822d1"
+# The FIFTEENTH composite: form-XObject recursion. Own moved (see the own pin above),
+# borrowed did not, so the composite moves with it.
+_PINNED_FRAGMENT_GEOMETRY_SHA256_V15 = "ff46a870fb617b20a328f2ef9546d882aec633965c1cc2fc3c4a533dabbd8c5d"
+# The SIXTEENTH composite: the form-XObject recursion now inherits the caller's fill/stroke
+# alpha (Copilot review finding on PR #72). Own moved again, borrowed still did not.
+_PINNED_FRAGMENT_GEOMETRY_SHA256 = "2af29eed4a2c9cf17b08f70590f8bbecb0cee8aba87370f00119758154ba2b74"
 
 # The carmel.* import surface of pdf_fragments.py, as of this test's writing. This is the
 # completeness claim of the composite identity, spelled out as data: extract_fragments runs

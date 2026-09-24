@@ -1221,6 +1221,7 @@ def _engine() -> tuple[Any, ...] | None:
     mismatch; the caller turns that into ``available=False``.
     """
     try:
+        from pypdf._font import Font
         from pypdf._text_extraction._layout_mode._fixed_width_page import resolve_font
         from pypdf._text_extraction._layout_mode._text_state_params import (
             TextStateParams,
@@ -1228,6 +1229,15 @@ def _engine() -> tuple[Any, ...] | None:
         from pypdf.generic import ContentStream, StreamObject
     except Exception:  # pragma: no cover - exercised via monkeypatch in tests
         logger.debug("pypdf layout-mode internals unavailable", exc_info=True)
+        return None
+
+    # `Font.from_font_resource` is how a page's -- and now a form XObject's -- /Font
+    # resources become the layout-mode fonts `resolve_font` looks up. Checked here for the
+    # same reason as everything else in this gate: a release that renamed or dropped it
+    # would otherwise surface as "every page carrying a form XObject happened to fail"
+    # rather than as the engine mismatch it is.
+    if not callable(getattr(Font, "from_font_resource", None)):
+        logger.warning("pypdf Font lacks from_font_resource; fragments unavailable")
         return None
 
     # The imports resolving is not enough: the names could survive while the objects
@@ -1303,7 +1313,7 @@ def _engine() -> tuple[Any, ...] | None:
             _PINNED_PYPDF_VERSION,
         )
         return None
-    return resolve_font, TextStateParams, ContentStream
+    return resolve_font, TextStateParams, ContentStream, Font
 
 
 _REQUIRED_PARAM_FIELD_ORDER = (
@@ -2490,42 +2500,153 @@ def _advance(show: Any) -> float:
     return base + (glyphs - 1) * float(show.Tc) * (float(show.Tz) / 100.0)
 
 
-def _refuse_form_xobject(operands: list[Any], xobjects: Any) -> None:
-    """Refuse a ``Do`` that could be drawing text, and let an image through.
+#: How deep a chain of ``/Form`` XObjects invoking one another this module will follow
+#: before refusing. A form may draw another form, and a cycle guard already stops a form
+#: reaching itself; this bounds a legitimate but pathologically deep nest so the recursion
+#: cannot exhaust the Python stack on a hostile document. 16 is far past anything a real
+#: figure or table wrapper builds -- the corpus's deepest form nest is one level -- so a
+#: page that exceeds it is recorded as a failure rather than trusted.
+_MAX_FORM_DEPTH = 16
 
-    pypdf's layout-mode walker has no ``Do`` branch at all, so text inside a form
-    XObject is invisible to it -- not misplaced, ABSENT. That is the more dangerous of
-    the two failure modes and it is the one this module inherited.
 
-    Recursing into the form is the complete fix and it is not built, on measurement
-    rather than on taste. Censused over the eight-paper corpus: **70 ``Do`` calls on 37
-    of 75 pages, and not one of them resolves to a ``/Form`` XObject** -- every one is
-    an image. Recursion would therefore be a resource-dictionary walk, a ``/Matrix``
-    composition, a cycle guard and a depth limit, none of which any document in hand
-    would execute, tested only against fixtures written to exercise it. A refusal is
-    honest at zero corpus cost, and it converts a silent hole into a recorded page
-    failure. When a corpus arrives that needs the text, the refusal is what will make
-    that visible.
+def _do_target(operands: list[Any], xobjects: Any) -> Any | None:
+    """Resolve a ``Do`` to the ``/Form`` stream to recurse into, or ``None`` for an image.
 
-    Everything that is not exactly an ``/Image`` refuses, not only a ``/Form``. An
-    allowlist rather than a denylist because the question being asked is "can I prove
-    this draws no text", and a missing, malformed or unrecognised ``/Subtype`` proves
-    nothing. All 71 XObjects in the corpus are ``/Image``.
+    pypdf's layout-mode walker has no ``Do`` branch at all, so text inside a form XObject
+    was invisible to it -- not misplaced, ABSENT, a page that reads as complete with a
+    column missing. The eight-paper corpus that shaped the original refusal held not one
+    ``/Form`` (all 71 XObjects were images), so refusing was honest at zero cost. A survey
+    over a 300-paper sample of the real library inverted that premise: ``/Do`` on a
+    ``/Form`` is **65.3% of all page-failure reasons**, the single largest, and the forms
+    are ordinary -- every matrix in the sample is axis-aligned, and the ones that carry
+    text carry it under their own ``/Font`` resources. So the form is now followed; see
+    :func:`_walk_operations`'s ``recurse_into_form``.
+
+    An image returns ``None`` and is let through, drawing no text. Everything that is not
+    provably an image or a form still refuses -- an allowlist, not a denylist, because the
+    question is "can I prove where this XObject's text goes", and a missing, malformed or
+    unrecognised ``/Subtype`` proves nothing.
     """
     if not operands:
         raise UnsupportedContentConstruct("a /Do operator with no operand")
     name = operands[0]
     try:
         entry = xobjects.get(name) if xobjects is not None else None
-        subtype = entry.get_object().get("/Subtype") if entry is not None else None
+        obj = entry.get_object() if entry is not None else None
     except Exception as exc:  # noqa: BLE001 - any resolution failure is a refusal
         raise UnsupportedContentConstruct("a /Do naming an unresolvable XObject") from exc
     if entry is None:
         raise UnsupportedContentConstruct("a /Do naming an XObject the page does not declare")
-    if subtype != "/Image":
-        raise UnsupportedContentConstruct(
-            f"a /Do on an XObject of subtype {subtype!r}, which may draw text this module does not position"
-        )
+    subtype = obj.get("/Subtype") if obj is not None else None
+    if subtype == "/Image":
+        return None
+    if subtype == "/Form":
+        return obj
+    raise UnsupportedContentConstruct(
+        f"a /Do on an XObject of subtype {subtype!r}, which may draw text this module does not position"
+    )
+
+
+def _form_matrix(raw: Any) -> list[float]:
+    """A form's ``/Matrix`` as six numbers, defaulting to the identity when absent.
+
+    The ``/Matrix`` maps the form's own coordinate space into the space of the ``Do`` that
+    invoked it (ISO 32000-1 8.10.1); absent, it is the identity. Anything present that is
+    not six finite numbers is malformed and refuses through :func:`_num` rather than being
+    guessed at.
+    """
+    if raw is None:
+        return list(_IDENTITY)
+    try:
+        values = list(raw.get_object() if hasattr(raw, "get_object") else raw)
+    except TypeError as exc:
+        raise UnsupportedContentConstruct("a /Form whose /Matrix is not an array") from exc
+    if len(values) != 6:
+        raise UnsupportedContentConstruct("a /Form whose /Matrix is not six numbers")
+    return [_num(value) for value in values]
+
+
+def _rect_from_bbox(bbox: Any, ctm: list[float]) -> _Clip:
+    """A form's ``/BBox`` as a page-space clip rectangle, or :data:`UNKNOWN_CLIP`.
+
+    The ``/BBox`` clips everything the form paints to its own rectangle (ISO 32000-1
+    8.10.1), so it is a clip like any ``re W n`` and is reduced the same way as
+    :func:`_rect_from_re`: refused to :data:`UNKNOWN_CLIP` under a rotated or skewed CTM,
+    whose image of a rectangle is a parallelogram no ``(x0, y0, x1, y1)`` describes. Text
+    the form then draws is tested against this clip by the same
+    :func:`_refuse_text_outside_a_clip` that guards ``re`` clips, so a form whose box does
+    not provably contain its own text refuses exactly as a page-level clip would.
+    """
+    try:
+        values = list(bbox.get_object() if hasattr(bbox, "get_object") else bbox)
+    except TypeError as exc:
+        raise UnsupportedContentConstruct("a /Form whose /BBox is not an array") from exc
+    if len(values) != 4:
+        raise UnsupportedContentConstruct("a /Form whose /BBox is not four numbers")
+    if abs(ctm[1]) > 1e-9 or abs(ctm[2]) > 1e-9:
+        return UNKNOWN_CLIP
+    x0, y0, x1, y1 = (_num(value) for value in values)
+    corners = [_mult([1.0, 0.0, 0.0, 1.0, x0, y0], ctm), _mult([1.0, 0.0, 0.0, 1.0, x1, y1], ctm)]
+    xs = [corner[4] for corner in corners]
+    ys = [corner[5] for corner in corners]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _form_fonts(font_res: Any, font_cls: Any) -> dict[str, Any]:
+    """The layout-mode font map for a form's own ``/Font`` resources.
+
+    Mirrors pypdf's ``PageObject._layout_mode_fonts`` for a form: one ``Font`` per resource
+    name via ``Font.from_font_resource``, keyed by the same name object a ``Tf`` inside the
+    form will present to :func:`resolve_font`. A form that names a font it did not declare
+    falls through ``resolve_font`` to an uninterpretable placeholder exactly as it would on
+    a page, so its text degrades to ``UNMAPPED`` rather than raising.
+    """
+    if font_res is None:
+        return {}
+    fonts: dict[str, Any] = {}
+    try:
+        for name in font_res:
+            fonts[name] = font_cls.from_font_resource(font_res[name])
+    except Exception as exc:  # noqa: BLE001 - an unreadable font entry refuses the form
+        raise UnsupportedContentConstruct("a /Form whose /Font resources cannot be read") from exc
+    return fonts
+
+
+def _form_fonts_and_resources(
+    form_obj: Any, parent_fonts: dict[str, Any], parent: _PageResources, font_cls: Any
+) -> tuple[dict[str, Any], _PageResources]:
+    """The fonts and resource dictionaries in force inside a form XObject.
+
+    A form with its own ``/Resources`` uses THOSE and nothing else (ISO 32000-1 8.10.1); a
+    form with no ``/Resources`` at all inherits the environment it is drawn in -- the page
+    or the containing form. The two are NOT merged: a form that declares a ``/Resources``
+    dictionary is stating it is complete, and pulling the parent's entries in behind it
+    would let a name the form left undeclared resolve to a parent object the form never
+    meant to draw. An unreadable ``/Resources`` refuses the form rather than falling back
+    silently, the fail-closed direction.
+    """
+    try:
+        resources = form_obj.get("/Resources")
+        resolved = resources.get_object() if resources is not None else None
+    except Exception as exc:  # noqa: BLE001 - an unreadable /Resources refuses the form
+        raise UnsupportedContentConstruct("a /Form whose /Resources cannot be read") from exc
+    if resolved is None:
+        return parent_fonts, parent
+
+    def sub(key: str) -> Any:
+        try:
+            entry = resolved.get(key)
+            return None if entry is None else entry.get_object()
+        except Exception:  # noqa: BLE001 - an unreadable sub-dictionary is "does not say"
+            logger.debug("form /Resources %s could not be resolved", key, exc_info=True)
+            return None
+
+    font_res = sub("/Font")
+    return _form_fonts(font_res, font_cls), _PageResources(
+        xobjects=sub("/XObject"),
+        ext_gstates=sub("/ExtGState"),
+        vertical_fonts=_unpositionable_fonts(font_res),
+    )
 
 
 @dataclass(frozen=True)
@@ -2797,6 +2918,16 @@ def _walk_operations(
     params_cls: Any,
     resources: _PageResources,
     budget: int,
+    content_stream: Any,
+    font_cls: Any,
+    pdf: Any,
+    form_content_budget: list[int],
+    depth: int = 0,
+    seen: frozenset[int] = frozenset(),
+    initial_ctm: tuple[float, ...] | list[float] | None = None,
+    initial_clip: _Clip = None,
+    initial_fill_alpha: float = 1.0,
+    initial_stroke_alpha: float = 1.0,
 ) -> tuple[list[Any], bool]:
     """Recompute where every text-show operation on one page actually starts.
 
@@ -2832,8 +2963,21 @@ def _walk_operations(
 
     Returns the shows in stream order, and whether ``budget`` cut the walk short.
     """
-    ctm: list[float] = list(_IDENTITY)
+    # The CTM and clip a top-level page walk starts from are the identity and no clip. A
+    # recursive walk of a form XObject starts from the CTM and clip in force at the `Do`
+    # that invoked it, already composed with the form's own `/Matrix` and `/BBox` by the
+    # caller -- so the same arithmetic below publishes the form's text in page space, and
+    # the same `_refuse_text_outside_a_clip` confines it to the form's box.
+    ctm: list[float] = list(initial_ctm) if initial_ctm is not None else list(_IDENTITY)
     state = _TextState()
+    state.clip = initial_clip
+    # A /Form XObject does not reset the graphics state; ISO 32000-1 8.10.2 has it painted
+    # under the state in effect at the `Do` that invoked it. A recursive walk that started
+    # from a bare `_TextState()` would forget the caller's `/ca`/`/CA`, so `q /GS1 gs /X1 Do
+    # Q` with `/ca 0` would publish the form's text as visible even though the page painted
+    # it fully transparent.
+    state.fill_alpha = initial_fill_alpha
+    state.stroke_alpha = initial_stroke_alpha
     stack: list[tuple[list[float], _TextState]] = []
     # `None` outside a text object. A positioning or showing operator that arrives with
     # no `BT` in effect has no text matrix to act on, and inventing an identity for it
@@ -2924,6 +3068,64 @@ def _walk_operations(
         # invention; feeding that back into the next show's position would propagate an
         # invented number down the rest of the text object.
         tm = _mult([1.0, 0.0, 0.0, 1.0, _advance(params), 0.0], _tm)
+
+    def recurse_into_form(form_obj: Any) -> None:
+        """Walk a ``/Form`` XObject's own content stream and fold its text in.
+
+        Composes the form's ``/Matrix`` onto the CTM in force at the ``Do`` and intersects
+        the clip in force with the form's ``/BBox``, then walks the form's operations with
+        the form's own resources under that transform. The shows it returns are already in
+        page space, so they extend this walk's list directly.
+
+        Every guard the top-level walk has still applies inside the form, plus three that
+        are specific to the descent and each refuses rather than guessing: a cycle (a form
+        that reaches itself), a nest deeper than :data:`_MAX_FORM_DEPTH`, and the shared
+        per-page decode budget that bounds the total form content one page may inflate. A
+        form under a rotated CTM, or one whose ``/BBox`` reduces to :data:`UNKNOWN_CLIP`,
+        needs no new guard: its text meets the same clip refusal a rotated page-level clip
+        already triggers.
+        """
+        if depth >= _MAX_FORM_DEPTH:
+            raise UnsupportedContentConstruct(
+                f"a /Form nested past the depth ({_MAX_FORM_DEPTH}) this module will follow"
+            )
+        key = id(form_obj)
+        if key in seen:
+            raise UnsupportedContentConstruct("a /Form that draws itself, directly or through a cycle")
+        form_ctm = _mult(_form_matrix(form_obj.get("/Matrix")), ctm)
+        bbox = form_obj.get("/BBox")
+        if bbox is None:
+            raise UnsupportedContentConstruct("a /Form with no /BBox, whose visible extent is undefined")
+        form_clip = _intersect_clips(state.clip, _rect_from_bbox(bbox, form_ctm))
+        form_fonts, form_resources = _form_fonts_and_resources(form_obj, fonts, resources, font_cls)
+        # Bounds the SUM of form content one page inflates against the same per-page ceiling
+        # the page's own /Contents already answered to; a page whose forms exceed the
+        # remaining budget fails that page rather than the document.
+        form_content_budget[0] -= _decoded_content_length(form_obj, form_content_budget[0])
+        content = content_stream(form_obj, pdf, "bytes")
+        child_shows, child_stopped = _walk_operations(
+            content.operations,
+            fonts=form_fonts,
+            resolve_font=resolve_font,
+            params_cls=params_cls,
+            resources=form_resources,
+            budget=budget - len(shows),
+            content_stream=content_stream,
+            font_cls=font_cls,
+            pdf=pdf,
+            form_content_budget=form_content_budget,
+            depth=depth + 1,
+            seen=seen | {key},
+            initial_ctm=form_ctm,
+            initial_clip=form_clip,
+            initial_fill_alpha=state.fill_alpha,
+            initial_stroke_alpha=state.stroke_alpha,
+        )
+        shows.extend(child_shows)
+        if child_stopped:
+            # The descent hit the fragment budget. Propagated as this walk's own
+            # `stopped_early` so the page is recorded truncated, not silently short.
+            raise _BudgetExhausted
 
     try:
         for operands, op in operations:
@@ -3038,7 +3240,9 @@ def _walk_operations(
             elif op == b"gs":
                 _apply_ext_gstate(operands, resources.ext_gstates, state)
             elif op == b"Do":
-                _refuse_form_xobject(operands, resources.xobjects)
+                target = _do_target(operands, resources.xobjects)
+                if target is not None:
+                    recurse_into_form(target)
             elif op == b"BDC":
                 _refuse_optional_content(operands)
             elif op == b"re":
@@ -3128,7 +3332,7 @@ def _page_fragments(
     below. See :data:`MAX_PAGE_CONTENT_BYTES` for the measurement it is set from, and
     for the one thing it still does not bound.
     """
-    resolve_font, params_cls, content_stream = engine
+    resolve_font, params_cls, content_stream, font_cls = engine
 
     _refuse_a_reframed_page(page)
     contents = page.get("/Contents")
@@ -3149,8 +3353,15 @@ def _page_fragments(
     # shape of the bomb this guard closed: either one puts an unbounded inflation FIRST.
     # pypdf's own inflation on the next line is safe only because it is second, and it is
     # only second because nothing here keeps its output.
-    _decoded_content_length(resolved, MAX_PAGE_CONTENT_BYTES)
+    page_content_bytes = _decoded_content_length(resolved, MAX_PAGE_CONTENT_BYTES)
     content = content_stream(resolved, page.pdf, "bytes")
+
+    # One decode budget for every form XObject the page pulls in, seeded with what the
+    # per-page ceiling has left after the page's own /Contents. Shared across the whole
+    # recursion tree (a single-element mutable), so the sum of page content plus all form
+    # content a page inflates stays under the one MAX_PAGE_CONTENT_BYTES ceiling the sibling
+    # caps are sized against, rather than one ceiling per form.
+    form_content_budget = [max(MAX_PAGE_CONTENT_BYTES - page_content_bytes, 0)]
 
     shows, stopped_early = _walk_operations(
         content.operations,
@@ -3159,6 +3370,10 @@ def _page_fragments(
         params_cls=params_cls,
         resources=_page_resources(page),
         budget=budget,
+        content_stream=content_stream,
+        font_cls=font_cls,
+        pdf=page.pdf,
+        form_content_budget=form_content_budget,
     )
 
     fragments: list[TextFragment] = []

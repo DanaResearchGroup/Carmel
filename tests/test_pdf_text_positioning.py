@@ -296,23 +296,35 @@ def test_the_pen_advance_survives_a_graphics_state_restore() -> None:
     assert extraction.fragments[1].x_end == pytest.approx(outer.x_end, abs=TOLERANCE)
 
 
-def test_a_form_xobject_fails_its_page_rather_than_dropping_its_text() -> None:
-    """Text drawn through ``Do`` is not positioned here, and is not silently lost either.
+def _form_page(
+    page_content: str,
+    forms: list[tuple[str, bytes]],
+    *,
+    page_resources: str = "/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+) -> bytes:
+    """A page whose content is ``page_content`` plus one or more form XObjects.
 
-    pypdf's layout-mode walker has no ``Do`` branch, so a form XObject's text is ABSENT
-    from its output -- a page that reads as complete with a column missing. Refusing the
-    page converts that into a recorded failure. See
-    :func:`~carmel.services.pdf_fragments._refuse_form_xobject` for why recursion is not
-    built instead: no document in the corpus contains a single form XObject.
+    ``forms`` are ``(dictionary_without_/Length, content_bytes)`` pairs assigned to objects
+    6, 7, ... in order, so a page or a form can reference ``6 0 R``, ``7 0 R`` and so on.
+    """
+    return build_page(page_content, resources=page_resources, extra_objects=list(forms))
+
+
+def test_a_form_xobject_has_its_text_positioned_in_page_space() -> None:
+    """The construct the eight-paper corpus lacked and the 300-paper library is full of.
+
+    pypdf's layout-mode walker has no ``Do`` branch, so a form XObject's text was ABSENT --
+    a page that reads as complete with a column missing. The walker now follows the form,
+    composing its ``/Matrix`` (here the identity) and clipping to its ``/BBox``, so the
+    text it draws is published at its real page position alongside the page's own.
     """
     require_pypdf()
     extraction = extract_fragments(
-        build_page(
+        _form_page(
             "BT /F1 10 Tf 1 0 0 1 100 700 Tm (012345) Tj ET /X1 Do",
-            resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
-            extra_objects=[
+            [
                 (
-                    "<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] >>",
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> >>",
                     b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (99) Tj ET",
                 )
             ],
@@ -320,11 +332,279 @@ def test_a_form_xobject_fails_its_page_rather_than_dropping_its_text() -> None:
     )
 
     assert extraction.available
-    assert extraction.lossy
-    assert [f.page for f in extraction.page_failures] == [1]
-    # And nothing from the page is published: a partial page is the failure mode the
-    # refusal exists to prevent, so the six glyphs drawn BEFORE the /Do are dropped too.
-    assert extraction.fragments == ()
+    assert not extraction.lossy
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012345", "99"]
+    inside = extraction.fragments[1]
+    assert inside.x_start == pytest.approx(10.0, abs=TOLERANCE)
+    assert inside.baseline_y == pytest.approx(10.0, abs=TOLERANCE)
+    assert all(f.glyph_mapping.value == "mapped" for f in extraction.fragments)
+
+
+def test_a_text_free_form_no_longer_fails_the_page() -> None:
+    """The 99% case, and the largest single win: a decorative vector form killed the page.
+
+    In the 300-paper sample almost every form carries no text at all -- a rule, a logo, a
+    figure drawn as vector graphics -- and refusing the ``Do`` failed the whole page for it,
+    dropping the page's real text with it. Following the form finds no text-show operator,
+    so it contributes nothing and, crucially, lets the page complete.
+    """
+    require_pypdf()
+    extraction = extract_fragments(
+        _form_page(
+            "BT /F1 10 Tf 1 0 0 1 100 700 Tm (012345) Tj ET /X1 Do",
+            [("<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] >>", b"0 0 50 50 re f")],
+        )
+    )
+
+    assert not extraction.lossy
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012345"]
+
+
+def test_a_form_matrix_is_composed_onto_the_ctm() -> None:
+    """The form's ``/Matrix`` maps its space into the ``Do``'s space (ISO 32000-1 8.10.1).
+
+    A form drawn at ``(10, 10)`` in its own space, invoked through a ``/Matrix`` that
+    translates by ``(300, 400)``, must publish its text at ``(310, 410)`` in page space.
+    """
+    require_pypdf()
+    extraction = extract_fragments(
+        _form_page(
+            "/X1 Do",
+            [
+                (
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Matrix [1 0 0 1 300 400] "
+                    "/Resources << /Font << /F1 4 0 R >> >> >>",
+                    b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (012) Tj ET",
+                )
+            ],
+        )
+    )
+
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+    assert extraction.fragments[0].x_start == pytest.approx(310.0, abs=TOLERANCE)
+    assert extraction.fragments[0].baseline_y == pytest.approx(410.0, abs=TOLERANCE)
+
+
+def test_a_form_inherits_page_resources_when_it_declares_none() -> None:
+    """A form with no ``/Resources`` draws in the environment it appears in (8.10.1).
+
+    The page's ``/F1`` is in force inside it, so its text is MAPPED rather than falling
+    through to an uninterpretable placeholder.
+    """
+    require_pypdf()
+    extraction = extract_fragments(
+        _form_page(
+            "/X1 Do",
+            [("<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] >>", b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (012) Tj ET")],
+        )
+    )
+
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+    assert extraction.fragments[0].glyph_mapping.value == "mapped"
+
+
+def test_a_form_inside_a_form_is_followed() -> None:
+    """A form may draw another form; the walker follows the chain and composes each matrix."""
+    require_pypdf()
+    extraction = extract_fragments(
+        _form_page(
+            "/X1 Do",
+            [
+                (
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Matrix [1 0 0 1 100 0] "
+                    "/Resources << /XObject << /X2 7 0 R >> >> >>",
+                    b"/X2 Do",
+                ),
+                (
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Matrix [1 0 0 1 0 500] "
+                    "/Resources << /Font << /F1 4 0 R >> >> >>",
+                    b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (012) Tj ET",
+                ),
+            ],
+        )
+    )
+
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+    # 10 + 100 (outer matrix) + 0 (inner), 10 + 0 + 500.
+    assert extraction.fragments[0].x_start == pytest.approx(110.0, abs=TOLERANCE)
+    assert extraction.fragments[0].baseline_y == pytest.approx(510.0, abs=TOLERANCE)
+
+
+def test_an_image_xobject_still_draws_no_text() -> None:
+    """An image ``Do`` is let through unchanged: it draws no text, so the page completes."""
+    require_pypdf()
+    extraction = extract_fragments(
+        _form_page(
+            "BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET /X1 Do",
+            [
+                (
+                    "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 "
+                    "/ColorSpace /DeviceGray /BitsPerComponent 8 >>",
+                    b"\x00",
+                )
+            ],
+        )
+    )
+
+    assert not extraction.page_failures
+    assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_non_image_non_form_xobject_is_still_refused() -> None:
+    """The allowlist holds: only a provable image or form is admitted, everything else
+    refuses. A ``/PS`` (PostScript) XObject could draw anything and is not followed."""
+    require_pypdf()
+    reason = _refusal(
+        "BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET /X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[("<< /Type /XObject /Subtype /PS >>", b"")],
+    )
+    assert "may draw text this module does not position" in reason
+
+
+def test_a_form_under_a_rotated_ctm_refuses_its_text() -> None:
+    """The neighbouring case the matrix composition must NOT admit.
+
+    Under a rotated CTM the form's ``/BBox`` maps to a parallelogram no rectangle describes,
+    so the clip becomes UNKNOWN and the form's text meets the same refusal a rotated
+    page-level clip triggers -- rather than being published against a box that is not its
+    true extent.
+    """
+    require_pypdf()
+    reason = _refusal(
+        "q 0.7 0.7 -0.7 0.7 0 0 cm /X1 Do Q",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[
+            (
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Resources << /Font << /F1 4 0 R >> >> >>",
+                b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (012) Tj ET",
+            )
+        ],
+    )
+    assert "cannot reduce to a rectangle" in reason
+
+
+def test_a_form_whose_bbox_does_not_contain_its_text_refuses() -> None:
+    """The ``/BBox`` is a clip: text drawn outside it paints nothing and must not publish."""
+    require_pypdf()
+    reason = _refusal(
+        "/X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[
+            (
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 5 5] /Resources << /Font << /F1 4 0 R >> >> >>",
+                b"BT /F1 10 Tf 1 0 0 1 100 700 Tm (012) Tj ET",
+            )
+        ],
+    )
+    assert "does not provably contain" in reason
+
+
+def test_a_form_that_references_itself_refuses() -> None:
+    """A cycle is refused rather than followed until the stack gives out."""
+    require_pypdf()
+    reason = _refusal(
+        "/X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[
+            (
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Resources << /XObject << /X1 6 0 R >> >> >>",
+                b"/X1 Do",
+            )
+        ],
+    )
+    assert "draws itself" in reason
+
+
+def test_a_form_nested_past_the_depth_limit_refuses() -> None:
+    """A legitimate but pathologically deep acyclic nest is bounded, not stack-crashed."""
+    require_pypdf()
+    from carmel.services.pdf_fragments import _MAX_FORM_DEPTH
+
+    chain = _MAX_FORM_DEPTH + 2
+    forms: list[tuple[str, bytes]] = []
+    for level in range(chain):
+        obj = 6 + level
+        if level < chain - 1:
+            forms.append(
+                (
+                    f"<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] "
+                    f"/Resources << /XObject << /X{level + 1} {obj + 1} 0 R >> >> >>",
+                    f"/X{level + 1} Do".encode("latin-1"),
+                )
+            )
+        else:
+            forms.append(
+                (
+                    "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Resources << /Font << /F1 4 0 R >> >> >>",
+                    b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (012) Tj ET",
+                )
+            )
+    reason = _refusal(
+        "/X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=forms,
+    )
+    assert "nested past the depth" in reason
+
+
+def test_a_form_with_no_bbox_refuses() -> None:
+    """A ``/BBox`` is required for a form; without it its visible extent is undefined."""
+    require_pypdf()
+    reason = _refusal(
+        "/X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[
+            ("<< /Type /XObject /Subtype /Form /Resources << /Font << /F1 4 0 R >> >> >>", b"BT /F1 10 Tf (012) Tj ET")
+        ],
+    )
+    assert "no /BBox" in reason
+
+
+def test_a_form_with_a_malformed_matrix_refuses() -> None:
+    """A ``/Matrix`` that is not six numbers is malformed and refuses rather than guessed."""
+    require_pypdf()
+    reason = _refusal(
+        "/X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[
+            (
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Matrix [1 0 0 1] "
+                "/Resources << /Font << /F1 4 0 R >> >> >>",
+                b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (012) Tj ET",
+            )
+        ],
+    )
+    assert "/Matrix is not six numbers" in reason
+
+
+def test_the_shared_form_decode_budget_bounds_a_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One page cannot inflate unbounded form content: the sum is capped per page.
+
+    With the per-page ceiling dropped low, a form whose content exceeds what the page's own
+    ``/Contents`` left fails that page rather than the document -- a recorded, visible
+    failure, the fail-closed direction.
+    """
+    require_pypdf()
+    import carmel.services.pdf_fragments as mod
+
+    monkeypatch.setattr(mod, "MAX_PAGE_CONTENT_BYTES", 60)
+    reason = _refusal(
+        "/X1 Do",
+        resources="/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >>",
+        extra_objects=[
+            (
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 600 792] /Resources << /Font << /F1 4 0 R >> >> >>",
+                b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (0123456789) Tj (0123456789) Tj (0123456789) Tj ET",
+            )
+        ],
+    )
+    assert "past the" in reason and "cap" in reason
 
 
 def _refusal(content: str, **kwargs: object) -> str:
@@ -750,6 +1030,27 @@ def test_a_graphics_state_restore_restores_the_alpha_too() -> None:
     )
     assert not extraction.page_failures
     assert [f.text for f in extraction.fragments] == ["012"]
+
+
+def test_a_form_inherits_the_callers_alpha() -> None:
+    """A ``/Form`` does not reset the graphics state -- ISO 32000-1 8.10.2 paints its
+    content under whatever was in force at the ``Do``. ``q /GS1 gs /X1 Do Q`` with ``/ca
+    0`` makes the page fully transparent before it draws the form, so the form's text is
+    exactly as invisible as text drawn directly on the page under the same state would be.
+    A recursive walk that started the form from a fresh, opaque ``_TextState`` would
+    publish it as ordinary visible text instead."""
+    require_pypdf()
+    reason = _refusal(
+        "q /GS1 gs /X1 Do Q",
+        resources=("/Font << /F1 4 0 R >> /XObject << /X1 6 0 R >> /ExtGState << /GS1 << /Type /ExtGState /ca 0 >> >>"),
+        extra_objects=[
+            (
+                "<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Resources << /Font << /F1 4 0 R >> >> >>",
+                b"BT /F1 10 Tf 1 0 0 1 10 10 Tm (99) Tj ET",
+            )
+        ],
+    )
+    assert "fully transparent" in reason
 
 
 def test_a_soft_mask_is_refused() -> None:

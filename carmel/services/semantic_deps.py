@@ -1082,7 +1082,7 @@ _FRAGMENT_GEOMETRY_SHA256_V7 = "2fc6f8df66a12d1be2c473ab17e91170cc0c1866b5098bd6
 # component is unmoved for the eighth consecutive time.
 _FRAGMENT_GEOMETRY_OWN_SHA256_V8 = "7444bb6fbf152fbb7aea42f58d2627966163ddd908adba336723202f4e40cd53"
 _FRAGMENT_GEOMETRY_BORROWED_SHA256 = "39844d90f40067b45a6413816336fd9cbb7a1f9db8be05c75640b74d56ea8199"
-_FRAGMENT_GEOMETRY_OWN_SHA256 = "3320c940bc597e39a73659a0d42aba5a23a1293e3be4950ce20bd3d7cd97dae0"
+_FRAGMENT_GEOMETRY_OWN_SHA256_V14 = "3320c940bc597e39a73659a0d42aba5a23a1293e3be4950ce20bd3d7cd97dae0"
 _FRAGMENT_GEOMETRY_SHA256_V8 = "ccd95b43ed5f048a77428ec6a8f199a34f6158a4a1b66f2d1ef746a1916a2491"
 
 # The NINTH entry, SUPERSEDED. V8 shipped the availability taxonomy; this tightened two
@@ -1175,7 +1175,40 @@ _FRAGMENT_GEOMETRY_SHA256_V13 = "06a2f1240e7fe17374a1380a345c2cec252ec8ca31808e3
 # per stream (`font_budget` threads `MAX_FONT_PROGRAM_BYTES_PER_DOCUMENT` through
 # `_page_fragments` exactly as `glyph_budget` is threaded). No document's output moves; the own
 # sha moves because the closure's source did.
-_FRAGMENT_GEOMETRY_SHA256 = "a78b91b48047c149a61d95ac24e8665d9775ee56d8f26651955bbaee3ce822d1"
+_FRAGMENT_GEOMETRY_SHA256_V14 = "a78b91b48047c149a61d95ac24e8665d9775ee56d8f26651955bbaee3ce822d1"
+
+# The FIFTEENTH entry, and the first to FOLLOW a form XObject rather than refuse it. Until
+# now `Do` was refused for anything but an image, on the eight-paper corpus's true premise
+# that it held not one `/Form` (all 71 XObjects were images). A survey over a 300-paper
+# sample of the real library inverted that: `Do` on a `/Form` is 65.3% of all page-failure
+# reasons, the single largest, and the forms are ordinary -- every matrix in the sample is
+# axis-aligned, 99% carry no text at all (a decorative form that killed the whole page for
+# nothing), and the ones that do carry it under their own `/Font`. `_walk_operations` now
+# composes the form's `/Matrix` onto the CTM, intersects the clip in force with the form's
+# `/BBox`, and walks the form's own content stream under that transform -- so its text is
+# published in page space and a text-free form no longer fails the page. What it does NOT
+# do is widen proof: a form under a rotated CTM, or one whose `/BBox` reduces to UNKNOWN,
+# meets the same clip refusal a rotated page-level clip already triggers; a cycle, a nest
+# past `_MAX_FORM_DEPTH`, and the shared per-page form-content decode budget each refuse
+# rather than guess. This is the first entry whose OWN change is a coverage change on real
+# documents rather than a refusal-boundary or output-shape move. Borrowed unmoved for the
+# fifteenth time.
+_FRAGMENT_GEOMETRY_OWN_SHA256_V15 = "b4e21f79974bb77d5f4bed49953d6d98b157227a81562dd2b96770c43c0b06df"
+_FRAGMENT_GEOMETRY_SHA256_V15 = "ff46a870fb617b20a328f2ef9546d882aec633965c1cc2fc3c4a533dabbd8c5d"
+
+# The SIXTEENTH entry, fixing a defect V15 introduced rather than adding coverage. The new
+# `recurse_into_form` started the child walk from a bare `_TextState()`, which ISO 32000-1
+# 8.10.2 does not allow: a form XObject is painted under the graphics state in effect at the
+# `Do` that invoked it, not under a fresh one. `q /GS1 gs /X1 Do Q` with `/ca 0` (or `/CA 0`
+# under a stroking-only render mode) made the PAGE fully transparent before drawing the form,
+# so the form's own text should be exactly as invisible as text drawn directly on the page
+# under the same state -- but the fresh `_TextState` reset both alphas to 1.0, so V15
+# published that text as ordinary visible content. `_walk_operations` now takes
+# `initial_fill_alpha`/`initial_stroke_alpha` and `recurse_into_form` passes the caller's
+# `state.fill_alpha`/`state.stroke_alpha` into the child walk, exactly as it already does for
+# `initial_ctm`/`initial_clip`. Borrowed unmoved for the sixteenth time.
+_FRAGMENT_GEOMETRY_OWN_SHA256 = "2b5e067fde9c14a743b2d7272e42a3b572424a1544b33589366925da04efe4e4"
+_FRAGMENT_GEOMETRY_SHA256 = "2af29eed4a2c9cf17b08f70590f8bbecb0cee8aba87370f00119758154ba2b74"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1278,6 +1311,16 @@ _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA: Mapping[str, _FragmentGeometryComponents] 
         ),
         _FRAGMENT_GEOMETRY_SHA256_V13: _FragmentGeometryComponents(
             own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V13,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V14: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V14,
+            borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
+            borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
+        ),
+        _FRAGMENT_GEOMETRY_SHA256_V15: _FragmentGeometryComponents(
+            own_sha256=_FRAGMENT_GEOMETRY_OWN_SHA256_V15,
             borrowed_sha256=_FRAGMENT_GEOMETRY_BORROWED_SHA256,
             borrowed_names=FRAGMENT_GEOMETRY_BORROWED_NAMES,
         ),
@@ -1463,6 +1506,18 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
             content_sha256=_FRAGMENT_GEOMETRY_SHA256_V13,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V14,
+            input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
+            is_current=False,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+            content_sha256=_FRAGMENT_GEOMETRY_SHA256_V15,
             input_policy=InputPolicy.EXTERNAL_DIGEST_REQUIRED,
             is_current=False,
         ),
