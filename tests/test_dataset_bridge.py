@@ -183,7 +183,7 @@ def test_reversed_series_order_is_rejected_by_model_validate() -> None:
     """
     envelope = _maximal_envelope()
     payload = copy.deepcopy(envelope.identity_payload())
-    assert [series["series_id"] for series in payload["series"]] == ["s1", "s2"]
+    assert [series["series_id"] for series in payload["series"]] == ["s1", "s2", "s3"]
     payload["series"].reverse()
 
     with pytest.raises(DatasetEnvelopeParseError, match="failed validation"):

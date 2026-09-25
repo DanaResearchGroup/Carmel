@@ -22,6 +22,7 @@ import pytest
 from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.units import (
     TABLE_V1,
+    TABLE_V2,
     TABLES_BY_SHA,
     AffineRule,
     ConversionRule,
@@ -491,6 +492,28 @@ class TestConvertPressureScaleRounding:
         assert result.rounded == "0"
 
 
+class TestConvertMbarExactScale:
+    """TABLE_V2's ``mbar`` rule: exactly 100 Pa, and bound only to pressure."""
+
+    def test_one_mbar_is_exactly_100_pa(self) -> None:
+        result = convert("1", quantity=QuantityKind.PRESSURE, from_unit="mbar", to_unit="Pa", table=TABLE_V2)
+        assert result.exact == "100"
+        assert result.rule_kind == "scale"
+        assert result.conversion_table_sha256 == TABLE_V2.sha256
+
+    def test_a_real_rkd_reading_converts_exactly(self) -> None:
+        assert convert("586", quantity=QuantityKind.PRESSURE, from_unit="mbar", to_unit="Pa", table=TABLE_V2).exact == (
+            "58600"
+        )
+
+    def test_mbar_normalizes_under_v2_only(self) -> None:
+        assert normalize_unit(QuantityKind.PRESSURE, "mbar", table=TABLE_V2) == "mbar"
+        with pytest.raises(UnitError):
+            normalize_unit(QuantityKind.PRESSURE, "mbar", table=TABLE_V1)
+        with pytest.raises(UnitError):
+            normalize_unit(QuantityKind.TEMPERATURE, "mbar", table=TABLE_V2)
+
+
 class TestConvertMoleFractionPpmScaling:
     """1 ppm -> mole fraction: pins Item 1's new ScaleRule at its documented scale."""
 
@@ -676,6 +699,8 @@ class TestShippedTablesAreNeverRemoved:
             # TABLE_V1, shipped since the module's introduction. This is a
             # literal historical constant -- see class docstring above.
             "1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122",
+            # TABLE_V2, shipped with the ReSpecTh database lane (RKD spellings + mbar).
+            "371d93150f0b4d078d91727e3a76cdfb8879ee9e25753a0431bf48a0fdf2e1ec",
         }
     )
 
