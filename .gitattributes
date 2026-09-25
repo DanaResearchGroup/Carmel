@@ -1,0 +1,2 @@
+# ReSpecTh RKD members are pinned by sha256 of their exact bytes: never normalize line endings.
+tests/fixtures/respecth/*.xml -text

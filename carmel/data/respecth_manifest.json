@@ -1,0 +1,28 @@
+{
+  "manifest_version": 1,
+  "source": "respecth",
+  "title": "ReSpecTh Kinetics Data, OSF mirror",
+  "osf_node": "nbmzv",
+  "doi": "10.17605/OSF.IO/NBMZV",
+  "license": "CC-BY-4.0",
+  "attribution": "(c) RESPECTH; cite the papers listed in each folder's notes.txt",
+  "download_url_template": "https://files.osf.io/v1/resources/nbmzv/providers/osfstorage/{osf_file_id}?version={osf_version}",
+  "archives": [
+    {
+      "name": "H2_indirect_v2_3.zip",
+      "osf_path": "/ReactionKinetics/indirect/hydrogen/H2_indirect_v2_3.zip",
+      "osf_file_id": "6716900181a7f78563a5e911",
+      "osf_version": 1,
+      "size": 896354,
+      "sha256": "7f7247f0c95dfe65cf784807b6fde5539d34f3fce43b47a779d4ad288b96ddda"
+    },
+    {
+      "name": "syngas_indirect_v2_3.zip",
+      "osf_path": "/ReactionKinetics/indirect/syngas/syngas_indirect_v2_3.zip",
+      "osf_file_id": "671691044a236f2bf52ecb24",
+      "osf_version": 1,
+      "size": 704397,
+      "sha256": "a14628e5300a7922f50bb354b95f46f1ae853eb6b31e2a33555ffab17812321b"
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+<experiment>
+    <fileAuthor>Chemical Kinetics Laboratory, Institute of Chemistry, ELTE, Budapest, Hungary</fileAuthor>
+    <fileDOI>10.24388/x40001058_19</fileDOI>
+    <fileVersion>
+        <major>1</major>
+        <minor>0</minor>
+    </fileVersion>
+    <ReSpecThVersion>
+        <major>2</major>
+        <minor>3</minor>
+    </ReSpecThVersion>
+    <firstPublicationDate>2014-06-24</firstPublicationDate>
+    <lastModificationDate>2022-01-17</lastModificationDate>
+    <bibliographyLink>
+        <description>A.B. Mansfield, M.S. Wooldridge, Combustion and Flame 161 (2014), 2242-2251</description>
+        <referenceDOI>10.1016/j.combustflame.2014.03.001</referenceDOI>
+        <location>Supplementary mat. strong ignitions only</location>
+        <details>
+            <author>Andrew B. Mansfield and Margaret S. Wooldridge</author>
+            <journal>Combustion and Flame</journal>
+            <number>9</number>
+            <pages>2242-2251</pages>
+            <title>High-pressure low-temperature ignition behavior of syngas mixtures</title>
+            <volume>161</volume>
+            <year>2014</year>
+        </details>
+    </bibliographyLink>
+    <experimentType>ignition delay measurement</experimentType>
+    <apparatus>
+        <kind>rapid compression machine</kind>
+    </apparatus>
+    <commonProperties>
+        <property name="initial composition"           sourcetype="reported"  >
+            <component><speciesLink preferredKey="CO"   CAS="630-08-0"   InChI="1S/CO/c1-2"     SMILES="[C-]#[O+]"  chemName="carbon monoxide" /><amount units="mole fraction" >0.017</amount></component>
+            <component><speciesLink preferredKey="H2"   CAS="1333-74-0"  InChI="1S/H2/h1H"      SMILES="[HH]"       chemName="hydrogen"        /><amount units="mole fraction" >0.025</amount></component>
+            <component><speciesLink preferredKey="O2"   CAS="7782-44-7"  InChI="1S/O2/c1-2"     SMILES="O=O"        chemName="oxygen"          /><amount units="mole fraction" >0.209</amount></component>
+            <component><speciesLink preferredKey="N2"   CAS="7727-37-9"  InChI="1S/N2/c1-2"     SMILES="N#N"        chemName="nitrogen"        /><amount units="mole fraction" >0.732</amount></component>
+            <component><speciesLink preferredKey="CO2"  CAS="124-38-9"   InChI="1S/CO2/c2-1-3"  SMILES="C(=O)=O"    chemName="carbon dioxide"  /><amount units="mole fraction" >0.017</amount></component>
+        </property>
+        <property name="evaluated standard deviation"  sourcetype="estimated"  units="unitless"       reference="ignition delay"  kind="relative"  method="statistical scatter" ><value>0.12</value></property>
+    </commonProperties>
+    <dataGroup id="dg1">
+        <property name="temperature"     id="x1"   label="T"    sourcetype="reported"  units="K"   />
+        <property name="pressure"        id="x2"   label="p"    sourcetype="reported"  units="atm" />
+        <property name="ignition delay"  id="x3"   label="tau"  sourcetype="reported"  units="ms"  />
+
+        <dataPoint><x1>1039</x1><x2>10.9</x2><x3>14.0</x3></dataPoint>
+    </dataGroup>
+    <ignitionType target="p;" type="d/dt max"/>
+    <dataGroup id="dg2" label="V-t history" dataPointLink="1">
+        <property name="time"    id="x8"   label="t"            sourcetype="estimated"  units="ms"  />
+        <property name="volume"  id="x9"   label="V"            sourcetype="estimated"  units="cm3" />
+
+        <dataPoint><x8>0.00</x8><x9>1.0000000</x9></dataPoint>
+        <dataPoint><x8>1.00</x8><x9>1.0034797</x9></dataPoint>
+        <dataPoint><x8>2.00</x8><x9>1.0044255</x9></dataPoint>
+        <dataPoint><x8>3.00</x8><x9>1.0046817</x9></dataPoint>
+        <dataPoint><x8>4.00</x8><x9>1.0047510</x9></dataPoint>
+        <dataPoint><x8>5.00</x8><x9>1.0047697</x9></dataPoint>
+        <dataPoint><x8>6.00</x8><x9>1.0047748</x9></dataPoint>
+        <dataPoint><x8>7.00</x8><x9>1.0047761</x9></dataPoint>
+        <dataPoint><x8>8.00</x8><x9>1.0047765</x9></dataPoint>
+        <dataPoint><x8>9.00</x8><x9>1.0047766</x9></dataPoint>
+        <dataPoint><x8>10.0</x8><x9>1.0047766</x9></dataPoint>
+        <dataPoint><x8>11.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>12.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>13.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>14.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>15.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>16.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>17.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>18.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>19.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>20.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>21.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>22.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>23.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>24.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>25.0</x8><x9>1.0047767</x9></dataPoint>
+        <dataPoint><x8>26.0</x8><x9>1.0047767</x9></dataPoint>
+    </dataGroup>
+</experiment>
