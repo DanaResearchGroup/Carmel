@@ -104,11 +104,18 @@ class CandidateRow(BaseModel):
 
 
 class DocumentRow(BaseModel):
-    """The complete record for one document, one JSON line in the results file."""
+    """The complete record for one document, one JSON line in the results file.
+
+    ``doc_id`` is deliberately opaque: the corpus survey walks a local, personal PDF
+    library, and this file is committed to a public repo. ``doc_id`` is the document's
+    content sha256 (identical to ``raw_sha256`` once ingestion succeeds) so a row is
+    identifiable and resume-matchable without ever writing an absolute path or a paper's
+    filename to disk. See :func:`_content_id_for_resume` and :func:`_fallback_doc_id`.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str
+    doc_id: str
     outcome: DocumentOutcome
     raw_sha256: str | None = None
     n_bytes: int | None = None
@@ -158,8 +165,20 @@ def ingest_pdf(workspace_root: Path, pdf_path: Path, *, max_bytes: int) -> tuple
 
     Returns:
         The recomputed ``raw_sha256`` and the byte count of the stored document.
+
+    Raises:
+        ValueError: ``pdf_path`` is over ``max_bytes``, checked twice: once via
+            ``stat()`` before any bytes are read (so an oversized file is never read into
+            memory), and again on ``len(data)`` after the read (a file can grow between
+            the stat and the read; mirrors the stat-then-recheck discipline in
+            :mod:`carmel.services.acquisition`).
     """
+    size = pdf_path.stat().st_size
+    if size > max_bytes:
+        raise ValueError(f"document is {size} bytes, over the {max_bytes} byte cap")
     data = pdf_path.read_bytes()
+    if len(data) > max_bytes:
+        raise ValueError(f"document is {len(data)} bytes after read, over the {max_bytes} byte cap")
     digest = hashlib.sha256(data).hexdigest()
     extracted = extract_text(data, PDF_CONTENT_TYPE)
     artifact = FetchedArtifact(
@@ -183,6 +202,55 @@ def ingest_pdf(workspace_root: Path, pdf_path: Path, *, max_bytes: int) -> tuple
     return digest, len(data)
 
 
+def _scrub_path(text: str, path: Path) -> str:
+    """Strip ``path`` -- absolute form and bare filename -- out of an exception message.
+
+    Stdlib ``OSError`` subclasses (``FileNotFoundError``, ``PermissionError``, ...)
+    interpolate the absolute path straight into ``str(exc)``. Those messages land in the
+    ``error`` field of a committed results row, so the same discipline as ``doc_id``
+    applies here: neither a local path nor a filename may escape into output. Best-effort;
+    the input is our own path so this cannot itself raise.
+    """
+    return text.replace(str(path), "<document>").replace(path.name, "<document>")
+
+
+def _fallback_doc_id(path: Path, *, max_bytes: int) -> str:
+    """A doc id for a document that failed before its content hash could be trusted.
+
+    Hashes the file's actual bytes when they fit under ``max_bytes`` (so an identical
+    failed-then-readable file still gets a stable, content-derived id). The read is
+    bounded to ``max_bytes + 1`` bytes: an over-cap file -- usually the very failure being
+    recorded -- is never read in full, so this handler cannot itself exhaust memory and
+    abort the batch. An over-cap or unreadable file falls back to a hash of the path
+    string. Either way this is a one-way hash, never the path or filename.
+    """
+    path_hash = hashlib.sha256(str(path).encode()).hexdigest()[:16]
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(max_bytes + 1)
+    except OSError:
+        return "unreadable-" + path_hash
+    if len(data) > max_bytes:
+        return "oversize-" + path_hash
+    return hashlib.sha256(data).hexdigest()
+
+
+def _content_id_for_resume(path: Path) -> str | None:
+    """The current content id of ``path``, for resume's identity check, or ``None``.
+
+    Deliberately independent of ``max_bytes``: an over-cap file still has a well-defined
+    identity (it will simply fail fast, and cheaply, if reprocessed), so the size cap is
+    not a reason to skip the comparison here. Returns ``None`` (never shortcuts) only
+    when the file cannot be read at all. A successful id here is exactly the
+    ``doc_id``/``raw_sha256`` a completed run would have recorded for this file's current
+    bytes.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
 def survey_document(workspace_root: Path, pdf_path: Path, *, max_bytes: int) -> DocumentRow:
     """Ingest one PDF, run the lane over it, and return a fully typed row.
 
@@ -195,9 +263,9 @@ def survey_document(workspace_root: Path, pdf_path: Path, *, max_bytes: int) -> 
         digest, n_bytes = ingest_pdf(workspace_root, pdf_path, max_bytes=max_bytes)
     except Exception as exc:  # noqa: BLE001 - untrusted input; record and continue
         return DocumentRow(
-            path=str(pdf_path),
+            doc_id=_fallback_doc_id(pdf_path, max_bytes=max_bytes),
             outcome=DocumentOutcome.INGEST_FAILED,
-            error=str(exc),
+            error=_scrub_path(str(exc), pdf_path),
             error_type=type(exc).__name__,
             elapsed_s=perf_counter() - start,
         )
@@ -206,21 +274,21 @@ def survey_document(workspace_root: Path, pdf_path: Path, *, max_bytes: int) -> 
         report = report_document_tables(workspace_root, digest, max_bytes=max_bytes)
     except GeneralTableReportError as exc:
         return DocumentRow(
-            path=str(pdf_path),
+            doc_id=digest,
             outcome=DocumentOutcome.WHOLE_DOC_REFUSED,
             raw_sha256=digest,
             n_bytes=n_bytes,
-            error=str(exc),
+            error=_scrub_path(str(exc), pdf_path),
             error_type=type(exc).__name__,
             elapsed_s=perf_counter() - start,
         )
     except Exception as exc:  # noqa: BLE001 - a crash is the contract violation to RECORD
         return DocumentRow(
-            path=str(pdf_path),
+            doc_id=digest,
             outcome=DocumentOutcome.CRASHED,
             raw_sha256=digest,
             n_bytes=n_bytes,
-            error=str(exc),
+            error=_scrub_path(str(exc), pdf_path),
             error_type=type(exc).__name__,
             elapsed_s=perf_counter() - start,
         )
@@ -241,7 +309,7 @@ def survey_document(workspace_root: Path, pdf_path: Path, *, max_bytes: int) -> 
     ]
     n_stored = sum(1 for candidate in candidates if candidate.status in _STORED_STATUSES)
     return DocumentRow(
-        path=str(pdf_path),
+        doc_id=digest,
         outcome=DocumentOutcome.REPORTED,
         raw_sha256=report.raw_sha256,
         n_bytes=n_bytes,
@@ -264,16 +332,38 @@ def _prune_artifact(workspace_root: Path, raw_sha256: str) -> None:
     shutil.rmtree(artifact_dir(workspace_root, raw_sha256), ignore_errors=True)
 
 
-def _load_done_paths(out_path: Path) -> set[str]:
-    """Read the paths already recorded in a results file, for resume."""
-    done: set[str] = set()
-    with out_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            line = line.strip()
-            if not line:
+def _read_rows(out_path: Path) -> list[DocumentRow]:
+    """Parse every complete row in a results file.
+
+    A process killed mid-write (SIGKILL, OOM, power loss) can leave a partial JSON
+    object as the file's last line with NO trailing newline -- a normal artifact of
+    append-and-fsync checkpointing, not corruption. That fragment is silently discarded
+    so resume and summarize continue over exactly what was durably flushed. Every row is
+    written with its newline in the same flushed write, so an invalid newline-terminated
+    line -- interior or final -- is not explainable by a mid-write kill and still raises,
+    since that really is corruption worth stopping for.
+    """
+    # split("\n"), not splitlines(): only "\n" terminates a row, and the element after
+    # the last "\n" is exactly the unterminated remainder ("" when the file ends cleanly).
+    lines = out_path.read_text(encoding="utf-8").split("\n")
+    last_index = len(lines) - 1
+    rows: list[DocumentRow] = []
+    for index, line in enumerate(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(DocumentRow.model_validate_json(line))
+        except ValueError:
+            if index == last_index:
                 continue
-            done.add(DocumentRow.model_validate_json(line).path)
-    return done
+            raise
+    return rows
+
+
+def _load_done_doc_ids(out_path: Path) -> set[str]:
+    """The ``doc_id`` of every document already recorded in a results file, for resume."""
+    return {row.doc_id for row in _read_rows(out_path)}
 
 
 def survey_batch(
@@ -284,7 +374,7 @@ def survey_batch(
     max_bytes: int,
     resume: bool = True,
     prune_unstored: bool = False,
-    on_row: Callable[[int, DocumentRow], None] | None = None,
+    on_row: Callable[[int, Path, DocumentRow], None] | None = None,
 ) -> BatchSummary:
     """Survey every PDF in ``pdf_paths``, checkpointing one JSON line per document.
 
@@ -293,39 +383,45 @@ def survey_batch(
         pdf_paths: The documents to survey, in order.
         out_path: Results file, appended to. One :class:`DocumentRow` JSON per line.
         max_bytes: Size cap passed to ingest and the replay check.
-        resume: When true and ``out_path`` exists, skip documents already recorded.
+        resume: When true and ``out_path`` exists, skip documents whose CURRENT content
+            id already appears in ``out_path`` (see :func:`_content_id_for_resume`) --
+            not merely a document at a previously-seen path. A path whose file changed
+            since the last run is reprocessed, never silently skipped as stale.
         prune_unstored: When true, delete the evidence directory of any document that
             stored nothing, to bound disk on a whole-corpus run. Stored-and-replayed
             documents are always kept.
-        on_row: Optional progress callback, called with ``(index, row)`` after each write.
+        on_row: Optional progress callback, called with ``(index, pdf_path, row)`` after
+            each write.
 
     Returns:
         A :class:`BatchSummary` computed from the complete results file.
     """
     workspace_root.mkdir(parents=True, exist_ok=True)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    done = _load_done_paths(out_path) if resume and out_path.exists() else set()
+    done = _load_done_doc_ids(out_path) if resume and out_path.exists() else set()
 
     with out_path.open("a", encoding="utf-8") as handle:
         for index, pdf_path in enumerate(pdf_paths):
-            if str(pdf_path) in done:
-                continue
+            if resume and done:
+                current_id = _content_id_for_resume(pdf_path)
+                if current_id is not None and current_id in done:
+                    continue
             row = survey_document(workspace_root, pdf_path, max_bytes=max_bytes)
             handle.write(row.model_dump_json() + "\n")
             handle.flush()
             os.fsync(handle.fileno())
+            done.add(row.doc_id)
             if prune_unstored and row.n_stored == 0 and row.raw_sha256 is not None:
                 _prune_artifact(workspace_root, row.raw_sha256)
             if on_row is not None:
-                on_row(index, row)
+                on_row(index, pdf_path, row)
 
     return summarize(out_path)
 
 
 def summarize(out_path: Path) -> BatchSummary:
     """Aggregate a results file into the counts the report needs."""
-    lines = out_path.read_text(encoding="utf-8").splitlines()
-    rows = [DocumentRow.model_validate_json(line) for line in lines if line.strip()]
+    rows = _read_rows(out_path)
     outcomes: Counter[str] = Counter()
     statuses: Counter[str] = Counter()
     refusal_reasons: Counter[str] = Counter()
@@ -345,7 +441,7 @@ def summarize(out_path: Path) -> BatchSummary:
         if row.extraction_unavailable:
             n_unavailable += 1
         if row.outcome is DocumentOutcome.CRASHED:
-            crashed.append(row.path)
+            crashed.append(row.doc_id)
         for candidate in row.candidates:
             statuses[candidate.status] += 1
             if candidate.proposal_refusal_reason is not None:
@@ -457,12 +553,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"surveying {len(pdfs)} PDFs into {args.workspace}", file=sys.stderr)
 
-    def _progress(index: int, row: DocumentRow) -> None:
+    def _progress(index: int, pdf_path: Path, row: DocumentRow) -> None:
         tag = row.outcome.value
         extra = ""
         if row.outcome is DocumentOutcome.REPORTED:
             extra = f" candidates={row.n_candidates} stored={row.n_stored}"
-        print(f"  [{index + 1}/{len(pdfs)}] {tag}{extra} :: {Path(row.path).name}", file=sys.stderr)
+        # Filenames are fine on the operator's own stderr; only the committed results
+        # file must never carry them (see DocumentRow.doc_id).
+        print(f"  [{index + 1}/{len(pdfs)}] {tag}{extra} :: {pdf_path.name}", file=sys.stderr)
 
     summary = survey_batch(
         args.workspace,
