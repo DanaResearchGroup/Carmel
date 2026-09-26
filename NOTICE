@@ -1,51 +1,8 @@
-Carmel — Agentic Predictive Chemical Kinetics Engine
-Copyright 2026 Dana Research Group (Technion — Israel Institute of Technology)
+ChemKED fixture and manifest attribution
+========================================
 
-This product includes software developed by the Dana Research Group.
-
-Licensed under the Apache License, Version 2.0 (the "License"); you may not
-use this software except in compliance with the License. A copy of the License
-is distributed with this software in the file LICENSE and is also available at
-http://www.apache.org/licenses/LICENSE-2.0
-
---------------------------------------------------------------------------------
-
-Third-party data: ReSpecTh Kinetics Data
-
-The files under tests/fixtures/respecth/ are unmodified member files of the
-ReSpecTh Kinetics Data (RKD) archives published on the Open Science Framework
-mirror of the ReSpecTh database (https://osf.io/nbmzv/,
-DOI 10.17605/OSF.IO/NBMZV), (c) RESPECTH, licensed under the Creative Commons
-Attribution 4.0 International licence (CC BY 4.0,
-https://creativecommons.org/licenses/by/4.0/). Carmel does not redistribute the
-database itself; carmel/data/respecth_manifest.json pins the archives it reads
-by OSF file id, version and sha256, and they are downloaded at run time.
-
-Users of these data are asked by the ReSpecTh maintainers to cite, for the
-hydrogen records:
-
-  Olm, C.; Zsely, I. Gy.; Palvolgyi, R.; Varga, T.; Nagy, T.; Curran, H. J.;
-  Turanyi, T. Comparison of the Performance of Several Recent Hydrogen
-  Combustion Mechanisms. Combustion and Flame 2014, 161 (9), 2219-2234.
-  https://doi.org/10.1016/j.combustflame.2014.03.006
-
-  Varga, T.; Nagy, T.; Olm, C.; Zsely, I. Gy.; Palvolgyi, R.; Valko, E.;
-  Vincze, G.; Cserhati, M.; Curran, H. J.; Turanyi, T. Optimization of a
-  Hydrogen Combustion Mechanism Using Both Direct and Indirect Measurements.
-  Proceedings of the Combustion Institute 2015, 35 (1), 589-596.
-  https://doi.org/10.1016/j.proci.2014.06.071
-
-for the syngas records:
-
-  Olm, C.; Zsely, I. Gy.; Varga, T.; Curran, H. J.; Turanyi, T. Comparison of
-  the Performance of Several Recent Syngas Combustion Mechanisms. Combustion
-  and Flame 2015, 162 (5), 1793-1812.
-  https://doi.org/10.1016/j.combustflame.2014.12.001
-
-  Varga, T.; Olm, C.; Nagy, T.; Zsely, I. Gy.; Valko, E.; Palvolgyi, R.;
-  Curran, H. J.; Turanyi, T. Development of a Joint Hydrogen and Syngas
-  Combustion Mechanism Based on an Optimization Approach. International
-  Journal of Chemical Kinetics 2016, 48 (8), 407-422.
-  https://doi.org/10.1002/kin.21006
-
-and the original experimental paper each record names (its bibliographyLink).
+`carmel/data/chemked_manifest.json` pins individual raw records from
+pr-omethe-us/ChemKED-database commit 606005bfc8f5214b3f0b5ca7300a96a82815c2ae.
+The upstream repository's LICENSE.txt is Creative Commons Attribution 4.0
+International (CC-BY-4.0). The single test fixture retains the record's DOI
+and file-authors metadata; no database archive is vendored.

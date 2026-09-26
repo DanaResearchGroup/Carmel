@@ -793,7 +793,7 @@ class TestCache:
 # --------------------------------------------------------------------------- CLI
 
 _FIXTURE_MEMBERS = ["x00000070_p.xml", "x10000001.xml", "x10000030_x.xml", "x40001058_19.xml"]
-_HEADER = "record_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints"
+_HEADER = "source\trecord_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints"
 
 
 @pytest.fixture
@@ -822,18 +822,18 @@ class TestDataFind:
         assert _find(fixture_cache, "--fuel", "H2", "--T", "900:1300", "--P", "10:40") == 0
         assert capsys.readouterr().out.splitlines() == [
             _HEADER,
-            "10.24388/x40001058_19\t10.1016/j.combustflame.2014.03.001\trcm\tCO+H2\t1039-1039\t11.04-11.04\t1/1",
-            "1 matching dataset(s) of 4 mapped ignition-delay records; 0 refused (none)",
+            "ReSpecTh\t10.24388/x40001058_19\t10.1016/j.combustflame.2014.03.001\trcm\tCO+H2\t1039-1039\t11.04-11.04\t1/1",
+            "1 matching dataset(s) of 4 ReSpecTh mapped ignition-delay records; 0 refused (none)",
         ]
 
     def test_every_h2_record(self, fixture_cache: tuple[Path, Path], capsys: pytest.CaptureFixture[str]) -> None:
         assert _find(fixture_cache, "--fuel", "H2") == 0
         assert capsys.readouterr().out.splitlines()[1:5] == [
-            "10.24388/x00000070\tplaceholder\tshock_tube\tH2\t1279-1344\t64.85-64.85\t3/3",
-            "10.24388/x10000001\t10.1063/1.1696266\tshock_tube\tH2\t964-1075\t5.066-5.066\t7/7",
-            "10.24388/x10000030\t10.1016/j.combustflame.2011.09.010\tshock_tube (mode assumed)"
+            "ReSpecTh\t10.24388/x00000070\tplaceholder\tshock_tube\tH2\t1279-1344\t64.85-64.85\t3/3",
+            "ReSpecTh\t10.24388/x10000001\t10.1063/1.1696266\tshock_tube\tH2\t964-1075\t5.066-5.066\t7/7",
+            "ReSpecTh\t10.24388/x10000030\t10.1016/j.combustflame.2011.09.010\tshock_tube (mode assumed)"
             "\tH2\t1024-1195\t5-5\t7/7",
-            "10.24388/x40001058_19\t10.1016/j.combustflame.2014.03.001\trcm\tCO+H2\t1039-1039\t11.04-11.04\t1/1",
+            "ReSpecTh\t10.24388/x40001058_19\t10.1016/j.combustflame.2014.03.001\trcm\tCO+H2\t1039-1039\t11.04-11.04\t1/1",
         ]
 
     def test_a_filter_excluding_everything_is_empty_and_exit_zero(
@@ -842,7 +842,7 @@ class TestDataFind:
         assert _find(fixture_cache, "--T", "5000:6000") == 0
         assert capsys.readouterr().out.splitlines() == [
             _HEADER,
-            "0 matching dataset(s) of 4 mapped ignition-delay records; 0 refused (none)",
+            "0 matching dataset(s) of 4 ReSpecTh mapped ignition-delay records; 0 refused (none)",
         ]
 
     def test_a_cache_integrity_failure_lists_nothing(

@@ -1438,7 +1438,7 @@ def _cmd_data_find(
     manifest_path: Path | None,
     offline: bool,
 ) -> int:
-    """List pinned ReSpecTh ignition-delay records inside the requested windows.
+    """List pinned ReSpecTh and ChemKED ignition-delay records inside requested windows.
 
     An archive that cannot be fetched or does not match its pin refuses the whole listing
     (exit 1): a partial listing would read as a complete one. A member the parser refuses is
@@ -1458,16 +1458,44 @@ def _cmd_data_find(
         return 1
     matches = find_idt(loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range)
 
+    from carmel.services.chemked import ChemkedIdtRecord
+
+    chemked_matches: tuple[ChemkedIdtRecord, ...] = ()
+    # A caller passing a ReSpecTh fixture manifest is testing that lane in
+    # isolation. Normal user invocation loads both curated sources.
+    if manifest_path is None:
+        from carmel.services.chemked_archive import load_manifest as load_chemked_manifest
+        from carmel.services.chemked_query import find_idt as find_chemked_idt
+        from carmel.services.chemked_query import load_idt_records as load_chemked_idt_records
+
+        try:
+            chemked_loaded = load_chemked_idt_records(
+                load_chemked_manifest(),
+                cache_root=cache if cache is not None else default_cache_root(),
+                download=not offline,
+            )
+        except RespecthError as exc:
+            print(f"Refusing to list ChemKED records: {exc}", file=sys.stderr)
+            return 1
+        chemked_matches = tuple(
+            match
+            for match in find_chemked_idt(
+                chemked_loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range
+            )
+            if match.citation_doi not in {record.paper_doi for record in loaded.records if record.paper_doi}
+        )
+
     def number(value: object) -> str:
         return f"{float(str(value)):.4g}"
 
-    print("record_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints")
+    print("source\trecord_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints")
     for match in matches:
         record = match.record
         paper = record.paper_doi or ("placeholder" if not isinstance(record.paper, Absent) else "-")
         print(
             "\t".join(
                 (
+                    "ReSpecTh",
                     record.citation_doi,
                     paper,
                     record.apparatus.device_class.value
@@ -1479,9 +1507,37 @@ def _cmd_data_find(
                 )
             )
         )
+    for chemked_record in chemked_matches:
+        points = chemked_record.envelope.series[0].points
+        temperatures = [
+            coordinate.value
+            for point in points
+            for coordinate in point.coordinates
+            if coordinate.axis_id == "temperature"
+        ]
+        pressures = [
+            coordinate.value for point in points for coordinate in point.coordinates if coordinate.axis_id == "pressure"
+        ]
+        print(
+            "\t".join(
+                (
+                    "ChemKED",
+                    chemked_record.citation_doi,
+                    chemked_record.citation_doi,
+                    "-",
+                    "+".join(chemked_record.fuels) or "-",
+                    f"{number(min(float(value.canonical_decimal_value) for value in temperatures))}-"
+                    f"{number(max(float(value.canonical_decimal_value) for value in temperatures))}",
+                    f"{number(min(float(value.canonical_decimal_value) for value in pressures))}-"
+                    f"{number(max(float(value.canonical_decimal_value) for value in pressures))}",
+                    f"{len(points)}/{len(points)}",
+                )
+            )
+        )
     refused = ", ".join(f"{reason} {count}" for reason, count in sorted(loaded.refusals.items()))
     print(
-        f"{len(matches)} matching dataset(s) of {len(loaded.records)} mapped ignition-delay records"
+        f"{len(matches) + len(chemked_matches)} matching dataset(s) of "
+        f"{len(loaded.records)} ReSpecTh mapped ignition-delay records"
         f"; {sum(loaded.refusals.values())} refused ({refused or 'none'})"
     )
     return 0

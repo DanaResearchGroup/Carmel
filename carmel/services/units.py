@@ -112,6 +112,7 @@ __all__ = [
     "TABLES_BY_SHA",
     "TABLE_V1",
     "TABLE_V2",
+    "TABLE_V3",
     "AffineRule",
     "ConversionRule",
     "ConversionTable",
@@ -951,7 +952,22 @@ resolving to exactly the rules it was written under. The paper lanes still
 normalize against ``TABLE_V1``; only the database lane writes against this one.
 """
 
-TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType({TABLE_V1.sha256: TABLE_V1, TABLE_V2.sha256: TABLE_V2})
+TABLE_V3 = ConversionTable(
+    table_id="carmel-unit-conversions",
+    version=3,
+    base_units=_base_units_v1(),
+    aliases=_aliases_v2()
+    + (
+        # ChemKED writes pint's long spelling in raw YAML quantities.  Preserve
+        # that source spelling while binding it to the existing exact Kelvin rule.
+        UnitAlias(quantity=QuantityKind.TEMPERATURE, raw="kelvin", normalized="K"),
+    ),
+    rules=_identity_rules_v1() + _scale_rules_v2(),
+)
+
+TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType(
+    {TABLE_V1.sha256: TABLE_V1, TABLE_V2.sha256: TABLE_V2, TABLE_V3.sha256: TABLE_V3}
+)
 """Every conversion table this module ships, keyed by content address.
 
 A dataset record only ever needs to remember a table's sha256 (via
