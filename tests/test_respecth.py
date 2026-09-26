@@ -1328,13 +1328,13 @@ class TestQueryEdges:
         assert dict(loaded.refusals) == {"rcm_pre_compression_conditions": 1}
 
     def test_fuel_filter_and_a_record_without_composition(self) -> None:
-        from carmel.services.respecth_query import find_idt
+        from carmel.services.respecth_query import find_records
 
         record = _parse(_ST)
         bare = _with(
             record, envelope=record.envelope.model_copy(update={"composition": Absent(reason=AbsenceReason.UNKNOWN)})
         )
-        assert find_idt((record,), fuel="CH4") == []
-        (match,) = find_idt((bare,))
+        assert find_records((record,), fuel="CH4") == []
+        (match,) = find_records((bare,))
         assert match.fuels == ()
-        assert find_idt((bare,), fuel="H2") == []
+        assert find_records((bare,), fuel="H2") == []

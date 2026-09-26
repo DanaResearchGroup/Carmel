@@ -329,7 +329,15 @@ def create_parser() -> argparse.ArgumentParser:
             "empty result is not an error."
         ),
     )
-    data_find.add_argument("--kind", choices=["idt"], required=True, help="Observable kind (ignition delay only)")
+    data_find.add_argument(
+        "--kind",
+        choices=["idt", "lbv", "jsr", "outlet", "profile"],
+        required=True,
+        help=(
+            "Record kind: idt (ignition delay), lbv (laminar burning velocity), jsr (jet-stirred-reactor "
+            "speciation), outlet (outlet concentration), profile (concentration time profile)"
+        ),
+    )
     data_find.add_argument("--fuel", default=None, help="A fuel species key, e.g. H2 or CO")
     data_find.add_argument(
         "--T", dest="t_range", type=_window, default=None, metavar="LOW:HIGH", help="Temperature window in K"
@@ -1431,6 +1439,7 @@ def _cmd_store_tabular_dataset(workspaces: Path | None) -> int:
 
 
 def _cmd_data_find(
+    kind: str,
     fuel: str | None,
     t_range: ConditionWindow | None,
     p_range: ConditionWindow | None,
@@ -1438,25 +1447,26 @@ def _cmd_data_find(
     manifest_path: Path | None,
     offline: bool,
 ) -> int:
-    """List pinned ReSpecTh ignition-delay records inside the requested windows.
+    """List pinned ReSpecTh records of ``kind`` inside the requested windows.
 
     An archive that cannot be fetched or does not match its pin refuses the whole listing
     (exit 1): a partial listing would read as a complete one. A member the parser refuses is
     counted by reason in the summary line. No match is exit 0 with an empty table.
     """
     from carmel.schemas.datasets import Absent
+    from carmel.services.respecth import RespecthIdtRecord
     from carmel.services.respecth_archive import RespecthError, default_cache_root, load_manifest
-    from carmel.services.respecth_query import find_idt, load_idt_records
+    from carmel.services.respecth_query import IDT_KIND, find_records, load_records
 
     try:
         manifest = load_manifest(manifest_path)
-        loaded = load_idt_records(
-            manifest, cache_root=cache if cache is not None else default_cache_root(), download=not offline
+        loaded = load_records(
+            manifest, kind, cache_root=cache if cache is not None else default_cache_root(), download=not offline
         )
     except RespecthError as exc:
         print(f"Refusing to list ReSpecTh records: {exc}", file=sys.stderr)
         return 1
-    matches = find_idt(loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range)
+    matches = find_records(loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range)
 
     def number(value: object) -> str:
         return f"{float(str(value)):.4g}"
@@ -1471,7 +1481,12 @@ def _cmd_data_find(
                     record.citation_doi,
                     paper,
                     record.apparatus.device_class.value
-                    + ("" if isinstance(record.apparatus.assumed_mode, Absent) else " (mode assumed)"),
+                    + (
+                        " (mode assumed)"
+                        if isinstance(record, RespecthIdtRecord)
+                        and not isinstance(record.apparatus.assumed_mode, Absent)
+                        else ""
+                    ),
                     "+".join(match.fuels) or "-",
                     f"{number(match.temperature_k[0])}-{number(match.temperature_k[1])}",
                     f"{number(match.pressure_bar[0])}-{number(match.pressure_bar[1])}",
@@ -1480,8 +1495,9 @@ def _cmd_data_find(
             )
         )
     refused = ", ".join(f"{reason} {count}" for reason, count in sorted(loaded.refusals.items()))
+    label = "ignition-delay" if kind == IDT_KIND else kind
     print(
-        f"{len(matches)} matching dataset(s) of {len(loaded.records)} mapped ignition-delay records"
+        f"{len(matches)} matching dataset(s) of {len(loaded.records)} mapped {label} records"
         f"; {sum(loaded.refusals.values())} refused ({refused or 'none'})"
     )
     return 0
@@ -1614,7 +1630,7 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_store_condition_set(args.workspaces)
 
     if args.command == "data" and args.data_command == "find":
-        return _cmd_data_find(args.fuel, args.t_range, args.p_range, args.cache, args.manifest, args.offline)
+        return _cmd_data_find(args.kind, args.fuel, args.t_range, args.p_range, args.cache, args.manifest, args.offline)
 
     parser.print_help()
     return 1

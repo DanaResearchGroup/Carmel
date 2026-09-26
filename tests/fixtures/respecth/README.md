@@ -1,6 +1,6 @@
 # ReSpecTh RKD fixtures
 
-Five unmodified member files of the ReSpecTh Kinetics Data archives pinned in
+Thirteen unmodified member files of the ReSpecTh Kinetics Data archives pinned in
 `carmel/data/respecth_manifest.json`, copied byte-for-byte out of the zips (see
 `.gitattributes`: line endings are never normalized, because each file is pinned by the
 sha256 of its exact bytes).
@@ -16,3 +16,11 @@ maintainers ask users to cite are in the repository `NOTICE`.
 | `x10000030_x.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `11576b4dd2559738ffc5dea6cf7456672a44896f36e569146ee05ef55bb32f86` | Shock tube with no stated mode: mapped with reflected shock ASSUMED (`mode_basis=assumed`), 7 points |
 | `x40001039.xml` | `syngas_indirect_v2_3.zip` (`671691044a236f2bf52ecb24`) | `4c0066cb7e54a98326f3d85f3e0dd1e7fbad4786444b988ab33d2ffd4cb00c21` | RCM, syngas, 18 points in `mbar` at 354–377 K: its volume history compresses, so P/T are pre-compression and the record is refused (`rcm_pre_compression_conditions`) |
 | `x40001058_19.xml` | `syngas_indirect_v2_3.zip` (`671691044a236f2bf52ecb24`) | `b505031a16926bc1bb22746c50636696c5c0513621779e54e78769af4017f85d` | RCM, syngas, 1 point; its volume history never falls below its first volume, so P/T are end-of-compression and the record maps |
+| `x20000040d.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `fd76c40663e962eeb88356da833cbec786ec0038a86340315887a606aec36e07` | Laminar burning velocity, 4 points in `mm/s`; the mixture is per-point `composition` columns; common temperature +- bound |
+| `x20000054.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `9aba880466a22f406e74b91b4d16014a2f4a18c5a2de632ecc7f1d581fc50bc5` | Laminar burning velocity, 1 point; the mixture is the common `initial composition` (the pressure-sweep encoding) |
+| `x20001222.xml` | `syngas_indirect_v2_3.zip` (`671691044a236f2bf52ecb24`) | `c4e7cfd32f2b6f209f2315d6e466bb67d7517f214ebae5c8c6e36c02760ba9db` | Laminar burning velocity, 4 points with a per-point `uncertainty` column (reference `Sl`); CO2 in the mixture has no role |
+| `g00000005psr.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `02df814ca8a5a799b2bce47b0f0e27be768c4cc25b22815026639b6a07df5961` | Jet stirred reactor, 6 points: H2 and H2O mole fractions against temperature, per-species standard deviations |
+| `x30000017.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `5e4db2c4f389a3989578831d0d008c44b3a5c22d1b4817a2a810ae6407c122be` | Flow-reactor concentration time profile, 6 points, `timeshift` half decrease of H2 |
+| `x30000029.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `eba547816918758ed516a84bffd04c9b86fc47c2a75a6f089e9e59047862a9cf` | Flow-reactor outlet concentration, 9 points against temperature and residence time |
+| `x50001004.xml` | `syngas_indirect_v2_3.zip` (`671691044a236f2bf52ecb24`) | `65b89665f1410c440a51f4b06be9fc480741841622188def78adbc97e0d27e19` | Shock-tube outlet concentration, 16 points: CO, CO2, O2 against T, P and residence time |
+| `x20000074burn.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `54a7492582f58a57b37bad1740d187c1fb0fcce4e909641c3505c8bc1dd04acd` | Burner-stabilized flame speciation: refused by type (`unmapped_experiment_type`) |
