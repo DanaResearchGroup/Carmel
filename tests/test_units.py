@@ -23,6 +23,7 @@ from carmel.services.dataset_store import canonical_json_bytes
 from carmel.services.units import (
     TABLE_V1,
     TABLE_V2,
+    TABLE_V3,
     TABLES_BY_SHA,
     AffineRule,
     ConversionRule,
@@ -514,6 +515,27 @@ class TestConvertMbarExactScale:
             normalize_unit(QuantityKind.TEMPERATURE, "mbar", table=TABLE_V2)
 
 
+class TestConvertMmPerSecondExactScale:
+    """TABLE_V3's ``mm/s`` rule: exactly 0.001 m/s, bound only to velocity, and absent from V2."""
+
+    def test_a_real_rkd_reading_converts_exactly(self) -> None:
+        result = convert("1640", quantity=QuantityKind.VELOCITY, from_unit="mm/s", to_unit="m/s", table=TABLE_V3)
+        assert result.exact == "1.640"
+        assert result.rule_kind == "scale"
+        assert result.conversion_table_sha256 == TABLE_V3.sha256
+
+    def test_mm_per_second_normalizes_under_v3_only(self) -> None:
+        assert normalize_unit(QuantityKind.VELOCITY, "mm/s", table=TABLE_V3) == "mm/s"
+        with pytest.raises(UnitError):
+            normalize_unit(QuantityKind.VELOCITY, "mm/s", table=TABLE_V2)
+        with pytest.raises(UnitError):
+            normalize_unit(QuantityKind.LENGTH, "mm/s", table=TABLE_V3)
+
+    def test_v3_keeps_every_v2_rule(self) -> None:
+        assert set(TABLE_V2.rules) < set(TABLE_V3.rules)
+        assert TABLE_V3.aliases == TABLE_V2.aliases
+
+
 class TestConvertMoleFractionPpmScaling:
     """1 ppm -> mole fraction: pins Item 1's new ScaleRule at its documented scale."""
 
@@ -701,6 +723,8 @@ class TestShippedTablesAreNeverRemoved:
             "1ac7a572c24b116e62fd360edc423a9bf333c35108d798f5336e91ad7b65a122",
             # TABLE_V2, shipped with the ReSpecTh database lane (RKD spellings + mbar).
             "371d93150f0b4d078d91727e3a76cdfb8879ee9e25753a0431bf48a0fdf2e1ec",
+            # TABLE_V3, shipped with the ReSpecTh flame-speed/speciation lane (mm/s).
+            "fd718e1d7cf54f0f94bdb24c4f325aef76441a7724605559309a4b2a751395bd",
         }
     )
 
