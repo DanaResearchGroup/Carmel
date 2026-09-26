@@ -506,6 +506,14 @@ class SourceNodeKind(StrEnum):
     JATS_XML = "jats_xml"
     SI_MEMBER = "si_member"
     FIGURE_CROP = "figure_crop"
+    DATABASE_RECORD = "database_record"
+    """One record file of a curated experimental database (e.g. a ReSpecTh RKD
+    XML file), read natively as structured data rather than as a paper. A
+    parentless root -- it is not derived from any paper node in the graph, and
+    the paper it cites is a claim IN its bytes, not an artifact Carmel holds.
+    It may carry an :class:`ArchiveOrigin` when the record is a member of a
+    pinned database archive; ``sha256`` is then the MEMBER's bytes, never the
+    archive's. Its values are addressed by :class:`XPathLocator` only."""
 
 
 class SiMemberDocumentKind(StrEnum):
@@ -549,6 +557,11 @@ class SiMemberDocumentKind(StrEnum):
     """A spreadsheet (e.g. ``.xlsx``/``.csv``). Carries workbook SHEETS and no
     printed captions, so a ``MemberSheetKey`` addresses it and a
     ``CaptionLabelKey`` does not (V3)."""
+
+
+_ARCHIVE_MEMBER_NODE_KINDS = frozenset({SourceNodeKind.SI_MEMBER, SourceNodeKind.DATABASE_RECORD})
+"""The node kinds that may name the archive they were read from -- see
+:meth:`SourceNode._validate_origin_only_for_si_member`."""
 
 
 class ArchiveOrigin(BaseModel):
@@ -1126,19 +1139,22 @@ class SourceNode(BaseModel):
 
     @model_validator(mode="after")
     def _validate_origin_only_for_si_member(self) -> SourceNode:
-        """Only an ``SI_MEMBER`` node may carry a concrete (non-``Absent``)
-        :class:`ArchiveOrigin`.
+        """Only an ``SI_MEMBER`` or a ``DATABASE_RECORD`` node may carry a
+        concrete (non-``Absent``) :class:`ArchiveOrigin`.
 
         A paper PDF didn't come out of a zip -- nor did a JATS/XML document,
         nor a figure crop (both derived some other way) -- so any other
         kind claiming a concrete origin is describing a provenance
-        relationship that cannot actually exist.
+        relationship that cannot actually exist. A database record is the
+        second kind that CAN: the ReSpecTh mirror publishes its records only
+        as members of a per-fuel zip, so the member is pinned through the
+        archive it was read from.
         """
-        if self.kind != SourceNodeKind.SI_MEMBER and not isinstance(self.origin, Absent):
+        if self.kind not in _ARCHIVE_MEMBER_NODE_KINDS and not isinstance(self.origin, Absent):
             raise ValueError(
                 f"node {self.node_id!r} has kind={self.kind.value!r}, which cannot carry a concrete "
-                "ArchiveOrigin -- only an SI_MEMBER node can, since only an SI_MEMBER node was ever "
-                "extracted from an archive; origin must be Absent(...) here"
+                "ArchiveOrigin -- only an SI_MEMBER or DATABASE_RECORD node can, since only those were "
+                "ever extracted from an archive; origin must be Absent(...) here"
             )
         return self
 
@@ -1542,7 +1558,17 @@ class TableCellLocator(BaseModel):
 
 
 class XPathLocator(BaseModel):
-    """Locates a reference in JATS/XML via an XPath expression."""
+    """Locates a reference in an XML node via an XPath expression.
+
+    Two node kinds admit it (see :data:`_LOCATOR_KIND_COMPATIBLE_NODE_KINDS`):
+    a ``JATS_XML`` document and a ``DATABASE_RECORD``. The expression is
+    evaluated against the node's own bytes, whose sha256 the node pins, so
+    "replay or refuse" holds with no further field here: re-hash the bytes,
+    re-evaluate the path, compare the text. The database lane emits only a
+    fully positional subset of XPath 1.0 (``/root/child[n]/.../@attr``) --
+    see :mod:`carmel.services.respecth` -- so a path names exactly one
+    element or attribute and cannot drift to a sibling when read back.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -1840,7 +1866,7 @@ class SourceGraph(BaseModel):
         # whose parent is the wrong kind, describes a provenance relationship
         # that cannot actually exist.
         for node in self.nodes:
-            if node.kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML):
+            if node.kind in (SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.DATABASE_RECORD):
                 if node.parent_node_id is not None:
                     parent_kind = nodes_by_id[node.parent_node_id].kind
                     raise ValueError(
@@ -3305,6 +3331,12 @@ class SourceForm(StrEnum):
     TABULAR = "tabular"
     DIGITIZED = "digitized"
     TEXTUAL = "textual"
+    STRUCTURED_RECORD = "structured_record"
+    """Read from a field of a structured database record (a ``DATABASE_RECORD``
+    node, addressed by :class:`XPathLocator`) -- neither a rendered table nor
+    running text nor a plotted figure. Distinct from ``TEXTUAL`` so that a
+    number parsed from a database field can never be mistaken for one quoted
+    out of prose, and vice versa (V4 holds each to its own node kind)."""
 
 
 class ValueOrigin(StrEnum):
@@ -5689,11 +5721,20 @@ def _check_source_form_for_ref(
                 f"node kind={node_kind!r}"
             )
     elif source_form == SourceForm.TEXTUAL:
-        if ref.locator.kind is LocatorKind.TABLE_CELL or node_kind is SourceNodeKind.FIGURE_CROP:
+        if ref.locator.kind is LocatorKind.TABLE_CELL or node_kind in (
+            SourceNodeKind.FIGURE_CROP,
+            SourceNodeKind.DATABASE_RECORD,
+        ):
             raise ValueError(
                 f"{where}: source_form=TEXTUAL requires value_ref to be neither a TABLE_CELL locator "
-                f"nor a reference to a FIGURE_CROP node, got locator kind={ref.locator.kind!r} node "
-                f"kind={node_kind!r}"
+                f"nor a reference to a FIGURE_CROP or DATABASE_RECORD node, got locator "
+                f"kind={ref.locator.kind!r} node kind={node_kind!r}"
+            )
+    elif source_form == SourceForm.STRUCTURED_RECORD:
+        if ref.locator.kind is not LocatorKind.XPATH or node_kind is not SourceNodeKind.DATABASE_RECORD:
+            raise ValueError(
+                f"{where}: source_form=STRUCTURED_RECORD requires value_ref to be an XPATH locator into a "
+                f"DATABASE_RECORD node, got locator kind={ref.locator.kind!r} node kind={node_kind!r}"
             )
     else:  # pragma: no cover - exhaustiveness guard, see docstring
         raise AssertionError(f"unhandled source_form={source_form!r}; every SourceForm member must be handled above")
@@ -5702,7 +5743,7 @@ def _check_source_form_for_ref(
 _LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]] = {
     LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
     LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
-    LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML}),
+    LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML, SourceNodeKind.DATABASE_RECORD}),
     LocatorKind.CHAR_SPAN: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
 }
 """Which :class:`SourceNodeKind`\\ s a given :class:`LocatorKind` may target.
@@ -5717,7 +5758,8 @@ which is exactly what an ``if``/``elif`` chain with no matching branch (and
 no final ``else: raise``) would do instead.
 
 The compatibility itself reflects what each locator actually addresses:
-``XPathLocator`` only makes sense against a JATS/XML document; a bounding
+``XPathLocator`` only makes sense against an XML document -- JATS/XML, or a
+structured database record; a bounding
 box only makes sense against something that was actually RENDERED to a page
 (a PDF, an SI member that is itself a rendered document, or a figure crop);
 a table cell locator makes sense against anything that can carry a table (a

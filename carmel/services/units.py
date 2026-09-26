@@ -111,6 +111,7 @@ from carmel.services.dataset_store import CanonicalDecimalError, canonical_decim
 __all__ = [
     "TABLES_BY_SHA",
     "TABLE_V1",
+    "TABLE_V2",
     "AffineRule",
     "ConversionRule",
     "ConversionTable",
@@ -913,7 +914,44 @@ not cover gets a new ``TABLE_V2`` -- see the module docstring for why
 cite its sha256.
 """
 
-TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType({TABLE_V1.sha256: TABLE_V1})
+
+def _aliases_v2() -> tuple[UnitAlias, ...]:
+    return _aliases_v1() + (
+        # The ReSpecTh Kinetics Data (RKD) format's own unit spellings, written verbatim in
+        # its `units` attributes: a component amount is `units="mole fraction"`, and an
+        # evaluated relative standard deviation is `units="unitless"`. Both are bare
+        # fractions, so each maps onto its quantity's base "1" with NO scale -- unlike "%"
+        # or "ppm", asserting either rescales nothing.
+        UnitAlias(quantity=QuantityKind.MOLE_FRACTION, raw="mole fraction", normalized="1"),
+        UnitAlias(quantity=QuantityKind.RELATIVE_UNCERTAINTY, raw="unitless", normalized="1"),
+    )
+
+
+def _scale_rules_v2() -> tuple[ConversionRule, ...]:
+    return _scale_and_affine_rules_v1() + (
+        # Exact by definition (1 mbar = 100 Pa); a third of the RKD rapid-compression-machine
+        # records report pressure in it. Torr is deliberately NOT added: 1 Torr = 101325/760 Pa
+        # does not terminate as a decimal, so no canonical-decimal scale can state it exactly.
+        ScaleRule(kind="scale", quantity=QuantityKind.PRESSURE, from_unit="mbar", to_unit="Pa", scale="100"),
+    )
+
+
+TABLE_V2 = ConversionTable(
+    table_id="carmel-unit-conversions",
+    version=2,
+    base_units=_base_units_v1(),
+    aliases=_aliases_v2(),
+    rules=_identity_rules_v1() + _scale_rules_v2(),
+)
+"""``TABLE_V1`` plus what the curated-database lane (:mod:`carmel.services.respecth`)
+must bind: the RKD-format spellings ``"mole fraction"`` and ``"unitless"``, and the
+exact ``mbar`` pressure scale. Added alongside ``TABLE_V1`` rather than edited into it, per the
+module docstring, so every dataset already citing ``TABLE_V1``'s sha256 keeps
+resolving to exactly the rules it was written under. The paper lanes still
+normalize against ``TABLE_V1``; only the database lane writes against this one.
+"""
+
+TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType({TABLE_V1.sha256: TABLE_V1, TABLE_V2.sha256: TABLE_V2})
 """Every conversion table this module ships, keyed by content address.
 
 A dataset record only ever needs to remember a table's sha256 (via

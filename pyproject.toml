@@ -82,6 +82,7 @@ include = ["carmel*"]
 
 [tool.setuptools.package-data]
 "carmel.ui" = ["templates/*.html", "static/*"]
+"carmel.data" = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

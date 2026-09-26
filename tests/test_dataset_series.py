@@ -1273,6 +1273,21 @@ class TestACharSpanCannotGroundASeriesValue:
                 where="direct call",
             )
 
+    @pytest.mark.parametrize(
+        ("ref", "node_kind"),
+        [
+            (_table_ref("record"), SourceNodeKind.DATABASE_RECORD),
+            (SourceRef(node_id="paper", locator=XPathLocator(xpath="/a[1]")), SourceNodeKind.PAPER_PDF),
+        ],
+    )
+    def test_v4s_structured_record_branch_needs_xpath_into_a_database_record(
+        self, ref: SourceRef, node_kind: SourceNodeKind
+    ) -> None:
+        with pytest.raises(ValueError, match="source_form=STRUCTURED_RECORD requires"):
+            _check_source_form_for_ref(
+                source_form=SourceForm.STRUCTURED_RECORD, ref=ref, node_kind=node_kind, where="direct call"
+            )
+
 
 # ===========================================================================
 # TableCellLocator.table_key -- new required discriminated-union field
@@ -1538,7 +1553,7 @@ class TestNewEnumsAndIdentifierSyntax:
         assert {member.value for member in ValueOrigin} == {"experimental", "simulation", "derived"}
 
     def test_source_form_members(self) -> None:
-        assert {member.value for member in SourceForm} == {"tabular", "digitized", "textual"}
+        assert {member.value for member in SourceForm} == {"tabular", "digitized", "textual", "structured_record"}
 
     def test_axis_role_members(self) -> None:
         assert {member.value for member in AxisRole} == {"coordinate", "observation", "constant"}

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     # inside the function that uses it.
     from carmel.agents.bridge import CarmelAgent
     from carmel.schemas import Campaign
+    from carmel.services.respecth_query import ConditionWindow
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -315,7 +316,51 @@ def create_parser() -> argparse.ArgumentParser:
         help="Carmel config file whose [agents] section builds the extraction agent for --extract-series.",
     )
 
+    data = subparsers.add_parser("data", help="Query curated experimental databases (ReSpecTh)")
+    data_commands = data.add_subparsers(dest="data_command")
+    data_find = data_commands.add_parser(
+        "find",
+        help="List pinned database records matching a fuel and condition window",
+        description=(
+            "Read every record of the pinned ReSpecTh archives (downloaded once into the cache and "
+            "verified against carmel/data/respecth_manifest.json), map each natively, and list the "
+            "records with at least one point inside every window given. A record the parser cannot "
+            "map without guessing is counted under its refusal reason, never listed partially. An "
+            "empty result is not an error."
+        ),
+    )
+    data_find.add_argument("--kind", choices=["idt"], required=True, help="Observable kind (ignition delay only)")
+    data_find.add_argument("--fuel", default=None, help="A fuel species key, e.g. H2 or CO")
+    data_find.add_argument(
+        "--T", dest="t_range", type=_window, default=None, metavar="LOW:HIGH", help="Temperature window in K"
+    )
+    data_find.add_argument(
+        "--P", dest="p_range", type=_window, default=None, metavar="LOW:HIGH", help="Pressure window in bar"
+    )
+    data_find.add_argument(
+        "--cache",
+        type=Path,
+        default=None,
+        help="Archive cache directory (default: $CARMEL_DATA_CACHE, else ~/.carmel/data_cache)",
+    )
+    data_find.add_argument(
+        "--manifest", type=Path, default=None, help="Pinned manifest to read instead of the packaged one"
+    )
+    data_find.add_argument(
+        "--offline", action="store_true", help="Never download; refuse any archive not already cached"
+    )
+
     return parser
+
+
+def _window(text: str) -> ConditionWindow:
+    """argparse type for a ``LOW:HIGH`` window."""
+    from carmel.services.respecth_query import parse_window
+
+    try:
+        return parse_window(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
 
 
 def _load_agent_config(config_file: Path | None) -> object | None:
@@ -1385,6 +1430,63 @@ def _cmd_store_tabular_dataset(workspaces: Path | None) -> int:
     return 0
 
 
+def _cmd_data_find(
+    fuel: str | None,
+    t_range: ConditionWindow | None,
+    p_range: ConditionWindow | None,
+    cache: Path | None,
+    manifest_path: Path | None,
+    offline: bool,
+) -> int:
+    """List pinned ReSpecTh ignition-delay records inside the requested windows.
+
+    An archive that cannot be fetched or does not match its pin refuses the whole listing
+    (exit 1): a partial listing would read as a complete one. A member the parser refuses is
+    counted by reason in the summary line. No match is exit 0 with an empty table.
+    """
+    from carmel.schemas.datasets import Absent
+    from carmel.services.respecth_archive import RespecthError, default_cache_root, load_manifest
+    from carmel.services.respecth_query import find_idt, load_idt_records
+
+    try:
+        manifest = load_manifest(manifest_path)
+        loaded = load_idt_records(
+            manifest, cache_root=cache if cache is not None else default_cache_root(), download=not offline
+        )
+    except RespecthError as exc:
+        print(f"Refusing to list ReSpecTh records: {exc}", file=sys.stderr)
+        return 1
+    matches = find_idt(loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range)
+
+    def number(value: object) -> str:
+        return f"{float(str(value)):.4g}"
+
+    print("record_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints")
+    for match in matches:
+        record = match.record
+        paper = record.paper_doi or ("placeholder" if not isinstance(record.paper, Absent) else "-")
+        print(
+            "\t".join(
+                (
+                    record.citation_doi,
+                    paper,
+                    record.apparatus.device_class.value
+                    + ("" if isinstance(record.apparatus.assumed_mode, Absent) else " (mode assumed)"),
+                    "+".join(match.fuels) or "-",
+                    f"{number(match.temperature_k[0])}-{number(match.temperature_k[1])}",
+                    f"{number(match.pressure_bar[0])}-{number(match.pressure_bar[1])}",
+                    f"{match.matched_points}/{match.total_points}",
+                )
+            )
+        )
+    refused = ", ".join(f"{reason} {count}" for reason, count in sorted(loaded.refusals.items()))
+    print(
+        f"{len(matches)} matching dataset(s) of {len(loaded.records)} mapped ignition-delay records"
+        f"; {sum(loaded.refusals.values())} refused ({refused or 'none'})"
+    )
+    return 0
+
+
 def _cmd_store_condition_set(workspaces: Path | None) -> int:
     """Produce and durably store the registered condition set, then export it.
 
@@ -1510,6 +1612,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "store-condition-set":
         return _cmd_store_condition_set(args.workspaces)
+
+    if args.command == "data" and args.data_command == "find":
+        return _cmd_data_find(args.fuel, args.t_range, args.p_range, args.cache, args.manifest, args.offline)
 
     parser.print_help()
     return 1
