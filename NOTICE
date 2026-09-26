@@ -12,7 +12,9 @@ http://www.apache.org/licenses/LICENSE-2.0
 
 Third-party data: ReSpecTh Kinetics Data
 
-The files under tests/fixtures/respecth/ are unmodified member files of the
+The files under tests/fixtures/respecth/ (ignition-delay, laminar-burning-velocity,
+jet-stirred-reactor, outlet-concentration, concentration-profile and burner-flame records;
+the directory's README lists each) are unmodified member files of the
 ReSpecTh Kinetics Data (RKD) archives published on the Open Science Framework
 mirror of the ReSpecTh database (https://osf.io/nbmzv/,
 DOI 10.17605/OSF.IO/NBMZV), (c) RESPECTH, licensed under the Creative Commons

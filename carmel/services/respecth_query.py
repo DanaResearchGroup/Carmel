@@ -1,11 +1,12 @@
 # Copyright 2026 Dana Research Group
 # SPDX-License-Identifier: Apache-2.0
-"""Load every pinned ReSpecTh ignition-delay record and filter them by condition window.
+"""Load every pinned ReSpecTh record of one kind and filter them by condition window.
 
-Backs ``carmel data find --kind idt``. Loading goes through the pinned cache
-(:func:`carmel.services.respecth_archive.fetch_archive`) and the native parser
-(:func:`carmel.services.respecth.parse_idt_record`); a member the parser refuses is COUNTED
-by reason, never silently dropped and never partially listed. Filtering compares exact
+Backs ``carmel data find --kind {idt,lbv,jsr,outlet,profile}``. Loading goes through the pinned
+cache (:func:`carmel.services.respecth_archive.fetch_archive`) and the native parsers
+(:func:`carmel.services.respecth.parse_idt_record`,
+:func:`carmel.services.respecth_series.parse_series_record`); a member of the requested kind the
+parser refuses is COUNTED by reason, never silently dropped and never partially listed. Filtering compares exact
 decimals after converting each point's temperature to K and pressure to bar through the
 same conversion table the record was bound under.
 """
@@ -17,19 +18,38 @@ from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
-from carmel.schemas.datasets import Absent, ComponentRole, Coordinate, MeasuredValue
+from carmel.schemas.datasets import ComponentRole, Composition, Coordinate, DatasetEnvelope, MeasuredValue
 from carmel.services import units
 from carmel.services.respecth import RespecthIdtRecord, RespecthRefusal, RespecthRefusalReason, parse_idt_record
 from carmel.services.respecth_archive import RespecthManifest, fetch_archive, iter_xml_members
+from carmel.services.respecth_series import (
+    EXPERIMENT_KINDS,
+    RespecthExperimentKind,
+    RespecthSeriesRecord,
+    parse_series_record,
+    read_experiment_type,
+)
 
 __all__ = [
+    "IDT_KIND",
+    "QUERY_KINDS",
     "ConditionWindow",
-    "IdtLoadResult",
-    "IdtMatch",
-    "find_idt",
+    "LoadResult",
+    "RecordMatch",
+    "RespecthRecord",
+    "find_records",
     "load_idt_records",
+    "load_records",
     "parse_window",
 ]
+
+#: The ``--kind`` name of the ignition-delay lane.
+IDT_KIND = "idt"
+
+#: Every ``carmel data find --kind`` value, the ignition-delay kind first.
+QUERY_KINDS: tuple[str, ...] = (IDT_KIND, *(kind.value for kind in RespecthExperimentKind))
+
+RespecthRecord = RespecthIdtRecord | RespecthSeriesRecord
 
 _PA_PER_BAR = Decimal(100000)
 
@@ -64,14 +84,14 @@ def parse_window(text: str) -> ConditionWindow:
 
 
 @dataclass(frozen=True)
-class IdtLoadResult:
-    """Every mapped record, plus how many IDT members were refused and why."""
+class LoadResult:
+    """Every mapped record of one kind, plus how many members of that kind were refused and why."""
 
-    records: tuple[RespecthIdtRecord, ...]
+    records: tuple[RespecthRecord, ...]
     refusals: Counter[str]
 
 
-def load_idt_records(manifest: RespecthManifest, *, cache_root: Path, download: bool = True) -> IdtLoadResult:
+def load_idt_records(manifest: RespecthManifest, *, cache_root: Path, download: bool = True) -> LoadResult:
     """Parse every ignition-delay member of every pinned archive.
 
     Members of another experiment type are skipped (they are not IDT records); every IDT
@@ -81,7 +101,7 @@ def load_idt_records(manifest: RespecthManifest, *, cache_root: Path, download: 
         RespecthError: An archive failed to fetch or verify -- the whole load is refused,
             since a partial listing would read as a complete one.
     """
-    records: list[RespecthIdtRecord] = []
+    records: list[RespecthRecord] = []
     refusals: Counter[str] = Counter()
     for archive in manifest.archives:
         data = fetch_archive(archive, manifest=manifest, cache_root=cache_root, download=download)
@@ -91,14 +111,42 @@ def load_idt_records(manifest: RespecthManifest, *, cache_root: Path, download: 
             except RespecthRefusal as exc:
                 if exc.reason is not RespecthRefusalReason.NOT_IGNITION_DELAY:
                     refusals[exc.reason.value] += 1
-    return IdtLoadResult(records=tuple(records), refusals=refusals)
+    return LoadResult(records=tuple(records), refusals=refusals)
+
+
+def load_records(manifest: RespecthManifest, kind: str, *, cache_root: Path, download: bool = True) -> LoadResult:
+    """Parse every member of ``kind`` (one of :data:`QUERY_KINDS`) of every pinned archive.
+
+    Members of another experiment type are skipped; every member of ``kind`` either maps or is
+    counted under its refusal reason. A member whose experiment type cannot be read at all is
+    counted too, since it might have been of ``kind``.
+
+    Raises:
+        ValueError: ``kind`` is not one of :data:`QUERY_KINDS`.
+        RespecthError: An archive failed to fetch or verify -- the whole load is refused.
+    """
+    if kind == IDT_KIND:
+        return load_idt_records(manifest, cache_root=cache_root, download=download)
+    wanted = RespecthExperimentKind(kind)
+    records: list[RespecthRecord] = []
+    refusals: Counter[str] = Counter()
+    for archive in manifest.archives:
+        data = fetch_archive(archive, manifest=manifest, cache_root=cache_root, download=download)
+        for member_path, member_bytes in iter_xml_members(data):
+            try:
+                if EXPERIMENT_KINDS.get(read_experiment_type(member_bytes)) is not wanted:
+                    continue
+                records.append(parse_series_record(member_bytes, archive, member_path))
+            except RespecthRefusal as exc:
+                refusals[exc.reason.value] += 1
+    return LoadResult(records=tuple(records), refusals=refusals)
 
 
 @dataclass(frozen=True)
-class IdtMatch:
+class RecordMatch:
     """One record with at least one point inside every requested window."""
 
-    record: RespecthIdtRecord
+    record: RespecthRecord
     fuels: tuple[str, ...]
     matched_points: int
     total_points: int
@@ -118,9 +166,9 @@ def _in_base_unit(value: MeasuredValue, base_unit: str) -> Decimal:
     return Decimal(converted.exact)
 
 
-def _point_conditions(record: RespecthIdtRecord) -> list[tuple[Decimal, Decimal]]:
+def _point_conditions(envelope: DatasetEnvelope) -> list[tuple[Decimal, Decimal]]:
     """``(T in K, P in bar)`` for every point, constants filled in."""
-    series = record.envelope.series[0]
+    series = envelope.series[0]
     constants = {constant.axis_id: constant for constant in series.constants}
     conditions: list[tuple[Decimal, Decimal]] = []
     for point in series.points:
@@ -131,28 +179,37 @@ def _point_conditions(record: RespecthIdtRecord) -> list[tuple[Decimal, Decimal]
     return conditions
 
 
-def _fuels(record: RespecthIdtRecord) -> tuple[str, ...]:
-    composition = record.envelope.composition
-    if isinstance(composition, Absent):
-        return ()
-    return tuple(c.species_raw_name for c in composition.components if c.role is ComponentRole.FUEL)
+def _fuels(envelope: DatasetEnvelope) -> tuple[str, ...]:
+    """Every fuel component of the record's mixture, or of any point's own mixture, sorted."""
+    compositions = [envelope.composition, *(point.composition for point in envelope.series[0].points)]
+    return tuple(
+        sorted(
+            {
+                component.species_raw_name
+                for composition in compositions
+                if isinstance(composition, Composition)
+                for component in composition.components
+                if component.role is ComponentRole.FUEL
+            }
+        )
+    )
 
 
-def find_idt(
-    records: tuple[RespecthIdtRecord, ...],
+def find_records(
+    records: tuple[RespecthRecord, ...],
     *,
     fuel: str | None = None,
     temperature_k: ConditionWindow | None = None,
     pressure_bar: ConditionWindow | None = None,
-) -> list[IdtMatch]:
+) -> list[RecordMatch]:
     """Records whose mixture has ``fuel`` as a fuel component and with at least one point
     inside both windows, sorted by the record's ReSpecTh DOI."""
-    matches: list[IdtMatch] = []
+    matches: list[RecordMatch] = []
     for record in records:
-        fuels = _fuels(record)
+        fuels = _fuels(record.envelope)
         if fuel is not None and fuel not in fuels:
             continue
-        conditions = _point_conditions(record)
+        conditions = _point_conditions(record.envelope)
         matched = [
             (t, p)
             for t, p in conditions
@@ -164,7 +221,7 @@ def find_idt(
         temperatures = [t for t, _ in conditions]
         pressures = [p for _, p in conditions]
         matches.append(
-            IdtMatch(
+            RecordMatch(
                 record=record,
                 fuels=fuels,
                 matched_points=len(matched),

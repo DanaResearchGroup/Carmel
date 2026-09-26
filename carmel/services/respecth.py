@@ -108,8 +108,10 @@ __all__ = [
     "RespecthRefusalReason",
     "SkippedDataGroup",
     "UncertaintyDefinition",
+    "check_record_node",
     "evaluate_xpath",
     "parse_idt_record",
+    "replay_grounded_text",
     "replay_idt_record",
 ]
 
@@ -157,6 +159,14 @@ class RespecthRefusalReason(StrEnum):
     """No volume history covers every point, so P/T cannot be told apart from pre-compression ones."""
     IMPLAUSIBLE_IGNITION_TEMPERATURE = "implausible_ignition_temperature"
     """A condition temperature below :data:`MIN_IGNITION_TEMPERATURE_K` -- a backstop, whatever the apparatus."""
+    UNMAPPED_EXPERIMENT_TYPE = "unmapped_experiment_type"
+    """An ``experimentType`` no parser of this lane maps (see
+    :data:`carmel.services.respecth_series.EXPERIMENT_KINDS`)."""
+    UNIDENTIFIED_SPECIES = "unidentified_species"
+    """A species column or species uncertainty that names no species identifier, or two columns
+    that name the same one."""
+    UNMAPPED_TIMESHIFT = "unmapped_timeshift"
+    """A concentration-profile ``timeshift`` whose definition the lane does not map."""
 
 
 class RespecthRefusal(RespecthError):
@@ -431,14 +441,7 @@ class RespecthIdtRecord(BaseModel):
 
     @model_validator(mode="after")
     def _node_matches_pin(self) -> RespecthIdtRecord:
-        node = self.envelope.source_graph.node(RECORD_NODE_ID)
-        if node.kind is not SourceNodeKind.DATABASE_RECORD or not isinstance(node.origin, ArchiveOrigin):
-            raise ValueError("the record node must be a DATABASE_RECORD with an ArchiveOrigin")
-        if (node.origin.archive_sha256, node.origin.member_display_path) != (
-            self.archive.archive_sha256,
-            self.archive.member_path,
-        ):
-            raise ValueError("the record node's ArchiveOrigin disagrees with the archive pin")
+        check_record_node(self.envelope, self.archive)
         return self
 
     @property
@@ -457,6 +460,16 @@ class RespecthIdtRecord(BaseModel):
         if isinstance(self.paper, Absent) or self.paper.trust is not ReferenceDoiTrust.CITED:
             return None
         return self.paper.doi.raw
+
+
+def check_record_node(envelope: DatasetEnvelope, archive: ArchivePin) -> None:
+    """Raise ``ValueError`` unless the envelope's record node is a ``DATABASE_RECORD`` whose
+    :class:`ArchiveOrigin` names exactly ``archive``'s zip and member."""
+    node = envelope.source_graph.node(RECORD_NODE_ID)
+    if node.kind is not SourceNodeKind.DATABASE_RECORD or not isinstance(node.origin, ArchiveOrigin):
+        raise ValueError("the record node must be a DATABASE_RECORD with an ArchiveOrigin")
+    if (node.origin.archive_sha256, node.origin.member_display_path) != (archive.archive_sha256, archive.member_path):
+        raise ValueError("the record node's ArchiveOrigin disagrees with the archive pin")
 
 
 # --------------------------------------------------------------------------- XML + XPath
@@ -591,10 +604,12 @@ def _repair_dependency() -> SemanticDependencyUse:
     )
 
 
-def _measured(value: RecordText, unit: RecordText, quantity: QuantityKind) -> MeasuredValue:
-    """Bind a verbatim numeral to its verbatim unit under :data:`_TABLE`, or refuse."""
+def _measured(
+    value: RecordText, unit: RecordText, quantity: QuantityKind, table: units.ConversionTable = _TABLE
+) -> MeasuredValue:
+    """Bind a verbatim numeral to its verbatim unit under ``table``, or refuse."""
     try:
-        unit_normalized = units.normalize_unit(quantity, unit.raw, table=_TABLE)
+        unit_normalized = units.normalize_unit(quantity, unit.raw, table=table)
     except units.UnitError as exc:
         raise RespecthRefusal(
             RespecthRefusalReason.UNMAPPED_UNIT, f"unit {unit.raw!r} at {unit.ref.locator} for {quantity.value}: {exc}"
@@ -622,7 +637,7 @@ def _measured(value: RecordText, unit: RecordText, quantity: QuantityKind) -> Me
         quantity_kind=quantity,
         unit_raw=unit.raw,
         unit_normalized=unit_normalized,
-        conversion_table_sha256=_TABLE.sha256,
+        conversion_table_sha256=table.sha256,
         value_ref=value.ref,
         unit_ref=unit.ref,
     )
@@ -744,7 +759,12 @@ class _Common:
     source_types: Mapping[str, RecordText]
 
 
-def _composition(doc: _Doc, prop: ElementTree.Element) -> Composition:
+def _composition(
+    doc: _Doc,
+    prop: ElementTree.Element,
+    table: units.ConversionTable = _TABLE,
+    equivalence_ratio_note: str = "RKD ignition-delay records state no equivalence ratio; not derived",
+) -> Composition:
     components: list[CompositionComponent] = []
     for component in prop:
         if component.tag != "component":
@@ -753,7 +773,9 @@ def _composition(doc: _Doc, prop: ElementTree.Element) -> Composition:
             )
         species = doc.attribute(_one(component, "speciesLink"), "preferredKey")
         amount_element = _one(component, "amount")
-        amount = _measured(doc.text(amount_element), doc.attribute(amount_element, "units"), QuantityKind.MOLE_FRACTION)
+        amount = _measured(
+            doc.text(amount_element), doc.attribute(amount_element, "units"), QuantityKind.MOLE_FRACTION, table
+        )
         if amount.unit_normalized != "1":
             raise RespecthRefusal(
                 RespecthRefusalReason.UNMAPPED_UNIT, f"component amount unit {amount.unit_raw!r} is not a mole fraction"
@@ -777,9 +799,7 @@ def _composition(doc: _Doc, prop: ElementTree.Element) -> Composition:
         raw_name=prop.get("name", "initial composition"),
         resolution=CompositionResolution.RESOLVED_COMPONENTS,
         basis=CompositionBasis.MOLE_FRACTION,
-        equivalence_ratio=Absent(
-            reason=AbsenceReason.UNKNOWN, note="RKD ignition-delay records state no equivalence ratio; not derived"
-        ),
+        equivalence_ratio=Absent(reason=AbsenceReason.UNKNOWN, note=equivalence_ratio_note),
         components=tuple(sorted(components, key=lambda component: component.species_raw_name)),
     )
 
@@ -1131,9 +1151,9 @@ def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: s
         raise RespecthRefusal(RespecthRefusalReason.SCHEMA_REJECTED, str(exc)) from exc
 
 
-def _embedded_table() -> EmbeddedConversionTable:
+def _embedded_table(table: units.ConversionTable = _TABLE) -> EmbeddedConversionTable:
     return EmbeddedConversionTable(
-        sha256=_TABLE.sha256, canonical_json=canonical_json_bytes(_TABLE.identity_payload()).decode("utf-8")
+        sha256=table.sha256, canonical_json=canonical_json_bytes(table.identity_payload()).decode("utf-8")
     )
 
 
@@ -1199,6 +1219,32 @@ def _replay_conditions(record: RespecthIdtRecord, root: ElementTree.Element) -> 
     return findings
 
 
+def replay_grounded_text(record: BaseModel, root: ElementTree.Element) -> tuple[int, list[str]]:
+    """Re-evaluate every grounded ``(ref, text)`` pair of ``record`` against the parsed member.
+
+    Every :class:`SourceRef` anywhere in the record (walked by
+    :func:`~carmel.schemas.datasets.iter_source_refs`, not hand-listed) must be paired with the
+    text it claims and address the record node by XPath. Returns how many pairs were checked and
+    every disagreement, verbatim.
+    """
+    findings: list[str] = []
+    pairs = list(_grounded_pairs(record))
+    paired_paths = {path for path, _, _ in pairs}
+    for path, _ in iter_source_refs(record):
+        if path not in paired_paths:
+            findings.append(f"{path}: a SourceRef with no text this replayer knows to compare")
+    checked = 0
+    for path, ref, expected in pairs:
+        if ref.node_id != RECORD_NODE_ID or not isinstance(ref.locator, XPathLocator):
+            findings.append(f"{path}: does not address the record node by XPath")
+            continue
+        actual = evaluate_xpath(root, ref.locator.xpath)
+        checked += 1
+        if actual != expected:
+            findings.append(f"{path}: {ref.locator.xpath} reads {actual!r}, recorded {expected!r}")
+    return checked, findings
+
+
 def replay_idt_record(record: RespecthIdtRecord, member_bytes: bytes) -> RecordReplayReport:
     """Re-derive every grounded string of ``record`` from ``member_bytes``.
 
@@ -1221,21 +1267,7 @@ def replay_idt_record(record: RespecthIdtRecord, member_bytes: bytes) -> RecordR
     except RespecthRefusal as exc:
         return RecordReplayReport(verified=False, checked=0, findings=(str(exc),))
 
-    findings: list[str] = []
-    pairs = list(_grounded_pairs(record))
-    paired_paths = {path for path, _, _ in pairs}
-    for path, _ in iter_source_refs(record):
-        if path not in paired_paths:
-            findings.append(f"{path}: a SourceRef with no text this replayer knows to compare")
-    checked = 0
-    for path, ref, expected in pairs:
-        if ref.node_id != RECORD_NODE_ID or not isinstance(ref.locator, XPathLocator):
-            findings.append(f"{path}: does not address the record node by XPath")
-            continue
-        actual = evaluate_xpath(root, ref.locator.xpath)
-        checked += 1
-        if actual != expected:
-            findings.append(f"{path}: {ref.locator.xpath} reads {actual!r}, recorded {expected!r}")
+    checked, findings = replay_grounded_text(record, root)
 
     kind = record.apparatus.kind_raw.raw.strip()
     mode = None if isinstance(record.apparatus.mode_raw, Absent) else record.apparatus.mode_raw.raw.strip()
