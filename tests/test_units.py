@@ -24,6 +24,7 @@ from carmel.services.units import (
     TABLE_V1,
     TABLE_V2,
     TABLE_V3,
+    TABLE_V4,
     TABLES_BY_SHA,
     AffineRule,
     ConversionRule,
@@ -536,6 +537,19 @@ class TestConvertMmPerSecondExactScale:
         assert TABLE_V3.aliases == TABLE_V2.aliases
 
 
+class TestChemkedKelvinAlias:
+    """TABLE_V4 adds ChemKED's pint spelling without changing shipped TABLE_V3."""
+
+    def test_kelvin_normalizes_under_v4_only(self) -> None:
+        assert normalize_unit(QuantityKind.TEMPERATURE, "kelvin", table=TABLE_V4) == "K"
+        with pytest.raises(UnitError):
+            normalize_unit(QuantityKind.TEMPERATURE, "kelvin", table=TABLE_V3)
+
+    def test_v4_keeps_every_v3_rule_and_alias(self) -> None:
+        assert TABLE_V4.rules == TABLE_V3.rules
+        assert set(TABLE_V3.aliases) < set(TABLE_V4.aliases)
+
+
 class TestConvertMoleFractionPpmScaling:
     """1 ppm -> mole fraction: pins Item 1's new ScaleRule at its documented scale."""
 
@@ -725,6 +739,8 @@ class TestShippedTablesAreNeverRemoved:
             "371d93150f0b4d078d91727e3a76cdfb8879ee9e25753a0431bf48a0fdf2e1ec",
             # TABLE_V3, shipped with the ReSpecTh flame-speed/speciation lane (mm/s).
             "fd718e1d7cf54f0f94bdb24c4f325aef76441a7724605559309a4b2a751395bd",
+            # TABLE_V4, shipped with the ChemKED lane (pint's long "kelvin" spelling).
+            "0a7504ec2e8fd4e56cc878cc9c9501863060f5aa57a7b9cf0ec48b00c68cae90",
         }
     )
 

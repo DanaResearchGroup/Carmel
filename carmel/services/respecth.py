@@ -184,6 +184,8 @@ class IgnitionTarget(StrEnum):
     PRESSURE = "p"
     OH = "OH"
     OH_STAR = "OH*"
+    CH = "CH"
+    CH_STAR = "CH*"
     OHEX = "OHEX"
     """ReSpecTh's species key for electronically excited OH -- kept distinct from ``OH*``
     because the records spell them differently and this lane does not merge spellings."""
@@ -194,8 +196,26 @@ class IgnitionCriterion(StrEnum):
 
     MAX_SLOPE = "d/dt max"
     PEAK = "max"
+    HALF_MAX = "1/2 max"
+    EXTRAPOLATED_MAX_SLOPE = "d/dt max extrapolated"
     RELATIVE_CONCENTRATION = "relative concentration"
     """The instant the target reaches ``amount`` times its peak; ``amount`` is required."""
+
+
+#: ReSpecTh's own spelling vocabulary. Keep it separate from the additive shared enums so
+#: adding spellings for another curated lane cannot make this parser accept records it
+#: previously refused.
+RESPECTH_IGNITION_TARGETS = (
+    IgnitionTarget.PRESSURE,
+    IgnitionTarget.OH,
+    IgnitionTarget.OH_STAR,
+    IgnitionTarget.OHEX,
+)
+RESPECTH_IGNITION_CRITERIA = (
+    IgnitionCriterion.MAX_SLOPE,
+    IgnitionCriterion.PEAK,
+    IgnitionCriterion.RELATIVE_CONCENTRATION,
+)
 
 
 #: The explicit apparatus table: (``apparatus/kind``, ``apparatus/mode`` or ``None``) -> device
@@ -693,13 +713,15 @@ def _ignition(doc: _Doc) -> IgnitionDefinition:
     criterion = doc.attribute(element, "type")
     targets = [part.strip() for part in target.raw.split(";") if part.strip()]
     unmapped = RespecthRefusalReason.UNMAPPED_IGNITION_DEFINITION
-    if len(targets) != 1 or targets[0] not in {member.value for member in IgnitionTarget}:
+    if len(targets) != 1 or targets[0] not in {member.value for member in RESPECTH_IGNITION_TARGETS}:
         raise RespecthRefusal(
-            unmapped, f"ignition target {target.raw!r} is not one of {[m.value for m in IgnitionTarget]}"
+            unmapped,
+            f"ignition target {target.raw!r} is not one of {[m.value for m in RESPECTH_IGNITION_TARGETS]}",
         )
-    if criterion.raw not in {member.value for member in IgnitionCriterion}:
+    if criterion.raw not in {member.value for member in RESPECTH_IGNITION_CRITERIA}:
         raise RespecthRefusal(
-            unmapped, f"ignition type {criterion.raw!r} is not one of {[m.value for m in IgnitionCriterion]}"
+            unmapped,
+            f"ignition type {criterion.raw!r} is not one of {[m.value for m in RESPECTH_IGNITION_CRITERIA]}",
         )
     mapped_criterion = IgnitionCriterion(criterion.raw)
     extra = set(element.attrib) - {"target", "type", "amount", "units"}

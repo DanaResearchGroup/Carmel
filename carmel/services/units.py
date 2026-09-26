@@ -113,6 +113,7 @@ __all__ = [
     "TABLE_V1",
     "TABLE_V2",
     "TABLE_V3",
+    "TABLE_V4",
     "AffineRule",
     "ConversionRule",
     "ConversionTable",
@@ -973,8 +974,29 @@ speciation records (:mod:`carmel.services.respecth_series`). Added alongside rat
 into ``TABLE_V2``, so the ignition-delay records keep binding against ``TABLE_V2`` byte for byte.
 """
 
+
+TABLE_V4 = ConversionTable(
+    table_id="carmel-unit-conversions",
+    version=4,
+    base_units=_base_units_v1(),
+    aliases=TABLE_V3.aliases
+    + (
+        # ChemKED writes pint's long spelling in raw YAML quantities. Preserve
+        # that source spelling while binding it to the existing exact Kelvin rule.
+        UnitAlias(quantity=QuantityKind.TEMPERATURE, raw="kelvin", normalized="K"),
+    ),
+    rules=TABLE_V3.rules,
+)
+"""``TABLE_V3`` plus ChemKED's ``kelvin`` spelling, without changing a shipped table."""
+
+
 TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType(
-    {TABLE_V1.sha256: TABLE_V1, TABLE_V2.sha256: TABLE_V2, TABLE_V3.sha256: TABLE_V3}
+    {
+        TABLE_V1.sha256: TABLE_V1,
+        TABLE_V2.sha256: TABLE_V2,
+        TABLE_V3.sha256: TABLE_V3,
+        TABLE_V4.sha256: TABLE_V4,
+    }
 )
 """Every conversion table this module ships, keyed by content address.
 

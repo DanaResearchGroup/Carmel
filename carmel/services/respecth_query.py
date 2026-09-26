@@ -41,6 +41,7 @@ __all__ = [
     "load_idt_records",
     "load_records",
     "parse_window",
+    "point_conditions",
 ]
 
 #: The ``--kind`` name of the ignition-delay lane.
@@ -166,9 +167,9 @@ def _in_base_unit(value: MeasuredValue, base_unit: str) -> Decimal:
     return Decimal(converted.exact)
 
 
-def _point_conditions(envelope: DatasetEnvelope) -> list[tuple[Decimal, Decimal]]:
+def point_conditions(record: RespecthRecord) -> list[tuple[Decimal, Decimal]]:
     """``(T in K, P in bar)`` for every point, constants filled in."""
-    series = envelope.series[0]
+    series = record.envelope.series[0]
     constants = {constant.axis_id: constant for constant in series.constants}
     conditions: list[tuple[Decimal, Decimal]] = []
     for point in series.points:
@@ -209,7 +210,7 @@ def find_records(
         fuels = _fuels(record.envelope)
         if fuel is not None and fuel not in fuels:
             continue
-        conditions = _point_conditions(record.envelope)
+        conditions = point_conditions(record)
         matched = [
             (t, p)
             for t, p in conditions

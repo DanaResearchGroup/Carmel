@@ -2,14 +2,43 @@
 
 from __future__ import annotations
 
+import http.server
 import logging
 import sys
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+
+
+class HttpDoubleHandler(http.server.BaseHTTPRequestHandler):
+    """Serve ``server.body`` for any GET while counting requests."""
+
+    server: HttpDoubleServer
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        self.server.requests += 1
+        if self.server.body is None:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(self.server.body)))
+        self.end_headers()
+        self.wfile.write(self.server.body)
+
+    def log_message(self, *args: object) -> None:  # noqa: D102 - silence test noise
+        pass
+
+
+class HttpDoubleServer(http.server.ThreadingHTTPServer):
+    body: bytes | None = None
+    requests: int = 0
+
 
 # Must match project.requires-python. A bare `pytest` with no environment activated finds the
 # base anaconda interpreter, where PEP 758's `except A, B:` is a SyntaxError in eight modules:
@@ -24,6 +53,22 @@ if sys.version_info < (3, 14):  # noqa: UP036
         f"Carmel's tests require Python >= 3.14; this interpreter is {sys.version.split()[0]} "
         f"at {sys.executable}. Run `conda activate crml_env` first."
     )
+
+
+@pytest.fixture
+def http_double(monkeypatch: pytest.MonkeyPatch) -> Iterator[HttpDoubleServer]:
+    """A loopback-only HTTP server shared by archive fetch tests."""
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    server = HttpDoubleServer(("127.0.0.1", 0), HttpDoubleHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 @pytest.fixture

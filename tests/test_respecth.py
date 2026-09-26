@@ -10,12 +10,9 @@ Every fixture under ``tests/fixtures/respecth/`` is an unmodified member of a pi
 from __future__ import annotations
 
 import hashlib
-import http.server
 import io
 import json
-import threading
 import zipfile
-from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -636,55 +633,15 @@ def _write_manifest(path: Path, archives: list[PinnedArchive], url_template: str
     return path
 
 
-class _Double(http.server.BaseHTTPRequestHandler):
-    """Serves ``server.body`` for any GET, counting requests."""
-
-    server: _DoubleServer
-
-    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
-        self.server.requests += 1
-        if self.server.body is None:
-            self.send_response(404)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(self.server.body)))
-        self.end_headers()
-        self.wfile.write(self.server.body)
-
-    def log_message(self, *args: object) -> None:  # noqa: D102 - silence test noise
-        pass
-
-
-class _DoubleServer(http.server.ThreadingHTTPServer):
-    body: bytes | None = None
-    requests: int = 0
-
-
-@pytest.fixture
-def http_double(monkeypatch: pytest.MonkeyPatch) -> Iterator[_DoubleServer]:
-    # Loopback must bypass any configured proxy so the double is reached directly.
-    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
-    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
-    server = _DoubleServer(("127.0.0.1", 0), _Double)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield server
-    finally:
-        server.shutdown()
-        thread.join(timeout=5)
-        server.server_close()
-
-
-def _manifest_for(server: _DoubleServer, archive: PinnedArchive, tmp_path: Path) -> RespecthManifest:
+def _manifest_for(server: object, archive: PinnedArchive, tmp_path: Path) -> RespecthManifest:
+    assert hasattr(server, "server_address")
     url = f"http://127.0.0.1:{server.server_address[1]}/{{osf_file_id}}?version={{osf_version}}"
     return load_manifest(_write_manifest(tmp_path / "manifest.json", [archive], url))
 
 
 class TestCache:
-    def test_download_verifies_caches_and_is_not_repeated(self, http_double: _DoubleServer, tmp_path: Path) -> None:
+    def test_download_verifies_caches_and_is_not_repeated(self, http_double: object, tmp_path: Path) -> None:
+        assert hasattr(http_double, "body") and hasattr(http_double, "requests")
         data = _zip_of(["x00000070_p.xml"])
         archive = _pin("h2.zip", data)
         manifest = _manifest_for(http_double, archive, tmp_path)
@@ -695,9 +652,8 @@ class TestCache:
         assert fetch_archive(archive, manifest=manifest, cache_root=cache, download=False) == data
         assert http_double.requests == 1
 
-    def test_a_download_that_does_not_match_its_pin_is_never_cached(
-        self, http_double: _DoubleServer, tmp_path: Path
-    ) -> None:
+    def test_a_download_that_does_not_match_its_pin_is_never_cached(self, http_double: object, tmp_path: Path) -> None:
+        assert hasattr(http_double, "body")
         archive = _pin("h2.zip", _zip_of(["x00000070_p.xml"]))
         manifest = _manifest_for(http_double, archive, tmp_path)
         http_double.body = _zip_of(["x10000001.xml"])
@@ -745,7 +701,7 @@ class TestCache:
         assert reads == []
         assert path.stat().st_size == archive.size + 10**9
 
-    def test_http_failure_and_offline_miss_are_fetch_errors(self, http_double: _DoubleServer, tmp_path: Path) -> None:
+    def test_http_failure_and_offline_miss_are_fetch_errors(self, http_double: object, tmp_path: Path) -> None:
         archive = _pin("h2.zip", _zip_of(["x00000070_p.xml"]))
         manifest = _manifest_for(http_double, archive, tmp_path)
         with pytest.raises(ArchiveFetchError):

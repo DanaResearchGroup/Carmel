@@ -1447,7 +1447,7 @@ def _cmd_data_find(
     manifest_path: Path | None,
     offline: bool,
 ) -> int:
-    """List pinned ReSpecTh records of ``kind`` inside the requested windows.
+    """List pinned ReSpecTh records of ``kind`` and ChemKED ignition-delay records.
 
     An archive that cannot be fetched or does not match its pin refuses the whole listing
     (exit 1): a partial listing would read as a complete one. A member the parser refuses is
@@ -1468,16 +1468,54 @@ def _cmd_data_find(
         return 1
     matches = find_records(loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range)
 
+    from carmel.services.chemked_query import ChemkedIdtMatch, ChemkedLoadResult
+
+    chemked_matches: tuple[ChemkedIdtMatch, ...] = ()
+    chemked_loaded: ChemkedLoadResult | None = None
+    # A caller passing a ReSpecTh fixture manifest is testing that lane in
+    # isolation. Normal user invocation loads both curated sources.
+    if kind == IDT_KIND and manifest_path is None:
+        from carmel.services.chemked_archive import load_manifest as load_chemked_manifest
+        from carmel.services.chemked_query import find_idt as find_chemked_idt
+        from carmel.services.chemked_query import load_idt_records as load_chemked_idt_records
+        from carmel.services.respecth_query import point_conditions as respecth_point_conditions
+
+        try:
+            chemked_loaded = load_chemked_idt_records(
+                load_chemked_manifest(),
+                cache_root=cache if cache is not None else default_cache_root(),
+                download=not offline,
+            )
+        except ValueError as exc:
+            print(f"Refusing to list ChemKED records: {exc}", file=sys.stderr)
+            return 1
+        respecth_keys = {
+            (record.paper_doi.casefold(), tuple(sorted(respecth_point_conditions(record))))
+            for record in loaded.records
+            if record.paper_doi
+        }
+        chemked_matches = tuple(
+            match
+            for match in find_chemked_idt(
+                chemked_loaded.records, fuel=fuel, temperature_k=t_range, pressure_bar=p_range
+            )
+            if (match.record.citation_doi.casefold(), tuple(sorted(match.conditions))) not in respecth_keys
+        )
+
     def number(value: object) -> str:
         return f"{float(str(value)):.4g}"
 
-    print("record_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints")
+    include_source = chemked_loaded is not None
+    header = "record_doi\tpaper_doi\tdevice\tfuels\tT_K\tP_bar\tpoints"
+    print(f"source\t{header}" if include_source else header)
     for match in matches:
         record = match.record
         paper = record.paper_doi or ("placeholder" if not isinstance(record.paper, Absent) else "-")
+        source = ("ReSpecTh",) if include_source else ()
         print(
             "\t".join(
-                (
+                source
+                + (
                     record.citation_doi,
                     paper,
                     record.apparatus.device_class.value
@@ -1494,11 +1532,35 @@ def _cmd_data_find(
                 )
             )
         )
-    refused = ", ".join(f"{reason} {count}" for reason, count in sorted(loaded.refusals.items()))
+    for chemked_match in chemked_matches:
+        chemked_record = chemked_match.record
+        print(
+            "\t".join(
+                (
+                    "ChemKED",
+                    chemked_record.citation_doi,
+                    chemked_record.citation_doi,
+                    "-",
+                    "+".join(chemked_record.fuels) or "-",
+                    f"{number(chemked_match.temperature_k[0])}-{number(chemked_match.temperature_k[1])}",
+                    f"{number(chemked_match.pressure_bar[0])}-{number(chemked_match.pressure_bar[1])}",
+                    f"{chemked_match.matched_points}/{chemked_match.total_points}",
+                )
+            )
+        )
+    refusals = loaded.refusals.copy()
+    if chemked_loaded is not None:
+        refusals.update(chemked_loaded.refusals)
+    refused = ", ".join(f"{reason} {count}" for reason, count in sorted(refusals.items()))
     label = "ignition-delay" if kind == IDT_KIND else kind
+    mapped = f"{len(loaded.records)} mapped {label} records"
+    if chemked_loaded is not None:
+        mapped = (
+            f"{len(loaded.records)} ReSpecTh and {len(chemked_loaded.records)} ChemKED mapped ignition-delay records"
+        )
     print(
-        f"{len(matches)} matching dataset(s) of {len(loaded.records)} mapped {label} records"
-        f"; {sum(loaded.refusals.values())} refused ({refused or 'none'})"
+        f"{len(matches) + len(chemked_matches)} matching dataset(s) of {mapped}"
+        f"; {sum(refusals.values())} refused ({refused or 'none'})"
     )
     return 0
 
