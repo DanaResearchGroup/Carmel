@@ -16,15 +16,21 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Collection, Mapping, Sequence
 from functools import cache
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
 
 from carmel.agents.bridge import AgentBridgeError, AgentTool, ModelResponse
-from carmel.agents.model_catalog import resolve_model_ladder
-from carmel.config import AgentConfig, AgentProvider
+from carmel.agents.model_catalog import (
+    OPENROUTER_FREE_SUFFIX,
+    fetch_openrouter_catalogue,
+    free_openrouter_model_ids,
+    is_auto_model_name,
+    resolve_model_ladder,
+)
+from carmel.config import AgentConfig, AgentProvider, ModelTier
 from carmel.credentials import credential_search_path, resolve_api_key
 from carmel.logger import get_logger
 
@@ -35,7 +41,43 @@ logger = get_logger("agents.models")
 
 _INSTALL_HINT = "pip install 'carmel[agents]'"
 
-__all__ = ["AgentBridgeError", "MockModel", "PydanticAIModel", "build_model", "compute_cost_usd"]
+__all__ = [
+    "AgentBridgeError",
+    "FreeModelRequiredError",
+    "MockModel",
+    "ModelRateLimitedError",
+    "PydanticAIModel",
+    "build_model",
+    "compute_cost_usd",
+]
+
+
+class ModelRateLimitedError(AgentBridgeError):
+    """Raised when the provider answers HTTP 429: the call may succeed if retried later.
+
+    A subclass of :class:`AgentBridgeError`, so every existing fail-closed handler still
+    catches it; ``retriable`` lets a caller that wants to back off tell it apart from a
+    permanent failure without parsing the message.
+    """
+
+    retriable = True
+
+    def __init__(self, message: str, *, status_code: int = 429) -> None:
+        """Initialise the error.
+
+        Args:
+            message: Human-readable description, naming the model but never the key.
+            status_code: The HTTP status the provider answered with.
+        """
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class FreeModelRequiredError(AgentBridgeError):
+    """Raised before any model request when a DEV-tier OpenRouter run names a model that
+    is not provably free (``:free`` id suffix AND zero prompt/completion price in the
+    live catalogue)."""
+
 
 # Hand-maintained FALLBACK pricing table (USD per 1,000,000 tokens), used only when
 # `genai_prices` cannot price the model --
@@ -445,6 +487,12 @@ _PERMANENTLY_UNAVAILABLE_STATUS_CODES = frozenset({404})
 _TRANSIENTLY_UNAVAILABLE_STATUS_CODES = frozenset({503})
 _UNAVAILABLE_STATUS_CODES = _PERMANENTLY_UNAVAILABLE_STATUS_CODES | _TRANSIENTLY_UNAVAILABLE_STATUS_CODES
 
+#: "Too many requests" -- OpenRouter's free models are rate-limited per account, so a 429
+#: is expected there and is surfaced as :class:`ModelRateLimitedError`. Not an
+#: availability failure: every rung shares the same account limit, so walking down the
+#: ladder would only spend more rate-limited requests.
+_RATE_LIMITED_STATUS_CODE = 429
+
 #: Process-lifetime cache of ``(provider, key-digest, model_id)`` triples that have
 #: already answered a call with a PERMANENT unavailability (404). Without this,
 #: `self._ladder` is a fixed tuple that is never narrowed, so a permanently-retired rung
@@ -499,6 +547,12 @@ def clear_dead_model_cache() -> None:
     _dead_model_cache.clear()
 
 
+def _status_code(exc: BaseException) -> int | None:
+    """Return the HTTP status a pydantic-ai ``ModelHTTPError`` carries, else None."""
+    status = getattr(exc, "status_code", None)
+    return status if isinstance(status, int) else None
+
+
 def _is_model_unavailable(exc: BaseException) -> bool:
     """Return True if ``exc`` means the model itself is unavailable (404 or 503).
 
@@ -535,6 +589,8 @@ class PydanticAIModel:
         provider: AgentProvider,
         api_key: str,
         fallback_model_names: Sequence[str] = (),
+        provider_kwargs: Mapping[str, str] | None = None,
+        _free_only: bool = False,
     ) -> None:
         """Construct a pydantic-ai-backed model.
 
@@ -545,6 +601,15 @@ class PydanticAIModel:
             fallback_model_names: Further models to try, in order, ONLY when a call fails
                 because the preferred model is unavailable (see :func:`_is_model_unavailable`).
                 Empty by default, so an explicitly-named model is never silently swapped.
+            provider_kwargs: Extra keyword arguments for the pydantic-ai provider
+                constructor (e.g. OpenRouter's ``app_url``/``app_title`` attribution).
+            _free_only: Internal flag set by ``build_model`` when DEV tier OpenRouter
+                requires free-only enforcement. Not part of the public API.
+
+        Free status is never an argument: an OpenRouter ladder member is charged exactly
+        0.0 only if :func:`_verified_free_openrouter_models` confirms it against the live
+        catalogue, so a caller cannot declare a paid model free. Everything else is
+        priced as usual.
 
         Raises:
             AgentBridgeError: If pydantic-ai is not installed.
@@ -553,6 +618,8 @@ class PydanticAIModel:
         self._ladder: tuple[str, ...] = (model_name, *fallback_model_names)
         self._provider = provider
         self._api_key = api_key
+        self._provider_kwargs = dict(provider_kwargs or {})
+        self._free_only = _free_only
         self._agent = self._build_agent()
 
     def _build_agent(self) -> Any:
@@ -572,6 +639,19 @@ class PydanticAIModel:
                 f"required to use a non-mock provider. Install it with: {_INSTALL_HINT}"
             ) from exc
         return pydantic_ai
+
+    def _is_model_free(self, model_name: str) -> bool:
+        """Return True if ``model_name`` is currently verified free in the OpenRouter catalogue.
+
+        For non-OpenRouter providers, always returns False. For OpenRouter, re-checks
+        the live catalogue (via the TTL-bounded cache) on every call, so a model that
+        starts charging stops counting as free within the TTL bound.
+        """
+        if self._provider != AgentProvider.OPENROUTER:
+            return False
+        if not model_name.endswith(OPENROUTER_FREE_SUFFIX):
+            return False
+        return model_name in _verified_free_openrouter_models((model_name,))
 
     def _infer_model(self, pydantic_ai: Any, model_name: str) -> Any:
         """Build a concrete pydantic-ai ``Model`` bound to ``self._api_key``.
@@ -612,7 +692,7 @@ class PydanticAIModel:
             # `agents` extra) the class is untyped, the error never fires, and the
             # ignore itself would fail the build as unused.
             provider_cls: Any = infer_provider_class(name)
-            return provider_cls(api_key=self._api_key)
+            return provider_cls(api_key=self._api_key, **self._provider_kwargs)
 
         return pydantic_ai.models.infer_model(f"{provider_name}:{model_name}", provider_factory=_provider_factory)
 
@@ -661,6 +741,11 @@ class PydanticAIModel:
                     tools=tools,
                 )
             except Exception as exc:
+                if self._provider == AgentProvider.OPENROUTER and _status_code(exc) == _RATE_LIMITED_STATUS_CODE:
+                    raise ModelRateLimitedError(
+                        f"model {candidate!r} is rate-limited by {self._provider.value!r} (HTTP 429); "
+                        "retry later -- free OpenRouter models carry per-account request limits"
+                    ) from exc
                 if not _is_model_unavailable(exc):
                     raise
                 if _is_permanently_unavailable(exc):
@@ -731,7 +816,19 @@ class PydanticAIModel:
 
         Raises:
             AgentBridgeError: If pydantic-ai is not installed.
+            FreeModelRequiredError: If the model has the ``:free`` suffix but is no longer
+                verified free in the catalogue (DEV tier OpenRouter with _free_only=True).
         """
+        if (
+            self._free_only
+            and self._provider == AgentProvider.OPENROUTER
+            and model_name.endswith(OPENROUTER_FREE_SUFFIX)
+            and not self._is_model_free(model_name)
+        ):
+            raise FreeModelRequiredError(
+                f"model {model_name!r} is no longer verified free in the OpenRouter catalogue; "
+                "DEV tier requires a currently free model"
+            )
         pydantic_ai = self._build_agent()
         model = self._infer_model(pydantic_ai, model_name)
         agent = pydantic_ai.Agent(
@@ -762,13 +859,17 @@ class PydanticAIModel:
         tokens_available = raw_input_tokens is not None or raw_output_tokens is not None
         input_tokens = raw_input_tokens or 0
         output_tokens = raw_output_tokens or 0
-        cost_usd = compute_cost_usd(
-            model_name,
-            input_tokens,
-            output_tokens,
-            tokens_available=tokens_available,
-            usage=usage,
-            provider_id=self._provider.value,
+        cost_usd = (
+            0.0
+            if self._is_model_free(model_name)
+            else compute_cost_usd(
+                model_name,
+                input_tokens,
+                output_tokens,
+                tokens_available=tokens_available,
+                usage=usage,
+                provider_id=self._provider.value,
+            )
         )
         return ModelResponse(
             output=output_dict,
@@ -791,8 +892,13 @@ class PydanticAIModel:
         :func:`_is_model_unavailable`) -- so the reservation must cover whichever
         ladder member is priciest, not just ``self.name``; otherwise a fallback to a
         more expensive model could be under-reserved (spar round 5, Finding 1).
+
+        Free status is re-checked against the live catalogue at reservation time.
         """
-        return max(estimate_worst_case_model_cost_usd(candidate, estimated_tokens) for candidate in self._ladder)
+        return max(
+            0.0 if self._is_model_free(candidate) else estimate_worst_case_model_cost_usd(candidate, estimated_tokens)
+            for candidate in self._ladder
+        )
 
 
 def build_model(config: AgentConfig) -> ModelProtocol:
@@ -814,6 +920,8 @@ def build_model(config: AgentConfig) -> ModelProtocol:
             consent, no api_key_env configured, no key found anywhere in the search
             path (the message names every location searched), or the pydantic-ai
             dependency being absent.
+        FreeModelRequiredError: A DEV-tier OpenRouter config names a model that is not
+            provably free (see :func:`_require_free_openrouter_ladder`).
     """
     if config.provider == AgentProvider.MOCK:
         return MockModel(name=config.resolved_model_name())
@@ -837,16 +945,64 @@ def build_model(config: AgentConfig) -> ModelProtocol:
             f"or put {env_var}=... in one of: {searched_str}"
         )
 
+    model_name = config.resolved_model_name()
+    free_only = config.provider == AgentProvider.OPENROUTER and config.tier == ModelTier.DEV
+    if free_only and not is_auto_model_name(model_name) and not model_name.endswith(OPENROUTER_FREE_SUFFIX):
+        raise FreeModelRequiredError(
+            f"tier 'dev' on OpenRouter only calls free models; {model_name!r} has no "
+            f"{OPENROUTER_FREE_SUFFIX!r} suffix -- choose a ':free' model or use tier 'prod'"
+        )
+
     # Resolve `auto:<family>` to concrete provider model ids, newest first. A model named
     # explicitly resolves to itself alone, so this cannot swap out an operator's choice.
     try:
-        ladder = resolve_model_ladder(config.resolved_model_name(), config.provider, api_key)
+        ladder = resolve_model_ladder(model_name, config.provider, api_key)
     except ValueError as exc:
         raise AgentBridgeError(str(exc)) from exc
+
+    provider_kwargs: dict[str, str] = {}
+    if config.provider == AgentProvider.OPENROUTER:
+        provider_kwargs = {"app_url": config.openrouter_app_url, "app_title": config.openrouter_app_title}
+        if free_only:
+            _require_free_openrouter_ladder(ladder, _verified_free_openrouter_models(ladder))
 
     return PydanticAIModel(
         model_name=ladder[0],
         provider=config.provider,
         api_key=api_key,
         fallback_model_names=ladder[1:],
+        provider_kwargs=provider_kwargs,
+        _free_only=free_only,
     )
+
+
+def _verified_free_openrouter_models(ladder: Sequence[str]) -> frozenset[str]:
+    """Return the ladder members the live OpenRouter catalogue confirms free.
+
+    The single source of free status: ``:free`` id suffix AND zero price in the catalogue
+    (see :attr:`OpenRouterModelInfo.is_free`). The catalogue is read only when some member
+    carries the suffix, since nothing else can qualify; an unreadable catalogue confirms
+    nothing.
+    """
+    if not any(name.endswith(OPENROUTER_FREE_SUFFIX) for name in ladder):
+        return frozenset()
+    return free_openrouter_model_ids(fetch_openrouter_catalogue()) & frozenset(ladder)
+
+
+def _require_free_openrouter_ladder(ladder: Sequence[str], free_model_names: Collection[str]) -> None:
+    """Refuse a DEV-tier OpenRouter ladder containing any model not verified free.
+
+    "Free" means BOTH the ``:free`` id suffix and a zero prompt/completion price in the
+    live catalogue. An unreadable catalogue verifies nothing, so it refuses too: a model
+    that cannot be shown to be free is treated as paid.
+
+    Raises:
+        FreeModelRequiredError: Naming every ladder member that failed verification.
+    """
+    unverified = [name for name in ladder if name not in free_model_names]
+    if unverified:
+        raise FreeModelRequiredError(
+            f"tier 'dev' on OpenRouter only calls free models; {unverified!r} could not be "
+            "verified free (':free' suffix and zero price in the live OpenRouter catalogue) -- "
+            "the catalogue may be unreachable, or the model is not free"
+        )

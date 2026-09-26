@@ -467,6 +467,53 @@ later phase.
 
 `carmel serve` accepts `--workspaces`, `--host`, `--port`, `--debug`.
 
+## LLM Providers
+
+Every persona gets its model from `carmel.agents.models.build_model`, so a provider is
+chosen in the `agents:` config section alone. `provider` is one of `mock`, `google`,
+`openai`, `deepseek`, `openrouter`, and any non-mock provider needs
+`external_provider_consent: true` and `api_key_env`.
+
+### OpenRouter
+
+```yaml
+agents:
+  tier: dev
+  provider: openrouter
+  api_key_env: OPENROUTER_API_KEY
+  external_provider_consent: true
+  # model_name: vendor/model:free       # optional; defaults to auto:nemotron-free on dev
+  # openrouter_app_url: https://...     # HTTP-Referer, default the Carmel repo URL
+  # openrouter_app_title: Carmel        # X-Title
+```
+
+Carmel uses pydantic-ai's own `OpenRouterProvider` (endpoint `https://openrouter.ai/api/v1`)
+and sends the two attribution headers on every call.
+
+**Key.** Read from `$OPENROUTER_API_KEY`. A missing key is a typed `AgentBridgeError` that
+names every location searched. The `~/.config/openrouter/env` file fallback that the other
+providers have is not yet wired for OpenRouter, so export the variable instead.
+
+**Free-only DEV tier.** With `tier: dev`, OpenRouter only calls models that are provably
+free: the id ends in `:free` **and** the live catalogue (`GET /api/v1/models`) prices both
+prompt and completion at `"0"`. A non-`:free` id is refused with `FreeModelRequiredError`
+before any network call. A `:free` id the catalogue cannot confirm, including when the
+catalogue is unreachable, is refused before any model request. Verified-free calls are
+charged exactly $0 in the budget ledger and never fall back to an estimated rate. Free status
+comes only from the catalogue: `PydanticAIModel` takes no caller-supplied free set, so a
+directly-constructed model is priced like any other unless the catalogue confirms it. A
+catalogue read is trusted for 10 minutes; after that it is re-read, and a failed re-read
+counts nothing as free rather than reusing the expired one. `tier: prod` has no such guard
+and no OpenRouter default model, so it needs an explicit `model_name`.
+
+**Default DEV model.** `auto:nemotron-free` resolves at build time to the free NVIDIA
+Nemotron with the largest context window in the live catalogue, preferring ≥ 1M tokens.
+It is a family rather than a pinned id because free ids come and go.
+
+**Errors.** HTTP 429 (free models are rate-limited per account) raises
+`ModelRateLimitedError`, an `AgentBridgeError` with `retriable = True`. A 404 is cached as a
+dead model for the process, as for other providers.
+
 ## External Tools
 
 | Tool    | Trust Level             | Phase 1 status |
