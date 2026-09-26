@@ -1423,6 +1423,7 @@ class LocatorKind(StrEnum):
     BBOX = "bbox"
     TABLE_CELL = "table_cell"
     XPATH = "xpath"
+    YAML_PATH = "yaml_path"
     CHAR_SPAN = "char_span"
 
 
@@ -1576,6 +1577,15 @@ class XPathLocator(BaseModel):
     xpath: str = Field(min_length=1)
 
 
+class YamlPathLocator(BaseModel):
+    """A fully positional key path into a YAML database record."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    kind: Literal[LocatorKind.YAML_PATH] = LocatorKind.YAML_PATH
+    path: str = Field(min_length=1)
+
+
 class CharSpanLocator(BaseModel):
     """Locates a reference by a half-open character span ``[start, end)``
     into a node's extracted text.
@@ -1635,7 +1645,7 @@ class CharSpanLocator(BaseModel):
 
 
 SourceLocator = Annotated[
-    BBoxLocator | TableCellLocator | XPathLocator | CharSpanLocator,
+    BBoxLocator | TableCellLocator | XPathLocator | YamlPathLocator | CharSpanLocator,
     Field(discriminator="kind"),
 ]
 
@@ -5731,7 +5741,8 @@ def _check_source_form_for_ref(
                 f"kind={ref.locator.kind!r} node kind={node_kind!r}"
             )
     elif source_form == SourceForm.STRUCTURED_RECORD:
-        if ref.locator.kind is not LocatorKind.XPATH or node_kind is not SourceNodeKind.DATABASE_RECORD:
+        locator_is_structured = ref.locator.kind in {LocatorKind.XPATH, LocatorKind.YAML_PATH}
+        if not locator_is_structured or node_kind is not SourceNodeKind.DATABASE_RECORD:
             raise ValueError(
                 f"{where}: source_form=STRUCTURED_RECORD requires value_ref to be an XPATH locator into a "
                 f"DATABASE_RECORD node, got locator kind={ref.locator.kind!r} node kind={node_kind!r}"
@@ -5744,6 +5755,7 @@ _LOCATOR_KIND_COMPATIBLE_NODE_KINDS: dict[LocatorKind, frozenset[SourceNodeKind]
     LocatorKind.BBOX: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.SI_MEMBER, SourceNodeKind.FIGURE_CROP}),
     LocatorKind.TABLE_CELL: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
     LocatorKind.XPATH: frozenset({SourceNodeKind.JATS_XML, SourceNodeKind.DATABASE_RECORD}),
+    LocatorKind.YAML_PATH: frozenset({SourceNodeKind.DATABASE_RECORD}),
     LocatorKind.CHAR_SPAN: frozenset({SourceNodeKind.PAPER_PDF, SourceNodeKind.JATS_XML, SourceNodeKind.SI_MEMBER}),
 }
 """Which :class:`SourceNodeKind`\\ s a given :class:`LocatorKind` may target.
@@ -5963,7 +5975,7 @@ def _table_key_identity_payload(table_key: CaptionLabelKey | MemberSheetKey) -> 
 
 
 def _source_locator_identity_payload(
-    locator: BBoxLocator | TableCellLocator | XPathLocator | CharSpanLocator,
+    locator: BBoxLocator | TableCellLocator | XPathLocator | YamlPathLocator | CharSpanLocator,
 ) -> dict[str, Any]:
     if isinstance(locator, BBoxLocator):
         return {"kind": locator.kind.value, "bbox": _bbox_identity_payload(locator.bbox)}
@@ -5986,6 +5998,8 @@ def _source_locator_identity_payload(
         }
     if isinstance(locator, XPathLocator):
         return {"kind": locator.kind.value, "xpath": locator.xpath}
+    if isinstance(locator, YamlPathLocator):
+        return {"kind": locator.kind.value, "path": locator.path}
     if isinstance(locator, CharSpanLocator):
         return {
             "kind": locator.kind.value,

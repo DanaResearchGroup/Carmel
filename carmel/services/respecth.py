@@ -591,10 +591,12 @@ def _repair_dependency() -> SemanticDependencyUse:
     )
 
 
-def _measured(value: RecordText, unit: RecordText, quantity: QuantityKind) -> MeasuredValue:
+def _measured(
+    value: RecordText, unit: RecordText, quantity: QuantityKind, table: units.ConversionTable = _TABLE
+) -> MeasuredValue:
     """Bind a verbatim numeral to its verbatim unit under :data:`_TABLE`, or refuse."""
     try:
-        unit_normalized = units.normalize_unit(quantity, unit.raw, table=_TABLE)
+        unit_normalized = units.normalize_unit(quantity, unit.raw, table=table)
     except units.UnitError as exc:
         raise RespecthRefusal(
             RespecthRefusalReason.UNMAPPED_UNIT, f"unit {unit.raw!r} at {unit.ref.locator} for {quantity.value}: {exc}"
@@ -622,7 +624,7 @@ def _measured(value: RecordText, unit: RecordText, quantity: QuantityKind) -> Me
         quantity_kind=quantity,
         unit_raw=unit.raw,
         unit_normalized=unit_normalized,
-        conversion_table_sha256=_TABLE.sha256,
+        conversion_table_sha256=table.sha256,
         value_ref=value.ref,
         unit_ref=unit.ref,
     )
