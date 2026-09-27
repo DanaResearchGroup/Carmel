@@ -51,3 +51,13 @@ for the syngas records:
   https://doi.org/10.1002/kin.21006
 
 and the original experimental paper each record names (its bibliographyLink).
+
+--------------------------------------------------------------------------------
+
+Third-party data: ChemKED database
+
+`carmel/data/chemked_manifest.json` pins individual raw records from
+pr-omethe-us/ChemKED-database commit 606005bfc8f5214b3f0b5ca7300a96a82815c2ae.
+The upstream repository's LICENSE.txt is Creative Commons Attribution 4.0
+International (CC-BY-4.0). The single test fixture retains the record's DOI
+and file-authors metadata; no database archive is vendored.

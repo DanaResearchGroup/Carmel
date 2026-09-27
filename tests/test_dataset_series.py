@@ -1280,10 +1280,13 @@ class TestACharSpanCannotGroundASeriesValue:
             (SourceRef(node_id="paper", locator=XPathLocator(xpath="/a[1]")), SourceNodeKind.PAPER_PDF),
         ],
     )
-    def test_v4s_structured_record_branch_needs_xpath_into_a_database_record(
+    def test_v4s_structured_record_branch_needs_xpath_or_yaml_path_into_a_database_record(
         self, ref: SourceRef, node_kind: SourceNodeKind
     ) -> None:
-        with pytest.raises(ValueError, match="source_form=STRUCTURED_RECORD requires"):
+        with pytest.raises(
+            ValueError,
+            match="source_form=STRUCTURED_RECORD requires value_ref.locator.kind to be XPATH or YAML_PATH",
+        ):
             _check_source_form_for_ref(
                 source_form=SourceForm.STRUCTURED_RECORD, ref=ref, node_kind=node_kind, where="direct call"
             )
