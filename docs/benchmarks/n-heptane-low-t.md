@@ -102,7 +102,7 @@ molecular graphs:
 - **OOQOOH:** a linear seven-carbon chain with one C–O–OH, one C–O–O•,
   one oxygen radical and no carbon radical, carbonyl, alkene or ether ring.
 - **P(OOH)₂:** a linear seven-carbon chain with two C–O–OH groups and one
-  carbon radical, with no carbonyl, alkene or ether ring.
+  carbon radical on a carbon bearing neither OOH group, with no carbonyl, alkene or ether ring.
 - **G1:** OOQOOH becomes a single P(OOH)₂ molecule.
 - **G2:** P(OOH)₂ becomes one closed-shell C7 cyclic ether retaining one OOH,
   plus exactly OH.
@@ -115,7 +115,7 @@ molecular graphs:
 
 These are net structural classes, not claims that an experimental observable uniquely
 identifies a transition state. Tests reject ordinary QOOH cyclic-ether formation,
-RO₂ ⇌ QOOH, conventional ketohydroperoxide formation, branched/shorter-carbon
+RO₂ ⇌ QOOH, conventional ketohydroperoxide formation (including its two-step α-hydroperoxy intermediate), branched/shorter-carbon
 analogues, invalid structures and unbalanced reactions.
 
 Absence is not inferred from NUIG labels. First, old species' **thermochemistry formulas**
@@ -232,6 +232,9 @@ support files are verified against the contract pins before use. If a pinned mec
 support file is absent, `--download-dir` downloads it from the URL in `contract.json` and
 verifies its byte count and SHA-256 before use. The ChemKED checkout must contain the
 pinned commit because its split files are verified by Git blob and SHA-256.
+
+The glossary audit also requires Poppler's `pdftotext` command to be installed and available
+on `PATH`.
 
 From the repository root, run:
 

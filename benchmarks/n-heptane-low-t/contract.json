@@ -9041,7 +9041,7 @@
       "id": "G1",
       "name": "Alternative OOQOOH H shift to P(OOH)2",
       "scope": "primary",
-      "rule": "One linear seven-carbon OOQOOH radical (one C-O-OH and one C-O-O radical, no C radical) becomes one linear seven-carbon radical with two C-O-OH groups and one carbon radical, no alkene/carbonyl/ring; elemental balance.",
+      "rule": "One linear seven-carbon OOQOOH radical (one C-O-OH and one C-O-O radical, no C radical) becomes one linear seven-carbon radical with two C-O-OH groups and one carbon radical on a carbon bearing neither OOH group, no alkene/carbonyl/ring; elemental balance.",
       "reactant_formula": {
         "C": 7,
         "H": 15,
@@ -9905,7 +9905,7 @@
       "id": "G2",
       "name": "P(OOH)2 to hydroperoxy cyclic ether + OH",
       "scope": "primary",
-      "rule": "One linear seven-carbon radical with two C-O-OH groups and one carbon radical becomes one closed-shell seven-carbon cyclic ether with one retained C-O-OH group plus OH; elemental balance.",
+      "rule": "One linear seven-carbon radical with two C-O-OH groups and one carbon radical on a carbon bearing neither OOH group becomes one closed-shell seven-carbon cyclic ether with one retained C-O-OH group plus OH; elemental balance.",
       "reactant_formula": {
         "C": 7,
         "H": 15,

@@ -19,6 +19,7 @@ class Features:
     hydroperoxide_on_carbonyl: bool
     peroxy_radicals: int
     carbon_radicals: int
+    radical_on_hydroperoxy_carbon: bool
     radicals: int
     carbonyls: int
     alkenes: int
@@ -61,6 +62,10 @@ def features(smiles: str) -> Features:
         hydroperoxide_on_carbonyl=bool(carbonyl_carbons & hydroperoxide_carbons),
         peroxy_radicals=matches("[C]-[O]-[O;X1;H0]"),
         carbon_radicals=sum(a.GetNumRadicalElectrons() for a in carbon_atoms),
+        radical_on_hydroperoxy_carbon=any(
+            mol.GetAtomWithIdx(match[0]).GetNumRadicalElectrons()
+            for match in mol.GetSubstructMatches(Chem.MolFromSmarts("[C]-[O]-[O;H1]"))
+        ),
         radicals=sum(a.GetNumRadicalElectrons() for a in mol.GetAtoms()),
         carbonyls=matches("[C]=[O]"),
         alkenes=matches("[C]=[C]"),
@@ -105,7 +110,13 @@ def classify(reactants: tuple[str, ...], products: tuple[str, ...]) -> frozenset
             dst = carbon_products[0]
             if dst.atoms["C"] != 7 or not dst.linear_carbon:
                 continue
-            if ooqooh and len(target) == 1 and dst.hydroperoxides == 2 and dst.carbon_radicals == dst.radicals == 1:
+            if (
+                ooqooh
+                and len(target) == 1
+                and dst.hydroperoxides == 2
+                and dst.carbon_radicals == dst.radicals == 1
+                and not dst.radical_on_hydroperoxy_carbon
+            ):
                 found.add("G1")
             if pooh and small == ["[OH]"] and dst.ether_rings == dst.hydroperoxides == 1 and dst.radicals == 0:
                 found.add("G2")
