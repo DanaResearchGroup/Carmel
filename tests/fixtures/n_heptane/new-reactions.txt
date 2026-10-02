@@ -1,0 +1,8 @@
+! Six tiny excerpts from Zhang et al. 2016, DOI 10.1016/j.combustflame.2016.06.028.
+! nc7-2016.txt, pinned in contract.json. The full mechanism is not distributed.
+C7H14OOH1-3O2<=>C7H13Q13-5                        7.033E+10      0.2000      18500.0
+C7H13Q13-2<=>C7H13O12-3OOH+OH                     1.775E+12      0.000       13376.0
+C7H13Q13-2<=>C7H13-1D3OOH+HO2                     5.630E+09      0.9700      15000.0
+C7H14OOH1-3O2<=>C7H13-2D1OOH+HO2                  7.710E+09      1.0100      29362.0
+C7H13Q13-5=>C3KET13+C4H8-1+OH                     3.081E+13      0.0000      24276.4
+C7KET13=>CH3COOH+PC4H9CHO                         5.100E+05      1.1300      26100.0
