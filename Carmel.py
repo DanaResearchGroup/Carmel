@@ -4,6 +4,7 @@
 """Command-line interface for Carmel."""
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -357,6 +358,12 @@ def create_parser() -> argparse.ArgumentParser:
     data_find.add_argument(
         "--offline", action="store_true", help="Never download; refuse any archive not already cached"
     )
+    data_coverage = data_commands.add_parser(
+        "coverage", help="Report mapped/refused records and replay coverage for every pinned source"
+    )
+    data_coverage.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    data_coverage.add_argument("--cache", type=Path, default=None, help="Data cache directory")
+    data_coverage.add_argument("--offline", action="store_true", help="Never download missing pinned data")
 
     return parser
 
@@ -1565,6 +1572,22 @@ def _cmd_data_find(
     return 0
 
 
+def _cmd_data_coverage(cache: Path | None, offline: bool, as_json: bool) -> int:
+    from carmel.services.data_coverage import build_coverage, coverage_payload, render_table
+    from carmel.services.respecth_archive import default_cache_root
+
+    try:
+        rows = build_coverage(cache_root=cache if cache is not None else default_cache_root(), download=not offline)
+    except Exception as exc:
+        print(f"Refusing to build data coverage: {exc}", file=sys.stderr)
+        return 1
+    if as_json:
+        print(json.dumps(coverage_payload(rows), indent=2, sort_keys=True))
+    else:
+        print(render_table(rows))
+    return 1 if any(row.replay_failed for row in rows) else 0
+
+
 def _cmd_store_condition_set(workspaces: Path | None) -> int:
     """Produce and durably store the registered condition set, then export it.
 
@@ -1693,6 +1716,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "data" and args.data_command == "find":
         return _cmd_data_find(args.kind, args.fuel, args.t_range, args.p_range, args.cache, args.manifest, args.offline)
+    if args.command == "data" and args.data_command == "coverage":
+        return _cmd_data_coverage(args.cache, args.offline, args.json)
 
     parser.print_help()
     return 1
