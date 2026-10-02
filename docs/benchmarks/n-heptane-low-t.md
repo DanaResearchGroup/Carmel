@@ -5,8 +5,8 @@ low-temperature reaction types for **n-heptane**. Structural recovery is the pri
 score. Improvement in held-out ignition delay is secondary. Korcek chemistry is carried
 separately for speciation, and never earns ignition or primary credit.
 
-The frozen data are [contract.json](../../benchmarks/n-heptane-low-t/contract.json);
-[schema.json](../../benchmarks/n-heptane-low-t/schema.json) is generated from
+The frozen data are [contract.json](https://github.com/DanaResearchGroup/Carmel/blob/main/benchmarks/n-heptane-low-t/contract.json);
+[schema.json](https://github.com/DanaResearchGroup/Carmel/blob/main/benchmarks/n-heptane-low-t/schema.json) is generated from
 `carmel.benchmarks.n_heptane.Contract`. Python validation rejects changed totals,
 missing species, guessed structures, crossed study groups, unsafe file paths and
 incorrect credit scopes. All molecular matching requires Carmel's `agents` extra.
