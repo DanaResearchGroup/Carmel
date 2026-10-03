@@ -196,7 +196,7 @@ class TestFromIdentityPayload:
         rules = [dict(rule) for rule in payload["rules"]]
         rules[0]["kind"] = "logarithmic"
         payload["rules"] = rules
-        with pytest.raises(ConversionTableInvariantError, match="'identity'/'scale'/'affine'"):
+        with pytest.raises(ConversionTableInvariantError, match="'identity'/'scale'/'rational_scale'/'affine'"):
             ConversionTable.from_identity_payload(payload)
 
     def test_scale_of_null_on_a_scale_rule_is_rejected(self) -> None:
@@ -741,6 +741,8 @@ class TestShippedTablesAreNeverRemoved:
             "fd718e1d7cf54f0f94bdb24c4f325aef76441a7724605559309a4b2a751395bd",
             # TABLE_V4, shipped with the ChemKED lane (pint's long "kelvin" spelling).
             "0a7504ec2e8fd4e56cc878cc9c9501863060f5aa57a7b9cf0ec48b00c68cae90",
+            # TABLE_V5, shipped with the RCM lane (exact rational Torr -> Pa).
+            "1a10cb5949c5330f593f95f1879c09184f0c953e8547f64ded9d66b0f7ce045e",
         }
     )
 
