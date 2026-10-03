@@ -120,6 +120,12 @@ class ChemkedIdtRecord:
             for name, kind, _ in self.species_identifiers
         ):
             raise ValueError("species identifiers require names and validated identity kinds")
+        if any(not isinstance(value, RecordText) for _, _, value in self.species_identifiers):
+            raise ValueError("species identifiers require frozen grounded RecordText values")
+        if any(value is not None and not isinstance(value, RcmHistory) for value in self.rcm_histories) or any(
+            value is not None and not isinstance(value, RcmState) for value in self.rcm_states
+        ):
+            raise ValueError("RCM histories/states require frozen validated models")
         count = len(self.envelope.series[0].points)
         if any(self.rcm_histories) and self.apparatus != "rapid compression machine":
             raise ValueError("histories require an RCM apparatus")

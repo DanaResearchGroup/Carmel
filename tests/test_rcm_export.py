@@ -753,3 +753,17 @@ def test_record_rejects_unknown_apparatus() -> None:
     record = parse_idt_record(chemked_history(), "history.yaml")
     with pytest.raises(ValueError, match="apparatus"):
         replace(record, apparatus="unmapped")
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"species_identifiers": (("fuel", "smiles", {}),)},
+        {"rcm_histories": ({},), "rcm_states": ({},)},
+        {"rcm_histories": (None,), "rcm_states": ({},)},
+    ],
+)
+def test_frozen_record_rejects_mutable_nested_extension_values(changes) -> None:
+    record = parse_idt_record(chemked_history(), "history.yaml")
+    with pytest.raises(ValueError, match="frozen"):
+        replace(record, **changes)
