@@ -9,13 +9,15 @@ pinned bytes with :func:`yaml.safe_load` before following every path.
 from __future__ import annotations
 
 import hashlib
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from typing import Any, Literal, cast
 
 import yaml
+from pydantic import ValidationError
 
 from carmel.schemas.datasets import (
     AbsenceReason,
@@ -45,7 +47,9 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import units
 from carmel.services.dataset_store import canonical_json_bytes
+from carmel.services.rcm_history import RcmHistory, RcmState, history_refusal
 from carmel.services.respecth import (
+    _SPECIES_IDENTIFIER_KEYS,
     IgnitionCriterion,
     IgnitionDefinition,
     IgnitionTarget,
@@ -76,6 +80,13 @@ class ChemkedRefusalReason(StrEnum):
     INCOMPLETE_RECORD = "incomplete_record"
     UNRESOLVABLE_PATH = "unresolvable_yaml_path"
     RCM_PRE_COMPRESSION_CONDITIONS = "rcm_pre_compression_conditions"
+    # Legacy stored-census value; current histories use the specific HISTORY_* reasons.
+    HISTORY_NONMONOTONE_TIME = "history_nonmonotone_time"
+    HISTORY_NONPOSITIVE_VOLUME = "history_nonpositive_volume"
+    HISTORY_NO_COMPRESSION = "history_no_compression"
+    HISTORY_MISSING_INITIAL_STATE = "history_missing_initial_state"
+    HISTORY_INVALID = "history_invalid"
+    RCM_THERMO_UNAVAILABLE = "rcm_thermo_unavailable"
 
 
 class ChemkedRefusal(ValueError):
@@ -92,6 +103,34 @@ class ChemkedIdtRecord:
     fuels: tuple[str, ...]
     ignition: IgnitionDefinition
     envelope: DatasetEnvelope
+    apparatus: Literal["shock tube", "rapid compression machine"] = "shock tube"
+    rcm_histories: tuple[RcmHistory | None, ...] = ()
+    rcm_states: tuple[RcmState | None, ...] = ()
+    species_identifiers: tuple[tuple[str, Literal["smiles", "inchi"], RecordText], ...] = ()
+
+    def __post_init__(self) -> None:
+        if self.apparatus not in {"shock tube", "rapid compression machine"}:
+            raise ValueError("unsupported apparatus")
+        if any(
+            not isinstance(value, tuple) for value in (self.rcm_histories, self.rcm_states, self.species_identifiers)
+        ) or any(not isinstance(item, tuple) for item in self.species_identifiers):
+            raise ValueError("record collections must be immutable tuples")
+        if any(
+            kind not in {"smiles", "inchi"} or not isinstance(name, str) or not name
+            for name, kind, _ in self.species_identifiers
+        ):
+            raise ValueError("species identifiers require names and validated identity kinds")
+        count = len(self.envelope.series[0].points)
+        if any(self.rcm_histories) and self.apparatus != "rapid compression machine":
+            raise ValueError("histories require an RCM apparatus")
+        if self.rcm_histories or self.rcm_states:
+            if len(self.rcm_histories) != count or len(self.rcm_states) != count:
+                raise ValueError("RCM histories/states must align with every point")
+            if any(
+                (history is None) != (state is None)
+                for history, state in zip(self.rcm_histories, self.rcm_states, strict=True)
+            ):
+                raise ValueError("RCM histories and initial states must be paired")
 
 
 #: Explicit translation from the target vocabulary in PyKED's
@@ -139,7 +178,34 @@ _SPECIES_ROLES: Mapping[str, ComponentRole] = {
 }
 
 
-_PART = re.compile(r"([^\[.]+)(?:\[(\d+)\])?")
+_PART = re.compile(r"([^\[.]+)((?:\[\d+\])*)")
+
+
+# A private loader class: keep floating YAML scalars as source lexemes,
+# without changing PyYAML's global constructors or requiring its C extension.
+_SourceLoader = cast(
+    "type[yaml.CSafeLoader] | type[yaml.SafeLoader]",
+    type("_SourceLoader", (getattr(yaml, "CSafeLoader", yaml.SafeLoader),), {}),
+)
+
+
+def _float_lexeme(loader: yaml.CSafeLoader | yaml.SafeLoader, node: yaml.Node) -> str:
+    if not isinstance(node, yaml.ScalarNode):
+        raise yaml.YAMLError("a floating source number must be a scalar")
+    return loader.construct_scalar(node)
+
+
+def _int_lexeme(loader: yaml.CSafeLoader | yaml.SafeLoader, node: yaml.Node) -> int:
+    if not isinstance(node, yaml.ScalarNode):
+        raise yaml.YAMLError("a source integer must be a scalar")
+    lexeme = loader.construct_scalar(node)
+    if not re.fullmatch(r"0|-?[1-9][0-9]{0,17}", lexeme):
+        raise yaml.YAMLError("source integers require plain decimal lexemes")
+    return int(lexeme)
+
+
+_SourceLoader.add_constructor("tag:yaml.org,2002:float", _float_lexeme)
+_SourceLoader.add_constructor("tag:yaml.org,2002:int", _int_lexeme)
 
 
 def yaml_value(document: object, path: str) -> object:
@@ -156,9 +222,9 @@ def yaml_value(document: object, path: str) -> object:
         if match is None or not isinstance(value, dict) or match.group(1) not in value:
             raise KeyError(path)
         value = value[match.group(1)]
-        if match.group(2) is not None:
+        for token in re.findall(r"\[(\d+)\]", match.group(2)):
             try:
-                index = int(match.group(2))
+                index = int(token)
             except ValueError as exc:
                 raise KeyError(path) from exc
             if not isinstance(value, list) or index >= len(value):
@@ -188,7 +254,7 @@ def _quantity(raw: object, path: str, quantity: QuantityKind, unit_path: str | N
             RecordText(raw=value, ref=_ref(path + "#value")),
             RecordText(raw=unit, ref=_ref((unit_path or path) + ("" if unit_path else "#unit"))),
             quantity,
-            units.TABLE_V4,
+            units.TABLE_V5,
         )
     except Exception as exc:
         raise ChemkedRefusal(ChemkedRefusalReason.UNMAPPED_UNIT, f"{path}: {exc}") from exc
@@ -200,9 +266,9 @@ def _dimensionless(raw: object, path: str, kind_path: str) -> MeasuredValue:
             RecordText(raw=str(raw), ref=_ref(path)),
             RecordText(raw="mole fraction", ref=_ref(kind_path)),
             QuantityKind.MOLE_FRACTION,
-            units.TABLE_V4,
+            units.TABLE_V5,
         )
-    except RespecthRefusal as exc:
+    except (RespecthRefusal, ValueError) as exc:
         raise ChemkedRefusal(ChemkedRefusalReason.UNMAPPED_UNIT, f"{path}: {exc}") from exc
 
 
@@ -213,7 +279,7 @@ def _equivalence_ratio(raw: object, path: str) -> MeasuredValue:
             RecordText(raw=str(raw), ref=_ref(path)),
             RecordText(raw="-", ref=_ref(path)),
             QuantityKind.EQUIVALENCE_RATIO,
-            units.TABLE_V4,
+            units.TABLE_V5,
         )
         return MeasuredValue(
             raw_text=measured.raw_text,
@@ -312,6 +378,11 @@ def _ignition_definition(doc: dict[object, object], rows: list[object], path: st
         else:
             ignition = common_ignition
             ignition_path = "common-properties.ignition-type"
+        if isinstance(ignition, dict) and set(ignition) - {"target", "type"}:
+            raise ChemkedRefusal(
+                ChemkedRefusalReason.UNMAPPED_IGNITION_DEFINITION,
+                f"{path}: {ignition_path} carries fields that its ignition criterion does not define",
+            )
         target_raw = ignition.get("target") if isinstance(ignition, dict) else None
         criterion_raw = ignition.get("type") if isinstance(ignition, dict) else None
         target = CHEMKED_IGNITION_TARGETS.get(target_raw) if isinstance(target_raw, str) else None
@@ -341,11 +412,13 @@ def _ignition_definition(doc: dict[object, object], rows: list[object], path: st
 
 
 def parse_idt_record(raw_bytes: bytes, path: str, expected_sha256: str | None = None) -> ChemkedIdtRecord:
+    if len(raw_bytes) > 4 * 1024 * 1024:
+        raise ChemkedRefusal(ChemkedRefusalReason.SCHEMA_REJECTED, "record exceeds 4 MiB")
     actual = hashlib.sha256(raw_bytes).hexdigest()
     if expected_sha256 is not None and actual != expected_sha256:
         raise ChemkedRefusal(ChemkedRefusalReason.INCOMPLETE_RECORD, f"{path}: sha256 mismatch")
     try:
-        doc = yaml.safe_load(raw_bytes)
+        doc = yaml.load(raw_bytes, Loader=_SourceLoader)
     except yaml.YAMLError as exc:
         raise ChemkedRefusal(ChemkedRefusalReason.MALFORMED_YAML, f"{path}: {exc}") from exc
     if not isinstance(doc, dict):
@@ -359,47 +432,135 @@ def parse_idt_record(raw_bytes: bytes, path: str, expected_sha256: str | None = 
     if not doi:
         raise ChemkedRefusal(ChemkedRefusalReason.INCOMPLETE_RECORD, f"{path}: missing reference DOI")
     ignition_definition = _ignition_definition(doc, rows, path)
-    if apparatus["kind"] == "rapid compression machine":
-        for row_index, row in enumerate(rows):
-            history = row.get("volume-history") if isinstance(row, dict) else None
-            if history is not None and not isinstance(history, dict):
+    rcm_histories: list[RcmHistory | None] = [None] * len(rows)
+    rcm_states: list[RcmState | None] = [None] * len(rows)
+    for row_index, row in enumerate(rows):
+        if (
+            isinstance(row, dict)
+            and "volume-history" not in row
+            and any(field in row for field in ("compressed-temperature", "compressed-pressure", "compression-time"))
+        ):
+            raise ChemkedRefusal(
+                ChemkedRefusalReason.HISTORY_INVALID,
+                f"{path}: datapoints[{row_index}] compressed T/P and compression time require a volume-history",
+            )
+        if isinstance(row, dict) and "volume-history" in row and apparatus["kind"] != "rapid compression machine":
+            raise ChemkedRefusal(
+                ChemkedRefusalReason.HISTORY_INVALID,
+                f"{path}: datapoints[{row_index}].volume-history requires a rapid compression machine",
+            )
+        history = row.get("volume-history") if isinstance(row, dict) else None
+        if isinstance(row, dict) and "volume-history" in row and not isinstance(history, dict):
+            raise ChemkedRefusal(
+                ChemkedRefusalReason.HISTORY_INVALID,
+                f"{path}: datapoints[{row_index}].volume-history must be a mapping",
+            )
+        values = history.get("values") if isinstance(history, dict) else None
+        if isinstance(history, dict) and (not isinstance(values, list) or not values):
+            raise ChemkedRefusal(
+                ChemkedRefusalReason.HISTORY_INVALID,
+                f"{path}: datapoints[{row_index}].volume-history.values must be a non-empty list",
+            )
+        if apparatus["kind"] == "rapid compression machine" and values:
+            try:
+                for entry_index, pair in enumerate(values):
+                    if not isinstance(pair, list) or len(pair) != 2 or any(isinstance(value, bool) for value in pair):
+                        raise ValueError(
+                            f"entry {entry_index} must be exactly two numbers [time, volume], got {pair!r}"
+                        )
+                    numeric_pair = (Decimal(str(pair[0])), Decimal(str(pair[1])))
+                    if not all(value.is_finite() for value in numeric_pair):
+                        raise ValueError(f"entry {entry_index} contains a non-finite value")
+            except (TypeError, ValueError, InvalidOperation) as exc:
                 raise ChemkedRefusal(
-                    ChemkedRefusalReason.SCHEMA_REJECTED,
-                    f"{path}: datapoints[{row_index}].volume-history must be a mapping",
-                )
-            values = history.get("values") if isinstance(history, dict) else None
-            if values is not None and not isinstance(values, list):
+                    ChemkedRefusalReason.HISTORY_INVALID,
+                    f"{path}: RCM volume-history values must be finite [time, volume] pairs: {exc}",
+                ) from exc
+            assert isinstance(history, dict)
+            prefix = f"datapoints[{row_index}]"
+            time, volume = history.get("time"), history.get("volume")
+            if (
+                not isinstance(time, dict)
+                or not isinstance(volume, dict)
+                or not isinstance(time.get("units"), str)
+                or not isinstance(volume.get("units"), str)
+            ):
                 raise ChemkedRefusal(
-                    ChemkedRefusalReason.SCHEMA_REJECTED,
-                    f"{path}: datapoints[{row_index}].volume-history.values must be a list",
+                    ChemkedRefusalReason.HISTORY_INVALID,
+                    f"{path}: RCM history has no time/volume units",
                 )
-            if values:
-                try:
-                    numeric_pairs: list[tuple[float, float]] = []
-                    for entry_index, pair in enumerate(values):
-                        if (
-                            not isinstance(pair, list)
-                            or len(pair) != 2
-                            or any(isinstance(value, bool) for value in pair)
-                        ):
-                            raise ValueError(
-                                f"entry {entry_index} must be exactly two numbers [time, volume], got {pair!r}"
-                            )
-                        numeric_pair = (float(pair[0]), float(pair[1]))
-                        if not all(math.isfinite(value) for value in numeric_pair):
-                            raise ValueError(f"entry {entry_index} contains a non-finite value")
-                        numeric_pairs.append(numeric_pair)
-                except (TypeError, ValueError, OverflowError) as exc:
-                    raise ChemkedRefusal(
-                        ChemkedRefusalReason.SCHEMA_REJECTED,
-                        f"{path}: RCM volume-history values must be finite [time, volume] pairs: {exc}",
-                    ) from exc
-                numeric_volumes = [pair[1] for pair in numeric_pairs]
-                if numeric_volumes[0] != min(numeric_volumes):
-                    raise ChemkedRefusal(
-                        ChemkedRefusalReason.RCM_PRE_COMPRESSION_CONDITIONS,
-                        f"{path}: RCM volume history begins before its minimum volume",
+            time_column, volume_column = time.get("column", 0), volume.get("column", 1)
+            if (
+                not isinstance(time_column, int)
+                or not isinstance(volume_column, int)
+                or {time_column, volume_column} != {0, 1}
+                or isinstance(time_column, bool)
+                or isinstance(volume_column, bool)
+            ):
+                raise ChemkedRefusal(
+                    ChemkedRefusalReason.HISTORY_INVALID, f"{path}: history columns must be distinct 0/1"
+                )
+
+            assert isinstance(values, list)
+
+            def samples(
+                column: int,
+                field: str,
+                quantity: QuantityKind,
+                unit: str,
+                prefix: str,
+                values: list[Any],
+            ) -> tuple[MeasuredValue, ...]:
+                return tuple(
+                    _measured(
+                        RecordText(
+                            raw=str(pair[column]), ref=_ref(f"{prefix}.volume-history.values[{index}][{column}]")
+                        ),
+                        RecordText(raw=unit, ref=_ref(f"{prefix}.volume-history.{field}.units")),
+                        quantity,
+                        units.TABLE_V5,
                     )
+                    for index, pair in enumerate(values)
+                )
+
+            try:
+                rcm_histories[row_index] = RcmHistory(
+                    time=samples(time_column, "time", QuantityKind.TIME, time["units"], prefix, values),
+                    volume=samples(volume_column, "volume", QuantityKind.VOLUME, volume["units"], prefix, values),
+                    compression_time_stated=_quantity(
+                        row["compression-time"][0], f"{prefix}.compression-time[0]", QuantityKind.TIME
+                    )
+                    if isinstance(row, dict) and row.get("compression-time")
+                    else None,
+                )
+                assert isinstance(row, dict)
+                if bool(row.get("compressed-temperature")) != bool(row.get("compressed-pressure")):
+                    raise ChemkedRefusal(ChemkedRefusalReason.HISTORY_INVALID, f"{path}: compressed T/P must be paired")
+                stated = bool(row.get("compressed-temperature") and row.get("compressed-pressure"))
+                rcm_states[row_index] = RcmState(
+                    initial_temperature=_quantity(
+                        row["temperature"][0], f"{prefix}.temperature[0]", QuantityKind.TEMPERATURE
+                    ),
+                    initial_pressure=_quantity(row["pressure"][0], f"{prefix}.pressure[0]", QuantityKind.PRESSURE),
+                    temperature=_quantity(
+                        row["compressed-temperature"][0],
+                        f"{prefix}.compressed-temperature[0]",
+                        QuantityKind.TEMPERATURE,
+                    )
+                    if stated
+                    else None,
+                    pressure=_quantity(
+                        row["compressed-pressure"][0], f"{prefix}.compressed-pressure[0]", QuantityKind.PRESSURE
+                    )
+                    if stated
+                    else None,
+                    eoc_basis="stated" if stated else "derived-isentropic",
+                )
+            except ValidationError as exc:
+                refusal = history_refusal(exc)
+                raise ChemkedRefusal(ChemkedRefusalReason(refusal.reason.value), f"{path}: {refusal}") from exc
+            except RespecthRefusal as exc:
+                raise ChemkedRefusal(ChemkedRefusalReason.UNMAPPED_UNIT, str(exc)) from exc
     compositions = tuple(_composition(row, index, path) for index, row in enumerate(rows))
     composition_is_constant = all(
         _composition_signature(composition) == _composition_signature(compositions[0])
@@ -504,8 +665,8 @@ def parse_idt_record(raw_bytes: bytes, path: str, expected_sha256: str | None = 
         ),
         conversion_tables=(
             EmbeddedConversionTable(
-                sha256=units.TABLE_V4.sha256,
-                canonical_json=canonical_json_bytes(units.TABLE_V4.identity_payload()).decode(),
+                sha256=units.TABLE_V5.sha256,
+                canonical_json=canonical_json_bytes(units.TABLE_V5.identity_payload()).decode(),
             ),
         ),
         table_inventories=(),
@@ -519,6 +680,23 @@ def parse_idt_record(raw_bytes: bytes, path: str, expected_sha256: str | None = 
         fuels=fuels,
         ignition=ignition_definition,
         envelope=envelope,
+        apparatus=apparatus["kind"],
+        rcm_histories=tuple(rcm_histories),
+        rcm_states=tuple(rcm_states),
+        species_identifiers=tuple(
+            (
+                item["species-name"],
+                kind,
+                RecordText(
+                    raw=item[key], ref=_ref(f"datapoints[{row_index}].composition.species[{species_index}].{key}")
+                ),
+            )
+            for row_index, row in enumerate(rows)
+            if isinstance(row, dict)
+            for species_index, item in enumerate(row["composition"]["species"])
+            for key, kind in _SPECIES_IDENTIFIER_KEYS
+            if isinstance(item.get(key), str) and item[key]
+        ),
     )
 
 
@@ -541,6 +719,8 @@ def _validate_subset(doc: dict[object, object], path: str) -> tuple[str, list[ob
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
+        if row.get("volume-history") and (not row.get("temperature") or not row.get("pressure")):
+            raise ChemkedRefusal(ChemkedRefusalReason.HISTORY_MISSING_INITIAL_STATE, f"{path}: initial T/P required")
         for field in ("pressure", "temperature", "ignition-delay"):
             values = row.get(field)
             if (
@@ -554,6 +734,18 @@ def _validate_subset(doc: dict[object, object], path: str) -> tuple[str, list[ob
                     f"{path}: datapoints[{index}].{field} must contain exactly one scalar value, "
                     "followed only by metadata mappings",
                 )
+        for field in ("compressed-temperature", "compressed-pressure", "compression-time"):
+            if field not in row:
+                continue
+            values = row[field]
+            if (
+                not isinstance(values, list)
+                or not values
+                or not isinstance(values[0], str)
+                or len(values[0].strip().split(None, 1)) != 2
+                or any(not isinstance(metadata, dict) for metadata in values[1:])
+            ):
+                raise ChemkedRefusal(ChemkedRefusalReason.HISTORY_INVALID, f"{path}: invalid {field} quantity")
     return reference["doi"], rows
 
 
@@ -585,7 +777,23 @@ def replay_idt_record(record: ChemkedIdtRecord, raw_bytes: bytes) -> None:
     derived = parse_idt_record(raw_bytes, record.path, record.sha256)
     fields = (
         (record.citation_doi, derived.citation_doi, "citation_doi"),
+        (record.apparatus, derived.apparatus, "apparatus"),
         (record.fuels, derived.fuels, "fuels"),
+        (
+            tuple((name, kind, value.model_dump(mode="json")) for name, kind, value in record.species_identifiers),
+            tuple((name, kind, value.model_dump(mode="json")) for name, kind, value in derived.species_identifiers),
+            "species_identifiers",
+        ),
+        (
+            tuple(h.model_dump(mode="json") if h else None for h in record.rcm_histories),
+            tuple(h.model_dump(mode="json") if h else None for h in derived.rcm_histories),
+            "rcm_histories",
+        ),
+        (
+            tuple(state.model_dump(mode="json") if state else None for state in record.rcm_states),
+            tuple(state.model_dump(mode="json") if state else None for state in derived.rcm_states),
+            "rcm_states",
+        ),
         (record.ignition.model_dump(mode="json"), derived.ignition.model_dump(mode="json"), "ignition"),
         (record.envelope.model_dump(mode="json"), derived.envelope.model_dump(mode="json"), "envelope"),
     )
