@@ -196,7 +196,7 @@ class TestFromIdentityPayload:
         rules = [dict(rule) for rule in payload["rules"]]
         rules[0]["kind"] = "logarithmic"
         payload["rules"] = rules
-        with pytest.raises(ConversionTableInvariantError, match="'identity'/'scale'/'affine'"):
+        with pytest.raises(ConversionTableInvariantError, match="'identity'/'scale'/'rational_scale'/'affine'"):
             ConversionTable.from_identity_payload(payload)
 
     def test_scale_of_null_on_a_scale_rule_is_rejected(self) -> None:

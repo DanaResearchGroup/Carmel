@@ -22,8 +22,8 @@ Three design choices carry the same cardinal rule the rest of Carmel's dataset
 machinery serves -- every load-bearing number must be auditable, never
 fabricated -- into this module specifically:
 
-1. **A conversion rule is a closed three-member union
-   (:class:`IdentityRule` / :class:`ScaleRule` / :class:`AffineRule`), and
+1. **A conversion rule is a closed four-member union
+   (:class:`IdentityRule` / :class:`ScaleRule` / :class:`RationalScaleRule` / :class:`AffineRule`), and
    ``IdentityRule`` carries no numeric parameters at all.** An identity
    conversion is structurally incapable of emitting a fake ``scale="1"`` for a
    conversion that never actually happened; "this unit needed no conversion"
@@ -33,7 +33,7 @@ fabricated -- into this module specifically:
 
 2. **A conversion table is versioned and content-addressed
    (:attr:`ConversionTable.sha256`), and a shipped table is NEVER mutated.**
-   :data:`TABLE_V1` is the first (and, as of this module, only) table. If its
+   :data:`TABLE_V1` is the first immutable table. If its
    rules ever need to change -- a new alias spelling discovered in a later
    paper, a corrected conversion factor -- that is not an edit to this file;
    it is a new ``TABLE_V2`` added alongside it, so that any dataset already
@@ -66,10 +66,10 @@ decimal expansion (760 = 2^3 * 5 * 19; the factor of 19 in the denominator
 never terminates in base 10). Writing any truncated decimal for it -- e.g.
 ``"133.322"`` -- would silently discard precision at every single Torr
 conversion, forever, with no record that it happened, because a ``ScaleRule``
-carries a decimal *string*, not a rational number. Adding Torr support
-correctly requires a different rule shape (a rational scale, e.g. numerator/
-denominator ``Decimal``s multiplied and divided as separate exact steps) --
-not a decimal approximation squeezed into the existing ``ScaleRule``.
+carries a decimal *string*, not a rational number. :class:`RationalScaleRule` now represents Torr in :data:`TABLE_V5` as
+separate canonical numerator and denominator strings. Multiplication is exact;
+recurring division uses the documented Decimal working precision and half-even
+rounding. No truncated factor is stored in a ``ScaleRule``.
 
 SIGNIFICANCE STANCE -- this module does not second-guess a source's printed
 significant digits. ``canonical_decimal`` preserves the (sign, digits,
@@ -103,6 +103,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, Inexact, InvalidOperation, Rounded, localcontext
 from enum import StrEnum
+from functools import lru_cache
 from types import MappingProxyType
 from typing import Any, Literal
 
@@ -114,6 +115,8 @@ __all__ = [
     "TABLE_V2",
     "TABLE_V3",
     "TABLE_V4",
+    "TABLE_V5",
+    "RationalScaleRule",
     "AffineRule",
     "ConversionRule",
     "ConversionTable",
@@ -229,6 +232,22 @@ class ScaleRule:
 
 
 @dataclass(frozen=True, slots=True)
+class RationalScaleRule:
+    """Multiplicative conversion ``to = from * numerator / denominator``.
+
+    Both coefficients are positive canonical decimal strings. The factor is
+    stored exactly, including factors with a recurring decimal expansion.
+    """
+
+    kind: Literal["rational_scale"]
+    quantity: QuantityKind
+    from_unit: str
+    to_unit: str
+    numerator: str
+    denominator: str
+
+
+@dataclass(frozen=True, slots=True)
 class AffineRule:
     """An affine conversion rule: ``to = from * scale + offset``, in exactly that form.
 
@@ -248,11 +267,11 @@ class AffineRule:
     offset: str
 
 
-ConversionRule = IdentityRule | ScaleRule | AffineRule
-"""A three-member discriminated union of every conversion rule shape this table supports.
+ConversionRule = IdentityRule | ScaleRule | RationalScaleRule | AffineRule
+"""A four-member discriminated union of every conversion rule shape this table supports.
 
 Discriminated on the ``kind`` field (``"identity"`` / ``"scale"`` /
-``"affine"``) rather than on ``isinstance`` alone, so a rule's canonical JSON
+``"rational_scale"`` / ``"affine"``) rather than on ``isinstance`` alone, so a rule's canonical JSON
 projection (see :meth:`ConversionTable.identity_payload`) can be driven by the
 same literal string a caller would use to branch on ``rule_kind`` in
 :class:`Converted`.
@@ -311,6 +330,15 @@ def _rule_identity_payload(rule: ConversionRule) -> dict[str, Any]:
             "from_unit": rule.from_unit,
             "to_unit": rule.to_unit,
             "scale": rule.scale,
+        }
+    if isinstance(rule, RationalScaleRule):
+        return {
+            "kind": "rational_scale",
+            "quantity": rule.quantity.value,
+            "from_unit": rule.from_unit,
+            "to_unit": rule.to_unit,
+            "numerator": rule.numerator,
+            "denominator": rule.denominator,
         }
     return {
         "kind": "affine",
@@ -444,6 +472,24 @@ def _rule_from_identity_payload(payload: Any, *, index: int) -> ConversionRule:
                     f"conversion table payload: {where} {field_name!r} must be a str, got {type(field_value).__name__}"
                 )
         return ScaleRule(kind="scale", quantity=quantity, from_unit=from_unit, to_unit=to_unit, scale=scale)
+    if kind == "rational_scale":
+        expected_keys = {"kind", "quantity", "from_unit", "to_unit", "numerator", "denominator"}
+        if set(payload) != expected_keys:
+            raise ConversionTableInvariantError(
+                f"conversion table payload: {where} rational_scale keys must be exactly {sorted(expected_keys)!r}"
+            )
+        quantity = _quantity_kind_from_identity_payload(payload["quantity"], where=where)
+        for name in ("from_unit", "to_unit", "numerator", "denominator"):
+            if not isinstance(payload[name], str):
+                raise ConversionTableInvariantError(f"conversion table payload: {where} {name!r} must be a str")
+        return RationalScaleRule(
+            kind="rational_scale",
+            quantity=quantity,
+            from_unit=payload["from_unit"],
+            to_unit=payload["to_unit"],
+            numerator=payload["numerator"],
+            denominator=payload["denominator"],
+        )
     if kind == "affine":
         expected_keys = {"kind", "quantity", "from_unit", "to_unit", "scale", "offset"}
         actual_keys = set(payload)
@@ -473,7 +519,8 @@ def _rule_from_identity_payload(payload: Any, *, index: int) -> ConversionRule:
             kind="affine", quantity=quantity, from_unit=from_unit, to_unit=to_unit, scale=scale, offset=offset
         )
     raise ConversionTableInvariantError(
-        f"conversion table payload: {where} 'kind' must be one of 'identity'/'scale'/'affine', got {kind!r}"
+        f"conversion table payload: {where} 'kind' must be one of "
+        f"'identity'/'scale'/'rational_scale'/'affine', got {kind!r}"
     )
 
 
@@ -527,6 +574,22 @@ class ConversionTable:
     rules: tuple[ConversionRule, ...]
 
     def __post_init__(self) -> None:
+        if (
+            not isinstance(self.base_units, tuple)
+            or any(not isinstance(pair, tuple) for pair in self.base_units)
+            or not isinstance(self.aliases, tuple)
+            or not isinstance(self.rules, tuple)
+        ):
+            raise ConversionTableInvariantError("conversion table collections must be immutable tuples")
+        for rule in self.rules:
+            kinds = {
+                IdentityRule: "identity",
+                ScaleRule: "scale",
+                RationalScaleRule: "rational_scale",
+                AffineRule: "affine",
+            }
+            if type(rule) not in kinds or rule.kind != kinds[type(rule)]:
+                raise ConversionTableInvariantError("rule kind must match its rule shape")
         base_quantities = [quantity for quantity, _ in self.base_units]
         if len(base_quantities) != len(set(base_quantities)):
             raise ConversionTableInvariantError(
@@ -583,6 +646,12 @@ class ConversionTable:
                     f"{rule.quantity.value!r} has from_unit == to_unit == {rule.from_unit!r}; "
                     "use an IdentityRule instead"
                 )
+            if isinstance(rule, RationalScaleRule):
+                for name, coefficient in (("numerator", rule.numerator), ("denominator", rule.denominator)):
+                    _require_canonical_positive_decimal(
+                        coefficient, what=f"rational_scale {name}", table_id=self.table_id, version=self.version
+                    )
+                continue
             _require_canonical_positive_decimal(
                 rule.scale,
                 what=f"{rule.kind} rule {rule.from_unit!r} -> {rule.to_unit!r} scale",
@@ -745,7 +814,7 @@ class ConversionTable:
         platform-dependent rendering) -- never of construction order or
         object identity.
         """
-        return hashlib.sha256(canonical_json_bytes(self.identity_payload())).hexdigest()
+        return _table_digest(self)
 
     def base_unit(self, quantity: QuantityKind) -> str:
         """Return ``quantity``'s single canonical base unit.
@@ -805,6 +874,12 @@ def _require_canonical_positive_decimal(text: str, *, what: str, table_id: str, 
     _require_canonical_decimal(text, what=what, table_id=table_id, version=version)
     if Decimal(text) <= 0:
         raise ConversionTableInvariantError(f"table {table_id!r} v{version}: {what} {text!r} must be strictly positive")
+
+
+@lru_cache(maxsize=64)
+def _table_digest(table: ConversionTable) -> str:
+    """Bounded cache over immutable table inputs and immutable digest strings."""
+    return hashlib.sha256(canonical_json_bytes(table.identity_payload())).hexdigest()
 
 
 def _base_units_v1() -> tuple[tuple[QuantityKind, str], ...]:
@@ -932,8 +1007,8 @@ def _aliases_v2() -> tuple[UnitAlias, ...]:
 def _scale_rules_v2() -> tuple[ConversionRule, ...]:
     return _scale_and_affine_rules_v1() + (
         # Exact by definition (1 mbar = 100 Pa); a third of the RKD rapid-compression-machine
-        # records report pressure in it. Torr is deliberately NOT added: 1 Torr = 101325/760 Pa
-        # does not terminate as a decimal, so no canonical-decimal scale can state it exactly.
+        # records report pressure in it. Torr is deliberately omitted from V2: 101325/760 Pa
+        # does not terminate as a decimal. V5 adds it using an exact rational rule.
         ScaleRule(kind="scale", quantity=QuantityKind.PRESSURE, from_unit="mbar", to_unit="Pa", scale="100"),
     )
 
@@ -990,12 +1065,37 @@ TABLE_V4 = ConversionTable(
 """``TABLE_V3`` plus ChemKED's ``kelvin`` spelling, without changing a shipped table."""
 
 
+TABLE_V5 = ConversionTable(
+    table_id=TABLE_V4.table_id,
+    version=5,
+    base_units=TABLE_V4.base_units,
+    aliases=TABLE_V4.aliases,
+    rules=TABLE_V4.rules
+    + (
+        RationalScaleRule(
+            kind="rational_scale",
+            quantity=QuantityKind.PRESSURE,
+            from_unit="Torr",
+            to_unit="Pa",
+            numerator="101325",
+            denominator="760",
+        ),
+    ),
+)
+"""``TABLE_V4`` plus exact rational Torr -> Pa for the curated database lanes.
+
+Added alongside the shipped tables so V1..V4 retain their content addresses.
+The rational factor is never stored as a truncated decimal scale.
+"""
+
+
 TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType(
     {
         TABLE_V1.sha256: TABLE_V1,
         TABLE_V2.sha256: TABLE_V2,
         TABLE_V3.sha256: TABLE_V3,
         TABLE_V4.sha256: TABLE_V4,
+        TABLE_V5.sha256: TABLE_V5,
     }
 )
 """Every conversion table this module ships, keyed by content address.
@@ -1108,20 +1208,22 @@ def normalize_unit(quantity: QuantityKind, unit_raw: str, *, table: ConversionTa
 class Converted:
     """The result of a single :func:`convert` call.
 
-    ``exact`` and ``rounded`` are both canonical decimal strings (see
+    ``rounded`` is a canonical decimal string. ``exact`` is the Decimal
+    working result: recurring rational division may use up to 4096 digits,
+    beyond the 1000-digit bound on source measurements (see
     :func:`~carmel.services.dataset_store.canonical_decimal`). They
     deliberately are not always equal -- see :func:`convert`'s docstring for
     the full rounding-policy rationale.
     """
 
     exact: str
-    """The exact result of the conversion arithmetic, with no rounding applied."""
+    """The arithmetic result before measurement rounding; rational division uses 4096 digits."""
 
     rounded: str
     """``exact`` rounded per :attr:`rounding_policy`, to a defensible precision."""
 
     rule_kind: str
-    """Which :class:`ConversionRule` kind produced this result: ``"identity"``/``"scale"``/``"affine"``."""
+    """The rule kind: identity, scale, rational_scale or affine."""
 
     rounding_policy: str
     """Which rounding branch ran: ``"identity"`` / ``"significant_digits"`` / ``"decimal_exponent"``."""
@@ -1174,6 +1276,8 @@ def _round_to_exponent(value: Decimal, exponent: int) -> Decimal:
     quantum = Decimal(1).scaleb(exponent)
     with localcontext() as ctx:
         ctx.prec = _CONVERT_PRECISION
+        ctx.traps[Inexact] = False
+        ctx.traps[Rounded] = False
         try:
             return value.quantize(quantum, rounding=ROUND_HALF_EVEN)
         except InvalidOperation as exc:
@@ -1248,7 +1352,7 @@ def convert(
 
     - **identity** -> unchanged. ``rounded == exact == value``, byte-identical
       to the input string, because nothing was computed at all.
-    - **scale** -> rounded to the number of SIGNIFICANT DIGITS in the source
+    - **scale / rational_scale** -> rounded to the number of SIGNIFICANT DIGITS in the source
       coefficient (``len(Decimal(value).as_tuple().digits)``), mode
       ``ROUND_HALF_EVEN``. Multiplying by a constant scale factor preserves
       RELATIVE precision: a value reported as ``"1.230"`` (4 significant
@@ -1347,13 +1451,21 @@ def convert(
             f"{rule.to_unit!r}, not the requested to_unit={to_unit!r}"
         )
 
+    # A rational factor is exact as stored. A recurring quotient is necessarily
+    # finite at the existing working precision; only its division may round.
     source = Decimal(canonical_value)
     with localcontext() as ctx:
         ctx.prec = _CONVERT_PRECISION
         ctx.traps[Inexact] = True
         ctx.traps[Rounded] = True
         try:
-            if isinstance(rule, ScaleRule):
+            if isinstance(rule, RationalScaleRule):
+                product = source * Decimal(rule.numerator)
+                ctx.traps[Inexact] = False
+                ctx.traps[Rounded] = False
+                ctx.rounding = ROUND_HALF_EVEN
+                exact_dec = product / Decimal(rule.denominator)
+            elif isinstance(rule, ScaleRule):
                 exact_dec = source * Decimal(rule.scale)
             else:
                 exact_dec = source * Decimal(rule.scale) + Decimal(rule.offset)
@@ -1363,7 +1475,7 @@ def convert(
                 f"{_CONVERT_PRECISION}-digit precision: {exc}"
             ) from exc
 
-    if isinstance(rule, ScaleRule):
+    if isinstance(rule, (ScaleRule, RationalScaleRule)):
         significant_digits = len(source.as_tuple().digits)
         exponent = exact_dec.adjusted() - (significant_digits - 1)
         rounded_dec = _round_to_exponent(exact_dec, exponent)
@@ -1374,8 +1486,23 @@ def convert(
         rounded_dec = _round_to_exponent(exact_dec, source_exponent)
         rounding_policy = "decimal_exponent"
 
+    if isinstance(rule, RationalScaleRule):
+        # Bound the adjusted exponent using the same canonical policy, while
+        # allowing the bounded working coefficient for recurring quotients.
+        _require_canonical_result(
+            Decimal((0, (1,), exact_dec.adjusted())),
+            value=value,
+            from_unit=from_unit,
+            to_unit=to_unit,
+            part="exact exponent",
+        )
+        exact_text = str(exact_dec)
+    else:
+        exact_text = _require_canonical_result(
+            exact_dec, value=value, from_unit=from_unit, to_unit=to_unit, part="exact"
+        )
     return Converted(
-        exact=_require_canonical_result(exact_dec, value=value, from_unit=from_unit, to_unit=to_unit, part="exact"),
+        exact=exact_text,
         rounded=_require_canonical_result(
             rounded_dec, value=value, from_unit=from_unit, to_unit=to_unit, part="rounded"
         ),
