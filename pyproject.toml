@@ -23,6 +23,7 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
     "types-PyYAML>=6.0",
+    "jsonschema>=4.0",
     "mkdocs-material>=9.0",
     # fontTools reads embedded CFF/TrueType glyph OUTLINES, which is the only ground truth
     # for the symbol-font-Latin-impostor fault (a font whose `f` slot draws a phi: its

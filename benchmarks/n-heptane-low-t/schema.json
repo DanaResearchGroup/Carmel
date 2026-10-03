@@ -1,0 +1,583 @@
+{
+  "$defs": {
+    "GroundTruth": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "enum": [
+            "G1",
+            "G2",
+            "G3",
+            "G4",
+            "G5",
+            "G6"
+          ],
+          "title": "Id",
+          "type": "string"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "scope": {
+          "enum": [
+            "primary",
+            "speciation-only"
+          ],
+          "title": "Scope",
+          "type": "string"
+        },
+        "rule": {
+          "title": "Rule",
+          "type": "string"
+        },
+        "reactant_formula": {
+          "additionalProperties": {
+            "type": "integer"
+          },
+          "title": "Reactant Formula",
+          "type": "object"
+        },
+        "member_count": {
+          "exclusiveMinimum": 0,
+          "title": "Member Count",
+          "type": "integer"
+        },
+        "resolved_count": {
+          "minimum": 0,
+          "title": "Resolved Count",
+          "type": "integer"
+        },
+        "member_species_count": {
+          "exclusiveMinimum": 0,
+          "title": "Member Species Count",
+          "type": "integer"
+        },
+        "resolved_species_count": {
+          "minimum": 0,
+          "title": "Resolved Species Count",
+          "type": "integer"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/Member"
+          },
+          "title": "Members",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "scope",
+        "rule",
+        "reactant_formula",
+        "member_count",
+        "resolved_count",
+        "member_species_count",
+        "resolved_species_count",
+        "members"
+      ],
+      "title": "GroundTruth",
+      "type": "object"
+    },
+    "Identity": {
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "const": "UNVERIFIED",
+          "title": "Status",
+          "type": "string"
+        },
+        "historical_identity_caveat": {
+          "title": "Historical Identity Caveat",
+          "type": "string"
+        },
+        "attempts": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Attempts",
+          "type": "array"
+        },
+        "evidence": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence",
+          "type": "array"
+        }
+      },
+      "required": [
+        "status",
+        "historical_identity_caveat",
+        "attempts",
+        "evidence"
+      ],
+      "title": "Identity",
+      "type": "object"
+    },
+    "Member": {
+      "additionalProperties": false,
+      "properties": {
+        "equation": {
+          "title": "Equation",
+          "type": "string"
+        },
+        "line": {
+          "exclusiveMinimum": 0,
+          "title": "Line",
+          "type": "integer"
+        },
+        "reactants": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Reactants",
+          "type": "array"
+        },
+        "products": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Products",
+          "type": "array"
+        },
+        "absence": {
+          "const": "structural-signature-and-exhaustive-formula-screen",
+          "title": "Absence",
+          "type": "string"
+        }
+      },
+      "required": [
+        "equation",
+        "line",
+        "reactants",
+        "products",
+        "absence"
+      ],
+      "title": "Member",
+      "type": "object"
+    },
+    "Pin": {
+      "additionalProperties": false,
+      "properties": {
+        "filename": {
+          "title": "Filename",
+          "type": "string"
+        },
+        "source_url": {
+          "pattern": "^https://",
+          "title": "Source Url",
+          "type": "string"
+        },
+        "retrieval_date": {
+          "const": "2026-10-02",
+          "title": "Retrieval Date",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "bytes": {
+          "exclusiveMinimum": 0,
+          "title": "Bytes",
+          "type": "integer"
+        },
+        "unique_species": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Unique Species"
+        },
+        "reaction_entries": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reaction Entries"
+        }
+      },
+      "required": [
+        "filename",
+        "source_url",
+        "retrieval_date",
+        "sha256",
+        "bytes"
+      ],
+      "title": "Pin",
+      "type": "object"
+    },
+    "Scoring": {
+      "additionalProperties": false,
+      "properties": {
+        "primary_unit": {
+          "const": "reaction-type-once",
+          "title": "Primary Unit",
+          "type": "string"
+        },
+        "primary_types": {
+          "items": {
+            "enum": [
+              "G1",
+              "G2",
+              "G3",
+              "G4",
+              "G5",
+              "G6"
+            ],
+            "type": "string"
+          },
+          "title": "Primary Types",
+          "type": "array"
+        },
+        "recovered": {
+          "title": "Recovered",
+          "type": "string"
+        },
+        "baseline_present": {
+          "title": "Baseline Present",
+          "type": "string"
+        },
+        "g5_merge": {
+          "const": "only-if-structural-matcher-cannot-separate-G5-from-G1;declare-before-lock",
+          "title": "G5 Merge",
+          "type": "string"
+        },
+        "secondary_idt": {
+          "title": "Secondary Idt",
+          "type": "string"
+        },
+        "secondary_groups": {
+          "items": {
+            "enum": [
+              "shock-tube",
+              "RCM-ideal"
+            ],
+            "type": "string"
+          },
+          "title": "Secondary Groups",
+          "type": "array"
+        },
+        "improvement": {
+          "title": "Improvement",
+          "type": "string"
+        },
+        "speciation": {
+          "title": "Speciation",
+          "type": "string"
+        },
+        "coverage": {
+          "title": "Coverage",
+          "type": "string"
+        },
+        "refusals": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Refusals",
+          "type": "array"
+        },
+        "locking": {
+          "title": "Locking",
+          "type": "string"
+        }
+      },
+      "required": [
+        "primary_unit",
+        "primary_types",
+        "recovered",
+        "baseline_present",
+        "g5_merge",
+        "secondary_idt",
+        "secondary_groups",
+        "improvement",
+        "speciation",
+        "coverage",
+        "refusals",
+        "locking"
+      ],
+      "title": "Scoring",
+      "type": "object"
+    },
+    "Species": {
+      "additionalProperties": false,
+      "properties": {
+        "label": {
+          "title": "Label",
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "RESOLVED",
+            "UNRESOLVED"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "smiles": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Smiles"
+        },
+        "formula": {
+          "additionalProperties": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "title": "Formula",
+          "type": "object"
+        },
+        "source": {
+          "title": "Source",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "status",
+        "smiles",
+        "formula",
+        "source"
+      ],
+      "title": "Species",
+      "type": "object"
+    },
+    "Split": {
+      "additionalProperties": false,
+      "properties": {
+        "repository": {
+          "const": "pr-omethe-us/ChemKED-database",
+          "title": "Repository",
+          "type": "string"
+        },
+        "commit": {
+          "const": "606005bfc8f5214b3f0b5ca7300a96a82815c2ae",
+          "title": "Commit",
+          "type": "string"
+        },
+        "frozen_at": {
+          "const": "2026-10-02T04:33:18.068272+00:00",
+          "title": "Frozen At",
+          "type": "string"
+        },
+        "studies": {
+          "items": {
+            "$ref": "#/$defs/Study"
+          },
+          "title": "Studies",
+          "type": "array"
+        }
+      },
+      "required": [
+        "repository",
+        "commit",
+        "frozen_at",
+        "studies"
+      ],
+      "title": "Split",
+      "type": "object"
+    },
+    "SplitFile": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "title": "Path",
+          "type": "string"
+        },
+        "git_blob": {
+          "pattern": "^[0-9a-f]{40}$",
+          "title": "Git Blob",
+          "type": "string"
+        },
+        "sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Sha256",
+          "type": "string"
+        },
+        "points": {
+          "exclusiveMinimum": 0,
+          "title": "Points",
+          "type": "integer"
+        },
+        "below_750": {
+          "minimum": 0,
+          "title": "Below 750",
+          "type": "integer"
+        },
+        "from_750_to_900": {
+          "minimum": 0,
+          "title": "From 750 To 900",
+          "type": "integer"
+        },
+        "rcm_ideal_points": {
+          "items": {
+            "type": "integer"
+          },
+          "title": "Rcm Ideal Points",
+          "type": "array"
+        }
+      },
+      "required": [
+        "path",
+        "git_blob",
+        "sha256",
+        "points",
+        "below_750",
+        "from_750_to_900",
+        "rcm_ideal_points"
+      ],
+      "title": "SplitFile",
+      "type": "object"
+    },
+    "Study": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "doi": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Doi"
+        },
+        "set": {
+          "enum": [
+            "development",
+            "holdout"
+          ],
+          "title": "Set",
+          "type": "string"
+        },
+        "files": {
+          "items": {
+            "$ref": "#/$defs/SplitFile"
+          },
+          "title": "Files",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "doi",
+        "set",
+        "files"
+      ],
+      "title": "Study",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "title": "Schema Version",
+      "type": "integer"
+    },
+    "case": {
+      "const": "n-heptane-low-t",
+      "title": "Case",
+      "type": "string"
+    },
+    "mechanisms": {
+      "additionalProperties": {
+        "$ref": "#/$defs/Pin"
+      },
+      "propertyNames": {
+        "enum": [
+          "v_old",
+          "v_new"
+        ]
+      },
+      "title": "Mechanisms",
+      "type": "object"
+    },
+    "support_sources": {
+      "items": {
+        "$ref": "#/$defs/Pin"
+      },
+      "title": "Support Sources",
+      "type": "array"
+    },
+    "identity": {
+      "$ref": "#/$defs/Identity"
+    },
+    "new_species": {
+      "items": {
+        "$ref": "#/$defs/Species"
+      },
+      "title": "New Species",
+      "type": "array"
+    },
+    "old_species": {
+      "items": {
+        "$ref": "#/$defs/Species"
+      },
+      "title": "Old Species",
+      "type": "array"
+    },
+    "ground_truth": {
+      "items": {
+        "$ref": "#/$defs/GroundTruth"
+      },
+      "title": "Ground Truth",
+      "type": "array"
+    },
+    "split": {
+      "$ref": "#/$defs/Split"
+    },
+    "scoring": {
+      "$ref": "#/$defs/Scoring"
+    },
+    "leakage_limits": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Leakage Limits",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "case",
+    "mechanisms",
+    "support_sources",
+    "identity",
+    "new_species",
+    "old_species",
+    "ground_truth",
+    "split",
+    "scoring",
+    "leakage_limits"
+  ],
+  "title": "Contract",
+  "type": "object"
+}
