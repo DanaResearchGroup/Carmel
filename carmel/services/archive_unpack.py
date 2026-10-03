@@ -161,14 +161,15 @@ class ArchiveUnpackResult:
 
 
 def _is_absolute_member_name(name: str) -> bool:
-    """Whether ``name`` is an absolute path under POSIX or Windows rules.
+    """Whether ``name`` is absolute or drive-qualified under POSIX/Windows rules.
 
     Both are checked because a zip written on Windows stores ``\\``-separated and
     possibly drive-qualified names, and a POSIX extractor that only tested for a
     leading ``/`` would treat ``C:\\Windows\\...`` as relative and happily join it
-    under the root on one platform while another honoured the drive.
+    under the root on one platform while another honoured the drive. Drive-relative
+    names such as ``C:member.yaml`` are refused for the same reason.
     """
-    return PurePosixPath(name).is_absolute() or ntpath.isabs(name)
+    return bool(ntpath.splitdrive(name)[0]) or PurePosixPath(name).is_absolute() or ntpath.isabs(name)
 
 
 def _resolves_within(root: Path, name: str) -> Path | None:

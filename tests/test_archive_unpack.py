@@ -15,8 +15,11 @@ import struct
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from carmel.services.archive_unpack import (
     ArchiveUnpackRefusalReason,
+    _is_absolute_member_name,
     unpack_archive,
 )
 
@@ -241,3 +244,20 @@ def test_hostile_and_benign_members_are_reported_together(tmp_path: Path) -> Non
         ArchiveUnpackRefusalReason.PATH_ESCAPE,
         ArchiveUnpackRefusalReason.ABSOLUTE_PATH,
     }
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "C:relative.yaml",
+        "c:relative.yaml",
+        "C:/relative.yaml",
+        r"\\server\share\relative.yaml",
+        "//server/share/relative.yaml",
+    ],
+)
+def test_drive_qualified_and_unc_names_are_refused(name: str, tmp_path: Path) -> None:
+    assert _is_absolute_member_name(name)
+    result = unpack_archive(_zip((name, b"content")), tmp_path / "extract")
+    assert not result.members
+    assert [r.reason for r in result.refusals] == [ArchiveUnpackRefusalReason.ABSOLUTE_PATH]

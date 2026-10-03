@@ -1,0 +1,277 @@
+{
+  "cantera_version": "3.2.0",
+  "cases": [
+    {
+      "composition": {
+        "H2": 0.3,
+        "N2": 0.5,
+        "O2": 0.2
+      },
+      "id": "H2-O2-N2-compression",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 300.0,
+      "pressure_pa": 2470047.1411022143,
+      "temperature_k": 731.3240980317438,
+      "volume_ratio": 10.0
+    },
+    {
+      "composition": {
+        "AR": 0.8,
+        "H2": 0.1,
+        "O2": 0.1
+      },
+      "id": "H2-O2-AR-compression",
+      "initial_pressure_pa": 200000.0,
+      "initial_temperature_k": 400.0,
+      "pressure_pa": 9793418.775651097,
+      "temperature_k": 1632.236462608516,
+      "volume_ratio": 12.0
+    },
+    {
+      "composition": {
+        "CO": 0.25,
+        "CO2": 0.25,
+        "H2O": 0.5
+      },
+      "id": "CO-CO2-H2O-compression",
+      "initial_pressure_pa": 150000.0,
+      "initial_temperature_k": 600.0,
+      "pressure_pa": 2724999.957794475,
+      "temperature_k": 1089.9999831177902,
+      "volume_ratio": 10.0
+    },
+    {
+      "composition": {
+        "H2": 1.0
+      },
+      "id": "H2-low-200",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 200.0,
+      "pressure_pa": 271321.6956206413,
+      "temperature_k": 267.773694172851,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "H2": 1.0
+      },
+      "id": "H2-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 262006.67322205185,
+      "temperature_k": 1292.9024091885115,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "H2": 1.0
+      },
+      "id": "H2-high-3500",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 3500.0,
+      "pressure_pa": 101324.9999999997,
+      "temperature_k": 3499.99999999999,
+      "volume_ratio": 1.0
+    },
+    {
+      "composition": {
+        "O2": 1.0
+      },
+      "id": "O2-low-200",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 200.0,
+      "pressure_pa": 267194.70450205647,
+      "temperature_k": 263.7006706163893,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "O2": 1.0
+      },
+      "id": "O2-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 250832.7400453106,
+      "temperature_k": 1237.763336024232,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "O2": 1.0
+      },
+      "id": "O2-high-3500",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 3500.0,
+      "pressure_pa": 101324.99999999956,
+      "temperature_k": 3499.9999999999854,
+      "volume_ratio": 1.0
+    },
+    {
+      "composition": {
+        "N2": 1.0
+      },
+      "id": "N2-low-300",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 300.0,
+      "pressure_pa": 267100.94204794883,
+      "temperature_k": 395.4122014033291,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "N2": 1.0
+      },
+      "id": "N2-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 255083.93976380033,
+      "temperature_k": 1258.7413755924024,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "N2": 1.0
+      },
+      "id": "N2-high-5000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 5000.0,
+      "pressure_pa": 101325.00000000013,
+      "temperature_k": 5000.000000000006,
+      "volume_ratio": 1.0
+    },
+    {
+      "composition": {
+        "AR": 1.0
+      },
+      "id": "AR-low-300",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 300.0,
+      "pressure_pa": 321686.8231813565,
+      "temperature_k": 476.22031559046104,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "AR": 1.0
+      },
+      "id": "AR-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 321686.8231811279,
+      "temperature_k": 1587.4010519670755,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "AR": 1.0
+      },
+      "id": "AR-high-5000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 5000.0,
+      "pressure_pa": 101324.99999999997,
+      "temperature_k": 4999.999999999998,
+      "volume_ratio": 1.0
+    },
+    {
+      "composition": {
+        "CO": 1.0
+      },
+      "id": "CO-low-200",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 200.0,
+      "pressure_pa": 267342.3661347008,
+      "temperature_k": 263.8464013172472,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "CO": 1.0
+      },
+      "id": "CO-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 254118.30083722353,
+      "temperature_k": 1253.9763179729757,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "CO": 1.0
+      },
+      "id": "CO-high-3500",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 3500.0,
+      "pressure_pa": 101324.99999999939,
+      "temperature_k": 3499.9999999999786,
+      "volume_ratio": 1.0
+    },
+    {
+      "composition": {
+        "CO2": 1.0
+      },
+      "id": "CO2-low-200",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 200.0,
+      "pressure_pa": 254513.75346154577,
+      "temperature_k": 251.1855449904227,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "CO2": 1.0
+      },
+      "id": "CO2-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 229269.8087475126,
+      "temperature_k": 1131.3585430422534,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "CO2": 1.0
+      },
+      "id": "CO2-high-3500",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 3500.0,
+      "pressure_pa": 101324.99999999985,
+      "temperature_k": 3499.9999999999945,
+      "volume_ratio": 1.0
+    },
+    {
+      "composition": {
+        "H2O": 1.0
+      },
+      "id": "H2O-low-200",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 200.0,
+      "pressure_pa": 255062.82258178352,
+      "temperature_k": 251.72743408022063,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "H2O": 1.0
+      },
+      "id": "H2O-mid-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 1000.0,
+      "pressure_pa": 239898.492193418,
+      "temperature_k": 1183.8070179788701,
+      "volume_ratio": 2.0
+    },
+    {
+      "composition": {
+        "H2O": 1.0
+      },
+      "id": "H2O-high-3500",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 3500.0,
+      "pressure_pa": 101324.99999999997,
+      "temperature_k": 3499.999999999999,
+      "volume_ratio": 1.0
+    }
+  ],
+  "gri30_yaml_sha256": "06650b1e0ee0012f6903d5328b1bb218cb6007d07f8ebe375d18f24811039345",
+  "procedure": "Set TPX, capture SV, then set S and V/volume_ratio at fixed composition; high-boundary ratio 1 avoids extrapolation."
+}

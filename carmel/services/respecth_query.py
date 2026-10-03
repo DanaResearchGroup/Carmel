@@ -169,6 +169,8 @@ def _in_base_unit(value: MeasuredValue, base_unit: str) -> Decimal:
 
 def point_conditions(record: RespecthRecord) -> list[tuple[Decimal, Decimal]]:
     """``(T in K, P in bar)`` for every point, constants filled in."""
+    if isinstance(record, RespecthIdtRecord) and record.end_of_compression_basis == "derived-isentropic":
+        return []  # This query requires stated ignition conditions, never derived labels.
     series = record.envelope.series[0]
     constants = {constant.axis_id: constant for constant in series.constants}
     conditions: list[tuple[Decimal, Decimal]] = []

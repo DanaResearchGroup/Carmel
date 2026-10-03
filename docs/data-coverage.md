@@ -1,12 +1,14 @@
 # Curated-data acceptance coverage
 
-Generated 2026-10-02 by `carmel data coverage` against the pinned source bytes.
+Generated 2026-10-03 by `carmel data coverage` against the pinned source bytes.
 Both lanes are CC-BY-4.0.
 
 | Source | Observable | Files mapped | Points mapped | Refusals | Replay |
 |---|---:|---:|---:|---|---:|
-| ChemKED | ignition delay | 238 | 1,431 | `incomplete_record=15`, `rcm_pre_compression_conditions=76`, `schema_rejected=12`, `unmapped_unit=10` | 238/0 |
-| ReSpecTh | ignition delay | 105 | 1,278 | `rcm_pre_compression_conditions=85`, `unmapped_apparatus=3`, `unmapped_ignition_definition=4`, `unmapped_property=17`, `unmapped_unit=26` | 105/0 |
+| ChemKED | ignition delay | 314 | 1,507 | `incomplete_record=15`, `schema_rejected=12`, `unmapped_unit=10` | 314/0 |
+| ChemKED | ignition delay, RCM subset | 172 | 177 | `incomplete_record=15`, `unmapped_unit=10` | 172/0 |
+| ReSpecTh | ignition delay | 192 | 1,903 | `rcm_thermo_unavailable=24`, `unmapped_apparatus=3`, `unmapped_ignition_definition=4`, `unmapped_property=17` | 192/0 |
+| ReSpecTh | ignition delay, RCM subset | 98 | 605 | `rcm_thermo_unavailable=24`, `unmapped_property=2` | 98/0 |
 | ReSpecTh | laminar flame speed | 286 | 2,719 | `unmapped_unit=1` | 286/0 |
 | ReSpecTh | speciation | 84 | 1,248 | `unidentified_species=2`, `unmapped_experiment_type=3`, `unmapped_property=2` | 84/0 |
 | ReSpecTh | unclassified | 0 | 0 | none | 0/0 |
@@ -29,7 +31,9 @@ Every mapped record replayed successfully against the downloaded, pinned bytes.
 ## Refusal reasons
 
 - `incomplete_record`: required source fields are absent; lift it by adding or recovering those fields in the source record.
-- `rcm_pre_compression_conditions`: the RCM values are before compression; lift it with RCM volume-history simulation in T3, which is in progress.
+- `history_nonmonotone_time`, `history_nonpositive_volume`, `history_no_compression`, `history_missing_initial_state`, `history_invalid`: an unusable compression history or initial state; each carries its source-specific detail.
+- `rcm_thermo_unavailable`: derived labels require the supported seven-species NASA7 mixture. Initial, trial and solved temperatures must lie in the intersection of the material species' polynomial ranges: N2/Ar require 300–5000 K; H2/O2/CO/CO2/H2O require 200–3500 K. Exact-zero components do not constrain that intersection.
+- `implausible_ignition_temperature`: stated or derived ignition conditions below the 500 K backstop; initial pre-compression temperatures are not ignition labels.
 - `schema_rejected`: the mapped value does not satisfy the lane schema; lift it by adding an explicit schema mapping that preserves the source evidence.
 - `unmapped_unit`: the unit is outside the pinned conversion table; lift it by adding a reviewed conversion-table entry or leave it refused.
 - `unmapped_apparatus`: the apparatus/mode combination is not in the explicit device map; lift it by adding a reviewed mapping for that combination.
@@ -39,3 +43,20 @@ Every mapped record replayed successfully against the downloaded, pinned bytes.
 - `unmapped_experiment_type`: the experiment type has no supported parser; lift it by implementing a parser and replay contract for that type.
 
 The machine-readable source for this document is `carmel data coverage --json`; the command exits nonzero if any mapped record fails replay.
+
+## RCM change from the 2026-10-02 baseline
+
+ChemKED now maps all 76 formerly refused compression-history files/points,
+carrying their stated compressed labels. ReSpecTh maps 85 compression-history
+records (592 points) and retains thirteen postcompression records. The 24 Torr
+history records convert correctly through V5, but their stated initial
+temperatures of 296.8–298.3 K lie below the pinned NASA7 minimum of 300 K for
+their N2/Ar components. They now refuse with `rcm_thermo_unavailable` rather than
+extrapolating. This range correction reduces the previous census by 24 files
+and 24 points in both ReSpecTh ignition-delay rows; every other census count
+is unchanged. No mapped record failed replay. V5 also admits two non-RCM Torr
+files (33 points).
+
+See [RCM export](rcm-t3-export.md) for selection, provenance and typed export
+refusals. Mapping coverage counts differ from export acceptance: the T3 schema
+requires a stricter mole-fraction sum than some source records provide.

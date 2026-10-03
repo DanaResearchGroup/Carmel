@@ -10,10 +10,11 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from importlib import resources
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import quote
 
+from carmel.services.archive_unpack import _is_absolute_member_name
 from carmel.services.respecth_archive import (
     ArchiveFetchError,
     ArchiveIntegrityError,
@@ -56,11 +57,11 @@ def _require(mapping: dict[str, Any], key: str, kind: type, where: str) -> Any:
 
 def load_manifest(path: Path | None = None) -> ChemkedManifest:
     try:
-        raw = (
-            path.read_bytes()
-            if path is not None
-            else resources.files("carmel.data").joinpath("chemked_manifest.json").read_bytes()
-        )
+        source = path if path is not None else resources.files("carmel.data").joinpath("chemked_manifest.json")
+        with source.open("rb") as handle:
+            raw = handle.read(_MAX_FILE_BYTES + 1)
+        if len(raw) > _MAX_FILE_BYTES:
+            raise ManifestError("ChemKED manifest exceeds 4 MiB")
         data = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise ManifestError(f"invalid ChemKED manifest: cannot read it: {exc}") from exc
@@ -86,7 +87,13 @@ def load_manifest(path: Path | None = None) -> ChemkedManifest:
             path=_require(entry, "path", str, where),
             sha256=_require(entry, "sha256", str, where),
         )
-        if not item.path or not _SHA256_RE.fullmatch(item.sha256):
+        if (
+            not item.path
+            or "\\" in item.path
+            or _is_absolute_member_name(item.path)
+            or ".." in PurePosixPath(item.path).parts
+            or not _SHA256_RE.fullmatch(item.sha256)
+        ):
             raise ManifestError(
                 f"invalid ChemKED manifest: {where} must have a non-empty path and 64 lowercase-hex sha256"
             )

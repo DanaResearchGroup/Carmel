@@ -689,14 +689,14 @@ def test_sha_mismatch_refuses_replay_before_any_partial_check() -> None:
     assert caught.value.reason is ChemkedRefusalReason.INCOMPLETE_RECORD
 
 
-def test_precompression_rcm_history_refuses() -> None:
+def test_rcm_history_missing_units_refuses_as_history_invalid() -> None:
     raw = FIXTURE.read_bytes().replace(b"kind: shock tube", b"kind: rapid compression machine", 1)
     raw = raw.replace(
         b"  - temperature:",
         b"  - volume-history:\n      values:\n        - [0.0, 1.0]\n        - [1.0, 0.2]\n    temperature:",
         1,
     )
-    with pytest.raises(ChemkedRefusal, match="rcm_pre_compression_conditions"):
+    with pytest.raises(ChemkedRefusal, match="history_invalid"):
         parse_idt_record(raw, "precompression.yaml")
 
 
