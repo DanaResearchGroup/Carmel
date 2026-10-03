@@ -91,3 +91,17 @@ def inchikey(raw_smiles: str) -> str | None:
         return str(Chem.MolToInchiKey(mol))  # type: ignore[no-untyped-call]
     except Exception:  # noqa: BLE001 - fail soft on any parse/conversion error
         return None
+
+
+def smiles_from_inchi(raw: str) -> str | None:
+    """Resolve a source-stated InChI, refusing absent RDKit or invalid identity."""
+    try:
+        from rdkit import Chem
+    except ImportError:
+        return None
+    _disable_rdkit_logging()
+    try:
+        mol = Chem.MolFromInchi(raw if raw.startswith("InChI=") else "InChI=" + raw)  # type: ignore[no-untyped-call]
+        return str(Chem.MolToSmiles(mol)) if mol is not None else None
+    except Exception:  # noqa: BLE001 - third-party identity conversion fails closed
+        return None

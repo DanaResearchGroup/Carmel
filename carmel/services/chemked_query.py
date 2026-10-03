@@ -56,10 +56,14 @@ def load_idt_records(manifest: ChemkedManifest, *, cache_root: Path, download: b
 def point_conditions(record: ChemkedIdtRecord) -> tuple[tuple[Decimal, Decimal], ...]:
     """Return every point as exact ``(temperature K, pressure bar)`` decimals."""
     conditions: list[tuple[Decimal, Decimal]] = []
-    for point in record.envelope.series[0].points:
+    for index, point in enumerate(record.envelope.series[0].points):
         values = {coordinate.axis_id: coordinate.value for coordinate in point.coordinates}
-        temperature_value = values["temperature"]
-        pressure_value = values["pressure"]
+        state = record.rcm_states[index] if record.rcm_states else None
+        if state is not None and state.eoc_basis != "stated":
+            continue
+        temperature_value = state.temperature if state is not None else values["temperature"]
+        pressure_value = state.pressure if state is not None else values["pressure"]
+        assert temperature_value is not None and pressure_value is not None
         temperature = Decimal(
             units.convert(
                 temperature_value.canonical_decimal_value,

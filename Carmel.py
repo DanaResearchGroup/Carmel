@@ -365,6 +365,24 @@ def create_parser() -> argparse.ArgumentParser:
     data_coverage.add_argument("--cache", type=Path, default=None, help="Data cache directory")
     data_coverage.add_argument("--offline", action="store_true", help="Never download missing pinned data")
 
+    data_export = data_commands.add_parser("export-t3", help="Export selected curated ignition delays as T3 v1 YAML")
+    data_export.add_argument("--source", choices=["chemked", "respecth", "all"], default="all")
+    data_export.add_argument("--fuel", default=None, help="Source fuel key or ChemKED fuel directory")
+    data_export.add_argument(
+        "--study",
+        action="append",
+        default=[],
+        help="Exact DOI or source file identifier; repeat for a frozen selection",
+    )
+    data_export.add_argument("--history-only", action="store_true")
+    data_export.add_argument(
+        "--derived-labels",
+        action="store_true",
+        help="Include explicitly derived end-of-compression labels on history points",
+    )
+    data_export.add_argument("--output", type=Path, required=True)
+    data_export.add_argument("--cache", type=Path, default=None)
+    data_export.add_argument("--offline", action="store_true")
     return parser
 
 
@@ -1572,6 +1590,39 @@ def _cmd_data_find(
     return 0
 
 
+def _cmd_data_export(args: argparse.Namespace) -> int:
+    from carmel.services.respecth_archive import default_cache_root
+    from carmel.services.t3_export import export_idt, load_records, write_export
+
+    try:
+        records, mapping_refusals = load_records(
+            source=args.source, cache_root=args.cache or default_cache_root(), download=not args.offline, fuel=args.fuel
+        )
+        payload, report = export_idt(
+            records,
+            fuel=args.fuel,
+            studies=tuple(args.study),
+            history_only=args.history_only,
+            include_derived_labels=args.derived_labels,
+        )
+        report["mapping_refusals"] = mapping_refusals
+        report_path = write_export(payload, report, args.output)
+    except (OSError, ValueError) as exc:
+        print(f"Refusing T3 export: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "output": str(args.output),
+                "report": str(report_path),
+                **{key: report[key] for key in ("exported", "stated", "derived", "refused")},
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def _cmd_data_coverage(cache: Path | None, offline: bool, as_json: bool) -> int:
     from carmel.services.data_coverage import build_coverage, coverage_payload, render_table
     from carmel.services.respecth_archive import default_cache_root
@@ -1716,6 +1767,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "data" and args.data_command == "find":
         return _cmd_data_find(args.kind, args.fuel, args.t_range, args.p_range, args.cache, args.manifest, args.offline)
+    if args.command == "data" and args.data_command == "export-t3":
+        return _cmd_data_export(args)
     if args.command == "data" and args.data_command == "coverage":
         return _cmd_data_coverage(args.cache, args.offline, args.json)
 
