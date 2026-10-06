@@ -2,13 +2,14 @@
 
 import re
 import xml.etree.ElementTree as ET
+from decimal import Decimal
 
 import pytest
 import yaml
 from pydantic import ValidationError
 
 from carmel.schemas.datasets import MeasuredValue, UncertaintyBasis
-from carmel.services import respecth_series, units
+from carmel.services import respecth_series, t3_export, units
 from carmel.services.chemked import ChemkedRefusal, ChemkedRefusalReason, parse_idt_record
 from carmel.services.dataset_store import canonical_decimal
 from carmel.services.respecth import RespecthRefusal, replay_idt_record
@@ -128,7 +129,7 @@ def test_nonzero_unsupported_species_that_underflows_is_not_treated_as_exact_zer
         argon_record("1E-999")
 
 
-@pytest.mark.parametrize("fractions", [("1.00000000000000001", "0", "0"), ("0.2", "0.80000100000000001", "0")])
+@pytest.mark.parametrize("fractions", [("1.00000000000000001", "0", "0"), ("0.2", "0.80001000000000001", "0")])
 def test_composition_bounds_and_sum_tolerance_use_exact_fractions(fractions):
     pytest.importorskip("rdkit")
     doc = yaml.safe_load(chemked_history())
@@ -137,6 +138,125 @@ def test_composition_bounds_and_sum_tolerance_use_exact_fractions(fractions):
         component["amount"] = [n]
     record = parse_idt_record(yaml.safe_dump(doc).encode(), "history.yaml")
     assert export_idt([record])[1]["refused"] == {"invalid_composition": 1}
+
+
+def test_rounding_level_composition_is_normalized_with_source_provenance():
+    pytest.importorskip("rdkit")
+    doc = yaml.safe_load(chemked_history())
+    components = doc["datapoints"][0]["composition"]["species"]
+    for component, fraction in zip(components, ("0.01869", "0.2056", "0.7757"), strict=True):
+        component["amount"] = [fraction]
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "rounding.yaml")
+
+    payload, report = export_idt([record])
+
+    assert report["exported"] == 1 and not report["refused"]
+    point = payload["points"][0]
+    assert sum(item["mole_fraction"] for item in point["composition"]) == pytest.approx(1)
+    assert point["source"]["composition"] == {"source_total": "0.99999", "renormalized": True}
+    recovered = sorted(Decimal(str(item["mole_fraction"])) * Decimal("0.99999") for item in point["composition"])
+    assert recovered == pytest.approx(sorted((Decimal("0.01869"), Decimal("0.2056"), Decimal("0.7757"))))
+
+
+def test_composition_beyond_rounding_tolerance_still_refuses():
+    pytest.importorskip("rdkit")
+    doc = yaml.safe_load(chemked_history())
+    components = doc["datapoints"][0]["composition"]["species"]
+    for component, fraction in zip(components, ("0.01869", "0.2056", "0.77569"), strict=True):
+        component["amount"] = [fraction]
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "not-rounding.yaml")
+    assert export_idt([record])[1]["refused"] == {"invalid_composition": 1}
+
+
+def test_newly_admitted_composition_drives_thermo_with_normalized_fractions(monkeypatch):
+    pytest.importorskip("rdkit")
+    doc = yaml.safe_load(chemked_history())
+    row = doc["datapoints"][0]
+    row.pop("compressed-temperature")
+    row.pop("compressed-pressure")
+    for component, fraction in zip(row["composition"]["species"], ("0.01869", "0.2056", "0.7757"), strict=True):
+        component["amount"] = [fraction]
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "rounding-history.yaml")
+    captured = {}
+
+    def check(temperature, composition, **kwargs):
+        captured["decimal"] = composition
+        return False
+
+    def solve(temperature, pressure, ratio, composition):
+        captured["float"] = composition
+        return 800.0, 1_000_000.0
+
+    monkeypatch.setattr(t3_export, "check_initial_temperature", check)
+    monkeypatch.setattr(
+        t3_export, "solver_composition", lambda composition: {k: float(v) for k, v in composition.items()}
+    )
+    monkeypatch.setattr(t3_export, "isentropic_eoc", solve)
+    payload, report = export_idt([record], include_derived_labels=True)
+
+    assert report["exported"] == 1 and payload["points"][0]["temperature"]["value"] == 800
+    assert sum(captured["decimal"].values(), Decimal(0)) == Decimal(1)
+    assert sum(captured["float"].values()) == pytest.approx(1)
+
+
+def test_already_admitted_rounding_noise_remains_byte_compatible():
+    pytest.importorskip("rdkit")
+    doc = yaml.safe_load(chemked_history())
+    components = doc["datapoints"][0]["composition"]["species"]
+    for component, fraction in zip(components, ("0.03", "0.116", "0.8540005"), strict=True):
+        component["amount"] = [fraction]
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "existing-tolerance.yaml")
+    payload, report = export_idt([record])
+    assert report["exported"] == 1 and not report["refused"]
+    point = payload["points"][0]
+    assert sorted(item["mole_fraction"] for item in point["composition"]) == [0.03, 0.116, 0.8540005]
+    assert "composition" not in point["source"]
+
+
+def test_inchikey_lookup_is_recorded_and_unknown_keys_still_refuse():
+    pytest.importorskip("rdkit")
+    key = "IMNFDUFMRHMDMM-UHFFFAOYSA-N"
+    doc = yaml.safe_load(chemked_history())
+    component = doc["datapoints"][0]["composition"]["species"][0]
+    component["InChI"] = key
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "key.yaml")
+    payload, report = export_idt([record])
+    assert report["exported"] == 1 and not report["refused"]
+    assert payload["points"][0]["source"]["identity_lookups"] == [
+        {
+            "species": "2-butanol",
+            "inchikey": key,
+            "inchi": "InChI=1S/C7H16/c1-3-5-7-6-4-2/h3-7H2,1-2H3",
+        }
+    ]
+
+    component["InChI"] = "AAAAAAAAAAAAAA-BBBBBBBBBB-C"
+    unknown = parse_idt_record(yaml.safe_dump(doc).encode(), "unknown-key.yaml")
+    assert export_idt([unknown])[1]["refused"] == {"no_confident_smiles": 1}
+
+
+def test_two_species_resolving_to_one_structure_still_refuse():
+    pytest.importorskip("rdkit")
+    doc = yaml.safe_load(chemked_history())
+    species = doc["datapoints"][0]["composition"]["species"]
+    species[2]["InChI"] = species[1]["InChI"]
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "duplicate.yaml")
+    assert export_idt([record])[1]["refused"] == {"invalid_composition": 1}
+
+
+def test_inchikey_lookup_without_rdkit_is_a_typed_refusal(monkeypatch):
+    key = "IMNFDUFMRHMDMM-UHFFFAOYSA-N"
+    doc = yaml.safe_load(chemked_history())
+    doc["datapoints"][0]["composition"]["species"][0]["InChI"] = key
+    record = parse_idt_record(yaml.safe_dump(doc).encode(), "key-without-rdkit.yaml")
+    monkeypatch.setattr(t3_export.chem, "rdkit_available", lambda: False)
+    monkeypatch.setattr(t3_export.chem, "canonical_smiles", lambda raw: raw)
+    monkeypatch.setattr(t3_export.chem, "smiles_from_inchi", lambda raw: raw)
+
+    payload, report = export_idt([record])
+
+    assert payload["points"] == []
+    assert report["refused"] == {"no_confident_smiles": 1}
 
 
 def test_idt_upper_bound_is_checked_before_float_rounding():

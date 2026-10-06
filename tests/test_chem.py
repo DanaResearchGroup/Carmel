@@ -10,13 +10,21 @@ explicitly marked absent in the cache).
 
 from __future__ import annotations
 
+import json
 import sys
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from carmel.services.chem import canonical_smiles, inchikey, rdkit_available
+from carmel.services.chem import (
+    canonical_smiles,
+    inchi_from_inchikey,
+    inchikey,
+    load_inchikey_table,
+    rdkit_available,
+)
 
 
 class _FakeMol:
@@ -137,3 +145,70 @@ def test_real_rdkit_end_to_end_if_installed() -> None:
     assert canonical_smiles("CCO") == "CCO"
     assert canonical_smiles("not a smiles string $$$") is None
     assert inchikey("CCO") == "LFQSCWFLJHTTHZ-UHFFFAOYSA-N"
+
+
+def test_pinned_inchikey_table_resolves_verified_n_heptane() -> None:
+    pytest.importorskip("rdkit")
+    assert inchi_from_inchikey("IMNFDUFMRHMDMM-UHFFFAOYSA-N") == ("InChI=1S/C7H16/c1-3-5-7-6-4-2/h3-7H2,1-2H3")
+    assert inchi_from_inchikey("AAAAAAAAAAAAAA-BBBBBBBBBB-C") is None
+
+
+def test_pinned_inchikey_lookup_returns_none_when_rdkit_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_missing_rdkit(monkeypatch)
+    assert inchi_from_inchikey("IMNFDUFMRHMDMM-UHFFFAOYSA-N") is None
+
+
+def test_pinned_inchikey_table_refuses_tampered_entry(tmp_path: Path) -> None:
+    pytest.importorskip("rdkit")
+    path = tmp_path / "inchikey_to_inchi.json"
+    path.write_text(
+        json.dumps({"IMNFDUFMRHMDMM-UHFFFAOYSA-N": "InChI=1S/H2O/h1H2"}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="RDKit recomputed"):
+        load_inchikey_table(path)
+
+
+_HEPTANE_KEY = "IMNFDUFMRHMDMM-UHFFFAOYSA-N"
+_HEPTANE_INCHI = "InChI=1S/C7H16/c1-3-5-7-6-4-2/h3-7H2,1-2H3"
+
+
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        (b" " * (64 * 1024 + 1), "exceeds 64 KiB"),
+        (b"\xff\xfe", "not valid UTF-8 JSON"),
+        (b"{not json", "not valid UTF-8 JSON"),
+        (json.dumps([_HEPTANE_KEY]).encode(), "must map strings to strings"),
+        (json.dumps({_HEPTANE_KEY: 1}).encode(), "must map strings to strings"),
+        (json.dumps({"not-a-key": _HEPTANE_INCHI}).encode(), "invalid pinned InChIKey table entry"),
+        (json.dumps({_HEPTANE_KEY: "C7H16"}).encode(), "invalid pinned InChIKey table entry"),
+    ],
+)
+def test_pinned_inchikey_table_refuses_malformed_tables(tmp_path: Path, raw: bytes, message: str) -> None:
+    pytest.importorskip("rdkit")
+    path = tmp_path / "inchikey_to_inchi.json"
+    path.write_bytes(raw)
+    with pytest.raises(ValueError, match=message):
+        load_inchikey_table(path)
+
+
+def test_pinned_inchikey_table_refuses_to_load_without_rdkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "inchikey_to_inchi.json"
+    path.write_text(json.dumps({_HEPTANE_KEY: _HEPTANE_INCHI}), encoding="utf-8")
+    _install_missing_rdkit(monkeypatch)
+    with pytest.raises(ValueError, match="RDKit is required"):
+        load_inchikey_table(path)
+
+
+def test_pinned_inchikey_table_refuses_when_rdkit_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    chem = pytest.importorskip("rdkit.Chem")
+    path = tmp_path / "inchikey_to_inchi.json"
+    path.write_text(json.dumps({_HEPTANE_KEY: _HEPTANE_INCHI}), encoding="utf-8")
+
+    def _boom(_inchi: str) -> None:
+        raise RuntimeError("rdkit failure")
+
+    monkeypatch.setattr(chem, "MolFromInchi", _boom)
+    with pytest.raises(ValueError, match="could not verify"):
+        load_inchikey_table(path)
