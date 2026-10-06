@@ -21,6 +21,7 @@ from carmel.schemas.datasets import (
     ComponentRole,
     Composition,
     DatasetEnvelope,
+    MeasuredValue,
     SourceRef,
     UnitProvenance,
     XPathLocator,
@@ -41,6 +42,10 @@ from carmel.services.respecth import IgnitionCriterion, IgnitionTarget
 from carmel.services.respecth import parse_idt_record as parse_respecth_idt_record
 from carmel.services.respecth_archive import ArchiveFetchError, ArchiveIntegrityError, cached_archive_path
 from carmel.services.respecth_query import ConditionWindow, LoadResult
+from carmel.services.semantic_deps import (
+    CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
+)
 from carmel.services.units import QuantityKind
 
 FIXTURE = Path(__file__).parent / "fixtures" / "chemked" / "Bec_2014_2-b_20atm.yaml"
@@ -300,6 +305,52 @@ def test_unmapped_unit_refuses_without_output() -> None:
     rows[0]["temperature"] = ["828 fortnight"]
     with pytest.raises(ChemkedRefusal) as caught:
         parse_idt_record(_yaml(document), "bad-unit.yaml")
+    assert caught.value.reason is ChemkedRefusalReason.UNMAPPED_UNIT
+
+
+@pytest.mark.parametrize(
+    ("field", "quantity", "trailing", "plain"),
+    [
+        ("temperature", QuantityKind.TEMPERATURE, "707.", "707"),
+        ("ignition-delay", QuantityKind.TIME, "2.", "2"),
+    ],
+)
+def test_structured_trailing_dot_numerals_preserve_raw_text_and_exact_value(
+    field: str, quantity: QuantityKind, trailing: str, plain: str
+) -> None:
+    def parse_with(value: str) -> tuple[bytes, MeasuredValue]:
+        document = _document()
+        rows = document["datapoints"]
+        assert isinstance(rows, list) and isinstance(rows[0], dict)
+        unit = "K" if field == "temperature" else "ms"
+        rows[0][field] = [f"{value} {unit}"]
+        raw = _yaml(document)
+        record = parse_idt_record(raw, f"{value}.yaml")
+        point = record.envelope.series[0].points[0]
+        values = [coordinate.value for coordinate in point.coordinates]
+        values.extend(observation.value for observation in point.observations)
+        measured = next(item for item in values if item.quantity_kind is quantity)
+        return raw, measured
+
+    trailing_raw, trailing_value = parse_with(trailing)
+    _, plain_value = parse_with(plain)
+
+    assert trailing_value.raw_text == trailing
+    assert trailing_value.canonical_decimal_value == plain_value.canonical_decimal_value == plain
+    assert trailing_value.repair_dependency.dependency_id == STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID
+    assert plain_value.repair_dependency.dependency_id == CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID
+    assert trailing_value.repair_dependency.content_sha256 != plain_value.repair_dependency.content_sha256
+    replay_idt_record(parse_idt_record(trailing_raw, "trailing.yaml"), trailing_raw)
+
+
+@pytest.mark.parametrize("value", ["707.x", ".", "7 07"])
+def test_other_malformed_structured_numerals_still_refuse(value: str) -> None:
+    document = _document()
+    rows = document["datapoints"]
+    assert isinstance(rows, list) and isinstance(rows[0], dict)
+    rows[0]["temperature"] = [f"{value} K"]
+    with pytest.raises(ChemkedRefusal) as caught:
+        parse_idt_record(_yaml(document), "bad-numeral.yaml")
     assert caught.value.reason is ChemkedRefusalReason.UNMAPPED_UNIT
 
 

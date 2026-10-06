@@ -48,6 +48,7 @@ from carmel.schemas.datasets import (
     UncertaintyScale,
     UnitProvenance,
     XPathLocator,
+    YamlPathLocator,
 )
 from carmel.services import semantic_deps
 from carmel.services.dataset_store import canonical_json_bytes
@@ -56,6 +57,7 @@ from carmel.services.numeric import GlyphHealth
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     GLYPH_HEALTH_DEPENDENCY_ID,
+    STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
     InputPolicy,
     SemanticDependencyDefinition,
     current_sha_for,
@@ -249,6 +251,12 @@ version, for every ``MeasuredValue`` fixture in this file that doesn't itself
 exercise ``repair_dependency`` -- SemanticDependencyUse is frozen, so sharing
 one instance is safe, mirroring the existing ``_NO_ORIGIN`` pattern above."""
 
+_STRUCTURED_REPAIR_DEPENDENCY = SemanticDependencyUse(
+    dependency_id=STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
+    content_sha256=current_sha_for(STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID),
+    input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
+)
+
 
 def _measured_value(
     raw_text: str = "1.20",
@@ -259,6 +267,7 @@ def _measured_value(
     conversion_table_sha256: str = TABLE_V1.sha256,
     repairs: tuple[str, ...] = (),
     repair_dependency: SemanticDependencyUse = _CURRENT_REPAIR_DEPENDENCY,
+    value_ref: SourceRef | None = None,
 ) -> MeasuredValue:
     return MeasuredValue(
         raw_text=raw_text,
@@ -269,7 +278,7 @@ def _measured_value(
         conversion_table_sha256=conversion_table_sha256,
         repairs=repairs,
         repair_dependency=repair_dependency,
-        value_ref=_bbox_ref(),
+        value_ref=value_ref if value_ref is not None else _bbox_ref(),
         unit_ref=_table_ref(),
     )
 
@@ -1560,7 +1569,7 @@ class TestMeasuredValueRepairDependency:
                 _measured_value(repair_dependency=other_use)
         message = str(excinfo.value)
         assert "is not the repair heuristic this validator chain re-runs" in message
-        assert "must name exactly the one dependency its own repair-chain validator knows how to re-run" in message
+        assert "must name a dependency its own repair-chain validator knows how to re-run" in message
 
     def test_registered_but_superseded_repair_dependency_is_rejected_outright(self) -> None:
         """A repair_dependency whose content_sha256 resolves (registry-wise)
@@ -1593,6 +1602,32 @@ class TestMeasuredValueRepairDependency:
             _measured_value(raw_text="/C0 1.0", canonical_decimal_value="-1.0", repairs=())
         message = str(excinfo.value)
         assert "disagrees with the repair(s)" in message
+
+    def test_structured_dependency_requires_an_xpath_or_yaml_path_locator(self) -> None:
+        with pytest.raises(ValidationError, match="requires an XPath or YAML-path field"):
+            _measured_value(
+                raw_text="707.",
+                canonical_decimal_value="707",
+                repair_dependency=_STRUCTURED_REPAIR_DEPENDENCY,
+            )
+
+    def test_structured_dependency_requires_the_trailing_dot_branch(self) -> None:
+        with pytest.raises(ValidationError, match="ordinary values must retain the context-free dependency"):
+            _measured_value(
+                raw_text="707",
+                canonical_decimal_value="707",
+                repair_dependency=_STRUCTURED_REPAIR_DEPENDENCY,
+                value_ref=SourceRef(node_id="database", locator=YamlPathLocator(path="datapoints[0].temperature")),
+            )
+
+    def test_structured_dependency_can_be_validated_before_the_source_graph_is_available(self) -> None:
+        value = _measured_value(
+            raw_text="707.",
+            canonical_decimal_value="707",
+            repair_dependency=_STRUCTURED_REPAIR_DEPENDENCY,
+            value_ref=SourceRef(node_id="database", locator=YamlPathLocator(path="datapoints[0].temperature")),
+        )
+        assert value.canonical_decimal_value == "707"
 
 
 def _uncertainty_measured_value(

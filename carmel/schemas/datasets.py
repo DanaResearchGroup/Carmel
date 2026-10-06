@@ -127,10 +127,15 @@ from carmel.services.pdf_table_record import (
 from carmel.services.semantic_deps import (
     CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
     GLYPH_HEALTH_DEPENDENCY_ID,
+    STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
     InputPolicy,
     UnknownSemanticDependencyError,
     current_sha_for,
     dependency_for_sha,
+)
+from carmel.services.structured_numeric import (
+    is_structured_trailing_dot_numeral,
+    normalize_structured_numeric_span,
 )
 from carmel.services.units import QuantityKind
 
@@ -2551,6 +2556,17 @@ class MeasuredValue(BaseModel):
     independently, and never silently equal to ``canonical_decimal(raw_text)``
     verbatim when a repair was actually needed.
 
+    A value whose ``repair_dependency`` names the structured-record policy
+    additionally uses
+    :func:`carmel.services.structured_numeric.normalize_structured_numeric_span`.
+    That policy admits an integer mantissa ending in a decimal point because the
+    whole YAML/XML field is the number; this model requires an XPath/YAML-path
+    locator and preserves the trailing point in ``raw_text``. The enclosing
+    :class:`DatasetEnvelope` resolves that locator through its source graph and
+    requires a ``DATABASE_RECORD`` node (and ``STRUCTURED_RECORD`` source form
+    within a series). XPath-grounded JATS prose and every character-span/table-cell
+    value keep using the shared grammar unchanged.
+
     Also enforced below (see :func:`_require_finite_as_float`) to evaluate to
     a finite ``float``. ``canonical_decimal`` itself stays permissive and
     accepts e.g. ``"1E+400"`` -- it also canonicalizes bbox coordinates and
@@ -2573,12 +2589,11 @@ class MeasuredValue(BaseModel):
     recorded no version identity for the heuristic that produced its
     ``repairs``, so a future change to :mod:`carmel.services.numeric`'s
     regex/logic would make old, correctly-recorded data fail validation
-    indistinguishably from forged data. Enforced below to name exactly
-    :data:`~carmel.services.semantic_deps.CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID`
-    -- the only repair heuristic this validator chain re-runs -- and its
-    ``content_sha256`` is what the repair-chain validator below compares
-    against the CURRENT sha to decide whether it may re-run the heuristic at
-    all."""
+    indistinguishably from forged data. Enforced below to name either the
+    ordinary context-free repair dependency or the structured trailing-dot
+    dependency -- the two repair policies this validator chain can re-run --
+    and its ``content_sha256`` is what the repair-chain validator below compares
+    against the CURRENT sha to decide whether it may re-run the heuristic at all."""
     quantity_kind: QuantityKind
     """Which physical (or dimensionless-bookkeeping) quantity this value
     measures. Required, no default: a unit pair alone does not identify a
@@ -2653,15 +2668,19 @@ class MeasuredValue(BaseModel):
 
     @field_validator("repair_dependency")
     @classmethod
-    def _validate_repair_dependency_names_the_context_free_span_repair(
+    def _validate_repair_dependency_names_a_runnable_span_repair(
         cls, value: SemanticDependencyUse
     ) -> SemanticDependencyUse:
-        if value.dependency_id != CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID:
+        known_repair_dependencies = {
+            CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+            STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
+        }
+        if value.dependency_id not in known_repair_dependencies:
             raise ValueError(
                 f"repair_dependency.dependency_id={value.dependency_id!r} is not the repair "
-                f"heuristic this validator chain re-runs ({CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID!r}); "
-                "a MeasuredValue's repair_dependency must name exactly the one dependency its own "
-                "repair-chain validator knows how to re-run"
+                f"heuristic this validator chain re-runs (expected one of {sorted(known_repair_dependencies)!r}); "
+                "a MeasuredValue's repair_dependency must name a dependency its own repair-chain "
+                "validator knows how to re-run"
             )
         return value
 
@@ -2689,7 +2708,11 @@ class MeasuredValue(BaseModel):
            NO "accept without re-running" middle path: a superseded record is
            rejected outright, never silently passed through.
         1. Otherwise (current version), ``raw_text`` must itself be
-           derivable at all (rejects with the core's own reason if not).
+           derivable at all (rejects with the core's own reason if not). Only a
+           structured dependency on an XPath/YAML-path field uses the structured
+           policy; the enclosing :class:`DatasetEnvelope` separately proves that
+           the field belongs to a database record. Every other value uses the shared
+           PDF/prose grammar.
         2. ``repairs`` must be an EXACT, ORDERED match for what
            :func:`~carmel.services.numeric.normalize_numeric_span` reports
            needing -- both under-claiming (a repair happened but was not
@@ -2705,20 +2728,33 @@ class MeasuredValue(BaseModel):
         completes -- including any raising -- before this outer model's own
         ``model_validator``s run.)
         """
-        current_sha = current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID)
+        dependency_id = self.repair_dependency.dependency_id
+        current_sha = current_sha_for(dependency_id)
         if self.repair_dependency.content_sha256 != current_sha:
             raise ValueError(
                 f"repair_dependency.content_sha256={self.repair_dependency.content_sha256!r} names a "
-                f"registered but SUPERSEDED version of {CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID!r} "
+                f"registered but SUPERSEDED version of {dependency_id!r} "
                 f"(current content_sha256 is {current_sha!r}); no runnable validator is registered for "
                 "a superseded version, so this record cannot be re-validated by re-running the CURRENT "
                 "heuristic against it -- there is no 'accept without re-running' path, so it is rejected "
                 "outright rather than silently passed through"
             )
-        normalized = normalize_numeric_span(
-            self.raw_text,
-            source_context=SourceContext.OPERATOR_RAW,
-            glyph_health=_HEALTHY_GLYPH_HEALTH,
+        structured_dependency = dependency_id == STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID
+        locator = self.value_ref.locator
+        structured_locator = isinstance(locator, (XPathLocator, YamlPathLocator))
+        if structured_dependency and not structured_locator:
+            raise ValueError(
+                "the structured numeric repair dependency requires an XPath or YAML-path field; "
+                "the enclosing DatasetEnvelope resolves that field to a DATABASE_RECORD node"
+            )
+        if structured_dependency and not is_structured_trailing_dot_numeral(self.raw_text):
+            raise ValueError(
+                "the structured numeric repair dependency is emitted only when raw_text exercises "
+                "the structured trailing-dot branch; ordinary values must retain the context-free dependency"
+            )
+        normalizer = normalize_structured_numeric_span if structured_dependency else normalize_numeric_span
+        normalized = normalizer(
+            self.raw_text, source_context=SourceContext.OPERATOR_RAW, glyph_health=_HEALTHY_GLYPH_HEALTH
         )
         if isinstance(normalized, Unresolvable):
             raise ValueError(f"raw_text={self.raw_text!r} is not derivable into a numeral: {normalized.reason}")
@@ -7970,6 +8006,37 @@ class DatasetEnvelope(BaseModel):
     def _validate_refs_resolve(self) -> DatasetEnvelope:
         """V1: see :func:`_validate_refs_resolve`."""
         _validate_refs_resolve(self)
+        return self
+
+    @model_validator(mode="after")
+    def _validate_structured_numeric_dependency_source(self) -> DatasetEnvelope:
+        """Require graph-grounded structured evidence for the structured policy.
+
+        Runs after V1 so every measured value's ``value_ref`` resolves. A node id is
+        only a producer-chosen label; the resolved node kind is the authority. When
+        the value belongs to a series, that series must also declare the matching
+        structured-record source form.
+        """
+        for path, value in iter_measured_values(self):
+            if value.repair_dependency.dependency_id != STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID:
+                continue
+            node = self.source_graph.node(value.value_ref.node_id)
+            if node.kind is not SourceNodeKind.DATABASE_RECORD:
+                raise ValueError(
+                    f"MeasuredValue at {path!r} cites the structured numeric repair dependency, "
+                    f"but value_ref resolves to node {node.node_id!r} of kind={node.kind.value!r}; "
+                    "structured numeric values require a DATABASE_RECORD node"
+                )
+        for series in self.series:
+            if series.source_form is SourceForm.STRUCTURED_RECORD:
+                continue
+            for path, value in iter_measured_values(series):
+                if value.repair_dependency.dependency_id == STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID:
+                    raise ValueError(
+                        f"Series(series_id={series.series_id!r}) contains a structured numeric value at "
+                        f"{path!r}, but source_form={series.source_form.value!r}; the structured numeric "
+                        "repair dependency requires source_form=STRUCTURED_RECORD"
+                    )
         return self
 
     @model_validator(mode="after")

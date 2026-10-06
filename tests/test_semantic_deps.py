@@ -26,7 +26,7 @@ import sys
 import pytest
 
 from carmel.agents.tools import extract
-from carmel.services import numeric, pdf_fragments
+from carmel.services import numeric, pdf_fragments, structured_numeric
 from carmel.services.semantic_deps import (
     _FRAGMENT_GEOMETRY_COMPONENTS_BY_SHA,
     _PYPDF_VERSION_UNKNOWN,
@@ -35,6 +35,7 @@ from carmel.services.semantic_deps import (
     EXTRACT_TEXT_DEPENDENCY_ID,
     FRAGMENT_GEOMETRY_BORROWED_NAMES,
     FRAGMENT_GEOMETRY_DEPENDENCY_ID,
+    STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
     ExtractionIdentity,
     FragmentGeometryIdentity,
     InputPolicy,
@@ -76,6 +77,8 @@ from carmel.services.semantic_deps import (
 # in place would silently invalidate that history's meaning.
 _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256 = "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
 
+_PINNED_STRUCTURED_NUMERIC_SPAN_REPAIR_SHA256 = "0796a78bbb936bbf10852382aac74dc106bbad82213e7dd0824cce1f5e51993c"
+
 # Pinned for carmel.numeric.glyph_health on exactly the same terms as the literal
 # above: hardcoded, never recomputed from the live module, never edited in place.
 # Entry point: assess_glyph_health.
@@ -95,6 +98,7 @@ _PINNED_GLYPH_HEALTH_SHA256 = "af3553a8142b50bba56b6ba164778b4cd2bff6e4916ac2e93
 _HISTORICALLY_SHIPPED_SHAS = frozenset(
     {
         _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256,
+        _PINNED_STRUCTURED_NUMERIC_SPAN_REPAIR_SHA256,
         _PINNED_GLYPH_HEALTH_SHA256,
         "aa008f66d255cfb079cf269438ef9cfb0f1c42c6326d51a75e3e6fed04ec7168",
         "4922bd55d53e90e9bcd7cb4823e15798cb89ffddb6b2b6d7745f96c9ff1767bb",
@@ -143,6 +147,27 @@ def test_registry_seed_agrees_with_the_pin() -> None:
     assert _PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256 in DEPENDENCIES_BY_SHA
     entry = DEPENDENCIES_BY_SHA[_PINNED_CONTEXT_FREE_SPAN_REPAIR_SHA256]
     assert entry.dependency_id == "carmel.numeric.context_free_span_repair"
+    assert entry.input_policy is InputPolicy.SIBLING_FIELD
+
+
+def test_structured_dependency_sha_matches_a_hardcoded_pin() -> None:
+    shared = compute_dependency_sha(_real_numeric_source(), ["normalize_numeric_span", "REPAIR_NAMES"])
+    structured = compute_dependency_sha(
+        inspect.getsource(structured_numeric),
+        ["normalize_structured_numeric_span", "is_structured_trailing_dot_numeral"],
+    )
+    computed = compose_component_sha(
+        {
+            "context_free_span_repair_sha256": shared,
+            "structured_numeric_sha256": structured,
+        }
+    )
+    assert computed == _PINNED_STRUCTURED_NUMERIC_SPAN_REPAIR_SHA256
+
+
+def test_structured_dependency_registry_seed_agrees_with_the_pin() -> None:
+    entry = DEPENDENCIES_BY_SHA[_PINNED_STRUCTURED_NUMERIC_SPAN_REPAIR_SHA256]
+    assert entry.dependency_id == STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID
     assert entry.input_policy is InputPolicy.SIBLING_FIELD
 
 

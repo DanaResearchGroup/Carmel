@@ -1149,6 +1149,15 @@ class TestACharSpanCannotGroundASeriesValue:
         envelope = _envelope_with_series((series,), graph=_jats_graph())
         assert envelope.series[0].source_form is SourceForm.TEXTUAL
 
+    def test_a_trailing_dot_xpath_value_under_textual_jats_still_refuses(self) -> None:
+        with pytest.raises(ValidationError, match="not derivable into a numeral"):
+            _equivalence_ratio_amount(
+                raw_text="707.",
+                node_id="jats",
+                value_ref=_xpath_ref("jats"),
+                unit_ref=_xpath_ref("jats"),
+            )
+
     def test_the_refusal_names_runtime_incapacity_not_impossibility(self) -> None:
         """Prose CAN carry a real series -- "At 300, 400 and 500 K the rates
         were 1.2, 2.4 and 4.8 s-1, respectively" is one. What this runtime
