@@ -11,6 +11,7 @@ from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import quote
 
 import yaml
 
@@ -261,7 +262,6 @@ def _point(record: IdtRecord, index: int, include_derived_labels: bool) -> tuple
         "idt": {"value": idt, "units": "s"},
         "source": {"doi": record.citation_doi, "record": locator},
     }
-    output["source"].update(source_provenance)
     history, state = point_history(record, index)
     basis = "stated"
     if history is not None:
@@ -392,6 +392,11 @@ def _point(record: IdtRecord, index: int, include_derived_labels: bool) -> tuple
             exact_error = upper * idt_exact if uncertainty.basis is UncertaintyBasis.RELATIVE else upper
         error = _float_value(exact_error, ExportReason.T3_CONSTRAINT, detail)
         output["uncertainty"] = {"value": error, "units": "s"}
+    if composition_provenance := source_provenance.get("composition"):
+        output["source"]["record"] += f";composition=renormalized;source_total={composition_provenance['source_total']}"
+    for lookup in source_provenance.get("identity_lookups", []):
+        species = quote(lookup["species"], safe="")
+        output["source"]["record"] += f";identity=inchikey:{species}:{lookup['inchikey']}"
     return output, basis
 
 
