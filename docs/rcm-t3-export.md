@@ -20,9 +20,22 @@ or a ChemKED fuel directory. A sibling `.report.json` gives exported points,
 stated/derived/unlabelled counts, per-point typed refusals and source mapping
 refusals. Source fractions and ignition definitions are preserved; a missing or
 conflicting chemical identity, incompatible definition or invalid mole-fraction
-sum is refused. Nonzero source fractions that underflow float representation
-are typed composition refusals; exact zeros carry no material and are omitted.
-No composition normalization is applied to the export.
+sum is refused. Exact decimal totals in the newly admitted rounding band
+`1e-6 < |total - 1| <= 1e-5` are normalized for both export and thermodynamic
+derivation. Each affected point records `source.composition.source_total` and
+`source.composition.renormalized`; totals farther from unity remain refused.
+The pinned-corpus survey found 30 ChemKED point compositions and 12 ReSpecTh
+record compositions at the `1e-5` band, while the next band begins at `1e-4`.
+Previously admitted totals within `1e-6` retain their source representation for
+byte compatibility. The independent T3 float-sum check remains in force.
+Nonzero source fractions that underflow float representation are typed
+composition refusals; exact zeros carry no material and are omitted.
+
+An identifier matching the InChIKey shape is resolved only through the pinned
+offline `carmel/data/inchikey_to_inchi.json` table. RDKit re-derives every key
+from its InChI when the table loads; a mismatched table refuses to load and an
+unknown key remains `no_confident_smiles`. A successful lookup is recorded in
+the point's `source.identity_lookups` provenance.
 
 Compression histories retain all source samples, their source time axis and the
 initial temperature/pressure. End of compression uses the source's explicit

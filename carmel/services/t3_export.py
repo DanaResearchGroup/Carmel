@@ -44,6 +44,9 @@ from carmel.services.respecth_archive import load_manifest as respecth_manifest
 
 IdtRecord = ChemkedIdtRecord | RespecthIdtRecord
 
+_EXISTING_SOURCE_SUM_TOLERANCE = Decimal("0.000001")
+_ROUNDING_SOURCE_SUM_TOLERANCE = Decimal("0.00001")
+
 
 class ExportReason(StrEnum):
     NO_SMILES = "no_confident_smiles"
@@ -120,14 +123,14 @@ def _base_decimal(value: MeasuredValue, reason: ExportReason) -> Decimal:
         raise ExportRefusal(reason, f"cannot convert {value.quantity_kind.value} to its base unit: {exc}") from exc
 
 
-def _composition(record: IdtRecord, index: int) -> tuple[list[dict[str, Any]], dict[str, Decimal]]:
+def _composition(record: IdtRecord, index: int) -> tuple[list[dict[str, Any]], dict[str, Decimal], dict[str, Any]]:
     point = record.envelope.series[0].points[index]
     composition = point.composition if isinstance(point.composition, Composition) else record.envelope.composition
     if not isinstance(composition, Composition):
         raise ExportRefusal(ExportReason.COMPOSITION, "no resolved mole-fraction composition")
-    entries: dict[str, float] = {}
-    thermo: dict[str, Decimal] = {}
+    material: list[tuple[str, str, Decimal]] = []
     exact_total = Decimal(0)
+    identity_lookups: set[tuple[str, str, str]] = set()
     identifiers = record.species_identifiers
     if isinstance(record, ChemkedIdtRecord):
         # parse_idt_record emits one series point per YAML row, in source order.
@@ -143,9 +146,6 @@ def _composition(record: IdtRecord, index: int) -> tuple[list[dict[str, Any]], d
             continue  # T3 requires positive entries; exact zero carries no material.
         if exact > 1:
             raise ExportRefusal(ExportReason.COMPOSITION, "source mole fractions must not exceed one")
-        amount = _float_value(
-            exact, ExportReason.COMPOSITION, "source fraction is not representable as a positive T3 fraction"
-        )
         with localcontext() as ctx:
             ctx.prec = units._CONVERT_PRECISION
             ctx.rounding = ROUND_HALF_EVEN
@@ -154,9 +154,15 @@ def _composition(record: IdtRecord, index: int) -> tuple[list[dict[str, Any]], d
         for name, kind, identifier in identifiers:
             if name != component.species_raw_name:
                 continue
-            smiles = (
-                chem.canonical_smiles(identifier.raw) if kind == "smiles" else chem.smiles_from_inchi(identifier.raw)
-            )
+            if kind == "smiles":
+                smiles = chem.canonical_smiles(identifier.raw)
+            elif chem.INCHIKEY_PATTERN.fullmatch(identifier.raw):
+                inchi = chem.inchi_from_inchikey(identifier.raw)
+                smiles = chem.smiles_from_inchi(inchi) if inchi is not None else None
+                if smiles is not None and inchi is not None:
+                    identity_lookups.add((component.species_raw_name, identifier.raw, inchi))
+            else:
+                smiles = chem.smiles_from_inchi(identifier.raw)
             if smiles:
                 smiles_set.add(smiles)
         if len(smiles_set) != 1:
@@ -164,16 +170,30 @@ def _composition(record: IdtRecord, index: int) -> tuple[list[dict[str, Any]], d
                 ExportReason.NO_SMILES, f"{component.species_raw_name}: absent or conflicting source identity"
             )
         (smiles,) = smiles_set
-        if smiles in entries:
+        if any(existing == smiles for existing, _, _ in material):
             raise ExportRefusal(ExportReason.COMPOSITION, "positive unique SMILES mole fractions required")
-        entries[smiles] = amount
-        thermo[component.species_raw_name] = exact
+        material.append((smiles, component.species_raw_name, exact))
     with localcontext() as ctx:
         ctx.prec = units._CONVERT_PRECISION
         ctx.rounding = ROUND_HALF_EVEN
-        outside_source_tolerance = abs(exact_total - Decimal(1)) > Decimal("0.000001")
-    if not entries or outside_source_tolerance:
+        source_deviation = abs(exact_total - Decimal(1))
+    if not material or source_deviation > _ROUNDING_SOURCE_SUM_TOLERANCE:
         raise ExportRefusal(ExportReason.COMPOSITION, "mole fractions must sum to one")
+    renormalized = source_deviation > _EXISTING_SOURCE_SUM_TOLERANCE
+    exact_amounts = [amount for _, _, amount in material]
+    if renormalized:
+        with localcontext() as ctx:
+            ctx.prec = units._CONVERT_PRECISION
+            ctx.rounding = ROUND_HALF_EVEN
+            exact_amounts = [amount / exact_total for amount in exact_amounts]
+            exact_amounts[-1] += Decimal(1) - sum(exact_amounts, Decimal(0))
+    entries: dict[str, float] = {}
+    thermo: dict[str, Decimal] = {}
+    for (smiles, species, _), exact in zip(material, exact_amounts, strict=True):
+        entries[smiles] = _float_value(
+            exact, ExportReason.COMPOSITION, "source fraction is not representable as a positive T3 fraction"
+        )
+        thermo[species] = exact
     # A separate transport check, after source admission: T3 consumes these floats.
     with localcontext() as ctx:
         ctx.prec = units._CONVERT_PRECISION
@@ -182,7 +202,15 @@ def _composition(record: IdtRecord, index: int) -> tuple[list[dict[str, Any]], d
         outside_t3_tolerance = abs(represented_total - Decimal(1)) > Decimal.from_float(1e-6)
     if outside_t3_tolerance:
         raise ExportRefusal(ExportReason.COMPOSITION, "T3 fraction representation must sum to one")
-    return [{"smiles": key, "mole_fraction": value} for key, value in sorted(entries.items())], thermo
+    provenance: dict[str, Any] = {}
+    if renormalized:
+        provenance["composition"] = {"source_total": format(exact_total, "f"), "renormalized": True}
+    if identity_lookups:
+        provenance["identity_lookups"] = [
+            {"species": species, "inchikey": inchikey, "inchi": inchi}
+            for species, inchikey, inchi in sorted(identity_lookups)
+        ]
+    return [{"smiles": key, "mole_fraction": value} for key, value in sorted(entries.items())], thermo, provenance
 
 
 def _quantity(value: MeasuredValue, units: str) -> dict[str, Any]:
@@ -201,7 +229,7 @@ def _point(record: IdtRecord, index: int, include_derived_labels: bool) -> tuple
     ignition = record.ignition
     if ignition.target is IgnitionTarget.OHEX or ignition.criterion is IgnitionCriterion.RELATIVE_CONCENTRATION:
         raise ExportRefusal(ExportReason.IGNITION_DEFINITION, f"{ignition.target.value}/{ignition.criterion.value}")
-    composition, thermo = _composition(record, index)
+    composition, thermo, source_provenance = _composition(record, index)
     series = record.envelope.series[0]
     point = series.points[index]
     values = {c.axis_id: c.value for c in (*series.constants, *point.coordinates)}
@@ -233,6 +261,7 @@ def _point(record: IdtRecord, index: int, include_derived_labels: bool) -> tuple
         "idt": {"value": idt, "units": "s"},
         "source": {"doi": record.citation_doi, "record": locator},
     }
+    output["source"].update(source_provenance)
     history, state = point_history(record, index)
     basis = "stated"
     if history is not None:
