@@ -299,19 +299,21 @@ class TestRcmConditions:
     def test_shock_tubes_carry_no_rcm_evidence(self) -> None:
         assert isinstance(_parse("x00000070_p.xml").rcm_conditions, Absent)
 
-    def test_real_mbar_member_is_refused_as_pre_compression(self) -> None:
-        # x40001039: 586 mbar / 354 K, and a history that compresses from 1.0 to ~0.1 --
-        # the pressure unit binds first (no unmapped_unit), then the conditions are refused.
-        with pytest.raises(RespecthRefusal) as caught:
-            _parse("x40001039.xml")
-        assert caught.value.reason is RespecthRefusalReason.RCM_PRE_COMPRESSION_CONDITIONS
-        assert "dg2" in caught.value.detail
+    def test_real_mbar_member_maps_initial_conditions_and_history(self) -> None:
+        record = _parse("x40001039.xml")
+        assert record.rcm_conditions.state == "pre_compression"
+        assert record.end_of_compression_basis == "derived-isentropic"
+        assert record.rcm_states[0].initial_temperature.raw_text == "354"
+        assert record.rcm_states[0].initial_pressure.raw_text == "586"
+        assert record.rcm_conditions.histories[0].history.compression_time_derived
+        assert record.skipped_data_groups == ()
+        assert replay_idt_record(record, _member("x40001039.xml")).verified
 
-    def test_a_compressing_history_is_refused(self) -> None:
+    def test_a_compressing_history_maps(self) -> None:
         data = _member("x40001058_19.xml").replace(b"<x9>1.0034797</x9>", b"<x9>0.9034797</x9>")
-        with pytest.raises(RespecthRefusal) as caught:
-            _parse("x40001058_19.xml", data)
-        assert caught.value.reason is RespecthRefusalReason.RCM_PRE_COMPRESSION_CONDITIONS
+        record = _parse("x40001058_19.xml", data)
+        assert record.rcm_conditions.state == "pre_compression"
+        assert replay_idt_record(record, data).verified
 
     def test_no_history_cannot_identify_the_conditions(self) -> None:
         data = _member("x40001058_19.xml")
@@ -353,7 +355,7 @@ class TestRcmConditions:
         )
         report = replay_idt_record(forged, data)
         assert not report.verified
-        assert any("rcm_pre_compression_conditions" in finding for finding in report.findings)
+        assert any("rcm_conditions" in finding for finding in report.findings)
 
 
 class TestImplausibleTemperature:
@@ -415,7 +417,7 @@ class TestOtherRealMembers:
         record = _parse("x40001058_19.xml", data)
         (pressure,) = (c.value for c in record.envelope.series[0].points[0].coordinates if c.axis_id == "pressure")
         assert (pressure.raw_text, pressure.unit_normalized) == ("11044", "mbar")
-        assert pressure.conversion_table_sha256 == units.TABLE_V2.sha256
+        assert pressure.conversion_table_sha256 == units.TABLE_V5.sha256
         converted = units.convert(
             pressure.canonical_decimal_value,
             quantity=QuantityKind.PRESSURE,
@@ -523,7 +525,7 @@ class TestRefusals:
         assert self._refused("x00000070_p.xml", data).reason is RespecthRefusalReason.UNMAPPED_IGNITION_DEFINITION
 
     def test_unmapped_unit(self) -> None:
-        data = _member("x00000070_p.xml").replace(b'units="atm"', b'units="Torr"')
+        data = _member("x00000070_p.xml").replace(b'units="atm"', b'units="psi"')
         assert self._refused("x00000070_p.xml", data).reason is RespecthRefusalReason.UNMAPPED_UNIT
 
     def test_unmapped_common_property(self) -> None:
@@ -1280,8 +1282,8 @@ class TestQueryEdges:
         path.write_bytes(data)
         manifest = load_manifest(_write_manifest(tmp_path / "m.json", [archive], "http://127.0.0.1:9/{osf_file_id}"))
         loaded = load_idt_records(manifest, cache_root=tmp_path / "cache", download=False)
-        assert [record.record_doi.raw for record in loaded.records] == ["10.24388/x40001058_19"]
-        assert dict(loaded.refusals) == {"rcm_pre_compression_conditions": 1}
+        assert [record.record_doi.raw for record in loaded.records] == ["10.24388/x40001039", "10.24388/x40001058_19"]
+        assert dict(loaded.refusals) == {}
 
     def test_fuel_filter_and_a_record_without_composition(self) -> None:
         from carmel.services.respecth_query import find_records

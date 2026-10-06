@@ -25,10 +25,10 @@ never a guess:
   :func:`replay_idt_record` lists the assumption. Any other stated mode (incident shock) is refused.
 - ignition definition: target ``p``/``OH``/``OH*``/``OHEX`` x criterion ``d/dt max``/``max``/
   ``relative concentration`` (the last with its ``amount`` in ``unitless``).
-- units: whatever :data:`carmel.services.units.TABLE_V2` cannot bind (e.g. ``Torr``).
+- units: whatever :data:`carmel.services.units.TABLE_V5` cannot bind.
 - properties and data groups: anything outside T, P, initial composition, the ignition delay,
-  and its evaluated relative standard deviation -- except an RCM volume-history group
-  (``time`` + ``volume``), which is recorded as skipped rather than ingested.
+  its evaluated relative standard deviation and grounded RCM compression histories.
+  Existing postcompression expansion traces are recorded as skipped, with stated P/T.
 
 No quality/"unreliable" flag is carried: no member of either pinned archive has one.
 """
@@ -39,7 +39,7 @@ import hashlib
 import re
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 from xml.etree import ElementTree
@@ -82,6 +82,21 @@ from carmel.schemas.datasets import (
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
 from carmel.services.numeric import GlyphHealth, SourceContext, Unresolvable, normalize_numeric_span
+from carmel.services.rcm_history import (
+    HistoryRefusal,
+    RcmHistory,
+    RcmState,
+    history_refusal,
+    in_si_decimal,
+    sample_decimals,
+)
+from carmel.services.rcm_thermo import (
+    EXTRAPOLATED_EOC_BASIS,
+    NASA7,
+    check_initial_temperature,
+    isentropic_eoc,
+    solver_composition,
+)
 from carmel.services.respecth_archive import PinnedArchive, RespecthError
 from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
 from carmel.services.units import QuantityKind
@@ -115,12 +130,16 @@ __all__ = [
     "replay_idt_record",
 ]
 
+_SPECIES_IDENTIFIER_KEYS: tuple[tuple[str, Literal["smiles", "inchi"]], ...] = (
+    ("SMILES", "smiles"),
+    ("InChI", "inchi"),
+)
+
 RECORD_NODE_ID = "record"
 """The single source-graph node every RKD envelope holds."""
 
-#: The conversion table this lane binds against: TABLE_V1 plus the RKD spellings
-#: ``"mole fraction"`` and ``"unitless"``.
-_TABLE = units.TABLE_V2
+#: The current database table, including exact rational Torr conversion.
+_TABLE = units.TABLE_V5
 
 #: A database field is read as-is: no glyph damage is possible in parsed XML text, so the
 #: healthy (all-false) assessment is the honest one. Any repair the numeral grammar would
@@ -153,10 +172,15 @@ class RespecthRefusalReason(StrEnum):
     UNREADABLE_VALUE = "unreadable_value"
     SCHEMA_REJECTED = "schema_rejected"
     RCM_PRE_COMPRESSION_CONDITIONS = "rcm_pre_compression_conditions"
-    """The RCM record's P/T start a volume history that compresses: they are pre-compression
-    conditions, and the ignition state needs a volume-history simulation (slice S4)."""
+    """Legacy stored-census reason; compression histories now map or use specific history refusals."""
     RCM_CONDITIONS_UNIDENTIFIED = "rcm_conditions_unidentified"
     """No volume history covers every point, so P/T cannot be told apart from pre-compression ones."""
+    HISTORY_NONMONOTONE_TIME = "history_nonmonotone_time"
+    HISTORY_NONPOSITIVE_VOLUME = "history_nonpositive_volume"
+    HISTORY_NO_COMPRESSION = "history_no_compression"
+    HISTORY_MISSING_INITIAL_STATE = "history_missing_initial_state"
+    HISTORY_INVALID = "history_invalid"
+    RCM_THERMO_UNAVAILABLE = "rcm_thermo_unavailable"
     IMPLAUSIBLE_IGNITION_TEMPERATURE = "implausible_ignition_temperature"
     """A condition temperature below :data:`MIN_IGNITION_TEMPERATURE_K` -- a backstop, whatever the apparatus."""
     UNMAPPED_EXPERIMENT_TYPE = "unmapped_experiment_type"
@@ -414,17 +438,18 @@ class RcmVolumeHistory(BaseModel):
     """``@dataPointLink``: ``all``, or the 1-based points it applies to (``1;2;``)."""
     first_volume: RecordText
     minimum_volume: RecordText
+    history: RcmHistory | None = None
     """The smallest volume anywhere in the history; not below ``first_volume`` means no compression."""
 
 
 class RcmConditions(BaseModel):
-    """Why an RCM record's P/T are taken as END-of-compression conditions (RKD v2.5: they are
-    the state at the start of the volume history, which may begin before compression or at its
-    end). Mapped only when every point is covered by a history with no compression phase."""
+    """How an RCM record's P/T relate to compression (RKD v2.5: the state at the start of the
+    volume history). ``end_of_compression``: no history compresses, so P/T are EOC values.
+    ``pre_compression``: every history compresses, so P/T are initial, not ignition, conditions."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    state: Literal["end_of_compression"] = "end_of_compression"
+    state: Literal["end_of_compression", "pre_compression"] = "end_of_compression"
     histories: tuple[RcmVolumeHistory, ...] = Field(min_length=1)
 
 
@@ -458,10 +483,34 @@ class RespecthIdtRecord(BaseModel):
     """Present exactly for an RCM: the evidence its P/T are end-of-compression conditions."""
     skipped_data_groups: tuple[SkippedDataGroup, ...]
     envelope: DatasetEnvelope
+    rcm_states: tuple[RcmState, ...] = ()
+    species_identifiers: tuple[tuple[str, Literal["smiles", "inchi"], RecordText], ...] = ()
+    end_of_compression_basis: Literal["stated", "derived-isentropic"] | None = None
 
     @model_validator(mode="after")
     def _node_matches_pin(self) -> RespecthIdtRecord:
         check_record_node(self.envelope, self.archive)
+        precompression = not isinstance(self.rcm_conditions, Absent) and self.rcm_conditions.state == "pre_compression"
+        if precompression:
+            if self.apparatus.device_class is not ReactorType.RCM or len(self.rcm_states) != len(
+                self.envelope.series[0].points
+            ):
+                raise ValueError("pre-compression histories require an RCM and one initial state per point")
+            assert isinstance(self.rcm_conditions, RcmConditions)
+            covered: set[int] = set()
+            for item in self.rcm_conditions.histories:
+                linked = _linked_points(item.point_link.raw, len(self.rcm_states))
+                if item.history is None or covered & linked:
+                    raise ValueError("pre-compression histories must cover points exactly once")
+                covered |= linked
+            if covered != set(range(1, len(self.rcm_states) + 1)):
+                raise ValueError("pre-compression histories must cover every point")
+            if self.end_of_compression_basis != "derived-isentropic" or any(
+                state.eoc_basis == "stated" for state in self.rcm_states
+            ):
+                raise ValueError("pre-compression ReSpecTh labels must be marked derived-isentropic")
+        elif self.rcm_states or self.end_of_compression_basis == "derived-isentropic":
+            raise ValueError("derived states require pre-compression histories")
         return self
 
     @property
@@ -509,6 +558,8 @@ def _parse_xml(data: bytes) -> ElementTree.Element:
     a UTF-16/32 BOM or NUL-interleaved text, bytes that do not decode, or an encoding
     declaration naming another charset -- is refused before the scan, never re-decoded.
     """
+    if len(data) > 4 * 1024 * 1024:
+        raise RespecthRefusal(RespecthRefusalReason.MALFORMED_XML, "record exceeds 4 MiB")
     declared = _ENCODING_DECL_RE.match(data)
     if declared is not None and declared.group(1).lower() not in {b"utf-8", b"utf8"}:
         raise RespecthRefusal(
@@ -641,7 +692,7 @@ def _measured(
         reason = normalized.reason if isinstance(normalized, Unresolvable) else f"needs repairs {normalized.repairs}"
         raise RespecthRefusal(
             RespecthRefusalReason.UNREADABLE_VALUE,
-            f"value {value.raw!r} at {value.ref.locator} is not a clean numeral: {reason}",
+            f"{value.ref.locator} reads {value.raw!r}; not a clean numeral: {reason}",
         )
     try:
         canonical = canonical_decimal(normalized.text)
@@ -663,15 +714,31 @@ def _measured(
     )
 
 
+def _base_decimal(value: MeasuredValue) -> Decimal:
+    """Refuse an unconvertible native value without aborting archive intake."""
+    try:
+        return in_si_decimal(value)
+    except Exception as exc:
+        raise RespecthRefusal(
+            RespecthRefusalReason.UNMAPPED_UNIT,
+            f"cannot convert {value.quantity_kind.value} to its base unit: {exc}",
+        ) from exc
+
+
+def _normalize_apparatus_text(raw: str | None) -> str:
+    """Normalize apparatus lookup text while its grounded evidence stays verbatim."""
+    return (raw or "").strip()
+
+
 def _apparatus(doc: _Doc) -> Apparatus:
     apparatus = _one(doc.root, "apparatus")
     kind = doc.text(_one(apparatus, "kind"))
     mode_element = _optional_one(apparatus, "mode")
     mode: RecordText | None = None
-    if mode_element is not None and (mode_element.text or "").strip():
+    if mode_element is not None and _normalize_apparatus_text(mode_element.text):
         mode = doc.text(mode_element)
     extra = {child.tag for child in apparatus} - {"kind", "mode"}
-    key = (kind.raw.strip(), mode.raw.strip() if mode is not None else None)
+    key = (_normalize_apparatus_text(kind.raw), _normalize_apparatus_text(mode.raw) if mode is not None else None)
     device_class = APPARATUS_DEVICE_CLASSES.get(key)
     if device_class is None or extra:
         raise RespecthRefusal(
@@ -736,7 +803,7 @@ def _ignition(doc: _Doc) -> IgnitionDefinition:
             fraction = canonical_decimal(amount.raw)
         except CanonicalDecimalError as exc:
             raise RespecthRefusal(unmapped, f"relative-concentration amount {amount.raw!r} is not a decimal") from exc
-        if amount_units.raw != "unitless" or not 0 < float(fraction) <= 1:
+        if amount_units.raw != "unitless" or not 0 < Decimal(fraction) <= 1:
             raise RespecthRefusal(
                 unmapped,
                 f"relative-concentration amount {amount.raw!r} {amount_units.raw!r} is not a unitless fraction",
@@ -915,36 +982,84 @@ def _data_groups(doc: _Doc) -> tuple[ElementTree.Element, tuple[SkippedDataGroup
     return idt_groups[0], tuple(skipped)
 
 
+def _apparatus_conditions(doc: _Doc, group: ElementTree.Element, device: ReactorType) -> RcmConditions | Absent:
+    if device is ReactorType.RCM:
+        return _rcm_conditions(doc, group)
+    _, skipped = _data_groups(doc)
+    if skipped:
+        raise RespecthRefusal(RespecthRefusalReason.HISTORY_INVALID, "a volume history requires an RCM apparatus")
+    return Absent(reason=AbsenceReason.NOT_APPLICABLE)
+
+
 def _rcm_conditions(doc: _Doc, idt_group: ElementTree.Element) -> RcmConditions:
     """Identify an RCM record's P/T as end-of-compression conditions, or refuse."""
     point_count = len(idt_group.findall("dataPoint"))
     covered: set[int] = set()
     histories: list[RcmVolumeHistory] = []
     for group in doc.root.findall("dataGroup"):
-        names = {prop.get("id", ""): prop.get("name", "") for prop in group.findall("property")}
-        if frozenset(names.values()) != _VOLUME_HISTORY_COLUMNS:
+        properties = group.findall("property")
+        names = tuple(prop.get("name", "") for prop in properties)
+        if frozenset(names) != _VOLUME_HISTORY_COLUMNS:
             continue
-        (volume_id,) = (column_id for column_id, name in names.items() if name == "volume")
-        cells = [_one(row, volume_id) for row in group.findall("dataPoint")]
+        if len(properties) != 2 or names.count("time") != 1 or names.count("volume") != 1:
+            raise RespecthRefusal(RespecthRefusalReason.HISTORY_INVALID, "one time and volume column required")
+        props = {prop.get("name"): prop for prop in properties}
+        time_id = props["time"].get("id", "")
+        volume_id = props["volume"].get("id", "")
+        if not time_id.strip() or not volume_id.strip() or time_id == volume_id:
+            raise RespecthRefusal(
+                RespecthRefusalReason.HISTORY_INVALID, "history time/volume ids must be distinct and non-empty"
+            )
+        rows = []
+        for point in group.findall("dataPoint"):
+            row = {cell.tag: cell for cell in point}
+            if set(row) != {time_id, volume_id} or len(row) != len(point) or point.attrib:
+                raise RespecthRefusal(
+                    RespecthRefusalReason.HISTORY_INVALID,
+                    f"{doc.path(point)} requires exactly one cell for each history id and no undeclared cells",
+                )
+            rows.append(row)
+        cells = [row[volume_id] for row in rows]
         if not cells:
             raise RespecthRefusal(RespecthRefusalReason.INCOMPLETE_RECORD, f"{doc.path(group)} holds no data points")
-        volumes = [_decimal_cell(doc, cell) for cell in cells]
+        time_prop, volume_prop = props["time"], props["volume"]
+        time_samples = tuple(
+            _measured(doc.text(row[time_id]), doc.attribute(time_prop, "units"), QuantityKind.TIME) for row in rows
+        )
+        volume_samples = tuple(
+            _measured(doc.text(cell), doc.attribute(volume_prop, "units"), QuantityKind.VOLUME) for cell in cells
+        )
+        try:
+            _, volumes = sample_decimals(time_samples, volume_samples)
+        except HistoryRefusal as exc:
+            raise RespecthRefusal(RespecthRefusalReason(exc.reason.value), str(exc)) from exc
+        except Exception as exc:
+            raise RespecthRefusal(RespecthRefusalReason.UNMAPPED_UNIT, f"history conversion failed: {exc}") from exc
+        if len(set(volumes)) == 1:
+            raise RespecthRefusal(RespecthRefusalReason.HISTORY_NO_COMPRESSION, "flat history has no compression")
         smallest = min(range(len(volumes)), key=volumes.__getitem__)
         group_id = doc.attribute(group, "id")
+        history: RcmHistory | None = None
         if volumes[smallest] < volumes[0]:
-            raise RespecthRefusal(
-                RespecthRefusalReason.RCM_PRE_COMPRESSION_CONDITIONS,
-                f"volume history {group_id.raw!r} compresses ({cells[0].text!r} down to {cells[smallest].text!r}), "
-                "so P/T are pre-compression conditions; the ignition state needs a volume-history simulation (S4)",
-            )
+            try:
+                history = RcmHistory(time=time_samples, volume=volume_samples)
+            except ValidationError as exc:
+                refusal = history_refusal(exc)
+                raise RespecthRefusal(RespecthRefusalReason(refusal.reason.value), str(refusal)) from exc
         link = doc.attribute(group, "dataPointLink")
-        covered |= _linked_points(link.raw, point_count)
+        linked = _linked_points(link.raw, point_count)
+        if not linked <= set(range(1, point_count + 1)) or covered & linked:
+            raise RespecthRefusal(
+                RespecthRefusalReason.RCM_CONDITIONS_UNIDENTIFIED, "history links must cover points exactly once"
+            )
+        covered |= linked
         histories.append(
             RcmVolumeHistory(
                 group_id=group_id,
                 point_link=link,
                 first_volume=doc.text(cells[0]),
                 minimum_volume=doc.text(cells[smallest]),
+                history=history,
             )
         )
     missing = sorted(set(range(1, point_count + 1)) - covered)
@@ -954,17 +1069,14 @@ def _rcm_conditions(doc: _Doc, idt_group: ElementTree.Element) -> RcmConditions:
             f"no volume history covers point(s) {missing}, so their P/T cannot be told apart from "
             "pre-compression conditions",
         )
-    return RcmConditions(histories=tuple(histories))
-
-
-def _decimal_cell(doc: _Doc, cell: ElementTree.Element) -> Decimal:
-    try:
-        value = Decimal((cell.text or "").strip())
-    except InvalidOperation:
-        value = Decimal("NaN")
-    if not value.is_finite():
-        raise RespecthRefusal(RespecthRefusalReason.UNREADABLE_VALUE, f"{doc.path(cell)} reads {cell.text!r}")
-    return value
+    has_history = [item.history is not None for item in histories]
+    if any(has_history) and not all(has_history):
+        raise RespecthRefusal(
+            RespecthRefusalReason.RCM_CONDITIONS_UNIDENTIFIED, "mixed initial and compressed conditions"
+        )
+    return RcmConditions(
+        state="pre_compression" if any(has_history) else "end_of_compression", histories=tuple(histories)
+    )
 
 
 def _linked_points(link: str, point_count: int) -> set[int]:
@@ -976,24 +1088,21 @@ def _linked_points(link: str, point_count: int) -> set[int]:
     return {int(part) for part in parts}
 
 
+def _check_plausible_kelvin(kelvin: Decimal | float, source: str) -> None:
+    if kelvin < MIN_IGNITION_TEMPERATURE_K:
+        raise RespecthRefusal(
+            RespecthRefusalReason.IMPLAUSIBLE_IGNITION_TEMPERATURE,
+            f"condition temperature {source} is below {MIN_IGNITION_TEMPERATURE_K} K, "
+            "implausible as an ignition condition",
+        )
+
+
 def _check_plausible_temperature(series: Series) -> None:
     """Backstop: refuse any condition temperature below :data:`MIN_IGNITION_TEMPERATURE_K`."""
     values = [c.value for c in series.constants if c.axis_id == "temperature"]
     values += [c.value for point in series.points for c in point.coordinates if c.axis_id == "temperature"]
     for value in values:
-        kelvin = units.convert(
-            value.canonical_decimal_value,
-            quantity=QuantityKind.TEMPERATURE,
-            from_unit=value.unit_normalized,
-            to_unit="K",
-            table=_TABLE,
-        )
-        if Decimal(kelvin.exact) < MIN_IGNITION_TEMPERATURE_K:
-            raise RespecthRefusal(
-                RespecthRefusalReason.IMPLAUSIBLE_IGNITION_TEMPERATURE,
-                f"condition temperature {value.raw_text} {value.unit_raw} is below {MIN_IGNITION_TEMPERATURE_K} K, "
-                "implausible as an ignition condition",
-            )
+        _check_plausible_kelvin(_base_decimal(value), f"{value.raw_text} {value.unit_raw}")
 
 
 def _series(doc: _Doc, group: ElementTree.Element, common: _Common) -> tuple[Series, dict[str, RecordText]]:
@@ -1100,6 +1209,64 @@ def _check_format(doc: _Doc) -> None:
         raise RespecthRefusal(RespecthRefusalReason.NOT_IGNITION_DELAY, f"experimentType is {experiment_type!r}")
 
 
+def _condition_states(
+    series: Series, composition: Composition, conditions: RcmConditions | Absent
+) -> tuple[RcmState, ...]:
+    """Validate stated or derived ignition conditions identically for parse and replay."""
+    if isinstance(conditions, Absent) or conditions.state != "pre_compression":
+        _check_plausible_temperature(series)
+        return ()
+    mixture_exact = {
+        component.species_raw_name: _base_decimal(component.amount)
+        for component in composition.components
+        if not _base_decimal(component.amount).is_zero()
+    }
+    if any(key.upper() not in NASA7 for key in mixture_exact):
+        raise RespecthRefusal(
+            RespecthRefusalReason.RCM_THERMO_UNAVAILABLE, "initial mixture is outside the seven GRI30 species"
+        )
+    initial_states = []
+    for number, point in enumerate(series.points, start=1):
+        coordinates = {c.axis_id: c.value for c in (*series.constants, *point.coordinates)}
+        initial_kelvin = _base_decimal(coordinates["temperature"])
+        if initial_kelvin <= 0:
+            raise RespecthRefusal(
+                RespecthRefusalReason.HISTORY_MISSING_INITIAL_STATE, "initial temperature must be positive"
+            )
+        try:
+            history = next(
+                item.history
+                for item in conditions.histories
+                if number in _linked_points(item.point_link.raw, len(series.points))
+            )
+            assert history is not None
+            extrapolated = check_initial_temperature(
+                initial_kelvin, mixture_exact, volume_ratio=history.volume_ratio_decimal
+            )
+            mixture = solver_composition(mixture_exact)
+            state = RcmState(
+                initial_temperature=coordinates["temperature"],
+                initial_pressure=coordinates["pressure"],
+                eoc_basis=EXTRAPOLATED_EOC_BASIS if extrapolated else "derived-isentropic",
+            )
+            temperature, _ = isentropic_eoc(
+                float(_base_decimal(state.initial_temperature)),
+                float(_base_decimal(state.initial_pressure)),
+                history.volume_ratio,
+                mixture,
+            )
+        except ValidationError as exc:
+            refusal = history_refusal(exc)
+            raise RespecthRefusal(RespecthRefusalReason.HISTORY_MISSING_INITIAL_STATE, str(refusal)) from exc
+        except HistoryRefusal as exc:
+            raise RespecthRefusal(RespecthRefusalReason(exc.reason.value), str(exc)) from exc
+        except ValueError as exc:
+            raise RespecthRefusal(RespecthRefusalReason.RCM_THERMO_UNAVAILABLE, str(exc)) from exc
+        _check_plausible_kelvin(temperature, f"derived {temperature} K")
+        initial_states.append(state)
+    return tuple(initial_states)
+
+
 def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: str) -> RespecthIdtRecord:
     """Map one RKD ignition-delay member into a :class:`RespecthIdtRecord`.
 
@@ -1124,12 +1291,13 @@ def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: s
         common = _common(doc)
         group, skipped = _data_groups(doc)
         series, source_types = _series(doc, group, common)
-        rcm_conditions: RcmConditions | Absent = (
-            _rcm_conditions(doc, group)
-            if apparatus.device_class is ReactorType.RCM
-            else Absent(reason=AbsenceReason.NOT_APPLICABLE)
-        )
-        _check_plausible_temperature(series)
+        rcm_conditions = _apparatus_conditions(doc, group, apparatus.device_class)
+        states = _condition_states(series, common.composition, rcm_conditions)
+        precompression = not isinstance(rcm_conditions, Absent) and rcm_conditions.state == "pre_compression"
+        if precompression:
+            assert isinstance(rcm_conditions, RcmConditions)
+            ingested = {item.group_id.raw for item in rcm_conditions.histories}
+            skipped = tuple(item for item in skipped if item.group_id not in ingested)
         node = SourceNode(
             node_id=RECORD_NODE_ID,
             kind=SourceNodeKind.DATABASE_RECORD,
@@ -1168,6 +1336,14 @@ def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: s
             rcm_conditions=rcm_conditions,
             skipped_data_groups=skipped,
             envelope=envelope,
+            rcm_states=states,
+            species_identifiers=tuple(
+                (doc.attribute(link, "preferredKey").raw, kind, doc.attribute(link, key))
+                for link in doc.root.findall("commonProperties/property/component/speciesLink")
+                for key, kind in _SPECIES_IDENTIFIER_KEYS
+                if link.get(key)
+            ),
+            end_of_compression_basis="derived-isentropic" if precompression else None,
         )
     except ValidationError as exc:
         raise RespecthRefusal(RespecthRefusalReason.SCHEMA_REJECTED, str(exc)) from exc
@@ -1227,17 +1403,24 @@ def _replay_conditions(record: RespecthIdtRecord, root: ElementTree.Element) -> 
     """Re-derive the RCM end-of-compression verdict and the temperature backstop from the bytes."""
     findings: list[str] = []
     try:
-        _check_plausible_temperature(record.envelope.series[0])
         doc = _Doc.of(root)
         group, _ = _data_groups(doc)
-        expected: RcmConditions | None = (
-            _rcm_conditions(doc, group) if record.apparatus.device_class is ReactorType.RCM else None
-        )
+        common = _common(doc)
+        series, _ = _series(doc, group, common)
+        expected = _apparatus_conditions(doc, group, _apparatus(doc).device_class)
+        expected_states = _condition_states(series, common.composition, expected)
     except RespecthRefusal as exc:
         return [f"conditions do not re-map: {exc.reason.value}: {exc.detail}"]
+    except ValidationError as exc:
+        return [f"conditions do not re-map: {RespecthRefusalReason.SCHEMA_REJECTED.value}: {exc}"]
+    if expected_states and record.end_of_compression_basis != "derived-isentropic":
+        findings.append("end-of-compression basis does not re-derive as derived-isentropic")
+    if record.rcm_states != expected_states:
+        findings.append("RCM initial states do not re-derive")
     recorded = None if isinstance(record.rcm_conditions, Absent) else record.rcm_conditions
-    if recorded != expected:
-        findings.append(f"rcm_conditions {recorded!r} do not re-derive (the member gives {expected!r})")
+    expected_conditions = None if isinstance(expected, Absent) else expected
+    if recorded != expected_conditions:
+        findings.append(f"rcm_conditions {recorded!r} do not re-derive (the member gives {expected_conditions!r})")
     return findings
 
 
@@ -1277,6 +1460,8 @@ def replay_idt_record(record: RespecthIdtRecord, member_bytes: bytes) -> RecordR
     that text; and the mapped apparatus and ignition definition re-map from their raw text.
     ``verified`` is true only when at least one pair was checked and nothing disagreed.
     """
+    if len(member_bytes) > 4 * 1024 * 1024:
+        return RecordReplayReport(verified=False, checked=0, findings=("member exceeds 4 MiB",))
     actual_sha = hashlib.sha256(member_bytes).hexdigest()
     if actual_sha != record.member_sha256:
         return RecordReplayReport(
@@ -1290,9 +1475,27 @@ def replay_idt_record(record: RespecthIdtRecord, member_bytes: bytes) -> RecordR
         return RecordReplayReport(verified=False, checked=0, findings=(str(exc),))
 
     checked, findings = replay_grounded_text(record, root)
+    if (
+        record.species_identifiers
+        or record.end_of_compression_basis == "derived-isentropic"
+        or (not isinstance(record.rcm_conditions, Absent) and record.rcm_conditions.state == "pre_compression")
+    ):
+        doc = _Doc.of(root)
+        expected_identifiers = tuple(
+            (doc.attribute(link, "preferredKey").raw, kind, doc.attribute(link, key))
+            for link in root.findall("commonProperties/property/component/speciesLink")
+            for key, kind in _SPECIES_IDENTIFIER_KEYS
+            if link.get(key)
+        )
+        if record.species_identifiers != expected_identifiers:
+            findings.append("species identity associations do not re-derive")
 
-    kind = record.apparatus.kind_raw.raw.strip()
-    mode = None if isinstance(record.apparatus.mode_raw, Absent) else record.apparatus.mode_raw.raw.strip()
+    kind = _normalize_apparatus_text(record.apparatus.kind_raw.raw)
+    mode = (
+        None
+        if isinstance(record.apparatus.mode_raw, Absent)
+        else _normalize_apparatus_text(record.apparatus.mode_raw.raw)
+    )
     if APPARATUS_DEVICE_CLASSES.get((kind, mode)) is not record.apparatus.device_class:
         findings.append(f"apparatus ({kind!r}, {mode!r}) does not re-map to {record.apparatus.device_class.value!r}")
     expected_assumption = ASSUMED_APPARATUS_MODES.get((kind, None)) if mode is None else None
@@ -1303,16 +1506,15 @@ def replay_idt_record(record: RespecthIdtRecord, member_bytes: bytes) -> RecordR
             f"(the table gives {expected_assumption!r})"
         )
     stated_mode = evaluate_xpath(root, f"{record.apparatus.apparatus_xpath}/mode[1]")
-    if recorded_assumption is not None and (stated_mode or "").strip():
+    if recorded_assumption is not None and _normalize_apparatus_text(stated_mode):
         findings.append(f"apparatus mode is recorded as assumed, but the member states {stated_mode!r}")
     assumption = record.apparatus.assumption
     findings.extend(_replay_conditions(record, root))
-    targets = [part.strip() for part in record.ignition.target_raw.raw.split(";") if part.strip()]
-    if (
-        targets != [record.ignition.target.value]
-        or record.ignition.criterion_raw.raw != record.ignition.criterion.value
-    ):
-        findings.append("the ignition definition does not re-map from its raw text")
+    try:
+        if record.ignition != _ignition(_Doc.of(root)):
+            findings.append("the ignition definition does not re-map from its raw text")
+    except RespecthRefusal as exc:
+        findings.append(f"ignition definition does not re-map: {exc.reason.value}: {exc.detail}")
     if not isinstance(record.uncertainty, Absent) and (
         record.uncertainty.name_raw.raw,
         record.uncertainty.basis_raw.raw,

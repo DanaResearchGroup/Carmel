@@ -351,7 +351,7 @@ def test_non_numeric_rcm_volume_history_is_a_chemked_refusal_counted_by_loader(t
         ChemkedManifest("example.invalid/source", "a" * 40, files), cache_root=tmp_path, download=False
     )
     assert [record.path for record in loaded.records] == ["good.yaml"]
-    assert dict(loaded.refusals) == {"schema_rejected": 1}
+    assert dict(loaded.refusals) == {"history_invalid": 1}
 
 
 def test_empty_species_is_a_typed_refusal_counted_by_loader(tmp_path: Path) -> None:
@@ -377,7 +377,7 @@ def test_malformed_rcm_history_entry_is_a_typed_refusal_counted_by_loader(tmp_pa
     rows[0]["volume-history"] = {"values": [entry]}
     loaded = _load_good_and_bad(tmp_path, _yaml(document), "malformed-history.yaml")
     assert [record.path for record in loaded.records] == ["good.yaml"]
-    assert dict(loaded.refusals) == {"schema_rejected": 1}
+    assert dict(loaded.refusals) == {"history_invalid": 1}
 
 
 @pytest.mark.parametrize("field", ["pressure", "temperature", "ignition-delay"])
@@ -407,7 +407,7 @@ def test_multi_valued_species_amount_is_a_typed_refusal_counted_by_loader(tmp_pa
     assert dict(loaded.refusals) == {"incomplete_record": 1}
 
 
-def test_rcm_volume_history_without_values_is_accepted() -> None:
+def test_rcm_volume_history_without_values_is_refused() -> None:
     document = _document()
     apparatus = document["apparatus"]
     rows = document["datapoints"]
@@ -415,8 +415,9 @@ def test_rcm_volume_history_without_values_is_accepted() -> None:
     assert isinstance(rows, list) and isinstance(rows[0], dict)
     apparatus["kind"] = "rapid compression machine"
     rows[0]["volume-history"] = {"values": []}
-    record = parse_idt_record(_yaml(document), "empty-volume-history.yaml")
-    assert len(record.envelope.series[0].points) == 13
+    with pytest.raises(ChemkedRefusal) as caught:
+        parse_idt_record(_yaml(document), "empty-volume-history.yaml")
+    assert caught.value.reason is ChemkedRefusalReason.HISTORY_INVALID
 
 
 def test_non_mapping_datapoint_is_a_typed_refusal() -> None:
@@ -689,14 +690,14 @@ def test_sha_mismatch_refuses_replay_before_any_partial_check() -> None:
     assert caught.value.reason is ChemkedRefusalReason.INCOMPLETE_RECORD
 
 
-def test_precompression_rcm_history_refuses() -> None:
+def test_rcm_history_missing_units_refuses_as_history_invalid() -> None:
     raw = FIXTURE.read_bytes().replace(b"kind: shock tube", b"kind: rapid compression machine", 1)
     raw = raw.replace(
         b"  - temperature:",
         b"  - volume-history:\n      values:\n        - [0.0, 1.0]\n        - [1.0, 0.2]\n    temperature:",
         1,
     )
-    with pytest.raises(ChemkedRefusal, match="rcm_pre_compression_conditions"):
+    with pytest.raises(ChemkedRefusal, match="history_invalid"):
         parse_idt_record(raw, "precompression.yaml")
 
 

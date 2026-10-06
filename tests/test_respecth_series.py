@@ -129,7 +129,7 @@ class TestFixturesArePinnedMembers:
     @pytest.mark.parametrize("name", _MAPPED)
     def test_the_envelope_binds_table_v3_and_pins_the_member(self, name: str) -> None:
         record = _parse(name)
-        assert [table.sha256 for table in record.envelope.conversion_tables] == [units.TABLE_V3.sha256]
+        assert [table.sha256 for table in record.envelope.conversion_tables] == [units.TABLE_V5.sha256]
         assert record.member_sha256 == MEMBERS[name][1]
         assert record.archive.archive_name == MEMBERS[name][0]
         assert record.citation_doi == f"10.24388/{name.removesuffix('.xml')}"
@@ -155,7 +155,7 @@ class TestLaminarBurningVelocity:
             quantity=QuantityKind.VELOCITY,
             from_unit=velocity.unit_normalized,
             to_unit="m/s",
-            table=units.TABLE_V3,
+            table=units.TABLE_V5,
         )
         assert Decimal(converted.exact) == Decimal("1.64")
 
@@ -381,10 +381,10 @@ class TestTicketRefusals:
         assert "plasma reactor measurement" in refusal.detail
 
     def test_a_unit_with_no_exact_si_scale(self) -> None:
-        data = _mutated(_JSR, b'units="atm"', b'units="Torr"')
+        data = _mutated(_JSR, b'units="atm"', b'units="psi"')
         refusal = _refused(_JSR, data)
         assert refusal.reason is _R.UNMAPPED_UNIT
-        assert "Torr" in refusal.detail
+        assert "psi" in refusal.detail
 
     def test_the_real_burner_member_is_refused_by_type(self) -> None:
         refusal = _refused(_BURNER)
@@ -774,7 +774,7 @@ class TestReplayCatchesForgery:
         assert report.findings == ("apparatus does not re-derive from the member",)
 
     def test_bytes_that_hash_right_but_no_longer_map(self) -> None:
-        data = _mutated(_JSR, b'units="atm"', b'units="Torr"')
+        data = _mutated(_JSR, b'units="atm"', b'units="psi"')
         record = _parse(_JSR)
         node = record.envelope.source_graph.nodes[0].model_copy(update={"sha256": hashlib.sha256(data).hexdigest()})
         graph = record.envelope.source_graph.model_copy(update={"nodes": (node,)})

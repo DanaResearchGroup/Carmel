@@ -28,8 +28,8 @@ one species.
 Everything this lane does not map is a typed :class:`RespecthRefusal` with no partial output:
 an experiment type outside :data:`EXPERIMENT_KINDS` (burner-stabilized flame speciation among
 them, see :data:`REFUSED_EXPERIMENT_TYPES`), an apparatus outside
-:data:`APPARATUS_DEVICE_CLASSES`, a unit :data:`carmel.services.units.TABLE_V3` cannot bind
-(``Torr``, ``mPa``), a property, column, top-level element or timeshift the lane does not know,
+:data:`APPARATUS_DEVICE_CLASSES`, a unit :data:`carmel.services.units.TABLE_V5` cannot bind
+(``mPa``), a property, column, top-level element or timeshift the lane does not know,
 and a condition stated both as a constant and as a column. No quality flag is carried: the
 records have none.
 """
@@ -119,8 +119,8 @@ __all__ = [
     "replay_series_record",
 ]
 
-#: TABLE_V2 plus the exact ``mm/s`` velocity scale some flame-speed columns use.
-_TABLE = units.TABLE_V3
+#: The database lane's current table, preserving V1..V4 for existing records.
+_TABLE = units.TABLE_V5
 
 
 class RespecthExperimentKind(StrEnum):

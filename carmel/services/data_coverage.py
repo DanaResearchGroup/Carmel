@@ -10,11 +10,15 @@ from importlib import resources
 from pathlib import Path
 from typing import Any, Protocol
 
+import yaml
+
 from carmel.services.chemked import ChemkedRefusal, parse_idt_record, replay_idt_record
 from carmel.services.chemked_archive import ChemkedManifest, fetch_file
 from carmel.services.chemked_archive import load_manifest as load_chemked_manifest
 from carmel.services.respecth import (
     RespecthRefusal,
+    _normalize_apparatus_text,
+    _parse_xml,
 )
 from carmel.services.respecth import (
     parse_idt_record as parse_respecth_idt,
@@ -63,7 +67,11 @@ class CoverageRow:
 
 
 def _manifest_sha256(package: str, filename: str) -> str:
-    return hashlib.sha256(resources.files(package).joinpath(filename).read_bytes()).hexdigest()
+    with resources.files(package).joinpath(filename).open("rb") as handle:
+        raw = handle.read(4 * 1024 * 1024 + 1)
+    if len(raw) > 4 * 1024 * 1024:
+        raise ValueError("coverage manifest exceeds 4 MiB")
+    return hashlib.sha256(raw).hexdigest()
 
 
 def _respecth_identity(manifest: RespecthManifest) -> dict[str, Any]:
@@ -92,6 +100,10 @@ def _points(record: _DatasetRecord) -> int:
 def _new_rows(respecth: RespecthManifest, chemked: ChemkedManifest) -> dict[str, CoverageRow]:
     respecth_identity = _respecth_identity(respecth)
     return {
+        "ChemKED|ignition_delay_rcm": CoverageRow("ChemKED", "ignition_delay_rcm", identity=_chemked_identity(chemked)),
+        "ReSpecTh|ignition_delay_rcm": CoverageRow(
+            "ReSpecTh", "ignition_delay_rcm", identity=respecth_identity, license=respecth.license
+        ),
         "ChemKED|ignition_delay": CoverageRow("ChemKED", "ignition_delay", identity=_chemked_identity(chemked)),
         "ReSpecTh|ignition_delay": CoverageRow(
             "ReSpecTh", "ignition_delay", identity=respecth_identity, license=respecth.license
@@ -108,6 +120,34 @@ def _new_rows(respecth: RespecthManifest, chemked: ChemkedManifest) -> dict[str,
     }
 
 
+def _is_rcm(raw: bytes, source: str) -> bool:
+    if len(raw) > 4 * 1024 * 1024:
+        return False
+    if source == "ChemKED":
+        try:
+            document = yaml.load(raw, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+        except yaml.YAMLError, ValueError:
+            return False
+        return (
+            isinstance(document, dict)
+            and isinstance(document.get("apparatus"), dict)
+            and document["apparatus"].get("kind") == "rapid compression machine"
+        )
+    try:
+        return _normalize_apparatus_text(_parse_xml(raw).findtext("apparatus/kind")) == "rapid compression machine"
+    except RespecthRefusal:
+        return False
+
+
+def _copy_rcm_counts(row: CoverageRow, rcm: CoverageRow, before: tuple[int, int, int, int, Counter[str]]) -> None:
+    files, points, passed, failed, refusals = before
+    rcm.files_mapped += row.files_mapped - files
+    rcm.points_mapped += row.points_mapped - points
+    rcm.replay_passed += row.replay_passed - passed
+    rcm.replay_failed += row.replay_failed - failed
+    rcm.refusals.update(row.refusals - refusals)
+
+
 def build_coverage(*, cache_root: Path, download: bool = True) -> list[CoverageRow]:
     """Load every pinned file/member, map it, and replay every mapped record."""
     respecth = load_respecth_manifest()
@@ -115,11 +155,21 @@ def build_coverage(*, cache_root: Path, download: bool = True) -> list[CoverageR
     rows = _new_rows(respecth, chemked)
     chemked_row = rows["ChemKED|ignition_delay"]
     for item in chemked.files:
+        raw = fetch_file(item, chemked, cache_root, download=download)
+        rcm = _is_rcm(raw, "ChemKED")
+        before = (
+            chemked_row.files_mapped,
+            chemked_row.points_mapped,
+            chemked_row.replay_passed,
+            chemked_row.replay_failed,
+            chemked_row.refusals.copy(),
+        )
         try:
-            raw = fetch_file(item, chemked, cache_root, download=download)
             chemked_record = parse_idt_record(raw, item.path, item.sha256)
         except ChemkedRefusal as exc:
             chemked_row.refusals[exc.reason.value] += 1
+            if rcm:
+                _copy_rcm_counts(chemked_row, rows["ChemKED|ignition_delay_rcm"], before)
             continue
         chemked_row.files_mapped += 1
         chemked_row.points_mapped += _points(chemked_record)
@@ -129,6 +179,8 @@ def build_coverage(*, cache_root: Path, download: bool = True) -> list[CoverageR
             chemked_row.replay_failed += 1
         else:
             chemked_row.replay_passed += 1
+        if rcm:
+            _copy_rcm_counts(chemked_row, rows["ChemKED|ignition_delay_rcm"], before)
 
     for archive in respecth.archives:
         archive_bytes = fetch_archive(archive, manifest=respecth, cache_root=cache_root, download=download)
@@ -139,10 +191,21 @@ def build_coverage(*, cache_root: Path, download: bool = True) -> list[CoverageR
                 rows["ReSpecTh|unclassified"].refusals[exc.reason.value] += 1
                 continue
             if experiment_type == "ignition delay measurement":
+                rcm = _is_rcm(raw, "ReSpecTh")
+                row = rows["ReSpecTh|ignition_delay"]
+                before = (
+                    row.files_mapped,
+                    row.points_mapped,
+                    row.replay_passed,
+                    row.replay_failed,
+                    row.refusals.copy(),
+                )
                 try:
                     respecth_record = parse_respecth_idt(raw, archive, member_path)
                 except RespecthRefusal as exc:
-                    rows["ReSpecTh|ignition_delay"].refusals[exc.reason.value] += 1
+                    row.refusals[exc.reason.value] += 1
+                    if rcm:
+                        _copy_rcm_counts(row, rows["ReSpecTh|ignition_delay_rcm"], before)
                     continue
                 row = rows["ReSpecTh|ignition_delay"]
                 row.files_mapped += 1
@@ -152,6 +215,8 @@ def build_coverage(*, cache_root: Path, download: bool = True) -> list[CoverageR
                     row.replay_passed += 1
                 else:
                     row.replay_failed += 1
+                if rcm:
+                    _copy_rcm_counts(row, rows["ReSpecTh|ignition_delay_rcm"], before)
                 continue
             kind = EXPERIMENT_KINDS.get(experiment_type)
             if kind is None:

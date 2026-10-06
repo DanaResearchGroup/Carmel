@@ -30,8 +30,10 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from importlib import resources
 from io import BytesIO
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+
+from carmel.services.archive_unpack import _is_absolute_member_name
 
 __all__ = [
     "DATA_CACHE_ENV_VAR",
@@ -132,11 +134,11 @@ def load_manifest(path: Path | None = None) -> RespecthManifest:
             version or size, or a licence other than CC-BY-4.0.
     """
     try:
-        raw = (
-            path.read_bytes()
-            if path is not None
-            else resources.files(_MANIFEST_PACKAGE).joinpath(_MANIFEST_RESOURCE).read_bytes()
-        )
+        source = path if path is not None else resources.files(_MANIFEST_PACKAGE).joinpath(_MANIFEST_RESOURCE)
+        with source.open("rb") as handle:
+            raw = handle.read(_MAX_MEMBER_BYTES + 1)
+        if len(raw) > _MAX_MEMBER_BYTES:
+            raise ManifestError("ReSpecTh manifest exceeds 4 MiB")
         data = json.loads(raw)
     except (OSError, ValueError) as exc:
         raise ManifestError(f"cannot read the ReSpecTh manifest: {exc}") from exc
@@ -282,7 +284,13 @@ def iter_xml_members(archive_bytes: bytes) -> Iterator[tuple[str, bytes]]:
     for info in bundle.infolist():
         if info.is_dir() or not info.filename.endswith(".xml"):
             continue
+        _require_member_path(info.filename)
         yield info.filename, _read_info(bundle, info)
+
+
+def _require_member_path(name: str) -> None:
+    if "\\" in name or _is_absolute_member_name(name) or ".." in PurePosixPath(name).parts:
+        raise ArchiveIntegrityError(f"unsafe archive member path {name!r}")
 
 
 def read_member(archive_bytes: bytes, member_path: str, member_sha256: str) -> bytes:
@@ -294,6 +302,7 @@ def read_member(archive_bytes: bytes, member_path: str, member_sha256: str) -> b
     Raises:
         ArchiveIntegrityError: No such member, or its bytes do not hash to ``member_sha256``.
     """
+    _require_member_path(member_path)
     bundle = _open_zip(archive_bytes)
     try:
         info = bundle.getinfo(member_path)
