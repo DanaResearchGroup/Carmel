@@ -81,7 +81,7 @@ from carmel.schemas.datasets import (
 )
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal, canonical_json_bytes
-from carmel.services.numeric import GlyphHealth, SourceContext, Unresolvable, normalize_numeric_span
+from carmel.services.numeric import GlyphHealth, SourceContext, Unresolvable
 from carmel.services.rcm_history import (
     HistoryRefusal,
     RcmHistory,
@@ -98,7 +98,15 @@ from carmel.services.rcm_thermo import (
     solver_composition,
 )
 from carmel.services.respecth_archive import PinnedArchive, RespecthError
-from carmel.services.semantic_deps import CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID, current_sha_for
+from carmel.services.semantic_deps import (
+    CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
+    STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
+    current_sha_for,
+)
+from carmel.services.structured_numeric import (
+    is_structured_trailing_dot_numeral,
+    normalize_structured_numeric_span,
+)
 from carmel.services.units import QuantityKind
 
 __all__ = [
@@ -667,10 +675,13 @@ def _optional_one(parent: ElementTree.Element, tag: str) -> ElementTree.Element 
 # --------------------------------------------------------------------------- mapping
 
 
-def _repair_dependency() -> SemanticDependencyUse:
+def _repair_dependency(*, structured: bool) -> SemanticDependencyUse:
+    dependency_id = (
+        STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID if structured else CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID
+    )
     return SemanticDependencyUse(
-        dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
-        content_sha256=current_sha_for(CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID),
+        dependency_id=dependency_id,
+        content_sha256=current_sha_for(dependency_id),
         input_sha256=Absent(reason=AbsenceReason.NOT_APPLICABLE),
     )
 
@@ -685,7 +696,7 @@ def _measured(
         raise RespecthRefusal(
             RespecthRefusalReason.UNMAPPED_UNIT, f"unit {unit.raw!r} at {unit.ref.locator} for {quantity.value}: {exc}"
         ) from exc
-    normalized = normalize_numeric_span(
+    normalized = normalize_structured_numeric_span(
         value.raw, source_context=SourceContext.OPERATOR_RAW, glyph_health=_CLEAN_GLYPH_HEALTH
     )
     if isinstance(normalized, Unresolvable) or normalized.repairs:
@@ -704,7 +715,7 @@ def _measured(
         raw_text=value.raw,
         canonical_decimal_value=canonical,
         repairs=(),
-        repair_dependency=_repair_dependency(),
+        repair_dependency=_repair_dependency(structured=is_structured_trailing_dot_numeral(value.raw)),
         quantity_kind=quantity,
         unit_raw=unit.raw,
         unit_normalized=unit_normalized,

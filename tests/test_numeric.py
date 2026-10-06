@@ -41,6 +41,7 @@ from carmel.services.numeric import (
     parse_numeric_span,
     unit_boundary_violation,
 )
+from carmel.services.structured_numeric import normalize_structured_numeric_span
 
 #: A GlyphHealth for a document that shows no sign of dash corruption at all: it
 #: contains real en dashes and no bare digit-e-digit tokens.
@@ -421,6 +422,32 @@ class TestRepairNames:
 
 
 class TestNormalizeNumericSpan:
+    def test_flat_pdf_trailing_dot_remains_refused_as_possible_sentence_punctuation(self) -> None:
+        result = normalize_numeric_span("707.", source_context=SourceContext.FLAT_PDF_TEXT, glyph_health=HEALTHY)
+        assert isinstance(result, Unresolvable)
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [("+707.", "707"), ("-707.e+2", "-707e+2")],
+    )
+    def test_structured_trailing_dot_policy_allows_signs_and_exponents(self, raw: str, expected: str) -> None:
+        result = normalize_structured_numeric_span(raw, source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, NormalizedNumeral)
+        assert result.raw == raw
+        assert result.text == expected
+
+    def test_structured_policy_still_refuses_an_empty_field(self) -> None:
+        result = normalize_structured_numeric_span("", source_context=SourceContext.OPERATOR_RAW, glyph_health=HEALTHY)
+        assert isinstance(result, Unresolvable)
+
+    def test_structured_wrapper_propagates_shared_refusal_with_the_original_raw_span(self) -> None:
+        result = normalize_structured_numeric_span(
+            "707.e2", source_context=SourceContext.FLAT_PDF_TEXT, glyph_health=SUSPECT
+        )
+        assert isinstance(result, Unresolvable)
+        assert result.raw == "707.e2"
+        assert "dash corruption is suspected" in result.reason
+
     def test_significance_is_preserved_trailing_zeros_survive_unlike_the_float_path(self) -> None:
         # This is the whole point of the split: parse_numeric_span would collapse
         # "7.000Eþ17" to the float 7e17, silently destroying the 4-significant-figure

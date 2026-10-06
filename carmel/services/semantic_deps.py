@@ -107,6 +107,7 @@ from carmel.services.dataset_store import canonical_json_bytes
 
 __all__ = [
     "CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID",
+    "STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID",
     "GLYPH_HEALTH_DEPENDENCY_ID",
     "EXTRACT_TEXT_DEPENDENCY_ID",
     "FRAGMENT_GEOMETRY_DEPENDENCY_ID",
@@ -154,6 +155,17 @@ particular) that need to pin ``MeasuredValue.repair_dependency`` to exactly
 this dependency never re-type the string literal by hand -- see
 :func:`_seed_registry`, which uses this same constant rather than an inline
 copy.
+"""
+
+STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID = "carmel.numeric.structured_span_repair"
+"""The stable ``dependency_id`` for the structured-record trailing-dot policy.
+
+This is separate from :data:`CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID`, not a
+supersession of it: ordinary values continue to cite the shipped context-free
+identity byte-for-byte, while only values that exercise the structured-only
+trailing-dot branch cite this dependency. Its content address is a composite
+covering both the shared numeric repair chain and the structured wrapper that
+selects and preserves that spelling.
 """
 
 EXTRACT_TEXT_DEPENDENCY_ID = "carmel.extraction.extract_text"
@@ -920,6 +932,25 @@ def compose_component_sha(components: Mapping[str, str]) -> str:
 # registry row that uses it.
 _CONTEXT_FREE_SPAN_REPAIR_SHA256 = "b29d34f644deff19a68e618340408839a138186a5a4229fed8babd4f22fedabb"
 
+# HARDCODED and append-only on the same terms as the literal above. This is a
+# composite because structured_numeric.py delegates to numeric.py across a module
+# boundary that compute_dependency_sha intentionally cannot traverse:
+#   shared = compute_dependency_sha(
+#       inspect.getsource(carmel.services.numeric),
+#       ["normalize_numeric_span", "REPAIR_NAMES"],
+#   )
+#   structured = compute_dependency_sha(
+#       inspect.getsource(carmel.services.structured_numeric),
+#       ["normalize_structured_numeric_span", "is_structured_trailing_dot_numeral"],
+#   )
+#   compose_component_sha(
+#       {"context_free_span_repair_sha256": shared, "structured_numeric_sha256": structured}
+#   )
+# tests/test_semantic_deps.py::test_structured_dependency_sha_matches_a_hardcoded_pin
+# re-verifies the composite on every test run. Add a new row if either component
+# changes; never edit this literal or the row that cites it once shipped.
+_STRUCTURED_NUMERIC_SPAN_REPAIR_SHA256 = "0796a78bbb936bbf10852382aac74dc106bbad82213e7dd0824cce1f5e51993c"
+
 # HARDCODED for exactly the same reasons as the literal above; the whole comment
 # there applies here verbatim. Independently verified once via:
 #   compute_dependency_sha(
@@ -1394,6 +1425,12 @@ def _seed_registry() -> tuple[SemanticDependencyDefinition, ...]:
         SemanticDependencyDefinition(
             dependency_id=CONTEXT_FREE_SPAN_REPAIR_DEPENDENCY_ID,
             content_sha256=_CONTEXT_FREE_SPAN_REPAIR_SHA256,
+            input_policy=InputPolicy.SIBLING_FIELD,
+            is_current=True,
+        ),
+        SemanticDependencyDefinition(
+            dependency_id=STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID,
+            content_sha256=_STRUCTURED_NUMERIC_SPAN_REPAIR_SHA256,
             input_policy=InputPolicy.SIBLING_FIELD,
             is_current=True,
         ),

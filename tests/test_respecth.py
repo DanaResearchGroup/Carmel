@@ -63,6 +63,7 @@ from carmel.services.respecth_archive import (
     read_member,
 )
 from carmel.services.respecth_query import parse_window
+from carmel.services.semantic_deps import STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID
 from carmel.services.units import QuantityKind
 
 FIXTURES = Path(__file__).parent / "fixtures" / "respecth"
@@ -159,6 +160,54 @@ class TestShockTubeRoundTrip:
         assert report.findings == ()
         assert report.verified
         assert report.checked == len(list(iter_source_refs(record)))
+
+    def test_trailing_dot_xml_value_preserves_raw_text_value_and_replays(self) -> None:
+        data = _member("x00000070_p.xml").replace(b"<x2>265.1</x2>", b"<x2>707.</x2>", 1)
+        record = _parse("x00000070_p.xml", data)
+        observation = record.envelope.series[0].points[0].observations[0]
+        assert not isinstance(observation.value, Absent)
+        assert observation.value.raw_text == "707."
+        assert observation.value.canonical_decimal_value == "707"
+        assert observation.value.repair_dependency.dependency_id == STRUCTURED_NUMERIC_SPAN_REPAIR_DEPENDENCY_ID
+        report = replay_idt_record(record, data)
+        assert report.findings == ()
+        assert report.verified
+
+    def test_structured_dependency_accepts_a_database_record_with_an_arbitrary_node_id(self) -> None:
+        data = _member("x00000070_p.xml").replace(b"<x2>265.1</x2>", b"<x2>707.</x2>", 1)
+        payload = _parse("x00000070_p.xml", data).envelope.model_dump()
+
+        def rename(value: object) -> None:
+            if isinstance(value, dict):
+                for key, child in value.items():
+                    if key == "node_id" and child == "record":
+                        value[key] = "respecth-member"
+                    else:
+                        rename(child)
+            elif isinstance(value, (list, tuple)):
+                for child in value:
+                    rename(child)
+
+        rename(payload)
+        envelope = DatasetEnvelope.model_validate(payload)
+        assert envelope.source_graph.nodes[0].node_id == "respecth-member"
+
+    def test_jats_node_named_record_with_experiment_xpath_cannot_claim_structured_dependency(self) -> None:
+        data = _member("x00000070_p.xml").replace(b"<x2>265.1</x2>", b"<x2>707.</x2>", 1)
+        payload = _parse("x00000070_p.xml", data).envelope.model_dump()
+        node = payload["source_graph"]["nodes"][0]
+        node["kind"] = SourceNodeKind.JATS_XML
+        node["origin"] = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+        payload["series"][0]["source_form"] = SourceForm.TEXTUAL
+        with pytest.raises(ValueError, match="structured numeric values require a DATABASE_RECORD node"):
+            DatasetEnvelope.model_validate(payload)
+
+    def test_structured_dependency_requires_structured_record_source_form(self) -> None:
+        data = _member("x00000070_p.xml").replace(b"<x2>265.1</x2>", b"<x2>707.</x2>", 1)
+        payload = _parse("x00000070_p.xml", data).envelope.model_dump()
+        payload["series"][0]["source_form"] = SourceForm.TEXTUAL
+        with pytest.raises(ValueError, match="requires source_form=STRUCTURED_RECORD"):
+            DatasetEnvelope.model_validate(payload)
 
     def test_the_node_pins_the_member_inside_its_archive(self) -> None:
         record = _parse("x00000070_p.xml")
