@@ -19,6 +19,44 @@ from carmel.services.t3_export import export_idt
 from tests.test_rcm_export import chemked_history, respecth_record
 
 
+def assert_t3_v1_point_mapping_shapes(point):
+    """Mirror T3 v1's ExperimentalIDTPoint mapping classes from t3/schema.py."""
+    assert set(point) <= {
+        "temperature",
+        "pressure",
+        "composition",
+        "apparatus",
+        "ignition_definition",
+        "idt",
+        "uncertainty",
+        "source",
+        "volume_history",
+        "initial_temperature",
+        "initial_pressure",
+    }
+    quantity_keys = {"value", "units"}
+    for name in ("temperature", "pressure", "idt", "uncertainty", "initial_temperature", "initial_pressure"):
+        if name in point:
+            # ExperimentalTemperature, ExperimentalPressure, ExperimentalTime,
+            # and ExperimentalUncertainty.
+            assert set(point[name]) <= quantity_keys
+    for entry in point["composition"]:
+        # ExperimentalCompositionEntry.
+        assert set(entry) <= {"smiles", "mole_fraction"}
+    # ExperimentalIgnitionDefinition and ExperimentalSourceReference.
+    assert set(point["ignition_definition"]) <= {"target", "type"}
+    assert set(point["source"]) == {"doi", "record"}
+    if "volume_history" in point:
+        # ExperimentalVolumeHistory, ExperimentalHistoryTimes,
+        # ExperimentalHistoryVolumes, and ExperimentalCompressionTime.
+        history = point["volume_history"]
+        assert set(history) <= {"time", "volume", "compression_time"}
+        assert set(history["time"]) <= {"values", "units"}
+        assert set(history["volume"]) <= {"values", "units"}
+        if "compression_time" in history:
+            assert set(history["compression_time"]) <= quantity_keys
+
+
 def uncertainty_record(lower, upper, *, basis=UncertaintyBasis.RELATIVE, idt="0.01", lower_unit=None, upper_unit=None):
     record, _ = respecth_record()
     series = record.envelope.series[0]
@@ -153,9 +191,34 @@ def test_rounding_level_composition_is_normalized_with_source_provenance():
     assert report["exported"] == 1 and not report["refused"]
     point = payload["points"][0]
     assert sum(item["mole_fraction"] for item in point["composition"]) == pytest.approx(1)
-    assert point["source"]["composition"] == {"source_total": "0.99999", "renormalized": True}
+    assert set(point["source"]) == {"doi", "record"}
+    assert point["source"]["record"].endswith(";composition=renormalized;source_total=0.99999")
     recovered = sorted(Decimal(str(item["mole_fraction"])) * Decimal("0.99999") for item in point["composition"])
     assert recovered == pytest.approx(sorted((Decimal("0.01869"), Decimal("0.2056"), Decimal("0.7757"))))
+
+
+def test_provenance_points_conform_to_t3_v1_mapping_shapes():
+    pytest.importorskip("rdkit")
+    rounding_doc = yaml.safe_load(chemked_history())
+    for component, fraction in zip(
+        rounding_doc["datapoints"][0]["composition"]["species"],
+        ("0.01869", "0.2056", "0.7757"),
+        strict=True,
+    ):
+        component["amount"] = [fraction]
+    key_doc = yaml.safe_load(chemked_history())
+    key_doc["datapoints"][0]["composition"]["species"][0]["InChI"] = "IMNFDUFMRHMDMM-UHFFFAOYSA-N"
+
+    payload, report = export_idt(
+        [
+            parse_idt_record(yaml.safe_dump(rounding_doc).encode(), "rounding.yaml"),
+            parse_idt_record(yaml.safe_dump(key_doc).encode(), "key.yaml"),
+        ]
+    )
+
+    assert report["exported"] == 2 and not report["refused"]
+    for point in payload["points"]:
+        assert_t3_v1_point_mapping_shapes(point)
 
 
 def test_composition_beyond_rounding_tolerance_still_refuses():
@@ -222,17 +285,27 @@ def test_inchikey_lookup_is_recorded_and_unknown_keys_still_refuse():
     record = parse_idt_record(yaml.safe_dump(doc).encode(), "key.yaml")
     payload, report = export_idt([record])
     assert report["exported"] == 1 and not report["refused"]
-    assert payload["points"][0]["source"]["identity_lookups"] == [
-        {
-            "species": "2-butanol",
-            "inchikey": key,
-            "inchi": "InChI=1S/C7H16/c1-3-5-7-6-4-2/h3-7H2,1-2H3",
-        }
-    ]
+    source = payload["points"][0]["source"]
+    assert set(source) == {"doi", "record"}
+    assert source["record"].endswith(f";identity=inchikey:2-butanol:{key}")
 
     component["InChI"] = "AAAAAAAAAAAAAA-BBBBBBBBBB-C"
     unknown = parse_idt_record(yaml.safe_dump(doc).encode(), "unknown-key.yaml")
     assert export_idt([unknown])[1]["refused"] == {"no_confident_smiles": 1}
+
+
+def test_inchikey_record_suffix_percent_encodes_species_separators():
+    pytest.importorskip("rdkit")
+    key = "IMNFDUFMRHMDMM-UHFFFAOYSA-N"
+    doc = yaml.safe_load(chemked_history())
+    component = doc["datapoints"][0]["composition"]["species"][0]
+    component["species-name"] = "fuel;alias:key=value%"
+    component["InChI"] = key
+
+    payload, report = export_idt([parse_idt_record(yaml.safe_dump(doc).encode(), "escaped-key.yaml")])
+
+    assert report["exported"] == 1 and not report["refused"]
+    assert payload["points"][0]["source"]["record"].endswith(f";identity=inchikey:fuel%3Balias%3Akey%3Dvalue%25:{key}")
 
 
 def test_two_species_resolving_to_one_structure_still_refuse():

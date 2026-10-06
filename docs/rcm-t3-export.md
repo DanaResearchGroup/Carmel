@@ -22,8 +22,10 @@ refusals. Source fractions and ignition definitions are preserved; a missing or
 conflicting chemical identity, incompatible definition or invalid mole-fraction
 sum is refused. Exact decimal totals in the newly admitted rounding band
 `1e-6 < |total - 1| <= 1e-5` are normalized for both export and thermodynamic
-derivation. Each affected point records `source.composition.source_total` and
-`source.composition.renormalized`; totals farther from unity remain refused.
+derivation. Each affected point appends
+`;composition=renormalized;source_total=<exact decimal>` to `source.record`;
+totals farther from unity remain refused. The `source` mapping itself stays
+within T3 v1's `{doi, record}` shape.
 The pinned-corpus survey found 30 ChemKED point compositions and 12 ReSpecTh
 record compositions at the `1e-5` band, while the next band begins at `1e-4`.
 Previously admitted totals within `1e-6` retain their source representation for
@@ -34,8 +36,13 @@ composition refusals; exact zeros carry no material and are omitted.
 An identifier matching the InChIKey shape is resolved only through the pinned
 offline `carmel/data/inchikey_to_inchi.json` table. RDKit re-derives every key
 from its InChI when the table loads; a mismatched table refuses to load and an
-unknown key remains `no_confident_smiles`. A successful lookup is recorded in
-the point's `source.identity_lookups` provenance.
+unknown key remains `no_confident_smiles`. A successful lookup appends
+`;identity=inchikey:<species>:<InChIKey>` to `source.record`. One suffix is
+written per resolved species, sorted by species name and key. Species names are
+UTF-8 percent-encoded (including `;`, `=`, `:`, and `%`), so the semicolon
+record-field delimiter, equals key/value delimiter, and colon identity-field
+delimiter remain unambiguous. The InChI stays recoverable from the pinned table
+and is not repeated in the record.
 
 Compression histories retain all source samples, their source time axis and the
 initial temperature/pressure. End of compression uses the source's explicit
