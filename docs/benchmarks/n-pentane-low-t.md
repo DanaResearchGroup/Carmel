@@ -50,9 +50,16 @@ or conflicting labels are unresolved rather than guessed.
 
 Every mapped member is a v_new entry accepted by the shared graph classifier with
 `carbon_count=5`. Absence is established against v_old by canonical, direction-free
-reaction signatures plus an exhaustive scan of the old straight-chain C5 formula/label
-grammar. The old conventional OOQOOH-to-ketohydroperoxide channels are mapped and
-rejected as negatives. Exact-label absence alone is never the test.
+reaction signatures plus an exhaustive elemental-formula profile scan in both reaction
+orientations. Because `nc5_49` has no THERMO block, its condensed NUIG labels supply an
+independent formula inventory; the reproduction accepts it only after all 1,593 baseline
+reactions balance. The old conventional OOQOOH-to-ketohydroperoxide channels are mapped and
+rejected as negatives. All 293 old species are inventoried: 31 structures resolve under
+the tested grammar and the other 262 are explicitly `UNRESOLVED`, never omitted or
+guessed, but all 293 retain their elemental formulas. Every old reaction whose formula
+profile could match a scored member must be fully
+structurally resolved before the reproduction can pass. Exact-label absence alone is
+never the test.
 
 ## Frozen whole-study split
 

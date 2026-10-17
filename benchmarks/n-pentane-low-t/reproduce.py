@@ -18,8 +18,11 @@ from carmel.benchmarks.chemkin import mechanism  # noqa: E402
 from carmel.benchmarks.n_heptane import _read_pinned_root_file  # noqa: E402
 from carmel.benchmarks.n_pentane import (  # noqa: E402
     Contract,
+    formula_inventory,
     load_contract,
     load_split,
+    require_structural_absence,
+    series_counts,
 )
 from carmel.benchmarks.structure import (  # noqa: E402
     classify,
@@ -81,9 +84,18 @@ def pin(raw: bytes, *, filename: str, source_url: str, retrieval_date: str) -> d
     }
 
 
-def species_record(label: str) -> dict[str, object]:
+def species_record(label: str, formula: dict[str, int], *, required: bool = True) -> dict[str, object]:
     smiles = pentane_low_temperature_species(label)
-    require(smiles is not None, f"UNRESOLVED member species: {label}")
+    if smiles is None:
+        require(not required, f"UNRESOLVED member species: {label}")
+        return {
+            "label": label,
+            "status": "UNRESOLVED",
+            "smiles": None,
+            "formula": formula,
+            "source": "no confident structure in the tested low-temperature label grammar",
+        }
+    require(dict(features(smiles).atoms) == formula, f"structure formula conflicts with mechanism composition: {label}")
     return {
         "label": label,
         "status": "RESOLVED",
@@ -104,6 +116,7 @@ def mapped_ground_truth(
 ) -> tuple[list[dict[str, object]], list[dict[str, object]], list[dict[str, object]]]:
     old_labels, old_reactions = mechanism(old_source)
     _, new_reactions = mechanism(new_source)
+    old_formulas = formula_inventory(old_labels, old_reactions)
     old_structures = {
         label: pentane_low_temperature_species(label)
         for label in old_labels
@@ -131,6 +144,15 @@ def mapped_ground_truth(
             continue
         signature = reaction_signature(left, right)
         require(signature not in old_signatures, f"baseline reaction signature already present: {reaction['equation']}")
+        candidate_formulas = {name: dict(features(structures[name]).atoms) for name in names}
+        require_structural_absence(
+            reaction,
+            candidate_formulas,
+            signature,
+            old_reactions,
+            old_formulas,
+            old_structures,
+        )
         labels.update(names)
         for class_id in classes:
             members[class_id].append(
@@ -141,8 +163,12 @@ def mapped_ground_truth(
             )
     expected = {"G1": 30, "G2": 30, "G3": 12, "G4": 12}
     require({key: len(value) for key, value in members.items()} == expected, "member counts changed")
-    new_species = [species_record(label) for label in sorted(labels)]
-    old_species = [species_record(label) for label in sorted(old_structures)]
+    new_species = []
+    for label in sorted(labels):
+        smiles = pentane_low_temperature_species(label)
+        assert smiles is not None
+        new_species.append(species_record(label, dict(features(smiles).atoms)))
+    old_species = [species_record(label, old_formulas[label], required=False) for label in sorted(old_labels)]
     ground_truth = []
     for class_id in RULES:
         class_members = members[class_id]
@@ -229,7 +255,7 @@ def frozen_split(archive_bytes: bytes) -> dict[str, object]:
                 record = parser(raw, parser_archive, name)
                 acceptance = "supported"
                 refusal_reason = None
-                low_rows, low_observations = _temperature_counts(record)
+                _, _, low_rows, low_observations = series_counts(record)
             except RespecthRefusal as exc:
                 acceptance = "refused"
                 refusal_reason = exc.reason.value

@@ -601,6 +601,548 @@
   ],
   "old_species": [
     {
+      "label": "AC3H5OOH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "AR",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "Ar": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H3CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 4,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H3CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 3,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H3COCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H3O1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H3OOH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H4O1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H4O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5CHCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5COCH2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5COCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 6,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H5OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C2H6",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 6
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H4-A",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H4-P",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H5-A",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H5-S",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H5-T",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H51-2,3OOH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H52-1,3OOH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H5O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H5OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6CHO-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6CHO-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6CHO-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6O1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6O1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH1-2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH1-3O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH2-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH2-1O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H6OOH2-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C3H8",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 8
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "C3KET12",
       "status": "RESOLVED",
       "smiles": "CC(C=O)OO",
@@ -634,6 +1176,446 @@
       "source": "tested N?CnKETij grammar"
     },
     {
+      "label": "C4H10",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 10
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H6",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 6
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H71-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H71-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H71-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H71-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H72-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H7O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8O1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8O1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8O1-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8O2-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OH-1O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OH-2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-3O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH1-4O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-1O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-3O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C4H8OOH2-4O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10O1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10O1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10O1-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10O1-5",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10O2-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10O2-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 10,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10OH-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10OH-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H10OOH1-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "C5H10OOH1-2O2",
       "status": "RESOLVED",
       "smiles": "CCCC(COO)O[O]",
@@ -643,6 +1625,17 @@
         "H": 11
       },
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "C5H10OOH1-3O2",
@@ -656,6 +1649,17 @@
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
     },
     {
+      "label": "C5H10OOH1-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "C5H10OOH1-4O2",
       "status": "RESOLVED",
       "smiles": "CC(CCCOO)O[O]",
@@ -665,6 +1669,17 @@
         "H": 11
       },
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-5",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "C5H10OOH1-5O2",
@@ -678,6 +1693,17 @@
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
     },
     {
+      "label": "C5H10OOH2-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "C5H10OOH2-1O2",
       "status": "RESOLVED",
       "smiles": "CCCC(CO[O])OO",
@@ -687,6 +1713,17 @@
         "H": 11
       },
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "C5H10OOH2-3O2",
@@ -700,6 +1737,17 @@
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
     },
     {
+      "label": "C5H10OOH2-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "C5H10OOH2-4O2",
       "status": "RESOLVED",
       "smiles": "CC(CC(C)OO)O[O]",
@@ -709,6 +1757,17 @@
         "H": 11
       },
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-5",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "C5H10OOH2-5O2",
@@ -722,6 +1781,17 @@
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
     },
     {
+      "label": "C5H10OOH3-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "C5H10OOH3-1O2",
       "status": "RESOLVED",
       "smiles": "CCC(CCO[O])OO",
@@ -731,6 +1801,17 @@
         "H": 11
       },
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH3-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "C5H10OOH3-2O2",
@@ -744,6 +1825,763 @@
       "source": "tested Bugler/NUIG straight-chain C5 label grammar"
     },
     {
+      "label": "C5H11-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O2-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O2-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O2-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O2H-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 12,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O2H-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 12,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H11O2H-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 12,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H81-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 8
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H91-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H91-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H91-5",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H92-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H92-5",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H9O1-3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "C5H9O2-4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CC4H8O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2(S)",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2CCH2OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2CH2CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2CH2COCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2CHOOHCOCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 2,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 2,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2OCH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2OCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH2OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CHCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 4,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CHCOCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CHOOCOCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CO2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CO3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3CO3H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3COCH2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3COCH2O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3COCH2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 5,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3COCH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3COCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 4,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCH2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCH2O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCH2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 6,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCH3",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH3OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 4,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CH4",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "CO2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "H": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "H2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "H": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "H2O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "H": 2,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "H2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "H": 2,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HCCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 1,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HCCOH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 2,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 1,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HE",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "He": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "HO2",
       "status": "RESOLVED",
       "smiles": "[O]O",
@@ -752,6 +2590,537 @@
         "H": 1
       },
       "source": "explicit small-radical structure"
+    },
+    {
+      "label": "HO2CH2OCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 4,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HO2CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 2,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HOC3H6O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HOCH2O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HOCH2O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HOCH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 4,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HOCH2OCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "HOCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 2,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H5CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H5CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H5O2HCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H5OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H6CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H6CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H7",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H7CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H7CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H7O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H7O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC3H7O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 8,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H10",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 10
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H6OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H7",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H7O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H7OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H7OOH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8O2H-I",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8O2H-T",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8OOH-IO2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H8OOH-TO2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H9",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H9O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H9O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4H9O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 10,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4KETII",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IC4KETIT",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IIC4H7Q2-I",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IIC4H7Q2-T",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "IO2C4H8OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "N2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "N": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "NC3H7",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "NC3H7CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "NC3H7CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "NC3H7O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "NC3H7O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "NC3H7O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 8,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "NC4KET12",
@@ -818,6 +3187,16 @@
         "H": 8
       },
       "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5H12",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 12
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     },
     {
       "label": "NC5KET12",
@@ -930,6 +3309,134 @@
       "source": "tested N?CnKETij grammar"
     },
     {
+      "label": "O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2C2H4OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2C4H8CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2C5H10OH-1",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2C5H10OH-2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 11,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2CH2OCH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 5
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 1,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "O2HC4H8CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "OCH2O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 3,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "OCH2OCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 3,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "OCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 1,
+        "H": 1,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
       "label": "OH",
       "status": "RESOLVED",
       "smiles": "[OH]",
@@ -938,6 +3445,311 @@
         "H": 1
       },
       "source": "explicit small-radical structure"
+    },
+    {
+      "label": "PC2H4OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "PC4H8OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "PC4H9",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "PC4H9O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "PC4H9O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "PC4H9O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 10,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC2H4OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 2,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC3H5CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 6,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC3H5CO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 5,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC4H8OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC4H9",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC4H9O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC4H9O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "SC4H9O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 10,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC3H6CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC3H6O2CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC3H6O2HCO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 3
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC3H6OCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 7,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC3H6OH",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 3,
+        "H": 7,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC3H6OHCHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 8,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H8CHO",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 5,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H8O2H-I",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H8OOH-IO2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H9",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H9O",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 1
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H9O2",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TC4H9O2H",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 10,
+        "O": 2
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
+    },
+    {
+      "label": "TIC4H7Q2-I",
+      "status": "UNRESOLVED",
+      "smiles": null,
+      "formula": {
+        "C": 4,
+        "H": 9,
+        "O": 4
+      },
+      "source": "no confident structure in the tested low-temperature label grammar"
     }
   ],
   "ground_truth": [

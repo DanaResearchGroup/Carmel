@@ -4,17 +4,25 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import TypedDict
 
 from carmel.benchmarks.n_heptane import _read_pinned_root_file
 
 
-def mechanism(source: Path | bytes) -> tuple[list[str], list[dict[str, object]]]:
+class ChemkinReaction(TypedDict):
+    equation: str
+    line: int
+    reactants: tuple[str, ...]
+    products: tuple[str, ...]
+
+
+def mechanism(source: Path | bytes) -> tuple[list[str], list[ChemkinReaction]]:
     """Return unique species labels and kinetic reaction entries from mechanism bytes."""
     display = str(source) if isinstance(source, Path) else "<verified snapshot>"
     raw_source = source if isinstance(source, bytes) else _read_pinned_root_file(source)
     mode = None
     species: list[str] = []
-    reactions: list[dict[str, object]] = []
+    reactions: list[ChemkinReaction] = []
     for number, raw in enumerate(raw_source.decode(errors="replace").splitlines(), 1):
         line = raw.split("!", 1)[0].strip()
         if not line:
@@ -48,5 +56,5 @@ def mechanism(source: Path | bytes) -> tuple[list[str], list[dict[str, object]]]
                         raise ValueError(f"unparsed reaction coefficient: {display}:{number}")
                     labels.extend([coefficient[2]] * int(coefficient[1] or 1))
                 sides.append(tuple(labels))
-            reactions.append(dict(equation=equation, line=number, reactants=sides[0], products=sides[1]))
+            reactions.append(ChemkinReaction(equation=equation, line=number, reactants=sides[0], products=sides[1]))
     return sorted(set(species)), reactions

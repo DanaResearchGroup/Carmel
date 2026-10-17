@@ -6,7 +6,7 @@ import hashlib
 import json
 from builtins import bytes as ByteString
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Annotated, Any, Literal, NoReturn, Self
@@ -197,6 +197,40 @@ class Identity(FrozenModel):
     evidence: tuple[str, ...]
 
 
+def validate_mechanism_pair(mechanisms: Mapping[Any, object]) -> None:
+    if set(mechanisms) != {"v_old", "v_new"}:
+        raise ValueError("both mechanism pins are required")
+
+
+def validate_species_inventories(
+    new_species: tuple[Species, ...], old_species: tuple[Species, ...], *, expected_old_species: int
+) -> dict[str, Species]:
+    new = {species.label: species for species in new_species}
+    if len(new) != len(new_species) or len({species.label for species in old_species}) != len(old_species):
+        raise ValueError("species labels must be unique within each mechanism")
+    if len(old_species) != expected_old_species:
+        raise ValueError("absence audit must inventory every old species")
+    return new
+
+
+def validate_ground_truth_counts(
+    members: tuple[Member, ...],
+    frozen_counts: tuple[int, int, int, int],
+    new_species: Mapping[str, Species],
+) -> set[str]:
+    labels = {label for member in members for label in (*member.reactants, *member.products)}
+    if labels - new_species.keys():
+        raise ValueError("member references an uninventoried species")
+    resolved = sum(
+        all(new_species[label].status == "RESOLVED" for label in (*member.reactants, *member.products))
+        for member in members
+    )
+    resolved_species = sum(new_species[label].status == "RESOLVED" for label in labels)
+    if frozen_counts != (len(members), resolved, len(labels), resolved_species):
+        raise ValueError("ground-truth counts do not reproduce")
+    return labels
+
+
 class Contract(FrozenModel):
     schema_version: Literal[1]
     case: Literal["n-heptane-low-t"]
@@ -212,8 +246,7 @@ class Contract(FrozenModel):
 
     @model_validator(mode="after")
     def frozen_invariants(self) -> Self:
-        if set(self.mechanisms) != {"v_old", "v_new"}:
-            raise ValueError("both mechanism pins are required")
+        validate_mechanism_pair(self.mechanisms)
         if tuple(source.filename for source in self.support_sources) != (
             "i117-glossary.pdf",
             "i117-v31-thermo.txt",
@@ -223,24 +256,18 @@ class Contract(FrozenModel):
             raise ValueError("exactly the six reviewed types are required")
         if set(self.scoring.primary_types) != {"G1", "G2", "G3", "G4", "G5"} or len(self.scoring.primary_types) != 5:
             raise ValueError("G6 must never be scored against ignition")
-        new = {s.label: s for s in self.new_species}
-        if len(new) != len(self.new_species) or len({s.label for s in self.old_species}) != len(self.old_species):
-            raise ValueError("species labels must be unique within each mechanism")
-        if len(self.old_species) != self.mechanisms["v_old"].unique_species:
-            raise ValueError("absence audit must inventory every old species")
+        expected_old_species = self.mechanisms["v_old"].unique_species
+        assert expected_old_species is not None
+        new = validate_species_inventories(
+            self.new_species, self.old_species, expected_old_species=expected_old_species
+        )
         for gt in self.ground_truth:
-            labels = {s for m in gt.members for s in (*m.reactants, *m.products)}
-            if labels - new.keys():
-                raise ValueError("member references an uninventoried species")
-            resolved = sum(all(new[s].status == "RESOLVED" for s in (*m.reactants, *m.products)) for m in gt.members)
-            resolved_species = sum(new[s].status == "RESOLVED" for s in labels)
-            if (gt.member_count, gt.resolved_count, gt.member_species_count, gt.resolved_species_count) != (
-                len(gt.members),
-                resolved,
-                len(labels),
-                resolved_species,
-            ):
-                raise ValueError("ground-truth counts do not reproduce")
+            labels = validate_ground_truth_counts(
+                gt.members,
+                (gt.member_count, gt.resolved_count, gt.member_species_count, gt.resolved_species_count),
+                new,
+            )
+            resolved_species = sum(new[label].status == "RESOLVED" for label in labels)
             if gt.scope != ("speciation-only" if gt.id == "G6" else "primary"):
                 raise ValueError("G6 is speciation-only; G1-G5 are primary")
             if gt.scope == "primary" and resolved_species / len(labels) < 0.7:

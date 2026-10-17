@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import zipfile
 from builtins import bytes as ByteString
 from collections import Counter
@@ -14,7 +15,17 @@ from xml.etree import ElementTree
 
 from pydantic import Field, model_validator
 
-from carmel.benchmarks.n_heptane import FrozenModel, Species, _read_pinned_root_file
+from carmel.benchmarks.chemkin import ChemkinReaction
+from carmel.benchmarks.n_heptane import (
+    FrozenModel,
+    Identity,
+    Member,
+    Species,
+    _read_pinned_root_file,
+    validate_ground_truth_counts,
+    validate_mechanism_pair,
+    validate_species_inventories,
+)
 from carmel.services.respecth import RespecthRefusal, parse_idt_record
 from carmel.services.respecth_archive import PinnedArchive
 from carmel.services.respecth_series import parse_series_record
@@ -42,13 +53,15 @@ class ArchivePin(Pin):
     osf_file_id: Annotated[str, Field(pattern=r"^[0-9a-f]{24}$")]
     osf_version: Annotated[int, Field(ge=1)]
 
-
-class Member(FrozenModel):
-    equation: str
-    line: Annotated[int, Field(gt=0)]
-    reactants: tuple[str, ...]
-    products: tuple[str, ...]
-    absence: Literal["structural-signature-and-exhaustive-formula-screen"]
+    def to_pinned_archive(self) -> PinnedArchive:
+        return PinnedArchive(
+            name=self.filename,
+            osf_path=self.osf_path,
+            osf_file_id=self.osf_file_id,
+            osf_version=self.osf_version,
+            size=self.bytes,
+            sha256=self.sha256,
+        )
 
 
 class GroundTruth(FrozenModel):
@@ -113,13 +126,6 @@ class Scoring(FrozenModel):
     locking: str
 
 
-class Identity(FrozenModel):
-    status: Literal["UNVERIFIED"]
-    historical_identity_caveat: str
-    attempts: tuple[str, ...]
-    evidence: tuple[str, ...]
-
-
 class Contract(FrozenModel):
     schema_version: Literal[1]
     case: Literal["n-pentane-low-t"]
@@ -135,35 +141,32 @@ class Contract(FrozenModel):
 
     @model_validator(mode="after")
     def frozen_invariants(self) -> Self:
-        if set(self.mechanisms) != {"v_old", "v_new"}:
-            raise ValueError("both mechanism pins are required")
+        validate_mechanism_pair(self.mechanisms)
         if self.support_sources != (self.split.archive,):
             raise ValueError("the split archive must be the sole support source")
         if {item.id for item in self.ground_truth} != {"G1", "G2", "G3", "G4"} or len(self.ground_truth) != 4:
             raise ValueError("exactly the four reviewed n-pentane types are required")
         if set(self.scoring.primary_types) != {"G1", "G2", "G3", "G4"} or len(self.scoring.primary_types) != 4:
             raise ValueError("all and only the four reviewed types are primary")
-        new = {item.label: item for item in self.new_species}
-        if len(new) != len(self.new_species) or len({item.label for item in self.old_species}) != len(self.old_species):
-            raise ValueError("species labels must be unique within each mechanism")
+        expected_old_species = self.mechanisms["v_old"].unique_species
+        assert expected_old_species is not None
+        new = validate_species_inventories(
+            self.new_species, self.old_species, expected_old_species=expected_old_species
+        )
         for truth in self.ground_truth:
             if dict(truth.reactant_formula) != {"C": 5, "H": 11, "O": 4}:
                 raise ValueError("reactant formula is not frozen for n-pentane")
-            labels = {label for member in truth.members for label in (*member.reactants, *member.products)}
-            if labels - new.keys():
-                raise ValueError("member references an uninventoried species")
-            resolved = sum(
-                all(new[label].status == "RESOLVED" for label in (*member.reactants, *member.products))
-                for member in truth.members
+            labels = validate_ground_truth_counts(
+                truth.members,
+                (
+                    truth.member_count,
+                    truth.resolved_count,
+                    truth.member_species_count,
+                    truth.resolved_species_count,
+                ),
+                new,
             )
             resolved_species = sum(new[label].status == "RESOLVED" for label in labels)
-            if (
-                truth.member_count,
-                truth.resolved_count,
-                truth.member_species_count,
-                truth.resolved_species_count,
-            ) != (len(truth.members), resolved, len(labels), resolved_species):
-                raise ValueError("ground-truth counts do not reproduce")
             if resolved_species / len(labels) < 0.7:
                 raise ValueError("NEEDS-INPUT: fewer than 70% of scored member species resolved")
         paths = [item.path for study in self.split.studies for item in study.files]
@@ -199,6 +202,118 @@ class Contract(FrozenModel):
         return self
 
 
+def condensed_formula(label: str) -> dict[str, int]:
+    """Read elemental composition from the complete NUIG baseline label grammar."""
+    if label == "AR":
+        return {"Ar": 1}
+    if label == "HE":
+        return {"He": 1}
+    if label == "N2":
+        return {"N": 2}
+
+    text = re.sub(r"^(?:IIC|TIC|NC|IC|PC|SC|TC|AC)(?=\d)", "C", label)
+    text = re.sub(r"^CC(?=\d)", "C", text)
+    if "KET" in text:
+        carbon = re.search(r"C(\d+)", text)
+        if carbon is None:
+            raise ValueError(f"unparsed KET composition: {label}")
+        count = int(carbon.group(1))
+        return {"C": count, "H": 2 * count, "O": 3}
+
+    extra: Counter[str] = Counter()
+    if "Q2" in text:
+        text = text.replace("Q2", "")
+        extra.update({"H": 2, "O": 4})
+    if re.search(r"\d-\d,\dOOH", text):
+        text = re.sub(r"\d-\d,\dOOH", "", text)
+        extra.update({"H": 2, "O": 4})
+    text = re.sub(r"OOH\d-\d", "OOH", text)
+
+    def normalize_hydrogen_locant(match: re.Match[str]) -> str:
+        carbon = int(match.group(1) or 1)
+        hydrogen_digits = match.group(2)
+        while int(hydrogen_digits) > 2 * carbon + 2:
+            hydrogen_digits = hydrogen_digits[:-1]
+        return f"C{carbon}H{hydrogen_digits}"
+
+    text = re.sub(r"C(\d*)H(\d+)", normalize_hydrogen_locant, text)
+    cyclic_ether = re.fullmatch(r"C(\d+)H(\d+)O\d-\d", text)
+    if cyclic_ether and int(cyclic_ether.group(2)) <= 2 * int(cyclic_ether.group(1)):
+        text = f"C{cyclic_ether.group(1)}H{cyclic_ether.group(2)}O"
+
+    atoms = Counter(extra)
+    for match in re.finditer(r"([CHO])(\d*)", text):
+        atoms[match.group(1)] += int(match.group(2) or 1)
+    if not atoms:
+        raise ValueError(f"unparsed species composition: {label}")
+    return {element: atoms[element] for element in ("C", "H", "N", "O", "Ar", "He") if atoms[element]}
+
+
+def formula_key(
+    labels: tuple[str, ...], formulas: dict[str, dict[str, int]]
+) -> tuple[tuple[tuple[str, int], ...], ...]:
+    """Return an order-independent elemental formula profile for one reaction side."""
+    return tuple(sorted(tuple(sorted(formulas[label].items())) for label in labels))
+
+
+def formula_inventory(labels: list[str], reactions: list[ChemkinReaction]) -> dict[str, dict[str, int]]:
+    """Decode every species formula and refuse an unbalanced mechanism reaction."""
+    formulas = {label: condensed_formula(label) for label in labels}
+    for reaction in reactions:
+        left = Counter[str]()
+        right = Counter[str]()
+        for label in reaction["reactants"]:
+            left.update(formulas[label])
+        for label in reaction["products"]:
+            right.update(formulas[label])
+        if left != right:
+            raise ValueError(f"mechanism composition does not balance: {reaction['equation']}")
+    return formulas
+
+
+def formula_compatible(
+    candidate: ChemkinReaction,
+    candidate_formulas: dict[str, dict[str, int]],
+    prior: ChemkinReaction,
+    prior_formulas: dict[str, dict[str, int]],
+) -> bool:
+    """Return whether two reactions share a formula profile in either orientation."""
+    candidate_profile = (
+        formula_key(candidate["reactants"], candidate_formulas),
+        formula_key(candidate["products"], candidate_formulas),
+    )
+    prior_profile = (
+        formula_key(prior["reactants"], prior_formulas),
+        formula_key(prior["products"], prior_formulas),
+    )
+    return prior_profile in (candidate_profile, candidate_profile[::-1])
+
+
+def require_structural_absence(
+    candidate: ChemkinReaction,
+    candidate_formulas: dict[str, dict[str, int]],
+    signature: tuple[tuple[str, ...], ...],
+    old_reactions: list[ChemkinReaction],
+    old_formulas: dict[str, dict[str, int]],
+    old_structures: dict[str, str],
+) -> None:
+    """Refuse unresolved or structurally matching formula-compatible prior reactions."""
+    from carmel.benchmarks.structure import reaction_signature
+
+    for prior in old_reactions:
+        if not formula_compatible(candidate, candidate_formulas, prior, old_formulas):
+            continue
+        prior_names = (*prior["reactants"], *prior["products"])
+        if not all(label in old_structures for label in prior_names):
+            raise ValueError(f"UNRESOLVED old formula-screen candidate: {prior['equation']}")
+        prior_signature = reaction_signature(
+            tuple(old_structures[label] for label in prior["reactants"]),
+            tuple(old_structures[label] for label in prior["products"]),
+        )
+        if prior_signature == signature:
+            raise ValueError(f"baseline reaction signature already present: {prior['equation']}")
+
+
 def load_contract(path: Path) -> Contract:
     return Contract.model_validate_json(_read_pinned_root_file(path))
 
@@ -223,7 +338,7 @@ def split_totals(split: Split) -> dict[str, int]:
     return dict(counts)
 
 
-def _temperature_counts(record: Any) -> tuple[int, int, int, int]:
+def series_counts(record: Any) -> tuple[int, int, int, int]:
     series = record.envelope.series[0]
     constants = {item.axis_id: item.value for item in series.constants}
     low_rows = low_observations = observations = 0
@@ -262,7 +377,7 @@ def load_split(contract: Contract, archive_source: Path | bytes) -> dict[str, in
                     record = parser(raw, archive, item.path)
                     actual_acceptance = "supported"
                     actual_reason = None
-                    actual_counts = _temperature_counts(record)
+                    actual_counts = series_counts(record)
                 except RespecthRefusal as exc:
                     actual_acceptance = "refused"
                     actual_reason = exc.reason.value

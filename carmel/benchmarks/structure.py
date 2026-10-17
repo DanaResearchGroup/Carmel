@@ -126,10 +126,11 @@ def classify(reactants: tuple[str, ...], products: tuple[str, ...], *, carbon_co
                     found.add("G3")
                 if ooqooh:
                     found.add("G4")
-        elif len(carbon_products) >= 2 and pooh:
+        elif carbon_count == 7 and len(carbon_products) >= 2 and pooh:
             found.add("G5")
         elif (
-            len(carbon_products) == 2
+            carbon_count == 7
+            and len(carbon_products) == 2
             and len(target) == 2
             and src.atoms == Counter({"C": carbon_count, "H": 2 * carbon_count, "O": 3})
         ):

@@ -15,8 +15,19 @@ import pytest
 pytest.importorskip("rdkit")
 
 from carmel.benchmarks import n_pentane
-from carmel.benchmarks.n_pentane import Contract, SplitFile, load_contract, split_totals
-from carmel.benchmarks.structure import classify
+from carmel.benchmarks.chemkin import ChemkinReaction
+from carmel.benchmarks.n_pentane import (
+    Contract,
+    SplitFile,
+    condensed_formula,
+    formula_compatible,
+    formula_inventory,
+    formula_key,
+    load_contract,
+    require_structural_absence,
+    split_totals,
+)
+from carmel.benchmarks.structure import classify, reaction_signature
 from carmel.services.respecth import RespecthRefusal, RespecthRefusalReason
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,6 +57,8 @@ def test_contract_validates_and_reproduces_frozen_totals(contract: Contract) -> 
         "holdout_low_temperature_observations": 1040,
     }
     assert [item.member_count for item in contract.ground_truth] == [30, 30, 12, 12]
+    assert len(contract.old_species) == contract.mechanisms["v_old"].unique_species == 293
+    assert Counter(item.status for item in contract.old_species) == {"RESOLVED": 31, "UNRESOLVED": 262}
     assert contract.scoring.requires == "jsr-adapter"
     assert contract.identity.status == "UNVERIFIED"
 
@@ -83,6 +96,141 @@ def test_tiny_excerpts_are_frozen_members_or_a_conventional_negative(contract: C
     ]
     assert set(excerpt_equations[:4]) <= equations
     assert excerpt_equations[4] not in equations
+
+
+def test_baseline_formula_inventory_is_independent_of_structure_resolution() -> None:
+    labels = ["C5H10OOH1-2O2", "NC5KET12", "OH"]
+    reaction = {
+        "equation": "C5H10OOH1-2O2<=>NC5KET12+OH",
+        "line": 1,
+        "reactants": ("C5H10OOH1-2O2",),
+        "products": ("NC5KET12", "OH"),
+    }
+
+    assert formula_inventory(labels, [reaction]) == {
+        "C5H10OOH1-2O2": {"C": 5, "H": 11, "O": 4},
+        "NC5KET12": {"C": 5, "H": 10, "O": 3},
+        "OH": {"H": 1, "O": 1},
+    }
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("AR", {"Ar": 1}),
+        ("HE", {"He": 1}),
+        ("N2", {"N": 2}),
+        ("CC5H12", {"C": 5, "H": 12}),
+        ("NC5KET12", {"C": 5, "H": 10, "O": 3}),
+        ("C5H9Q2", {"C": 5, "H": 11, "O": 4}),
+        ("C5H93-1,2OOH", {"C": 5, "H": 11, "O": 4}),
+        ("C5H10OOH1-2O2", {"C": 5, "H": 11, "O": 4}),
+        ("C5H101", {"C": 5, "H": 10}),
+        ("CH4", {"C": 1, "H": 4}),
+        ("C5H10O1-2", {"C": 5, "H": 10, "O": 1}),
+        ("C5H11O1-2", {"C": 5, "H": 11, "O": 1}),
+        ("OH", {"H": 1, "O": 1}),
+    ],
+)
+def test_condensed_formula_covers_the_baseline_label_conventions(label: str, expected: dict[str, int]) -> None:
+    assert condensed_formula(label) == expected
+
+
+@pytest.mark.parametrize("label,message", [("KET", "unparsed KET"), ("XYZ", "unparsed species")])
+def test_condensed_formula_refuses_labels_outside_its_grammar(label: str, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        condensed_formula(label)
+
+
+def test_formula_inventory_refuses_an_unbalanced_reaction() -> None:
+    reaction = ChemkinReaction(
+        equation="CH4<=>OH",
+        line=1,
+        reactants=("CH4",),
+        products=("OH",),
+    )
+
+    with pytest.raises(ValueError, match="mechanism composition does not balance"):
+        formula_inventory(["CH4", "OH"], [reaction])
+
+
+def test_formula_profiles_are_order_independent_and_orientation_aware() -> None:
+    candidate = ChemkinReaction(equation="A+B<=>C", line=1, reactants=("A", "B"), products=("C",))
+    same = ChemkinReaction(equation="Y+X<=>Z", line=2, reactants=("Y", "X"), products=("Z",))
+    reverse = ChemkinReaction(equation="Z<=>X+Y", line=3, reactants=("Z",), products=("X", "Y"))
+    different = ChemkinReaction(equation="X<=>Y+Z", line=4, reactants=("X",), products=("Y", "Z"))
+    candidate_formulas = {"A": {"H": 2}, "B": {"O": 2}, "C": {"H": 2, "O": 2}}
+    prior_formulas = {"X": {"O": 2}, "Y": {"H": 2}, "Z": {"H": 2, "O": 2}}
+
+    assert formula_key(("A", "B"), candidate_formulas) == ((("H", 2),), (("O", 2),))
+    assert formula_compatible(candidate, candidate_formulas, same, prior_formulas)
+    assert formula_compatible(candidate, candidate_formulas, reverse, prior_formulas)
+    assert not formula_compatible(candidate, candidate_formulas, different, prior_formulas)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_unresolved_formula_compatible_baseline_reaction_fails_the_audit(reverse: bool) -> None:
+    candidate = {
+        "equation": "NEW_SOURCE<=>NEW_PRODUCT+OH",
+        "line": 1,
+        "reactants": ("NEW_SOURCE",),
+        "products": ("NEW_PRODUCT", "OH"),
+    }
+    prior = {
+        "equation": "UNRESOLVED<=>OLD_PRODUCT+OH",
+        "line": 2,
+        "reactants": ("UNRESOLVED",),
+        "products": ("OLD_PRODUCT", "OH"),
+    }
+    if reverse:
+        prior["reactants"], prior["products"] = prior["products"], prior["reactants"]
+    candidate_formulas = {
+        "NEW_SOURCE": {"C": 5, "H": 11, "O": 4},
+        "NEW_PRODUCT": {"C": 5, "H": 10, "O": 3},
+        "OH": {"H": 1, "O": 1},
+    }
+    prior_formulas = {
+        "UNRESOLVED": {"C": 5, "H": 11, "O": 4},
+        "OLD_PRODUCT": {"C": 5, "H": 10, "O": 3},
+        "OH": {"H": 1, "O": 1},
+    }
+
+    with pytest.raises(ValueError, match="UNRESOLVED old formula-screen candidate"):
+        require_structural_absence(
+            candidate,
+            candidate_formulas,
+            (),
+            [prior],
+            prior_formulas,
+            {"OLD_PRODUCT": "CCCCC", "OH": "[OH]"},
+        )
+
+
+def test_resolved_formula_candidate_must_be_structurally_absent() -> None:
+    candidate = ChemkinReaction(equation="A<=>B", line=1, reactants=("A",), products=("B",))
+    prior = ChemkinReaction(equation="X<=>Y", line=2, reactants=("X",), products=("Y",))
+    formulas = {"A": {"C": 1}, "B": {"C": 1}}
+    prior_formulas = {"X": {"C": 1}, "Y": {"C": 1}}
+    structures = {"X": "C", "Y": "[CH3]"}
+    signature = reaction_signature((structures["X"],), (structures["Y"],))
+
+    with pytest.raises(ValueError, match="baseline reaction signature already present"):
+        require_structural_absence(candidate, formulas, signature, [prior], prior_formulas, structures)
+    require_structural_absence(candidate, formulas, (), [prior], prior_formulas, structures)
+
+
+def test_formula_incompatible_prior_does_not_require_a_structure() -> None:
+    candidate = ChemkinReaction(equation="A<=>B", line=1, reactants=("A",), products=("B",))
+    prior = ChemkinReaction(equation="X<=>Y", line=2, reactants=("X",), products=("Y",))
+
+    require_structural_absence(
+        candidate,
+        {"A": {"C": 1}, "B": {"C": 1}},
+        (),
+        [prior],
+        {"X": {"C": 2}, "Y": {"C": 2}},
+        {},
+    )
 
 
 @pytest.mark.parametrize(
@@ -144,14 +292,15 @@ def _archive_contract(tmp_path: Path, *, acceptance: str = "supported", reason: 
     with zipfile.ZipFile(archive_path, "w") as target:
         target.writestr("xunit.xml", member)
     archive_bytes = archive_path.read_bytes()
-    archive = SimpleNamespace(
+    archive = n_pentane.ArchivePin(
         filename=archive_path.name,
+        source_url="https://example.test/fixture.zip",
+        retrieval_date="2026-10-17",
         osf_path="/fixture.zip",
         osf_file_id="0" * 24,
         osf_version=1,
         bytes=len(archive_bytes),
         sha256=hashlib.sha256(archive_bytes).hexdigest(),
-        verify=lambda data: None,
     )
     item = SimpleNamespace(
         path="xunit.xml",
@@ -245,6 +394,7 @@ def test_schema_writer_emits_the_contract_schema(tmp_path: Path) -> None:
         ("truths", "exactly the four"),
         ("primary", "all and only"),
         ("species", "species labels must be unique"),
+        ("old_inventory", "inventory every old species"),
         ("formula", "reactant formula"),
         ("label", "uninventoried species"),
         ("counts", "ground-truth counts"),
@@ -267,6 +417,8 @@ def test_contract_invariants_fail_closed(change: str, message: str) -> None:
         raw["scoring"]["primary_types"].pop()
     elif change == "species":
         raw["new_species"].append(raw["new_species"][0])
+    elif change == "old_inventory":
+        raw["old_species"].pop()
     elif change == "formula":
         raw["ground_truth"][0]["reactant_formula"]["C"] = 4
     elif change == "label":
