@@ -75,7 +75,7 @@ census file is an input.
 
 | Set | Study | DOI | Files | Rows | Observations | 600–900 K |
 |---|---|---|---:|---:|---:|---:|
-| Development | Bugler et al. 2016 n-pentane ignition delay | `10.1016/j.combustflame.2015.09.014` | 26 | 226 | 226 IDT | not frozen |
+| Development | Bugler et al. 2016 n-pentane ignition delay | `10.1016/j.combustflame.2015.09.014` | 26 | 226 | 226 IDT | 5 IDT |
 | Holdout | Bugler et al. 2017 n-pentane JSR | `10.1016/j.proci.2016.05.048` | 6 | 144 | 2,080 scalar | 72 rows / 1,040 scalar |
 
 The legacy v2.5 records omit `fileDOI`. Carmel now applies the documented ReSpecTh
@@ -87,36 +87,39 @@ record's pinned member path. This is the only reader generalization needed for t
 ## Data acceptance
 
 No refused point is patched into the contract. All six holdout files are supported.
-The development refusals remain typed: nine shock-tube files carry an unmapped
-equivalence-ratio property; eleven RCM files require thermochemistry outside Carmel's
-current seven-species solver set; three histories are nonmonotone; and three ignition
-definitions request an unmapped second maximum.
+Development admits 18 files / 177 points. Four RCM files / 31 points remain
+`rcm_thermo_unavailable` because at least one point starts below the unchanged 295 K
+mixture-domain boundary, and `x40011033.xml` remains refused because point 4 repeats a
+time with a different volume. Exact duplicate rows in `x40011041.xml` and
+`x40011042.xml` are collapsed with provenance. The three `d/dt second max` files remain
+unsupported because T3's existing `ExperimentalIDTFile` vocabulary cannot express that
+criterion.
 
 | File | Set | Rows | Observations | Reader result | Reason |
 |---|---|---:|---:|---|---|
-| `x10011004.xml` | development | 8 | 8 | refused | `unmapped_property` |
-| `x10011005.xml` | development | 17 | 17 | refused | `unmapped_property` |
-| `x10011006.xml` | development | 6 | 6 | refused | `unmapped_property` |
-| `x10011007.xml` | development | 9 | 9 | refused | `unmapped_property` |
-| `x10011008.xml` | development | 11 | 11 | refused | `unmapped_property` |
-| `x10011009.xml` | development | 11 | 11 | refused | `unmapped_property` |
-| `x10011010.xml` | development | 8 | 8 | refused | `unmapped_property` |
-| `x10011011.xml` | development | 17 | 17 | refused | `unmapped_property` |
-| `x10011012.xml` | development | 25 | 25 | refused | `unmapped_property` |
-| `x40011029.xml` | development | 12 | 12 | refused | `rcm_thermo_unavailable` |
+| `x10011004.xml` | development | 8 | 8 | supported | — |
+| `x10011005.xml` | development | 17 | 17 | supported | — |
+| `x10011006.xml` | development | 6 | 6 | supported | — |
+| `x10011007.xml` | development | 9 | 9 | supported | — |
+| `x10011008.xml` | development | 11 | 11 | supported | — |
+| `x10011009.xml` | development | 11 | 11 | supported | — |
+| `x10011010.xml` | development | 8 | 8 | supported | — |
+| `x10011011.xml` | development | 17 | 17 | supported | — |
+| `x10011012.xml` | development | 25 | 25 | supported | — |
+| `x40011029.xml` | development | 12 | 12 | supported | — |
 | `x40011030.xml` | development | 11 | 11 | refused | `rcm_thermo_unavailable` |
 | `x40011031.xml` | development | 5 | 5 | refused | `rcm_thermo_unavailable` |
 | `x40011032.xml` | development | 5 | 5 | refused | `rcm_thermo_unavailable` |
 | `x40011033.xml` | development | 6 | 6 | refused | `history_nonmonotone_time` |
-| `x40011034.xml` | development | 2 | 2 | refused | `rcm_thermo_unavailable` |
-| `x40011035.xml` | development | 10 | 10 | refused | `rcm_thermo_unavailable` |
-| `x40011036.xml` | development | 3 | 3 | refused | `rcm_thermo_unavailable` |
-| `x40011037.xml` | development | 6 | 6 | refused | `rcm_thermo_unavailable` |
+| `x40011034.xml` | development | 2 | 2 | supported | — |
+| `x40011035.xml` | development | 10 | 10 | supported | — |
+| `x40011036.xml` | development | 3 | 3 | supported | — |
+| `x40011037.xml` | development | 6 | 6 | supported | — |
 | `x40011038.xml` | development | 10 | 10 | refused | `rcm_thermo_unavailable` |
-| `x40011039.xml` | development | 9 | 9 | refused | `rcm_thermo_unavailable` |
-| `x40011040.xml` | development | 8 | 8 | refused | `rcm_thermo_unavailable` |
-| `x40011041.xml` | development | 9 | 9 | refused | `history_nonmonotone_time` |
-| `x40011042.xml` | development | 6 | 6 | refused | `history_nonmonotone_time` |
+| `x40011039.xml` | development | 9 | 9 | supported | — |
+| `x40011040.xml` | development | 8 | 8 | supported | — |
+| `x40011041.xml` | development | 9 | 9 | supported | — |
+| `x40011042.xml` | development | 6 | 6 | supported | — |
 | `x40011043.xml` | development | 3 | 3 | refused | `unmapped_ignition_definition` |
 | `x40011044.xml` | development | 4 | 4 | refused | `unmapped_ignition_definition` |
 | `x40011045.xml` | development | 5 | 5 | refused | `unmapped_ignition_definition` |

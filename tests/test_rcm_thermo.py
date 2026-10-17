@@ -6,9 +6,28 @@ from pathlib import Path
 
 import pytest
 
-from carmel.services.rcm_thermo import GRI30_YAML_SHA256, isentropic_eoc
+from carmel.services.rcm_thermo import (
+    BURCAT_RETRIEVAL_DATE,
+    BURCAT_SOURCE_URL,
+    BURCAT_THERM_SHA256,
+    GRI30_YAML_SHA256,
+    NASA7,
+    admissible_temperature_domain,
+    isentropic_eoc,
+)
 
 ORACLE = json.loads((Path(__file__).parent / "fixtures/rcm/cantera-3.2.0-isentropic.json").read_text())
+
+
+def _cantera_solution_with_burcat_species(ct, gri30_path: Path):
+    gas = ct.Solution(str(gri30_path))
+    species = gas.species()
+    for name, composition in (("NC5H12", {"C": 5, "H": 12}), ("HE", {"He": 1})):
+        ranges, high, low = NASA7[name]
+        added = ct.Species(name, composition)
+        added.thermo = ct.NasaPoly2(ranges[0], ranges[2], ct.one_atm, [ranges[1], *high, *low])
+        species.append(added)
+    return ct.Solution(thermo="ideal-gas", species=species)
 
 
 @pytest.mark.parametrize("case", ORACLE["cases"], ids=lambda case: case["id"])
@@ -32,7 +51,7 @@ def test_live_cantera_regenerates_and_matches_pinned_oracle() -> None:
         "procedure": ORACLE["procedure"],
         "cases": [],
     }
-    gas = ct.Solution(str(path))
+    gas = _cantera_solution_with_burcat_species(ct, path)
     for case in ORACLE["cases"]:
         gas.TPX = case["initial_temperature_k"], case["initial_pressure_pa"], case["composition"]
         entropy, specific_volume = gas.SV
@@ -50,6 +69,12 @@ def test_live_cantera_regenerates_and_matches_pinned_oracle() -> None:
     assert regenerated["cantera_version"] == ORACLE["cantera_version"]
     assert regenerated["gri30_yaml_sha256"] == ORACLE["gri30_yaml_sha256"]
     assert len(regenerated["cases"]) == len(ORACLE["cases"])
+
+
+def test_pentane_oracle_spans_the_nasa7_breakpoint() -> None:
+    cases = [case for case in ORACLE["cases"] if case["id"].startswith("NC5H12-")]
+    assert any(case["temperature_k"] < 1000 for case in cases)
+    assert any(case["initial_temperature_k"] < 1000 < case["temperature_k"] for case in cases)
 
 
 def test_argon_compression_has_analytic_monatomic_limit() -> None:
@@ -94,3 +119,37 @@ def test_coefficients_cannot_be_mutated() -> None:
         NASA7["AR"] = (0, (), ())
     with pytest.raises(TypeError):
         NASA7["AR"][1][0] = 0
+
+
+def test_burcat_pin_and_pentane_helium_coefficients_are_frozen() -> None:
+    assert BURCAT_SOURCE_URL == "https://respecth.elte.hu/burcat/THERM.DAT"
+    assert BURCAT_RETRIEVAL_DATE == "2026-10-17"
+    assert BURCAT_THERM_SHA256 == "1bcc0261e5003a94496c07632a5727e312fc9055a18e61fdb7c2d5bdca8eacaa"
+    assert NASA7["NC5H12"].temperature_ranges == (200.0, 1000.0, 6000.0)
+    assert NASA7["NC5H12"].high == (
+        12.6972155,
+        0.0304568131,
+        -1.09153473e-05,
+        1.7552367e-09,
+        -1.04805044e-13,
+        -25151.8655,
+        -43.0901457,
+    )
+    assert NASA7["NC5H12"].low == (
+        6.54437541,
+        -0.00659895449,
+        0.000151083807,
+        -1.93191011e-07,
+        7.60508963e-11,
+        -20965.4379,
+        1.41151597,
+    )
+    assert NASA7["HE"].high == NASA7["HE"].low == (2.5, 0, 0, 0, 0, -745.375, 0.928723974)
+
+
+def test_pentane_rcm_mixture_uses_existing_temperature_intersection() -> None:
+    composition = {"NC5H12": 0.01, "O2": 0.21, "N2": 0.7799999999974, "HE": 2.6e-12}
+    assert admissible_temperature_domain(composition) == (pytest.approx(295), pytest.approx(3500))
+    temperature, pressure = isentropic_eoc(360, 1e5, 10, composition)
+    assert 360 < temperature < 3500
+    assert pressure == pytest.approx(1e5 * 10 * temperature / 360)

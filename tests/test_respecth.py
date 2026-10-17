@@ -13,7 +13,10 @@ import hashlib
 import io
 import json
 import zipfile
+from copy import deepcopy
+from decimal import ROUND_DOWN, ROUND_UP, localcontext
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pytest
 
@@ -270,6 +273,67 @@ class TestShockTubeRoundTrip:
         assert canonical_json_bytes(parsed.identity_payload()) == canonical_json_bytes(envelope.identity_payload())
 
 
+class TestStatedEquivalenceRatio:
+    @staticmethod
+    def _with_ratio(value: str) -> bytes:
+        prop = (
+            '<property name="equivalence ratio" label="equivalence ratio" '
+            f'sourcetype="reported" units="unitless"><value>{value}</value></property>'
+        ).encode()
+        return _member("x00000070_p.xml").replace(b"<commonProperties>", b"<commonProperties>" + prop, 1)
+
+    def test_stated_ratio_is_grounded_cross_checked_and_replayed(self) -> None:
+        data = self._with_ratio("1")
+        record = _parse("x00000070_p.xml", data)
+        ratio = record.envelope.composition.equivalence_ratio
+        assert not isinstance(ratio, Absent)
+        assert ratio.quantity_kind is QuantityKind.EQUIVALENCE_RATIO
+        assert (ratio.raw_text, ratio.unit_raw, ratio.unit_normalized) == ("1", "unitless", "1")
+        assert replay_idt_record(record, data).verified
+
+    def test_stated_ratio_that_disagrees_with_composition_is_refused(self) -> None:
+        with pytest.raises(RespecthRefusal) as caught:
+            _parse("x00000070_p.xml", self._with_ratio("0.5"))
+        assert caught.value.reason is RespecthRefusalReason.UNMAPPED_PROPERTY
+        assert "equivalence ratio" in caught.value.detail
+
+    def test_stated_ratio_with_an_unsupported_reactant_is_refused(self) -> None:
+        data = self._with_ratio("1").replace(b'preferredKey="Ar"', b'preferredKey="CH4"')
+        with pytest.raises(RespecthRefusal) as caught:
+            _parse("x00000070_p.xml", data)
+        assert caught.value.reason is RespecthRefusalReason.UNMAPPED_PROPERTY
+        assert "unsupported=['CH4']" in caught.value.detail
+
+    def test_ratio_disagreement_refusal_is_independent_of_the_caller_decimal_context(self) -> None:
+        data = self._with_ratio("1")
+        data = data.replace(b">0.0050</amount>", b">0.50000075</amount>")
+        data = data.replace(b">0.0025</amount>", b">0.25</amount>")
+        data = data.replace(b">0.9925</amount>", b">0.24999925</amount>")
+        verdicts = []
+        for precision, rounding in ((6, ROUND_DOWN), (28, ROUND_UP)):
+            with localcontext() as ctx:
+                ctx.prec = precision
+                ctx.rounding = rounding
+                with pytest.raises(RespecthRefusal) as caught:
+                    _parse("x00000070_p.xml", data)
+            verdicts.append((caught.value.reason, caught.value.detail))
+        assert verdicts[0] == verdicts[1]
+        assert verdicts[0][0] is RespecthRefusalReason.UNMAPPED_PROPERTY
+        assert "beyond 0.000001" in verdicts[0][1]
+
+    def test_ratio_admission_and_replay_are_independent_of_the_caller_decimal_context(self) -> None:
+        data = self._with_ratio("1")
+        serialized = []
+        for precision, rounding in ((6, ROUND_DOWN), (28, ROUND_UP)):
+            with localcontext() as ctx:
+                ctx.prec = precision
+                ctx.rounding = rounding
+                record = _parse("x00000070_p.xml", data)
+                assert replay_idt_record(record, data).verified
+                serialized.append(record.model_dump_json())
+        assert serialized[0] == serialized[1]
+
+
 class TestAssumedApparatusMode:
     """A shock tube that states no mode is mapped as reflected shock, and says so everywhere."""
 
@@ -368,7 +432,45 @@ class TestRcmConditions:
         data = _member("x40001058_19.xml").replace(b"<x9>1.0034797</x9>", b"<x9>0.9034797</x9>")
         record = _parse("x40001058_19.xml", data)
         assert record.rcm_conditions.state == "pre_compression"
+        assert '"collapsed_samples"' not in record.model_dump_json()
         assert replay_idt_record(record, data).verified
+
+    @staticmethod
+    def _with_repeated_history_row(*, different_volume: bool = False, repeat_count: int = 1) -> bytes:
+        root = ElementTree.fromstring(_member("x40001039.xml"))
+        group = next(
+            item
+            for item in root.findall("dataGroup")
+            if {prop.get("name") for prop in item.findall("property")} == {"time", "volume"}
+        )
+        original = group.findall("dataPoint")[0]
+        repeated = deepcopy(original)
+        if different_volume:
+            volume_id = next(prop.get("id") for prop in group.findall("property") if prop.get("name") == "volume")
+            repeated.find(volume_id).text = "0.999"
+        insertion_index = list(group).index(original) + 1
+        for _ in range(repeat_count):
+            group.insert(insertion_index, deepcopy(repeated))
+        return ElementTree.tostring(root)
+
+    def test_an_exact_adjacent_history_duplicate_is_collapsed_with_provenance(self) -> None:
+        data = self._with_repeated_history_row()
+        record = _parse("x40001039.xml", data)
+        collapse = record.rcm_conditions.histories[0].collapsed_samples
+        assert [(item.source_row_index, item.count) for item in collapse] == [(2, 1)]
+        assert replay_idt_record(record, data).verified
+
+    def test_a_run_of_exact_history_duplicates_is_one_counted_collapse(self) -> None:
+        data = self._with_repeated_history_row(repeat_count=2)
+        record = _parse("x40001039.xml", data)
+        collapse = record.rcm_conditions.histories[0].collapsed_samples
+        assert [(item.source_row_index, item.count) for item in collapse] == [(2, 2)]
+        assert replay_idt_record(record, data).verified
+
+    def test_a_repeated_time_with_a_different_volume_stays_refused(self) -> None:
+        with pytest.raises(RespecthRefusal) as caught:
+            _parse("x40001039.xml", self._with_repeated_history_row(different_volume=True))
+        assert caught.value.reason is RespecthRefusalReason.HISTORY_NONMONOTONE_TIME
 
     def test_no_history_cannot_identify_the_conditions(self) -> None:
         data = _member("x40001058_19.xml")
@@ -460,6 +562,13 @@ class TestOtherRealMembers:
         assert roles["CO"] is ComponentRole.FUEL
         assert isinstance(roles["CO2"], Absent)
         assert replay_idt_record(record, _member("x40001058_19.xml")).verified
+
+    def test_second_maximum_pressure_derivative_stays_refused(self) -> None:
+        data = _member("x40001039.xml").replace(b'type="d/dt max"', b'type="d/dt second max"')
+        with pytest.raises(RespecthRefusal) as caught:
+            _parse("x40001039.xml", data)
+        assert caught.value.reason is RespecthRefusalReason.UNMAPPED_IGNITION_DEFINITION
+        assert "d/dt second max" in caught.value.detail
 
     def test_mbar_pressure_binds_exactly_to_pascal(self) -> None:
         # Every real mbar member states pre-compression conditions and is refused for that

@@ -17,12 +17,14 @@ import sys
 from pathlib import Path
 
 sys.modules["rdkit"] = None
-from carmel.benchmarks.n_pentane import load_contract
+from carmel.benchmarks.n_heptane import load_contract as load_heptane_contract
+from carmel.benchmarks.n_pentane import load_contract as load_pentane_contract
 from carmel.benchmarks.schema import validate_contract_json
 
 pentane = Path({str(PENTANE_CONTRACT)!r})
 heptane = Path({str(HEPTANE_CONTRACT)!r})
-assert load_contract(pentane).case == "n-pentane-low-t"
+assert load_pentane_contract(pentane).case == "n-pentane-low-t"
+assert load_heptane_contract(heptane).case == "n-heptane-low-t"
 assert validate_contract_json(pentane.read_bytes()).case == "n-pentane-low-t"
 assert validate_contract_json(heptane.read_bytes()).case == "n-heptane-low-t"
 """

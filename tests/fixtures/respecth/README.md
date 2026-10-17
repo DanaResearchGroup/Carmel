@@ -24,3 +24,8 @@ maintainers ask users to cite are in the repository `NOTICE`.
 | `x30000029.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `eba547816918758ed516a84bffd04c9b86fc47c2a75a6f089e9e59047862a9cf` | Flow-reactor outlet concentration, 9 points against temperature and residence time |
 | `x50001004.xml` | `syngas_indirect_v2_3.zip` (`671691044a236f2bf52ecb24`) | `65b89665f1410c440a51f4b06be9fc480741841622188def78adbc97e0d27e19` | Shock-tube outlet concentration, 16 points: CO, CO2, O2 against T, P and residence time |
 | `x20000074burn.xml` | `H2_indirect_v2_3.zip` (`6716900181a7f78563a5e911`) | `54a7492582f58a57b37bad1740d187c1fb0fcce4e909641c3505c8bc1dd04acd` | Burner-stabilized flame speciation: refused by type (`unmapped_experiment_type`) |
+
+`x00011003-jsr-excerpt.xml` is a minimal test-only excerpt from the pinned pentane
+member `x00011003.xml`. It retains one NC5H12 common-composition component, one
+NC5H12 series column, and one data row to guard the legacy non-IDT role and replay
+semantics without committing the full archive member.

@@ -189,7 +189,7 @@ class Contract(FrozenModel):
             "development_files": 26,
             "development_rows": 226,
             "development_observations": 226,
-            "development_supported_files": 0,
+            "development_supported_files": 18,
             "holdout_files": 6,
             "holdout_rows": 144,
             "holdout_observations": 2080,

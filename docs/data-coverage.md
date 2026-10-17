@@ -1,16 +1,16 @@
 # Curated-data acceptance coverage
 
-Generated 2026-10-04 by `carmel data coverage` against the pinned source bytes.
+Generated 2026-10-17 by `carmel data coverage` against the pinned source bytes.
 Both lanes are CC-BY-4.0.
 
 | Source | Observable | Files mapped | Points mapped | Refusals | Replay |
 |---|---:|---:|---:|---|---:|
-| ChemKED | ignition delay | 314 | 1,507 | `incomplete_record=15`, `schema_rejected=12`, `unmapped_unit=10` | 314/0 |
-| ChemKED | ignition delay, RCM subset | 172 | 177 | `incomplete_record=15`, `unmapped_unit=10` | 172/0 |
-| ReSpecTh | ignition delay | 216 | 1,927 | `unmapped_apparatus=3`, `unmapped_ignition_definition=4`, `unmapped_property=17` | 216/0 |
-| ReSpecTh | ignition delay, RCM subset | 122 | 629 | `unmapped_property=2` | 122/0 |
-| ReSpecTh | laminar flame speed | 286 | 2,719 | `unmapped_unit=1` | 286/0 |
-| ReSpecTh | speciation | 84 | 1,248 | `unidentified_species=2`, `unmapped_experiment_type=3`, `unmapped_property=2` | 84/0 |
+| ChemKED | ignition delay | 318 | 1,516 | `incomplete_record=15`, `schema_rejected=12`, `unmapped_unit=6` | 318/0 |
+| ChemKED | ignition delay, RCM subset | 176 | 186 | `incomplete_record=15`, `unmapped_unit=6` | 176/0 |
+| ReSpecTh | ignition delay | 234 | 2,104 | `history_nonmonotone_time=1`, `rcm_thermo_unavailable=26`, `unmapped_apparatus=3`, `unmapped_ignition_definition=13`, `unmapped_property=23` | 234/0 |
+| ReSpecTh | ignition delay, RCM subset | 131 | 694 | `history_nonmonotone_time=1`, `rcm_thermo_unavailable=26`, `unmapped_ignition_definition=9`, `unmapped_property=2` | 131/0 |
+| ReSpecTh | laminar flame speed | 287 | 2,730 | none | 287/0 |
+| ReSpecTh | speciation | 100 | 1,536 | `unmapped_experiment_type=3` | 100/0 |
 | ReSpecTh | unclassified | 0 | 0 | none | 0/0 |
 
 Every mapped record replayed successfully against the downloaded, pinned bytes.
@@ -24,15 +24,17 @@ Every mapped record replayed successfully against the downloaded, pinned bytes.
   `H2_indirect_v2_3.zip` SHA-256
   `7f7247f0c95dfe65cf784807b6fde5539d34f3fce43b47a779d4ad288b96ddda` and
   `syngas_indirect_v2_3.zip` SHA-256
-  `a14628e5300a7922f50bb354b95f46f1ae853eb6b31e2a33555ffab17812321b`;
+  `a14628e5300a7922f50bb354b95f46f1ae853eb6b31e2a33555ffab17812321b`, and
+  `pentane_indirect_v2.5.zip` SHA-256
+  `b34d6e78a0600bffba9bf7f04f59d9479d6d1314df9964e4071902c929a65e56`;
   manifest SHA-256
-  `d268155744c0a19503249c9fd4f1e5c64dad974ccd484bb7a7f0daaabd3882a5`.
+  `d6119a8af1a8a386fe4628650a04a0d090e8dc3caf70a979bd3cb2fb94499703`.
 
 ## Refusal reasons
 
 - `incomplete_record`: required source fields are absent; lift it by adding or recovering those fields in the source record.
 - `history_nonmonotone_time`, `history_nonpositive_volume`, `history_no_compression`, `history_missing_initial_state`, `history_invalid`: an unusable compression history or initial state; each carries its source-specific detail.
-- `rcm_thermo_unavailable`: derived labels require the supported seven-species NASA7 mixture. Initial, trial and solved temperatures must lie in the material species' admissible intersection: H2/O2/CO/CO2/H2O require 200–3500 K; N2/Ar's published range is 300–5000 K, with an operator-approved 5 K low-temperature allowance down to 295 K. No other species or upper bound receives a tolerance. Exact-zero components do not constrain that intersection. Exact source Kelvin admission precedes float conversion.
+- `rcm_thermo_unavailable`: derived labels require the supported nine-species NASA7 mixture. Initial, trial and solved temperatures must lie in the material species' admissible intersection: H2/O2/CO/CO2/H2O require 200–3500 K; NC5H12/HE require 200–6000 K; N2/Ar's published range is 300–5000 K, with an operator-approved 5 K low-temperature allowance down to 295 K. No other species or upper bound receives a tolerance. Exact-zero components do not constrain that intersection. Exact source Kelvin admission precedes float conversion.
 - `implausible_ignition_temperature`: stated or derived ignition conditions below the 500 K backstop; initial pre-compression temperatures are not ignition labels.
 - `schema_rejected`: the mapped value does not satisfy the lane schema; lift it by adding an explicit schema mapping that preserves the source evidence.
 - `unmapped_unit`: the unit is outside the pinned conversion table, or a native value cannot be bound or converted under the schema and canonical numeric bounds. Unknown units need a reviewed table entry; unrepresentable values remain refused.
@@ -74,3 +76,25 @@ published ranges stay pinned. V5 also admits two non-RCM Torr files (33 points).
 See [RCM export](rcm-t3-export.md) for selection, provenance and typed export
 refusals. Mapping coverage counts differ from export acceptance: the T3 schema
 requires a stricter mole-fraction sum than some source records provide.
+
+## n-pentane development admission (2026-10-17)
+
+The pinned Bugler 2016 development study now maps 18 files / 177 ignition-delay
+points. A stated common `equivalence ratio` is grounded in the existing
+composition field and checked against the source mole fractions to an absolute
+`1e-6` tolerance. Adjacent history rows with identical time and volume are
+collapsed, with the first removed source-row index and count recorded; a repeated
+time with a different volume remains `history_nonmonotone_time`. The public
+ChemKED/PyKED definition identifies `d/dt second max` as the second maximum of the
+target's time derivative, but T3's existing `ExperimentalIDTFile` vocabulary has
+no such criterion, so all three files remain `unmapped_ignition_definition`.
+
+NC5H12 and HE NASA7 data come from the ReSpecTh-hosted Burcat `THERM.DAT`,
+retrieved 2026-10-17, SHA-256
+`1bcc0261e5003a94496c07632a5727e312fc9055a18e61fdb7c2d5bdca8eacaa`.
+The existing temperature intersection is unchanged. Four files / 31 points still
+refuse as `rcm_thermo_unavailable` because at least one point starts below 295 K;
+the conflicting-volume file's 6 points and the second-maximum files' 12 points
+remain refused. Across every pinned
+archive, H2 and syngas counts are unchanged and only these n-pentane development
+records gain acceptance.

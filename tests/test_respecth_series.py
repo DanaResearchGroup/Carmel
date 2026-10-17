@@ -79,6 +79,7 @@ _PROFILE = "x30000017.xml"
 _OUTLET = "x30000029.xml"
 _OUTLET_ST = "x50001004.xml"
 _BURNER = "x20000074burn.xml"
+_PENTANE_JSR_EXCERPT = "x00011003-jsr-excerpt.xml"
 _R = RespecthRefusalReason
 
 
@@ -89,6 +90,10 @@ def _member(name: str) -> bytes:
 def _archive(name: str) -> PinnedArchive:
     by_name = {archive.name: archive for archive in load_manifest().archives}
     return by_name[MEMBERS[name][0]]
+
+
+def _pentane_archive() -> PinnedArchive:
+    return next(archive for archive in load_manifest().archives if archive.name == "pentane_indirect_v2.5.zip")
 
 
 def _parse(name: str, data: bytes | None = None) -> RespecthSeriesRecord:
@@ -130,6 +135,27 @@ def _replays(name: str) -> None:
     report = replay_series_record(record, _member(name))
     assert report.verified, report.findings
     assert report.checked > len(record.envelope.series[0].points)
+
+
+def test_nc5h12_role_stays_absent_in_jsr_compositions_and_replays() -> None:
+    data = _member(_PENTANE_JSR_EXCERPT)
+    record = parse_series_record(data, _pentane_archive(), "x00011003.xml")
+    common = record.envelope.composition
+    assert isinstance(common, Composition)
+    nc5h12 = next(component for component in common.components if component.species_raw_name == "NC5H12")
+    assert isinstance(nc5h12.role, Absent)
+    assert nc5h12.role.note == "the record states no role and the species is not in the lane's role table"
+    assert replay_series_record(record, data).verified
+
+
+def test_nc5h12_role_stays_absent_in_a_per_point_series_composition_and_replays() -> None:
+    data = _member(_LBV_PER_POINT).replace(b'preferredKey="H2"', b'preferredKey="NC5H12"')
+    record = _parse(_LBV_PER_POINT, data)
+    composition = record.envelope.series[0].points[0].composition
+    assert isinstance(composition, Composition)
+    nc5h12 = next(component for component in composition.components if component.species_raw_name == "NC5H12")
+    assert isinstance(nc5h12.role, Absent)
+    assert replay_series_record(record, data).verified
 
 
 class TestFixturesArePinnedMembers:

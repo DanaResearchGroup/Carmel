@@ -163,7 +163,7 @@ def test_zero_unsupported_species_exports_with_optional_labels(zero):
 
 
 def test_nonzero_unsupported_species_that_underflows_is_not_treated_as_exact_zero():
-    with pytest.raises(RespecthRefusal, match="outside the seven"):
+    with pytest.raises(RespecthRefusal, match="without pinned NASA7 data"):
         argon_record("1E-999")
 
 

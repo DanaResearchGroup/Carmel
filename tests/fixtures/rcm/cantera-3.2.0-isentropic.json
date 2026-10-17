@@ -292,8 +292,36 @@
       },
       "temperature_k": 468.28331033062034,
       "pressure_pa": 321686.8231813566
+    },
+    {
+      "composition": {
+        "HE": 2.5910092e-12,
+        "N2": 0.77976422,
+        "NC5H12": 0.012955046,
+        "O2": 0.20728074
+      },
+      "id": "NC5H12-O2-N2-HE-below-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 360.0,
+      "pressure_pa": 2245310.1003324045,
+      "temperature_k": 797.7415604437855,
+      "volume_ratio": 10.0
+    },
+    {
+      "composition": {
+        "HE": 2.5910092e-12,
+        "N2": 0.77976422,
+        "NC5H12": 0.012955046,
+        "O2": 0.20728074
+      },
+      "id": "NC5H12-O2-N2-HE-cross-1000",
+      "initial_pressure_pa": 101325.0,
+      "initial_temperature_k": 450.0,
+      "pressure_pa": 2743384.096043217,
+      "temperature_k": 1015.3160977213979,
+      "volume_ratio": 12.0
     }
   ],
   "gri30_yaml_sha256": "06650b1e0ee0012f6903d5328b1bb218cb6007d07f8ebe375d18f24811039345",
-  "procedure": "Set TPX, capture SV, then set S and V/volume_ratio at fixed composition; high-boundary ratio 1 avoids extrapolation."
+  "procedure": "Build NC5H12 and HE as Cantera NasaPoly2 species from Carmel's pinned NASA7 coefficients; set TPX, capture SV, then set S and V/volume_ratio at fixed composition; high-boundary ratio 1 avoids extrapolation."
 }

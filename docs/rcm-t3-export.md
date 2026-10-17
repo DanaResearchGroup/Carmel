@@ -49,8 +49,11 @@ initial temperature/pressure. End of compression uses the source's explicit
 compression time when present, otherwise the first minimum-volume sample, with
 that derivation recorded in `source.record`. Source file SHA-256 and archive pin
 are also included. Histories must have increasing finite times, positive volumes
-and a compression phase. Existing ReSpecTh postcompression expansion traces stay
-on their stated, history-free ignition-condition path.
+and a compression phase. An adjacent source row identical to its predecessor in
+both time and volume is one repeated reading: Carmel collapses it and records the
+first removed source-row index and count. Equal times with different volumes
+still refuse. Existing ReSpecTh postcompression expansion traces stay on their
+stated, history-free ignition-condition path.
 
 ChemKED compressed temperature/pressure labels are carried as stated. ReSpecTh
 compression records carry initial states and histories, and omit derived
@@ -58,8 +61,9 @@ end-of-compression temperature/pressure labels by default. `--derived-labels`
 (or `include_derived_labels=True` in the export API) opts in to labels marked
 `;eoc=derived-isentropic`. Stated labels remain present in either mode.
 The pure-Python ideal-gas entropy solver evaluates
-NASA7 temperature-dependent heat capacities for H2, O2, N2, AR, CO, CO2 and H2O.
-H2, O2, CO, CO2 and H2O support 200–3500 K; N2 and Ar support 300–5000 K.
+NASA7 temperature-dependent heat capacities for H2, O2, N2, AR, CO, CO2, H2O,
+NC5H12 and HE. H2, O2, CO, CO2 and H2O support 200–3500 K; NC5H12 and HE
+support 200–6000 K; N2 and Ar support 300–5000 K.
 The operator-approved `N2_AR_LOW_T_EXTRAPOLATION_K = 5` admits initial N2/Ar
 temperatures down to 295 K: their low-T polynomials are nearly flat over a few
 kelvin. This is the only extrapolation allowance; no other species or upper
@@ -86,11 +90,21 @@ source row; ReSpecTh identities remain scoped to the file's common composition.
 
 Coefficients come from GRI-Mech 3.0 in [Cantera 3.2.0's gri30.yaml](https://raw.githubusercontent.com/Cantera/cantera/v3.2.0/data/gri30.yaml),
 SHA-256 `06650b1e0ee0012f6903d5328b1bb218cb6007d07f8ebe375d18f24811039345`.
+NC5H12 and HE come from the mechanism-neutral
+[Burcat THERM.DAT hosted by ReSpecTh](https://respecth.elte.hu/burcat/THERM.DAT),
+retrieved 2026-10-17, SHA-256
+`1bcc0261e5003a94496c07632a5727e312fc9055a18e61fdb7c2d5bdca8eacaa`.
 Carmel requires no Cantera dependency. Both export modes validate with T3's
 `ExperimentalIDTFile` at commit `4043bb9` (merged T3 #222), which accepts
 history points without end-of-compression labels.
 
-Database measurements bind conversion table V5. Torr uses the exact rational
-factor `101325/760`, with Decimal working precision 4096 and half-even rounding,
-preserving source significant digits in the rounded value. Tables V1–V4 retain
-their published serialized identities.
+ReSpecTh's `d/dt second max` is the public ChemKED/PyKED definition "second
+maximum of the time derivative of the target". T3's pinned
+`ExperimentalIDTFile` vocabulary does not express that definition, so Carmel
+keeps those records refused rather than exporting an invalid criterion.
+Existing database measurements bind conversion table V5. A source-printed
+`unitless` equivalence ratio binds through V6 while all component amounts remain
+on V5, so previously admitted envelopes stay byte-identical. Torr uses the exact
+rational factor `101325/760`, with Decimal working precision 4096 and half-even
+rounding, preserving source significant digits in the rounded value. Tables
+V1–V5 retain their published serialized identities.

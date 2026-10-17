@@ -53,7 +53,7 @@ def test_contract_validates_and_reproduces_frozen_totals(contract: Contract) -> 
         "development_files": 26,
         "development_rows": 226,
         "development_observations": 226,
-        "development_supported_files": 0,
+        "development_supported_files": 18,
         "holdout_files": 6,
         "holdout_rows": 144,
         "holdout_observations": 2080,
@@ -266,9 +266,9 @@ def test_data_acceptance_freezes_every_file_and_typed_refusal(contract: Contract
     )
     assert summary == Counter(
         {
-            ("development", "refused", "unmapped_property"): 9,
-            ("development", "refused", "rcm_thermo_unavailable"): 11,
-            ("development", "refused", "history_nonmonotone_time"): 3,
+            ("development", "supported", None): 18,
+            ("development", "refused", "rcm_thermo_unavailable"): 4,
+            ("development", "refused", "history_nonmonotone_time"): 1,
             ("development", "refused", "unmapped_ignition_definition"): 3,
             ("holdout", "supported", None): 6,
         }
