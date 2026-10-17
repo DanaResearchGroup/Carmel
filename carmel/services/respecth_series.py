@@ -42,10 +42,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
 from xml.etree import ElementTree
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_serializer, model_validator
 
 from carmel.schemas.campaign import ReactorType
 from carmel.schemas.datasets import (
@@ -73,6 +73,7 @@ from carmel.schemas.datasets import (
     UncertaintyBasis,
     UncertaintyKind,
     ValueOrigin,
+    XPathLocator,
 )
 from carmel.services import units
 from carmel.services.dataset_store import CanonicalDecimalError, canonical_decimal
@@ -85,6 +86,7 @@ from carmel.services.respecth import (
     RecordReplayReport,
     RecordText,
     ReferenceDoiTrust,
+    RespecthCorrection,
     RespecthRefusal,
     RespecthRefusalReason,
     _composition,
@@ -95,6 +97,7 @@ from carmel.services.respecth import (
     _paper,
     _parse_xml,
     check_record_node,
+    prepare_series_corrections,
     replay_grounded_text,
 )
 from carmel.services.respecth_archive import PinnedArchive
@@ -366,6 +369,14 @@ class RespecthSeriesRecord(BaseModel):
     column_source_types: tuple[tuple[str, RecordText], ...]
     """Per series axis, the RKD ``@sourcetype`` (``reported``/``digitized``/...)."""
     envelope: DatasetEnvelope
+    corrections: tuple[RespecthCorrection, ...] = ()
+
+    @model_serializer(mode="wrap")
+    def _serialize_without_empty_corrections(self, handler: Any) -> Any:
+        payload = handler(self)
+        if not self.corrections:
+            payload.pop("corrections", None)
+        return payload
 
     @model_validator(mode="after")
     def _node_matches_pin(self) -> RespecthSeriesRecord:
@@ -416,6 +427,11 @@ def _species_identity(doc: _Doc, owner: ElementTree.Element) -> SpeciesIdentity:
         raise RespecthRefusal(unidentified, f"{where} speciesLink has unmapped attributes {sorted(extra)}")
     if not any((link.get(name) or "").strip() for name in _SPECIES_IDENTIFIERS):
         raise RespecthRefusal(unidentified, f"{where} names no species identifier (preferredKey, InChI, CAS or SMILES)")
+    if link.get("preferredKey") == "OH" and link.get("InChI") == "1S/H2O/h1H2/p-1":
+        raise RespecthRefusal(
+            unidentified,
+            f"{where} identifies OH by preferred key but water by InChI",
+        )
     return SpeciesIdentity(
         preferred_key=_optional_attribute(doc, link, "preferredKey"),
         inchi=_optional_attribute(doc, link, "InChI"),
@@ -505,6 +521,15 @@ class _Mapping:
     columns: list[_Column] = field(default_factory=list)
     uncertainty_columns: list[ElementTree.Element] = field(default_factory=list)
     source_types: dict[str, RecordText] = field(default_factory=dict)
+    nominal_temperature_allowed: bool = False
+    """The member is named in :data:`_NOMINAL_TEMPERATURE_MEMBERS`."""
+    overridden_nominals: list[ElementTree.Element] = field(default_factory=list)
+    """Common temperatures that yielded to a per-point temperature column."""
+
+
+#: Members that state a nominal common temperature beside a complete per-point temperature
+#: column; the column is the measured coordinate and the common value is kept as a correction.
+_NOMINAL_TEMPERATURE_MEMBERS = frozenset({"x30000010.xml", "x30000014.xml"})
 
 
 def _read_common(doc: _Doc, mapping: _Mapping) -> None:
@@ -561,7 +586,10 @@ def _read_columns(doc: _Doc, kind: RespecthExperimentKind, group: ElementTree.El
             role = AxisRole.COORDINATE if kind is _LBV else AxisRole.OBSERVATION
         else:
             raise RespecthRefusal(unmapped, f"{kind.value} data column {name!r} is not mapped")
-        if axis_id in mapping.constants:
+        if axis_id in mapping.constants and name == "temperature" and mapping.nominal_temperature_allowed:
+            mapping.overridden_nominals.append(mapping.constants.pop(axis_id)[0])
+            mapping.source_types.pop(axis_id, None)
+        elif axis_id in mapping.constants:
             raise RespecthRefusal(
                 unmapped, f"{name!r} is stated both as a common constant and as data column {column_id!r}"
             )
@@ -904,7 +932,7 @@ def read_experiment_type(member_bytes: bytes) -> str:
 
 
 def _build(member_bytes: bytes, pin: ArchivePin) -> RespecthSeriesRecord:
-    doc = _Doc.of(_parse_xml(member_bytes))
+    doc, corrections = prepare_series_corrections(member_bytes, pin.member_path)
     experiment_type = _check_format(doc)
     kind = EXPERIMENT_KINDS.get(experiment_type.raw.strip())
     if kind is None:
@@ -918,7 +946,7 @@ def _build(member_bytes: bytes, pin: ArchivePin) -> RespecthSeriesRecord:
     try:
         apparatus = _apparatus(doc, kind)
         timeshift = _timeshift(doc, kind)
-        mapping = _Mapping()
+        mapping = _Mapping(nominal_temperature_allowed=pin.member_path in _NOMINAL_TEMPERATURE_MEMBERS)
         _read_common(doc, mapping)
         groups = doc.root.findall("dataGroup")
         if len(groups) != 1:
@@ -926,6 +954,21 @@ def _build(member_bytes: bytes, pin: ArchivePin) -> RespecthSeriesRecord:
                 RespecthRefusalReason.UNMAPPED_DATA_GROUP, f"expected one data group, found {len(groups)}"
             )
         _read_columns(doc, kind, groups[0], mapping)
+        for nominal in mapping.overridden_nominals:
+            stated = doc.text(_one(nominal, "value"))
+            assert isinstance(stated.ref.locator, XPathLocator)
+            corrections += (
+                RespecthCorrection(
+                    field_xpath=stated.ref.locator.xpath,
+                    source_value=stated,
+                    corrected_value="per-point dataGroup temperature",
+                    evidence=(
+                        "every dataPoint carries the temperature column; the common value is retained "
+                        "as the stated nominal."
+                    ),
+                    rule_id=f"carmel.respecth.{pin.member_path.removesuffix('.xml')}.temperature_axis.v1",
+                ),
+            )
         _check_required(kind, mapping)
         column_ids = {column.column_id for column in mapping.columns}
         column_ids |= {doc.attribute(prop, "id").raw for prop in mapping.uncertainty_columns}
@@ -973,6 +1016,7 @@ def _build(member_bytes: bytes, pin: ArchivePin) -> RespecthSeriesRecord:
             timeshift=timeshift,
             column_source_types=tuple(sorted(mapping.source_types.items())),
             envelope=envelope,
+            corrections=corrections,
         )
     except ValidationError as exc:
         raise RespecthRefusal(RespecthRefusalReason.SCHEMA_REJECTED, str(exc)) from exc
@@ -1027,7 +1071,7 @@ def replay_series_record(record: RespecthSeriesRecord, member_bytes: bytes) -> R
         rebuilt = _build(member_bytes, record.archive)
     except RespecthRefusal as exc:
         return RecordReplayReport(verified=False, checked=0, findings=(f"the member does not re-map: {exc}",))
-    checked, findings = replay_grounded_text(record, root)
+    checked, findings = replay_grounded_text(record, root, rebuilt.corrections)
     findings.extend(
         f"{name} does not re-derive from the member"
         for name in type(record).model_fields
