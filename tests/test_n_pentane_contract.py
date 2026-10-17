@@ -27,7 +27,8 @@ from carmel.benchmarks.n_pentane import (
     require_structural_absence,
     split_totals,
 )
-from carmel.benchmarks.structure import classify, reaction_signature
+from carmel.benchmarks.schema import benchmark_contract_schema, validate_contract_json
+from carmel.benchmarks.structure import classify, low_temperature_reactant_role, reaction_signature
 from carmel.services.respecth import RespecthRefusal, RespecthRefusalReason
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,9 +42,13 @@ def contract() -> Contract:
 
 def test_contract_validates_and_reproduces_frozen_totals(contract: Contract) -> None:
     raw = json.loads(CONTRACT_PATH.read_text())
-    schema = Contract.model_json_schema()
+    schema = benchmark_contract_schema()
     jsonschema.Draft202012Validator.check_schema(schema)
     jsonschema.validate(raw, schema)
+    assert isinstance(validate_contract_json(CONTRACT_PATH.read_bytes()), Contract)
+    assert validate_contract_json((ROOT / "benchmarks/n-heptane-low-t/contract.json").read_bytes()).case == (
+        "n-heptane-low-t"
+    )
     assert split_totals(contract.split) == {
         "development_files": 26,
         "development_rows": 226,
@@ -82,6 +87,13 @@ def test_all_members_are_resolved_and_accepted_by_their_shared_class_rule(contra
             assert all(reactants) and all(products)
             assert classify(reactants, products, carbon_count=5) == {truth.id}
             assert classify(products, reactants, carbon_count=5) == {truth.id}
+
+    assert low_temperature_reactant_role(species[contract.ground_truth[0].members[0].reactants[0]], carbon_count=5) == (
+        "ooqooh"
+    )
+    assert low_temperature_reactant_role(species[contract.ground_truth[1].members[0].reactants[0]], carbon_count=5) == (
+        "pooh"
+    )
 
 
 def test_tiny_excerpts_are_frozen_members_or_a_conventional_negative(contract: Contract) -> None:

@@ -6,10 +6,11 @@ recovery is primary. Holdout jet-stirred-reactor (JSR) speciation error is secon
 and is declared `requires: jsr-adapter`; Carmel can validate and load the contract
 without that adapter.
 
-The contract uses the same frozen-model, pin-verification, species and structural-rule
-implementation as the n-heptane case. The C5 validator adds the ReSpecTh whole-study
-split and its acceptance ledger. The n-heptane contract and generated schema are not
-changed.
+The contract uses the same frozen-model, pin-verification, species, invariant-validator
+and structural-rule implementation as the n-heptane case. Both cases validate through
+the discriminated shared schema in `carmel.benchmarks.schema`; the C5 model adds the
+ReSpecTh whole-study split and its acceptance ledger. The n-heptane contract and
+generated case schema are not changed.
 
 ## Mechanism pins and identity
 

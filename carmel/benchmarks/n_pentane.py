@@ -16,16 +16,16 @@ from xml.etree import ElementTree
 from pydantic import Field, model_validator
 
 from carmel.benchmarks.chemkin import ChemkinReaction
-from carmel.benchmarks.n_heptane import (
+from carmel.benchmarks.contract import (
     FrozenModel,
     Identity,
     Member,
     Species,
-    _read_pinned_root_file,
     validate_ground_truth_counts,
     validate_mechanism_pair,
     validate_species_inventories,
 )
+from carmel.benchmarks.n_heptane import _read_pinned_root_file
 from carmel.services.respecth import RespecthRefusal, parse_idt_record
 from carmel.services.respecth_archive import PinnedArchive
 from carmel.services.respecth_series import parse_series_record
