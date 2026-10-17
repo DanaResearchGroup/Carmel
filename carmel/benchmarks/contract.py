@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from carmel.services.chemked_archive import _MAX_FILE_BYTES
+MAX_PINNED_FILE_BYTES = 4 * 1024 * 1024
 
 
 class FrozenModel(BaseModel):
@@ -124,17 +124,17 @@ def read_pinned_file(path: Path) -> bytes:
         before = path.stat()
     except OSError as exc:
         raise ValueError(f"cannot read local pinned file {path}: {exc}") from exc
-    if before.st_size > _MAX_FILE_BYTES:
-        raise ValueError(f"local pinned file {path} is {before.st_size} bytes, over the {_MAX_FILE_BYTES} cap")
+    if before.st_size > MAX_PINNED_FILE_BYTES:
+        raise ValueError(f"local pinned file {path} is {before.st_size} bytes, over the {MAX_PINNED_FILE_BYTES} cap")
     try:
         with path.open("rb") as handle:
-            data = handle.read(_MAX_FILE_BYTES + 1)
+            data = handle.read(MAX_PINNED_FILE_BYTES + 1)
         after = path.stat()
     except OSError as exc:
         raise ValueError(f"cannot read local pinned file {path}: {exc}") from exc
-    if len(data) > _MAX_FILE_BYTES or after.st_size > _MAX_FILE_BYTES:
+    if len(data) > MAX_PINNED_FILE_BYTES or after.st_size > MAX_PINNED_FILE_BYTES:
         size = max(len(data), after.st_size)
-        raise ValueError(f"local pinned file {path} is {size} bytes, over the {_MAX_FILE_BYTES} cap")
+        raise ValueError(f"local pinned file {path} is {size} bytes, over the {MAX_PINNED_FILE_BYTES} cap")
     if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or after.st_size != len(data):
         raise ValueError(f"local pinned file {path} changed while reading")
     return data

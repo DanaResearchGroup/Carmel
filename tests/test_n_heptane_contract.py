@@ -513,13 +513,13 @@ def test_reproduction_frozen_split_uses_bounded_local_reader(tmp_path: Path, mon
         )
     )
     calls: list[Path] = []
-    reader = module._read_pinned_root_file
+    reader = module.read_pinned_file
 
     def bounded_reader(path: Path) -> bytes:
         calls.append(path)
         return reader(path)
 
-    monkeypatch.setattr(module, "_read_pinned_root_file", bounded_reader)
+    monkeypatch.setattr(module, "read_pinned_file", bounded_reader)
     module.frozen_split(raw, census)
     assert calls == [raw, census / "evidence/chemked-local-ledger.json", file_path]
 

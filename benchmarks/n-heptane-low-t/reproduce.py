@@ -18,7 +18,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from carmel.benchmarks.chemkin import mechanism  # noqa: E402
-from carmel.benchmarks.contract import read_pinned_file as _read_pinned_root_file  # noqa: E402
+from carmel.benchmarks.contract import read_pinned_file  # noqa: E402
 from carmel.benchmarks.n_heptane import (  # noqa: E402
     GroundTruth,
     Pin,
@@ -48,7 +48,7 @@ def require(condition: bool, message: str) -> None:
 
 
 def _source_bytes(source: Path | bytes) -> bytes:
-    return source if isinstance(source, bytes) else _read_pinned_root_file(source)
+    return source if isinstance(source, bytes) else read_pinned_file(source)
 
 
 def fetch_url(url: str, *, max_bytes: int = _MAX_FILE_BYTES) -> bytes:
@@ -284,16 +284,14 @@ def validate_ground_truth_formula(ground_truth: GroundTruth) -> None:
 def frozen_split(source_report: Path, census_root: Path) -> dict[str, object]:
     import yaml
 
-    source = json.loads(_read_pinned_root_file(source_report))
-    ledger = {
-        r["path"]: r for r in json.loads(_read_pinned_root_file(census_root / "evidence/chemked-local-ledger.json"))
-    }
+    source = json.loads(read_pinned_file(source_report))
+    ledger = {r["path"]: r for r in json.loads(read_pinned_file(census_root / "evidence/chemked-local-ledger.json"))}
     studies = []
     for study in source["studies"]:
         files = []
         for path in study["paths"]:
             relative = path.removeprefix("chemked/")
-            raw = _read_pinned_root_file(census_root / path)
+            raw = read_pinned_file(census_root / path)
             require(
                 hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == ledger[relative]["git_blob"],
                 f"ChemKED Git blob changed: {path}",
