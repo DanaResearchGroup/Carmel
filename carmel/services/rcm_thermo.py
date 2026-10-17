@@ -1,8 +1,8 @@
-"""Offline GRI-Mech 3.0 NASA-7 mixture isentropic RCM label estimates.
+"""Offline pinned NASA-7 mixture isentropic RCM label estimates.
 
-Coefficients are from cantera/data/gri30.yaml, GRI-Mech 3.0,
-https://combustion.berkeley.edu/gri-mech/version30/text30.html.  They were
-extracted from Cantera 3.2.0's gri30.yaml (SHA-256 recorded by release).
+The original seven species come from GRI-Mech 3.0. NC5H12 and HE come from
+Burcat's mechanism-neutral thermochemical database. Exact source pins are
+recorded below and in ``docs/rcm-t3-export.md``.
 """
 
 from __future__ import annotations
@@ -20,6 +20,10 @@ GRI30_YAML_SHA256 = "06650b1e0ee0012f6903d5328b1bb218cb6007d07f8ebe375d18f248110
 
 GRI30_SOURCE_URL = "https://raw.githubusercontent.com/Cantera/cantera/v3.2.0/data/gri30.yaml"
 GRI30_RELEASE = "GRI-Mech 3.0 / Cantera 3.2.0"
+
+BURCAT_SOURCE_URL = "https://respecth.elte.hu/burcat/THERM.DAT"
+BURCAT_RETRIEVAL_DATE = "2026-10-17"
+BURCAT_THERM_SHA256 = "1bcc0261e5003a94496c07632a5727e312fc9055a18e61fdb7c2d5bdca8eacaa"
 
 N2_AR_LOW_T_EXTRAPOLATION_K = Decimal("5")
 """Operator-approved low-T tolerance: N2/Ar polynomials are nearly flat over
@@ -75,6 +79,16 @@ NASA7: Mapping[str, Nasa7] = MappingProxyType(
             (200.0, 1000.0, 3500.0),
             (3.03399249, 0.00217691804, -1.64072518e-07, -9.7041987e-11, 1.68200992e-14, -30004.2971, 4.9667701),
             (4.19864056, -0.0020364341, 6.52040211e-06, -5.48797062e-09, 1.77197817e-12, -30293.7267, -0.849032208),
+        ),
+        "NC5H12": Nasa7(
+            (200.0, 1000.0, 6000.0),
+            (12.6972155, 0.0304568131, -1.09153473e-05, 1.7552367e-09, -1.04805044e-13, -25151.8655, -43.0901457),
+            (6.54437541, -0.00659895449, 0.000151083807, -1.93191011e-07, 7.60508963e-11, -20965.4379, 1.41151597),
+        ),
+        "HE": Nasa7(
+            (200.0, 1000.0, 6000.0),
+            (2.5, 0, 0, 0, 0, -745.375, 0.928723974),
+            (2.5, 0, 0, 0, 0, -745.375, 0.928723974),
         ),
     }
 )

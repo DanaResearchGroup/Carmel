@@ -1,0 +1,26 @@
+<experiment>
+  <fileAuthor>P. Wang and T. Nagy</fileAuthor>
+  <fileVersion><major>2</major><minor>1</minor></fileVersion>
+  <ReSpecThVersion><major>2</major><minor>5</minor></ReSpecThVersion>
+  <bibliographyLink>
+    <description>Bugler et al., Proc. Combust. Inst. 36 (2017) 441-448</description>
+    <referenceDOI>doi.org/10.1016/j.proci.2016.05.048</referenceDOI>
+  </bibliographyLink>
+  <experimentType>jet stirred reactor measurement</experimentType>
+  <apparatus><kind>stirred reactor</kind></apparatus>
+  <commonProperties>
+    <property name="volume" units="cm3"><value>30</value></property>
+    <property name="pressure" units="atm"><value>10</value></property>
+    <property name="residence time" units="ms"><value>700.0</value></property>
+    <property name="initial composition">
+      <component><speciesLink preferredKey="NC5H12"/><amount units="mole fraction">0.00108</amount></component>
+      <component><speciesLink preferredKey="O2"/><amount units="mole fraction">0.02880</amount></component>
+      <component><speciesLink preferredKey="N2"/><amount units="mole fraction">0.97012</amount></component>
+    </property>
+  </commonProperties>
+  <dataGroup id="dg1">
+    <property name="temperature" id="x1" units="K"/>
+    <property name="composition" id="x2" units="mole fraction"><speciesLink preferredKey="NC5H12"/></property>
+    <dataPoint><x1>530</x1><x2>1.08E-03</x2></dataPoint>
+  </dataGroup>
+</experiment>

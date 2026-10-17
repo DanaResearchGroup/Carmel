@@ -42,6 +42,8 @@ def test_transcribed_temperature_ranges_are_pinned():
         "CO": (200.0, 1000.0, 3500.0),
         "CO2": (200.0, 1000.0, 3500.0),
         "H2O": (200.0, 1000.0, 3500.0),
+        "NC5H12": (200.0, 1000.0, 6000.0),
+        "HE": (200.0, 1000.0, 6000.0),
     }
     assert {key: entry.temperature_ranges for key, entry in NASA7.items()} == expected
 
@@ -59,7 +61,8 @@ def test_transcription_matches_pinned_gri30_when_cantera_is_available():
     raw = path.read_bytes()
     assert hashlib.sha256(raw).hexdigest() == GRI30_YAML_SHA256
     species = {item["name"]: item["thermo"] for item in yaml.safe_load(raw)["species"]}
-    for name, entry in NASA7.items():
+    for name in ("H2", "O2", "N2", "AR", "CO", "CO2", "H2O"):
+        entry = NASA7[name]
         thermo = species[name]
         assert thermo["model"] == "NASA7"
         assert entry.temperature_ranges == tuple(thermo["temperature-ranges"])

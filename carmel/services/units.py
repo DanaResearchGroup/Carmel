@@ -115,6 +115,7 @@ __all__ = [
     "TABLE_V3",
     "TABLE_V4",
     "TABLE_V5",
+    "TABLE_V6",
     "RationalScaleRule",
     "AffineRule",
     "ConversionRule",
@@ -1098,6 +1099,16 @@ The rational factor is never stored as a truncated decimal scale.
 """
 
 
+TABLE_V6 = ConversionTable(
+    table_id=TABLE_V5.table_id,
+    version=6,
+    base_units=TABLE_V5.base_units,
+    aliases=TABLE_V5.aliases + (UnitAlias(quantity=QuantityKind.EQUIVALENCE_RATIO, raw="unitless", normalized="1"),),
+    rules=TABLE_V5.rules,
+)
+"""``TABLE_V5`` plus ReSpecTh's printed ``unitless`` equivalence-ratio spelling."""
+
+
 TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType(
     {
         TABLE_V1.sha256: TABLE_V1,
@@ -1105,6 +1116,7 @@ TABLES_BY_SHA: Mapping[str, ConversionTable] = MappingProxyType(
         TABLE_V3.sha256: TABLE_V3,
         TABLE_V4.sha256: TABLE_V4,
         TABLE_V5.sha256: TABLE_V5,
+        TABLE_V6.sha256: TABLE_V6,
     }
 )
 """Every conversion table this module ships, keyed by content address.

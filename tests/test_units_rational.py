@@ -11,6 +11,7 @@ from carmel.services.units import (
     TABLE_V3,
     TABLE_V4,
     TABLE_V5,
+    TABLE_V6,
     ConversionTable,
     ConversionTableInvariantError,
     QuantityKind,
@@ -118,4 +119,4 @@ def test_reconstructed_table_digest_is_not_retained() -> None:
     assert rebuilt is not TABLE_V5
     assert rebuilt.sha256 == TABLE_V5.sha256
     assert shipped == units._SHIPPED_DIGESTS
-    assert {table for table, _ in shipped.values()} == {TABLE_V1, TABLE_V2, TABLE_V3, TABLE_V4, TABLE_V5}
+    assert {table for table, _ in shipped.values()} == {TABLE_V1, TABLE_V2, TABLE_V3, TABLE_V4, TABLE_V5, TABLE_V6}

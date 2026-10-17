@@ -39,7 +39,7 @@ import hashlib
 import re
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Literal
@@ -268,8 +268,8 @@ ASSUMED_APPARATUS_MODES: Mapping[tuple[str, None], str] = {
     ("shock tube", None): "reflected shock",
 }
 
-#: Species whose mixture role is fixed by what the species IS in this fuel family. A species
-#: absent here keeps an explicit ``Absent`` role rather than a guessed one.
+#: Species roles shared by every ReSpecTh lane. A species absent here keeps an
+#: explicit ``Absent`` role rather than a guessed one.
 _SPECIES_ROLES: Mapping[str, ComponentRole] = {
     "H2": ComponentRole.FUEL,
     "CO": ComponentRole.FUEL,
@@ -278,6 +278,26 @@ _SPECIES_ROLES: Mapping[str, ComponentRole] = {
     "He": ComponentRole.DILUENT,
     "N2": ComponentRole.DILUENT,
 }
+
+#: IDT-only role ruling. Series records predate this admission and must retain
+#: their existing identities, where NC5H12 has an explicitly absent role.
+_IDT_SPECIES_ROLES: Mapping[str, ComponentRole] = {
+    **_SPECIES_ROLES,
+    "NC5H12": ComponentRole.FUEL,
+}
+
+#: Stoichiometric O2 demand (mol O2 / mol fuel) for the explicit fuels this
+#: reader can use to audit a source-stated equivalence ratio.  The comparison
+#: tolerance is absolute because both the ratio and source fractions are
+#: dimensionless; 1e-6 is wider than the worst 3.7e-8 roundoff in the pinned
+#: pentane records while still rejecting a changed reported digit.
+_EQUIVALENCE_RATIO_O2_DEMAND: Mapping[str, Decimal] = {
+    "H2": Decimal("0.5"),
+    "CO": Decimal("0.5"),
+    "NC5H12": Decimal("8"),
+}
+_EQUIVALENCE_RATIO_DILUENTS = frozenset({"Ar", "He", "N2"})
+_EQUIVALENCE_RATIO_TOLERANCE = Decimal("1e-6")
 
 #: RKD property name -> (series axis id, quantity).
 _CONDITION_PROPERTIES: Mapping[str, tuple[str, QuantityKind]] = {
@@ -464,6 +484,17 @@ class ArchivePin(BaseModel):
     member_path: str = Field(min_length=1)
 
 
+class HistorySampleCollapse(BaseModel):
+    """A run of exact adjacent duplicate source rows removed before validation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    source_row_index: int = Field(ge=2)
+    """One-based index of the first removed row in the unmodified source group."""
+    count: int = Field(ge=1)
+    """Number of adjacent duplicate rows removed from that run."""
+
+
 class RcmVolumeHistory(BaseModel):
     """One volume-time history, and the two cells its verdict rests on."""
 
@@ -476,6 +507,7 @@ class RcmVolumeHistory(BaseModel):
     minimum_volume: RecordText
     history: RcmHistory | None = None
     """The smallest volume anywhere in the history; not below ``first_volume`` means no compression."""
+    collapsed_samples: tuple[HistorySampleCollapse, ...] = Field(default=(), exclude_if=lambda samples: not samples)
 
 
 class RcmConditions(BaseModel):
@@ -955,6 +987,7 @@ def _composition(
     prop: ElementTree.Element,
     table: units.ConversionTable = _TABLE,
     equivalence_ratio_note: str = "RKD ignition-delay records state no equivalence ratio; not derived",
+    species_roles: Mapping[str, ComponentRole] = _SPECIES_ROLES,
 ) -> Composition:
     components: list[CompositionComponent] = []
     for component in prop:
@@ -971,7 +1004,7 @@ def _composition(
             raise RespecthRefusal(
                 RespecthRefusalReason.UNMAPPED_UNIT, f"component amount unit {amount.unit_raw!r} is not a mole fraction"
             )
-        role = _SPECIES_ROLES.get(species.raw)
+        role = species_roles.get(species.raw)
         components.append(
             CompositionComponent(
                 species_raw_name=species.raw,
@@ -993,6 +1026,40 @@ def _composition(
         equivalence_ratio=Absent(reason=AbsenceReason.UNKNOWN, note=equivalence_ratio_note),
         components=tuple(sorted(components, key=lambda component: component.species_raw_name)),
     )
+
+
+def _stated_equivalence_ratio(doc: _Doc, prop: ElementTree.Element, composition: Composition) -> MeasuredValue:
+    ratio = _measured(
+        doc.text(_one(prop, "value")),
+        doc.attribute(prop, "units"),
+        QuantityKind.EQUIVALENCE_RATIO,
+        units.TABLE_V6,
+    )
+    amounts = {component.species_raw_name: _base_decimal(component.amount) for component in composition.components}
+    supported = set(_EQUIVALENCE_RATIO_O2_DEMAND) | _EQUIVALENCE_RATIO_DILUENTS | {"O2"}
+    unsupported = sorted(name for name, amount in amounts.items() if amount and name not in supported)
+    oxygen = amounts.get("O2", Decimal(0))
+    with localcontext() as ctx:
+        ctx.prec = units._CONVERT_PRECISION
+        ctx.rounding = ROUND_HALF_EVEN
+        demand = sum(
+            (amounts.get(name, Decimal(0)) * coefficient for name, coefficient in _EQUIVALENCE_RATIO_O2_DEMAND.items()),
+            Decimal(0),
+        )
+        if unsupported or oxygen <= 0 or demand <= 0:
+            raise RespecthRefusal(
+                RespecthRefusalReason.UNMAPPED_PROPERTY,
+                f"equivalence ratio cannot be cross-checked from composition (unsupported={unsupported})",
+            )
+        computed = demand / oxygen
+        stated = _base_decimal(ratio)
+        if abs(stated - computed) > _EQUIVALENCE_RATIO_TOLERANCE:
+            raise RespecthRefusal(
+                RespecthRefusalReason.UNMAPPED_PROPERTY,
+                f"stated equivalence ratio {stated} disagrees with composition-derived {computed} "
+                f"beyond {_EQUIVALENCE_RATIO_TOLERANCE}",
+            )
+    return ratio
 
 
 def _uncertainty(doc: _Doc, prop: ElementTree.Element) -> tuple[Uncertainty, UncertaintyDefinition]:
@@ -1031,6 +1098,7 @@ def _common(doc: _Doc) -> _Common:
     composition: Composition | None = None
     uncertainty: Maybe[Uncertainty] = Absent(reason=AbsenceReason.UNKNOWN, note="the record states no uncertainty")
     definition: Maybe[UncertaintyDefinition] = Absent(reason=AbsenceReason.NOT_APPLICABLE)
+    equivalence_ratio: ElementTree.Element | None = None
     seen: set[str] = set()
     for prop in common:
         name = prop.get("name", "")
@@ -1045,7 +1113,9 @@ def _common(doc: _Doc) -> _Common:
             if prop.get("sourcetype"):
                 source_types[axis_id] = doc.attribute(prop, "sourcetype")
         elif name == "initial composition":
-            composition = _composition(doc, prop)
+            composition = _composition(doc, prop, species_roles=_IDT_SPECIES_ROLES)
+        elif name == "equivalence ratio":
+            equivalence_ratio = prop
         elif name == "evaluated standard deviation":
             uncertainty, definition = _uncertainty(doc, prop)
         else:
@@ -1055,6 +1125,10 @@ def _common(doc: _Doc) -> _Common:
             )
     if composition is None:
         raise RespecthRefusal(RespecthRefusalReason.INCOMPLETE_RECORD, "the record states no initial composition")
+    if equivalence_ratio is not None:
+        composition = composition.model_copy(
+            update={"equivalence_ratio": _stated_equivalence_ratio(doc, equivalence_ratio, composition)}
+        )
     return _Common(
         constants=constants,
         composition=composition,
@@ -1121,6 +1195,20 @@ def _rcm_conditions(doc: _Doc, idt_group: ElementTree.Element) -> RcmConditions:
                     f"{doc.path(point)} requires exactly one cell for each history id and no undeclared cells",
                 )
             rows.append(row)
+        collapsed: list[HistorySampleCollapse] = []
+        distinct_rows: list[dict[str, ElementTree.Element]] = []
+        for source_row_index, row in enumerate(rows, start=1):
+            if distinct_rows and all(
+                (row[column].text or "").strip() == (distinct_rows[-1][column].text or "").strip()
+                for column in (time_id, volume_id)
+            ):
+                if collapsed and collapsed[-1].source_row_index + collapsed[-1].count == source_row_index:
+                    collapsed[-1] = collapsed[-1].model_copy(update={"count": collapsed[-1].count + 1})
+                else:
+                    collapsed.append(HistorySampleCollapse(source_row_index=source_row_index, count=1))
+                continue
+            distinct_rows.append(row)
+        rows = distinct_rows
         cells = [row[volume_id] for row in rows]
         if not cells:
             raise RespecthRefusal(RespecthRefusalReason.INCOMPLETE_RECORD, f"{doc.path(group)} holds no data points")
@@ -1162,6 +1250,7 @@ def _rcm_conditions(doc: _Doc, idt_group: ElementTree.Element) -> RcmConditions:
                 first_volume=doc.text(cells[0]),
                 minimum_volume=doc.text(cells[smallest]),
                 history=history,
+                collapsed_samples=tuple(collapsed),
             )
         )
     missing = sorted(set(range(1, point_count + 1)) - covered)
@@ -1325,7 +1414,8 @@ def _condition_states(
     }
     if any(key.upper() not in NASA7 for key in mixture_exact):
         raise RespecthRefusal(
-            RespecthRefusalReason.RCM_THERMO_UNAVAILABLE, "initial mixture is outside the seven GRI30 species"
+            RespecthRefusalReason.RCM_THERMO_UNAVAILABLE,
+            "initial mixture includes species without pinned NASA7 data",
         )
     initial_states = []
     for number, point in enumerate(series.points, start=1):
@@ -1425,11 +1515,15 @@ def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: s
             crop_region=Absent(reason=AbsenceReason.NOT_APPLICABLE),
             document_kind=Absent(reason=AbsenceReason.NOT_APPLICABLE),
         )
+        conversion_tables = [_embedded_table()]
+        ratio = common.composition.equivalence_ratio
+        if isinstance(ratio, MeasuredValue) and ratio.conversion_table_sha256 != _TABLE.sha256:
+            conversion_tables.append(_embedded_table(units.table_for_sha(ratio.conversion_table_sha256)))
         envelope = DatasetEnvelope(
             source_graph=SourceGraph(nodes=(node,)),
             composition=common.composition,
             series=(series,),
-            conversion_tables=(_embedded_table(),),
+            conversion_tables=tuple(sorted(conversion_tables, key=lambda item: item.sha256)),
             table_inventories=(),
             ooxml_table_inventories=(),
             figure_digitizations=(),
