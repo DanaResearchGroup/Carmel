@@ -33,7 +33,13 @@ from carmel.schemas.datasets import (
     UncertaintyKind,
 )
 from carmel.services import units
-from carmel.services.respecth import RespecthRefusal, RespecthRefusalReason, evaluate_xpath
+from carmel.services.respecth import (
+    RespecthRefusal,
+    RespecthRefusalReason,
+    evaluate_xpath,
+    prepare_series_corrections,
+    replay_grounded_text,
+)
 from carmel.services.respecth_archive import PinnedArchive, cached_archive_path, load_manifest
 from carmel.services.respecth_query import QUERY_KINDS, find_records, load_records
 from carmel.services.respecth_series import (
@@ -394,6 +400,188 @@ class TestTicketRefusals:
     def test_an_ignition_delay_member_is_not_this_parsers(self) -> None:
         refusal = parse_refusal(FIXTURES / "x10000001.xml")
         assert refusal.reason is _R.UNMAPPED_EXPERIMENT_TYPE
+
+
+_OH_AS_WATER = (
+    b'<speciesLink preferredKey="OH" CAS="3352-57-6" InChI="1S/H2O/h1H2/p-1" SMILES="[OH]" chemName="hydroxyl" />'
+)
+_OH = b'<speciesLink preferredKey="OH" CAS="3352-57-6" InChI="1S/HO/h1H" SMILES="[OH]" chemName="hydroxyl" />'
+
+
+def _with_doi(name: str, data: bytes, doi: str) -> bytes:
+    old = f"<fileDOI>10.24388/{name.removesuffix('.xml')}</fileDOI>".encode()
+    assert old in data, old
+    return data.replace(old, f"<fileDOI>10.24388/{doi}</fileDOI>".encode(), 1)
+
+
+def _pressure_in(units_and_value: bytes) -> bytes:
+    data = _mutated(_LBV_PER_POINT, b'units="atm"  ><value>1</value>', units_and_value)
+    return _with_doi(_LBV_PER_POINT, data, "x20000070_x")
+
+
+def _profile_with_oh(link: bytes, doi: str) -> bytes:
+    """The H2 profile with its species swapped for OH (and its H2-only uncertainty dropped)."""
+    data = _mutated(
+        _PROFILE,
+        b'<speciesLink preferredKey="H2"  CAS="1333-74-0"  InChI="1S/H2/h1H"  SMILES="[HH]"  chemName="hydrogen" />',
+        link,
+    )
+    start = data.index(b'<property name="evaluated standard deviation"')
+    end = data.index(b"</property>", start) + len(b"</property>")
+    return _with_doi(_PROFILE, data[:start] + data[end:], doi)
+
+
+def _outlet_with_nominal_temperature(doi: str) -> bytes:
+    """The outlet record with a common temperature stated beside its per-point temperature column."""
+    data = _mutated(
+        _OUTLET,
+        b'units="bar"           ><value>50</value></property>',
+        b'units="bar"           ><value>50</value></property>\n'
+        b'        <property name="temperature" label="T" sourcetype="reported" units="K"><value>934</value></property>',
+    )
+    return _with_doi(_OUTLET, data, doi)
+
+
+class TestNamedSourceCorrections:
+    def test_pressure_typo_is_admitted_only_for_its_named_member(self) -> None:
+        data = _pressure_in(b'units="mPa"  ><value>0.1</value>')
+        record = parse_series_record(data, _archive(_LBV_PER_POINT), "x20000070_x.xml")
+        (correction,) = record.corrections
+        assert (correction.source_value.raw, correction.corrected_value) == ("mPa", "MPa")
+        assert correction.rule_id == "carmel.respecth.x20000070_x.pressure_units.v1"
+        assert record.model_dump(mode="json")["corrections"][0]["corrected_value"] == "MPa"
+        assert replay_series_record(record, data).verified
+        assert _refused(_LBV_PER_POINT, data).reason is _R.UNMAPPED_UNIT
+
+    def test_replay_honours_only_corrections_re_derived_from_the_member(self) -> None:
+        data = _pressure_in(b'units="mPa"  ><value>0.1</value>')
+        record = parse_series_record(data, _archive(_LBV_PER_POINT), "x20000070_x.xml")
+        from xml.etree import ElementTree
+
+        root = ElementTree.fromstring(data)  # noqa: S314 - committed fixture
+        _, derived = prepare_series_corrections(data, "x20000070_x.xml")
+        units = "reads 'mPa', recorded 'MPa'"
+        assert any(units in finding for finding in replay_grounded_text(record, root)[1])
+        assert replay_grounded_text(record, root, derived)[1] == []
+        (correction,) = derived
+        source = correction.source_value.model_copy(update={"raw": "Pa"})
+        forged = correction.model_copy(update={"source_value": source})
+        assert any(units in finding for finding in replay_grounded_text(record, root, (forged,))[1])
+
+    def test_a_correction_the_rules_do_not_derive_fails_replay(self) -> None:
+        data = _member(_LBV_PER_POINT)
+        honest = parse_series_record(
+            _pressure_in(b'units="mPa"  ><value>0.1</value>'), _archive(_LBV_PER_POINT), "x20000070_x.xml"
+        )
+        forged = _parse(_LBV_PER_POINT).model_copy(update={"corrections": honest.corrections})
+        report = replay_series_record(forged, data)
+        assert not report.verified
+        assert "corrections does not re-derive from the member" in report.findings
+
+    def test_named_pressure_member_with_another_mpa_value_is_not_corrected(self) -> None:
+        data = _pressure_in(b'units="mPa"  ><value>1</value>')
+        assert prepare_series_corrections(data, "x20000070_x.xml")[1] == ()
+        assert _refused(_LBV_PER_POINT, data).reason is _R.UNMAPPED_UNIT
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [
+            (b'CAS="3352-57-6"', b'CAS="7732-18-5"'),
+            (b'SMILES="[OH]"', b'SMILES="O"'),
+            (b'chemName="hydroxyl"', b'chemName="water"'),
+        ],
+    )
+    def test_oh_link_with_a_conflicting_identifier_is_not_corrected(self, old: bytes, new: bytes) -> None:
+        data = _profile_with_oh(_OH_AS_WATER.replace(old, new), "x30001027")
+        assert prepare_series_corrections(data, "x30001027.xml")[1] == ()
+        with pytest.raises(RespecthRefusal):
+            parse_series_record(data, _archive(_PROFILE), "x30001027.xml")
+
+    def test_named_member_without_the_typo_records_no_correction(self) -> None:
+        data = _pressure_in(b'units="MPa"  ><value>0.1</value>')
+        record = parse_series_record(data, _archive(_LBV_PER_POINT), "x20000070_x.xml")
+        assert record.corrections == ()
+        assert "corrections" not in record.model_dump(mode="json")
+
+    @pytest.mark.parametrize("name", ("x30001027.xml", "x30001028.xml"))
+    def test_oh_inchi_typo_is_named_and_replayed(self, name: str) -> None:
+        data = _profile_with_oh(_OH_AS_WATER, name.removesuffix(".xml"))
+        record = parse_series_record(data, _archive(_PROFILE), name)
+        (correction,) = record.corrections
+        assert (correction.source_value.raw, correction.corrected_value) == ("1S/H2O/h1H2/p-1", "1S/HO/h1H")
+        assert replay_series_record(record, data).verified
+
+    def test_oh_inchi_typo_in_an_unlisted_member_still_refuses(self) -> None:
+        data = _profile_with_oh(_OH_AS_WATER, "x30000017")
+        refusal = _refused(_PROFILE, data)
+        assert refusal.reason is _R.UNIDENTIFIED_SPECIES
+        assert "water by InChI" in str(refusal)
+
+    def test_named_oh_member_with_a_correct_inchi_records_no_correction(self) -> None:
+        data = _profile_with_oh(_OH, "x30001027")
+        assert parse_series_record(data, _archive(_PROFILE), "x30001027.xml").corrections == ()
+
+    @pytest.mark.parametrize("name", ("x30000010.xml", "x30000014.xml"))
+    def test_nominal_temperature_yields_to_the_measured_column(self, name: str) -> None:
+        data = _outlet_with_nominal_temperature(name.removesuffix(".xml"))
+        record = parse_series_record(data, _archive(_OUTLET), name)
+        (correction,) = record.corrections
+        assert correction.source_value.raw == "934"
+        assert correction.corrected_value == "per-point dataGroup temperature"
+        assert correction.rule_id == f"carmel.respecth.{name.removesuffix('.xml')}.temperature_axis.v1"
+        assert _values(record, "temperature") == _values(_parse(_OUTLET), "temperature")
+        assert replay_series_record(record, data).verified
+
+    def test_overridden_nominal_leaves_no_source_type_behind(self) -> None:
+        column = b'label="T"     sourcetype="reported"    units="K"             />'
+        stripped = column.replace(b'sourcetype="reported"', b"")
+        data = _outlet_with_nominal_temperature("x30000010").replace(column, stripped)
+        record = parse_series_record(data, _archive(_OUTLET), "x30000010.xml")
+        assert "temperature" not in dict(record.column_source_types)
+
+    def test_duplicate_temperature_in_an_unlisted_member_still_refuses(self) -> None:
+        refusal = _refused(_OUTLET, _outlet_with_nominal_temperature("x30000029"))
+        assert refusal.reason is _R.UNMAPPED_PROPERTY
+        assert "both as a common constant and as data column" in str(refusal)
+
+    def test_named_pressure_member_without_a_common_pressure_is_left_to_the_mapper(self) -> None:
+        start = _member(_LBV_PER_POINT).index(b'<property name="pressure"')
+        data = _pressure_in(b'units="mPa"  ><value>0.1</value>')
+        end = data.index(b"</property>", start) + len(b"</property>")
+        data = data[:start] + data[end:]
+        assert prepare_series_corrections(data, "x20000070_x.xml")[1] == ()
+        with pytest.raises(RespecthRefusal):
+            parse_series_record(data, _archive(_LBV_PER_POINT), "x20000070_x.xml")
+
+    def test_oh_inchi_typo_is_found_in_a_renumbered_column(self) -> None:
+        data = _profile_with_oh(_OH_AS_WATER, "x30001027").replace(b'id="x2"', b'id="x7"').replace(b"<x2>", b"<x7>")
+        data = data.replace(b"</x2>", b"</x7>")
+        (correction,) = parse_series_record(data, _archive(_PROFILE), "x30001027.xml").corrections
+        assert correction.field_xpath.endswith("/@InChI")
+
+    def test_named_oh_member_without_an_inchi_records_no_correction(self) -> None:
+        link = b'<speciesLink preferredKey="OH" CAS="3352-57-6" SMILES="[OH]" chemName="hydroxyl" />'
+        data = _profile_with_oh(link, "x30001027")
+        assert parse_series_record(data, _archive(_PROFILE), "x30001027.xml").corrections == ()
+
+    def test_named_doi_in_an_unlisted_member_does_not_override_temperature(self) -> None:
+        refusal = _refused(_OUTLET, _outlet_with_nominal_temperature("x30000010"))
+        assert refusal.reason is _R.UNMAPPED_PROPERTY
+        assert "both as a common constant and as data column" in str(refusal)
+
+    def test_named_temperature_member_with_only_a_column_records_no_correction(self) -> None:
+        data = _with_doi(_OUTLET, _member(_OUTLET), "x30000010")
+        record = parse_series_record(data, _archive(_OUTLET), "x30000010.xml")
+        assert record.corrections == ()
+        assert _values(record, "temperature") == _values(_parse(_OUTLET), "temperature")
+
+    def test_named_temperature_member_with_only_a_common_value_records_no_correction(self) -> None:
+        data = _with_doi(_PROFILE, _member(_PROFILE), "x30000014")
+        assert parse_series_record(data, _archive(_PROFILE), "x30000014.xml").corrections == ()
+
+    def test_empty_corrections_do_not_change_existing_serialization(self) -> None:
+        record = _parse(_JSR)
+        assert "corrections" not in record.model_dump(mode="json")
 
 
 def parse_refusal(path: Path) -> RespecthRefusal:

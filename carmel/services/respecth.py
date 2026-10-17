@@ -37,10 +37,11 @@ from __future__ import annotations
 
 import hashlib
 import re
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Literal
 from xml.etree import ElementTree
 
@@ -125,6 +126,7 @@ __all__ = [
     "RcmConditions",
     "RcmVolumeHistory",
     "RecordText",
+    "RespecthCorrection",
     "ReferenceDoiTrust",
     "RespecthIdtRecord",
     "RespecthRefusal",
@@ -135,6 +137,7 @@ __all__ = [
     "evaluate_xpath",
     "parse_idt_record",
     "replay_grounded_text",
+    "prepare_series_corrections",
     "replay_idt_record",
 ]
 
@@ -301,6 +304,19 @@ class RecordText(BaseModel):
 
     raw: str = Field(min_length=1)
     ref: SourceRef
+
+
+class RespecthCorrection(BaseModel):
+    """One named, file-scoped interpretation of defective source text."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    field_xpath: str
+    source_value: RecordText
+    corrected_value: str
+    evidence: str
+    rule_id: str
+    rule_sha256: str = "c7a73c4d181d4d6fdc63e34fd486ef996ca25e1274c3e6070dacd0a36f93c2b6"
 
 
 class ReferenceDoiTrust(StrEnum):
@@ -650,6 +666,69 @@ class _Doc:
                 RespecthRefusalReason.INCOMPLETE_RECORD, f"{self.path(element)} has no @{name}; nothing to ground"
             )
         return RecordText(raw=raw, ref=self.ref(element, name))
+
+
+_OH_AS_WATER_LINK = MappingProxyType(
+    {
+        "preferredKey": "OH",
+        "CAS": "3352-57-6",
+        "InChI": "1S/H2O/h1H2/p-1",
+        "SMILES": "[OH]",
+        "chemName": "hydroxyl",
+    }
+)
+"""The exact x30001027/x30001028 hydroxyl link: every identifier but the InChI agrees on OH."""
+
+
+def prepare_series_corrections(member_bytes: bytes, member_path: str) -> tuple[_Doc, tuple[RespecthCorrection, ...]]:
+    """Apply the operator-approved, member-specific corrections in memory only.
+
+    A correction fires only where its exact defect is present; a named member without it (or
+    laid out differently) is returned unchanged, so the normal mapper validates it as usual.
+    """
+    root = _parse_xml(member_bytes)
+    source = _Doc.of(root)
+    corrections: list[RespecthCorrection] = []
+    if member_path == "x20000070_x.xml":
+        for prop in root.findall("commonProperties/property[@name='pressure']"):
+            value = prop.find("value")
+            if prop.get("units") != "mPa" or value is None or (value.text or "").strip() != "0.1":
+                continue
+            original = source.attribute(prop, "units")
+            assert isinstance(original.ref.locator, XPathLocator)
+            corrections.append(
+                RespecthCorrection(
+                    field_xpath=original.ref.locator.xpath,
+                    source_value=original,
+                    corrected_value="MPa",
+                    evidence=(
+                        "0.1 MPa is a flame-speed pressure; 0.1 mPa is implausibly near-vacuum "
+                        "relative to the record's 298 K, 89.776-186.076 cm/s measurements."
+                    ),
+                    rule_id="carmel.respecth.x20000070_x.pressure_units.v1",
+                )
+            )
+            prop.set("units", "MPa")
+    elif member_path in {"x30001027.xml", "x30001028.xml"}:
+        for link in root.findall("dataGroup/property/speciesLink"):
+            if any(link.get(name) != value for name, value in _OH_AS_WATER_LINK.items()):
+                continue
+            original = source.attribute(link, "InChI")
+            assert isinstance(original.ref.locator, XPathLocator)
+            corrections.append(
+                RespecthCorrection(
+                    field_xpath=original.ref.locator.xpath,
+                    source_value=original,
+                    corrected_value="1S/HO/h1H",
+                    evidence=(
+                        "preferredKey OH, CAS 3352-57-6, SMILES [OH], and the hydroxyl name agree; "
+                        "only this InChI conflicts."
+                    ),
+                    rule_id=f"carmel.respecth.{member_path.removesuffix('.xml')}.oh_inchi.v1",
+                )
+            )
+            link.set("InChI", "1S/HO/h1H")
+    return _Doc.of(root), tuple(corrections)
 
 
 def _one(parent: ElementTree.Element, tag: str) -> ElementTree.Element:
@@ -1435,13 +1514,19 @@ def _replay_conditions(record: RespecthIdtRecord, root: ElementTree.Element) -> 
     return findings
 
 
-def replay_grounded_text(record: BaseModel, root: ElementTree.Element) -> tuple[int, list[str]]:
+def replay_grounded_text(
+    record: BaseModel, root: ElementTree.Element, corrections: Sequence[RespecthCorrection] = ()
+) -> tuple[int, list[str]]:
     """Re-evaluate every grounded ``(ref, text)`` pair of ``record`` against the parsed member.
 
     Every :class:`SourceRef` anywhere in the record (walked by
     :func:`~carmel.schemas.datasets.iter_source_refs`, not hand-listed) must be paired with the
     text it claims and address the record node by XPath. Returns how many pairs were checked and
     every disagreement, verbatim.
+
+    ``corrections`` are the named corrections re-derived from the member bytes by the caller,
+    never the ones ``record`` claims: a mapped field may read its corrected value only where
+    one of them names that path and the member still holds its source spelling there.
     """
     findings: list[str] = []
     pairs = list(_grounded_pairs(record))
@@ -1455,6 +1540,16 @@ def replay_grounded_text(record: BaseModel, root: ElementTree.Element) -> tuple[
             findings.append(f"{path}: does not address the record node by XPath")
             continue
         actual = evaluate_xpath(root, ref.locator.xpath)
+        # A corrected mapped field replays from the source spelling plus its named
+        # correction.  The correction's own source_value still compares raw text.
+        for correction in corrections:
+            if (
+                correction.field_xpath == ref.locator.xpath
+                and actual == correction.source_value.raw
+                and expected == correction.corrected_value
+            ):
+                actual = correction.corrected_value
+                break
         checked += 1
         if actual != expected:
             findings.append(f"{path}: {ref.locator.xpath} reads {actual!r}, recorded {expected!r}")
