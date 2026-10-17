@@ -924,7 +924,7 @@ def test_loader_reports_local_stat_failure(tmp_path: Path, point_data: dict, mon
         return real_stat(candidate)
 
     monkeypatch.setattr(Path, "stat", failing_stat)
-    with pytest.raises(ValueError, match="cannot read local ChemKED file"):
+    with pytest.raises(ValueError, match="cannot read local pinned file"):
         load_split(contract, tmp_path)
 
 
@@ -941,7 +941,7 @@ def test_loader_reports_local_read_failure(tmp_path: Path, point_data: dict, mon
         return real_open(candidate, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", failing_open)
-    with pytest.raises(ValueError, match="cannot read local ChemKED file"):
+    with pytest.raises(ValueError, match="cannot read local pinned file"):
         load_split(contract, tmp_path)
 
 

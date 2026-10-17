@@ -15,7 +15,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from carmel.benchmarks.chemkin import mechanism  # noqa: E402
-from carmel.benchmarks.n_heptane import _read_pinned_root_file  # noqa: E402
+from carmel.benchmarks.contract import read_pinned_file  # noqa: E402
 from carmel.benchmarks.n_pentane import (  # noqa: E402
     Contract,
     formula_inventory,
@@ -400,13 +400,13 @@ def main() -> None:
     parser.add_argument("--archive", type=Path, default=ARCHIVE)
     args = parser.parse_args()
     frozen = None if args.write_contract else load_contract(args.contract)
-    old_source = _read_pinned_root_file(args.v_old)
+    old_source = read_pinned_file(args.v_old)
     if frozen is not None:
         frozen.mechanisms["v_old"].verify(old_source)
-    new_source = _read_pinned_root_file(args.v_new)
+    new_source = read_pinned_file(args.v_new)
     if frozen is not None:
         frozen.mechanisms["v_new"].verify(new_source)
-    archive_bytes = _read_pinned_root_file(args.archive)
+    archive_bytes = read_pinned_file(args.archive)
     if frozen is not None:
         frozen.split.archive.verify(archive_bytes)
     reproduced = build_contract(old_source, new_source, archive_bytes)

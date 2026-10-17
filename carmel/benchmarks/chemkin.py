@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import TypedDict
 
-from carmel.benchmarks.n_heptane import _read_pinned_root_file
+from carmel.benchmarks.contract import read_pinned_file
 
 
 class ChemkinReaction(TypedDict):
@@ -19,7 +19,7 @@ class ChemkinReaction(TypedDict):
 def mechanism(source: Path | bytes) -> tuple[list[str], list[ChemkinReaction]]:
     """Return unique species labels and kinetic reaction entries from mechanism bytes."""
     display = str(source) if isinstance(source, Path) else "<verified snapshot>"
-    raw_source = source if isinstance(source, bytes) else _read_pinned_root_file(source)
+    raw_source = source if isinstance(source, bytes) else read_pinned_file(source)
     mode = None
     species: list[str] = []
     reactions: list[ChemkinReaction] = []

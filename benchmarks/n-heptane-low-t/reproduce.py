@@ -18,15 +18,15 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from carmel.benchmarks.chemkin import mechanism  # noqa: E402
+from carmel.benchmarks.contract import read_pinned_file as _read_pinned_root_file  # noqa: E402
 from carmel.benchmarks.n_heptane import (  # noqa: E402
-    _MAX_FILE_BYTES,
     GroundTruth,
     Pin,
-    _read_pinned_root_file,
     expected_reactant_formula,
     load_contract,
     load_split,
 )
+from carmel.services.chemked_archive import _MAX_FILE_BYTES  # noqa: E402
 
 
 class PinnedInputError(ValueError):

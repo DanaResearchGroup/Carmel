@@ -21,11 +21,11 @@ from carmel.benchmarks.contract import (
     Identity,
     Member,
     Species,
+    read_pinned_file,
     validate_ground_truth_counts,
     validate_mechanism_pair,
     validate_species_inventories,
 )
-from carmel.benchmarks.n_heptane import _read_pinned_root_file
 from carmel.services.respecth import RespecthRefusal, parse_idt_record
 from carmel.services.respecth_archive import PinnedArchive
 from carmel.services.respecth_series import parse_series_record
@@ -315,7 +315,7 @@ def require_structural_absence(
 
 
 def load_contract(path: Path) -> Contract:
-    return Contract.model_validate_json(_read_pinned_root_file(path))
+    return Contract.model_validate_json(read_pinned_file(path))
 
 
 def split_totals(split: Split) -> dict[str, int]:
@@ -354,7 +354,7 @@ def series_counts(record: Any) -> tuple[int, int, int, int]:
 
 def load_split(contract: Contract, archive_source: Path | bytes) -> dict[str, int]:
     """Reverify archive/member pins and run every frozen member through Carmel's readers."""
-    raw_archive = archive_source if isinstance(archive_source, bytes) else _read_pinned_root_file(archive_source)
+    raw_archive = archive_source if isinstance(archive_source, bytes) else read_pinned_file(archive_source)
     contract.split.archive.verify(raw_archive)
     archive = contract.split.archive.to_pinned_archive()
     with zipfile.ZipFile(io.BytesIO(raw_archive)) as source:

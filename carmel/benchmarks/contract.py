@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from carmel.services.chemked_archive import _MAX_FILE_BYTES
 
 
 class FrozenModel(BaseModel):
@@ -113,3 +116,25 @@ def validate_ground_truth_counts(
     if frozen_counts != (len(members), resolved, len(labels), resolved_species):
         raise ValueError("ground-truth counts do not reproduce")
     return labels
+
+
+def read_pinned_file(path: Path) -> bytes:
+    """Read a local pinned input with a size cap and TOCTOU checks."""
+    try:
+        before = path.stat()
+    except OSError as exc:
+        raise ValueError(f"cannot read local pinned file {path}: {exc}") from exc
+    if before.st_size > _MAX_FILE_BYTES:
+        raise ValueError(f"local pinned file {path} is {before.st_size} bytes, over the {_MAX_FILE_BYTES} cap")
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_FILE_BYTES + 1)
+        after = path.stat()
+    except OSError as exc:
+        raise ValueError(f"cannot read local pinned file {path}: {exc}") from exc
+    if len(data) > _MAX_FILE_BYTES or after.st_size > _MAX_FILE_BYTES:
+        size = max(len(data), after.st_size)
+        raise ValueError(f"local pinned file {path} is {size} bytes, over the {_MAX_FILE_BYTES} cap")
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or after.st_size != len(data):
+        raise ValueError(f"local pinned file {path} changed while reading")
+    return data

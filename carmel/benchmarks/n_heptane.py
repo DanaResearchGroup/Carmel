@@ -19,13 +19,13 @@ from carmel.benchmarks.contract import (
     Identity,
     Member,
     Species,
+    read_pinned_file,
     validate_ground_truth_counts,
     validate_mechanism_pair,
     validate_species_inventories,
 )
 from carmel.services.archive_unpack import _is_absolute_member_name
 from carmel.services.chemked import ChemkedRefusal, ChemkedRefusalReason
-from carmel.services.chemked_archive import _MAX_FILE_BYTES
 
 Sha256 = Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")]
 GitSha = Annotated[str, Field(pattern=r"^[0-9a-f]{40}$")]
@@ -207,7 +207,7 @@ class Contract(FrozenModel):
 
 
 def load_contract(path: Path) -> Contract:
-    return Contract.model_validate_json(_read_pinned_root_file(path))
+    return Contract.model_validate_json(read_pinned_file(path))
 
 
 def split_totals(split: Split) -> dict[str, int]:
@@ -256,7 +256,7 @@ def load_split(
     for study in contract.split.studies:
         for item in study.files:
             if root is not None:
-                raw = _read_pinned_root_file(root / item.path)
+                raw = read_pinned_file(root / item.path)
             else:
                 assert fetcher is not None
                 raw = fetcher(item)
@@ -289,28 +289,6 @@ def load_split(
             if actual != expected:
                 raise ValueError(f"NEEDS-INPUT: point/RCM counts changed: {item.path}: {actual} != {expected}")
     return split_totals(contract.split)
-
-
-def _read_pinned_root_file(path: Path) -> bytes:
-    """Read a local ChemKED file with the same cap and TOCTOU checks as fetches."""
-    try:
-        before = path.stat()
-    except OSError as exc:
-        raise ValueError(f"cannot read local ChemKED file {path}: {exc}") from exc
-    if before.st_size > _MAX_FILE_BYTES:
-        raise ValueError(f"local ChemKED file {path} is {before.st_size} bytes, over the {_MAX_FILE_BYTES} cap")
-    try:
-        with path.open("rb") as handle:
-            data = handle.read(_MAX_FILE_BYTES + 1)
-        after = path.stat()
-    except OSError as exc:
-        raise ValueError(f"cannot read local ChemKED file {path}: {exc}") from exc
-    if len(data) > _MAX_FILE_BYTES or after.st_size > _MAX_FILE_BYTES:
-        size = max(len(data), after.st_size)
-        raise ValueError(f"local ChemKED file {path} is {size} bytes, over the {_MAX_FILE_BYTES} cap")
-    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino) or after.st_size != len(data):
-        raise ValueError(f"local ChemKED file {path} changed while reading")
-    return data
 
 
 def write_schema(path: Path) -> None:
