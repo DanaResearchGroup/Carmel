@@ -23,6 +23,14 @@
       "osf_version": 1,
       "size": 704397,
       "sha256": "a14628e5300a7922f50bb354b95f46f1ae853eb6b31e2a33555ffab17812321b"
+    },
+    {
+      "name": "pentane_indirect_v2.5.zip",
+      "osf_path": "/ReactionKinetics/indirect/pentane/pentane_indirect_v2.5.zip",
+      "osf_file_id": "671690d83dea2353a7b93476",
+      "osf_version": 1,
+      "size": 242617,
+      "sha256": "b34d6e78a0600bffba9bf7f04f59d9479d6d1314df9964e4071902c929a65e56"
     }
   ]
 }

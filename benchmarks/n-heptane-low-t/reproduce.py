@@ -17,15 +17,16 @@ from urllib.request import urlopen
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
+from carmel.benchmarks.chemkin import mechanism  # noqa: E402
+from carmel.benchmarks.contract import read_pinned_file  # noqa: E402
 from carmel.benchmarks.n_heptane import (  # noqa: E402
-    _MAX_FILE_BYTES,
     GroundTruth,
     Pin,
-    _read_pinned_root_file,
     expected_reactant_formula,
     load_contract,
     load_split,
 )
+from carmel.services.chemked_archive import _MAX_FILE_BYTES  # noqa: E402
 
 
 class PinnedInputError(ValueError):
@@ -47,49 +48,7 @@ def require(condition: bool, message: str) -> None:
 
 
 def _source_bytes(source: Path | bytes) -> bytes:
-    return source if isinstance(source, bytes) else _read_pinned_root_file(source)
-
-
-def mechanism(source: Path | bytes) -> tuple[list[str], list[dict[str, object]]]:
-    display = str(source) if isinstance(source, Path) else "<verified snapshot>"
-    mode = None
-    species: list[str] = []
-    reactions: list[dict[str, object]] = []
-    for number, raw in enumerate(_source_bytes(source).decode(errors="replace").splitlines(), 1):
-        line = raw.split("!", 1)[0].strip()
-        if not line:
-            continue
-        head = line.split()[0].upper()
-        if head in ("SPECIES", "SPEC"):
-            mode = "species"
-            species.extend(line.split()[1:])
-            continue
-        if head in ("REACTIONS", "REAC"):
-            mode = "reactions"
-            continue
-        if head == "END":
-            mode = None
-            continue
-        if mode == "species":
-            species.extend(line.split())
-        elif mode == "reactions" and "=" in line:
-            match = re.match(r"(.+?)\s+[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?\s+", line)
-            if not match:
-                raise ValueError(f"unparsed reaction: {display}:{number}")
-            equation = re.sub(r"\s+", "", match[1])
-            sides = []
-            for side in re.split("<=>|=>|=", equation):
-                labels: list[str] = []
-                for token in side.replace("(+M)", "").split("+"):
-                    if token == "M":
-                        continue
-                    coefficient = re.fullmatch(r"(\d+)?(.+)", token)
-                    if coefficient is None:
-                        raise ContractMismatch(f"unparsed reaction coefficient: {display}:{number}")
-                    labels.extend([coefficient[2]] * int(coefficient[1] or 1))
-                sides.append(tuple(labels))
-            reactions.append(dict(equation=equation, line=number, reactants=sides[0], products=sides[1]))
-    return sorted(set(species)), reactions
+    return source if isinstance(source, bytes) else read_pinned_file(source)
 
 
 def fetch_url(url: str, *, max_bytes: int = _MAX_FILE_BYTES) -> bytes:
@@ -325,16 +284,14 @@ def validate_ground_truth_formula(ground_truth: GroundTruth) -> None:
 def frozen_split(source_report: Path, census_root: Path) -> dict[str, object]:
     import yaml
 
-    source = json.loads(_read_pinned_root_file(source_report))
-    ledger = {
-        r["path"]: r for r in json.loads(_read_pinned_root_file(census_root / "evidence/chemked-local-ledger.json"))
-    }
+    source = json.loads(read_pinned_file(source_report))
+    ledger = {r["path"]: r for r in json.loads(read_pinned_file(census_root / "evidence/chemked-local-ledger.json"))}
     studies = []
     for study in source["studies"]:
         files = []
         for path in study["paths"]:
             relative = path.removeprefix("chemked/")
-            raw = _read_pinned_root_file(census_root / path)
+            raw = read_pinned_file(census_root / path)
             require(
                 hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest() == ledger[relative]["git_blob"],
                 f"ChemKED Git blob changed: {path}",

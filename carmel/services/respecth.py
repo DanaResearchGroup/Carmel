@@ -319,6 +319,18 @@ class RespecthCorrection(BaseModel):
     rule_sha256: str = "c7a73c4d181d4d6fdc63e34fd486ef996ca25e1274c3e6070dacd0a36f93c2b6"
 
 
+class DerivedRecordDoi(BaseModel):
+    """A ReSpecTh record DOI reconstructed from its canonical member filename."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    raw: str = Field(pattern=r"^10\.24388/[xg][0-9]{8}$")
+    basis: Literal["member-filename-convention"] = "member-filename-convention"
+
+
+RecordDoi = RecordText | DerivedRecordDoi
+
+
 class ReferenceDoiTrust(StrEnum):
     """Whether the record's ``referenceDOI`` may be emitted as the paper's citation."""
 
@@ -495,7 +507,7 @@ class RespecthIdtRecord(BaseModel):
 
     source: Literal["respecth"] = "respecth"
     archive: ArchivePin
-    record_doi: RecordText
+    record_doi: RecordDoi
     """The ReSpecTh ``fileDOI`` -- the citable, stable id of THIS record."""
     paper: Maybe[PaperReference]
     apparatus: Apparatus
@@ -1357,6 +1369,19 @@ def _condition_states(
     return tuple(initial_states)
 
 
+def _record_doi(doc: _Doc, member_path: str) -> RecordDoi:
+    elements = doc.root.findall("fileDOI")
+    if elements:
+        return doc.text(_one(doc.root, "fileDOI"))
+    filename = member_path.rsplit("/", 1)[-1]
+    if re.fullmatch(r"[xg][0-9]{8}\.xml", filename) is None:
+        raise RespecthRefusal(
+            RespecthRefusalReason.INCOMPLETE_RECORD,
+            "missing <fileDOI> and member filename does not identify a ReSpecTh record",
+        )
+    return DerivedRecordDoi(raw=f"10.24388/{filename.removesuffix('.xml')}")
+
+
 def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: str) -> RespecthIdtRecord:
     """Map one RKD ignition-delay member into a :class:`RespecthIdtRecord`.
 
@@ -1417,7 +1442,7 @@ def parse_idt_record(member_bytes: bytes, archive: PinnedArchive, member_path: s
                 archive_sha256=archive.sha256,
                 member_path=member_path,
             ),
-            record_doi=doc.text(_one(doc.root, "fileDOI")),
+            record_doi=_record_doi(doc, member_path),
             paper=_paper(doc),
             apparatus=apparatus,
             ignition=ignition,
@@ -1581,6 +1606,18 @@ def replay_idt_record(record: RespecthIdtRecord, member_bytes: bytes) -> RecordR
         return RecordReplayReport(verified=False, checked=0, findings=(str(exc),))
 
     checked, findings = replay_grounded_text(record, root)
+    try:
+        expected_record_doi = _record_doi(_Doc.of(root), record.archive.member_path)
+    except RespecthRefusal as exc:
+        findings.append(f"record_doi does not re-derive: {exc.reason.value}: {exc.detail}")
+    else:
+        if (
+            isinstance(record.record_doi, DerivedRecordDoi) or isinstance(expected_record_doi, DerivedRecordDoi)
+        ) and record.record_doi != expected_record_doi:
+            findings.append(
+                f"record_doi {record.record_doi.raw!r} does not re-derive "
+                f"(the member gives {expected_record_doi.raw!r})"
+            )
     if (
         record.species_identifiers
         or record.end_of_compression_basis == "derived-isentropic"

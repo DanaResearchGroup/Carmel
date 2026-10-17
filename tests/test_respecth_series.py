@@ -95,6 +95,15 @@ def _parse(name: str, data: bytes | None = None) -> RespecthSeriesRecord:
     return parse_series_record(_member(name) if data is None else data, _archive(name), name)
 
 
+def test_legacy_member_without_file_doi_uses_the_respecth_filename_convention() -> None:
+    data = _member(_JSR).replace(b"<fileDOI>10.24388/g00000005psr</fileDOI>", b"")
+
+    record = parse_series_record(data, _archive(_JSR), "g00000005.xml")
+
+    assert record.citation_doi == "10.24388/g00000005"
+    assert record.record_doi.basis == "member-filename-convention"
+
+
 def _values(record: RespecthSeriesRecord, axis_id: str) -> list[MeasuredValue]:
     """Every point's value on ``axis_id`` (a constant repeats), in point order."""
     series = record.envelope.series[0]

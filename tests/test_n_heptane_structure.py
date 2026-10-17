@@ -10,7 +10,15 @@ import pytest
 
 pytest.importorskip("rdkit")
 
-from carmel.benchmarks.structure import canonical, classify, features, ketohydroperoxide, molecule, reaction_signature
+from carmel.benchmarks.structure import (
+    canonical,
+    classify,
+    features,
+    ketohydroperoxide,
+    molecule,
+    pentane_low_temperature_species,
+    reaction_signature,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 RAW = json.loads((ROOT / "benchmarks/n-heptane-low-t/contract.json").read_text())
@@ -110,6 +118,32 @@ def test_conventional_alpha_hydroperoxy_intermediate_gets_no_alternative_credit(
     assert classify(ooqooh, alpha) == set()
     assert classify(alpha, ooqooh) == set()
     assert not features(SMILES["C7H13Q13-5"]).radical_on_hydroperoxy_carbon
+
+
+def test_same_rules_classify_n_pentane_when_carbon_count_is_explicit() -> None:
+    ooqooh = ("OOCC(O[O])CCC",)
+    pooh = ("OOCC(OO)CC[CH2]",)
+    olefinic_hydroperoxide = ("C=CC(OO)CC", "[O]O")
+
+    assert classify(ooqooh, pooh, carbon_count=5) == {"G1"}
+    assert classify(pooh, olefinic_hydroperoxide, carbon_count=5) == {"G3"}
+    assert classify(ooqooh, olefinic_hydroperoxide, carbon_count=5) == {"G4"}
+    assert classify(ooqooh, pooh) == set()
+
+
+@pytest.mark.parametrize(
+    "label,formula",
+    [
+        ("C5H10OOH1-3O2", {"C": 5, "H": 11, "O": 4}),
+        ("C5H91-2,3OOH", {"C": 5, "H": 11, "O": 4}),
+        ("C5H91-3OOH", {"C": 5, "H": 10, "O": 2}),
+        ("C5H9O1-3OOH-2", {"C": 5, "H": 10, "O": 3}),
+    ],
+)
+def test_pentane_label_grammar_resolves_documented_species(label: str, formula: dict[str, int]) -> None:
+    smiles = pentane_low_temperature_species(label)
+    assert smiles is not None
+    assert dict(features(smiles).atoms) == formula
 
 
 @pytest.mark.parametrize(

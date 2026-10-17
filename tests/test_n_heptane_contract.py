@@ -513,13 +513,13 @@ def test_reproduction_frozen_split_uses_bounded_local_reader(tmp_path: Path, mon
         )
     )
     calls: list[Path] = []
-    reader = module._read_pinned_root_file
+    reader = module.read_pinned_file
 
     def bounded_reader(path: Path) -> bytes:
         calls.append(path)
         return reader(path)
 
-    monkeypatch.setattr(module, "_read_pinned_root_file", bounded_reader)
+    monkeypatch.setattr(module, "read_pinned_file", bounded_reader)
     module.frozen_split(raw, census)
     assert calls == [raw, census / "evidence/chemked-local-ledger.json", file_path]
 
@@ -924,7 +924,7 @@ def test_loader_reports_local_stat_failure(tmp_path: Path, point_data: dict, mon
         return real_stat(candidate)
 
     monkeypatch.setattr(Path, "stat", failing_stat)
-    with pytest.raises(ValueError, match="cannot read local ChemKED file"):
+    with pytest.raises(ValueError, match="cannot read local pinned file"):
         load_split(contract, tmp_path)
 
 
@@ -941,7 +941,7 @@ def test_loader_reports_local_read_failure(tmp_path: Path, point_data: dict, mon
         return real_open(candidate, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", failing_open)
-    with pytest.raises(ValueError, match="cannot read local ChemKED file"):
+    with pytest.raises(ValueError, match="cannot read local pinned file"):
         load_split(contract, tmp_path)
 
 

@@ -1,4 +1,4 @@
-"""Structure-only rules for the frozen n-heptane benchmark (requires agents extra)."""
+"""Structure-only rules for frozen straight-chain alkane benchmarks."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cache
 from types import MappingProxyType
+from typing import Literal
 
 from rdkit import Chem
 
@@ -75,12 +76,39 @@ def features(smiles: str) -> Features:
     )
 
 
+ReactantRole = Literal["pooh", "ooqooh"]
+
+
+def _low_temperature_reactant_role(structure: Features, carbon_count: int) -> ReactantRole | None:
+    if structure.atoms != Counter({"C": carbon_count, "H": 2 * carbon_count + 1, "O": 4}):
+        return None
+    if not structure.linear_carbon or structure.carbonyls or structure.alkenes or structure.ether_rings:
+        return None
+    if (
+        structure.hydroperoxides == 2
+        and not structure.radical_on_hydroperoxy_carbon
+        and structure.carbon_radicals == structure.radicals == 1
+    ):
+        return "pooh"
+    if (
+        structure.hydroperoxides == structure.peroxy_radicals == structure.radicals == 1
+        and structure.carbon_radicals == 0
+    ):
+        return "ooqooh"
+    return None
+
+
+def low_temperature_reactant_role(smiles: str, *, carbon_count: int) -> ReactantRole | None:
+    """Identify the shared P(OOH)2/OOQOOH structural role used by class rules and audits."""
+    return _low_temperature_reactant_role(features(smiles), carbon_count)
+
+
 def reaction_signature(reactants: tuple[str, ...], products: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
     """Ignore labels, rates, direction, and unassigned stereochemistry; retain multiplicity."""
     return tuple(sorted((tuple(sorted(map(canonical, reactants))), tuple(sorted(map(canonical, products))))))
 
 
-def classify(reactants: tuple[str, ...], products: tuple[str, ...]) -> frozenset[str]:
+def classify(reactants: tuple[str, ...], products: tuple[str, ...], *, carbon_count: int = 7) -> frozenset[str]:
     """Recognize net structural classes in either orientation; require elemental balance."""
     left, right = [features(s) for s in reactants], [features(s) for s in products]
     if sum((Counter(f.atoms) for f in left), Counter()) != sum((Counter(f.atoms) for f in right), Counter()):
@@ -90,25 +118,16 @@ def classify(reactants: tuple[str, ...], products: tuple[str, ...]) -> frozenset
         if len(source) != 1:
             continue
         src = source[0]
-        if src.atoms["C"] != 7 or not src.linear_carbon:
+        if src.atoms["C"] != carbon_count or not src.linear_carbon:
             continue
-        pooh = (
-            src.atoms == Counter({"C": 7, "H": 15, "O": 4})
-            and src.hydroperoxides == 2
-            and not src.radical_on_hydroperoxy_carbon
-            and src.carbon_radicals == src.radicals == 1
-            and src.carbonyls == src.alkenes == src.ether_rings == 0
-        )
-        ooqooh = (
-            src.atoms == Counter({"C": 7, "H": 15, "O": 4})
-            and src.hydroperoxides == src.peroxy_radicals == src.radicals == 1
-            and src.carbon_radicals == src.carbonyls == src.alkenes == src.ether_rings == 0
-        )
+        role = _low_temperature_reactant_role(src, carbon_count)
+        pooh = role == "pooh"
+        ooqooh = role == "ooqooh"
         carbon_products = [f for f in target if f.atoms.get("C", 0)]
         small = sorted(canonical(s) for s, f in zip(target_smiles, target, strict=True) if not f.atoms.get("C", 0))
         if len(carbon_products) == 1:
             dst = carbon_products[0]
-            if dst.atoms["C"] != 7 or not dst.linear_carbon:
+            if dst.atoms["C"] != carbon_count or not dst.linear_carbon:
                 continue
             if (
                 ooqooh
@@ -125,9 +144,14 @@ def classify(reactants: tuple[str, ...], products: tuple[str, ...]) -> frozenset
                     found.add("G3")
                 if ooqooh:
                     found.add("G4")
-        elif len(carbon_products) >= 2 and pooh:
+        elif carbon_count == 7 and len(carbon_products) >= 2 and pooh:
             found.add("G5")
-        elif len(carbon_products) == 2 and len(target) == 2 and src.atoms == Counter({"C": 7, "H": 14, "O": 3}):
+        elif (
+            carbon_count == 7
+            and len(carbon_products) == 2
+            and len(target) == 2
+            and src.atoms == Counter({"C": carbon_count, "H": 2 * carbon_count, "O": 3})
+        ):
             acids = [f for f in target if f.acids == f.carbonyls == 1]
             non_acid_carbonyls = [f for f in target if f.acids == 0 and f.carbonyls == 1]
             if (
@@ -153,3 +177,71 @@ def ketohydroperoxide(label: str) -> str | None:
     chain[carbonyl - 1] += "(=O)"
     chain[hydroperoxy - 1] += "(OO)"
     return canonical("".join(chain))
+
+
+def pentane_low_temperature_species(label: str) -> str | None:
+    """Resolve Bugler's documented straight-chain C5 low-temperature label grammar."""
+    if label == "OH":
+        return "[OH]"
+    if label == "HO2":
+        return "[O]O"
+
+    hydroperoxides: tuple[int, ...]
+    peroxy: int | None = None
+    radical: int | None = None
+    double_bond: int | None = None
+    ether: tuple[int, int] | None = None
+    match = re.fullmatch(r"C5H10OOH([1-5])-([1-5])O2", label)
+    if match:
+        hydroperoxides = (int(match[1]),)
+        peroxy = int(match[2])
+    elif match := re.fullmatch(r"C5H9([1-5])-([1-5]),([1-5])OOH", label):
+        radical = int(match[1])
+        hydroperoxides = (int(match[2]), int(match[3]))
+    elif match := re.fullmatch(r"C5H9([1-4])-([1-5])OOH", label):
+        double_bond = int(match[1])
+        hydroperoxides = (int(match[2]),)
+    elif match := re.fullmatch(r"C5H9O([1-5])-([1-5])OOH-([1-5])", label):
+        ether = (int(match[1]), int(match[2]))
+        hydroperoxides = (int(match[3]),)
+    else:
+        return ketohydroperoxide(label)
+
+    if len(set(hydroperoxides)) != len(hydroperoxides):
+        return None
+    if radical in hydroperoxides or peroxy in hydroperoxides:
+        return None
+    if ether is not None and (ether[0] == ether[1] or ether[0] in hydroperoxides or ether[1] in hydroperoxides):
+        return None
+
+    graph = Chem.RWMol()
+    carbons = [graph.AddAtom(Chem.Atom("C")) for _ in range(5)]
+    for left, right in zip(carbons, carbons[1:], strict=False):
+        graph.AddBond(left, right, Chem.BondType.SINGLE)
+    if double_bond is not None:
+        graph.RemoveBond(carbons[double_bond - 1], carbons[double_bond])
+        graph.AddBond(carbons[double_bond - 1], carbons[double_bond], Chem.BondType.DOUBLE)
+    if radical is not None:
+        graph.GetAtomWithIdx(carbons[radical - 1]).SetNumRadicalElectrons(1)
+    for position in hydroperoxides:
+        inner = graph.AddAtom(Chem.Atom("O"))
+        outer = graph.AddAtom(Chem.Atom("O"))
+        graph.AddBond(carbons[position - 1], inner, Chem.BondType.SINGLE)
+        graph.AddBond(inner, outer, Chem.BondType.SINGLE)
+    if peroxy is not None:
+        inner = graph.AddAtom(Chem.Atom("O"))
+        outer_atom = Chem.Atom("O")
+        outer_atom.SetNumRadicalElectrons(1)
+        outer = graph.AddAtom(outer_atom)
+        graph.AddBond(carbons[peroxy - 1], inner, Chem.BondType.SINGLE)
+        graph.AddBond(inner, outer, Chem.BondType.SINGLE)
+    if ether is not None:
+        oxygen = graph.AddAtom(Chem.Atom("O"))
+        graph.AddBond(carbons[ether[0] - 1], oxygen, Chem.BondType.SINGLE)
+        graph.AddBond(oxygen, carbons[ether[1] - 1], Chem.BondType.SINGLE)
+    try:
+        molecule = graph.GetMol()
+        Chem.SanitizeMol(molecule)
+    except ValueError:
+        return None
+    return str(Chem.MolToSmiles(molecule, isomericSmiles=False))

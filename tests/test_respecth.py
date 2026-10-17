@@ -135,6 +135,12 @@ class TestFixturesArePinnedMembers:
                 1,
                 "a14628e5300a7922f50bb354b95f46f1ae853eb6b31e2a33555ffab17812321b",
             ),
+            (
+                "pentane_indirect_v2.5.zip",
+                "671690d83dea2353a7b93476",
+                1,
+                "b34d6e78a0600bffba9bf7f04f59d9479d6d1314df9964e4071902c929a65e56",
+            ),
         }
         assert manifest.download_url(manifest.archives[0]) == (
             "https://files.osf.io/v1/resources/nbmzv/providers/osfstorage/6716900181a7f78563a5e911?version=1"
@@ -509,6 +515,20 @@ class TestReplayRefuses:
         assert not report.verified
         assert any("10.0/forged" in finding for finding in report.findings)
 
+    def test_a_forged_derived_record_doi_does_not_verify(self) -> None:
+        data = _member("x00000070_p.xml").replace(b"<fileDOI>10.24388/x00000070</fileDOI>", b"")
+        record = _parse("x00000070.xml", data)
+        forged = record.model_copy(
+            update={"record_doi": record.record_doi.model_copy(update={"raw": "10.24388/x99999999"})}
+        )
+
+        report = replay_idt_record(forged, data)
+
+        assert not report.verified
+        assert report.findings == (
+            "record_doi '10.24388/x99999999' does not re-derive (the member gives '10.24388/x00000070')",
+        )
+
     def test_a_trust_marker_the_comments_do_not_support(self) -> None:
         record = _parse("x10000001.xml")
         assert not isinstance(record.paper, Absent)
@@ -527,6 +547,18 @@ class TestReplayRefuses:
 
 class TestRefusals:
     """Each refusal is a typed RespecthRefusal: no record is returned at all."""
+
+    @pytest.mark.parametrize("name", ["x00000070_p.xml", "x10000030_x.xml", "x40001058_19.xml"])
+    def test_missing_file_doi_refuses_ambiguous_filename_variants(self, name: str) -> None:
+        data = _member(name)
+        start = data.index(b"<fileDOI>")
+        stop = data.index(b"</fileDOI>", start) + len(b"</fileDOI>")
+
+        with pytest.raises(RespecthRefusal) as caught:
+            _parse(name, data[:start] + data[stop:])
+
+        assert caught.value.reason is RespecthRefusalReason.INCOMPLETE_RECORD
+        assert "filename does not identify" in caught.value.detail
 
     def _refused(self, name: str, data: bytes | None = None) -> RespecthRefusal:
         with pytest.raises(RespecthRefusal) as caught:
