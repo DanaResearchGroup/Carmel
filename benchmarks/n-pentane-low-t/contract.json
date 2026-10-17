@@ -1,0 +1,2375 @@
+{
+  "schema_version": 1,
+  "case": "n-pentane-low-t",
+  "mechanisms": {
+    "v_old": {
+      "filename": "nc5_49_mech.dat",
+      "source_url": "https://nuigalway.ie/media/researchcentres/combustionchemistrycentre/files/mechanismdownloads/nc5_49_mech.dat",
+      "retrieval_date": "2026-10-14",
+      "sha256": "aae8ebbe144b081a52aae08efb14740d8b90cbda59d6e300f5cb34acf41614bd",
+      "bytes": 147877,
+      "unique_species": 293,
+      "reaction_entries": 1593
+    },
+    "v_new": {
+      "filename": "nuigmech_c5_july2015_1215.chem",
+      "source_url": "https://nuigalway.ie/media/researchcentres/combustionchemistrycentre/files/mechanismdownloads/nuigmech_c5_july2015_1215.chem",
+      "retrieval_date": "2026-10-14",
+      "sha256": "b54aa3569d8f3796a242402b08c4395381fced58f6edcf1fc060b0ac3446be48",
+      "bytes": 488335,
+      "unique_species": 697,
+      "reaction_entries": 3214
+    }
+  },
+  "support_sources": [
+    {
+      "filename": "pentane_indirect_v2.5.zip",
+      "source_url": "https://files.osf.io/v1/resources/nbmzv/providers/osfstorage/671690d83dea2353a7b93476?version=1",
+      "retrieval_date": "2026-10-02",
+      "sha256": "b34d6e78a0600bffba9bf7f04f59d9479d6d1314df9964e4071902c929a65e56",
+      "bytes": 242617,
+      "unique_species": null,
+      "reaction_entries": null,
+      "osf_path": "/ReactionKinetics/indirect/pentane/pentane_indirect_v2.5.zip",
+      "osf_file_id": "671690d83dea2353a7b93476",
+      "osf_version": 1
+    }
+  ],
+  "identity": {
+    "status": "UNVERIFIED",
+    "historical_identity_caveat": "Bugler names Healy as the starting mechanism, but the current nc5_49 and July-2015 files are not authenticated publication-era snapshots.",
+    "attempts": [
+      "Inspected both mechanism headers and filenames for a publication date or immutable release identifier.",
+      "Read Bugler 2015 section 2, which names Healy's model as the starting mechanism but does not fingerprint nc5_49 bytes.",
+      "Compared the retrieved endpoint species and reaction-entry counts with the census evidence."
+    ],
+    "evidence": [
+      "Bugler et al. 2015 section 2 states that the model is based on the n-pentane mechanism developed by Healy et al.",
+      "The nc5_49 filename and 293/1593 inventory are consistent with the retrieved historical release.",
+      "No primary source located ties either frozen SHA-256 to the exact submitted/published mechanism bytes."
+    ]
+  },
+  "new_species": [
+    {
+      "label": "C5H10OOH1-2O2",
+      "status": "RESOLVED",
+      "smiles": "CCCC(COO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-3O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(CCOO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-4O2",
+      "status": "RESOLVED",
+      "smiles": "CC(CCCOO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-5O2",
+      "status": "RESOLVED",
+      "smiles": "[O]OCCCCCOO",
+      "formula": {
+        "O": 4,
+        "C": 5,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-1O2",
+      "status": "RESOLVED",
+      "smiles": "CCCC(CO[O])OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-3O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(O[O])C(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-4O2",
+      "status": "RESOLVED",
+      "smiles": "CC(CC(C)OO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-5O2",
+      "status": "RESOLVED",
+      "smiles": "CC(CCCO[O])OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH3-1O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(CCO[O])OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH3-2O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(OO)C(C)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-2,3OOH",
+      "status": "RESOLVED",
+      "smiles": "[CH2]C(OO)C(CC)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-2,4OOH",
+      "status": "RESOLVED",
+      "smiles": "[CH2]C(CC(C)OO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-2,5OOH",
+      "status": "RESOLVED",
+      "smiles": "[CH2]C(CCCOO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-3,4OOH",
+      "status": "RESOLVED",
+      "smiles": "[CH2]CC(OO)C(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-3,5OOH",
+      "status": "RESOLVED",
+      "smiles": "[CH2]CC(CCOO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-3OOH",
+      "status": "RESOLVED",
+      "smiles": "C=CC(CC)OO",
+      "formula": {
+        "C": 5,
+        "O": 2,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-4,5OOH",
+      "status": "RESOLVED",
+      "smiles": "[CH2]CCC(COO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-4OOH",
+      "status": "RESOLVED",
+      "smiles": "C=CCC(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 2,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H91-5OOH",
+      "status": "RESOLVED",
+      "smiles": "C=CCCCOO",
+      "formula": {
+        "C": 5,
+        "O": 2,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-1,3OOH",
+      "status": "RESOLVED",
+      "smiles": "CCC([CH]COO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-1,4OOH",
+      "status": "RESOLVED",
+      "smiles": "CC(C[CH]COO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-1,5OOH",
+      "status": "RESOLVED",
+      "smiles": "OOC[CH]CCCOO",
+      "formula": {
+        "O": 4,
+        "C": 5,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-1OOH",
+      "status": "RESOLVED",
+      "smiles": "CCC=CCOO",
+      "formula": {
+        "C": 5,
+        "O": 2,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-3,4OOH",
+      "status": "RESOLVED",
+      "smiles": "C[CH]C(OO)C(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-3,5OOH",
+      "status": "RESOLVED",
+      "smiles": "C[CH]C(CCOO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-4,5OOH",
+      "status": "RESOLVED",
+      "smiles": "C[CH]CC(COO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-4OOH",
+      "status": "RESOLVED",
+      "smiles": "CC=CC(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 2,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H92-5OOH",
+      "status": "RESOLVED",
+      "smiles": "CC=CCCOO",
+      "formula": {
+        "C": 5,
+        "O": 2,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H93-1,2OOH",
+      "status": "RESOLVED",
+      "smiles": "CC[CH]C(COO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H93-1,4OOH",
+      "status": "RESOLVED",
+      "smiles": "CC([CH]CCOO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H93-1,5OOH",
+      "status": "RESOLVED",
+      "smiles": "OOCC[CH]CCOO",
+      "formula": {
+        "O": 4,
+        "C": 5,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H93-2,4OOH",
+      "status": "RESOLVED",
+      "smiles": "CC([CH]C(C)OO)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-2OOH-3",
+      "status": "RESOLVED",
+      "smiles": "CCC(OO)C1CO1",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-2OOH-4",
+      "status": "RESOLVED",
+      "smiles": "CC(CC1CO1)OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-2OOH-5",
+      "status": "RESOLVED",
+      "smiles": "OOCCCC1CO1",
+      "formula": {
+        "O": 3,
+        "C": 5,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-3OOH-2",
+      "status": "RESOLVED",
+      "smiles": "CCC1OCC1OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-3OOH-4",
+      "status": "RESOLVED",
+      "smiles": "CC(OO)C1CCO1",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-3OOH-5",
+      "status": "RESOLVED",
+      "smiles": "OOCCC1CCO1",
+      "formula": {
+        "O": 3,
+        "C": 5,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-4OOH-2",
+      "status": "RESOLVED",
+      "smiles": "CC1CC(OO)CO1",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-4OOH-3",
+      "status": "RESOLVED",
+      "smiles": "CC1OCCC1OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-4OOH-5",
+      "status": "RESOLVED",
+      "smiles": "OOCC1CCCO1",
+      "formula": {
+        "O": 3,
+        "C": 5,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-5OOH-2",
+      "status": "RESOLVED",
+      "smiles": "OOC1CCCOC1",
+      "formula": {
+        "O": 3,
+        "C": 5,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O1-5OOH-3",
+      "status": "RESOLVED",
+      "smiles": "OOC1CCOCC1",
+      "formula": {
+        "O": 3,
+        "C": 5,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O2-3OOH-1",
+      "status": "RESOLVED",
+      "smiles": "CCC1OC1COO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O2-3OOH-4",
+      "status": "RESOLVED",
+      "smiles": "CC(OO)C1OC1C",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O2-3OOH-5",
+      "status": "RESOLVED",
+      "smiles": "CC1OC1CCOO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O2-4OOH-1",
+      "status": "RESOLVED",
+      "smiles": "CC1CC(COO)O1",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H9O2-4OOH-3",
+      "status": "RESOLVED",
+      "smiles": "CC1OC(C)C1OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "HO2",
+      "status": "RESOLVED",
+      "smiles": "[O]O",
+      "formula": {
+        "O": 2,
+        "H": 1
+      },
+      "source": "explicit small-radical structure"
+    },
+    {
+      "label": "OH",
+      "status": "RESOLVED",
+      "smiles": "[OH]",
+      "formula": {
+        "O": 1,
+        "H": 1
+      },
+      "source": "explicit small-radical structure"
+    }
+  ],
+  "old_species": [
+    {
+      "label": "C3KET12",
+      "status": "RESOLVED",
+      "smiles": "CC(C=O)OO",
+      "formula": {
+        "C": 3,
+        "O": 3,
+        "H": 6
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "C3KET13",
+      "status": "RESOLVED",
+      "smiles": "O=CCCOO",
+      "formula": {
+        "O": 3,
+        "C": 3,
+        "H": 6
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "C3KET21",
+      "status": "RESOLVED",
+      "smiles": "CC(=O)COO",
+      "formula": {
+        "C": 3,
+        "O": 3,
+        "H": 6
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "C5H10OOH1-2O2",
+      "status": "RESOLVED",
+      "smiles": "CCCC(COO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-3O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(CCOO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-4O2",
+      "status": "RESOLVED",
+      "smiles": "CC(CCCOO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH1-5O2",
+      "status": "RESOLVED",
+      "smiles": "[O]OCCCCCOO",
+      "formula": {
+        "O": 4,
+        "C": 5,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-1O2",
+      "status": "RESOLVED",
+      "smiles": "CCCC(CO[O])OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-3O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(O[O])C(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-4O2",
+      "status": "RESOLVED",
+      "smiles": "CC(CC(C)OO)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH2-5O2",
+      "status": "RESOLVED",
+      "smiles": "CC(CCCO[O])OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH3-1O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(CCO[O])OO",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "C5H10OOH3-2O2",
+      "status": "RESOLVED",
+      "smiles": "CCC(OO)C(C)O[O]",
+      "formula": {
+        "C": 5,
+        "O": 4,
+        "H": 11
+      },
+      "source": "tested Bugler/NUIG straight-chain C5 label grammar"
+    },
+    {
+      "label": "HO2",
+      "status": "RESOLVED",
+      "smiles": "[O]O",
+      "formula": {
+        "O": 2,
+        "H": 1
+      },
+      "source": "explicit small-radical structure"
+    },
+    {
+      "label": "NC4KET12",
+      "status": "RESOLVED",
+      "smiles": "CCC(C=O)OO",
+      "formula": {
+        "C": 4,
+        "O": 3,
+        "H": 8
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC4KET13",
+      "status": "RESOLVED",
+      "smiles": "CC(CC=O)OO",
+      "formula": {
+        "C": 4,
+        "O": 3,
+        "H": 8
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC4KET14",
+      "status": "RESOLVED",
+      "smiles": "O=CCCCOO",
+      "formula": {
+        "O": 3,
+        "C": 4,
+        "H": 8
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC4KET21",
+      "status": "RESOLVED",
+      "smiles": "CCC(=O)COO",
+      "formula": {
+        "C": 4,
+        "O": 3,
+        "H": 8
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC4KET23",
+      "status": "RESOLVED",
+      "smiles": "CC(=O)C(C)OO",
+      "formula": {
+        "C": 4,
+        "O": 3,
+        "H": 8
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC4KET24",
+      "status": "RESOLVED",
+      "smiles": "CC(=O)CCOO",
+      "formula": {
+        "C": 4,
+        "O": 3,
+        "H": 8
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET12",
+      "status": "RESOLVED",
+      "smiles": "CCCC(C=O)OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET13",
+      "status": "RESOLVED",
+      "smiles": "CCC(CC=O)OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET14",
+      "status": "RESOLVED",
+      "smiles": "CC(CCC=O)OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET15",
+      "status": "RESOLVED",
+      "smiles": "O=CCCCCOO",
+      "formula": {
+        "O": 3,
+        "C": 5,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET21",
+      "status": "RESOLVED",
+      "smiles": "CCCC(=O)COO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET23",
+      "status": "RESOLVED",
+      "smiles": "CCC(OO)C(C)=O",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET24",
+      "status": "RESOLVED",
+      "smiles": "CC(=O)CC(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET25",
+      "status": "RESOLVED",
+      "smiles": "CC(=O)CCCOO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET31",
+      "status": "RESOLVED",
+      "smiles": "CCC(=O)CCOO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "NC5KET32",
+      "status": "RESOLVED",
+      "smiles": "CCC(=O)C(C)OO",
+      "formula": {
+        "C": 5,
+        "O": 3,
+        "H": 10
+      },
+      "source": "tested N?CnKETij grammar"
+    },
+    {
+      "label": "OH",
+      "status": "RESOLVED",
+      "smiles": "[OH]",
+      "formula": {
+        "O": 1,
+        "H": 1
+      },
+      "source": "explicit small-radical structure"
+    }
+  ],
+  "ground_truth": [
+    {
+      "id": "G1",
+      "name": "alternative OOQOOH H-shift to P(OOH)2",
+      "scope": "primary",
+      "rule": "One linear five-carbon OOQOOH radical becomes one linear five-carbon P(OOH)2 radical; elemental balance.",
+      "reactant_formula": {
+        "C": 5,
+        "H": 11,
+        "O": 4
+      },
+      "member_count": 30,
+      "resolved_count": 30,
+      "member_species_count": 26,
+      "resolved_species_count": 26,
+      "members": [
+        {
+          "equation": "C5H10OOH1-2O2<=>C5H93-1,2OOH",
+          "line": 7682,
+          "reactants": [
+            "C5H10OOH1-2O2"
+          ],
+          "products": [
+            "C5H93-1,2OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-2O2<=>C5H92-4,5OOH",
+          "line": 7683,
+          "reactants": [
+            "C5H10OOH1-2O2"
+          ],
+          "products": [
+            "C5H92-4,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-2O2<=>C5H91-4,5OOH",
+          "line": 7684,
+          "reactants": [
+            "C5H10OOH1-2O2"
+          ],
+          "products": [
+            "C5H91-4,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-3O2<=>C5H92-1,3OOH",
+          "line": 7687,
+          "reactants": [
+            "C5H10OOH1-3O2"
+          ],
+          "products": [
+            "C5H92-1,3OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-3O2<=>C5H92-3,5OOH",
+          "line": 7688,
+          "reactants": [
+            "C5H10OOH1-3O2"
+          ],
+          "products": [
+            "C5H92-3,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-3O2<=>C5H91-3,5OOH",
+          "line": 7689,
+          "reactants": [
+            "C5H10OOH1-3O2"
+          ],
+          "products": [
+            "C5H91-3,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-4O2<=>C5H92-1,4OOH",
+          "line": 7692,
+          "reactants": [
+            "C5H10OOH1-4O2"
+          ],
+          "products": [
+            "C5H92-1,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-4O2<=>C5H93-1,4OOH",
+          "line": 7693,
+          "reactants": [
+            "C5H10OOH1-4O2"
+          ],
+          "products": [
+            "C5H93-1,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-4O2<=>C5H91-2,5OOH",
+          "line": 7694,
+          "reactants": [
+            "C5H10OOH1-4O2"
+          ],
+          "products": [
+            "C5H91-2,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-5O2<=>C5H92-1,5OOH",
+          "line": 7697,
+          "reactants": [
+            "C5H10OOH1-5O2"
+          ],
+          "products": [
+            "C5H92-1,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-5O2<=>C5H93-1,5OOH",
+          "line": 7699,
+          "reactants": [
+            "C5H10OOH1-5O2"
+          ],
+          "products": [
+            "C5H93-1,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-5O2<=>C5H92-1,5OOH",
+          "line": 7700,
+          "reactants": [
+            "C5H10OOH1-5O2"
+          ],
+          "products": [
+            "C5H92-1,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-1O2<=>C5H93-1,2OOH",
+          "line": 7704,
+          "reactants": [
+            "C5H10OOH2-1O2"
+          ],
+          "products": [
+            "C5H93-1,2OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-1O2<=>C5H92-4,5OOH",
+          "line": 7705,
+          "reactants": [
+            "C5H10OOH2-1O2"
+          ],
+          "products": [
+            "C5H92-4,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-1O2<=>C5H91-4,5OOH",
+          "line": 7706,
+          "reactants": [
+            "C5H10OOH2-1O2"
+          ],
+          "products": [
+            "C5H91-4,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-3O2<=>C5H91-2,3OOH",
+          "line": 7709,
+          "reactants": [
+            "C5H10OOH2-3O2"
+          ],
+          "products": [
+            "C5H91-2,3OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-3O2<=>C5H92-3,4OOH",
+          "line": 7710,
+          "reactants": [
+            "C5H10OOH2-3O2"
+          ],
+          "products": [
+            "C5H92-3,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-3O2<=>C5H91-3,4OOH",
+          "line": 7711,
+          "reactants": [
+            "C5H10OOH2-3O2"
+          ],
+          "products": [
+            "C5H91-3,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-4O2<=>C5H91-2,4OOH",
+          "line": 7714,
+          "reactants": [
+            "C5H10OOH2-4O2"
+          ],
+          "products": [
+            "C5H91-2,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-4O2<=>C5H93-2,4OOH",
+          "line": 7716,
+          "reactants": [
+            "C5H10OOH2-4O2"
+          ],
+          "products": [
+            "C5H93-2,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-4O2<=>C5H91-2,4OOH",
+          "line": 7717,
+          "reactants": [
+            "C5H10OOH2-4O2"
+          ],
+          "products": [
+            "C5H91-2,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-5O2<=>C5H91-2,5OOH",
+          "line": 7721,
+          "reactants": [
+            "C5H10OOH2-5O2"
+          ],
+          "products": [
+            "C5H91-2,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-5O2<=>C5H93-1,4OOH",
+          "line": 7722,
+          "reactants": [
+            "C5H10OOH2-5O2"
+          ],
+          "products": [
+            "C5H93-1,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-5O2<=>C5H92-1,4OOH",
+          "line": 7723,
+          "reactants": [
+            "C5H10OOH2-5O2"
+          ],
+          "products": [
+            "C5H92-1,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-1O2<=>C5H92-1,3OOH",
+          "line": 7726,
+          "reactants": [
+            "C5H10OOH3-1O2"
+          ],
+          "products": [
+            "C5H92-1,3OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-1O2<=>C5H92-3,5OOH",
+          "line": 7727,
+          "reactants": [
+            "C5H10OOH3-1O2"
+          ],
+          "products": [
+            "C5H92-3,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-1O2<=>C5H91-3,5OOH",
+          "line": 7728,
+          "reactants": [
+            "C5H10OOH3-1O2"
+          ],
+          "products": [
+            "C5H91-3,5OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-2O2<=>C5H91-2,3OOH",
+          "line": 7731,
+          "reactants": [
+            "C5H10OOH3-2O2"
+          ],
+          "products": [
+            "C5H91-2,3OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-2O2<=>C5H92-3,4OOH",
+          "line": 7732,
+          "reactants": [
+            "C5H10OOH3-2O2"
+          ],
+          "products": [
+            "C5H92-3,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-2O2<=>C5H91-3,4OOH",
+          "line": 7733,
+          "reactants": [
+            "C5H10OOH3-2O2"
+          ],
+          "products": [
+            "C5H91-3,4OOH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        }
+      ]
+    },
+    {
+      "id": "G2",
+      "name": "P(OOH)2 to hydroperoxy cyclic ether + OH",
+      "scope": "primary",
+      "rule": "One linear five-carbon P(OOH)2 radical becomes one closed-shell hydroperoxy cyclic ether plus OH; elemental balance.",
+      "reactant_formula": {
+        "C": 5,
+        "H": 11,
+        "O": 4
+      },
+      "member_count": 30,
+      "resolved_count": 30,
+      "member_species_count": 33,
+      "resolved_species_count": 33,
+      "members": [
+        {
+          "equation": "C5H91-2,3OOH<=>C5H9O1-2OOH-3+OH",
+          "line": 7781,
+          "reactants": [
+            "C5H91-2,3OOH"
+          ],
+          "products": [
+            "C5H9O1-2OOH-3",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,3OOH<=>C5H9O1-3OOH-2+OH",
+          "line": 7784,
+          "reactants": [
+            "C5H91-2,3OOH"
+          ],
+          "products": [
+            "C5H9O1-3OOH-2",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,4OOH<=>C5H9O1-2OOH-4+OH",
+          "line": 7788,
+          "reactants": [
+            "C5H91-2,4OOH"
+          ],
+          "products": [
+            "C5H9O1-2OOH-4",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,4OOH<=>C5H9O1-4OOH-2+OH",
+          "line": 7791,
+          "reactants": [
+            "C5H91-2,4OOH"
+          ],
+          "products": [
+            "C5H9O1-4OOH-2",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,5OOH<=>C5H9O1-2OOH-5+OH",
+          "line": 7796,
+          "reactants": [
+            "C5H91-2,5OOH"
+          ],
+          "products": [
+            "C5H9O1-2OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,5OOH<=>C5H9O1-5OOH-2+OH",
+          "line": 7800,
+          "reactants": [
+            "C5H91-2,5OOH"
+          ],
+          "products": [
+            "C5H9O1-5OOH-2",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-3,4OOH<=>C5H9O1-3OOH-4+OH",
+          "line": 7805,
+          "reactants": [
+            "C5H91-3,4OOH"
+          ],
+          "products": [
+            "C5H9O1-3OOH-4",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-3,4OOH<=>C5H9O1-4OOH-3+OH",
+          "line": 7808,
+          "reactants": [
+            "C5H91-3,4OOH"
+          ],
+          "products": [
+            "C5H9O1-4OOH-3",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-3,5OOH<=>C5H9O1-3OOH-5+OH",
+          "line": 7812,
+          "reactants": [
+            "C5H91-3,5OOH"
+          ],
+          "products": [
+            "C5H9O1-3OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-3,5OOH<=>C5H9O1-5OOH-3+OH",
+          "line": 7816,
+          "reactants": [
+            "C5H91-3,5OOH"
+          ],
+          "products": [
+            "C5H9O1-5OOH-3",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-4,5OOH<=>C5H9O1-4OOH-5+OH",
+          "line": 7820,
+          "reactants": [
+            "C5H91-4,5OOH"
+          ],
+          "products": [
+            "C5H9O1-4OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-4,5OOH<=>C5H9O1-5OOH-2+OH",
+          "line": 7823,
+          "reactants": [
+            "C5H91-4,5OOH"
+          ],
+          "products": [
+            "C5H9O1-5OOH-2",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,3OOH<=>C5H9O1-2OOH-3+OH",
+          "line": 7825,
+          "reactants": [
+            "C5H92-1,3OOH"
+          ],
+          "products": [
+            "C5H9O1-2OOH-3",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,3OOH<=>C5H9O2-3OOH-1+OH",
+          "line": 7827,
+          "reactants": [
+            "C5H92-1,3OOH"
+          ],
+          "products": [
+            "C5H9O2-3OOH-1",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,4OOH<=>C5H9O1-2OOH-4+OH",
+          "line": 7830,
+          "reactants": [
+            "C5H92-1,4OOH"
+          ],
+          "products": [
+            "C5H9O1-2OOH-4",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,4OOH<=>C5H9O2-4OOH-1+OH",
+          "line": 7832,
+          "reactants": [
+            "C5H92-1,4OOH"
+          ],
+          "products": [
+            "C5H9O2-4OOH-1",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,5OOH<=>C5H9O1-2OOH-5+OH",
+          "line": 7835,
+          "reactants": [
+            "C5H92-1,5OOH"
+          ],
+          "products": [
+            "C5H9O1-2OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,5OOH<=>C5H9O1-4OOH-5+OH",
+          "line": 7837,
+          "reactants": [
+            "C5H92-1,5OOH"
+          ],
+          "products": [
+            "C5H9O1-4OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-3,4OOH<=>C5H9O2-3OOH-4+OH",
+          "line": 7839,
+          "reactants": [
+            "C5H92-3,4OOH"
+          ],
+          "products": [
+            "C5H9O2-3OOH-4",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-3,4OOH<=>C5H9O2-4OOH-3+OH",
+          "line": 7841,
+          "reactants": [
+            "C5H92-3,4OOH"
+          ],
+          "products": [
+            "C5H9O2-4OOH-3",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-3,5OOH<=>C5H9O2-3OOH-5+OH",
+          "line": 7844,
+          "reactants": [
+            "C5H92-3,5OOH"
+          ],
+          "products": [
+            "C5H9O2-3OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-3,5OOH<=>C5H9O1-4OOH-3+OH",
+          "line": 7847,
+          "reactants": [
+            "C5H92-3,5OOH"
+          ],
+          "products": [
+            "C5H9O1-4OOH-3",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-4,5OOH<=>C5H9O2-4OOH-1+OH",
+          "line": 7849,
+          "reactants": [
+            "C5H92-4,5OOH"
+          ],
+          "products": [
+            "C5H9O2-4OOH-1",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-4,5OOH<=>C5H9O1-4OOH-2+OH",
+          "line": 7851,
+          "reactants": [
+            "C5H92-4,5OOH"
+          ],
+          "products": [
+            "C5H9O1-4OOH-2",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,2OOH<=>C5H9O1-3OOH-2+OH",
+          "line": 7853,
+          "reactants": [
+            "C5H93-1,2OOH"
+          ],
+          "products": [
+            "C5H9O1-3OOH-2",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,2OOH<=>C5H9O2-3OOH-1+OH",
+          "line": 7855,
+          "reactants": [
+            "C5H93-1,2OOH"
+          ],
+          "products": [
+            "C5H9O2-3OOH-1",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,4OOH<=>C5H9O1-3OOH-4+OH",
+          "line": 7857,
+          "reactants": [
+            "C5H93-1,4OOH"
+          ],
+          "products": [
+            "C5H9O1-3OOH-4",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,4OOH<=>C5H9O2-3OOH-5+OH",
+          "line": 7859,
+          "reactants": [
+            "C5H93-1,4OOH"
+          ],
+          "products": [
+            "C5H9O2-3OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,5OOH<=>C5H9O1-3OOH-5+OH",
+          "line": 7861,
+          "reactants": [
+            "C5H93-1,5OOH"
+          ],
+          "products": [
+            "C5H9O1-3OOH-5",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-2,4OOH<=>C5H9O2-3OOH-4+OH",
+          "line": 7863,
+          "reactants": [
+            "C5H93-2,4OOH"
+          ],
+          "products": [
+            "C5H9O2-3OOH-4",
+            "OH"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        }
+      ]
+    },
+    {
+      "id": "G3",
+      "name": "P(OOH)2 to olefinic hydroperoxide + HO2",
+      "scope": "primary",
+      "rule": "One linear five-carbon P(OOH)2 radical becomes one closed-shell olefinic hydroperoxide plus HO2; elemental balance.",
+      "reactant_formula": {
+        "C": 5,
+        "H": 11,
+        "O": 4
+      },
+      "member_count": 12,
+      "resolved_count": 12,
+      "member_species_count": 18,
+      "resolved_species_count": 18,
+      "members": [
+        {
+          "equation": "C5H91-2,3OOH<=>C5H91-3OOH+HO2",
+          "line": 7735,
+          "reactants": [
+            "C5H91-2,3OOH"
+          ],
+          "products": [
+            "C5H91-3OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,4OOH<=>C5H91-4OOH+HO2",
+          "line": 7739,
+          "reactants": [
+            "C5H91-2,4OOH"
+          ],
+          "products": [
+            "C5H91-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H91-2,5OOH<=>C5H91-5OOH+HO2",
+          "line": 7743,
+          "reactants": [
+            "C5H91-2,5OOH"
+          ],
+          "products": [
+            "C5H91-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,3OOH<=>C5H91-3OOH+HO2",
+          "line": 7752,
+          "reactants": [
+            "C5H92-1,3OOH"
+          ],
+          "products": [
+            "C5H91-3OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,3OOH<=>C5H92-1OOH+HO2",
+          "line": 7753,
+          "reactants": [
+            "C5H92-1,3OOH"
+          ],
+          "products": [
+            "C5H92-1OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,4OOH<=>C5H91-4OOH+HO2",
+          "line": 7756,
+          "reactants": [
+            "C5H92-1,4OOH"
+          ],
+          "products": [
+            "C5H91-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-1,5OOH<=>C5H91-5OOH+HO2",
+          "line": 7759,
+          "reactants": [
+            "C5H92-1,5OOH"
+          ],
+          "products": [
+            "C5H91-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-3,4OOH<=>C5H92-4OOH+HO2",
+          "line": 7762,
+          "reactants": [
+            "C5H92-3,4OOH"
+          ],
+          "products": [
+            "C5H92-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H92-3,5OOH<=>C5H92-5OOH+HO2",
+          "line": 7766,
+          "reactants": [
+            "C5H92-3,5OOH"
+          ],
+          "products": [
+            "C5H92-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,2OOH<=>C5H92-1OOH+HO2",
+          "line": 7771,
+          "reactants": [
+            "C5H93-1,2OOH"
+          ],
+          "products": [
+            "C5H92-1OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-1,4OOH<=>C5H92-5OOH+HO2",
+          "line": 7773,
+          "reactants": [
+            "C5H93-1,4OOH"
+          ],
+          "products": [
+            "C5H92-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H93-2,4OOH<=>C5H92-4OOH+HO2",
+          "line": 7778,
+          "reactants": [
+            "C5H93-2,4OOH"
+          ],
+          "products": [
+            "C5H92-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        }
+      ]
+    },
+    {
+      "id": "G4",
+      "name": "direct OOQOOH concerted HO2 elimination",
+      "scope": "primary",
+      "rule": "One linear five-carbon OOQOOH radical directly becomes one closed-shell olefinic hydroperoxide plus HO2; elemental balance.",
+      "reactant_formula": {
+        "C": 5,
+        "H": 11,
+        "O": 4
+      },
+      "member_count": 12,
+      "resolved_count": 12,
+      "member_species_count": 16,
+      "resolved_species_count": 16,
+      "members": [
+        {
+          "equation": "C5H10OOH1-2O2<=>C5H92-1OOH+HO2",
+          "line": 7866,
+          "reactants": [
+            "C5H10OOH1-2O2"
+          ],
+          "products": [
+            "C5H92-1OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-3O2<=>C5H92-1OOH+HO2",
+          "line": 7867,
+          "reactants": [
+            "C5H10OOH1-3O2"
+          ],
+          "products": [
+            "C5H92-1OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-3O2<=>C5H92-5OOH+HO2",
+          "line": 7868,
+          "reactants": [
+            "C5H10OOH1-3O2"
+          ],
+          "products": [
+            "C5H92-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-4O2<=>C5H91-5OOH+HO2",
+          "line": 7869,
+          "reactants": [
+            "C5H10OOH1-4O2"
+          ],
+          "products": [
+            "C5H91-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-4O2<=>C5H92-5OOH+HO2",
+          "line": 7870,
+          "reactants": [
+            "C5H10OOH1-4O2"
+          ],
+          "products": [
+            "C5H92-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH1-5O2<=>C5H91-5OOH+HO2",
+          "line": 7871,
+          "reactants": [
+            "C5H10OOH1-5O2"
+          ],
+          "products": [
+            "C5H91-5OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-3O2<=>C5H92-4OOH+HO2",
+          "line": 7872,
+          "reactants": [
+            "C5H10OOH2-3O2"
+          ],
+          "products": [
+            "C5H92-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-4O2<=>C5H92-4OOH+HO2",
+          "line": 7873,
+          "reactants": [
+            "C5H10OOH2-4O2"
+          ],
+          "products": [
+            "C5H92-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-4O2<=>C5H91-4OOH+HO2",
+          "line": 7874,
+          "reactants": [
+            "C5H10OOH2-4O2"
+          ],
+          "products": [
+            "C5H91-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH2-5O2<=>C5H91-4OOH+HO2",
+          "line": 7875,
+          "reactants": [
+            "C5H10OOH2-5O2"
+          ],
+          "products": [
+            "C5H91-4OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-1O2<=>C5H91-3OOH+HO2",
+          "line": 7876,
+          "reactants": [
+            "C5H10OOH3-1O2"
+          ],
+          "products": [
+            "C5H91-3OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        },
+        {
+          "equation": "C5H10OOH3-2O2<=>C5H91-3OOH+HO2",
+          "line": 7877,
+          "reactants": [
+            "C5H10OOH3-2O2"
+          ],
+          "products": [
+            "C5H91-3OOH",
+            "HO2"
+          ],
+          "absence": "structural-signature-and-exhaustive-formula-screen"
+        }
+      ]
+    }
+  ],
+  "split": {
+    "archive": {
+      "filename": "pentane_indirect_v2.5.zip",
+      "source_url": "https://files.osf.io/v1/resources/nbmzv/providers/osfstorage/671690d83dea2353a7b93476?version=1",
+      "retrieval_date": "2026-10-02",
+      "sha256": "b34d6e78a0600bffba9bf7f04f59d9479d6d1314df9964e4071902c929a65e56",
+      "bytes": 242617,
+      "unique_species": null,
+      "reaction_entries": null,
+      "osf_path": "/ReactionKinetics/indirect/pentane/pentane_indirect_v2.5.zip",
+      "osf_file_id": "671690d83dea2353a7b93476",
+      "osf_version": 1
+    },
+    "studies": [
+      {
+        "id": "Bugler et al. 2016 n-pentane ignition delay",
+        "bibliography": "J. Bugler et al., Combustion and Flame 163 (2016) 138-156",
+        "doi": "10.1016/j.combustflame.2015.09.014",
+        "set": "development",
+        "files": [
+          {
+            "path": "x10011004.xml",
+            "sha256": "b1b6dfba65843a845c0d55036a67825b0cd875b5e22afa3b848111bd6a1ad1c9",
+            "rows": 8,
+            "observations": 8,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011005.xml",
+            "sha256": "2304654b9bc870f3e627a1881708ed154fdb77bc85ca5d51ae2e41ac5ac76597",
+            "rows": 17,
+            "observations": 17,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011006.xml",
+            "sha256": "d44fe16806975488165e17d2dc5d341ef2cdead9c650bfb33b9f57d75ab9d808",
+            "rows": 6,
+            "observations": 6,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011007.xml",
+            "sha256": "f05967e62fda9aa425ef27731331b3ded7df495854a8414943067229a3b64d3b",
+            "rows": 9,
+            "observations": 9,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011008.xml",
+            "sha256": "035ed6af39946ba75c6c4a7bf10f25fa9e6bbe799445df366d220acb50c40890",
+            "rows": 11,
+            "observations": 11,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011009.xml",
+            "sha256": "8394383eb68752b3e89394a74621dd8a0929566ca9818c154669f73e109ae71e",
+            "rows": 11,
+            "observations": 11,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011010.xml",
+            "sha256": "ae96e40d6b653ee9b083843d1be9dd2be8982ed0322b1621de747388fc928700",
+            "rows": 8,
+            "observations": 8,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011011.xml",
+            "sha256": "e3b42b985c11d3be27a17f1c8a900c851f498f0111dca588638b2c4dbec1ff07",
+            "rows": 17,
+            "observations": 17,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x10011012.xml",
+            "sha256": "def8bff423fa4ec95787034d8f11283b0e72645aca7ca9de7d7bf08c45ba4716",
+            "rows": 25,
+            "observations": 25,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_property"
+          },
+          {
+            "path": "x40011029.xml",
+            "sha256": "4378a5e95af617df1210838cc6cc0ff0013c993cd8af8baff8b1934eecb4fad5",
+            "rows": 12,
+            "observations": 12,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011030.xml",
+            "sha256": "7de381b5a09efa5445f25a3816f68979358c5b9b85c341c930014ee0ac4f32fd",
+            "rows": 11,
+            "observations": 11,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011031.xml",
+            "sha256": "da312b534e1660b1c60771312402c3dd55f61fa425186e1521cb63a8d07cc42d",
+            "rows": 5,
+            "observations": 5,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011032.xml",
+            "sha256": "8c5ed7c8b6905c656e532a968467764299c123be47ba5c754c37685367bb6ced",
+            "rows": 5,
+            "observations": 5,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011033.xml",
+            "sha256": "3b7fb0e8fa0078f47e8f6af46413982f0e3e02ff19055a942fc859cc7fbbe7dc",
+            "rows": 6,
+            "observations": 6,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "history_nonmonotone_time"
+          },
+          {
+            "path": "x40011034.xml",
+            "sha256": "ca5d78401e97d86cb85a2a11071381a60e33557002aca9184e6bb280dbc85496",
+            "rows": 2,
+            "observations": 2,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011035.xml",
+            "sha256": "b5dd7e6576edae697a534f8efcf7b4b7b9dbc3e20a68a5a9a6ca286054c66ea1",
+            "rows": 10,
+            "observations": 10,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011036.xml",
+            "sha256": "d00ad8398d74969144523f1c8b3e5a12e726b1fb6d55c5cf142eb4446acbe192",
+            "rows": 3,
+            "observations": 3,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011037.xml",
+            "sha256": "50785032211c3f046f7e21ad5b290eaf06d819d73356e5199498aed8566e6640",
+            "rows": 6,
+            "observations": 6,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011038.xml",
+            "sha256": "677afd79997642fece2517805bc76857433b8bd6319aec74f69945835d02596e",
+            "rows": 10,
+            "observations": 10,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011039.xml",
+            "sha256": "854403e62243b63160c0528480f89b117e3a57cbceba65665232aead4bfd525a",
+            "rows": 9,
+            "observations": 9,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011040.xml",
+            "sha256": "4c02c940de2375d7370b4843ea2e7833178093e63c74c3f341ad51c68de1221b",
+            "rows": 8,
+            "observations": 8,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "rcm_thermo_unavailable"
+          },
+          {
+            "path": "x40011041.xml",
+            "sha256": "c74f3fe5a20bba365cc39b9f194c33fb4aaaf7d191d5a9baddc7a4b6965763ac",
+            "rows": 9,
+            "observations": 9,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "history_nonmonotone_time"
+          },
+          {
+            "path": "x40011042.xml",
+            "sha256": "24480276b25c36fe8cada34a3ce4b0cad4166e5e4797c4e2cdf55aab15e59d2e",
+            "rows": 6,
+            "observations": 6,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "history_nonmonotone_time"
+          },
+          {
+            "path": "x40011043.xml",
+            "sha256": "c004288716fa01913ac243a7e6023f373b59247e7e5667bb0d806b208bb0acdb",
+            "rows": 3,
+            "observations": 3,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_ignition_definition"
+          },
+          {
+            "path": "x40011044.xml",
+            "sha256": "5c69301f54fbd8cbf7c62e6b879cb038eb2b983c642022b8439792a10a864137",
+            "rows": 4,
+            "observations": 4,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_ignition_definition"
+          },
+          {
+            "path": "x40011045.xml",
+            "sha256": "aede50f140feaf5971ead4b0dd1218afa972db9d3e0ef3c0298d705605632834",
+            "rows": 5,
+            "observations": 5,
+            "low_temperature_rows": 0,
+            "low_temperature_observations": 0,
+            "acceptance": "refused",
+            "refusal_reason": "unmapped_ignition_definition"
+          }
+        ]
+      },
+      {
+        "id": "Bugler et al. 2017 n-pentane jet-stirred reactors",
+        "bibliography": "J. Bugler et al., Proceedings of the Combustion Institute 36 (2017) 441-448",
+        "doi": "10.1016/j.proci.2016.05.048",
+        "set": "holdout",
+        "files": [
+          {
+            "path": "x00011003.xml",
+            "sha256": "29ccd81de6d5c444615ed324a8709191831cd63e7c78feb88433383c3712f001",
+            "rows": 20,
+            "observations": 280,
+            "low_temperature_rows": 10,
+            "low_temperature_observations": 140,
+            "acceptance": "supported",
+            "refusal_reason": null
+          },
+          {
+            "path": "x00011004.xml",
+            "sha256": "59cded9a745abea4b1b4e11db0d7ff54f2f9653f8687da3b3d791a4867be1c79",
+            "rows": 20,
+            "observations": 280,
+            "low_temperature_rows": 10,
+            "low_temperature_observations": 140,
+            "acceptance": "supported",
+            "refusal_reason": null
+          },
+          {
+            "path": "x00011005.xml",
+            "sha256": "b828f07a577637ef19c0db2ecccd35ef332e7dcfd47e46d358bc40f700d0e1f2",
+            "rows": 20,
+            "observations": 260,
+            "low_temperature_rows": 10,
+            "low_temperature_observations": 130,
+            "acceptance": "supported",
+            "refusal_reason": null
+          },
+          {
+            "path": "x00011006.xml",
+            "sha256": "1711a84c9ca1316ec2dddd373bd748059585e34e080096ffb7f6a2e6902d845a",
+            "rows": 29,
+            "observations": 435,
+            "low_temperature_rows": 14,
+            "low_temperature_observations": 210,
+            "acceptance": "supported",
+            "refusal_reason": null
+          },
+          {
+            "path": "x00011007.xml",
+            "sha256": "aa21605f8dbce30f506345515387ba22805fdc8decdfa5a98e8f1a9e1a679c45",
+            "rows": 28,
+            "observations": 420,
+            "low_temperature_rows": 14,
+            "low_temperature_observations": 210,
+            "acceptance": "supported",
+            "refusal_reason": null
+          },
+          {
+            "path": "x00011008.xml",
+            "sha256": "e2ef6a2d3e0b290bdb28c790cd72182f167d9b0dfd4702572fb8f68554bab4b4",
+            "rows": 27,
+            "observations": 405,
+            "low_temperature_rows": 14,
+            "low_temperature_observations": 210,
+            "acceptance": "supported",
+            "refusal_reason": null
+          }
+        ]
+      }
+    ]
+  },
+  "scoring": {
+    "primary_unit": "reaction-type-once",
+    "primary_types": [
+      "G1",
+      "G2",
+      "G3",
+      "G4"
+    ],
+    "recovered": "A structurally accepted type earns one unit once; duplicate entries, fitted rates, and extra members earn no additional credit.",
+    "baseline_present": "Classify the generated baseline first; a type already present receives baseline coverage and zero revision credit.",
+    "secondary_metric": "For each measured species, mean absolute log10(max(x_sim,L_s)/max(x_exp,L_s)) over its frozen rows; the overall score is the unweighted mean of species scores.",
+    "species_aggregation": "Rows are equally weighted within species and species are equally weighted; report every per-species score and scored-row count.",
+    "zero_and_detection_limit_policy": "L_s is the stated detection limit where supplied; otherwise half the smallest strictly positive frozen observation for that species. Exact zeros and values below L_s are clamped to L_s. A species with no positive value and no stated limit is refused, never assigned zero error.",
+    "low_temperature_subset": "600-900 K inclusive; reported separately",
+    "requires": "jsr-adapter",
+    "refusals": [
+      "missing or nonfinite simulated mole fraction",
+      "negative simulated or experimental mole fraction",
+      "species with no stated detection limit and no positive frozen observation",
+      "unsupported reactor condition or solver failure"
+    ],
+    "locking": "Lock candidate, baseline, contract hash, structural matcher, JSR adapter and simulator before one holdout evaluation; no holdout-driven retries, tuning or exclusions."
+  },
+  "leakage_limits": [
+    "The Bugler ignition-delay study validated v_new and is development data, never holdout.",
+    "The JSR holdout shares mechanism-community authors with the revision; historical blindness is not claimed.",
+    "Keep v_new bytes, mapped reactions and labels out of the revision agent and retrieval tools until candidate locking.",
+    "Thermochemistry and rate-rule changes made with the revision are excluded from structural ground truth.",
+    "Korcek chemistry was not included in v_new and is not a scored type.",
+    "ChemKED n-pentane records are NOx-doped and excluded from both sets.",
+    "Hash drift, split-count drift and unresolved eligible old structures fail the benchmark rather than shrinking it."
+  ]
+}

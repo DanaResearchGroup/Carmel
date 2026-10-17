@@ -421,7 +421,7 @@ def test_loader_replays_pinned_sources_and_exact_fuel_prefilter(tmp_path: Path, 
 
     monkeypatch.setattr(t3_export, "parse_respecth", parse)
     records, refused = t3_export.load_records(source="all", cache_root=tmp_path, download=False)
-    assert len(records) == 4 and refused["respecth:malformed_xml"] == 2
+    assert len(records) == 5 and refused["respecth:malformed_xml"] == 3
     monkeypatch.setattr(t3_export, "replay_respecth", lambda *args: SimpleNamespace(verified=False))
     with pytest.raises(ValueError, match="replay failed"):
         t3_export.load_records(source="respecth", cache_root=tmp_path, download=False)

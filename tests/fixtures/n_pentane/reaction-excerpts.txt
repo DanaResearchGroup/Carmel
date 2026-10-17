@@ -1,0 +1,7 @@
+! Tiny, unmodified kinetic-line excerpts from the pinned C5 release.
+C5H10OOH1-2O2<=>C5H93-1,2OOH                      1.716E+09      0.900   29500.0
+C5H91-2,3OOH<=>C5H9O1-2OOH-3+OH                   1.160E+011     0.430   10700.0
+C5H91-2,3OOH<=>C5H91-3OOH+HO2                     2.210E+012     0.230   15600.0
+C5H10OOH1-2O2<=>C5H92-1OOH+HO2                    5.140E+009     1.010   29362.0
+! Conventional-chain negative from v_old.
+C5H10OOH1-2O2<=>NC5KET12+OH                       2.000E+11      0.000   26000.0

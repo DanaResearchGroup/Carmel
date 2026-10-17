@@ -83,6 +83,7 @@ from carmel.services.respecth import (
     RECORD_NODE_ID,
     ArchivePin,
     PaperReference,
+    RecordDoi,
     RecordReplayReport,
     RecordText,
     ReferenceDoiTrust,
@@ -96,6 +97,7 @@ from carmel.services.respecth import (
     _one,
     _paper,
     _parse_xml,
+    _record_doi,
     check_record_node,
     prepare_series_corrections,
     replay_grounded_text,
@@ -357,7 +359,7 @@ class RespecthSeriesRecord(BaseModel):
     kind: RespecthExperimentKind
     experiment_type: RecordText
     archive: ArchivePin
-    record_doi: RecordText
+    record_doi: RecordDoi
     """The ReSpecTh ``fileDOI`` -- the citable, stable id of THIS record."""
     paper: Maybe[PaperReference]
     apparatus: SeriesApparatus
@@ -1007,7 +1009,7 @@ def _build(member_bytes: bytes, pin: ArchivePin) -> RespecthSeriesRecord:
             kind=kind,
             experiment_type=experiment_type,
             archive=pin,
-            record_doi=doc.text(_one(doc.root, "fileDOI")),
+            record_doi=_record_doi(doc, pin.member_path),
             paper=_paper(doc),
             apparatus=apparatus,
             species_columns=tuple(sorted(species_columns, key=lambda column: column.axis_id)),
