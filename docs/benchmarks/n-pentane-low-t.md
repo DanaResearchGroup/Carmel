@@ -22,12 +22,38 @@ generated case schema are not changed.
 `Pin.verify()` checks byte count and SHA-256 and raises `PIN CHANGED` before parsing
 changed bytes. Mechanism bytes are not committed.
 
-Historical identity is **UNVERIFIED**. Bugler et al. 2015, section 2, names Healy's
-n-pentane model as the starting mechanism. The endpoint filenames and reproduced
-inventories are consistent with that lineage, but neither mechanism header nor the
-paper authenticates these exact SHA-256 values as publication-era snapshots. The
-headers, paper statement, census notes and endpoint inventories were checked; no byte
-fingerprint or immutable release identifier was found.
+The v_new bytes are a post-2015 maintained file, not a publication-era snapshot. The
+maintenance markers and adjacent reaction edits are:
+
+| v_new marker line | Bytes show | Classification |
+|---|---|---|
+| 1568, `!DONG 15/12/2018` | The two `C2H3OO=CO+CH3O` PLOG/DUP pairs and the two `C2H3OO=CO2+CH3` pairs are retained as comments, while each pair is folded into one active PLOG/DUP representation. | Rate representation change; same reactions, not an added or removed reaction type. |
+| 1646, `!DONG 15/12/2018` | A second marker for the same 2018 maintenance block; no separate reaction edit is attached directly to this marker. | Maintenance marker only. |
+| 5812, `!CZ 27/01/2014` | `C3H5-T+CH3(+M)<=>IC4H8(+M)` and `IC4H7+H(+M)<=>IC4H8(+M)` are commented out, with their LOW/TROE data; no active copy of either equation follows. | Removed reaction type, not a rate re-expression. |
+
+The marker inventory does not touch any G1–G4 member. The contract reproducer resolves
+all 30/30, 30/30, 12/12 and 12/12 members and verifies their structural absence from
+v_old; the marked reactions are C2/C3/C4 reactions, whereas G1–G4 are the listed C5
+OOQOOH/P(OOH)2 channels.
+
+v_old is also **UNVERIFIED**, but has no dated or initialled maintenance markers and no
+commented-out reaction lines adjacent to active reactions. Its `!REV/` lines are reverse
+rate data, not provenance markers. Bugler et al. 2015 section 2 names Healy's model as
+the starting mechanism, but neither paper nor either endpoint authenticates these exact
+SHA-256 values as publication-era bytes.
+
+Snapshot search (2026-10-18): the [current NUIG mechanism-download page](https://nuigalway.ie/combustionchemistrycentre/mechanismdownloads/)
+links the current July-2015 C5 file and the [Bugler et al. 2015 paper](https://doi.org/10.1021/acs.jpca.5b00837),
+but supplies no dated byte snapshot or immutable release identifier. The [Bugler et al.
+2016 page's supplementary material](https://www.universityofgalway.ie/media/researchcentres/combustionchemistrycentre/files/mechanismdownloads/c5_15_supplementary_material.pdf)
+contains figures and experimental/model data, not an earlier mechanism copy. The [Bugler
+et al. 2016 mechanism link](https://www.universityofgalway.ie/media/researchcentres/combustionchemistrycentre/files/mechanismdownloads/nuigmech_c5_july2015_1215.chem)
+resolves to the same current endpoint. The Bugler et al. 2017 JSR paper page was checked
+for supplementary mechanism material; none was located. Wayback CDX checks for both
+mechanism URLs for 2015–2017 returned an archive-service internal error, so no candidate
+2015 re-pin was found. A genuine snapshot would require a byte-preserved 2015–2017 copy
+from the paper supplement, NUIG release archive, or a successful Wayback capture, followed
+by operator review and a new SHA-256 pin; none is available here.
 
 ## Mapped ground truth
 
