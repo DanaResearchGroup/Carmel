@@ -20,13 +20,19 @@ from carmel.benchmarks.cantera_worker import THREAD_ENV, canonical_reaction_key
 from carmel.benchmarks.chemkin import mechanism, normalize_for_ck2yaml
 from carmel.benchmarks.contract import FrozenModel, read_pinned_file
 from carmel.benchmarks.n_pentane import Contract, load_contract
-from carmel.benchmarks.structure import canonical
 from carmel.schemas.datasets import Absent
 from carmel.services.artifacts import write_bytes, write_text
 from carmel.services.respecth_series import SpeciesIdentity, parse_series_record
 
 DEFAULT_ROW_TIMEOUT_S = 600.0
 DEFAULT_WORKERS = max(1, (os.cpu_count() or 1) - 2)
+
+
+def canonical(smiles: str) -> str:
+    """Canonicalize only when the structure-dependent harness path is used."""
+    from carmel.benchmarks.structure import canonical as canonical_structure
+
+    return canonical_structure(smiles)
 
 
 class WorkerRequestRow(FrozenModel):

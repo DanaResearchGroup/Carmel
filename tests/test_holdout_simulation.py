@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -1180,6 +1181,7 @@ def test_simulate_row_classifies_python_integrator_failure(
     assert result["integrator_steps"] == 4
 
 
+@pytest.mark.skipif(importlib.util.find_spec("rdkit") is None, reason="RDKit is an optional agents dependency")
 def test_structure_mapping_helpers_and_thermo_duplicate_audit() -> None:
     assert holdout.observable_smiles("O2") == holdout.canonical("O=O")
     assert holdout.observable_smiles("unknown") is None
@@ -1225,6 +1227,7 @@ def test_structure_mapping_helpers_and_thermo_duplicate_audit() -> None:
 def test_load_rows_uses_verified_holdout_and_existing_respecth_shape(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(holdout, "canonical", lambda value: value)
     member = b"record"
     archive_path = tmp_path / "split.zip"
     import zipfile
@@ -1948,6 +1951,7 @@ def test_score_holdout_cli_writes_the_report(tmp_path: Path, monkeypatch: pytest
 
 
 def test_run_harness_builds_a_telemetry_rich_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(holdout, "canonical", lambda value: value)
     contract_path = tmp_path / "contract.json"
     mechanism_path = tmp_path / "mechanism.inp"
     thermo_path = tmp_path / "thermo.dat"
