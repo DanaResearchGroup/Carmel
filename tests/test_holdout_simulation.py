@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import time
+from builtins import __import__ as builtin_import
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1222,6 +1223,17 @@ def test_structure_mapping_helpers_and_thermo_duplicate_audit() -> None:
     assert duplicates[0]["species"] == "A"
     assert duplicates[0]["first_used"] is True
     assert duplicates[0]["coefficients_differ"] is True
+
+
+def test_non_cyclic_label_does_not_import_optional_rdkit(monkeypatch: pytest.MonkeyPatch) -> None:
+    def import_without_rdkit(name: str, *args: Any, **kwargs: Any) -> Any:
+        if name == "rdkit" or name.startswith("rdkit."):
+            raise AssertionError("ordinary labels must not import RDKit")
+        return builtin_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", import_without_rdkit)
+
+    assert holdout._cyclic_ether("FUEL") is None
 
 
 def test_load_rows_uses_verified_holdout_and_existing_respecth_shape(

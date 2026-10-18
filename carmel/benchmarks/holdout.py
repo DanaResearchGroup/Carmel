@@ -116,13 +116,11 @@ def _base_unit_value(value: Any) -> float:
 
 
 def _cyclic_ether(label: str) -> str | None:
-    import re
-
-    from rdkit import Chem
-
     match = re.fullmatch(r"C5H10O([1-5])-([1-5])", label)
     if match is None or match[1] == match[2]:
         return None
+    from rdkit import Chem
+
     left, right = int(match[1]) - 1, int(match[2]) - 1
     graph = Chem.RWMol()
     carbons = [graph.AddAtom(Chem.Atom("C")) for _ in range(5)]
