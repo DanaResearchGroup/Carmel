@@ -230,3 +230,39 @@ coverage, reactor groups and contract temperature bands (<750, 750–900 inclusi
 The dispatch gate requires all 174 shock points to be refused for absent targets and at least
 12 of the 15 RCM-ideal points to score for each mechanism. A failed gate is reported after
 saving its report; settings must not be tuned using that result.
+
+## Paired uncertainty
+
+`carmel.benchmarks.holdout_intervals` exposes `idt_separation` and `jsr_intervals`. Both require
+matching simulation locks and frozen holdout fingerprints and compare the intersection of valid
+point/observable IDs. `rescore_saved_jsr(report_path)` rebuilds simulated values from the sibling
+`rows.jsonl`, verifies agreement with the saved report, pins both input hashes, and never writes
+to either input or launches a simulation.
+
+Rescoring also requires the sibling `request.json`. Checkpoint entries are selected by
+the saved request row, mechanism semantic hash, simulation-lock hash, and PLOG-validation
+hash, using the recorded lock rather than the installed worker's current settings. Stale
+entries are ignored before checking for conflicts within that identity; identical repeated
+entries are allowed. Every dispatched row must have a matching entry, with the same status
+as the report. A refused entry must carry a nonempty reason matching the reported row and
+its mapped metric observations. A known `unmapped_inlet_species` refusal omitted from the
+request needs no checkpoint entry, but its status, unmapped-species evidence, and metric
+refusals must agree. Missing provenance or mismatched fingerprints are never rescued by
+matching row IDs or simulated values alone.
+If no rows were dispatched, the worker may never have created `rows.jsonl`; rescoring then
+records a null checkpoint hash and validates every row as a pre-dispatch refusal.
+
+Intervals use 10,000 paired row bootstrap replicates, seed **20261018**, NumPy PCG64, and the
+2.5th/97.5th percentiles with linear interpolation. Each replicate samples N whole row IDs
+with replacement (implemented as multinomial row counts), using identical weights for both
+mechanisms. The reported gap is **v_old error minus v_new error**; a positive value favors
+v_new. JSR species stay together within a row; each sampled species mean receives equal weight,
+using the fixed detection limits from the complete frozen observations. Species with no sampled
+observation are omitted exactly as in the existing JSR metric. Empty diagnostics have null
+scores and intervals, never zero-error claims. Re-running with the same seed and input reports
+produces byte-identical serialized interval reports in the same recorded NumPy environment.
+
+Diagnostic intervals accompany the contract aggregate: IDT by reactor group and contract
+band; JSR overall, inclusive 600–900 K, C0–C2 (CH4, C2H4, C2H6, CH2O, CH3CHO, CO, CO2),
+fuel/alkenes (NC5H12, C5H10-1, C5H10-2, C3H6), C5 cyclic ethers (C5H10O1-2, C5H10O1-3,
+C5H10O1-4, C5H10O2-3, C5H10O2-4), and O2. The decompositions do not replace the contract metric.

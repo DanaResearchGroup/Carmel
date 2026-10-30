@@ -744,11 +744,20 @@ def _row_fingerprint(
     cantera_version: str,
     plog_validation_identity: str = "",
 ) -> str:
+    return checkpoint_fingerprint(
+        mechanism_sha256, row, simulation_lock_sha256(row_timeout_s, cantera_version), plog_validation_identity
+    )
+
+
+def checkpoint_fingerprint(
+    mechanism_sha256: str, row: dict[str, Any], simulation_lock_identity: str, plog_validation_identity: str
+) -> str:
+    """Identify a row using its recorded lock, including historical saved runs."""
     payload = json.dumps(
         {
             "mechanism_semantic_sha256": mechanism_sha256,
             "plog_validation_sha256": plog_validation_identity,
-            "simulation_lock_sha256": simulation_lock_sha256(row_timeout_s, cantera_version),
+            "simulation_lock_sha256": simulation_lock_identity,
             "row": row,
         },
         sort_keys=True,
