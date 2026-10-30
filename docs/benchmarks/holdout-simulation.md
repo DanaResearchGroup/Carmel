@@ -2,8 +2,8 @@
 
 Carmel's holdout harness turns a frozen benchmark contract and a historical CHEMKIN
 mechanism into a provenance-rich secondary-score report. The harness is observable-oriented:
-this first adapter evaluates JSR species profiles, while a later adapter can add ignition delay
-without changing the contract, conversion, mapping, or scoring boundary.
+its adapters evaluate JSR species profiles and ignition delay through a shared contract,
+conversion, mapping, and subprocess boundary.
 
 ## Process and provenance boundary
 
@@ -173,5 +173,60 @@ its pinned split archive, one contract mechanism key and CHEMKIN file, the compa
 and its URL/date/SHA-256 pin, a run directory, and an output JSON path. `--cantera-python` selects
 the isolated Cantera interpreter (default: `$T3_PYTHON`; see above). `--row-timeout-s` and `--workers` control only per-row process
 execution; the defaults are 600 seconds and `max(1, os.cpu_count()-2)`, respectively.
-The versioned worker request carries `observable: "jsr"`; unsupported observable values are an
-explicit run-level refusal, leaving a typed discriminator for future IDT adapters.
+The versioned worker request carries `observable: "jsr"` or `"idt"`, with matching typed row
+models; unsupported values and mismatched row types are refused.
+
+## Ignition delay
+
+`carmel score-holdout-idt` uses the same worker, per-row subprocesses, thread pins,
+conversion rules, source-line reaction keys, lock fingerprint and `rows.jsonl` checkpoint.
+Supply `--split-root` pointing at the pinned ChemKED tree instead of the JSR `--archive`.
+The n-heptane loader verifies every split SHA-256/git blob and its point/temperature/RCM
+counts before exporting 189 holdout points: 174 shock-tube and 15 RCM-ideal. Inlet labels
+are resolved with the existing structural mapper; ignition target labels remain exact.
+
+Every point starts an adiabatic constant-volume `IdealGasReactor` at its stored temperature,
+pressure and mole fractions, including the RCM-ideal points. There is no compression history
+or heat loss. The locked horizon is **1.0 s**, independently of the measured delay; relative
+and absolute tolerances are **1e-8** and **1e-16**. The initial t=0 state is included, and the
+integrator steps until it reaches the horizon, retaining the final step as T3 does. A resolved
+event must have a finite positive delay at or before 1.0 s and a temperature rise of at least
+**50 K**. No event meeting those requirements yields `ignition_not_resolved`.
+
+IDT execution carries every removed PLOG level's kept pressure bracket into the row
+process. It checks the initial pressure and every integration step, including a step
+that crosses an entire bracket, and refuses the trace as `plog_trimmed_interval_entered`
+before scoring. Brackets are open at their kept levels and may be unbounded at either
+end. This applies to every ignition target, since pressure can change even when the
+observed signal is a species or temperature. The simulation lock versions this guard;
+the execution row's brackets also participate in its checkpoint fingerprint.
+
+Event definitions follow the T3 experimental numerical path: `max` selects the first maximum;
+`d/dt max` selects the first maximum positive `numpy.gradient(values, times)` slope;
+`1/2 max` interpolates the first rising half-absolute-peak crossing; `d/dt max extrapolated`
+intersects the maximum-slope tangent with the initial target baseline. Species traces use mole
+fractions, pressure uses Pa, and temperature uses K. T3's history-free trace-span and settled-tail
+checks establish that the event finishes within the trace. These semantics were checked against
+T3 commit `4043bb98fcbbad5c252d8e1d57bbfabc6aa76087`. The dispatch deliberately fixes constant
+volume and 1.0 s for every point; T3's broader experimental wrapper has different defaults for
+RCM and its observation-dependent horizon.
+
+The recorded model check uses five h2o2 states and pressure d/dt max, OH max and OH d/dt max.
+The local T3 package import was blocked by unavailable ARC/broken OpenBabel dependencies.
+The check therefore executes the unchanged `CanteraIDT` class and event-helper AST nodes
+from that detached reference, using real Cantera/NumPy and replacing only the unused adapter
+base with `object`. It records the source SHA-256 and this limitation; it does not claim a
+full T3 application integration test.
+
+An undeclared exact target produces `target_species_absent`, naming the target. OHV/CHV are
+not substituted for OH*/CH*, even though their reviewed thermo warning digests agree.
+Missing targets are checkpointed before simulation. Solver failure, fatal signal and the
+per-row wall-clock `ignition_timeout` remain explicit refusals; construction defects refuse
+the run. Default wall-clock timeout and worker count match the JSR CLI controls.
+
+IDT scoring is the equal-point mean `abs(log10(tau_sim_seconds / tau_exp_seconds))` over
+finite, strictly positive delays. Reports retain all point IDs, per-point errors/refusals,
+coverage, reactor groups and contract temperature bands (<750, 750–900 inclusive, >900 K).
+The dispatch gate requires all 174 shock points to be refused for absent targets and at least
+12 of the 15 RCM-ideal points to score for each mechanism. A failed gate is reported after
+saving its report; settings must not be tuned using that result.

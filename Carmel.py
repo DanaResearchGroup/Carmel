@@ -7,8 +7,9 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from carmel.config import validate_config_file
 from carmel.paths import init_workspace
@@ -39,38 +40,41 @@ def create_parser() -> argparse.ArgumentParser:
     init = subparsers.add_parser("init-workspace", help="Initialize a workspace directory")
     init.add_argument("directory", type=Path, help="Path to the workspace directory")
 
-    score_holdout = subparsers.add_parser(
-        "score-holdout",
-        help="Score a frozen benchmark holdout with a Chemkin mechanism",
-    )
-    score_holdout.add_argument("--contract", type=Path, required=True)
-    score_holdout.add_argument("--mechanism", type=Path, required=True)
-    score_holdout.add_argument("--mechanism-key", choices=("v_old", "v_new"), required=True)
-    score_holdout.add_argument("--thermo", type=Path, required=True)
-    score_holdout.add_argument("--thermo-url", required=True)
-    score_holdout.add_argument("--thermo-retrieval-date", required=True)
-    score_holdout.add_argument("--thermo-sha256", required=True)
-    score_holdout.add_argument("--archive", type=Path, required=True)
-    score_holdout.add_argument("--run-dir", type=Path, required=True)
-    score_holdout.add_argument("--output", type=Path, required=True)
-    score_holdout.add_argument(
-        "--row-timeout-s",
-        type=float,
-        default=600.0,
-        help="Wall-clock limit for each independently killable row process (default: 600)",
-    )
-    score_holdout.add_argument(
-        "--workers",
-        type=int,
-        default=max(1, (os.cpu_count() or 1) - 2),
-        help="Concurrent row processes (default: max(1, os.cpu_count()-2))",
-    )
-    score_holdout.add_argument(
-        "--cantera-python",
-        type=Path,
-        default=None,
-        help="Python interpreter with Cantera installed (default: $T3_PYTHON)",
-    )
+    for command, description in (
+        ("score-holdout", "Score a frozen benchmark JSR holdout"),
+        ("score-holdout-idt", "Score a frozen n-heptane ignition-delay holdout"),
+    ):
+        score_holdout = subparsers.add_parser(command, help=description)
+        score_holdout.add_argument("--contract", type=Path, required=True)
+        score_holdout.add_argument("--mechanism", type=Path, required=True)
+        score_holdout.add_argument("--mechanism-key", choices=("v_old", "v_new"), required=True)
+        score_holdout.add_argument("--thermo", type=Path, required=True)
+        score_holdout.add_argument("--thermo-url", required=True)
+        score_holdout.add_argument("--thermo-retrieval-date", required=True)
+        score_holdout.add_argument("--thermo-sha256", required=True)
+        score_holdout.add_argument(
+            "--split-root" if command == "score-holdout-idt" else "--archive", type=Path, required=True
+        )
+        score_holdout.add_argument("--run-dir", type=Path, required=True)
+        score_holdout.add_argument("--output", type=Path, required=True)
+        score_holdout.add_argument(
+            "--row-timeout-s",
+            type=float,
+            default=600.0,
+            help="Wall-clock limit for each independently killable row process (default: 600)",
+        )
+        score_holdout.add_argument(
+            "--workers",
+            type=int,
+            default=max(1, (os.cpu_count() or 1) - 2),
+            help="Concurrent row processes (default: max(1, os.cpu_count()-2))",
+        )
+        score_holdout.add_argument(
+            "--cantera-python",
+            type=Path,
+            default=None,
+            help="Python interpreter with Cantera installed (default: $T3_PYTHON)",
+        )
 
     serve = subparsers.add_parser("serve", help="Launch the local Flask UI")
     serve.add_argument("--workspaces", type=Path, default=None, help="Parent workspaces directory")
@@ -1735,13 +1739,21 @@ def _cmd_store_condition_set(workspaces: Path | None) -> int:
 
 
 def _cmd_score_holdout(args: argparse.Namespace) -> int:
-    """Run the isolated JSR harness and write its provenance-rich JSON report."""
+    """Run the selected isolated harness and write its provenance-rich JSON report."""
     from carmel.benchmarks.holdout import resolve_cantera_python, run_harness
     from carmel.services.artifacts import write_text
 
     try:
         cantera_python = resolve_cantera_python(args.cantera_python)
-        report = run_harness(
+        if args.command == "score-holdout-idt":
+            from carmel.benchmarks.holdout_idt import run_idt_harness
+
+            selected_harness: Callable[..., dict[str, Any]] = run_idt_harness
+            split_argument = {"split_root": args.split_root}
+        else:
+            selected_harness = run_harness
+            split_argument = {"archive_path": args.archive}
+        report = selected_harness(
             contract_path=args.contract,
             mechanism_path=args.mechanism,
             mechanism_key=args.mechanism_key,
@@ -1749,7 +1761,7 @@ def _cmd_score_holdout(args: argparse.Namespace) -> int:
             thermo_url=args.thermo_url,
             thermo_retrieval_date=args.thermo_retrieval_date,
             thermo_sha256=args.thermo_sha256,
-            archive_path=args.archive,
+            **split_argument,
             run_dir=args.run_dir,
             cantera_python=cantera_python,
             row_timeout_s=args.row_timeout_s,
@@ -1758,6 +1770,9 @@ def _cmd_score_holdout(args: argparse.Namespace) -> int:
         write_text(args.output, json.dumps(report, indent=2) + "\n")
     except (OSError, ValueError) as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
+        return 1
+    if args.command == "score-holdout-idt" and not report["coverage_gate"]["passed"]:
+        print(f"REFUSED: IDT coverage gate; see {args.output}", file=sys.stderr)
         return 1
     gate = report.get("convergence_gate")
     if isinstance(gate, dict) and not gate.get("passed", True):
@@ -1787,7 +1802,7 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_validate_config(args.file)
     if args.command == "init-workspace":
         return _cmd_init_workspace(args.directory)
-    if args.command == "score-holdout":
+    if args.command in ("score-holdout", "score-holdout-idt"):
         return _cmd_score_holdout(args)
     if args.command == "serve":
         return _cmd_serve(args.workspaces, args.host, args.port, args.debug, args.config)

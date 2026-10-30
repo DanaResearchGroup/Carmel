@@ -13,7 +13,9 @@ import zipfile
 from collections import defaultdict
 from pathlib import Path
 from statistics import fmean
-from typing import Any, Literal
+from typing import Any, Literal, Self
+
+from pydantic import model_validator
 
 from carmel.adapters.t3 import T3_LAYOUT
 from carmel.benchmarks.cantera_worker import THREAD_ENV, canonical_reaction_key
@@ -47,20 +49,38 @@ class WorkerRequestRow(FrozenModel):
     output_species: tuple[str, ...]
 
 
+class IDTWorkerRequestRow(FrozenModel):
+    """A constant-volume ignition condition with an exact source target."""
+
+    row_id: str
+    temperature_k: float
+    pressure_pa: float
+    composition: dict[str, float]
+    ignition_target: str
+    ignition_type: Literal["max", "d/dt max", "1/2 max", "d/dt max extrapolated"]
+
+
 class WorkerRequest(FrozenModel):
     """Versioned request accepted by the self-contained Cantera worker."""
 
     schema_version: Literal[1] = 1
-    observable: Literal["jsr"] = "jsr"
+    observable: Literal["jsr", "idt"] = "jsr"
     mechanism_path: Path
     thermo_path: Path
     converted_yaml_path: Path
     trimmed_yaml_path: Path
     checkpoint_path: Path
     reaction_source_lines: dict[str, tuple[int, ...]]
-    rows: tuple[WorkerRequestRow, ...]
+    rows: tuple[WorkerRequestRow | IDTWorkerRequestRow, ...]
     row_timeout_s: float = DEFAULT_ROW_TIMEOUT_S
     workers: int = DEFAULT_WORKERS
+
+    @model_validator(mode="after")
+    def matching_observable(self) -> Self:
+        expected = WorkerRequestRow if self.observable == "jsr" else IDTWorkerRequestRow
+        if any(not isinstance(row, expected) for row in self.rows):
+            raise ValueError("row type does not match request observable")
+        return self
 
 
 class WorkerResponseRow(FrozenModel):
@@ -69,6 +89,8 @@ class WorkerResponseRow(FrozenModel):
     row_id: str
     status: Literal["ok", "refused"]
     mole_fractions: dict[str, float] | None = None
+    ignition_delay_s: float | None = None
+    ignition_target: str | None = None
     reason: str | None = None
     wall_time_s: float
     integrator_steps: int | None

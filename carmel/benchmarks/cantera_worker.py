@@ -48,6 +48,10 @@ JSR_RTOL = 1.0e-9
 JSR_ATOL = 1.0e-15
 JSR_MAX_STEPS = 100000
 PRESSURE_CONTROLLER_K = 1.0e-5
+IDT_RTOL = 1.0e-8
+IDT_ATOL = 1.0e-16
+IDT_HORIZON_S = 1.0
+IDT_TEMPERATURE_RISE_K = 50.0
 # Reviewed case-2 v_new/thermo.normalized.dat headers: OH* line 25, CH* line 145.
 # SHA-256 of the three 10-byte temperature fields followed by fourteen 15-byte
 # coefficient fields, in CHEMKIN card order, with padding retained.
@@ -105,6 +109,19 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
             "temperature_continuation": False,
             "energy": "off",
             "pressure_controller_K": PRESSURE_CONTROLLER_K,
+        },
+        "idt": {
+            "rtol": IDT_RTOL,
+            "atol": IDT_ATOL,
+            "horizon_s": IDT_HORIZON_S,
+            "minimum_temperature_rise_k": IDT_TEMPERATURE_RISE_K,
+            "reactor": "adiabatic_constant_volume_IdealGasReactor",
+            "initial_state": "stored_temperature_pressure_composition",
+            "criterion": "exact_target_and_source_definition_t3_v1",
+            "gradient": "numpy.gradient_default_edge_order_1",
+            "resolution": "t3_source_defined_idt_is_resolved_history_free_v1",
+            "ignition_timeout_s": float(row_timeout_s),
+            "plog_pressure_guard": "initial_and_each_step_crossing_removed_open_brackets_v1",
         },
         "process": {
             "thread_env": THREAD_ENV,
@@ -173,6 +190,14 @@ class PlogValidationError(ValueError):
     """A PLOG rate cannot be validated without guessing its units."""
 
     reason = "unsupported_plog_activation_energy_unit"
+
+
+class PlogTrimmedIntervalEntered(RuntimeError):
+    """An IDT trace reached kinetics altered by PLOG trimming."""
+
+    def __init__(self, integrator_steps: int) -> None:
+        super().__init__("plog_trimmed_interval_entered")
+        self.integrator_steps = integrator_steps
 
 
 def _write_progress(
@@ -540,6 +565,178 @@ def _simulate_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict[str
         }
 
 
+def source_defined_idt(times: list[float], values: list[float], criterion_type: str) -> float | None:
+    """T3 experimental event semantics, including its nonuniform numerical gradient."""
+    import numpy as np
+
+    t = np.asarray(times, dtype=np.float64)
+    y = np.asarray(values, dtype=np.float64)
+    if (
+        t.ndim != 1
+        or y.ndim != 1
+        or len(t) != len(y)
+        or len(t) < 2
+        or not np.all(np.isfinite(t))
+        or not np.all(np.isfinite(y))
+        or np.any(np.diff(t) <= 0)
+    ):
+        return None
+    peak = int(np.argmax(y))
+    if criterion_type == "max":
+        return float(t[peak])
+    if criterion_type == "1/2 max":
+        threshold = 0.5 * float(y[peak])
+        crossings = np.flatnonzero(y[: peak + 1] >= threshold)
+        if not len(crossings):
+            return None
+        upper = int(crossings[0])
+        if upper == 0:
+            return float(t[0])
+        lower = upper - 1
+        delta = y[upper] - y[lower]
+        if delta == 0:
+            return float(t[upper])
+        return float(t[lower] + (threshold - y[lower]) / delta * (t[upper] - t[lower]))
+    slopes = np.gradient(y, t)
+    index = int(np.argmax(slopes))
+    slope = float(slopes[index])
+    if not math.isfinite(slope) or slope <= 0:
+        return None
+    if criterion_type == "d/dt max":
+        return float(t[index])
+    if criterion_type == "d/dt max extrapolated":
+        intersection = float(t[index] - (y[index] - y[0]) / slope)
+        return intersection if math.isfinite(intersection) else None
+    raise ValueError(f"unknown source-defined ignition criterion: {criterion_type!r}")
+
+
+def idt_trace_is_resolved(times: list[float], values: list[float], criterion_type: str, target: str) -> bool:
+    """T3 history-free experimental resolution check (including the settled tail)."""
+    import numpy as np
+
+    if source_defined_idt(times, values, criterion_type) is None or len(times) < 3:
+        return False
+    y = np.asarray(values, dtype=np.float64)
+    span = float(np.ptp(y))
+    minimum_span = max(abs(float(y[0])), 1.0) * 1e-6 if target in ("pressure", "temperature") else 1e-12
+    if not math.isfinite(span) or span <= minimum_span:
+        return False
+    tail_length = max(3, len(y) // 10)
+    peak = int(np.argmax(y))
+    if criterion_type in ("max", "1/2 max"):
+        return peak < len(y) - 1 or float(np.ptp(y[-tail_length:])) <= max(span * 1e-3, np.finfo(float).eps)
+    slopes = np.gradient(y, np.asarray(times, dtype=np.float64))
+    index = int(np.argmax(slopes))
+    return bool(
+        index < len(y) - tail_length
+        and float(np.max(np.abs(slopes[-tail_length:]))) <= max(abs(float(slopes[index])) * 0.1, np.finfo(float).eps)
+    )
+
+
+def integrate_idt_trace(ct: Any, gas: Any, row: dict[str, Any]) -> tuple[list[float], list[float], list[float], int]:
+    """Integrate a fixed one-second, adiabatic constant-volume trace from t=0."""
+    try:
+        reactor = ct.IdealGasReactor(gas, energy="on")
+        network = ct.ReactorNet([reactor])
+        network.atol, network.rtol = IDT_ATOL, IDT_RTOL
+    except Exception as exc:
+        raise RunLevelSimulationError(
+            {"refusal": "reactor_construction_failed", "construction_error": str(exc)}
+        ) from exc
+    target = row["ignition_target"]
+    species_index = gas.species_index(target) if target not in ("pressure", "temperature") else None
+
+    def value() -> float:
+        if target == "pressure":
+            return float(reactor.phase.P)
+        if target == "temperature":
+            return float(reactor.T)
+        return float(reactor.phase.X[species_index])
+
+    times, values, temperatures = [0.0], [value()], [float(reactor.T)]
+    brackets = row.get("plog_trimmed_brackets_pa", [])
+    previous_pressure = float(reactor.phase.P)
+
+    def check_pressure(pressure: float) -> None:
+        # A continuous pressure path can cross an entire removed bracket between
+        # samples; checking only the endpoints would miss that entry. Kept
+        # boundary levels themselves remain valid, hence the strict inequalities.
+        for lower, upper in brackets:
+            if (lower is None or max(previous_pressure, pressure) > lower) and (
+                upper is None or min(previous_pressure, pressure) < upper
+            ):
+                raise PlogTrimmedIntervalEntered(int(network.solver_stats.get("steps", 0)))
+
+    check_pressure(previous_pressure)
+    _write_progress("integration", last_reactor_time_s=0.0, temperature_k=float(reactor.T), integrator_steps=0)
+    while network.time < IDT_HORIZON_S:
+        network.step()
+        pressure = float(reactor.phase.P)
+        check_pressure(pressure)
+        previous_pressure = pressure
+        times.append(float(network.time))
+        values.append(value())
+        temperatures.append(float(reactor.T))
+        # Sidecars stay bounded in cost while still identifying integration crashes.
+        if len(times) % 100 == 0:
+            _write_progress(
+                "integration",
+                last_reactor_time_s=times[-1],
+                temperature_k=temperatures[-1],
+                integrator_steps=int(network.solver_stats.get("steps", 0)),
+            )
+    steps = int(network.solver_stats.get("steps", 0))
+    _write_progress("complete", last_reactor_time_s=times[-1], temperature_k=temperatures[-1], integrator_steps=steps)
+    return times, values, temperatures, steps
+
+
+def _simulate_idt_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    import cantera as ct
+
+    started = time.monotonic()
+    target = row["ignition_target"]
+    result: dict[str, Any] = {
+        "row_id": row["row_id"],
+        "status": "refused",
+        "ignition_target": target,
+        "integrator_steps": 0,
+        "wall_time_s": 0.0,
+    }
+    try:
+        _write_progress("construction")
+        gas = ct.Solution(trimmed_path)
+        if target not in ("pressure", "temperature") and target not in gas.species_names:
+            result["reason"] = "target_species_absent"
+            return "row", result
+        gas.TPX = row["temperature_k"], row["pressure_pa"], row["composition"]
+    except Exception as exc:
+        return "run", {"refusal": "reactor_construction_failed", "construction_error": str(exc)}
+    try:
+        times, values, temperatures, steps = integrate_idt_trace(ct, gas, row)
+        result["integrator_steps"] = steps
+        delay = source_defined_idt(times, values, row["ignition_type"])
+        if (
+            delay is None
+            or not math.isfinite(delay)
+            or not 0 < delay <= IDT_HORIZON_S
+            or max(temperatures) - temperatures[0] < IDT_TEMPERATURE_RISE_K
+            or not idt_trace_is_resolved(times, values, row["ignition_type"], target)
+        ):
+            result["reason"] = "ignition_not_resolved"
+        else:
+            result.update(status="ok", ignition_delay_s=delay)
+    except RunLevelSimulationError as exc:
+        return "run", exc.result
+    except PlogTrimmedIntervalEntered as exc:
+        result["reason"] = str(exc)
+        result["integrator_steps"] = exc.integrator_steps
+    except Exception as exc:
+        result["reason"] = f"solver_failure: {exc}"
+        result["integrator_steps"] = None
+    result["wall_time_s"] = time.monotonic() - started
+    return "row", result
+
+
 def _row_fingerprint(
     mechanism_sha256: str,
     row: dict[str, Any],
@@ -791,7 +988,7 @@ def execute_rows(
                     result = {
                         "row_id": row["row_id"],
                         "status": "refused",
-                        "reason": "steady_state_timeout",
+                        "reason": "ignition_timeout" if "ignition_target" in row else "steady_state_timeout",
                         "wall_time_s": expired[process],
                         "integrator_steps": None,
                     }
@@ -881,6 +1078,7 @@ def execute_rows(
 
 
 _OBSERVABLE_SIMULATORS["jsr"] = _simulate_row
+_OBSERVABLE_SIMULATORS["idt"] = _simulate_idt_row
 
 
 def _write_response(path: Path, response: dict[str, Any]) -> None:
@@ -973,7 +1171,7 @@ def main() -> int:
     try:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            ct.Solution(trimmed_path)
+            validated_gas = ct.Solution(trimmed_path)
     except Exception as exc:
         response["refusal"] = "trimmed_mechanism_validation_failed"
         response["validation_error"] = str(exc)
@@ -992,7 +1190,19 @@ def main() -> int:
     affected_pressures = {item["pressure_pa"] for item in pressure_refusals}
     initial_results: dict[str, dict[str, Any]] = {}
     for row in request["rows"]:
-        if float(row["pressure_pa"]) in affected_pressures:
+        target = row.get("ignition_target")
+        if (
+            observable == "idt"
+            and target not in ("pressure", "temperature")
+            and target not in validated_gas.species_names
+        ):
+            initial_results[row["row_id"]] = {
+                "row_id": row["row_id"],
+                "status": "refused",
+                "reason": "target_species_absent",
+                "ignition_target": target,
+            }
+        elif float(row["pressure_pa"]) in affected_pressures:
             initial_results[row["row_id"]] = {
                 "row_id": row["row_id"],
                 "status": "refused",
@@ -1006,9 +1216,14 @@ def main() -> int:
     response["checkpoint_path"] = str(checkpoint_path)
     checkpoint_recoveries: list[dict[str, Any]] = []
     response["checkpoint_recoveries"] = checkpoint_recoveries
+    execution_rows = request["rows"]
+    if observable == "idt" and trims:
+        execution_rows = [
+            {**row, "plog_trimmed_brackets_pa": [trim["kept_bracket_pa"] for trim in trims]} for row in execution_rows
+        ]
     try:
         results, resumed = execute_rows(
-            request["rows"],
+            execution_rows,
             trimmed_path=str(trimmed_path),
             mechanism_sha256=response["mechanism_semantic_sha256"],
             checkpoint_path=checkpoint_path,
