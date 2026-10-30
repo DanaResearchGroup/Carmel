@@ -110,24 +110,28 @@ def _worker_row() -> dict[str, Any]:
 
 def test_ck2yaml_normalization_rewrites_only_fortran_eless_exponents() -> None:
     source = (
+        b"REACTIONS\n"
         b"LOW / 1.5270+104 -2.4826E+01 9.4800E+04 /\n"
-        b"RATE 2.5-03 ! comment 7.25+99 and 1.0E+04\n"
+        b"A=>B 2.5-03 0.0 0.0 ! comment 7.25+99 and 1.0E+04\n"
+        b"END\n"
         b"SPECIES C5H10-2 TOKEN1.0+04\n"
     )
 
     result = normalize_for_ck2yaml(source, file="mechanism.inp")
 
     expected = (
+        b"REACTIONS\n"
         b"LOW / 1.5270E+104 -2.4826E+01 9.4800E+04 /\n"
-        b"RATE 2.5E-03 ! comment 7.25+99 and 1.0E+04\n"
+        b"A=>B 2.5E-03 0.0 0.0 ! comment 7.25+99 and 1.0E+04\n"
+        b"END\n"
         b"SPECIES C5H10-2 TOKEN1.0+04\n"
     )
     assert result.data == expected
     assert result.raw_sha256 == hashlib.sha256(source).hexdigest()
     assert result.normalized_sha256 == hashlib.sha256(expected).hexdigest()
     assert [rewrite.model_dump() for rewrite in result.rewrites] == [
-        {"file": "mechanism.inp", "line": 1, "before": "1.5270+104", "after": "1.5270E+104"},
-        {"file": "mechanism.inp", "line": 2, "before": "2.5-03", "after": "2.5E-03"},
+        {"file": "mechanism.inp", "line": 2, "before": "1.5270+104", "after": "1.5270E+104"},
+        {"file": "mechanism.inp", "line": 3, "before": "2.5-03", "after": "2.5E-03"},
     ]
 
 
@@ -281,15 +285,17 @@ def test_ck2yaml_warning_allowlist_refuses_noncomment_skipped_block() -> None:
 
 
 def test_cantera_validation_warning_allowlist_is_species_specific() -> None:
+    source = (Path(__file__).parent / "data/reviewed_excited_thermo.dat").read_bytes()
     allowed = [
         "NasaPoly2::validate: \nFor species OH*, discontinuity in h/RT detected at Tmid = 1000",
         "NasaPoly2::validate: \nFor species CH*, discontinuity in h/RT detected at Tmid = 1000",
     ]
 
-    assert cantera_validation_refusals(allowed) == []
-    assert cantera_validation_refusals([*allowed, "NasaPoly2::validate: For species OTHER, discontinuity"])[-1] == (
-        "NasaPoly2::validate: For species OTHER, discontinuity"
-    )
+    assert cantera_validation_refusals(allowed, (source,)) == []
+    assert cantera_validation_refusals(allowed) == allowed
+    assert cantera_validation_refusals([*allowed, "NasaPoly2::validate: For species OTHER, discontinuity"], (source,))[
+        -1
+    ] == ("NasaPoly2::validate: For species OTHER, discontinuity")
 
 
 def test_row_timeout_is_an_explicit_checkpointed_refusal(tmp_path: Path) -> None:

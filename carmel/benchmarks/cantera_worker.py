@@ -48,6 +48,23 @@ JSR_RTOL = 1.0e-9
 JSR_ATOL = 1.0e-15
 JSR_MAX_STEPS = 100000
 PRESSURE_CONTROLLER_K = 1.0e-5
+# Reviewed case-2 v_new/thermo.normalized.dat headers: OH* line 25, CH* line 145.
+# SHA-256 of the three 10-byte temperature fields followed by fourteen 15-byte
+# coefficient fields, in CHEMKIN card order, with padding retained.
+REVIEWED_OH_NASA_SHA256 = "85ab13a7ce62508df7daf3411313e27f5e650008f665ec790e04c194aa7fb2d7"
+REVIEWED_CH_NASA_SHA256 = "4a3c493e51e59ada6dfba5d198e487ab5e78b907d4bd0ba32f217df460ae880f"
+_REVIEWED_NASA_LABELS = {
+    "OH*": REVIEWED_OH_NASA_SHA256,
+    "OHV": REVIEWED_OH_NASA_SHA256,
+    "CH*": REVIEWED_CH_NASA_SHA256,
+    "CHV": REVIEWED_CH_NASA_SHA256,
+}
+_REVIEWED_NASA_WARNING = re.compile(
+    r"NasaPoly2::validate:\s*For species (OH\*|OHV|CH\*|CHV), "
+    r"discontinuity in h/RT detected at Tmid = 1000(?:\.0*)?\s*"
+    rf"(?:Value computed using low-temperature polynomial:\s*{_NUMBER_PATTERN}\s*"
+    rf"Value computed using high-temperature polynomial:\s*{_NUMBER_PATTERN}\s*)?"
+)
 Simulation = Callable[[str, dict[str, Any]], tuple[str, dict[str, Any]]]
 _ROW_PROGRESS_PATH: Path | None = None
 _OBSERVABLE_SIMULATORS: dict[str, Simulation] = {}
@@ -95,12 +112,15 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
         },
         "ck2yaml": {
             "flags": ["--permissive", "--verbose", "--no-validate"],
-            "eless_exponent_normalization": "whole_numeric_tokens_outside_bang_comments_v1",
+            "eless_exponent_normalization": "nasa_fixed_width_and_reaction_rate_fields_only_v2",
+            "nasa7_fourth_card_normalization": "restore_absent_or_lone_column_81_index_after_valid_cards_v2",
             "warning_allowlist": [
                 "redundant_species_declaration",
                 "redundant_thermo_entry_first_wins",
                 "comment_only_unparsable_thermo_block",
             ],
+            "validation_warning_allowlist": "reviewed_nasa_numeric_field_sha256_v2",
+            "reviewed_nasa_sha256_by_label": dict(_REVIEWED_NASA_LABELS),
             "plog_rule": "trim_nonpositive_levels_only_outside_scored_interpolation_intervals_v1",
             "plog_validation_temperatures_k": list(PLOG_VALIDATION_TEMPERATURES_K),
         },
@@ -174,13 +194,52 @@ def _write_progress(
     write_text(_ROW_PROGRESS_PATH, json.dumps(payload, sort_keys=True))
 
 
-def cantera_validation_refusals(messages: list[str]) -> list[str]:
-    """Allow only the two reviewed NASA discontinuity warnings."""
-    return [
-        message
-        for message in messages
-        if not ("NasaPoly2::validate" in message and ("For species OH*," in message or "For species CH*," in message))
-    ]
+def nasa7_record_digests(sources: tuple[bytes, ...]) -> dict[str, str | None]:
+    """Hash fixed-width numeric records; first entries win as in ck2yaml.
+
+    Sources are ordered as the converter reads them: kinetics, then thermo.
+    An invalid first record cannot be rescued by an approved later duplicate.
+    """
+    digests: dict[str, str | None] = {}
+    for source in sources:
+        lines = [line.partition(b"!")[0] for line in source.splitlines()]
+        in_thermo = False
+        for index, line in enumerate(lines):
+            head = line.split()[0].upper() if line.split() else b""
+            if head in (b"THERMO", b"THERM"):
+                in_thermo = True
+            elif head == b"END":
+                in_thermo = False
+            if not in_thermo or line[79:80] != b"1":
+                continue
+            label = line[:18].split()[0].decode("ascii") if line[:18].split() else ""
+            if label in digests:
+                continue
+            digests[label] = None
+            cards = lines[index : index + 4]
+            if len(cards) != 4 or any(card[79:80] != str(i).encode() for i, card in enumerate(cards, 1)):
+                continue
+            fields = [line[start : start + 10] for start in (45, 55, 65)]
+            fields += [
+                card[start : start + 15]
+                for card, count in zip(cards[1:], (5, 5, 4), strict=True)
+                for start in range(0, 15 * count, 15)
+            ]
+            if not all(re.fullmatch(_NUMBER_PATTERN, field.decode("ascii").strip()) for field in fields):
+                continue
+            digests[label] = hashlib.sha256(b"".join(fields)).hexdigest()
+    return digests
+
+
+def cantera_validation_refusals(messages: list[str], thermo_sources: tuple[bytes, ...] = ()) -> list[str]:
+    """Allow only reviewed h/RT warnings with the pinned numeric-field digest."""
+    digests = nasa7_record_digests(thermo_sources)
+    refused = []
+    for message in messages:
+        match = _REVIEWED_NASA_WARNING.fullmatch(message.strip())
+        if match is None or digests.get(match[1]) != _REVIEWED_NASA_LABELS[match[1]]:
+            refused.append(message)
+    return refused
 
 
 def parse_ck2yaml_log(log: str) -> dict[str, list[Any]]:
@@ -921,7 +980,10 @@ def main() -> int:
         _write_response(response_path, response)
         return 0
     response["validation_warnings"] = [str(item.message) for item in caught]
-    unexpected = cantera_validation_refusals(response["validation_warnings"])
+    thermo_sources: tuple[bytes, ...] = ()
+    if any(_REVIEWED_NASA_WARNING.fullmatch(message.strip()) for message in response["validation_warnings"]):
+        thermo_sources = (Path(request["mechanism_path"]).read_bytes(), Path(request["thermo_path"]).read_bytes())
+    unexpected = cantera_validation_refusals(response["validation_warnings"], thermo_sources)
     if unexpected:
         response["refusal"] = "unallowlisted_cantera_validation_warning"
         _write_response(response_path, response)

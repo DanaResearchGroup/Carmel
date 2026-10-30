@@ -18,9 +18,30 @@ captured as `stdout.log` and `stderr.log` in the run directory.
 
 The worker converts kinetics and thermo together with the invoked Cantera version's `ck2yaml`.
 Every raw input SHA-256, normalized-input SHA-256, converter version, converted warning, and
-trimmed-YAML SHA-256 is recorded. CHEMKIN's Fortran E-less numeric tokens are normalized by a
-general preprocessing rule: outside `!` comments, a whole mantissa-plus-signed-digits token gets
-an explicit `E`. Every rewrite records its input file, line, before text, and after text.
+trimmed-YAML SHA-256 is recorded. CHEMKIN's Fortran E-less numeric tokens receive an explicit
+`E` only within numeric fields: NASA-7 header columns 46–75 (three temperature fields),
+coefficient-card columns 1–75 (five 15-column fields), the last three numeric rate parameters
+after a reaction equation, and numeric auxiliary lines (`LOW`, `HIGH`, `TROE`, `SRI`, `PLOG`,
+`REV`, `CHEB`, `TCHEB`, `PCHEB`, `LT`, `RLT`). Fixed-width fields retain their width by consuming
+padding; a field without space for `E` remains unchanged for conversion to refuse. No rewriting
+occurs in `SPECIES`, reaction equations, other header text, or `!` comments. In particular,
+identifiers such as `C8H141-5,3-4` and `C4H6OHOOH1-4-3` retain their exact spelling.
+Every rewrite records its input file, line, before text, and after text.
+
+Inside a `THERMO` section, one additional format-only rule restores a missing NASA-7
+fourth-card index. After three consecutive cards with valid indices `1`, `2`, `3`, valid
+temperature fields, and fixed-width coefficients, a fourth card containing four valid
+15-column coefficient fields and a blank trailer is padded through column 79 and receives
+`4` in column 80. The same rule also accepts an exactly 81-column card whose only nonblank
+trailer byte is `4` in column 81: it moves that index to column 80 and drops the extra byte.
+Coefficient and temperature bytes, species names, comments, line endings, and record order are
+preserved. Any other nonblank trailer, malformed coefficient, or interrupted card sequence is
+left unchanged for conversion to refuse; two populated index columns are never repaired.
+Each repair records its source line and before/after text; the rule is named in the simulation
+lock. Validation of a new thermo pin must independently compare all fourteen coefficient
+strings, temperature fields and species names in every record before and after normalization.
+Both normalization rules are versioned in the simulation lock. The n-pentane regression also
+requires byte-identical normalized inputs and unchanged saved JSR results.
 
 Conversion always uses `--permissive --verbose`. Only redundant species declarations, redundant
 thermo entries, and unparsable thermo blocks containing whitespace and `!` characters are allowed
@@ -29,6 +50,26 @@ input are recorded as information; they are also emitted by strict conversion an
 permissive warnings. Any other warning or skipped source block refuses the run. Duplicate thermo
 records are reported with both headers, whether their coefficients differ, and the fact that the
 first entry was used.
+
+Cantera validation accepts only the reviewed `NasaPoly2::validate` **h/RT discontinuity at
+1000 K** for OH*/OHV or CH*/CHV, and only when that species' parsed NASA numeric fields
+match the corresponding pinned SHA-256. The reviewed sources are
+`/home/alon/runs/i127-holdout-sim/v_new/thermo.normalized.dat`, OH* header line 25 and CH*
+header line 145. The digest concatenates the three 10-byte temperature fields (columns
+46–75), then fourteen 15-byte coefficient fields in card order, preserving every padding
+byte. Species labels and card indices are excluded; values are never converted and rounded.
+
+| Reviewed source | Allowed labels | Numeric-field SHA-256 |
+| --- | --- | --- |
+| OH*, line 25 | OH*, OHV | `85ab13a7ce62508df7daf3411313e27f5e650008f665ec790e04c194aa7fb2d7` |
+| CH*, line 145 | CH*, CHV | `4a3c493e51e59ada6dfba5d198e487ab5e78b907d4bd0ba32f217df460ae880f` |
+
+The first record wins, including across kinetics and companion thermo; a malformed or
+changed first record cannot acquire approval through a later duplicate. Any other species,
+warning type, midpoint, or changed numeric byte remains refused. Original case-2 labels use
+the same digest check. The simulation lock records `reviewed_nasa_numeric_field_sha256_v2`
+and all four label-to-digest entries. This warning rule changes no input, coefficient or JSR
+result and does not map the ignition targets OH*/CH* to OHV/CHV.
 
 Before validation, every PLOG pressure level is checked at Cantera's validation temperatures.
 A rate expression's activation energy is converted from the YAML document's inherited
