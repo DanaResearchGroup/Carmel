@@ -79,6 +79,9 @@ def _must_not_run(_: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     raise AssertionError(f"resumed row was unexpectedly rerun: {row['row_id']}")
 
 
+CRASH_TEST_ROW_TIMEOUT_S = 60.0
+
+
 def _fake_solver_crash(_: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     _write_progress(
         "integration",
@@ -529,7 +532,9 @@ def test_negative_signal_during_integration_is_a_solver_crash_refusal(tmp_path: 
         cantera_version=_TEST_CANTERA_VERSION,
         checkpoint_path=tmp_path / "rows.jsonl",
         workers=1,
-        row_timeout_s=5.0,
+        # A spawned child crashes on its own; the budget only has to outlast
+        # interpreter start-up plus the fault dump on a slow, coverage-traced runner.
+        row_timeout_s=CRASH_TEST_ROW_TIMEOUT_S,
         simulation=_fake_solver_crash,
         poll_interval_s=0.005,
     )
@@ -552,7 +557,9 @@ def test_negative_signal_during_construction_is_a_run_level_failure(tmp_path: Pa
             cantera_version=_TEST_CANTERA_VERSION,
             checkpoint_path=tmp_path / "rows.jsonl",
             workers=1,
-            row_timeout_s=5.0,
+            # A spawned child crashes on its own; the budget only has to outlast
+            # interpreter start-up plus the fault dump on a slow, coverage-traced runner.
+            row_timeout_s=CRASH_TEST_ROW_TIMEOUT_S,
             simulation=_fake_construction_crash,
             poll_interval_s=0.005,
         )
