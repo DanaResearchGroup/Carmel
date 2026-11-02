@@ -79,6 +79,9 @@ def _must_not_run(_: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     raise AssertionError(f"resumed row was unexpectedly rerun: {row['row_id']}")
 
 
+CRASH_TEST_ROW_TIMEOUT_S = 60.0
+
+
 def _fake_solver_crash(_: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     _write_progress(
         "integration",
@@ -110,24 +113,28 @@ def _worker_row() -> dict[str, Any]:
 
 def test_ck2yaml_normalization_rewrites_only_fortran_eless_exponents() -> None:
     source = (
+        b"REACTIONS\n"
         b"LOW / 1.5270+104 -2.4826E+01 9.4800E+04 /\n"
-        b"RATE 2.5-03 ! comment 7.25+99 and 1.0E+04\n"
+        b"A=>B 2.5-03 0.0 0.0 ! comment 7.25+99 and 1.0E+04\n"
+        b"END\n"
         b"SPECIES C5H10-2 TOKEN1.0+04\n"
     )
 
     result = normalize_for_ck2yaml(source, file="mechanism.inp")
 
     expected = (
+        b"REACTIONS\n"
         b"LOW / 1.5270E+104 -2.4826E+01 9.4800E+04 /\n"
-        b"RATE 2.5E-03 ! comment 7.25+99 and 1.0E+04\n"
+        b"A=>B 2.5E-03 0.0 0.0 ! comment 7.25+99 and 1.0E+04\n"
+        b"END\n"
         b"SPECIES C5H10-2 TOKEN1.0+04\n"
     )
     assert result.data == expected
     assert result.raw_sha256 == hashlib.sha256(source).hexdigest()
     assert result.normalized_sha256 == hashlib.sha256(expected).hexdigest()
     assert [rewrite.model_dump() for rewrite in result.rewrites] == [
-        {"file": "mechanism.inp", "line": 1, "before": "1.5270+104", "after": "1.5270E+104"},
-        {"file": "mechanism.inp", "line": 2, "before": "2.5-03", "after": "2.5E-03"},
+        {"file": "mechanism.inp", "line": 2, "before": "1.5270+104", "after": "1.5270E+104"},
+        {"file": "mechanism.inp", "line": 3, "before": "2.5-03", "after": "2.5E-03"},
     ]
 
 
@@ -281,22 +288,28 @@ def test_ck2yaml_warning_allowlist_refuses_noncomment_skipped_block() -> None:
 
 
 def test_cantera_validation_warning_allowlist_is_species_specific() -> None:
+    source = (Path(__file__).parent / "data/reviewed_excited_thermo.dat").read_bytes()
     allowed = [
         "NasaPoly2::validate: \nFor species OH*, discontinuity in h/RT detected at Tmid = 1000",
         "NasaPoly2::validate: \nFor species CH*, discontinuity in h/RT detected at Tmid = 1000",
     ]
 
-    assert cantera_validation_refusals(allowed) == []
-    assert cantera_validation_refusals([*allowed, "NasaPoly2::validate: For species OTHER, discontinuity"])[-1] == (
-        "NasaPoly2::validate: For species OTHER, discontinuity"
-    )
+    assert cantera_validation_refusals(allowed, (source,)) == []
+    assert cantera_validation_refusals(allowed) == allowed
+    assert cantera_validation_refusals([*allowed, "NasaPoly2::validate: For species OTHER, discontinuity"], (source,))[
+        -1
+    ] == ("NasaPoly2::validate: For species OTHER, discontinuity")
 
 
-def test_row_timeout_is_an_explicit_checkpointed_refusal(tmp_path: Path) -> None:
+@pytest.mark.parametrize(("target", "reason"), [(None, "steady_state_timeout"), ("OH*", "ignition_timeout")])
+def test_row_timeout_is_an_explicit_checkpointed_refusal(tmp_path: Path, target: str | None, reason: str) -> None:
     checkpoint = tmp_path / "rows.jsonl"
+    row = _worker_row()
+    if target is not None:
+        row.update(ignition_target=target, ignition_type="d/dt max")
 
     results, resumed = execute_rows(
-        [_worker_row()],
+        [row],
         trimmed_path=str(tmp_path / "trimmed.yaml"),
         mechanism_sha256="a" * 64,
         cantera_version=_TEST_CANTERA_VERSION,
@@ -310,11 +323,11 @@ def test_row_timeout_is_an_explicit_checkpointed_refusal(tmp_path: Path) -> None
     assert resumed == 0
     result = results["fake-row"]
     assert result["status"] == "refused"
-    assert result["reason"] == "steady_state_timeout"
+    assert result["reason"] == reason
     assert result["wall_time_s"] >= 0.05
     assert result["integrator_steps"] is None
     persisted = json.loads(checkpoint.read_text().strip())
-    assert persisted["result"]["reason"] == "steady_state_timeout"
+    assert persisted["result"]["reason"] == reason
 
 
 def test_row_timeout_kills_a_process_that_ignores_terminate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -519,7 +532,9 @@ def test_negative_signal_during_integration_is_a_solver_crash_refusal(tmp_path: 
         cantera_version=_TEST_CANTERA_VERSION,
         checkpoint_path=tmp_path / "rows.jsonl",
         workers=1,
-        row_timeout_s=5.0,
+        # A spawned child crashes on its own; the budget only has to outlast
+        # interpreter start-up plus the fault dump on a slow, coverage-traced runner.
+        row_timeout_s=CRASH_TEST_ROW_TIMEOUT_S,
         simulation=_fake_solver_crash,
         poll_interval_s=0.005,
     )
@@ -542,7 +557,9 @@ def test_negative_signal_during_construction_is_a_run_level_failure(tmp_path: Pa
             cantera_version=_TEST_CANTERA_VERSION,
             checkpoint_path=tmp_path / "rows.jsonl",
             workers=1,
-            row_timeout_s=5.0,
+            # A spawned child crashes on its own; the budget only has to outlast
+            # interpreter start-up plus the fault dump on a slow, coverage-traced runner.
+            row_timeout_s=CRASH_TEST_ROW_TIMEOUT_S,
             simulation=_fake_construction_crash,
             poll_interval_s=0.005,
         )
@@ -770,13 +787,13 @@ def test_worker_main_refusal_paths_are_serialized(tmp_path: Path, monkeypatch: p
         "converted_yaml_path": str(tmp_path / "converted.yaml"),
         "trimmed_yaml_path": str(tmp_path / "trimmed.yaml"),
         "rows": [],
-        "observable": "idt",
+        "observable": "unknown",
     }
     request_path.write_text(json.dumps(request))
     monkeypatch.setattr(sys, "argv", ["cantera_worker.py", str(request_path), str(response_path)])
     assert cantera_worker.main() == 0
     unsupported = WorkerResponse.model_validate_json(response_path.read_text())
-    assert unsupported.refusal == "unsupported_observable: idt"
+    assert unsupported.refusal == "unsupported_observable: unknown"
     assert unsupported.converter == {}
 
     request.pop("observable")
@@ -794,7 +811,7 @@ def test_cantera_worker_script_is_self_contained_without_pythonpath(tmp_path: Pa
     worker = Path(__file__).parents[1] / "carmel" / "benchmarks" / "cantera_worker.py"
     request_path = tmp_path / "request.json"
     response_path = tmp_path / "response.json"
-    request_path.write_text(json.dumps({"observable": "idt"}))
+    request_path.write_text(json.dumps({"observable": "unknown"}))
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
 
@@ -809,7 +826,7 @@ def test_cantera_worker_script_is_self_contained_without_pythonpath(tmp_path: Pa
 
     assert completed.returncode == 0, completed.stderr
     response = WorkerResponse.model_validate_json(response_path.read_text())
-    assert response.refusal == "unsupported_observable: idt"
+    assert response.refusal == "unsupported_observable: unknown"
     tree = ast.parse(worker.read_text())
     imported_modules = {
         alias.name for node in ast.walk(tree) if isinstance(node, ast.Import) for alias in node.names
@@ -913,8 +930,9 @@ def test_worker_main_rejects_after_conversion(mode: str, tmp_path: Path, monkeyp
     assert response["refusal"] == expected[mode]
 
 
+@pytest.mark.parametrize("observable", ["jsr", "idt"])
 def test_worker_main_preserves_duplicate_plog_source_line_occurrences(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, observable: str
 ) -> None:
     request_path = tmp_path / "request.json"
     response_path = tmp_path / "response.json"
@@ -925,6 +943,9 @@ def test_worker_main_preserves_duplicate_plog_source_line_occurrences(
         {**_worker_row(), "row_id": "affected", "pressure_pa": affected_pressure},
         {**_worker_row(), "row_id": "sound", "pressure_pa": 101325.0},
     ]
+    if observable == "idt":
+        for row in rows:
+            row.update(ignition_target="pressure", ignition_type="d/dt max")
     request_path.write_text(
         json.dumps(
             {
@@ -934,6 +955,7 @@ def test_worker_main_preserves_duplicate_plog_source_line_occurrences(
                 "trimmed_yaml_path": str(trimmed),
                 "checkpoint_path": str(tmp_path / "rows.jsonl"),
                 "reaction_source_lines": {"A <=> B": [1628, 1700]},
+                "observable": observable,
                 "rows": rows,
                 "workers": 2,
                 "row_timeout_s": 3.0,
@@ -962,6 +984,10 @@ def test_worker_main_preserves_duplicate_plog_source_line_occurrences(
     monkeypatch.setattr(cantera_worker.subprocess, "run", converted_ok)
 
     def fake_execute(input_rows: list[dict[str, Any]], **kwargs: Any) -> tuple[dict[str, dict[str, Any]], int]:
+        if observable == "idt":
+            assert all(row["plog_trimmed_brackets_pa"] == [[31.6 * 101325.0, None]] for row in input_rows)
+        else:
+            assert input_rows == rows
         assert kwargs["initial_results"] == {
             "affected": {
                 "row_id": "affected",

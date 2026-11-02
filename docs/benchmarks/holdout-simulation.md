@@ -2,8 +2,8 @@
 
 Carmel's holdout harness turns a frozen benchmark contract and a historical CHEMKIN
 mechanism into a provenance-rich secondary-score report. The harness is observable-oriented:
-this first adapter evaluates JSR species profiles, while a later adapter can add ignition delay
-without changing the contract, conversion, mapping, or scoring boundary.
+its adapters evaluate JSR species profiles and ignition delay through a shared contract,
+conversion, mapping, and subprocess boundary.
 
 ## Process and provenance boundary
 
@@ -18,9 +18,30 @@ captured as `stdout.log` and `stderr.log` in the run directory.
 
 The worker converts kinetics and thermo together with the invoked Cantera version's `ck2yaml`.
 Every raw input SHA-256, normalized-input SHA-256, converter version, converted warning, and
-trimmed-YAML SHA-256 is recorded. CHEMKIN's Fortran E-less numeric tokens are normalized by a
-general preprocessing rule: outside `!` comments, a whole mantissa-plus-signed-digits token gets
-an explicit `E`. Every rewrite records its input file, line, before text, and after text.
+trimmed-YAML SHA-256 is recorded. CHEMKIN's Fortran E-less numeric tokens receive an explicit
+`E` only within numeric fields: NASA-7 header columns 46–75 (three temperature fields),
+coefficient-card columns 1–75 (five 15-column fields), the last three numeric rate parameters
+after a reaction equation, and numeric auxiliary lines (`LOW`, `HIGH`, `TROE`, `SRI`, `PLOG`,
+`REV`, `CHEB`, `TCHEB`, `PCHEB`, `LT`, `RLT`). Fixed-width fields retain their width by consuming
+padding; a field without space for `E` remains unchanged for conversion to refuse. No rewriting
+occurs in `SPECIES`, reaction equations, other header text, or `!` comments. In particular,
+identifiers such as `C8H141-5,3-4` and `C4H6OHOOH1-4-3` retain their exact spelling.
+Every rewrite records its input file, line, before text, and after text.
+
+Inside a `THERMO` section, one additional format-only rule restores a missing NASA-7
+fourth-card index. After three consecutive cards with valid indices `1`, `2`, `3`, valid
+temperature fields, and fixed-width coefficients, a fourth card containing four valid
+15-column coefficient fields and a blank trailer is padded through column 79 and receives
+`4` in column 80. The same rule also accepts an exactly 81-column card whose only nonblank
+trailer byte is `4` in column 81: it moves that index to column 80 and drops the extra byte.
+Coefficient and temperature bytes, species names, comments, line endings, and record order are
+preserved. Any other nonblank trailer, malformed coefficient, or interrupted card sequence is
+left unchanged for conversion to refuse; two populated index columns are never repaired.
+Each repair records its source line and before/after text; the rule is named in the simulation
+lock. Validation of a new thermo pin must independently compare all fourteen coefficient
+strings, temperature fields and species names in every record before and after normalization.
+Both normalization rules are versioned in the simulation lock. The n-pentane regression also
+requires byte-identical normalized inputs and unchanged saved JSR results.
 
 Conversion always uses `--permissive --verbose`. Only redundant species declarations, redundant
 thermo entries, and unparsable thermo blocks containing whitespace and `!` characters are allowed
@@ -29,6 +50,26 @@ input are recorded as information; they are also emitted by strict conversion an
 permissive warnings. Any other warning or skipped source block refuses the run. Duplicate thermo
 records are reported with both headers, whether their coefficients differ, and the fact that the
 first entry was used.
+
+Cantera validation accepts only the reviewed `NasaPoly2::validate` **h/RT discontinuity at
+1000 K** for OH*/OHV or CH*/CHV, and only when that species' parsed NASA numeric fields
+match the corresponding pinned SHA-256. The reviewed sources are
+`/home/alon/runs/i127-holdout-sim/v_new/thermo.normalized.dat`, OH* header line 25 and CH*
+header line 145. The digest concatenates the three 10-byte temperature fields (columns
+46–75), then fourteen 15-byte coefficient fields in card order, preserving every padding
+byte. Species labels and card indices are excluded; values are never converted and rounded.
+
+| Reviewed source | Allowed labels | Numeric-field SHA-256 |
+| --- | --- | --- |
+| OH*, line 25 | OH*, OHV | `85ab13a7ce62508df7daf3411313e27f5e650008f665ec790e04c194aa7fb2d7` |
+| CH*, line 145 | CH*, CHV | `4a3c493e51e59ada6dfba5d198e487ab5e78b907d4bd0ba32f217df460ae880f` |
+
+The first record wins, including across kinetics and companion thermo; a malformed or
+changed first record cannot acquire approval through a later duplicate. Any other species,
+warning type, midpoint, or changed numeric byte remains refused. Original case-2 labels use
+the same digest check. The simulation lock records `reviewed_nasa_numeric_field_sha256_v2`
+and all four label-to-digest entries. This warning rule changes no input, coefficient or JSR
+result and does not map the ignition targets OH*/CH* to OHV/CHV.
 
 Before validation, every PLOG pressure level is checked at Cantera's validation temperatures.
 A rate expression's activation energy is converted from the YAML document's inherited
@@ -132,5 +173,96 @@ its pinned split archive, one contract mechanism key and CHEMKIN file, the compa
 and its URL/date/SHA-256 pin, a run directory, and an output JSON path. `--cantera-python` selects
 the isolated Cantera interpreter (default: `$T3_PYTHON`; see above). `--row-timeout-s` and `--workers` control only per-row process
 execution; the defaults are 600 seconds and `max(1, os.cpu_count()-2)`, respectively.
-The versioned worker request carries `observable: "jsr"`; unsupported observable values are an
-explicit run-level refusal, leaving a typed discriminator for future IDT adapters.
+The versioned worker request carries `observable: "jsr"` or `"idt"`, with matching typed row
+models; unsupported values and mismatched row types are refused.
+
+## Ignition delay
+
+`carmel score-holdout-idt` uses the same worker, per-row subprocesses, thread pins,
+conversion rules, source-line reaction keys, lock fingerprint and `rows.jsonl` checkpoint.
+Supply `--split-root` pointing at the pinned ChemKED tree instead of the JSR `--archive`.
+The n-heptane loader verifies every split SHA-256/git blob and its point/temperature/RCM
+counts before exporting 189 holdout points: 174 shock-tube and 15 RCM-ideal. Inlet labels
+are resolved with the existing structural mapper; ignition target labels remain exact.
+
+Every point starts an adiabatic constant-volume `IdealGasReactor` at its stored temperature,
+pressure and mole fractions, including the RCM-ideal points. There is no compression history
+or heat loss. The locked horizon is **1.0 s**, independently of the measured delay; relative
+and absolute tolerances are **1e-8** and **1e-16**. The initial t=0 state is included, and the
+integrator steps until it reaches the horizon, retaining the final step as T3 does. A resolved
+event must have a finite positive delay at or before 1.0 s and a temperature rise of at least
+**50 K**. No event meeting those requirements yields `ignition_not_resolved`.
+
+IDT execution carries every removed PLOG level's kept pressure bracket into the row
+process. It checks the initial pressure and every integration step, including a step
+that crosses an entire bracket, and refuses the trace as `plog_trimmed_interval_entered`
+before scoring. Brackets are open at their kept levels and may be unbounded at either
+end. This applies to every ignition target, since pressure can change even when the
+observed signal is a species or temperature. The simulation lock versions this guard;
+the execution row's brackets also participate in its checkpoint fingerprint.
+
+Event definitions follow the T3 experimental numerical path: `max` selects the first maximum;
+`d/dt max` selects the first maximum positive `numpy.gradient(values, times)` slope;
+`1/2 max` interpolates the first rising half-absolute-peak crossing; `d/dt max extrapolated`
+intersects the maximum-slope tangent with the initial target baseline. Species traces use mole
+fractions, pressure uses Pa, and temperature uses K. T3's history-free trace-span and settled-tail
+checks establish that the event finishes within the trace. These semantics were checked against
+T3 commit `4043bb98fcbbad5c252d8e1d57bbfabc6aa76087`. The dispatch deliberately fixes constant
+volume and 1.0 s for every point; T3's broader experimental wrapper has different defaults for
+RCM and its observation-dependent horizon.
+
+The recorded model check uses five h2o2 states and pressure d/dt max, OH max and OH d/dt max.
+The local T3 package import was blocked by unavailable ARC/broken OpenBabel dependencies.
+The check therefore executes the unchanged `CanteraIDT` class and event-helper AST nodes
+from that detached reference, using real Cantera/NumPy and replacing only the unused adapter
+base with `object`. It records the source SHA-256 and this limitation; it does not claim a
+full T3 application integration test.
+
+An undeclared exact target produces `target_species_absent`, naming the target. OHV/CHV are
+not substituted for OH*/CH*, even though their reviewed thermo warning digests agree.
+Missing targets are checkpointed before simulation. Solver failure, fatal signal and the
+per-row wall-clock `ignition_timeout` remain explicit refusals; construction defects refuse
+the run. Default wall-clock timeout and worker count match the JSR CLI controls.
+
+IDT scoring is the equal-point mean `abs(log10(tau_sim_seconds / tau_exp_seconds))` over
+finite, strictly positive delays. Reports retain all point IDs, per-point errors/refusals,
+coverage, reactor groups and contract temperature bands (<750, 750–900 inclusive, >900 K).
+The dispatch gate requires all 174 shock points to be refused for absent targets and at least
+12 of the 15 RCM-ideal points to score for each mechanism. A failed gate is reported after
+saving its report; settings must not be tuned using that result.
+
+## Paired uncertainty
+
+`carmel.benchmarks.holdout_intervals` exposes `idt_separation` and `jsr_intervals`. Both require
+matching simulation locks and frozen holdout fingerprints and compare the intersection of valid
+point/observable IDs. `rescore_saved_jsr(report_path)` rebuilds simulated values from the sibling
+`rows.jsonl`, verifies agreement with the saved report, pins both input hashes, and never writes
+to either input or launches a simulation.
+
+Rescoring also requires the sibling `request.json`. Checkpoint entries are selected by
+the saved request row, mechanism semantic hash, simulation-lock hash, and PLOG-validation
+hash, using the recorded lock rather than the installed worker's current settings. Stale
+entries are ignored before checking for conflicts within that identity; identical repeated
+entries are allowed. Every dispatched row must have a matching entry, with the same status
+as the report. A refused entry must carry a nonempty reason matching the reported row and
+its mapped metric observations. A known `unmapped_inlet_species` refusal omitted from the
+request needs no checkpoint entry, but its status, unmapped-species evidence, and metric
+refusals must agree. Missing provenance or mismatched fingerprints are never rescued by
+matching row IDs or simulated values alone.
+If no rows were dispatched, the worker may never have created `rows.jsonl`; rescoring then
+records a null checkpoint hash and validates every row as a pre-dispatch refusal.
+
+Intervals use 10,000 paired row bootstrap replicates, seed **20261018**, NumPy PCG64, and the
+2.5th/97.5th percentiles with linear interpolation. Each replicate samples N whole row IDs
+with replacement (implemented as multinomial row counts), using identical weights for both
+mechanisms. The reported gap is **v_old error minus v_new error**; a positive value favors
+v_new. JSR species stay together within a row; each sampled species mean receives equal weight,
+using the fixed detection limits from the complete frozen observations. Species with no sampled
+observation are omitted exactly as in the existing JSR metric. Empty diagnostics have null
+scores and intervals, never zero-error claims. Re-running with the same seed and input reports
+produces byte-identical serialized interval reports in the same recorded NumPy environment.
+
+Diagnostic intervals accompany the contract aggregate: IDT by reactor group and contract
+band; JSR overall, inclusive 600–900 K, C0–C2 (CH4, C2H4, C2H6, CH2O, CH3CHO, CO, CO2),
+fuel/alkenes (NC5H12, C5H10-1, C5H10-2, C3H6), C5 cyclic ethers (C5H10O1-2, C5H10O1-3,
+C5H10O1-4, C5H10O2-3, C5H10O2-4), and O2. The decompositions do not replace the contract metric.
