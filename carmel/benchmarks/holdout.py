@@ -18,7 +18,12 @@ from typing import Any, Literal, Self
 from pydantic import model_validator
 
 from carmel.adapters.t3 import T3_LAYOUT
-from carmel.benchmarks.cantera_worker import THREAD_ENV, canonical_reaction_key
+from carmel.benchmarks.cantera_worker import (
+    DEFAULT_ROW_WALL_CEILING_S,
+    THREAD_ENV,
+    canonical_reaction_key,
+    validate_row_refusal,
+)
 from carmel.benchmarks.chemkin import mechanism, normalize_for_ck2yaml
 from carmel.benchmarks.contract import FrozenModel, read_pinned_file
 from carmel.benchmarks.n_pentane import Contract, load_contract
@@ -26,7 +31,7 @@ from carmel.schemas.datasets import Absent
 from carmel.services.artifacts import write_bytes, write_text
 from carmel.services.respecth_series import SpeciesIdentity, parse_series_record
 
-DEFAULT_ROW_TIMEOUT_S = 600.0
+DEFAULT_ROW_TIMEOUT_S = DEFAULT_ROW_WALL_CEILING_S
 DEFAULT_WORKERS = max(1, (os.cpu_count() or 1) - 2)
 
 
@@ -131,6 +136,12 @@ class WorkerResponse(FrozenModel):
     wall_time_s: float | None = None
     signal: int | None = None
     fault_log: str | None = None
+
+    @model_validator(mode="after")
+    def refusals_match_lock(self) -> Self:
+        for row in self.rows:
+            validate_row_refusal(row.reason, self.simulation_lock)
+        return self
 
 
 def _base_unit_value(value: Any) -> float:

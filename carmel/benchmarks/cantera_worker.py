@@ -47,6 +47,9 @@ ROW_PROCESS_START_METHOD = "spawn"
 JSR_RTOL = 1.0e-9
 JSR_ATOL = 1.0e-15
 JSR_MAX_STEPS = 100000
+JSR_STEPS_PER_ITERATION = 10
+IDT_MAX_STEPS = 1000000
+DEFAULT_ROW_WALL_CEILING_S = 3600.0
 PRESSURE_CONTROLLER_K = 1.0e-5
 IDT_RTOL = 1.0e-8
 IDT_ATOL = 1.0e-16
@@ -98,13 +101,15 @@ def write_text(path: Path, content: str) -> None:
 def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[str, Any]:
     """Return the complete locked simulation and conversion regime."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "simulator": {"cantera_version": cantera_version},
         "jsr": {
             "rtol": JSR_RTOL,
             "atol": JSR_ATOL,
             "max_steps": JSR_MAX_STEPS,
-            "steady_state_timeout_s": float(row_timeout_s),
+            "steady_state_max_iterations": JSR_MAX_STEPS,
+            "steps_per_iteration": JSR_STEPS_PER_ITERATION,
+            "max_accepted_steps": JSR_STEPS_PER_ITERATION * JSR_MAX_STEPS,
             "initial_state": "row_inlet",
             "temperature_continuation": False,
             "energy": "off",
@@ -114,16 +119,18 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
             "rtol": IDT_RTOL,
             "atol": IDT_ATOL,
             "horizon_s": IDT_HORIZON_S,
+            "max_accepted_steps": IDT_MAX_STEPS,
             "minimum_temperature_rise_k": IDT_TEMPERATURE_RISE_K,
             "reactor": "adiabatic_constant_volume_IdealGasReactor",
             "initial_state": "stored_temperature_pressure_composition",
             "criterion": "exact_target_and_source_definition_t3_v1",
             "gradient": "numpy.gradient_default_edge_order_1",
             "resolution": "t3_source_defined_idt_is_resolved_history_free_v1",
-            "ignition_timeout_s": float(row_timeout_s),
             "plog_pressure_guard": "initial_and_each_step_crossing_removed_open_brackets_v1",
         },
         "process": {
+            "row_wall_ceiling_s": float(row_timeout_s),
+            "wall_ceiling_policy": "abort_run_without_row_refusal",
             "thread_env": THREAD_ENV,
             "row_start_method": ROW_PROCESS_START_METHOD,
         },
@@ -142,6 +149,21 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
             "plog_validation_temperatures_k": list(PLOG_VALIDATION_TEMPERATURES_K),
         },
     }
+
+
+def validate_row_refusal(reason: str | None, lock: dict[str, Any]) -> None:
+    """Accept wall-time row refusals only with their historical version-1 lock."""
+    legacy = {"steady_state_timeout": "jsr", "ignition_timeout": "idt"}
+    if reason in legacy and (lock.get("schema_version") != 1 or reason + "_s" not in lock.get(legacy[reason], {})):
+        raise ValueError(f"{reason} requires its historical simulation lock")
+
+
+class MaxStepsExceeded(RuntimeError):
+    """A deterministic solver budget was exhausted before reaching the target."""
+
+    def __init__(self, integrator_steps: int) -> None:
+        super().__init__("max_steps_exceeded")
+        self.integrator_steps = integrator_steps
 
 
 def simulation_lock_sha256(row_timeout_s: float, cantera_version: str | None) -> str:
@@ -179,7 +201,7 @@ def plog_validation_sha256(trims: list[dict[str, Any]], pressure_refusals: list[
 
 
 class RunLevelSimulationError(RuntimeError):
-    """A child exposed an adapter defect rather than a condition-level failure."""
+    """An evaluator defect or safety ceiling prevents scoring the run."""
 
     def __init__(self, result: dict[str, Any]) -> None:
         super().__init__(str(result.get("construction_error") or result.get("refusal")))
@@ -530,7 +552,19 @@ def _simulate_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict[str
             temperature_k=float(reactor.T),
             integrator_steps=int(network.solver_stats.get("steps", 0)),
         )
-        network.advance_to_steady_state(max_steps=JSR_MAX_STEPS)
+        # Restrict classification to this locked, valid-argument call. The same
+        # undefined name also occurs on unrelated Cantera error paths.
+        try:
+            network.advance_to_steady_state(max_steps=JSR_MAX_STEPS)
+        except Exception as exc:
+            steps = int(network.solver_stats.get("steps", 0))
+            signature = (type(exc) is NameError and str(exc) == "name 'CanteraError' is not defined") or (
+                isinstance(exc, getattr(ct, "CanteraError", ()))
+                and str(exc) == "Maximum number of steps reached before convergence below maximum residual"
+            )
+            if signature and steps == JSR_STEPS_PER_ITERATION * JSR_MAX_STEPS:
+                raise MaxStepsExceeded(steps) from exc
+            raise
         steps = int(network.solver_stats.get("steps", 0))
         _write_progress(
             "complete",
@@ -559,7 +593,7 @@ def _simulate_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict[str
         return "row", {
             "row_id": row["row_id"],
             "status": "refused",
-            "reason": f"solver_failure: {exc}",
+            "reason": str(exc) if isinstance(exc, MaxStepsExceeded) else f"solver_failure: {exc}",
             "wall_time_s": time.monotonic() - started,
             "integrator_steps": steps,
         }
@@ -669,8 +703,12 @@ def integrate_idt_trace(ct: Any, gas: Any, row: dict[str, Any]) -> tuple[list[fl
 
     check_pressure(previous_pressure)
     _write_progress("integration", last_reactor_time_s=0.0, temperature_k=float(reactor.T), integrator_steps=0)
+    steps = 0
     while network.time < IDT_HORIZON_S:
+        if steps >= IDT_MAX_STEPS:
+            raise MaxStepsExceeded(steps)
         network.step()
+        steps = int(network.solver_stats["steps"])
         pressure = float(reactor.phase.P)
         check_pressure(pressure)
         previous_pressure = pressure
@@ -722,12 +760,12 @@ def _simulate_idt_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict
             or max(temperatures) - temperatures[0] < IDT_TEMPERATURE_RISE_K
             or not idt_trace_is_resolved(times, values, row["ignition_type"], target)
         ):
-            result["reason"] = "ignition_not_resolved"
+            result["reason"] = "ignition_not_reached"
         else:
             result.update(status="ok", ignition_delay_s=delay)
     except RunLevelSimulationError as exc:
         return "run", exc.result
-    except PlogTrimmedIntervalEntered as exc:
+    except (PlogTrimmedIntervalEntered, MaxStepsExceeded) as exc:
         result["reason"] = str(exc)
         result["integrator_steps"] = exc.integrator_steps
     except Exception as exc:
@@ -821,6 +859,7 @@ def _load_checkpoint(
             raise ValueError(f"malformed row checkpoint at line {line_number}") from exc
         valid_bytes += len(raw_line)
         if expected.get(row_id) == fingerprint:
+            validate_row_refusal(result.get("reason"), simulation_lock(row_timeout_s, cantera_version))
             if row_id in results and results[row_id] != result:
                 raise ValueError(f"conflicting row checkpoint entries for {row_id}")
             results[row_id] = result
@@ -907,8 +946,8 @@ def execute_rows(
     """Run rows in individually killable processes and durably checkpoint each result."""
     if workers < 1:
         raise ValueError("workers must be at least 1")
-    if row_timeout_s <= 0:
-        raise ValueError("row timeout must be positive")
+    if not math.isfinite(row_timeout_s) or row_timeout_s <= 0:
+        raise ValueError("row wall ceiling must be finite and positive")
     checkpointed = _load_checkpoint(
         checkpoint_path,
         rows,
@@ -972,46 +1011,23 @@ def execute_rows(
                 }
 
             progressed = False
-            expired = {
-                process: time.monotonic() - float(task["started"])
-                for process, task in active.items()
-                if process.is_alive() and time.monotonic() - float(task["started"]) >= row_timeout_s
-            }
-            for process in expired:
-                process.terminate()
             for process, task in list(active.items()):
                 elapsed = time.monotonic() - float(task["started"])
                 row = task["row"]
                 result_path = task["result_path"]
                 progress_path = task["progress_path"]
                 fault_path = task["fault_path"]
-                if process in expired:
-                    process.join(timeout=1.0)
-                    if process.is_alive():
-                        process.kill()
-                        process.join()
-                    del active[process]
-                    progressed = True
-                    for stale_path in (result_path, progress_path, fault_path):
-                        stale_path.unlink(missing_ok=True)
-                    result = {
-                        "row_id": row["row_id"],
-                        "status": "refused",
-                        "reason": "ignition_timeout" if "ignition_target" in row else "steady_state_timeout",
-                        "wall_time_s": expired[process],
-                        "integrator_steps": None,
-                    }
-                    _append_checkpoint(
-                        checkpoint_path,
-                        mechanism_sha256,
-                        row,
-                        result,
-                        row_timeout_s,
-                        cantera_version,
-                        plog_validation_sha256,
+                if process.is_alive() and elapsed >= row_timeout_s:
+                    # The outer exception handler stops every active child. Keep
+                    # diagnostic sidecars, but never checkpoint a timed-out row.
+                    raise RunLevelSimulationError(
+                        {
+                            "refusal": "row_wall_ceiling_exceeded",
+                            "construction_error": f"row {row['row_id']} exceeded wall ceiling {row_timeout_s:g} s",
+                            "wall_time_s": elapsed,
+                        }
                     )
-                    results[str(row["row_id"])] = result
-                elif not process.is_alive():
+                if not process.is_alive():
                     process.join()
                     del active[process]
                     progressed = True
@@ -1110,7 +1126,7 @@ def main() -> int:
         import cantera as ct
 
         cantera_version = str(ct.__version__)
-    locked = simulation_lock(float(request.get("row_timeout_s", 600.0)), cantera_version)
+    locked = simulation_lock(float(request.get("row_timeout_s", DEFAULT_ROW_WALL_CEILING_S)), cantera_version)
     response: dict[str, Any] = {
         "schema_version": 1,
         "status": "refused",
@@ -1120,7 +1136,9 @@ def main() -> int:
         "row_process_start_method": ROW_PROCESS_START_METHOD,
         "load_average_at_start": list(os.getloadavg()),
         "simulation_lock": locked,
-        "simulation_lock_sha256": simulation_lock_sha256(float(request.get("row_timeout_s", 600.0)), cantera_version),
+        "simulation_lock_sha256": simulation_lock_sha256(
+            float(request.get("row_timeout_s", DEFAULT_ROW_WALL_CEILING_S)), cantera_version
+        ),
         "cantera_version": cantera_version,
         "observable": observable,
     }
@@ -1220,7 +1238,7 @@ def main() -> int:
     requested_workers = int(request.get("workers", max(1, (os.cpu_count() or 1) - 2)))
     response["configured_workers"] = requested_workers
     response["row_workers"] = min(requested_workers, len(request["rows"])) if request["rows"] else 0
-    response["row_timeout_s"] = float(request.get("row_timeout_s", 600.0))
+    response["row_timeout_s"] = float(request.get("row_timeout_s", DEFAULT_ROW_WALL_CEILING_S))
     checkpoint_path = Path(request.get("checkpoint_path", response_path.parent / "rows.jsonl"))
     response["checkpoint_path"] = str(checkpoint_path)
     checkpoint_recoveries: list[dict[str, Any]] = []

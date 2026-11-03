@@ -62,7 +62,7 @@ class _Quantity:
 
 def _fake_slow_row(_: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     time.sleep(1.0)
-    return "row", {"row_id": row["row_id"], "status": "ok", "mole_fractions": {}}
+    return _fake_fast_row(_, row)
 
 
 def _fake_fast_row(_: str, row: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -301,33 +301,51 @@ def test_cantera_validation_warning_allowlist_is_species_specific() -> None:
     ] == ("NasaPoly2::validate: For species OTHER, discontinuity")
 
 
-@pytest.mark.parametrize(("target", "reason"), [(None, "steady_state_timeout"), ("OH*", "ignition_timeout")])
-def test_row_timeout_is_an_explicit_checkpointed_refusal(tmp_path: Path, target: str | None, reason: str) -> None:
+@pytest.mark.parametrize("target", [None, "OH*"])
+def test_row_wall_ceiling_aborts_without_checkpointed_refusal(tmp_path: Path, target: str | None) -> None:
     checkpoint = tmp_path / "rows.jsonl"
     row = _worker_row()
     if target is not None:
         row.update(ignition_target=target, ignition_type="d/dt max")
+    with pytest.raises(RunLevelSimulationError, match="wall ceiling") as caught:
+        execute_rows(
+            [row],
+            trimmed_path=str(tmp_path / "trimmed.yaml"),
+            mechanism_sha256="a" * 64,
+            cantera_version=_TEST_CANTERA_VERSION,
+            checkpoint_path=checkpoint,
+            workers=1,
+            row_timeout_s=0.05,
+            simulation=_fake_slow_row,
+            poll_interval_s=0.005,
+        )
+    assert caught.value.result["refusal"] == "row_wall_ceiling_exceeded"
+    assert caught.value.result["wall_time_s"] >= 0.05
+    assert "status" not in caught.value.result
+    assert not checkpoint.exists()
 
-    results, resumed = execute_rows(
-        [row],
-        trimmed_path=str(tmp_path / "trimmed.yaml"),
-        mechanism_sha256="a" * 64,
-        cantera_version=_TEST_CANTERA_VERSION,
-        checkpoint_path=checkpoint,
-        workers=1,
-        row_timeout_s=0.05,
-        simulation=_fake_slow_row,
-        poll_interval_s=0.005,
-    )
 
-    assert resumed == 0
-    result = results["fake-row"]
-    assert result["status"] == "refused"
-    assert result["reason"] == reason
-    assert result["wall_time_s"] >= 0.05
-    assert result["integrator_steps"] is None
-    persisted = json.loads(checkpoint.read_text().strip())
-    assert persisted["result"]["reason"] == reason
+def test_slowed_child_has_identical_scientific_result(tmp_path: Path) -> None:
+    results = []
+    for name, simulation in (("normal", _fake_fast_row), ("slow", _fake_slow_row)):
+        started = time.monotonic()
+        result, resumed = execute_rows(
+            [_worker_row()],
+            trimmed_path="unused",
+            mechanism_sha256="a" * 64,
+            cantera_version=_TEST_CANTERA_VERSION,
+            checkpoint_path=tmp_path / name / "rows.jsonl",
+            workers=1,
+            row_timeout_s=60.0,
+            simulation=simulation,
+        )
+        assert resumed == 0
+        if name == "slow":
+            assert time.monotonic() - started >= 1.0
+        results.append(result["fake-row"])
+    assert results[0] == results[1]
+    assert results[0]["status"] == "ok"
+    assert results[0]["mole_fractions"] == {"A": 0.25}
 
 
 def test_row_timeout_kills_a_process_that_ignores_terminate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -365,19 +383,21 @@ def test_row_timeout_kills_a_process_that_ignores_terminate(tmp_path: Path, monk
 
     monkeypatch.setattr(cantera_worker, "get_context", lambda _: Context())
 
-    results, _ = execute_rows(
-        [_worker_row()],
-        trimmed_path="unused.yaml",
-        mechanism_sha256="a" * 64,
-        cantera_version=_TEST_CANTERA_VERSION,
-        checkpoint_path=tmp_path / "rows.jsonl",
-        workers=1,
-        row_timeout_s=1.0e-9,
-        poll_interval_s=0.0,
-    )
+    with pytest.raises(RunLevelSimulationError, match="wall ceiling"):
+        execute_rows(
+            [{**_worker_row(), "row_id": str(i)} for i in range(3)],
+            trimmed_path="unused.yaml",
+            mechanism_sha256="a" * 64,
+            cantera_version=_TEST_CANTERA_VERSION,
+            checkpoint_path=tmp_path / "rows.jsonl",
+            workers=2,
+            row_timeout_s=1.0e-9,
+            poll_interval_s=0.0,
+        )
 
-    assert results["fake-row"]["reason"] == "steady_state_timeout"
-    assert processes[0].events == ["start", "terminate", "join:1.0", "kill", "join:None"]
+    assert not (tmp_path / "rows.jsonl").exists()
+    assert len(processes) == 2  # Pending rows must not start after the run aborts.
+    assert all(p.events == ["start", "terminate", "join:1.0", "kill", "join:None"] for p in processes)
 
 
 def test_execute_rows_collects_an_in_process_child_result(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -432,7 +452,7 @@ def test_completed_row_resumes_from_jsonl_without_rerunning(tmp_path: Path) -> N
         "cantera_version": _TEST_CANTERA_VERSION,
         "checkpoint_path": checkpoint,
         "workers": 1,
-        "row_timeout_s": 1.0,
+        "row_timeout_s": 60.0,
         "poll_interval_s": 0.005,
     }
     first, first_resumed = execute_rows([_worker_row()], simulation=_fake_fast_row, **arguments)
@@ -693,7 +713,7 @@ def test_checkpoint_validation_and_initial_refusal_path(tmp_path: Path) -> None:
             workers=0,
             row_timeout_s=1.0,
         )
-    with pytest.raises(ValueError, match="row timeout must be positive"):
+    with pytest.raises(ValueError, match="row wall ceiling must be finite and positive"):
         execute_rows(
             [row],
             trimmed_path="unused",
@@ -874,7 +894,7 @@ def test_worker_main_refuses_unsupported_plog_activation_energy_unit(
     assert response.validation_error == "unsupported PLOG activation-energy unit 'eV'"
 
 
-@pytest.mark.parametrize("mode", ["validation", "warning", "run_level"])
+@pytest.mark.parametrize("mode", ["validation", "warning", "run_level", "wall_ceiling"])
 def test_worker_main_rejects_after_conversion(mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     request_path = tmp_path / "request.json"
     response_path = tmp_path / "response.json"
@@ -910,12 +930,19 @@ def test_worker_main_rejects_after_conversion(mode: str, tmp_path: Path, monkeyp
 
     monkeypatch.setitem(sys.modules, "cantera", FakeCantera)
     monkeypatch.setattr(cantera_worker.subprocess, "run", converted_ok)
-    if mode == "run_level":
+    if mode in ("run_level", "wall_ceiling"):
         monkeypatch.setattr(
             cantera_worker,
             "execute_rows",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                RunLevelSimulationError({"refusal": "reactor_construction_failed", "construction_error": "boom"})
+                RunLevelSimulationError(
+                    {
+                        "refusal": "row_wall_ceiling_exceeded"
+                        if mode == "wall_ceiling"
+                        else "reactor_construction_failed",
+                        "construction_error": "boom",
+                    }
+                )
             ),
         )
     monkeypatch.setattr(sys, "argv", ["cantera_worker.py", str(request_path), str(response_path)])
@@ -926,8 +953,11 @@ def test_worker_main_rejects_after_conversion(mode: str, tmp_path: Path, monkeyp
         "validation": "trimmed_mechanism_validation_failed",
         "warning": "unallowlisted_cantera_validation_warning",
         "run_level": "reactor_construction_failed",
+        "wall_ceiling": "row_wall_ceiling_exceeded",
     }
     assert response["refusal"] == expected[mode]
+    assert response["rows"] == []
+    WorkerResponse.model_validate(response)
 
 
 @pytest.mark.parametrize("observable", ["jsr", "idt"])
@@ -1117,8 +1147,14 @@ def test_simulate_row_classifies_fake_cantera_construction_failure(monkeypatch: 
     assert result["construction_error"] == "bad mechanism"
 
 
-def test_simulate_row_returns_fake_cantera_steady_state(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("failure_after", [False, True])
+def test_simulate_row_returns_fake_cantera_steady_state(monkeypatch: pytest.MonkeyPatch, failure_after: bool) -> None:
     captured: dict[str, Any] = {}
+
+    def species_index(_: str) -> int:
+        if failure_after:
+            raise NameError("name 'CanteraError' is not defined")
+        return 0
 
     class Gas:
         TPX: object
@@ -1126,7 +1162,7 @@ def test_simulate_row_returns_fake_cantera_steady_state(monkeypatch: pytest.Monk
     class Reactor:
         mass = 2.0
         T = 700.0
-        phase = SimpleNamespace(X=[0.25], species_index=lambda _: 0)
+        phase = SimpleNamespace(X=[0.25], species_index=species_index)
 
         def __init__(self, *_: Any, **__: Any) -> None:
             pass
@@ -1141,7 +1177,7 @@ def test_simulate_row_returns_fake_cantera_steady_state(monkeypatch: pytest.Monk
         def advance_to_steady_state(self, *, max_steps: int) -> None:
             captured["max_steps"] = max_steps
             self.time = 0.5
-            self.solver_stats["steps"] = 7
+            self.solver_stats["steps"] = 1000000 if failure_after else 7
 
     def pressure_controller(*_: Any, **kwargs: Any) -> object:
         captured["pressure_K"] = kwargs["K"]
@@ -1160,14 +1196,50 @@ def test_simulate_row_returns_fake_cantera_steady_state(monkeypatch: pytest.Monk
     scope, result = cantera_worker._simulate_row("unused.yaml", _worker_row())
 
     assert scope == "row"
+    if failure_after:
+        assert result["reason"] == "solver_failure: name 'CanteraError' is not defined"
+        assert result["integrator_steps"] == 1000000
+        return
     assert result["status"] == "ok"
     assert result["mole_fractions"] == {"A": 0.25}
     assert result["integrator_steps"] == 7
     assert captured == {"max_steps": 100000, "pressure_K": 1.0e-5}
 
 
+class FakeCanteraError(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("exception", "steps", "expected"),
+    [
+        (RuntimeError("integrator refused"), 4, "solver_failure: integrator refused"),
+        (NameError("name 'CanteraError' is not defined"), 1000000, "max_steps_exceeded"),
+        (NameError("name 'CanteraError' is not defined"), 999990, "solver_failure: name 'CanteraError' is not defined"),
+        (
+            NameError("name 'CanteraError' is not defined"),
+            1000010,
+            "solver_failure: name 'CanteraError' is not defined",
+        ),
+        (NameError("name 'unrelated' is not defined"), 1000000, "solver_failure: name 'unrelated' is not defined"),
+        (
+            RuntimeError("name 'CanteraError' is not defined"),
+            1000000,
+            "solver_failure: name 'CanteraError' is not defined",
+        ),
+        (
+            FakeCanteraError("Maximum number of steps reached before convergence below maximum residual"),
+            1000000,
+            "max_steps_exceeded",
+        ),
+        (FakeCanteraError("other solver failure"), 1000000, "solver_failure: other solver failure"),
+    ],
+)
 def test_simulate_row_classifies_python_integrator_failure(
     monkeypatch: pytest.MonkeyPatch,
+    exception: Exception,
+    steps: int,
+    expected: str,
 ) -> None:
     class Gas:
         TPX: object
@@ -1182,15 +1254,16 @@ def test_simulate_row_classifies_python_integrator_failure(
 
     class Network:
         time = 0.1
-        solver_stats = {"steps": 4}
+        solver_stats = {"steps": steps}
 
         def __init__(self, _: list[Any]) -> None:
             self.rtol = self.atol = self.max_steps = None
 
         def advance_to_steady_state(self, **_: Any) -> None:
-            raise RuntimeError("integrator refused")
+            raise exception
 
     fake_cantera = SimpleNamespace(
+        CanteraError=FakeCanteraError,
         Solution=lambda _: Gas(),
         Reservoir=lambda *_args, **_kwargs: object(),
         IdealGasReactor=Reactor,
@@ -1204,8 +1277,8 @@ def test_simulate_row_classifies_python_integrator_failure(
 
     assert scope == "row"
     assert result["status"] == "refused"
-    assert result["reason"] == "solver_failure: integrator refused"
-    assert result["integrator_steps"] == 4
+    assert result["reason"] == expected
+    assert result["integrator_steps"] == steps
 
 
 @pytest.mark.skipif(importlib.util.find_spec("rdkit") is None, reason="RDKit is an optional agents dependency")
@@ -2193,7 +2266,7 @@ def test_cantera_worker_round_trip_builds_a_real_reactor(tmp_path: Path) -> None
     assert 0.0 <= response["rows"][0]["mole_fractions"]["CO2"] <= 1.0
     assert response["rows"][0]["wall_time_s"] > 0.0
     assert response["rows"][0]["integrator_steps"] > 0
-    assert response["row_timeout_s"] == 600.0
+    assert response["row_timeout_s"] == 3600.0
     assert response["configured_workers"] == max(1, (os.cpu_count() or 1) - 2)
     assert response["thread_env"] == THREAD_ENV
     assert response["row_process_start_method"] == "spawn"
@@ -2334,3 +2407,51 @@ def test_load_rows_accepts_all_real_holdout_files() -> None:
 
     assert len({row["record"] for row in rows}) == 6
     assert len(rows) == 144
+
+
+@pytest.mark.parametrize("cap", ["JSR_MAX_STEPS", "JSR_STEPS_PER_ITERATION", "IDT_MAX_STEPS"])
+def test_deterministic_caps_change_checkpoint_identity(monkeypatch: pytest.MonkeyPatch, cap: str) -> None:
+    before = _row_fingerprint("mechanism", _worker_row(), 3600.0, "3.2.0")
+    monkeypatch.setattr(cantera_worker, cap, getattr(cantera_worker, cap) + 1)
+    assert _row_fingerprint("mechanism", _worker_row(), 3600.0, "3.2.0") != before
+
+
+def test_old_lock_checkpoint_does_not_resume(tmp_path: Path) -> None:
+    row = _worker_row()
+    old_lock = {"schema_version": 1, "jsr": {"steady_state_timeout_s": 600.0}}
+    old_sha = hashlib.sha256(json.dumps(old_lock, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    entry = {
+        "fingerprint": cantera_worker.checkpoint_fingerprint("mechanism", row, old_sha, ""),
+        "result": {"row_id": row["row_id"], "status": "refused", "reason": "steady_state_timeout"},
+    }
+    checkpoint = tmp_path / "rows.jsonl"
+    checkpoint.write_text(json.dumps(entry) + "\n")
+    assert cantera_worker._load_checkpoint(checkpoint, [row], "mechanism", 600.0, "3.2.0") == {}
+    lock = simulation_lock(3600.0, "3.2.0")
+    assert lock["schema_version"] == 2
+    assert lock["jsr"]["steady_state_max_iterations"] == 100000
+    assert lock["jsr"]["max_accepted_steps"] == lock["idt"]["max_accepted_steps"] == 1000000
+    assert lock["process"]["row_wall_ceiling_s"] == 3600.0
+    assert "steady_state_timeout_s" not in lock["jsr"]
+    assert "ignition_timeout_s" not in lock["idt"]
+
+
+@pytest.mark.parametrize(("reason", "observable"), [("steady_state_timeout", "jsr"), ("ignition_timeout", "idt")])
+def test_response_accepts_timeout_rows_only_under_historical_lock(reason: str, observable: str) -> None:
+    data = {
+        "schema_version": 1,
+        "status": "ok",
+        "converter": {},
+        "thread_env": THREAD_ENV,
+        "row_process_start_method": "spawn",
+        "load_average_at_start": [0.0, 0.0, 0.0],
+        "simulation_lock": {"schema_version": 1, observable: {reason + "_s": 600.0}},
+        "simulation_lock_sha256": "historical",
+        "rows": [
+            {"row_id": "row", "status": "refused", "reason": reason, "wall_time_s": 600.0, "integrator_steps": None}
+        ],
+    }
+    assert WorkerResponse.model_validate(data).rows[0].reason == reason
+    data["simulation_lock"] = simulation_lock(3600.0, "3.2.0")
+    with pytest.raises(ValueError, match="historical simulation lock"):
+        WorkerResponse.model_validate(data)

@@ -121,6 +121,7 @@ def _jsr_report() -> dict[str, Any]:
 
 def _write_saved_jsr(tmp_path: Path, report: dict[str, Any], rows: list[dict[str, Any]]) -> Path:
     """Serialize the historical checkpoint identity independently of the worker."""
+    report.setdefault("simulation_lock", {"schema_version": 1, "jsr": {"steady_state_timeout_s": 600.0}})
     report.update(inputs={"mechanism_semantic_sha256": "saved-mechanism"}, plog_validation_sha256="saved-plog")
     requests = [{"row_id": str(i), "temperature_k": t} for i, t in enumerate((600.0, 900.0, 1000.0))]
     (tmp_path / "request.json").write_text(json.dumps({"rows": requests}))
@@ -462,3 +463,15 @@ def test_jsr_intervals_exclude_failed_rows_and_invalid_observables() -> None:
     assert result["primary"]["observable_count"] == 3
     assert result["primary"]["gap"] == 0.0
     assert result["primary"]["interval_95"] == [0.0, 0.0]
+
+
+@pytest.mark.parametrize("lock", [{}, {"schema_version": 2}, {"schema_version": 1}])
+def test_saved_timeout_requires_historical_lock(tmp_path: Path, lock: dict[str, Any]) -> None:
+    report = _jsr_report()
+    report["simulation_lock"] = lock
+    rows = [{"row_id": str(i), "status": "refused", "reason": "steady_state_timeout"} for i in range(3)]
+    for row in report["row_results"]:
+        row.update(status="refused", reason="steady_state_timeout")
+    path = _write_saved_jsr(tmp_path, report, rows)
+    with pytest.raises(ValueError, match="historical simulation lock"):
+        rescore_saved_jsr(path)

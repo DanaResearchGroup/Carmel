@@ -97,20 +97,38 @@ Each frozen row is simulated independently as an isothermal, isobaric, perfectly
 - a mass-flow controller uses `mdot = initial reactor mass / residence time`;
 - a pressure controller follows that mass flow with `K = 1e-5`;
 - a `ReactorNet` advances to steady state with relative tolerance `1e-9`, absolute tolerance
-  `1e-15`, and at most 100,000 steps.
+  `1e-15`, and at most 100,000 steady-state residual-check iterations. Cantera 3.2.0 takes
+  ten accepted integrator steps per iteration, giving a 1,000,000-step budget.
 
 There is no temperature continuation: every row starts from its own inlet state. Every row runs
-in a separate, killable process. Its wall-clock limit is configurable with `--row-timeout-s` and
-defaults to 600 seconds; expiry is the explicit row refusal `steady_state_timeout`. The worker
+in a separate, killable process. The run safety ceiling for any active row process is configurable
+with the retained `--row-timeout-s` option and defaults to **3600 seconds**. Expiry raises
+`RunLevelSimulationError` with `row_wall_ceiling_exceeded`, aborting the run without checkpointing
+a row refusal or publishing a score. The worker
 count is configurable with `--workers` and defaults to `max(1, os.cpu_count()-2)`. Both settings,
 each row's wall time, and each row's integrator step count are recorded in the report. Changing
 these process controls does not change the fixed solver tolerances or initial state.
+
+Reaching the JSR steady-state cap gives `max_steps_exceeded`. Classification is confined to
+`advance_to_steady_state(max_steps=100000)`: the exact Cantera max-steps exception or Cantera
+3.2.0's `NameError("name 'CanteraError' is not defined")` must be corroborated by exactly
+1,000,000 accepted steps. A matching message below the cap, an unrelated `NameError`, or an
+exception outside that call stays `solver_failure`. Cantera's final-iteration boundary behavior
+is preserved, including rejection on the last iteration even if its residual converges.
+
+The cap rule preserves the existing JSR iteration budget and uses the same accepted-step budget
+for IDT; it is not tuned against holdout scores. The two-row Cantera 3.2.0 probe reproduced exact
+statuses, step counts and values under normal and contended CPU scheduling. Its slowest row was
+648.638 s; `max(3600, ceil(4 * slowest_wall_s))` fixes the default run safety ceiling at 3600 s.
 
 The Cantera worker is launched with `OMP_NUM_THREADS=1`, `MKL_NUM_THREADS=1`,
 `OPENBLAS_NUM_THREADS=1`, and `NUMEXPR_NUM_THREADS=1` before NumPy or Cantera is imported. Row
 processes use Python's fresh-interpreter `spawn` start method, so no initialized Cantera/native
 state is inherited through `fork`. Resume fingerprints include the complete simulation-lock hash,
-so they pin the Cantera version, timeout, solver settings, thread regime, start method, and conversion rules.
+so they pin the Cantera version, wall ceiling, deterministic caps, solver settings, thread regime,
+start method, and conversion rules. Simulation lock **version 2** invalidates old checkpoint
+fingerprints; historical `steady_state_timeout` and `ignition_timeout` row reasons are accepted
+only with their version-1 simulation lock.
 They also include a canonical hash of the pre-trim PLOG validation report, so a cached success or
 prevalidation refusal cannot survive a changed removed level, affected interval, or kept bracket.
 The child-observed values and the 1-, 5-, and 15-minute load averages at run start are recorded
@@ -120,7 +138,7 @@ Each row child enables Python's fatal-signal handler into its own fault log and 
 construction/integration phase, reactor time, temperature, and step count to a sidecar. A negative
 signal after integration begins is the row refusal `solver_crash`, including the signal number and
 sidecar paths. A signal during construction remains a run-level construction failure. The report
-also records a canonical SHA-256 lock over the tolerances, timeout, inlet start, lack of temperature
+also records a canonical SHA-256 lock over the tolerances, caps, wall ceiling, inlet start, lack of temperature
 continuation, thread pins, Cantera version, and all three approved CHEMKIN
 conversion/preprocessing rulings.
 
@@ -160,9 +178,9 @@ Explicit refusal classes include:
 - unmapped or ambiguous species structure;
 - missing, nonfinite, or negative measured/simulated values;
 - unsupported reactor conditions;
-- steady-state wall-clock timeout;
+- deterministic solver budget exhaustion (`max_steps_exceeded`);
 - solver failure;
-- fatal solver signal (`solver_crash`), reported separately from timeouts;
+- fatal solver signal (`solver_crash`), reported separately from budget exhaustion;
 - a condition adjacent to a removed unsound PLOG level;
 - conversion, validation, subprocess, or reactor-construction failure at run level.
 
@@ -172,7 +190,7 @@ Run `carmel score-holdout --help` for the complete interface. A run supplies the
 its pinned split archive, one contract mechanism key and CHEMKIN file, the companion thermo file
 and its URL/date/SHA-256 pin, a run directory, and an output JSON path. `--cantera-python` selects
 the isolated Cantera interpreter (default: `$T3_PYTHON`; see above). `--row-timeout-s` and `--workers` control only per-row process
-execution; the defaults are 600 seconds and `max(1, os.cpu_count()-2)`, respectively.
+execution; expiry aborts the run. The defaults are 3600 seconds and `max(1, os.cpu_count()-2)`, respectively.
 The versioned worker request carries `observable: "jsr"` or `"idt"`, with matching typed row
 models; unsupported values and mismatched row types are refused.
 
@@ -191,7 +209,7 @@ or heat loss. The locked horizon is **1.0 s**, independently of the measured del
 and absolute tolerances are **1e-8** and **1e-16**. The initial t=0 state is included, and the
 integrator steps until it reaches the horizon, retaining the final step as T3 does. A resolved
 event must have a finite positive delay at or before 1.0 s and a temperature rise of at least
-**50 K**. No event meeting those requirements yields `ignition_not_resolved`.
+**50 K**. No event meeting those requirements yields `ignition_not_reached`.
 
 IDT execution carries every removed PLOG level's kept pressure bracket into the row
 process. It checks the initial pressure and every integration step, including a step
@@ -220,9 +238,12 @@ full T3 application integration test.
 
 An undeclared exact target produces `target_species_absent`, naming the target. OHV/CHV are
 not substituted for OH*/CH*, even though their reviewed thermo warning digests agree.
-Missing targets are checkpointed before simulation. Solver failure, fatal signal and the
-per-row wall-clock `ignition_timeout` remain explicit refusals; construction defects refuse
-the run. Default wall-clock timeout and worker count match the JSR CLI controls.
+Missing targets are checkpointed before simulation. IDT integrates to the existing one-second
+reactor-time horizon with at most **1,000,000 accepted integrator steps**. Exhausting the step
+budget before the horizon gives `max_steps_exceeded`; a completed trace without a qualifying
+ignition gives `ignition_not_reached`. Solver failure and fatal signals remain row refusals;
+construction defects and wall-ceiling expiry refuse the run. The wall ceiling and worker count
+match the JSR CLI controls.
 
 IDT scoring is the equal-point mean `abs(log10(tau_sim_seconds / tau_exp_seconds))` over
 finite, strictly positive delays. Reports retain all point IDs, per-point errors/refusals,

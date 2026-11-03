@@ -72,10 +72,11 @@ def _row() -> dict[str, Any]:
     ("mode", "scope", "reason"),
     [
         ("ok", "row", None),
-        ("cold", "row", "ignition_not_resolved"),
-        ("late", "row", "ignition_not_resolved"),
+        ("cold", "row", "ignition_not_reached"),
+        ("late", "row", "ignition_not_reached"),
         ("absent", "row", "target_species_absent"),
         ("solver", "row", "solver_failure: failure"),
+        ("cap", "row", "max_steps_exceeded"),
         ("construction", "run", "reactor_construction_failed"),
     ],
 )
@@ -86,6 +87,8 @@ def test_simulation_refusals_and_positive_delay(
     monkeypatch.setitem(sys.modules, "cantera", SimpleNamespace(Solution=lambda _: gas))
 
     def trace(*_: Any) -> Any:
+        if mode == "cap":
+            raise worker.MaxStepsExceeded(1000000)
         if mode == "solver":
             raise RuntimeError("failure")
         if mode == "construction":
@@ -106,6 +109,8 @@ def test_simulation_refusals_and_positive_delay(
     actual_scope, result = worker._simulate_idt_row("fake.yaml", row)
     assert actual_scope == scope
     assert result.get("reason", result.get("refusal")) == reason
+    if mode == "cap":
+        assert result["integrator_steps"] == 1000000
     if mode == "ok":
         assert result["ignition_delay_s"] == pytest.approx(0.3)
         assert result["status"] == "ok"
@@ -265,7 +270,7 @@ def test_idt_pressure_guard_refuses_entry_or_crossing_of_trimmed_interval(
         assert result["integrator_steps"] in (0, 1)
         assert "ignition_delay_s" not in result
     else:
-        assert result.get("reason") in (None, "ignition_not_resolved")
+        assert result.get("reason") in (None, "ignition_not_reached")
         if target != "pressure":
             assert result["status"] == "ok"
 
@@ -511,6 +516,14 @@ def test_trace_integrator_locks_physics_horizon_and_sampling(monkeypatch: pytest
         assert times[0] == 0.0 and times[-2] < 1.0 <= times[-1]
         assert len(times) == len(values) == len(temperatures) == steps + 1
         assert networks[-1].atol == 1e-16 and networks[-1].rtol == 1e-8
+    monkeypatch.setattr(worker, "IDT_MAX_STEPS", 3)
+    with pytest.raises(worker.MaxStepsExceeded) as caught:
+        worker.integrate_idt_trace(ct, gas, _row())
+    assert caught.value.integrator_steps == 3
+    assert networks[-1].solver_stats["steps"] == 3
+    # Reaching the reactor horizon on the last permitted step completes normally.
+    monkeypatch.setattr(worker, "IDT_HORIZON_S", 0.015)
+    assert worker.integrate_idt_trace(ct, gas, _row())[-1] == 3
     ct.IdealGasReactor = lambda *a, **k: (_ for _ in ()).throw(ValueError("bad reactor"))
     with pytest.raises(worker.RunLevelSimulationError, match="bad reactor"):
         worker.integrate_idt_trace(ct, gas, _row())
