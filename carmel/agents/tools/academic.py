@@ -53,6 +53,7 @@ from carmel.agents.tools.search import (
     budgeted_get_raw,
     default_opener,
 )
+from carmel.config import SEMANTIC_SCHOLAR_API_KEY_ENV
 from carmel.logger import get_logger
 
 logger = get_logger("agents.tools.academic")
@@ -167,7 +168,6 @@ _OPENALEX_NON_PAPER_TYPES = frozenset(
 _SEMANTIC_SCHOLAR_NON_PAPER_TYPES = frozenset({"editorial", "news"})
 
 SEMANTIC_SCHOLAR_SEARCH_ENDPOINT = "https://api.semanticscholar.org/graph/v1/paper/search"
-SEMANTIC_SCHOLAR_API_KEY_ENV = "CARMEL_SEMANTIC_SCHOLAR_API_KEY"
 SEMANTIC_SCHOLAR_MAX_RETRIES = 3
 SEMANTIC_SCHOLAR_SEARCH_FIELDS = "title,year,authors,venue,externalIds,publicationTypes,openAccessPdf,abstract,url"
 
