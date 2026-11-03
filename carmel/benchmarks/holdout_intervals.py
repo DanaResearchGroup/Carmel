@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 
-from carmel.benchmarks.cantera_worker import checkpoint_fingerprint
+from carmel.benchmarks.cantera_worker import checkpoint_fingerprint, validate_row_refusal
 from carmel.benchmarks.holdout import _metric_limits, build_separation_report, score_metric
 from carmel.benchmarks.holdout_idt import idt_metric
 
@@ -185,6 +185,7 @@ def rescore_saved_jsr(report_path: Path) -> dict[str, Any]:
             reason = result.get("reason")
             if not isinstance(reason, str) or not reason.strip():
                 raise ValueError(f"checkpoint requires a nonempty refusal reason: {row_id}")
+            validate_row_refusal(reason, report.get("simulation_lock", {}))
             if reported[row_id].get("reason") != reason:
                 raise ValueError(f"checkpoint and reported refusal differ: {row_id}")
     rebuilt = copy.deepcopy(report)

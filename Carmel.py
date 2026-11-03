@@ -26,6 +26,8 @@ if TYPE_CHECKING:
 
 def create_parser() -> argparse.ArgumentParser:
     """Create the Carmel CLI argument parser."""
+    from carmel.benchmarks.cantera_worker import DEFAULT_ROW_WALL_CEILING_S
+
     parser = argparse.ArgumentParser(
         prog="carmel",
         description="Carmel: Agentic Predictive Chemical Kinetics Engine",
@@ -60,8 +62,8 @@ def create_parser() -> argparse.ArgumentParser:
         score_holdout.add_argument(
             "--row-timeout-s",
             type=float,
-            default=600.0,
-            help="Wall-clock limit for each independently killable row process (default: 600)",
+            default=DEFAULT_ROW_WALL_CEILING_S,
+            help=f"Row wall safety ceiling; expiry aborts the run (default: {DEFAULT_ROW_WALL_CEILING_S:g} seconds)",
         )
         score_holdout.add_argument(
             "--workers",
