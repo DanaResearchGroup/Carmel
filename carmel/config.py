@@ -153,19 +153,22 @@ class SearchProvider(StrEnum):
     queries and which index answers them are independent choices. A run may use a
     Google LLM against the keyless OpenAlex index, and the fail-closed key checks
     differ per backend — ``HTTP_JSON`` needs an operator-supplied endpoint and key,
-    while the scholarly indices below are keyless and must NOT be forced to invent
+    while the scholarly indices are keyless-capable and must NOT be forced to invent
     one (that requirement is what previously made them unconfigurable).
     """
 
     HTTP_JSON = "http_json"  # generic operator-configured JSON endpoint + bearer key
     OPENALEX = "openalex"  # keyless; api.openalex.org
     CROSSREF = "crossref"  # keyless; api.crossref.org
+    SEMANTIC_SCHOLAR = "semantic_scholar"  # keyless-capable; api.semanticscholar.org
 
 
-#: Search backends that take no API key. Keeping this as data (rather than an ``in``
+#: Search backends that can run without an API key. Keeping this as data (rather than an ``in``
 #: check spelled out at each call site) means adding a backend cannot silently miss
 #: one of the fail-closed branches in ``carmel.services.literature.build_deps``.
-KEYLESS_SEARCH_PROVIDERS: frozenset[SearchProvider] = frozenset({SearchProvider.OPENALEX, SearchProvider.CROSSREF})
+KEYLESS_SEARCH_PROVIDERS: frozenset[SearchProvider] = frozenset(
+    {SearchProvider.OPENALEX, SearchProvider.CROSSREF, SearchProvider.SEMANTIC_SCHOLAR}
+)
 
 #: Environment-variable fallback for :attr:`AgentConfig.unpaywall_email`. Holds the
 #: operator's contact email itself (not the name of another variable): an email
@@ -362,9 +365,14 @@ class AgentConfig(BaseModel):
     provider: AgentProvider = AgentProvider.MOCK
     model_name: str | None = None  # None -> DEFAULT_TIER_MODELS[tier]
     api_key_env: str | None = None  # env var holding the key; never the key itself
-    search_provider: SearchProvider = SearchProvider.HTTP_JSON
+    search_provider: SearchProvider = SearchProvider.SEMANTIC_SCHOLAR
     search_endpoint: str | None = None  # HTTP_JSON only; keyless backends know their own
     search_api_key_env: str | None = None
+    semantic_scholar_min_interval_s: float = Field(default=1.0, ge=1.0, strict=True, allow_inf_nan=False)
+    """Minimum time between Semantic Scholar request starts within this process.
+
+    The rate limiter is process-wide only; separate Carmel processes do not coordinate.
+    """
     search_contact_email: str | None = None
     """Contact address sent to keyless scholarly APIs (OpenAlex/Crossref "polite pool").
 
@@ -457,6 +465,13 @@ class AgentConfig(BaseModel):
             raise ValueError("provider MOCK requires tier TEST")
         if self.provider != AgentProvider.MOCK and not self.api_key_env:
             raise ValueError(f"provider {self.provider} requires api_key_env to be set")
+        if (
+            self.search_endpoint is not None or self.search_api_key_env is not None
+        ) and self.search_provider != SearchProvider.HTTP_JSON:
+            raise ValueError(
+                "search_endpoint and search_api_key_env require search_provider: http_json; "
+                "set search_provider: http_json explicitly"
+            )
         return self
 
     def resolved_model_name(self) -> str:

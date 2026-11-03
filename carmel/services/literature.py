@@ -59,6 +59,9 @@ from carmel.agents.tools.academic import (
     OpenAccessResolver,
     OpenAccessResolverProtocol,
     OpenAlexSearchTool,
+    SemanticScholarRateLimiter,
+    SemanticScholarSearchTool,
+    get_semantic_scholar_rate_limiter,
     normalize_doi,
 )
 from carmel.agents.tools.extract import ExtractedText, extract_text, normalize_for_match
@@ -597,7 +600,8 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
     # Built BEFORE the models: this is pure local-config validation, so a campaign
     # misconfigured for search must fail on that, not on whichever error a later
     # model construction happens to raise first.
-    search = _build_search_tool(config, ledger)
+    semantic_scholar_limiter = get_semantic_scholar_rate_limiter(config.semantic_scholar_min_interval_s)
+    search = _build_search_tool(config, ledger, rate_limiter=semantic_scholar_limiter)
 
     return LiteratureDeps(
         config=config,
@@ -617,13 +621,20 @@ def build_deps(config: AgentConfig, *, daily_ledger_path: Path | None = None) ->
             unpaywall_email=config.resolved_unpaywall_email(),
             core_api_key=config.resolved_core_api_key(),
             semantic_scholar_api_key=config.resolved_semantic_scholar_api_key(),
+            semantic_scholar_min_interval_s=config.semantic_scholar_min_interval_s,
+            semantic_scholar_rate_limiter=semantic_scholar_limiter,
             elsevier_api_key=config.resolved_elsevier_api_key(),
             elsevier_insttoken=config.resolved_elsevier_insttoken(),
         ),
     )
 
 
-def _build_search_tool(config: AgentConfig, ledger: BudgetLedger) -> SearchToolProtocol:
+def _build_search_tool(
+    config: AgentConfig,
+    ledger: BudgetLedger,
+    *,
+    rate_limiter: SemanticScholarRateLimiter | None = None,
+) -> SearchToolProtocol:
     """Build the configured search backend, failing closed on missing credentials.
 
     Only ``SearchProvider.HTTP_JSON`` needs an operator-supplied endpoint and key; the
@@ -652,6 +663,14 @@ def _build_search_tool(config: AgentConfig, ledger: BudgetLedger) -> SearchToolP
             ledger=ledger,
             contact_email=config.search_contact_email,
             external_provider_consent=config.external_provider_consent,
+        )
+    if config.search_provider == SearchProvider.SEMANTIC_SCHOLAR:
+        return SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=config.external_provider_consent,
+            api_key=config.resolved_semantic_scholar_api_key(),
+            rate_limiter=rate_limiter,
+            min_interval_s=config.semantic_scholar_min_interval_s,
         )
     if config.search_provider in KEYLESS_SEARCH_PROVIDERS:  # pragma: no cover - defensive
         raise AgentBridgeError(

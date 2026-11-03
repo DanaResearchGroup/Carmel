@@ -1,4 +1,4 @@
-"""Scholarly index adapters: OpenAlex/Crossref search, and open-access resolution.
+"""Scholarly index adapters: OpenAlex/Crossref/Semantic Scholar search and OA resolution.
 
 The search backends exist because the generic
 :class:`~carmel.agents.tools.search.HttpSearchTool` assumes an operator-supplied
@@ -11,8 +11,8 @@ are registered but disabled by default; see :data:`DEFAULT_ENABLED_PROVIDERS`. F
 / Internet Archive Scholar was removed entirely on 2026-07-29 -- see the note by the
 provider registry.
 
-Both adapters are shaped by a live probe of 60 combustion-kinetics works rather than by
-the APIs' own documentation, because the two disagree sharply:
+The OpenAlex and Crossref adapters are shaped by a live probe of 60 combustion-kinetics works rather
+than by the APIs' own documentation, because the two disagree sharply:
 
 - **An OA flag is not a fetchable paper.** 29/60 works (48%) were flagged
   ``is_oa``, but only 11 (18%) carried any full-text URL, and only 2 (3.3%) yielded
@@ -33,8 +33,12 @@ treated as "ask a human for this paper", not as an obstacle to route around.
 from __future__ import annotations
 
 import re
+import threading
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from enum import IntEnum, StrEnum
 from typing import Any, Protocol
 from urllib.parse import quote, quote_plus
@@ -155,6 +159,174 @@ _OPENALEX_NON_PAPER_TYPES = frozenset(
         "peer-review",
     }
 )
+
+# S2's publicationTypes vocabulary differs from OpenAlex's. Editorial and News
+# records cannot be research papers; Reviews and LettersAndComments can carry
+# research data and are deliberately retained. The rest of the documented values
+# are also retained because a broad type allowlist would silently lose research.
+_SEMANTIC_SCHOLAR_NON_PAPER_TYPES = frozenset({"editorial", "news"})
+
+SEMANTIC_SCHOLAR_SEARCH_ENDPOINT = "https://api.semanticscholar.org/graph/v1/paper/search"
+SEMANTIC_SCHOLAR_API_KEY_ENV = "CARMEL_SEMANTIC_SCHOLAR_API_KEY"
+SEMANTIC_SCHOLAR_MAX_RETRIES = 3
+SEMANTIC_SCHOLAR_SEARCH_FIELDS = "title,year,authors,venue,externalIds,publicationTypes,openAccessPdf,abstract,url"
+
+
+class SemanticScholarRateLimiter:
+    """Serialize requests, measuring the minimum gap from prior completion.
+
+    Separate Carmel processes have independent limiters and do not coordinate.
+    Clock and sleep injection keeps timing behavior deterministic in tests.
+    """
+
+    def __init__(
+        self,
+        min_interval_s: float = 1.0,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        if min_interval_s < 1.0:
+            raise ValueError("Semantic Scholar minimum interval must be at least 1.0 seconds")
+        self._min_interval_s = min_interval_s
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._last_start: float | None = None
+
+    @property
+    def min_interval_s(self) -> float:
+        with self._lock:
+            return self._min_interval_s
+
+    def configure(self, min_interval_s: float) -> None:
+        """Raise the process-wide floor without allowing a later run to weaken it."""
+        if min_interval_s < 1.0:
+            raise ValueError("Semantic Scholar minimum interval must be at least 1.0 seconds")
+        with self._lock:
+            self._min_interval_s = max(self._min_interval_s, min_interval_s)
+
+    def start_request(self, request: Callable[[], Any]) -> Any:
+        """Wait and invoke the opener while holding the lock that guards its start."""
+        with self._lock:
+            # Eligibility is read only after acquiring the lock. Recheck after every
+            # sleep because a sleeper may return early and the clock may advance while
+            # this caller is queued for the lock.
+            now = self._clock()
+            while self._last_start is not None:
+                remaining = self._last_start + self._min_interval_s - now
+                if remaining <= 0:
+                    break
+                self._sleep(remaining)
+                now = self._clock()
+            now = self._clock()
+            wall_start = datetime.now(UTC).isoformat(timespec="milliseconds")
+            self._last_start = now
+            try:
+                return request()
+            finally:
+                # Anchor the next eligibility window after the request has finished,
+                # including when the callback raises. This is conservative when the
+                # callback includes connection setup before the server sees a start.
+                self._last_start = self._clock()
+                logger.info("Semantic Scholar request start utc=%s monotonic=%.6f", wall_start, now)
+
+
+_SEMANTIC_SCHOLAR_LIMITER_LOCK = threading.Lock()
+_SEMANTIC_SCHOLAR_LIMITER: SemanticScholarRateLimiter | None = None
+
+
+def get_semantic_scholar_rate_limiter(min_interval_s: float = 1.0) -> SemanticScholarRateLimiter:
+    """Return Carmel's one process-wide Semantic Scholar limiter."""
+    global _SEMANTIC_SCHOLAR_LIMITER
+    with _SEMANTIC_SCHOLAR_LIMITER_LOCK:
+        if _SEMANTIC_SCHOLAR_LIMITER is None:
+            _SEMANTIC_SCHOLAR_LIMITER = SemanticScholarRateLimiter(min_interval_s)
+        else:
+            _SEMANTIC_SCHOLAR_LIMITER.configure(min_interval_s)
+        return _SEMANTIC_SCHOLAR_LIMITER
+
+
+def _retry_after_seconds(raw: str | None) -> float | None:
+    """Parse Retry-After seconds or HTTP-date, bounded to a minute."""
+    if not raw:
+        return None
+    try:
+        delay = float(raw)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(raw)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=UTC)
+            delay = (retry_at - datetime.now(UTC)).total_seconds()
+        except TypeError, ValueError, OverflowError:
+            return None
+    return max(0.0, min(delay, 60.0))
+
+
+def _semantic_scholar_get_json(
+    url: str,
+    *,
+    headers: dict[str, str],
+    ledger: BudgetLedger,
+    opener: Callable[..., Any],
+    timeout_s: float,
+    external_provider_consent: bool,
+    rate_limiter: SemanticScholarRateLimiter,
+    sleep: Callable[[float], None] = time.sleep,
+    before_attempt: Callable[[], None] | None = None,
+) -> Any:
+    """Budget and rate-limit each bounded Semantic Scholar request attempt."""
+    if not external_provider_consent:
+        # Match the common search path's fail-closed behavior without delaying a
+        # request that will never be allowed to leave this process.
+        raise SearchError("external_provider_consent is False; refusing Semantic Scholar request")
+
+    for retry_index in range(SEMANTIC_SCHOLAR_MAX_RETRIES + 1):
+        ledger.check_wall_clock()
+        if before_attempt is not None:
+            before_attempt()
+
+        def limited_opener(request_url: str, *, headers: dict[str, str], timeout_s: float) -> Any:
+            def open_if_in_budget() -> Any:
+                ledger.check_wall_clock()
+                return opener(request_url, headers=headers, timeout_s=timeout_s)
+
+            return rate_limiter.start_request(open_if_in_budget)
+
+        try:
+            return budgeted_get_json(
+                url,
+                headers=headers,
+                ledger=ledger,
+                opener=limited_opener,
+                timeout_s=timeout_s,
+                external_provider_consent=external_provider_consent,
+            )
+        except SearchError as exc:
+            retryable = exc.status == 429 or (exc.status is not None and 500 <= exc.status <= 599)
+            if not retryable:
+                raise
+            if retry_index == SEMANTIC_SCHOLAR_MAX_RETRIES:
+                if exc.status == 429:
+                    credential_note = (
+                        "no API key configured"
+                        if "x-api-key" not in headers
+                        else "API key configured but the rate limit was still reached"
+                    )
+                    raise SearchError(
+                        f"Semantic Scholar rate-limited after 4 attempts; {credential_note}. "
+                        f"Check {SEMANTIC_SCHOLAR_API_KEY_ENV} for an individual rate limit.",
+                        status=429,
+                    ) from exc
+                raise SearchError(
+                    f"Semantic Scholar request failed after 4 attempts (HTTP {exc.status})", status=exc.status
+                ) from exc
+            delay = _retry_after_seconds(exc.retry_after)
+            if delay is None:
+                delay = rate_limiter.min_interval_s * (2**retry_index)
+            sleep(min(delay, 60.0))
+
 
 #: Titles that betray a peer-review artefact minted as its own work. Needed BESIDE the
 #: type set, not instead of it: a journal that deposits its review correspondence as
@@ -513,6 +685,110 @@ class CrossrefSearchTool(_KeylessSearchTool):
         return dedupe_by_doi(results)[:limit]
 
 
+class SemanticScholarSearchTool(_KeylessSearchTool):
+    """Search Semantic Scholar's Graph API, keyless-capable and rate-limited."""
+
+    def __init__(
+        self,
+        *,
+        ledger: BudgetLedger,
+        external_provider_consent: bool,
+        api_key: str | None = None,
+        rate_limiter: SemanticScholarRateLimiter | None = None,
+        min_interval_s: float = 1.0,
+        opener: Callable[..., Any] | None = None,
+        timeout_s: float = 30.0,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        super().__init__(
+            ledger=ledger,
+            external_provider_consent=external_provider_consent,
+            opener=opener,
+            timeout_s=timeout_s,
+        )
+        self._api_key = api_key
+        self._rate_limiter = rate_limiter or get_semantic_scholar_rate_limiter(min_interval_s)
+        if rate_limiter is not None:
+            rate_limiter.configure(min_interval_s)
+        self._sleep = sleep
+
+    def search(self, query: str, *, limit: int = 10) -> list[SearchResult]:
+        bounded_limit = max(1, min(100, limit))
+        url = (
+            f"{SEMANTIC_SCHOLAR_SEARCH_ENDPOINT}?query={quote_plus(query)}"
+            f"&fields={quote_plus(SEMANTIC_SCHOLAR_SEARCH_FIELDS)}&limit={bounded_limit}"
+        )
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        if self._api_key:
+            headers["x-api-key"] = self._api_key
+        payload = _semantic_scholar_get_json(
+            url,
+            headers=headers,
+            ledger=self._ledger,
+            opener=self._opener,
+            timeout_s=self._timeout_s,
+            external_provider_consent=self._external_provider_consent,
+            rate_limiter=self._rate_limiter,
+            sleep=self._sleep,
+        )
+        papers = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(papers, list):
+            logger.warning("Semantic Scholar response had no usable data list")
+            return []
+
+        results: list[SearchResult] = []
+        dropped: list[str] = []
+        for paper in papers:
+            if not isinstance(paper, dict):
+                continue
+            title = paper.get("title")
+            if not isinstance(title, str) or not title:
+                continue
+            publication_types = paper.get("publicationTypes")
+            if isinstance(publication_types, list) and any(
+                isinstance(kind, str) and kind.casefold() in _SEMANTIC_SCHOLAR_NON_PAPER_TYPES
+                for kind in publication_types
+            ):
+                dropped.append(title)
+                continue
+            external_ids = paper.get("externalIds")
+            doi = normalize_doi(external_ids.get("DOI")) if isinstance(external_ids, dict) else None
+            oa_pdf = paper.get("openAccessPdf")
+            pdf_url = oa_pdf.get("url") if isinstance(oa_pdf, dict) else None
+            if not isinstance(pdf_url, str) or not pdf_url:
+                pdf_url = None
+            paper_url = paper.get("url")
+            paper_id = paper.get("paperId")
+            landing = paper_url if isinstance(paper_url, str) and paper_url else None
+            if landing is None and isinstance(paper_id, str) and paper_id:
+                landing = f"https://www.semanticscholar.org/paper/{paper_id}"
+            fetch_target = pdf_url or (f"https://doi.org/{doi}" if doi else None) or landing
+            if fetch_target is None:
+                continue
+            abstract = paper.get("abstract")
+            results.append(
+                SearchResult(
+                    title=title,
+                    url=fetch_target,
+                    snippet=abstract[:600] if isinstance(abstract, str) else "",
+                    source="semantic_scholar",
+                    doi=doi,
+                    pdf_url=pdf_url,
+                    is_open_access=pdf_url is not None,
+                    # The Graph API advertises a URL but no repository display name;
+                    # don't mislabel every linked copy as hosted by Semantic Scholar.
+                    repository="",
+                )
+            )
+        if dropped:
+            logger.info(
+                "Semantic Scholar search dropped %d non-research record(s): %s",
+                len(dropped),
+                "; ".join(title[:80] for title in dropped),
+            )
+        return dedupe_by_doi(results)[:limit]
+
+
 def _crossref_pdf_link(links: Any) -> str | None:
     """Extract a PDF full-text link from a Crossref ``link[]`` array.
 
@@ -565,12 +841,9 @@ class OaCandidate:
     tier: OaTier
 
 
-#: Hard ceiling on index lookup calls per resolved paper. Nine providers are
-#: registered today and each makes at most one call, so this never trips in normal
-#: operation; it is the bound that keeps a 12-paper run at <=96 small JSON/Atom
-#: lookups no matter how many providers are added later, instead of letting provider
-#: growth silently multiply network fan-out. Providers beyond the cap are skipped
-#: loudly in the resolution note.
+#: Hard ceiling on budgeted index lookup attempts per resolved paper, including
+#: retries. It bounds the total JSON/Atom fan-out even as providers or retry policies
+#: evolve; providers beyond the cap are skipped loudly in the resolution note.
 MAX_OA_LOOKUP_CALLS_PER_PAPER = 10
 
 #: Providers actually queried by :class:`OpenAccessResolver` by default. All
@@ -1213,7 +1486,7 @@ class _ProviderSkip(Exception):
 class OpenAccessResolver(_KeylessSearchTool):
     """DOI -> open-access PDF candidates, via a pluggable list of OA index providers.
 
-    Providers registered (each at most one lookup call): OpenAlex, Unpaywall, Crossref
+    Providers registered (at most one logical lookup each; Semantic Scholar can retry): OpenAlex, Unpaywall, Crossref
     (publisher TDM links), Semantic Scholar, CORE, DOAJ, Europe PMC, Elsevier,
     ChemRxiv and arXiv, consulted in that order for whichever of them are enabled --
     see :data:`DEFAULT_ENABLED_PROVIDERS` (ChemRxiv and Elsevier are registered but
@@ -1247,10 +1520,13 @@ class OpenAccessResolver(_KeylessSearchTool):
         unpaywall_email: str | None = None,
         core_api_key: str | None = None,
         semantic_scholar_api_key: str | None = None,
+        semantic_scholar_min_interval_s: float = 1.0,
+        semantic_scholar_rate_limiter: SemanticScholarRateLimiter | None = None,
         elsevier_api_key: str | None = None,
         elsevier_insttoken: str | None = None,
         opener: Callable[..., Any] | None = None,
         timeout_s: float = OA_INDEX_LOOKUP_TIMEOUT_S,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         """Construct the resolver.
 
@@ -1289,6 +1565,12 @@ class OpenAccessResolver(_KeylessSearchTool):
         self._unpaywall_email = unpaywall_email
         self._core_api_key = core_api_key
         self._semantic_scholar_api_key = semantic_scholar_api_key
+        self._semantic_scholar_rate_limiter = semantic_scholar_rate_limiter or get_semantic_scholar_rate_limiter(
+            semantic_scholar_min_interval_s
+        )
+        if semantic_scholar_rate_limiter is not None:
+            semantic_scholar_rate_limiter.configure(semantic_scholar_min_interval_s)
+        self._semantic_scholar_sleep = sleep
         self._elsevier_api_key = elsevier_api_key
         self._elsevier_insttoken = elsevier_insttoken
         self._warned_skips: set[str] = set()
@@ -1441,8 +1723,30 @@ class OpenAccessResolver(_KeylessSearchTool):
 
     def _lookup_semantic_scholar(self, doi: str, title: str | None) -> list[OaCandidate]:
         url = f"{SEMANTIC_SCHOLAR_ENDPOINT}/DOI:{quote(doi, safe='/')}?fields=openAccessPdf,externalIds,title"
-        headers = {"x-api-key": self._semantic_scholar_api_key} if self._semantic_scholar_api_key else None
-        return semantic_scholar_oa_candidates(self._counted_get_json(url, extra_headers=headers))
+        headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        if self._semantic_scholar_api_key:
+            headers["x-api-key"] = self._semantic_scholar_api_key
+
+        def count_attempt() -> None:
+            if self._lookup_calls >= MAX_OA_LOOKUP_CALLS_PER_PAPER:
+                raise SearchError(
+                    f"Semantic Scholar retry stopped at per-paper lookup cap of "
+                    f"{MAX_OA_LOOKUP_CALLS_PER_PAPER} attempts"
+                )
+            self._lookup_calls += 1
+
+        payload = _semantic_scholar_get_json(
+            url,
+            headers=headers,
+            ledger=self._ledger,
+            opener=self._opener,
+            timeout_s=self._timeout_s,
+            external_provider_consent=self._external_provider_consent,
+            rate_limiter=self._semantic_scholar_rate_limiter,
+            sleep=self._semantic_scholar_sleep,
+            before_attempt=count_attempt,
+        )
+        return semantic_scholar_oa_candidates(payload)
 
     def _lookup_core(self, doi: str, title: str | None) -> list[OaCandidate]:
         if not self._core_api_key:

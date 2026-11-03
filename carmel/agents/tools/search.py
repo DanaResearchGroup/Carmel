@@ -16,7 +16,7 @@ from urllib.parse import urlencode
 
 from pydantic import BaseModel, ConfigDict
 
-from carmel.agents.budget import BudgetLedger
+from carmel.agents.budget import BudgetExceededError, BudgetLedger
 from carmel.logger import get_logger
 
 logger = get_logger("agents.tools.search")
@@ -52,7 +52,7 @@ class SearchError(RuntimeError):
     three different responses and, as unstructured text, look alike.
     """
 
-    def __init__(self, message: str, *, status: int | None = None) -> None:
+    def __init__(self, message: str, *, status: int | None = None, retry_after: str | None = None) -> None:
         """Initialise the error.
 
         Args:
@@ -61,9 +61,12 @@ class SearchError(RuntimeError):
                 the call never got far enough to receive one (timeout, DNS, refused
                 connection) -- which is itself diagnostic, and distinct from a
                 provider that answered with an error.
+            retry_after: Raw ``Retry-After`` response header, if an HTTP error supplied
+                one.
         """
         super().__init__(message)
         self.status = status
+        self.retry_after = retry_after
 
 
 class SearchNotFound(SearchError):
@@ -272,10 +275,10 @@ def budgeted_get_raw(
         BudgetExceededError: Propagated from the reservation or the mid-stream check.
         SearchError: When ``external_provider_consent`` is False. Every search backend
             reaches the network through this one function, so gating here covers
-            ``HttpSearchTool`` and both keyless scholarly tools at once. Without it the
+            ``HttpSearchTool`` and all keyless-capable scholarly tools at once. Without it the
             consent flag was enforced only for LLM calls and (since the fetch fix) for
             artifact fetches, leaving search egress ungated -- so "no network without
-            explicit opt-in" was simply untrue for the OpenAlex/Crossref queries that
+            explicit opt-in" was simply untrue for the scholarly queries that
             begin every literature run.
         SearchError: On any transport failure opening the request (P1-12) --
             connection refused, DNS failure, timeout, or a non-2xx HTTP status the
@@ -306,6 +309,8 @@ def budgeted_get_raw(
             try:
                 response = opener(url, headers=headers, timeout_s=timeout_s)
             except Exception as exc:  # noqa: BLE001 - normalize all transport errors (P1-12)
+                if isinstance(exc, BudgetExceededError):
+                    raise
                 if isinstance(exc, urllib.error.HTTPError) and exc.code == 404:
                     # A 404 is not "transport failed" -- the provider was reached and
                     # answered normally, it just has no record for this identifier.
@@ -320,7 +325,14 @@ def budgeted_get_raw(
                         f"search request for {url!r} returned HTTP 404 (no record)", status=404
                     ) from exc
                 status = exc.code if isinstance(exc, urllib.error.HTTPError) else None
-                raise SearchError(f"search request failed for {url!r}: {exc}", status=status) from exc
+                retry_after = (
+                    exc.headers.get("Retry-After")
+                    if isinstance(exc, urllib.error.HTTPError) and exc.headers is not None
+                    else None
+                )
+                raise SearchError(
+                    f"search request failed for {url!r}: {exc}", status=status, retry_after=retry_after
+                ) from exc
             try:
                 chunks: list[bytes] = []
                 while True:

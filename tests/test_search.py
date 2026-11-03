@@ -7,7 +7,7 @@ from collections.abc import Iterator
 
 import pytest
 
-from carmel.agents.budget import BudgetExceededError, BudgetLedger, session_budget
+from carmel.agents.budget import BudgetDimension, BudgetExceededError, BudgetLedger, session_budget
 from carmel.agents.tools.academic import OpenAlexSearchTool
 from carmel.agents.tools.search import CHUNK_SIZE, HttpSearchTool, MockSearchTool, SearchError, SearchResult
 from carmel.config import AgentBudgetConfig
@@ -59,6 +59,27 @@ class TestHttpSearchToolConfig:
 
 
 class TestHttpSearchToolRequest:
+    def test_budget_exhaustion_from_opener_is_not_normalized_and_reservation_settles(self) -> None:
+        ledger = make_ledger()
+        exhausted = BudgetExceededError(BudgetDimension.WALL_CLOCK_S, 2.0, 1.0)
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> FakeSearchResponse:
+            raise exhausted
+
+        tool = HttpSearchTool(
+            external_provider_consent=True,
+            endpoint="https://search.example",
+            api_key="k",
+            ledger=ledger,
+            opener=opener,
+        )
+        with pytest.raises(BudgetExceededError) as caught:
+            tool.search("q")
+
+        assert caught.value is exhausted
+        assert ledger.usage().index_lookups == 1
+        assert ledger.usage().fetch_bytes == 0
+
     def test_api_key_sent_in_header_not_url(self) -> None:
         ledger = make_ledger()
         captured: dict[str, object] = {}
