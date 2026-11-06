@@ -1,0 +1,338 @@
+{
+  "description": "Coordinate-only projection of the 24 pinned holdout files; no ignition observations or mechanism data. Extracted 2026-11-06.",
+  "files": {
+    "n-heptane/Di Sante 2012/rcm_disante_2012-1.yaml": {
+      "sha256": "a3c7a9b68df9eb8b632e19ef200205ee8f16cc0b834d5a0d0badd536c760df47",
+      "group": "RCM-ideal",
+      "temperature_k": [
+        711.0,
+        732.0,
+        751.0,
+        770.0,
+        780.0,
+        811.0
+      ]
+    },
+    "n-heptane/Di Sante 2012/rcm_disante_2012-2.yaml": {
+      "sha256": "4c8b43fee0b3c0e3391f5ac162fdd6d064f7e1721cec1b5ee0f2d3ed673ab653",
+      "group": "RCM-ideal",
+      "temperature_k": [
+        718.0,
+        729.0,
+        749.0,
+        769.0,
+        782.0,
+        800.0
+      ]
+    },
+    "n-heptane/Hartmann 2011/st_hartmann_2011-1.yaml": {
+      "sha256": "736096fbb52cda99b7bebd3417f736854742d21e79b5c91b5ff1d4e5c628da49",
+      "group": "shock-tube",
+      "temperature_k": [
+        739.0,
+        812.0,
+        826.0,
+        853.0,
+        860.0,
+        885.0,
+        970.0,
+        1033.0,
+        1165.0,
+        1247.0,
+        1275.0
+      ]
+    },
+    "n-heptane/Hartmann 2011/st_hartmann_2011-2.yaml": {
+      "sha256": "ddf89129ca66e17b515cb656b9e9045f4c48becf3b204ddb3f2123462ee0b07f",
+      "group": "shock-tube",
+      "temperature_k": [
+        692.0,
+        695.0,
+        705.0,
+        735.0,
+        767.0,
+        769.0,
+        823.0,
+        836.0,
+        841.0,
+        880.0,
+        933.0,
+        937.0,
+        970.0,
+        984.0,
+        990.0,
+        1030.0,
+        1032.0,
+        1040.0,
+        1072.0,
+        1246.0,
+        1249.0,
+        1264.0
+      ]
+    },
+    "n-heptane/Herzler 2005/st_herzler_2005-1.yaml": {
+      "sha256": "116155173684185b89888a48241816f4a90a36a905da13c9ffb588fe210399ff",
+      "group": "shock-tube",
+      "temperature_k": [
+        1092.0,
+        1048.0,
+        1017.0,
+        973.0,
+        943.0,
+        919.0,
+        863.0
+      ]
+    },
+    "n-heptane/Herzler 2005/st_herzler_2005-2.yaml": {
+      "sha256": "8cdab6b0336bff0516e527165ca0e827ff2a2d5c4cd118f437cfe682a4fc6063",
+      "group": "shock-tube",
+      "temperature_k": [
+        1115.0,
+        1062.0,
+        1043.0,
+        989.0,
+        937.0,
+        917.0,
+        856.0,
+        784.0,
+        735.0
+      ]
+    },
+    "n-heptane/Herzler 2005/st_herzler_2005-3.yaml": {
+      "sha256": "2b725178323d4e567cd375cc1a3954d1c02a6555f82dd4b7e346b42a6ca25c17",
+      "group": "shock-tube",
+      "temperature_k": [
+        1128.0,
+        1036.0,
+        970.0,
+        888.0,
+        834.0,
+        774.0,
+        722.0
+      ]
+    },
+    "n-heptane/Herzler 2005/st_herzler_2005-4.yaml": {
+      "sha256": "586bf3a472256d913cf790878131386184f76b387893979a59bad01e4019181e",
+      "group": "shock-tube",
+      "temperature_k": [
+        1100.0,
+        1067.0,
+        1018.0,
+        973.0,
+        973.0,
+        945.0,
+        877.0,
+        825.0,
+        779.0,
+        726.0
+      ]
+    },
+    "n-heptane/Karwat 2013/rcm_karwat_2013-1.yaml": {
+      "sha256": "e75fe094ebb238af5fdbda37b8090685b4e1ed9f983dd37c748edcb0fb4c71b2",
+      "group": "RCM-ideal",
+      "temperature_k": [
+        707.0
+      ]
+    },
+    "n-heptane/Karwat 2013/rcm_karwat_2013-2.yaml": {
+      "sha256": "b8075d97fc9681002584aa6b51d54fd4c2d78af2133c2615187aee5510ae8959",
+      "group": "RCM-ideal",
+      "temperature_k": [
+        660.0
+      ]
+    },
+    "n-heptane/Karwat 2013/rcm_karwat_2013-3.yaml": {
+      "sha256": "19784823fef5dfd3fce9b5617dbfb60c5b4adb20f64b0f4875bb66fc50a04908",
+      "group": "RCM-ideal",
+      "temperature_k": [
+        686.0
+      ]
+    },
+    "n-heptane/Shen 2009/st_shen_2009-1.yaml": {
+      "sha256": "f97b0fb0306e54729195472e5ba6a878d4abce499c730ef34e17ba90947a0378",
+      "group": "shock-tube",
+      "temperature_k": [
+        1064.0,
+        1078.0,
+        1092.0,
+        1116.0,
+        1133.0,
+        1204.0,
+        1206.0,
+        1248.0,
+        1309.0,
+        1317.0,
+        1336.0,
+        1396.0
+      ]
+    },
+    "n-heptane/Shen 2009/st_shen_2009-2.yaml": {
+      "sha256": "a5384021d64526c5baf73525c02a0f9d4075d2df4bbc6cf028b09c8a9c669ee5",
+      "group": "shock-tube",
+      "temperature_k": [
+        786.0,
+        791.0,
+        830.0,
+        831.0,
+        836.0,
+        856.0,
+        872.0,
+        920.0,
+        948.0,
+        987.0,
+        1055.0,
+        1099.0,
+        1147.0,
+        1178.0,
+        1230.0
+      ]
+    },
+    "n-heptane/Shen 2009/st_shen_2009-3.yaml": {
+      "sha256": "88f72ae64353e21f07949c80b3457ea523e6a0e30caa624e870ff3dcb8c538d4",
+      "group": "shock-tube",
+      "temperature_k": [
+        1063.0,
+        1063.0,
+        1101.0,
+        1168.0,
+        1224.0
+      ]
+    },
+    "n-heptane/Shen 2009/st_shen_2009-4.yaml": {
+      "sha256": "923bada9730f4d7948061e1dd5862011445fcf5f5b14ef9aca1df81d83321e55",
+      "group": "shock-tube",
+      "temperature_k": [
+        829.0,
+        873.0,
+        944.0,
+        1014.0,
+        1082.0,
+        1110.0,
+        1161.0
+      ]
+    },
+    "n-heptane/Shen 2009/st_shen_2009-5.yaml": {
+      "sha256": "1476008e79051470d1016078870391b13bfcdb63c69abd4db73385061209960a",
+      "group": "shock-tube",
+      "temperature_k": [
+        809.0,
+        826.0,
+        972.0,
+        1058.0,
+        1096.0,
+        1098.0,
+        1196.0
+      ]
+    },
+    "n-heptane/Shen 2009/st_shen_2009-6.yaml": {
+      "sha256": "f645b7588460bd028409f8b2048c0a075fe8b1f4547839cb45e116a19ddd57e5",
+      "group": "shock-tube",
+      "temperature_k": [
+        788.0,
+        797.0,
+        799.0,
+        834.0,
+        862.0,
+        899.0,
+        967.0,
+        991.0,
+        996.0,
+        1003.0,
+        1022.0,
+        1029.0,
+        1050.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-1.yaml": {
+      "sha256": "cb9e00fbb98503e782c4d31f4039e211a239bbc371051edf751a992f369bb2e1",
+      "group": "shock-tube",
+      "temperature_k": [
+        714.0,
+        759.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-2.yaml": {
+      "sha256": "ded31bdf37820e4cdc337f7c4ba55c842b7ef96803cb7e06dea27451ef163616",
+      "group": "shock-tube",
+      "temperature_k": [
+        726.0,
+        780.0,
+        793.0,
+        832.0,
+        875.0,
+        945.0,
+        988.0,
+        994.0,
+        1094.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-3.yaml": {
+      "sha256": "2306df30b4361338c1d7910d217cd13dc531b62faf1df1e380facd248c294e1f",
+      "group": "shock-tube",
+      "temperature_k": [
+        753.0,
+        785.0,
+        827.0,
+        879.0,
+        936.0,
+        1000.0,
+        1059.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-4.yaml": {
+      "sha256": "543a73303668e1002561a0a56fc5703b9eedf6c4ab57123b74163ee65096dcdd",
+      "group": "shock-tube",
+      "temperature_k": [
+        716.0,
+        796.0,
+        913.0,
+        1002.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-5.yaml": {
+      "sha256": "04ac9e9bd2929ccd2dd938cbe8a5f12032974a684ee736bdb1324dafb71382a8",
+      "group": "shock-tube",
+      "temperature_k": [
+        698.0,
+        701.0,
+        714.0,
+        743.0,
+        772.0,
+        804.0,
+        817.0,
+        889.0,
+        897.0,
+        940.0,
+        969.0,
+        1009.0,
+        1029.0,
+        1099.0,
+        1117.0,
+        1153.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-6.yaml": {
+      "sha256": "7230295826770a7c951076904e200de570d245ca9f5517648b570b20294d3933",
+      "group": "shock-tube",
+      "temperature_k": [
+        711.0,
+        793.0,
+        906.0,
+        1011.0
+      ]
+    },
+    "n-heptane/Vandersickel 2012/st_vandersickel_2012-7.yaml": {
+      "sha256": "72bdc2fb4a27ef2800ea33fd85cae0751cea59d0165399fdd016dcf0af7c2813",
+      "group": "shock-tube",
+      "temperature_k": [
+        679.0,
+        693.0,
+        773.0,
+        803.0,
+        887.0,
+        976.0,
+        996.0
+      ]
+    }
+  }
+}

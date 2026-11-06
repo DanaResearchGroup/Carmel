@@ -9,6 +9,7 @@ from pathlib import Path
 from statistics import fmean
 from typing import Any, Literal
 
+from carmel.benchmarks.cantera_worker import FFCM1_EXCITED_SHA256
 from carmel.benchmarks.chemkin import mechanism, normalize_for_ck2yaml
 from carmel.benchmarks.contract import read_pinned_file
 from carmel.benchmarks.holdout import (
@@ -102,16 +103,38 @@ def idt_metric(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def idt_coverage_gate(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """Enforce the dispatch's expected target absence and RCM coverage gates."""
+    """Allow at most one third non-solver shock refusals; retain the RCM coverage gate."""
     shock = [r for r in rows if r["group"] == "shock-tube"]
     rcm = [r for r in rows if r["group"] == "RCM-ideal"]
     rcm_count = idt_metric(rcm)["scored_count"]
-    unexpected = [r["row_id"] for r in shock if r.get("reason") != "target_species_absent"]
+    unexpected = [
+        r["row_id"]
+        for r in idt_metric(shock)["refusals"]
+        if not r["reason"].startswith("solver_failure") and r["reason"] not in ("solver_crash", "max_steps_exceeded")
+    ]
     return {
-        "passed": len(rows) == 189 and len(shock) == 174 and len(rcm) == 15 and not unexpected and rcm_count >= 12,
+        "passed": len(rows) == 189
+        and len(shock) == 174
+        and len(rcm) == 15
+        and len(unexpected) <= 58
+        and rcm_count >= 12,
         "unexpected_shock_rows": unexpected,
         "rcm_scored": rcm_count,
         "minimum_rcm_scored": 12,
+        "maximum_non_solver_shock_refusals": 58,
+    }
+
+
+def target_idt_metric(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """The predeclared inclusive 600–1000 K window, with equal point weights."""
+    selected = [r for r in rows if 600 <= r["temperature_k"] <= 1000]
+    return {
+        "temperature_min_k": 600,
+        "temperature_max_k": 1000,
+        **idt_metric(selected),
+        "groups": {
+            group: idt_metric([r for r in selected if r["group"] == group]) for group in ("shock-tube", "RCM-ideal")
+        },
     }
 
 
@@ -173,6 +196,7 @@ def run_idt_harness(
     )
     request = WorkerRequest(
         observable="idt",
+        excited_state_submechanism_sha256=FFCM1_EXCITED_SHA256,
         mechanism_path=mechanism_input,
         thermo_path=thermo_input,
         converted_yaml_path=run_dir / "converted.yaml",
@@ -187,6 +211,11 @@ def run_idt_harness(
     if response.status != "ok" or response.observable != "idt":
         detail = response.validation_error or response.construction_error or response.observable
         raise ValueError(f"Cantera subprocess refused: {response.refusal}: {detail}")
+    if (
+        response.excited_state_submechanism is None
+        or response.excited_state_submechanism.get("sha256") != FFCM1_EXCITED_SHA256
+    ):
+        raise ValueError("worker omitted or changed the pinned excited-state submechanism")
     simulated = {item.row_id: item for item in response.rows}
     if len(simulated) != len(response.rows) or set(simulated) != {r["row_id"] for r in rows}:
         raise ValueError("worker response row IDs differ from the frozen request")
@@ -243,6 +272,7 @@ def run_idt_harness(
         "thermo_duplicates": _thermo_duplicates(raw_thermo),
         "row_results": results,
         "metric": idt_metric(results),
+        "target_chemistry": target_idt_metric(results),
         "diagnostics": {
             "groups": {
                 group: idt_metric([r for r in results if r["group"] == group])

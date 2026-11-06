@@ -24,6 +24,7 @@ from carmel.benchmarks.contract import (
     validate_mechanism_pair,
     validate_species_inventories,
 )
+from carmel.benchmarks.revision import IDTTarget, Revision, verify_revision
 from carmel.services.archive_unpack import _is_absolute_member_name
 from carmel.services.chemked import ChemkedRefusal, ChemkedRefusalReason
 
@@ -119,6 +120,8 @@ class Split(FrozenModel):
 
 
 class Scoring(FrozenModel):
+    target_chemistry: IDTTarget
+    excited_state_submechanism_sha256: str
     primary_unit: Literal["reaction-type-once"]
     primary_types: tuple[TypeId, ...]
     recovered: str
@@ -135,6 +138,7 @@ class Scoring(FrozenModel):
 
 class Contract(FrozenModel):
     schema_version: Literal[1]
+    revision: Revision
     case: Literal["n-heptane-low-t"]
     mechanisms: dict[Literal["v_old", "v_new"], Pin]
     support_sources: tuple[Pin, ...]
@@ -207,7 +211,10 @@ class Contract(FrozenModel):
 
 
 def load_contract(path: Path) -> Contract:
-    return Contract.model_validate_json(read_pinned_file(path))
+    data = read_pinned_file(path)
+    contract = Contract.model_validate_json(data)
+    verify_revision(data)
+    return contract
 
 
 def split_totals(split: Split) -> dict[str, int]:

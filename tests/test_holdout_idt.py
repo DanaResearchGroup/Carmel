@@ -150,7 +150,7 @@ def test_worker_refuses_exact_absent_targets_before_row_execution(
 ) -> None:
     rows = [
         {**_row(), "row_id": target, "ignition_target": target}
-        for target in ("CH*", "OH*", "OH", "pressure", "temperature")
+        for target in ("CH*", "OH*", "UNKNOWN*", "OH", "pressure", "temperature")
     ]
     converted = tmp_path / "converted.yaml"
     request, response = tmp_path / "request.json", tmp_path / "response.json"
@@ -181,12 +181,15 @@ def test_worker_refuses_exact_absent_targets_before_row_execution(
                 "reason": "target_species_absent",
                 "ignition_target": target,
             }
-            for target in ("CH*", "OH*")
+            for target in ("UNKNOWN*",)
         }
         assert kwargs["initial_results"] == expected
         return {
             **expected,
-            **{t: {"row_id": t, "status": "ok", "ignition_delay_s": 0.3} for t in ("OH", "pressure", "temperature")},
+            **{
+                t: {"row_id": t, "status": "ok", "ignition_delay_s": 0.3}
+                for t in ("CH*", "OH*", "OH", "pressure", "temperature")
+            },
         }, 0
 
     gas = SimpleNamespace(species_names=["OH", "OHV", "CHV"])
@@ -198,7 +201,8 @@ def test_worker_refuses_exact_absent_targets_before_row_execution(
     result = json.loads(response.read_text())
     assert result["status"] == "ok"
     assert [r.get("reason") for r in result["rows"]] == [
-        "target_species_absent",
+        None,
+        None,
         "target_species_absent",
         None,
         None,
@@ -303,6 +307,9 @@ def test_metric_and_coverage_do_not_hide_invalid_delays() -> None:
     metric = idt.idt_metric(rows)
     assert metric["overall"] == pytest.approx(math.log10(2))
     assert metric["scored_count"] == 15 and len(metric["refusals"]) == 174
+    assert not idt.idt_coverage_gate(rows)["passed"]
+    for row in rows[15:]:
+        row.update(status="ok", reason=None, ignition_delay_s=0.2)
     assert idt.idt_coverage_gate(rows)["passed"]
     for row in rows[:4]:
         row["ignition_delay_s"] = math.nan
@@ -343,14 +350,14 @@ def fake_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[
         result = [
             {
                 "row_id": row.row_id,
-                "status": "ok" if i < 15 else "refused",
-                "reason": None if i < 15 else "target_species_absent",
-                "ignition_delay_s": 0.2 if i < 15 else None,
+                "status": "ok",
+                "reason": None,
+                "ignition_delay_s": 0.2,
                 "ignition_target": row.ignition_target,
                 "wall_time_s": 1.0,
                 "integrator_steps": 5,
             }
-            for i, row in enumerate(request.rows)
+            for row in request.rows
         ]
         return WorkerResponse(
             schema_version=1,
@@ -358,6 +365,7 @@ def fake_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[dict[
             status="ok",
             rows=result,
             converter={},
+            excited_state_submechanism={"sha256": worker.FFCM1_EXCITED_SHA256},
             thread_env=worker.THREAD_ENV,
             row_process_start_method="spawn",
             load_average_at_start=(0.0, 0.0, 0.0),
@@ -389,8 +397,8 @@ def test_fake_worker_harness_preserves_targets_and_reports_all_rows(
     kwargs["mechanism_key"] = mechanism_key
     report = idt.run_idt_harness(**kwargs)
     assert report["coverage_gate"]["passed"]
-    assert report["metric"]["scored_count"] == 15
-    assert report["diagnostics"]["groups"]["shock-tube"]["overall"] is None
+    assert report["metric"]["scored_count"] == 189
+    assert report["diagnostics"]["groups"]["shock-tube"]["overall"] == pytest.approx(math.log10(2))
     assert report["row_results"][15]["ignition_target"] == "CH*"
     rows.pop()
     with pytest.raises(ValueError, match="export gate"):
@@ -465,7 +473,7 @@ def test_harness_retains_refusal_when_worker_omits_reason_or_target(
 
     def omit(*args: Any, **kw: Any) -> WorkerResponse:
         data = original(*args, **kw).model_dump()
-        data["rows"][15].update(reason=None, ignition_target=None)
+        data["rows"][15].update(status="refused", reason=None, ignition_target=None)
         return WorkerResponse.model_validate(data)
 
     monkeypatch.setattr(idt, "invoke_cantera_worker", omit)
@@ -473,7 +481,26 @@ def test_harness_retains_refusal_when_worker_omits_reason_or_target(
     assert report["row_results"][15]["reason"] == "unspecified_worker_refusal"
     assert report["row_results"][15]["ignition_target"] == "CH*"
     assert report["coverage_gate"]["unexpected_shock_rows"] == ["15"]
-    assert not report["coverage_gate"]["passed"]
+    assert report["coverage_gate"]["passed"]
+
+
+@pytest.mark.parametrize("metadata", [None, {"sha256": "changed"}])
+def test_harness_refuses_unconfirmed_excited_state_chemistry(
+    fake_harness: tuple[dict[str, Any], list[dict[str, Any]]],
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: dict[str, str] | None,
+) -> None:
+    kwargs, _ = fake_harness
+    original = idt.invoke_cantera_worker
+
+    def corrupt(*args: Any, **kw: Any) -> WorkerResponse:
+        data = original(*args, **kw).model_dump()
+        data["excited_state_submechanism"] = metadata
+        return WorkerResponse.model_validate(data)
+
+    monkeypatch.setattr(idt, "invoke_cantera_worker", corrupt)
+    with pytest.raises(ValueError, match="pinned excited-state"):
+        idt.run_idt_harness(**kwargs)
 
 
 def test_trace_integrator_locks_physics_horizon_and_sampling(monkeypatch: pytest.MonkeyPatch) -> None:

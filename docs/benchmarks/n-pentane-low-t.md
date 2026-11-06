@@ -1,5 +1,31 @@
 # Frozen n-pentane low-temperature benchmark
 
+## Secondary-score revision 2
+
+This owner-authorized revision precedes candidate scoring and records previous
+contract byte SHA-256
+`72947ab95a15cf5375815be9c4ee7e7452183cb439bedbdf7f592a93b7ffa9f2`.
+The contract loader and shared JSON validator check the entire document against
+its reviewed revision digest. Unrecorded edits fail before simulation.
+
+The aggregate and the existing 600–900 K subset remain unchanged. The additional
+**target-chemistry score** applies the existing species-balanced JSR metric over all
+frozen temperatures to exactly these five C5 cyclic ethers:
+
+| Holdout label | Canonical SMILES |
+| --- | --- |
+| C5H10O1-2 | `CCCC1CO1` |
+| C5H10O1-3 | `CCC1CCO1` |
+| C5H10O1-4 | `CC1CCCO1` |
+| C5H10O2-3 | `CCC1OC1C` |
+| C5H10O2-4 | `CC1CC(C)O1` |
+
+Their 600 scalar observations comprise 84, 84, 144, 144 and 144 rows respectively.
+Clamps retain the existing full-frozen-observation definition, with equal row weights
+within each species and equal species weights. Reports retain every species score,
+scored-row count and refusal. The excited-state replacement is used for case-1 IDT;
+it does not change case-2 JSR chemistry.
+
 This benchmark asks whether a mechanism-revision process can recover four structural
 reaction types added between the frozen `nc5_49` and July-2015 C5 files. Structural
 recovery is primary. Holdout jet-stirred-reactor (JSR) speciation error is secondary
@@ -9,8 +35,8 @@ without that adapter.
 The contract uses the same frozen-model, pin-verification, species, invariant-validator
 and structural-rule implementation as the n-heptane case. Both cases validate through
 the discriminated shared schema in `carmel.benchmarks.schema`; the C5 model adds the
-ReSpecTh whole-study split and its acceptance ledger. The n-heptane contract and
-generated case schema are not changed.
+ReSpecTh whole-study split and its acceptance ledger. Both cases carry their own
+recorded secondary-score revision.
 
 ## Mechanism pins and identity
 

@@ -1,0 +1,302 @@
+{
+  "source": {
+    "citation": "G. P. Smith, Y. Tao, H. Wang, Foundational Fuel Chemistry Model Version 1.0 (FFCM-1), 2016.",
+    "retrieval_date": "2026-11-06",
+    "files": [
+      {
+        "url": "https://web.stanford.edu/group/haiwanglab/FFCM1/download/mech-FFCM1",
+        "sha256": "a0ec06a8ed857a4eb5e4a844100515e5e113f6e45ebb88119f18b7794656a7cb",
+        "bytes": 31342
+      },
+      {
+        "url": "https://web.stanford.edu/group/haiwanglab/FFCM1/download/thermdat",
+        "sha256": "b346582aba5a59776f33e0c6188d271832278a89b55d9a6e2d62bf379ffc799e",
+        "bytes": 24301
+      }
+    ],
+    "extraction": "Cantera 3.2 ck2yaml; retain only OH* and CH* species and all 25 reactions involving them. ENDOFDATA terminator ignored by permissive conversion; no chemical records skipped."
+  },
+  "units": {
+    "length": "cm",
+    "time": "s",
+    "quantity": "mol",
+    "activation-energy": "cal/mol"
+  },
+  "species": [
+    {
+      "name": "OH*",
+      "composition": {
+        "O": 1,
+        "H": 1
+      },
+      "thermo": {
+        "model": "NASA7",
+        "temperature-ranges": [
+          200.0,
+          1000.0,
+          6000.0
+        ],
+        "data": [
+          [
+            3.46084428,
+            0.000501872172,
+            -2.00254474e-06,
+            3.18901984e-09,
+            -1.35451838e-12,
+            50734.9466,
+            1.73976415
+          ],
+          [
+            2.7558292,
+            0.00139848756,
+            -4.19428493e-07,
+            6.33453282e-11,
+            -3.56042218e-15,
+            50975.1756,
+            5.62581429
+          ]
+        ],
+        "note": "ATcT A\n Goos-Burcat-Ruscic-thermodatabase; Y. Tao 25.05.2012\n OH A 2Sigma+ (excited)\n CAS: 3352-57-6 (?)\n Uncertainty unknown => -1.0"
+      }
+    },
+    {
+      "name": "CH*",
+      "composition": {
+        "C": 1,
+        "H": 1
+      },
+      "thermo": {
+        "model": "NASA7",
+        "temperature-ranges": [
+          200.0,
+          1000.0,
+          6000.0
+        ],
+        "data": [
+          [
+            3.47250101,
+            0.000426443626,
+            -1.95181794e-06,
+            3.51755043e-09,
+            -1.60436174e-12,
+            104334.869,
+            1.44799533
+          ],
+          [
+            2.78220752,
+            0.00147246754,
+            -4.63436227e-07,
+            7.32736021e-11,
+            -4.19705404e-15,
+            104547.06,
+            5.17421018
+          ]
+        ],
+        "note": "EG4/09\n Goos-Burcat-Ruscic-thermodatabase; Y. Tao 25.05.2012\n CH A2Delta  excited state only\n CAS: 3315-37-5\n Uncertainty unknown => -1.0"
+      }
+    }
+  ],
+  "reactions": [
+    {
+      "equation": "CH + O2 <=> CO + OH*",
+      "rate-constant": {
+        "A": 180000000000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "C2H + O <=> CO + CH*",
+      "rate-constant": {
+        "A": 2500000000000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "C2H + O2 <=> CO2 + CH*",
+      "rate-constant": {
+        "A": 320000000000.0,
+        "b": 0.0,
+        "Ea": 1600.0
+      }
+    },
+    {
+      "equation": "H + O + M => OH* + M",
+      "type": "three-body",
+      "rate-constant": {
+        "A": 5450000000000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "2 OH + H => OH* + H2O",
+      "rate-constant": {
+        "A": 1450000000000000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "CH* => CH",
+      "rate-constant": {
+        "A": 1850000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "CH* + N2 <=> CH + N2",
+      "rate-constant": {
+        "A": 303.0,
+        "b": 3.4,
+        "Ea": -381.0
+      }
+    },
+    {
+      "equation": "CH* + O2 <=> CH + O2",
+      "rate-constant": {
+        "A": 2400000.0,
+        "b": 2.14,
+        "Ea": -1720.0
+      }
+    },
+    {
+      "equation": "CH* + H2O <=> CH + H2O",
+      "rate-constant": {
+        "A": 53000000000000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "CH* + H2 <=> CH + H2",
+      "rate-constant": {
+        "A": 147000000000000.0,
+        "b": 0.0,
+        "Ea": 1361.0
+      }
+    },
+    {
+      "equation": "CH* + CO2 <=> CH + CO2",
+      "rate-constant": {
+        "A": 0.241,
+        "b": 4.3,
+        "Ea": -1694.0
+      }
+    },
+    {
+      "equation": "CH* + CO <=> CH + CO",
+      "rate-constant": {
+        "A": 2440000000000.0,
+        "b": 0.5,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "CH* + CH4 <=> CH + CH4",
+      "rate-constant": {
+        "A": 17300000000000.0,
+        "b": 0.0,
+        "Ea": 167.0
+      }
+    },
+    {
+      "equation": "CH* + AR <=> CH + AR",
+      "rate-constant": {
+        "A": 12500000000.0,
+        "b": 0.5,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "CH* + HE <=> CH + HE",
+      "rate-constant": {
+        "A": 1950000000.0,
+        "b": 0.5,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "OH* => OH",
+      "rate-constant": {
+        "A": 1450000.0,
+        "b": 0.0,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "OH* + N2 <=> OH + N2",
+      "rate-constant": {
+        "A": 108000000000.0,
+        "b": 0.5,
+        "Ea": -1238.0
+      }
+    },
+    {
+      "equation": "OH* + O2 <=> OH + O2",
+      "rate-constant": {
+        "A": 2100000000000.0,
+        "b": 0.5,
+        "Ea": -482.0
+      }
+    },
+    {
+      "equation": "OH* + H2O <=> OH + H2O",
+      "rate-constant": {
+        "A": 5920000000000.0,
+        "b": 0.5,
+        "Ea": -861.0
+      }
+    },
+    {
+      "equation": "OH* + H2 <=> OH + H2",
+      "rate-constant": {
+        "A": 2950000000000.0,
+        "b": 0.5,
+        "Ea": -444.0
+      }
+    },
+    {
+      "equation": "OH* + CO2 <=> OH + CO2",
+      "rate-constant": {
+        "A": 2750000000000.0,
+        "b": 0.5,
+        "Ea": -968.0
+      }
+    },
+    {
+      "equation": "OH* + CO <=> OH + CO",
+      "rate-constant": {
+        "A": 3230000000000.0,
+        "b": 0.5,
+        "Ea": -787.0
+      }
+    },
+    {
+      "equation": "OH* + CH4 <=> OH + CH4",
+      "rate-constant": {
+        "A": 3360000000000.0,
+        "b": 0.5,
+        "Ea": -635.0
+      }
+    },
+    {
+      "equation": "OH* + AR <=> OH + AR",
+      "rate-constant": {
+        "A": 12500000000.0,
+        "b": 0.5,
+        "Ea": 0.0
+      }
+    },
+    {
+      "equation": "OH* + HE <=> OH + HE",
+      "rate-constant": {
+        "A": 1950000000.0,
+        "b": 0.5,
+        "Ea": 0.0
+      }
+    }
+  ]
+}

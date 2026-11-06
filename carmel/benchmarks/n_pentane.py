@@ -26,6 +26,7 @@ from carmel.benchmarks.contract import (
     validate_mechanism_pair,
     validate_species_inventories,
 )
+from carmel.benchmarks.revision import EtherTarget, Revision, verify_revision
 from carmel.services.respecth import RespecthRefusal, parse_idt_record
 from carmel.services.respecth_archive import PinnedArchive
 from carmel.services.respecth_series import parse_series_record
@@ -124,6 +125,7 @@ class Scoring(FrozenModel):
     requires: Literal["jsr-adapter"]
     refusals: tuple[str, ...]
     locking: str
+    target_chemistry: EtherTarget
 
 
 class Contract(FrozenModel):
@@ -138,6 +140,7 @@ class Contract(FrozenModel):
     split: Split
     scoring: Scoring
     leakage_limits: tuple[str, ...]
+    revision: Revision
 
     @model_validator(mode="after")
     def frozen_invariants(self) -> Self:
@@ -315,7 +318,10 @@ def require_structural_absence(
 
 
 def load_contract(path: Path) -> Contract:
-    return Contract.model_validate_json(read_pinned_file(path))
+    data = read_pinned_file(path)
+    contract = Contract.model_validate_json(data)
+    verify_revision(data)
+    return contract
 
 
 def split_totals(split: Split) -> dict[str, int]:

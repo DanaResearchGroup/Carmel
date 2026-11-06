@@ -20,6 +20,7 @@ from pydantic import model_validator
 from carmel.adapters.t3 import T3_LAYOUT
 from carmel.benchmarks.cantera_worker import (
     DEFAULT_ROW_WALL_CEILING_S,
+    FFCM1_EXCITED_SHA256,
     THREAD_ENV,
     canonical_reaction_key,
     validate_row_refusal,
@@ -70,6 +71,9 @@ class WorkerRequest(FrozenModel):
 
     schema_version: Literal[1] = 1
     observable: Literal["jsr", "idt"] = "jsr"
+    excited_state_submechanism_sha256: (
+        Literal["49d61ec0c538eca831336d2ab316a0dbed212b6f4d44fa10082ab7ca071e918b"] | None
+    ) = None
     mechanism_path: Path
     thermo_path: Path
     converted_yaml_path: Path
@@ -85,6 +89,10 @@ class WorkerRequest(FrozenModel):
         expected = WorkerRequestRow if self.observable == "jsr" else IDTWorkerRequestRow
         if any(not isinstance(row, expected) for row in self.rows):
             raise ValueError("row type does not match request observable")
+        if self.observable == "idt":
+            object.__setattr__(self, "excited_state_submechanism_sha256", FFCM1_EXCITED_SHA256)
+        elif self.excited_state_submechanism_sha256 is not None:
+            raise ValueError("excited-state submechanism is only defined for IDT")
         return self
 
 
@@ -112,6 +120,7 @@ class WorkerResponse(FrozenModel):
     status: Literal["ok", "refused"]
     rows: tuple[WorkerResponseRow, ...]
     converter: dict[str, Any]
+    excited_state_submechanism: dict[str, Any] | None = None
     plog_trims: tuple[dict[str, Any], ...] = ()
     pressure_refusals: tuple[dict[str, Any], ...] = ()
     plog_validation_sha256: str | None = None
@@ -444,6 +453,33 @@ def score_metric(
         return {"overall": fmean(scores) if scores else None, "per_species": per_species, "refusals": local_refusals}
 
     return {"all": subset(False), "low_temperature_600_900_k": subset(True)}
+
+
+TARGET_ETHERS = {
+    "C5H10O1-2": "CCCC1CO1",
+    "C5H10O1-3": "CCC1CCO1",
+    "C5H10O1-4": "CC1CCCO1",
+    "C5H10O2-3": "CCC1OC1C",
+    "C5H10O2-4": "CC1CC(C)O1",
+}
+
+
+def target_jsr_metric(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Use the existing JSR metric and full frozen clamps for the five declared ethers."""
+    selected = [row for row in rows if row["species"] in TARGET_ETHERS]
+    limits, refusals, sources = _metric_limits(rows)
+    metric = score_metric(
+        selected,
+        metric_limits=(limits, [r for r in refusals if r["species"] in TARGET_ETHERS], sources),
+    )["all"]
+    # Report every declared ether, including one with no scorable row, so its zero count stays visible.
+    metric["per_species"] = {
+        species: metric["per_species"].get(
+            species, {"score": None, "scored_rows": 0, "detection_limit": limits.get(species)}
+        )
+        for species in TARGET_ETHERS
+    }
+    return {"species": dict(TARGET_ETHERS), "total_observations": len(selected), **metric}
 
 
 def _temperature_band(temperature_k: float) -> str:
@@ -867,5 +903,6 @@ def run_harness(
         "detection_limits": metric_limits[0],
         "detection_limit_sources": metric_limits[2],
         "metric": score_metric(metric_rows, metric_limits=metric_limits),
+        "target_chemistry": target_jsr_metric(metric_rows),
         "metric_rows": metric_rows,
     }

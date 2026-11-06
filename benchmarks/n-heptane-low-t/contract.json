@@ -12808,7 +12808,15 @@
       "Missing speciation numerics or uncalibrated/figure-only signal is UNAVAILABLE or unscored, never an invented observation.",
       "A changed pin, split count or unresolved eligible old species fails the benchmark before scoring; it is not an omitted point."
     ],
-    "locking": "Before the single holdout evaluation, record candidate mechanism SHA256, baseline SHA256, contract SHA256, matcher/version and G5 grouping, simulator/version, ignition definitions and time horizon. Lock candidate and all evaluator settings after development; no holdout-driven retries, tuning, pathway search or point exclusions. Failed points are reported in that single evaluation. With G5 merged into G1 declare four type units and denominator 4 before lock."
+    "locking": "Before the single holdout evaluation, record candidate mechanism SHA256, baseline SHA256, contract SHA256, matcher/version and G5 grouping, simulator/version, ignition definitions and time horizon. Lock candidate and all evaluator settings after development; no holdout-driven retries, tuning, pathway search or point exclusions. Failed points are reported in that single evaluation. With G5 merged into G1 declare four type units and denominator 4 before lock.",
+    "target_chemistry": {
+      "temperature_min_k": 600,
+      "temperature_max_k": 1000,
+      "inclusive": true,
+      "frozen_points": 124,
+      "metric": "mean_abs_log10_delay_ratio"
+    },
+    "excited_state_submechanism_sha256": "49d61ec0c538eca831336d2ab316a0dbed212b6f4d44fa10082ab7ca071e918b"
   },
   "leakage_limits": [
     "Retuning is separate from addition: Zhang2016 Table2 rate changes and thermochemistry updates do not earn structural credit; a fitted observable cannot establish pathway recovery.",
@@ -12821,5 +12829,10 @@
     "PDF-only observations, uncalibrated mass spectra and histories are not scalar responses. Use named open numeric sources; do not count speciation cells as independent experiments.",
     "Dataset provenance/weighting: preserve DOI, Git blobs and whole-study IDs; report the 15 RCM points as ideal constant-volume with supplied T/p and no invented volume/heat-loss histories.",
     "Do not inspect holdout error until candidate locking; one holdout evaluation per frozen candidate. Record refusal reasons and coverage instead of selecting successful points."
-  ]
+  ],
+  "revision": {
+    "number": 2,
+    "previous_contract_sha256": "7cd90d0594f645257b4d268c0b6c21a74429a8e32e80686c2894e20d394c94e5",
+    "reason": "Owner-authorized secondary-score revision before any candidate was scored: declare aggregate and target-chemistry scores; case 1 uses identical pinned FFCM-1 OH*/CH* chemistry for every mechanism, replacing native excited chemistry."
+  }
 }

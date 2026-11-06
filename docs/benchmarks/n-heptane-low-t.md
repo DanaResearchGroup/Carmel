@@ -1,5 +1,51 @@
 # Frozen n-heptane low-temperature benchmark
 
+## Secondary-score revision 2
+
+Before any candidate was scored, the owner authorized revision 2 of this contract.
+The previous contract byte SHA-256 is
+`7cd90d0594f645257b4d268c0b6c21a74429a8e32e80686c2894e20d394c94e5`.
+The revision record states the reason. Both `load_contract()` and the shared
+`validate_contract_json()` check the entire document against a reviewed canonical
+digest; editing a metric, pin, split or revision record without updating the reviewed
+revision fails as `UNRECORDED CONTRACT CHANGE`. The model classes remain structural
+validators for isolated test fixtures; production callers use these loading APIs.
+
+The aggregate IDT metric below is unchanged. The additional **target-chemistry score**
+uses the same mean absolute log10 delay ratio over **600 ≤ T ≤ 1000 K**, including
+both boundaries. The frozen window contains **124 points**: 109 shock-tube and 15
+RCM-ideal; 89 are at or below 900 K and 35 are above 900 K. The report retains separate
+shock-tube and RCM-ideal scores, individual errors and refusals within this window.
+
+Every typed IDT worker request, including baseline and candidate requests, installs
+the same pinned FFCM-1 OH*/CH* submechanism. Native `OHV`, `CHV`, `OH*` and `CH*`
+species and reactions involving them are replaced in the derived Cantera input.
+Ground-state species records and reactions are preserved. For the frozen v_new this
+replaces two species and 25 reactions; v_old has no native excited chemistry to remove.
+The common addition is two species and 25 reactions, with explicit local units.
+Missing ground-state dependencies, conflicting compositions or a ground-state reaction
+using a replaced species as collider stop conversion for owner review.
+
+Source: Smith, Tao and Wang, FFCM-1 (2016), retrieved 2026-11-06 from the
+[official release](https://web.stanford.edu/group/haiwanglab/FFCM1/pages/download.html).
+Only the extracted excited species/reactions are distributed, in
+`carmel/data/ffcm1_excited.json` (SHA-256
+`49d61ec0c538eca831336d2ab316a0dbed212b6f4d44fa10082ab7ca071e918b`).
+Its provenance records the complete reaction list and both upstream pins:
+
+| File | SHA-256 |
+| --- | --- |
+| [mech-FFCM1](https://web.stanford.edu/group/haiwanglab/FFCM1/download/mech-FFCM1) | `a0ec06a8ed857a4eb5e4a844100515e5e113f6e45ebb88119f18b7794656a7cb` |
+| [thermdat](https://web.stanford.edu/group/haiwanglab/FFCM1/download/thermdat) | `b346582aba5a59776f33e0c6188d271832278a89b55d9a6e2d62bf379ffc799e` |
+
+Stored ignition definitions are retained. A shared resolver accepts only the
+`OH*` ↔ `OHV` and `CH*` ↔ `CHV` aliases; an unknown excited label remains refused.
+The pin and aliases enter the simulation lock, and the augmented mechanism enters
+the checkpoint identity. Reports record every replaced and appended reaction.
+More than 58 non-solver shock-tube refusals fail the coverage gate; numerical solver
+failures, crashes and deterministic step exhaustion are reported separately. The
+existing requirement to score at least 12 of the 15 RCM-ideal points is retained.
+
 This benchmark tests whether a mechanism revision process recovers five documented
 low-temperature reaction types for **n-heptane**. Structural recovery is the primary
 score. Improvement in held-out ignition delay is secondary. Korcek chemistry is carried

@@ -196,6 +196,25 @@ models; unsupported values and mismatched row types are refused.
 
 ## Ignition delay
 
+For revision-2 case 1, the typed IDT request pins the small FFCM-1 excited-state data
+file described in the [case contract](n-heptane-low-t.md). After conversion and before
+validation/row execution, the worker replaces native OH*/CH*/OHV/CHV species and
+associated reactions with the pinned chemistry. Every ground-state record is retained;
+missing dependencies or a required change to a ground-state collider are refused.
+The appended rates carry their own units, independent of the parent mechanism's units.
+This applies identically to historical mechanisms, baseline and candidates. Raw legacy
+worker JSON without the pin remains usable for historical reproduction; all newly
+constructed typed IDT requests carry the pin automatically.
+
+The single target resolver maps OH* ↔ OHV and CH* ↔ CHV during both preflight and
+trace integration. Stored target text remains unchanged in the row and report.
+Unknown labels are still `target_species_absent`. The chemistry pin and alias map
+are included in the lock; checkpoints from the former refusal policy cannot resume.
+
+Case 1 now reports `target_chemistry` alongside `metric`, restricted to 600–1000 K
+inclusive and split by reactor group. Case 2 reports its five named C5 ethers in
+`target_chemistry`, preserving `metric.all` and `metric.low_temperature_600_900_k`.
+
 `carmel score-holdout-idt` uses the same worker, per-row subprocesses, thread pins,
 conversion rules, source-line reaction keys, lock fingerprint and `rows.jsonl` checkpoint.
 Supply `--split-root` pointing at the pinned ChemKED tree instead of the JSR `--archive`.
