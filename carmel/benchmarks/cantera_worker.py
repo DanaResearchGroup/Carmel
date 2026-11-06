@@ -19,9 +19,10 @@ import tempfile
 import time
 import warnings
 from collections.abc import Callable
+from dataclasses import dataclass
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 FFCM1_EXCITED_SHA256 = "49d61ec0c538eca831336d2ab316a0dbed212b6f4d44fa10082ab7ca071e918b"
 EXCITED_ALIASES = {"OH*": "OH*", "OHV": "OH*", "CH*": "CH*", "CHV": "CH*"}
@@ -157,15 +158,63 @@ IDT_TEMPERATURE_RISE_K = 50.0
 # coefficient fields, in CHEMKIN card order, with padding retained.
 REVIEWED_OH_NASA_SHA256 = "85ab13a7ce62508df7daf3411313e27f5e650008f665ec790e04c194aa7fb2d7"
 REVIEWED_CH_NASA_SHA256 = "4a3c493e51e59ada6dfba5d198e487ab5e78b907d4bd0ba32f217df460ae880f"
+
+
+@dataclass(frozen=True)
+class ReviewedNasaWarning:
+    """One reviewed warning and its exact source, independent of label spelling."""
+
+    labels: tuple[str, ...]
+    quantity: Literal["h/RT", "s/R", "cp/R"]
+    tmid_k: int
+    numeric_field_sha256: str
+    source_file: str
+    source_line: int
+    reason: str
+    requires_below_tmid: bool = False
+
+
+REVIEWED_NASA_WARNINGS = (
+    ReviewedNasaWarning(
+        ("OH*", "OHV"),
+        "h/RT",
+        1000,
+        REVIEWED_OH_NASA_SHA256,
+        "nuigmech_c5_july2015.therm",
+        25,
+        "Existing case-2 reviewed excited-OH enthalpy warning; exact numeric fields preserved.",
+    ),
+    ReviewedNasaWarning(
+        ("CH*", "CHV"),
+        "h/RT",
+        1000,
+        REVIEWED_CH_NASA_SHA256,
+        "nuigmech_c5_july2015.therm",
+        145,
+        "Existing case-2 reviewed excited-CH enthalpy warning; exact numeric fields preserved.",
+    ),
+    ReviewedNasaWarning(
+        ("EC6H13O2",),
+        "s/R",
+        1388,
+        "d1d4928748f6538395afde16ef286c6a78bc4cf4994c1f979f2290b1e6efb0b6",
+        "prf_v3_therm_dat.txt",
+        2987,
+        "0.64% s/R jump (107.806 vs 107.116) at 1388 K, above the case-3 holdout maximum "
+        "temperature (1100 K), so the high-T polynomial is never evaluated at a scored condition.",
+        requires_below_tmid=True,
+    ),
+)
+# Preserve the existing case-2 simulation-lock serialization and fingerprint.
 _REVIEWED_NASA_LABELS = {
-    "OH*": REVIEWED_OH_NASA_SHA256,
-    "OHV": REVIEWED_OH_NASA_SHA256,
-    "CH*": REVIEWED_CH_NASA_SHA256,
-    "CHV": REVIEWED_CH_NASA_SHA256,
+    label: review.numeric_field_sha256
+    for review in REVIEWED_NASA_WARNINGS
+    if not review.requires_below_tmid
+    for label in review.labels
 }
 _REVIEWED_NASA_WARNING = re.compile(
-    r"NasaPoly2::validate:\s*For species (OH\*|OHV|CH\*|CHV), "
-    r"discontinuity in h/RT detected at Tmid = 1000(?:\.0*)?\s*"
+    r"NasaPoly2::validate:\s*For species ([^,\s]+), "
+    r"discontinuity in (h/RT|s/R|cp/R) detected at Tmid = (\d+(?:\.0*)?)\s*"
     rf"(?:Value computed using low-temperature polynomial:\s*{_NUMBER_PATTERN}\s*"
     rf"Value computed using high-temperature polynomial:\s*{_NUMBER_PATTERN}\s*)?"
 )
@@ -377,13 +426,42 @@ def nasa7_record_digests(sources: tuple[bytes, ...]) -> dict[str, str | None]:
     return digests
 
 
-def cantera_validation_refusals(messages: list[str], thermo_sources: tuple[bytes, ...] = ()) -> list[str]:
-    """Allow only reviewed h/RT warnings with the pinned numeric-field digest."""
+def reviewed_nasa_warning(message: str) -> ReviewedNasaWarning | None:
+    """Find the exact reviewed label, quantity and midpoint; do not approve bytes."""
+    match = _REVIEWED_NASA_WARNING.fullmatch(message.strip())
+    if match is None:
+        return None
+    return next(
+        (
+            review
+            for review in REVIEWED_NASA_WARNINGS
+            if match[1] in review.labels and match[2] == review.quantity and float(match[3]) == review.tmid_k
+        ),
+        None,
+    )
+
+
+def cantera_validation_refusals(
+    messages: list[str],
+    thermo_sources: tuple[bytes, ...] = (),
+    *,
+    holdout_max_temperature_k: float | None = None,
+) -> list[str]:
+    """Match every review field and digest; enforce any temperature-dependent review."""
     digests = nasa7_record_digests(thermo_sources)
     refused = []
     for message in messages:
         match = _REVIEWED_NASA_WARNING.fullmatch(message.strip())
-        if match is None or digests.get(match[1]) != _REVIEWED_NASA_LABELS[match[1]]:
+        review = reviewed_nasa_warning(message)
+        if (
+            match is None
+            or review is None
+            or digests.get(match[1]) != review.numeric_field_sha256
+            or (
+                review.requires_below_tmid
+                and not (holdout_max_temperature_k is not None and 0 < holdout_max_temperature_k < review.tmid_k)
+            )
+        ):
             refused.append(message)
     return refused
 
@@ -1334,7 +1412,13 @@ def main() -> int:
     thermo_sources: tuple[bytes, ...] = ()
     if any(_REVIEWED_NASA_WARNING.fullmatch(message.strip()) for message in response["validation_warnings"]):
         thermo_sources = (Path(request["mechanism_path"]).read_bytes(), Path(request["thermo_path"]).read_bytes())
-    unexpected = cantera_validation_refusals(response["validation_warnings"], thermo_sources)
+    unexpected = cantera_validation_refusals(
+        response["validation_warnings"],
+        thermo_sources,
+        holdout_max_temperature_k=(
+            max((float(row["temperature_k"]) for row in request["rows"]), default=None) if observable == "jsr" else None
+        ),
+    )
     if unexpected:
         response["refusal"] = "unallowlisted_cantera_validation_warning"
         _write_response(response_path, response)
