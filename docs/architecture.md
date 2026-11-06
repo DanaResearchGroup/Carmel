@@ -508,11 +508,36 @@ and no OpenRouter default model, so it needs an explicit `model_name`.
 
 **Default DEV model.** `auto:nemotron-free` resolves at build time to the free NVIDIA
 Nemotron with the largest context window in the live catalogue, preferring ≥ 1M tokens.
+
 It is a family rather than a pinned id because free ids come and go.
 
 **Errors.** HTTP 429 (free models are rate-limited per account) raises
 `ModelRateLimitedError`, an `AgentBridgeError` with `retriable = True`. A 404 is cached as a
 dead model for the process, as for other providers.
+
+## Literature Search Providers
+
+`agents.search_provider` selects exactly one literature search backend. The default is
+`semantic_scholar`, which uses the Semantic Scholar Graph API and works without an API key.
+When `agents.semantic_scholar_api_key` or `CARMEL_SEMANTIC_SCHOLAR_API_KEY` is configured,
+Carmel sends it only in the `x-api-key` request header. `agents.semantic_scholar_min_interval_s`
+sets the minimum request-start interval (default `1.0`; values below one second are invalid).
+When multiple configurations use the same process, the limiter keeps the largest configured
+interval for that process lifetime.
+The limiter is shared by search and DOI-based Semantic Scholar open-access lookup within one
+Carmel process. Separate Carmel processes do not coordinate their request starts.
+
+Other choices are `openalex`, `crossref`, and `http_json`. The latter requires both
+`search_endpoint` and `search_api_key_env`; configurations that set either field must explicitly
+set `search_provider: http_json`, so moving to the new default cannot silently redirect an old
+custom search configuration.
+
+```yaml
+agents:
+  search_provider: semantic_scholar # default
+  semantic_scholar_min_interval_s: 1.0
+  # Set CARMEL_SEMANTIC_SCHOLAR_API_KEY in the environment for the optional API key.
+```
 
 ## External Tools
 

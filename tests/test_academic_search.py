@@ -13,13 +13,18 @@ alongside the article they belong to.
 from __future__ import annotations
 
 import json
+import threading
+import time
 import urllib.error
+from datetime import UTC, datetime, timedelta
+from email.message import Message
+from email.utils import format_datetime
 from typing import Any
 
 import pytest
 
 import carmel.agents.tools.academic as academic
-from carmel.agents.budget import BudgetLedger
+from carmel.agents.budget import BudgetDimension, BudgetExceededError, BudgetLedger
 from carmel.agents.tools.academic import (
     ARXIV_ENDPOINT,
     CHEMRXIV_ENDPOINT,
@@ -37,6 +42,8 @@ from carmel.agents.tools.academic import (
     OaTier,
     OpenAccessResolver,
     OpenAlexSearchTool,
+    SemanticScholarRateLimiter,
+    SemanticScholarSearchTool,
     arxiv_oa_candidates,
     chemrxiv_oa_candidates,
     core_oa_candidates,
@@ -50,7 +57,7 @@ from carmel.agents.tools.academic import (
     semantic_scholar_oa_candidates,
     unpaywall_oa_pdf_urls,
 )
-from carmel.agents.tools.search import SearchResult
+from carmel.agents.tools.search import SearchError, SearchResult
 from carmel.config import AgentBudgetConfig
 
 
@@ -95,9 +102,606 @@ def _opener_for(payload: Any, seen: list[str] | None = None) -> Any:
     return opener
 
 
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+        self.lock = threading.Lock()
+
+    def clock(self) -> float:
+        with self.lock:
+            return self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self.lock:
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+
+def _semantic_scholar_payload() -> dict[str, Any]:
+    return {
+        "total": 4,
+        "offset": 0,
+        "next": None,
+        "data": [
+            {
+                "paperId": "paper-1",
+                "title": "Ignition delay measurements",
+                "year": 2024,
+                "authors": [{"authorId": "a1", "name": "A. Author"}],
+                "venue": "Combustion and Flame",
+                "externalIds": {"DOI": "10.1016/j.caf.2024.000001"},
+                "publicationTypes": ["JournalArticle"],
+                "openAccessPdf": {"url": "https://repo.example/paper.pdf"},
+                "abstract": "Measured ignition delay in a shock tube.",
+                "url": "https://www.semanticscholar.org/paper/paper-1",
+            },
+            {
+                "paperId": "paper-editorial",
+                "title": "Editorial: combustion research",
+                "externalIds": {"DOI": "10.1111/editorial"},
+                "publicationTypes": ["Editorial"],
+            },
+            {
+                "paperId": "paper-letter",
+                "title": "A short letter with new ignition measurements",
+                "externalIds": {"DOI": "10.2222/letter"},
+                "publicationTypes": ["LettersAndComments"],
+                "url": "https://www.semanticscholar.org/paper/paper-letter",
+            },
+            {
+                "paperId": "paper-review",
+                "title": "Review of ignition kinetics",
+                "externalIds": {"DOI": "10.3333/review"},
+                "publicationTypes": ["Review"],
+                "url": "https://www.semanticscholar.org/paper/paper-review",
+            },
+        ],
+    }
+
+
+def _http_error(status: int, retry_after: str | None = None) -> urllib.error.HTTPError:
+    headers = Message()
+    if retry_after is not None:
+        headers["Retry-After"] = retry_after
+    return urllib.error.HTTPError(
+        "https://api.semanticscholar.org/graph/v1/paper/search", status, "rate limited", headers, None
+    )
+
+
 @pytest.fixture
 def ledger() -> BudgetLedger:
     return BudgetLedger(AgentBudgetConfig())
+
+
+class TestSemanticScholarSearchTool:
+    def test_expired_wall_clock_before_first_attempt_does_not_open(self) -> None:
+        clock = _FakeClock()
+        ledger = BudgetLedger(AgentBudgetConfig(max_wall_clock_s=0.1), now=clock.clock)
+        clock.sleep(0.2)
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            return _FakeResponse({"data": []})
+
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+        with pytest.raises(BudgetExceededError):
+            tool.search("expired")
+        assert attempts == 0
+
+    def test_wall_clock_expiring_during_retry_sleep_stops_next_attempt(self) -> None:
+        clock = _FakeClock()
+        ledger = BudgetLedger(AgentBudgetConfig(max_wall_clock_s=0.5), now=clock.clock)
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            raise _http_error(503)
+
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+        with pytest.raises(BudgetExceededError):
+            tool.search("retry expires")
+        assert attempts == 1
+
+    def test_wall_clock_expiring_during_limiter_wait_prevents_opener(self) -> None:
+        clock = _FakeClock()
+        limiter = SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep)
+        limiter.start_request(lambda: None)
+        ledger = BudgetLedger(AgentBudgetConfig(max_wall_clock_s=0.5), now=clock.clock)
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            return _FakeResponse({"data": []})
+
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=limiter,
+            sleep=clock.sleep,
+        )
+        with pytest.raises(BudgetExceededError):
+            tool.search("wait expires")
+        assert attempts == 0
+
+    def test_oa_resolution_propagates_budget_exhaustion(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", frozenset({"Semantic Scholar"}))
+        ledger = BudgetLedger(AgentBudgetConfig())
+        exhausted = BudgetExceededError(BudgetDimension.WALL_CLOCK_S, 2.0, 1.0)
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            raise exhausted
+
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            semantic_scholar_rate_limiter=SemanticScholarRateLimiter(),
+        )
+        with pytest.raises(BudgetExceededError) as caught:
+            resolver.resolve("10.1016/j.caf.2024.000001")
+        assert caught.value is exhausted
+        assert ledger.usage().index_lookups == 1
+
+    def test_retry_after_parse_failure_and_cap_fall_back_to_bounded_delay(self) -> None:
+        assert academic._retry_after_seconds("not an HTTP date") is None
+        assert academic._retry_after_seconds("120") == 60.0
+        assert academic._retry_after_seconds("Wed, 21 Oct 2015 07:28:00") == 0.0
+
+    def test_rate_limiter_rejects_interval_below_one_second(self) -> None:
+        with pytest.raises(ValueError, match="at least 1.0 seconds"):
+            SemanticScholarRateLimiter(0.5)
+        limiter = SemanticScholarRateLimiter()
+        with pytest.raises(ValueError, match="at least 1.0 seconds"):
+            limiter.configure(0.5)
+
+    def test_maps_documented_schema_doi_and_narrow_publication_type_filter(self, ledger: BudgetLedger) -> None:
+        clock = _FakeClock()
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=_opener_for(_semantic_scholar_payload()),
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+
+        results = tool.search("ignition delay")
+
+        assert [result.title for result in results] == [
+            "Ignition delay measurements",
+            "A short letter with new ignition measurements",
+            "Review of ignition kinetics",
+        ]
+        assert results[0].doi == "10.1016/j.caf.2024.000001"
+        assert results[0].pdf_url == "https://repo.example/paper.pdf"
+        assert results[0].is_open_access is True
+        assert results[0].repository == ""
+        assert "shock tube" in results[0].snippet
+        assert results[0].source == "semantic_scholar"
+
+    @pytest.mark.parametrize("payload", [{}, {"data": None}, {"data": "not a list"}])
+    def test_malformed_data_field_returns_no_results(self, ledger: BudgetLedger, payload: dict[str, Any]) -> None:
+        clock = _FakeClock()
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=_opener_for(payload),
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+
+        assert tool.search("ignition delay") == []
+
+    def test_withheld_consent_refuses_before_opening_network(self, ledger: BudgetLedger) -> None:
+        calls: list[str] = []
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            calls.append(url)
+            return _FakeResponse({"data": []})
+
+        clock = _FakeClock()
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=False,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+
+        with pytest.raises(SearchError, match="external_provider_consent is False"):
+            tool.search("ignition delay")
+        assert calls == []
+
+    def test_null_publication_types_and_missing_external_ids_keep_paper(self, ledger: BudgetLedger) -> None:
+        payload = {
+            "data": [
+                {"title": "No publication type", "publicationTypes": None, "url": "https://example.test/1"},
+                {"title": "Missing external IDs", "url": "https://example.test/2"},
+                {"title": "Paper ID fallback", "paperId": "paper-id-only"},
+                {"title": "No DOI or landing URL"},
+                "malformed row",
+                {"publicationTypes": None, "url": "https://example.test/3"},
+            ]
+        }
+        clock = _FakeClock()
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=_opener_for(payload),
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+
+        results = tool.search("ignition delay")
+
+        assert [result.title for result in results] == [
+            "No publication type",
+            "Missing external IDs",
+            "Paper ID fallback",
+        ]
+        assert results[-1].url == "https://www.semanticscholar.org/paper/paper-id-only"
+        assert all(result.doi is None for result in results)
+
+    @pytest.mark.parametrize("api_key", [None, "secret-s2-key"])
+    def test_key_is_only_sent_as_optional_header(self, ledger: BudgetLedger, api_key: str | None) -> None:
+        calls: list[tuple[str, dict[str, str]]] = []
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            calls.append((url, headers))
+            return _FakeResponse({"data": []})
+
+        clock = _FakeClock()
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            api_key=api_key,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+        tool.search("test")
+
+        assert len(calls) == 1
+        url, headers = calls[0]
+        assert "secret-s2-key" not in url
+        assert "api_key" not in url
+        if api_key is None:
+            assert "x-api-key" not in headers
+        else:
+            assert headers["x-api-key"] == api_key
+
+    def test_back_to_back_calls_wait_for_minimum_interval(self, ledger: BudgetLedger) -> None:
+        clock = _FakeClock()
+        starts: list[float] = []
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            starts.append(clock.clock())
+            return _FakeResponse({"data": []})
+
+        limiter = SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep)
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=limiter,
+            sleep=clock.sleep,
+        )
+        tool.search("first")
+        tool.search("second")
+        assert starts[1] - starts[0] >= 1.0
+
+    def test_limiter_measures_interval_from_request_completion(self) -> None:
+        clock = _FakeClock()
+        limiter = SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep)
+        starts: list[float] = []
+
+        def request() -> None:
+            starts.append(clock.clock())
+            clock.now += 0.25
+
+        limiter.start_request(request)
+        completed_at = clock.clock()
+        limiter.start_request(request)
+
+        assert starts[1] - completed_at >= 1.0
+
+    def test_limiter_reanchors_after_request_raises(self) -> None:
+        clock = _FakeClock()
+        limiter = SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep)
+        starts: list[float] = []
+
+        def failing_request() -> None:
+            starts.append(clock.clock())
+            clock.now += 0.25
+            raise RuntimeError("request failed")
+
+        with pytest.raises(RuntimeError, match="request failed"):
+            limiter.start_request(failing_request)
+        completed_at = clock.clock()
+        limiter.start_request(lambda: starts.append(clock.clock()))
+
+        assert starts[1] - completed_at >= 1.0
+
+    def test_lock_wait_rechecks_clock_after_acquiring_lock(self) -> None:
+        clock = _FakeClock()
+        limiter = SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep)
+        assert limiter.start_request(clock.clock) == 0.0
+        limiter._lock.acquire()
+        returned: list[float] = []
+        entered = threading.Event()
+
+        def queued_caller() -> None:
+            entered.set()
+            returned.append(limiter.start_request(clock.clock))
+
+        worker = threading.Thread(target=queued_caller)
+        worker.start()
+        assert entered.wait(timeout=1)
+        clock.now = 2.0
+        limiter._lock.release()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert returned == [2.0]
+        assert clock.sleeps == []
+
+    def test_concurrent_calls_never_start_closer_than_interval(self, ledger: BudgetLedger) -> None:
+        limiter = SemanticScholarRateLimiter()
+        starts: list[float] = []
+        starts_lock = threading.Lock()
+        barrier = threading.Barrier(4)
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            with starts_lock:
+                starts.append(time.monotonic())
+            return _FakeResponse({"data": []})
+
+        tools = [
+            SemanticScholarSearchTool(
+                ledger=ledger,
+                external_provider_consent=True,
+                opener=opener,
+                rate_limiter=limiter,
+            )
+            for _ in range(4)
+        ]
+
+        def call(tool: SemanticScholarSearchTool) -> None:
+            barrier.wait(timeout=3)
+            tool.search("concurrent")
+
+        threads = [threading.Thread(target=call, args=(tool,)) for tool in tools]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=6)
+            assert not thread.is_alive()
+        assert len(starts) == 4
+        starts.sort()
+        assert all(right - left >= 1.0 for left, right in zip(starts, starts[1:], strict=False))
+
+    def test_search_and_oa_resolver_share_limiter(self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", frozenset({"Semantic Scholar"}))
+        clock = _FakeClock()
+        starts: list[float] = []
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            starts.append(clock.clock())
+            return _FakeResponse({"data": []} if "query=first" in url else {})
+
+        limiter = SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep)
+        SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=limiter,
+            sleep=clock.sleep,
+        ).search("first")
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            semantic_scholar_rate_limiter=limiter,
+            sleep=clock.sleep,
+        )
+        resolver.resolve("10.1016/j.caf.2024.000001")
+        assert len(starts) == 2
+        assert starts[1] - starts[0] >= 1.0
+
+    def test_default_search_and_oa_tools_get_one_process_limiter(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(academic, "_SEMANTIC_SCHOLAR_LIMITER", None)
+        search = SemanticScholarSearchTool(ledger=ledger, external_provider_consent=True)
+        resolver = OpenAccessResolver(ledger=ledger, external_provider_consent=True)
+        assert search._rate_limiter is resolver._semantic_scholar_rate_limiter
+
+    def test_retry_after_seconds_is_honored(self, ledger: BudgetLedger) -> None:
+        clock = _FakeClock()
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise _http_error(429, "3")
+            return _FakeResponse({"data": []})
+
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+        tool.search("retry")
+        assert attempts == 2
+        assert clock.sleeps[0] == 3.0
+
+    def test_server_errors_retry_but_other_client_errors_do_not(self, ledger: BudgetLedger) -> None:
+        for status, expected_attempts in ((503, 2), (403, 1)):
+            clock = _FakeClock()
+            attempts = 0
+
+            def opener(
+                url: str,
+                *,
+                headers: dict[str, str],
+                timeout_s: float,
+                failure_status: int = status,
+            ) -> _FakeResponse:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1 or failure_status == 403:
+                    raise _http_error(failure_status)
+                return _FakeResponse({"data": []})
+
+            tool = SemanticScholarSearchTool(
+                ledger=ledger,
+                external_provider_consent=True,
+                opener=opener,
+                rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+                sleep=clock.sleep,
+            )
+            if status == 403:
+                with pytest.raises(SearchError):
+                    tool.search("retry")
+            else:
+                tool.search("retry")
+            assert attempts == expected_attempts
+
+    def test_server_error_retries_exhaust_with_typed_search_error(self, ledger: BudgetLedger) -> None:
+        clock = _FakeClock()
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            raise _http_error(503)
+
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+
+        with pytest.raises(SearchError, match=r"after 4 attempts \(HTTP 503\)") as error:
+            tool.search("retry")
+
+        assert error.value.status == 503
+        assert attempts == 4
+
+    def test_retry_after_http_date_is_honored(self, ledger: BudgetLedger) -> None:
+        clock = _FakeClock()
+        attempts = 0
+        retry_after = format_datetime(datetime.now(UTC) + timedelta(seconds=10), usegmt=True)
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise _http_error(429, retry_after)
+            return _FakeResponse({"data": []})
+
+        SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        ).search("retry")
+        assert attempts == 2
+        assert 8.0 <= clock.sleeps[0] <= 10.0
+
+    def test_retries_exhaust_with_typed_cause_and_four_bounded_attempts(self, ledger: BudgetLedger) -> None:
+        clock = _FakeClock()
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            raise _http_error(429)
+
+        tool = SemanticScholarSearchTool(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+        with pytest.raises(SearchError, match="rate-limited.*no API key configured.*CARMEL_SEMANTIC_SCHOLAR_API_KEY"):
+            tool.search("retry")
+        assert attempts == 4
+        assert ledger.usage().index_lookups == 4
+
+    def test_oa_resolver_is_fail_soft_when_retries_exhaust(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", frozenset({"Semantic Scholar"}))
+        clock = _FakeClock()
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            raise _http_error(429)
+
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            semantic_scholar_rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+        result = resolver.resolve("10.1016/j.caf.2024.000001")
+        assert attempts == 4
+        assert result.coverage == OaLookupCoverage.PARTIAL
+        assert "rate-limited" in result.note
+
+    def test_oa_resolver_stops_retry_when_per_paper_attempt_cap_is_reached(
+        self, ledger: BudgetLedger, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(academic, "DEFAULT_ENABLED_PROVIDERS", frozenset({"Semantic Scholar"}))
+        monkeypatch.setattr(academic, "MAX_OA_LOOKUP_CALLS_PER_PAPER", 1)
+        clock = _FakeClock()
+        attempts = 0
+
+        def opener(url: str, *, headers: dict[str, str], timeout_s: float) -> _FakeResponse:
+            nonlocal attempts
+            attempts += 1
+            raise _http_error(429)
+
+        resolver = OpenAccessResolver(
+            ledger=ledger,
+            external_provider_consent=True,
+            opener=opener,
+            semantic_scholar_rate_limiter=SemanticScholarRateLimiter(clock=clock.clock, sleep=clock.sleep),
+            sleep=clock.sleep,
+        )
+
+        result = resolver.resolve("10.1016/j.caf.2024.000001")
+
+        assert attempts == 1
+        assert result.coverage == OaLookupCoverage.PARTIAL
+        assert "per-paper lookup cap of 1 attempts" in result.note
 
 
 class TestNormalizeDoi:

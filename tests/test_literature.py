@@ -32,7 +32,7 @@ from carmel.agents.tools.academic import OaLookupCoverage, OaResolution, OpenAcc
 from carmel.agents.tools.extract import extract_text
 from carmel.agents.tools.fetch import FetchedArtifact, FetchError, HttpFetchTool, MockFetchTool
 from carmel.agents.tools.search import MockSearchTool, SearchError, SearchResult
-from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier
+from carmel.config import AgentBudgetConfig, AgentConfig, AgentProvider, ModelTier, SearchProvider
 from carmel.schemas import (
     ActionKind,
     ApprovalRequirement,
@@ -1070,11 +1070,19 @@ class TestBuildDeps:
         assert isinstance(deps.verifier_model, MockModel)
         assert deps.verifier_model is not deps.model
 
+    def test_default_search_tool_is_semantic_scholar(self) -> None:
+        config = AgentConfig()
+        tool = literature_module._build_search_tool(config, BudgetLedger(config.budget))
+        from carmel.agents.tools.academic import SemanticScholarSearchTool
+
+        assert isinstance(tool, SemanticScholarSearchTool)
+
     def test_real_provider_without_search_endpoint_fails_closed(self) -> None:
         config = AgentConfig(
             tier=ModelTier.DEV,
             provider=AgentProvider.GOOGLE,
             api_key_env="CARMEL_TEST_FAKE_KEY",
+            search_provider=SearchProvider.HTTP_JSON,
             external_provider_consent=True,
         )
         with pytest.raises(AgentBridgeError, match="search_endpoint"):
@@ -1085,6 +1093,7 @@ class TestBuildDeps:
             tier=ModelTier.DEV,
             provider=AgentProvider.GOOGLE,
             api_key_env="CARMEL_TEST_FAKE_KEY",
+            search_provider=SearchProvider.HTTP_JSON,
             external_provider_consent=True,
             search_endpoint="https://search.example.com/api",
         )
@@ -1097,6 +1106,7 @@ class TestBuildDeps:
             tier=ModelTier.DEV,
             provider=AgentProvider.GOOGLE,
             api_key_env="CARMEL_TEST_FAKE_KEY",
+            search_provider=SearchProvider.HTTP_JSON,
             external_provider_consent=True,
             search_endpoint="https://search.example.com/api",
             search_api_key_env="CARMEL_TEST_SEARCH_KEY",

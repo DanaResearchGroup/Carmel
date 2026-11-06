@@ -15,6 +15,7 @@ from carmel.config import (
     AgentProvider,
     CarmelConfig,
     ModelTier,
+    SearchProvider,
 )
 
 
@@ -128,6 +129,7 @@ class TestAgentConfigEnvVarValidation:
                 tier=ModelTier.DEV,
                 provider=AgentProvider.GOOGLE,
                 api_key_env="GOOGLE_API_KEY",
+                search_provider=SearchProvider.HTTP_JSON,
                 search_api_key_env="not-valid",
             )
 
@@ -136,9 +138,33 @@ class TestAgentConfigEnvVarValidation:
             tier=ModelTier.DEV,
             provider=AgentProvider.GOOGLE,
             api_key_env="GOOGLE_API_KEY",
+            search_provider=SearchProvider.HTTP_JSON,
             search_api_key_env="SEARCH_API_KEY",
         )
         assert cfg.search_api_key_env == "SEARCH_API_KEY"
+
+    def test_default_search_provider_is_semantic_scholar(self) -> None:
+        cfg = AgentConfig()
+        assert cfg.search_provider == SearchProvider.SEMANTIC_SCHOLAR
+        assert cfg.semantic_scholar_min_interval_s == 1.0
+
+    @pytest.mark.parametrize("value", [0.99, 0, -1])
+    def test_semantic_scholar_interval_must_be_at_least_one_second(self, value: float) -> None:
+        with pytest.raises(ValidationError, match="semantic_scholar_min_interval_s"):
+            AgentConfig(semantic_scholar_min_interval_s=value)
+
+    @pytest.mark.parametrize("value", ["soon", "1.5", True, float("inf"), float("nan")])
+    def test_semantic_scholar_interval_rejects_malformed_value(self, value: Any) -> None:
+        with pytest.raises(ValidationError, match="semantic_scholar_min_interval_s"):
+            AgentConfig(semantic_scholar_min_interval_s=value)  # type: ignore[arg-type]
+
+    def test_search_endpoint_requires_explicit_http_json(self) -> None:
+        with pytest.raises(ValidationError, match="set search_provider: http_json"):
+            AgentConfig(search_endpoint="https://search.example.test")
+
+    def test_search_key_env_requires_explicit_http_json(self) -> None:
+        with pytest.raises(ValidationError, match="set search_provider: http_json"):
+            AgentConfig(search_api_key_env="SEARCH_API_KEY")
 
 
 class TestResolvedModelName:
