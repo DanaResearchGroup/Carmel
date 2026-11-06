@@ -228,7 +228,10 @@ or heat loss. The locked horizon is **1.0 s**, independently of the measured del
 and absolute tolerances are **1e-8** and **1e-16**. The initial t=0 state is included, and the
 integrator steps until it reaches the horizon, retaining the final step as T3 does. A resolved
 event must have a finite positive delay at or before 1.0 s and a temperature rise of at least
-**50 K**. No event meeting those requirements yields `ignition_not_reached`.
+**50 K**. Refusals report the first failed condition: `no_ignition_within_horizon` when
+the source definition finds no delay, `source_delay_nonfinite`,
+`source_delay_outside_horizon` (including a nonpositive delay),
+`temperature_rise_below_minimum`, or `trace_unresolved`.
 
 IDT execution carries every removed PLOG level's kept pressure bracket into the row
 process. It checks the initial pressure and every integration step, including a step
@@ -243,7 +246,16 @@ Event definitions follow the T3 experimental numerical path: `max` selects the f
 `1/2 max` interpolates the first rising half-absolute-peak crossing; `d/dt max extrapolated`
 intersects the maximum-slope tangent with the initial target baseline. Species traces use mole
 fractions, pressure uses Pa, and temperature uses K. T3's history-free trace-span and settled-tail
-checks establish that the event finishes within the trace. These semantics were checked against
+checks establish that the event finishes within the trace. For the excited targets in the
+shared alias map (`OH*`/`OHV`, `CH*`/`CHV`), the span check is relative:
+`max(abs(y)) > 0` and `span > 1e-6 * max(abs(y))`. Ground-state species retain the
+absolute `1e-12` floor; pressure and temperature retain their existing relative floor.
+The peak endpoint and derivative-tail checks keep their relative thresholds; their
+machine-epsilon floor is absolute for ground-state targets and scaled to the signal
+(`eps * max(abs(y))`, `eps * max(abs(dy/dt))`) for excited targets, so a faint trace still
+rising at the horizon stays unresolved. The simulation lock records
+`t3_source_defined_idt_is_resolved_excited_relative_span_v3`, preventing reuse of checkpoints
+from earlier excited-target rules. The original event semantics were checked against
 T3 commit `4043bb98fcbbad5c252d8e1d57bbfabc6aa76087`. The dispatch deliberately fixes constant
 volume and 1.0 s for every point; T3's broader experimental wrapper has different defaults for
 RCM and its observation-dependent horizon.
@@ -255,20 +267,20 @@ from that detached reference, using real Cantera/NumPy and replacing only the un
 base with `object`. It records the source SHA-256 and this limitation; it does not claim a
 full T3 application integration test.
 
-An undeclared exact target produces `target_species_absent`, naming the target. OHV/CHV are
-not substituted for OH*/CH*, even though their reviewed thermo warning digests agree.
+An undeclared target produces `target_species_absent`, naming the target. The shared alias
+map resolves OHV/CHV and OH*/CH* to the pinned excited-state submechanism.
 Missing targets are checkpointed before simulation. IDT integrates to the existing one-second
 reactor-time horizon with at most **1,000,000 accepted integrator steps**. Exhausting the step
 budget before the horizon gives `max_steps_exceeded`; a completed trace without a qualifying
-ignition gives `ignition_not_reached`. Solver failure and fatal signals remain row refusals;
+ignition gives the first failed condition listed above. Solver failure and fatal signals remain row refusals;
 construction defects and wall-ceiling expiry refuse the run. The wall ceiling and worker count
 match the JSR CLI controls.
 
 IDT scoring is the equal-point mean `abs(log10(tau_sim_seconds / tau_exp_seconds))` over
 finite, strictly positive delays. Reports retain all point IDs, per-point errors/refusals,
 coverage, reactor groups and contract temperature bands (<750, 750–900 inclusive, >900 K).
-The dispatch gate requires all 174 shock points to be refused for absent targets and at least
-12 of the 15 RCM-ideal points to score for each mechanism. A failed gate is reported after
+The revised dispatch gate permits at most 58 non-solver refusals among the 174 shock points
+and requires at least 12 of the 15 RCM-ideal points to score for each mechanism. A failed gate is reported after
 saving its report; settings must not be tuned using that result.
 
 ## Paired uncertainty

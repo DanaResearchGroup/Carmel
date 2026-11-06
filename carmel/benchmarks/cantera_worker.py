@@ -224,7 +224,7 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
             "initial_state": "stored_temperature_pressure_composition",
             "criterion": "exact_target_and_source_definition_t3_v1",
             "gradient": "numpy.gradient_default_edge_order_1",
-            "resolution": "t3_source_defined_idt_is_resolved_history_free_v1",
+            "resolution": "t3_source_defined_idt_is_resolved_excited_relative_span_v3",
             "plog_pressure_guard": "initial_and_each_step_crossing_removed_open_brackets_v1",
         },
         "process": {
@@ -752,17 +752,29 @@ def idt_trace_is_resolved(times: list[float], values: list[float], criterion_typ
     y = np.asarray(values, dtype=np.float64)
     span = float(np.ptp(y))
     minimum_span = max(abs(float(y[0])), 1.0) * 1e-6 if target in ("pressure", "temperature") else 1e-12
+    if target in EXCITED_ALIASES:
+        # Emission mole fractions can be far below the ground-species floor.
+        amplitude = float(np.max(np.abs(y)))
+        if amplitude <= 0:
+            return False
+        minimum_span = 1e-6 * amplitude
     if not math.isfinite(span) or span <= minimum_span:
         return False
     tail_length = max(3, len(y) // 10)
     peak = int(np.argmax(y))
+    # Settled-tail floors: absolute machine epsilon for ground-state targets; for excited targets,
+    # epsilon scaled to the signal, since an absolute floor would pass a still-rising faint trace.
+    excited = target in EXCITED_ALIASES
+    eps = float(np.finfo(float).eps)
     if criterion_type in ("max", "1/2 max"):
-        return peak < len(y) - 1 or float(np.ptp(y[-tail_length:])) <= max(span * 1e-3, np.finfo(float).eps)
+        tail_floor = eps * float(np.max(np.abs(y))) if excited else eps
+        return peak < len(y) - 1 or float(np.ptp(y[-tail_length:])) <= max(span * 1e-3, tail_floor)
     slopes = np.gradient(y, np.asarray(times, dtype=np.float64))
     index = int(np.argmax(slopes))
+    slope_floor = eps * float(np.max(np.abs(slopes))) if excited else eps
     return bool(
         index < len(y) - tail_length
-        and float(np.max(np.abs(slopes[-tail_length:]))) <= max(abs(float(slopes[index])) * 0.1, np.finfo(float).eps)
+        and float(np.max(np.abs(slopes[-tail_length:]))) <= max(abs(float(slopes[index])) * 0.1, slope_floor)
     )
 
 
@@ -854,14 +866,16 @@ def _simulate_idt_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict
         times, values, temperatures, steps = integrate_idt_trace(ct, gas, row)
         result["integrator_steps"] = steps
         delay = source_defined_idt(times, values, row["ignition_type"])
-        if (
-            delay is None
-            or not math.isfinite(delay)
-            or not 0 < delay <= IDT_HORIZON_S
-            or max(temperatures) - temperatures[0] < IDT_TEMPERATURE_RISE_K
-            or not idt_trace_is_resolved(times, values, row["ignition_type"], target)
-        ):
-            result["reason"] = "ignition_not_reached"
+        if delay is None:
+            result["reason"] = "no_ignition_within_horizon"
+        elif not math.isfinite(delay):
+            result["reason"] = "source_delay_nonfinite"
+        elif not 0 < delay <= IDT_HORIZON_S:
+            result["reason"] = "source_delay_outside_horizon"
+        elif max(temperatures) - temperatures[0] < IDT_TEMPERATURE_RISE_K:
+            result["reason"] = "temperature_rise_below_minimum"
+        elif not idt_trace_is_resolved(times, values, row["ignition_type"], target):
+            result["reason"] = "trace_unresolved"
         else:
             result.update(status="ok", ignition_delay_s=delay)
     except RunLevelSimulationError as exc:

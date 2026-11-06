@@ -57,6 +57,68 @@ def test_degenerate_and_incomplete_events_are_unresolved() -> None:
         worker.source_defined_idt(TIMES, VALUES, "unknown")
 
 
+@pytest.mark.parametrize("target", list(worker.EXCITED_ALIASES))
+def test_recorded_excited_trace_resolves_below_absolute_species_floor(target: str) -> None:
+    excerpt = json.loads((Path(__file__).parent / "fixtures/idt_excited_trace_excerpt.json").read_text())
+    assert 0 < max(excerpt["values"]) < 1e-12
+    assert worker.idt_trace_is_resolved(excerpt["times"], excerpt["values"], excerpt["criterion"], target)
+    assert not worker.idt_trace_is_resolved(excerpt["times"], excerpt["values"], excerpt["criterion"], "OH")
+
+
+@pytest.mark.parametrize("target", list(worker.EXCITED_ALIASES))
+@pytest.mark.parametrize("value", [0.0, 1e-14, 1.0])
+@pytest.mark.parametrize("criterion", ["max", "d/dt max", "1/2 max", "d/dt max extrapolated"])
+def test_flat_excited_trace_stays_unresolved(target: str, value: float, criterion: str) -> None:
+    assert not worker.idt_trace_is_resolved(TIMES, [value] * len(TIMES), criterion, target)
+
+
+@pytest.mark.parametrize("scale", [1e-17, 1.0, 1e3])
+def test_excited_relative_flatness_and_tail_requirements(scale: float) -> None:
+    assert not worker.idt_trace_is_resolved(TIMES, [scale * (1 + v * 1e-8) for v in VALUES], "max", "CH*")
+    assert worker.idt_trace_is_resolved(TIMES, [scale * v for v in VALUES], "d/dt max", "CH*")
+    # At ordinary amplitude, endpoint and derivative-tail guards remain active.
+    assert not worker.idt_trace_is_resolved(TIMES, TIMES, "max", "CH*")
+    assert not worker.idt_trace_is_resolved(TIMES, TIMES, "d/dt max", "CH*")
+
+
+@pytest.mark.parametrize("scale", [1e-17, 1e-13, 1.0])
+@pytest.mark.parametrize("criterion", ["max", "1/2 max", "d/dt max"])
+def test_still_rising_excited_trace_stays_unresolved_at_any_amplitude(scale: float, criterion: str) -> None:
+    # A signal still rising at the horizon has no completed peak; an absolute epsilon floor on the
+    # tail would pass it once its amplitude falls below machine epsilon.
+    rising = [scale * t for t in TIMES]
+    assert not worker.idt_trace_is_resolved(TIMES, rising, criterion, "CH*")
+    assert not worker.idt_trace_is_resolved(TIMES, rising, criterion, "OH*")
+
+
+def test_ground_state_tail_floor_is_unchanged() -> None:
+    # Ground-state species keep the absolute epsilon floor: below it, a flat-enough tail counts as settled.
+    tiny = [1e-11 * v for v in VALUES[:-1]] + [1e-11 * VALUES[-1] + 1e-17]
+    assert worker.idt_trace_is_resolved(TIMES, tiny, "max", "OH")
+
+
+def test_excited_resolution_revision_invalidates_previous_checkpoints() -> None:
+    lock = worker.simulation_lock(3600, "test")
+    assert lock["idt"]["resolution"] == "t3_source_defined_idt_is_resolved_excited_relative_span_v3"
+    lock["idt"]["resolution"] = "t3_source_defined_idt_is_resolved_history_free_v1"
+    previous_sha = hashlib.sha256(json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    previous = worker.checkpoint_fingerprint("mechanism", _row(), previous_sha, "")
+    assert previous != worker._row_fingerprint("mechanism", _row(), 3600, "test")
+
+
+def test_resolved_excited_trace_still_requires_temperature_rise(monkeypatch: pytest.MonkeyPatch) -> None:
+    excerpt = json.loads((Path(__file__).parent / "fixtures/idt_excited_trace_excerpt.json").read_text())
+    gas = SimpleNamespace(species_names=["CH*"], TPX=None)
+    monkeypatch.setitem(sys.modules, "cantera", SimpleNamespace(Solution=lambda _: gas))
+    monkeypatch.setattr(
+        worker, "integrate_idt_trace", lambda *args: (excerpt["times"], excerpt["values"], [800.0, 849.0], 100)
+    )
+    scope, result = worker._simulate_idt_row("fake.yaml", {**_row(), "ignition_target": "CH*"})
+    assert scope == "row"
+    assert result["status"] == "refused"
+    assert result["reason"] == "temperature_rise_below_minimum"
+
+
 def _row() -> dict[str, Any]:
     return {
         "row_id": "point",
@@ -72,8 +134,11 @@ def _row() -> dict[str, Any]:
     ("mode", "scope", "reason"),
     [
         ("ok", "row", None),
-        ("cold", "row", "ignition_not_reached"),
-        ("late", "row", "ignition_not_reached"),
+        ("cold", "row", "temperature_rise_below_minimum"),
+        ("late", "row", "source_delay_outside_horizon"),
+        ("flat", "row", "no_ignition_within_horizon"),
+        ("nonfinite", "row", "source_delay_nonfinite"),
+        ("unresolved", "row", "trace_unresolved"),
         ("absent", "row", "target_species_absent"),
         ("solver", "row", "solver_failure: failure"),
         ("cap", "row", "max_steps_exceeded"),
@@ -97,12 +162,14 @@ def test_simulation_refusals_and_positive_delay(
             )
         return (
             ([v * 10 for v in TIMES] if mode == "late" else TIMES),
-            VALUES,
+            [0.0] * len(TIMES) if mode == "flat" else [v * 1e-14 for v in VALUES] if mode == "unresolved" else VALUES,
             [800.0, 849.0 if mode == "cold" else 850.0],
             100,
         )
 
     monkeypatch.setattr(worker, "integrate_idt_trace", trace)
+    if mode == "nonfinite":
+        monkeypatch.setattr(worker, "source_defined_idt", lambda *args: math.nan)
     row = _row()
     if mode == "absent":
         row["ignition_target"] = "OH*"
@@ -274,9 +341,12 @@ def test_idt_pressure_guard_refuses_entry_or_crossing_of_trimmed_interval(
         assert result["integrator_steps"] in (0, 1)
         assert "ignition_delay_s" not in result
     else:
-        assert result.get("reason") in (None, "ignition_not_reached")
-        if target != "pressure":
+        if target == "pressure":
+            assert result["reason"] == "source_delay_outside_horizon"
+            assert result["status"] == "refused"
+        else:
             assert result["status"] == "ok"
+            assert "reason" not in result
 
 
 def _export() -> list[dict[str, Any]]:
