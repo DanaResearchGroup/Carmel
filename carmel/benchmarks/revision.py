@@ -33,6 +33,8 @@ class EtherTarget(FrozenModel):
 FROZEN_REVISIONS = {
     "n-heptane-low-t": "f9389f365e688a52815abe594d059c44bdb3438df7dbf98e387d7c1bd968520c",
     "n-pentane-low-t": "e83ea400fe20335c4d3661d03191c51212f5ad3adb139e8640ce13ed99848605",
+    # First freeze (I-137); it has not yet adopted the revision-2 secondary scores.
+    "iso-pentane-low-t": "8f2d7b4f7cb021ebbdb2819f8b05fa9b359b5e2ab2ed195e0a5ca0017aac0a5e",
 }
 
 
