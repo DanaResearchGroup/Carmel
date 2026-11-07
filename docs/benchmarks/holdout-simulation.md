@@ -51,7 +51,7 @@ permissive warnings. Any other warning or skipped source block refuses the run. 
 records are reported with both headers, whether their coefficients differ, and the fact that the
 first entry was used.
 
-Cantera validation accepts only the reviewed `NasaPoly2::validate` **h/RT discontinuity at
+The original case-2 reviews accept the `NasaPoly2::validate` **h/RT discontinuity at
 1000 K** for OH*/OHV or CH*/CHV, and only when that species' parsed NASA numeric fields
 match the corresponding pinned SHA-256. The reviewed sources are
 `/home/alon/runs/i127-holdout-sim/v_new/thermo.normalized.dat`, OH* header line 25 and CH*
@@ -65,11 +65,22 @@ byte. Species labels and card indices are excluded; values are never converted a
 | CH*, line 145 | CH*, CHV | `4a3c493e51e59ada6dfba5d198e487ab5e78b907d4bd0ba32f217df460ae880f` |
 
 The first record wins, including across kinetics and companion thermo; a malformed or
-changed first record cannot acquire approval through a later duplicate. Any other species,
+changed first record cannot acquire approval through a later duplicate. Any unreviewed species,
 warning type, midpoint, or changed numeric byte remains refused. Original case-2 labels use
 the same digest check. The simulation lock records `reviewed_nasa_numeric_field_sha256_v2`
 and all four label-to-digest entries. This warning rule changes no input, coefficient or JSR
 result and does not map the ignition targets OH*/CH* to OHV/CHV.
+
+`REVIEWED_NASA_WARNINGS` records each review's labels, quantity (`h/RT`, `s/R` or
+`cp/R`), midpoint, numeric-field digest, source file/line and reason. The case-3
+EC6H13O2 review adds only the pinned PRF `s/R` warning at 1388 K (line 2987).
+Its 0.64% entropy jump is accepted because the isothermal holdout never exceeds
+1100 K. This review requires a supplied JSR maximum strictly below its midpoint;
+it is refused for IDT, missing bounds or a bound at/above 1388 K. Case-3 contract
+loading checks every temperature-dependent review and archive replay verifies
+the per-file maximum against pinned XML bytes. The original case-2 exceptions
+do not depend on this temperature argument and keep their existing acceptance
+and serialized simulation lock. All other warnings remain refused.
 
 Before validation, every PLOG pressure level is checked at Cantera's validation temperatures.
 A rate expression's activation energy is converted from the YAML document's inherited

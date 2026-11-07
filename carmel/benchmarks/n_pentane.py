@@ -10,7 +10,7 @@ import zipfile
 from builtins import bytes as ByteString
 from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 from xml.etree import ElementTree
 
 from pydantic import Field, model_validator
@@ -125,12 +125,19 @@ class Scoring(FrozenModel):
     requires: Literal["jsr-adapter"]
     refusals: tuple[str, ...]
     locking: str
+
+
+class RevisedScoring(Scoring):
+    """Case-2 scoring after revision 2 (I-135); case 3 has not adopted it yet."""
+
     target_chemistry: EtherTarget
 
 
-class Contract(FrozenModel):
+class PentaneContractBase(FrozenModel):
+    """Shared C5 invariants, with case-specific frozen totals."""
+
     schema_version: Literal[1]
-    case: Literal["n-pentane-low-t"]
+    case: str
     mechanisms: dict[Literal["v_old", "v_new"], Pin]
     support_sources: tuple[ArchivePin, ...]
     identity: Identity
@@ -140,7 +147,19 @@ class Contract(FrozenModel):
     split: Split
     scoring: Scoring
     leakage_limits: tuple[str, ...]
-    revision: Revision
+
+    expected_totals: ClassVar[dict[str, int]] = {
+        "development_files": 26,
+        "development_rows": 226,
+        "development_observations": 226,
+        "development_supported_files": 18,
+        "holdout_files": 6,
+        "holdout_rows": 144,
+        "holdout_observations": 2080,
+        "holdout_low_temperature_rows": 72,
+        "holdout_low_temperature_observations": 1040,
+        "holdout_supported_files": 6,
+    }
 
     @model_validator(mode="after")
     def frozen_invariants(self) -> Self:
@@ -185,24 +204,18 @@ class Contract(FrozenModel):
             for item in study.files
             if item.acceptance == "refused"
         )
-        if refused_holdout_rows * 3 > 144:
+        if refused_holdout_rows * 3 > self.expected_totals["holdout_rows"]:
             raise ValueError("NEEDS-INPUT: more than one third of holdout rows are refused")
         totals = split_totals(self.split)
-        expected = {
-            "development_files": 26,
-            "development_rows": 226,
-            "development_observations": 226,
-            "development_supported_files": 18,
-            "holdout_files": 6,
-            "holdout_rows": 144,
-            "holdout_observations": 2080,
-            "holdout_low_temperature_rows": 72,
-            "holdout_low_temperature_observations": 1040,
-            "holdout_supported_files": 6,
-        }
-        if totals != expected:
+        if totals != self.expected_totals:
             raise ValueError(f"NEEDS-INPUT: frozen split counts do not reproduce: {totals}")
         return self
+
+
+class Contract(PentaneContractBase):
+    case: Literal["n-pentane-low-t"]
+    scoring: RevisedScoring
+    revision: Revision
 
 
 def condensed_formula(label: str) -> dict[str, int]:
@@ -301,11 +314,24 @@ def require_structural_absence(
     old_structures: dict[str, str],
 ) -> None:
     """Refuse unresolved or structurally matching formula-compatible prior reactions."""
-    from carmel.benchmarks.structure import reaction_signature
+    from carmel.benchmarks.structure import canonical, reaction_signature
 
     for prior in old_reactions:
         if not formula_compatible(candidate, candidate_formulas, prior, old_formulas):
             continue
+        # A resolved participant can disprove identity even when a different
+        # participant remains unresolved (e.g. a neo-C5 source versus iC5).
+        # Keep multiplicities and consider both orientations of the net reaction.
+        if len(signature) == 2:
+            known = tuple(
+                Counter(canonical(old_structures[label]) for label in side if label in old_structures)
+                for side in (prior["reactants"], prior["products"])
+            )
+            if not any(
+                all(not (part - Counter(side)) for part, side in zip(known, orientation, strict=True))
+                for orientation in (signature, signature[::-1])
+            ):
+                continue
         prior_names = (*prior["reactants"], *prior["products"])
         if not all(label in old_structures for label in prior_names):
             raise ValueError(f"UNRESOLVED old formula-screen candidate: {prior['equation']}")
@@ -358,7 +384,7 @@ def series_counts(record: Any) -> tuple[int, int, int, int]:
     return len(series.points), observations, low_rows, low_observations
 
 
-def load_split(contract: Contract, archive_source: Path | bytes) -> dict[str, int]:
+def load_split(contract: PentaneContractBase, archive_source: Path | bytes) -> dict[str, int]:
     """Reverify archive/member pins and run every frozen member through Carmel's readers."""
     raw_archive = archive_source if isinstance(archive_source, bytes) else read_pinned_file(archive_source)
     contract.split.archive.verify(raw_archive)

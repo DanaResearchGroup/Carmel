@@ -195,9 +195,9 @@ def _study_doi(root: ElementTree.Element) -> str:
     return (root.findtext("bibliographyLink/referenceDOI") or "").removeprefix("doi.org/")
 
 
-def _has_n_pentane(root: ElementTree.Element) -> bool:
+def _has_n_pentane(root: ElementTree.Element, fuel: str = "NC5H12") -> bool:
     return any(
-        link.get("preferredKey") == "NC5H12" for link in root.findall("commonProperties/property/component/speciesLink")
+        link.get("preferredKey") == fuel for link in root.findall("commonProperties/property/component/speciesLink")
     )
 
 
@@ -217,7 +217,7 @@ def _response_counts(root: ElementTree.Element) -> tuple[int, int]:
     return rows, observations
 
 
-def frozen_split(archive_bytes: bytes) -> dict[str, object]:
+def frozen_split(archive_bytes: bytes, *, fuel: str = "NC5H12", holdout_doi: str = HOLDOUT_DOI) -> dict[str, object]:
     archive_pin = {
         "filename": ARCHIVE_FILENAME,
         "source_url": "https://files.osf.io/v1/resources/nbmzv/providers/osfstorage/671690d83dea2353a7b93476?version=1",
@@ -247,7 +247,7 @@ def frozen_split(archive_bytes: bytes) -> dict[str, object]:
             raw = source.read(name)
             root = ElementTree.fromstring(raw)
             doi = _study_doi(root)
-            if doi not in {DEVELOPMENT_DOI, HOLDOUT_DOI} or not _has_n_pentane(root):
+            if doi not in {DEVELOPMENT_DOI, holdout_doi} or not _has_n_pentane(root, fuel):
                 continue
             rows, observations = _response_counts(root)
             target = development if doi == DEVELOPMENT_DOI else holdout
