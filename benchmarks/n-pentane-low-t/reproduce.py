@@ -16,6 +16,7 @@ sys.path.insert(0, str(REPO))
 
 from carmel.benchmarks.chemkin import mechanism  # noqa: E402
 from carmel.benchmarks.contract import read_pinned_file  # noqa: E402
+from carmel.benchmarks.holdout import TARGET_ETHERS  # noqa: E402
 from carmel.benchmarks.n_pentane import (  # noqa: E402
     Contract,
     formula_inventory,
@@ -293,6 +294,19 @@ def frozen_split(archive_bytes: bytes) -> dict[str, object]:
     }
 
 
+# Revision 2 (I-135): the reproducer emits the recorded revision so the frozen contract still
+# reproduces byte for byte; carmel.benchmarks.revision rejects any unrecorded change.
+REVISION = {
+    "number": 2,
+    "previous_contract_sha256": "72947ab95a15cf5375815be9c4ee7e7452183cb439bedbdf7f592a93b7ffa9f2",
+    "reason": (
+        "Owner-authorized secondary-score revision before any candidate was scored: declare aggregate and "
+        "target-chemistry scores; case 1 uses identical pinned FFCM-1 OH*/CH* chemistry for every mechanism, "
+        "replacing native excited chemistry."
+    ),
+}
+
+
 def build_contract(old_source: bytes, new_source: bytes, archive_bytes: bytes) -> dict[str, object]:
     new_species, old_species, ground_truth = mapped_ground_truth(old_source, new_source)
     split = frozen_split(archive_bytes)
@@ -375,6 +389,7 @@ def build_contract(old_source: bytes, new_source: bytes, archive_bytes: bytes) -
                 "Lock candidate, baseline, contract hash, structural matcher, JSR adapter and simulator before one "
                 "holdout evaluation; no holdout-driven retries, tuning or exclusions."
             ),
+            "target_chemistry": {"species": dict(TARGET_ETHERS), "metric": "existing_species_balanced_jsr_metric"},
         },
         "leakage_limits": [
             "The Bugler ignition-delay study validated v_new and is development data, never holdout.",
@@ -388,6 +403,7 @@ def build_contract(old_source: bytes, new_source: bytes, archive_bytes: bytes) -
             "Hash drift, split-count drift and unresolved eligible old structures fail the benchmark rather than "
             "shrinking it.",
         ],
+        "revision": dict(REVISION),
     }
 
 

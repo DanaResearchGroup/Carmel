@@ -81,6 +81,45 @@
       "title": "GroundTruth",
       "type": "object"
     },
+    "IDTTarget": {
+      "additionalProperties": false,
+      "properties": {
+        "temperature_min_k": {
+          "const": 600,
+          "title": "Temperature Min K",
+          "type": "integer"
+        },
+        "temperature_max_k": {
+          "const": 1000,
+          "title": "Temperature Max K",
+          "type": "integer"
+        },
+        "inclusive": {
+          "const": true,
+          "title": "Inclusive",
+          "type": "boolean"
+        },
+        "frozen_points": {
+          "const": 124,
+          "title": "Frozen Points",
+          "type": "integer"
+        },
+        "metric": {
+          "const": "mean_abs_log10_delay_ratio",
+          "title": "Metric",
+          "type": "string"
+        }
+      },
+      "required": [
+        "temperature_min_k",
+        "temperature_max_k",
+        "inclusive",
+        "frozen_points",
+        "metric"
+      ],
+      "title": "IDTTarget",
+      "type": "object"
+    },
     "Identity": {
       "additionalProperties": false,
       "properties": {
@@ -223,9 +262,41 @@
       "title": "Pin",
       "type": "object"
     },
+    "Revision": {
+      "additionalProperties": false,
+      "properties": {
+        "number": {
+          "const": 2,
+          "title": "Number",
+          "type": "integer"
+        },
+        "previous_contract_sha256": {
+          "title": "Previous Contract Sha256",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "number",
+        "previous_contract_sha256",
+        "reason"
+      ],
+      "title": "Revision",
+      "type": "object"
+    },
     "Scoring": {
       "additionalProperties": false,
       "properties": {
+        "target_chemistry": {
+          "$ref": "#/$defs/IDTTarget"
+        },
+        "excited_state_submechanism_sha256": {
+          "title": "Excited State Submechanism Sha256",
+          "type": "string"
+        },
         "primary_unit": {
           "const": "reaction-type-once",
           "title": "Primary Unit",
@@ -299,6 +370,8 @@
         }
       },
       "required": [
+        "target_chemistry",
+        "excited_state_submechanism_sha256",
         "primary_unit",
         "primary_types",
         "recovered",
@@ -502,6 +575,9 @@
       "title": "Schema Version",
       "type": "integer"
     },
+    "revision": {
+      "$ref": "#/$defs/Revision"
+    },
     "case": {
       "const": "n-heptane-low-t",
       "title": "Case",
@@ -567,6 +643,7 @@
   },
   "required": [
     "schema_version",
+    "revision",
     "case",
     "mechanisms",
     "support_sources",

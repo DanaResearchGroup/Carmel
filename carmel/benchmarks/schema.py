@@ -8,13 +8,16 @@ from pydantic import Field, TypeAdapter
 
 from carmel.benchmarks.n_heptane import Contract as HeptaneContract
 from carmel.benchmarks.n_pentane import Contract as PentaneContract
+from carmel.benchmarks.revision import verify_revision
 
 BenchmarkContract = Annotated[HeptaneContract | PentaneContract, Field(discriminator="case")]
 BENCHMARK_CONTRACT_ADAPTER: TypeAdapter[BenchmarkContract] = TypeAdapter(BenchmarkContract)
 
 
 def validate_contract_json(data: bytes | str) -> BenchmarkContract:
-    return BENCHMARK_CONTRACT_ADAPTER.validate_json(data)
+    contract = BENCHMARK_CONTRACT_ADAPTER.validate_json(data)
+    verify_revision(data)
+    return contract
 
 
 def benchmark_contract_schema() -> dict[str, object]:

@@ -5173,7 +5173,17 @@
       "species with no stated detection limit and no positive frozen observation",
       "unsupported reactor condition or solver failure"
     ],
-    "locking": "Lock candidate, baseline, contract hash, structural matcher, JSR adapter and simulator before one holdout evaluation; no holdout-driven retries, tuning or exclusions."
+    "locking": "Lock candidate, baseline, contract hash, structural matcher, JSR adapter and simulator before one holdout evaluation; no holdout-driven retries, tuning or exclusions.",
+    "target_chemistry": {
+      "species": {
+        "C5H10O1-2": "CCCC1CO1",
+        "C5H10O1-3": "CCC1CCO1",
+        "C5H10O1-4": "CC1CCCO1",
+        "C5H10O2-3": "CCC1OC1C",
+        "C5H10O2-4": "CC1CC(C)O1"
+      },
+      "metric": "existing_species_balanced_jsr_metric"
+    }
   },
   "leakage_limits": [
     "The Bugler ignition-delay study validated v_new and is development data, never holdout.",
@@ -5183,5 +5193,10 @@
     "Korcek chemistry was not included in v_new and is not a scored type.",
     "ChemKED n-pentane records are NOx-doped and excluded from both sets.",
     "Hash drift, split-count drift and unresolved eligible old structures fail the benchmark rather than shrinking it."
-  ]
+  ],
+  "revision": {
+    "number": 2,
+    "previous_contract_sha256": "72947ab95a15cf5375815be9c4ee7e7452183cb439bedbdf7f592a93b7ffa9f2",
+    "reason": "Owner-authorized secondary-score revision before any candidate was scored: declare aggregate and target-chemistry scores; case 1 uses identical pinned FFCM-1 OH*/CH* chemistry for every mechanism, replacing native excited chemistry."
+  }
 }

@@ -23,6 +23,103 @@ from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
+FFCM1_EXCITED_SHA256 = "49d61ec0c538eca831336d2ab316a0dbed212b6f4d44fa10082ab7ca071e918b"
+EXCITED_ALIASES = {"OH*": "OH*", "OHV": "OH*", "CH*": "CH*", "CHV": "CH*"}
+
+
+def resolve_ignition_target(target: str, species_names: list[str]) -> str | None:
+    """Resolve only the two declared excited-state aliases; never guess a label."""
+    if target in ("pressure", "temperature") or target in species_names:
+        return target
+    canonical = EXCITED_ALIASES.get(target)
+    matches = [name for name in species_names if canonical is not None and EXCITED_ALIASES.get(name) == canonical]
+    return matches[0] if len(matches) == 1 else None
+
+
+def load_excited_submechanism() -> dict[str, Any]:
+    raw = (Path(__file__).parents[1] / "data" / "ffcm1_excited.json").read_bytes()
+    if hashlib.sha256(raw).hexdigest() != FFCM1_EXCITED_SHA256:
+        raise ValueError("PIN CHANGED: FFCM-1 excited-state submechanism")
+    data: dict[str, Any] = json.loads(raw)
+    return data
+
+
+def _equation_species(equation: str) -> set[str]:
+    compact = re.sub(r"\s+", "", equation)
+    compact = re.sub(r"\(\+[^)]+\)", "", compact)
+    return {re.sub(r"^\d+(?:\.\d+)?", "", term) for term in re.split(r"<=>|=>|=|\+", compact)} - {"M", ""}
+
+
+def _side_counts(side: str) -> dict[str, float]:
+    counts: dict[str, float] = {}
+    for term in side.split("+"):
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)?(.+)", term)
+        if match:
+            counts[match[2]] = counts.get(match[2], 0.0) + float(match[1] or 1)
+    return counts
+
+
+def _explicit_colliders(equation: str, labels: set[str]) -> set[str]:
+    """Labels written with the same stoichiometry on both sides: an unchanged third body."""
+    compact = re.sub(r"\(\+[^)]+\)", "", re.sub(r"\s+", "", equation))
+    sides = re.split(r"<=>|=>|=", compact, maxsplit=1)
+    if len(sides) != 2:
+        return set()
+    left, right = map(_side_counts, sides)
+    return {label for label in labels if left.get(label) and left.get(label) == right.get(label)}
+
+
+def append_excited_submechanism(mechanism: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Replace native excited species/reactions, preserving all ground-state records.
+
+    This is shared by every IDT worker request, including baseline and candidates.
+    Local units on the appended reactions prevent parent-unit reinterpretation.
+    """
+    pinned = load_excited_submechanism()
+    result = copy.deepcopy(mechanism)
+    aliases = set(EXCITED_ALIASES)
+    native = [s for s in result["species"] if s["name"] in aliases]
+    for species in native:
+        expected = {"O" if EXCITED_ALIASES[species["name"]] == "OH*" else "C": 1, "H": 1}
+        if species["composition"] != expected:
+            raise ValueError("NEEDS-INPUT: excited label identifies a ground-state species with different composition")
+    ground_species = [s for s in result["species"] if s["name"] not in aliases]
+    names = {s["name"] for s in ground_species} | {"OH*", "CH*"}
+    required = set().union(*(_equation_species(r["equation"]) for r in pinned["reactions"]))
+    if required - names:
+        raise ValueError(f"NEEDS-INPUT: missing ground-state dependencies: {sorted(required - names)}")
+    removed, kept = [], []
+    for reaction in result["reactions"]:
+        if _explicit_colliders(reaction["equation"], aliases):
+            # e.g. H + O2 + OHV <=> HO2 + OHV is ground-state chemistry with an excited third body.
+            raise ValueError("NEEDS-INPUT: replacement would alter a ground-state reaction collider")
+        if _equation_species(reaction["equation"]) & aliases:
+            removed.append(reaction)
+        else:
+            if aliases & set(reaction.get("efficiencies", {})) or any(
+                f"(+{label})" in reaction["equation"].replace(" ", "") for label in aliases
+            ):
+                raise ValueError("NEEDS-INPUT: replacement would alter a ground-state reaction collider")
+            kept.append(reaction)
+    if len(result["phases"]) != 1 or not isinstance(result["phases"][0]["species"], list):
+        raise ValueError("NEEDS-INPUT: expected one explicit gas-phase species list")
+    phase = result["phases"][0]
+    phase["species"] = [name for name in phase["species"] if name not in aliases] + ["OH*", "CH*"]
+    result["species"] = ground_species + pinned["species"]
+    appended = [{**reaction, "units": pinned["units"]} for reaction in pinned["reactions"]]
+    result["reactions"] = kept + appended
+    return result, {
+        "sha256": FFCM1_EXCITED_SHA256,
+        "source": pinned["source"],
+        "replaced_species": [s["name"] for s in native],
+        "replaced_reactions": [r["equation"] for r in removed],
+        "appended_species": ["OH*", "CH*"],
+        "appended_reactions": [r["equation"] for r in appended],
+        "ground_species_preserved": len(ground_species),
+        "ground_reactions_preserved": len(kept),
+    }
+
+
 PLOG_VALIDATION_TEMPERATURES_K = (300.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0)
 _R_CAL = 1.98720425864083
 _PRESSURE_UNITS = {"pa": 1.0, "bar": 1.0e5, "atm": 101325.0}
@@ -116,6 +213,8 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
             "pressure_controller_K": PRESSURE_CONTROLLER_K,
         },
         "idt": {
+            "excited_state_submechanism_sha256": FFCM1_EXCITED_SHA256,
+            "target_aliases": dict(EXCITED_ALIASES),
             "rtol": IDT_RTOL,
             "atol": IDT_ATOL,
             "horizon_s": IDT_HORIZON_S,
@@ -125,7 +224,7 @@ def simulation_lock(row_timeout_s: float, cantera_version: str | None) -> dict[s
             "initial_state": "stored_temperature_pressure_composition",
             "criterion": "exact_target_and_source_definition_t3_v1",
             "gradient": "numpy.gradient_default_edge_order_1",
-            "resolution": "t3_source_defined_idt_is_resolved_history_free_v1",
+            "resolution": "t3_source_defined_idt_is_resolved_excited_relative_span_v3",
             "plog_pressure_guard": "initial_and_each_step_crossing_removed_open_brackets_v1",
         },
         "process": {
@@ -653,17 +752,29 @@ def idt_trace_is_resolved(times: list[float], values: list[float], criterion_typ
     y = np.asarray(values, dtype=np.float64)
     span = float(np.ptp(y))
     minimum_span = max(abs(float(y[0])), 1.0) * 1e-6 if target in ("pressure", "temperature") else 1e-12
+    if target in EXCITED_ALIASES:
+        # Emission mole fractions can be far below the ground-species floor.
+        amplitude = float(np.max(np.abs(y)))
+        if amplitude <= 0:
+            return False
+        minimum_span = 1e-6 * amplitude
     if not math.isfinite(span) or span <= minimum_span:
         return False
     tail_length = max(3, len(y) // 10)
     peak = int(np.argmax(y))
+    # Settled-tail floors: absolute machine epsilon for ground-state targets; for excited targets,
+    # epsilon scaled to the signal, since an absolute floor would pass a still-rising faint trace.
+    excited = target in EXCITED_ALIASES
+    eps = float(np.finfo(float).eps)
     if criterion_type in ("max", "1/2 max"):
-        return peak < len(y) - 1 or float(np.ptp(y[-tail_length:])) <= max(span * 1e-3, np.finfo(float).eps)
+        tail_floor = eps * float(np.max(np.abs(y))) if excited else eps
+        return peak < len(y) - 1 or float(np.ptp(y[-tail_length:])) <= max(span * 1e-3, tail_floor)
     slopes = np.gradient(y, np.asarray(times, dtype=np.float64))
     index = int(np.argmax(slopes))
+    slope_floor = eps * float(np.max(np.abs(slopes))) if excited else eps
     return bool(
         index < len(y) - tail_length
-        and float(np.max(np.abs(slopes[-tail_length:]))) <= max(abs(float(slopes[index])) * 0.1, np.finfo(float).eps)
+        and float(np.max(np.abs(slopes[-tail_length:]))) <= max(abs(float(slopes[index])) * 0.1, slope_floor)
     )
 
 
@@ -678,6 +789,8 @@ def integrate_idt_trace(ct: Any, gas: Any, row: dict[str, Any]) -> tuple[list[fl
             {"refusal": "reactor_construction_failed", "construction_error": str(exc)}
         ) from exc
     target = row["ignition_target"]
+    if target in EXCITED_ALIASES:
+        target = resolve_ignition_target(target, gas.species_names)
     species_index = gas.species_index(target) if target not in ("pressure", "temperature") else None
 
     def value() -> float:
@@ -743,7 +856,7 @@ def _simulate_idt_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict
     try:
         _write_progress("construction")
         gas = ct.Solution(trimmed_path)
-        if target not in ("pressure", "temperature") and target not in gas.species_names:
+        if resolve_ignition_target(target, gas.species_names) is None:
             result["reason"] = "target_species_absent"
             return "row", result
         gas.TPX = row["temperature_k"], row["pressure_pa"], row["composition"]
@@ -753,14 +866,16 @@ def _simulate_idt_row(trimmed_path: str, row: dict[str, Any]) -> tuple[str, dict
         times, values, temperatures, steps = integrate_idt_trace(ct, gas, row)
         result["integrator_steps"] = steps
         delay = source_defined_idt(times, values, row["ignition_type"])
-        if (
-            delay is None
-            or not math.isfinite(delay)
-            or not 0 < delay <= IDT_HORIZON_S
-            or max(temperatures) - temperatures[0] < IDT_TEMPERATURE_RISE_K
-            or not idt_trace_is_resolved(times, values, row["ignition_type"], target)
-        ):
-            result["reason"] = "ignition_not_reached"
+        if delay is None:
+            result["reason"] = "no_ignition_within_horizon"
+        elif not math.isfinite(delay):
+            result["reason"] = "source_delay_nonfinite"
+        elif not 0 < delay <= IDT_HORIZON_S:
+            result["reason"] = "source_delay_outside_horizon"
+        elif max(temperatures) - temperatures[0] < IDT_TEMPERATURE_RISE_K:
+            result["reason"] = "temperature_rise_below_minimum"
+        elif not idt_trace_is_resolved(times, values, row["ignition_type"], target):
+            result["reason"] = "trace_unresolved"
         else:
             result.update(status="ok", ignition_delay_s=delay)
     except RunLevelSimulationError as exc:
@@ -1176,6 +1291,17 @@ def main() -> int:
     mechanism = yaml.safe_load(Path(request["converted_yaml_path"]).read_text())
     source_lines = request.get("reaction_source_lines", {})
     _annotate_reaction_source_lines(mechanism, source_lines)
+    requested_submechanism = request.get("excited_state_submechanism_sha256")
+    if requested_submechanism is not None:
+        try:
+            if observable != "idt" or requested_submechanism != FFCM1_EXCITED_SHA256:
+                raise ValueError("PIN CHANGED: unknown or incompatible excited-state model request")
+            mechanism, response["excited_state_submechanism"] = append_excited_submechanism(mechanism)
+        except ValueError as exc:
+            response["refusal"] = "excited_state_submechanism_refused"
+            response["validation_error"] = str(exc)
+            _write_response(response_path, response)
+            return 0
     try:
         trimmed, trims, pressure_refusals = trim_unsound_plog_levels(
             mechanism, [float(row["pressure_pa"]) for row in request["rows"]]
@@ -1221,7 +1347,7 @@ def main() -> int:
         if (
             observable == "idt"
             and target not in ("pressure", "temperature")
-            and target not in validated_gas.species_names
+            and resolve_ignition_target(target, validated_gas.species_names) is None
         ):
             initial_results[row["row_id"]] = {
                 "row_id": row["row_id"],
