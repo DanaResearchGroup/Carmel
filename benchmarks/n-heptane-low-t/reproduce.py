@@ -10,6 +10,7 @@ import re
 import subprocess
 import sys
 from collections.abc import Callable
+from decimal import Decimal
 from pathlib import Path
 from typing import NamedTuple
 from urllib.request import urlopen
@@ -159,7 +160,9 @@ def thermo(source: Path | bytes) -> dict[str, dict[str, int]]:
                 element = line[start : start + 2].strip().capitalize()
                 if not element:
                     continue
-                value = int(line[start + 2 : start + 5].strip() or "0")
+                count = Decimal(line[start + 2 : start + 5].strip() or "0")
+                require(count.is_finite() and count == count.to_integral_value(), "noninteger thermo atom count")
+                value = int(count)
                 if value:
                     formula[element] = value
             rows[line[:18].split()[0]] = formula

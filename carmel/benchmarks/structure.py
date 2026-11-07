@@ -1,4 +1,4 @@
-"""Structure-only rules for frozen straight-chain alkane benchmarks."""
+"""Structure-only rules for frozen alkane benchmarks."""
 
 from __future__ import annotations
 
@@ -27,6 +27,7 @@ class Features:
     ether_rings: int
     acids: int
     linear_carbon: bool
+    iso_pentane_carbon: bool
 
 
 def molecule(smiles: str) -> Chem.Mol:
@@ -57,6 +58,9 @@ def features(smiles: str) -> Features:
     carbon_bonds = [b for b in mol.GetBonds() if b.GetBeginAtom().GetSymbol() == b.GetEndAtom().GetSymbol() == "C"]
     linear = bool(carbon_atoms) and len(carbon_bonds) == len(carbon_atoms) - 1
     linear = linear and all(sum(n.GetSymbol() == "C" for n in a.GetNeighbors()) <= 2 for a in carbon_atoms)
+    # A connected five-carbon tree with these degrees is exactly 2-methylbutane.
+    carbon_degrees = sorted(sum(n.GetSymbol() == "C" for n in a.GetNeighbors()) for a in carbon_atoms)
+    iso_pentane = len(carbon_bonds) == 4 and carbon_degrees == [1, 1, 1, 2, 3]
     return Features(
         atoms=MappingProxyType(dict(atoms)),
         hydroperoxides=matches("[C]-[O]-[O;H1]"),
@@ -73,16 +77,24 @@ def features(smiles: str) -> Features:
         ether_rings=matches("[C;R]-[O;R]-[C;R]"),
         acids=matches("[C](=[O])-[O;H1]"),
         linear_carbon=linear,
+        iso_pentane_carbon=iso_pentane,
     )
 
 
 ReactantRole = Literal["pooh", "ooqooh"]
+CarbonSkeleton = Literal["linear", "iso-pentane"]
 
 
-def _low_temperature_reactant_role(structure: Features, carbon_count: int) -> ReactantRole | None:
+def _skeleton_matches(structure: Features, skeleton: CarbonSkeleton) -> bool:
+    return structure.linear_carbon if skeleton == "linear" else structure.iso_pentane_carbon
+
+
+def _low_temperature_reactant_role(
+    structure: Features, carbon_count: int, skeleton: CarbonSkeleton = "linear"
+) -> ReactantRole | None:
     if structure.atoms != Counter({"C": carbon_count, "H": 2 * carbon_count + 1, "O": 4}):
         return None
-    if not structure.linear_carbon or structure.carbonyls or structure.alkenes or structure.ether_rings:
+    if not _skeleton_matches(structure, skeleton) or structure.carbonyls or structure.alkenes or structure.ether_rings:
         return None
     if (
         structure.hydroperoxides == 2
@@ -108,7 +120,13 @@ def reaction_signature(reactants: tuple[str, ...], products: tuple[str, ...]) ->
     return tuple(sorted((tuple(sorted(map(canonical, reactants))), tuple(sorted(map(canonical, products))))))
 
 
-def classify(reactants: tuple[str, ...], products: tuple[str, ...], *, carbon_count: int = 7) -> frozenset[str]:
+def classify(
+    reactants: tuple[str, ...],
+    products: tuple[str, ...],
+    *,
+    carbon_count: int = 7,
+    skeleton: CarbonSkeleton = "linear",
+) -> frozenset[str]:
     """Recognize net structural classes in either orientation; require elemental balance."""
     left, right = [features(s) for s in reactants], [features(s) for s in products]
     if sum((Counter(f.atoms) for f in left), Counter()) != sum((Counter(f.atoms) for f in right), Counter()):
@@ -118,16 +136,16 @@ def classify(reactants: tuple[str, ...], products: tuple[str, ...], *, carbon_co
         if len(source) != 1:
             continue
         src = source[0]
-        if src.atoms["C"] != carbon_count or not src.linear_carbon:
+        if src.atoms.get("C", 0) != carbon_count or not _skeleton_matches(src, skeleton):
             continue
-        role = _low_temperature_reactant_role(src, carbon_count)
+        role = _low_temperature_reactant_role(src, carbon_count, skeleton)
         pooh = role == "pooh"
         ooqooh = role == "ooqooh"
         carbon_products = [f for f in target if f.atoms.get("C", 0)]
         small = sorted(canonical(s) for s, f in zip(target_smiles, target, strict=True) if not f.atoms.get("C", 0))
         if len(carbon_products) == 1:
             dst = carbon_products[0]
-            if dst.atoms["C"] != carbon_count or not dst.linear_carbon:
+            if dst.atoms["C"] != carbon_count or not _skeleton_matches(dst, skeleton):
                 continue
             if (
                 ooqooh

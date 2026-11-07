@@ -6,11 +6,12 @@ from typing import Annotated
 
 from pydantic import Field, TypeAdapter
 
+from carmel.benchmarks.iso_pentane import Contract as IsoPentaneContract
 from carmel.benchmarks.n_heptane import Contract as HeptaneContract
 from carmel.benchmarks.n_pentane import Contract as PentaneContract
 from carmel.benchmarks.revision import verify_revision
 
-BenchmarkContract = Annotated[HeptaneContract | PentaneContract, Field(discriminator="case")]
+BenchmarkContract = Annotated[HeptaneContract | PentaneContract | IsoPentaneContract, Field(discriminator="case")]
 BENCHMARK_CONTRACT_ADAPTER: TypeAdapter[BenchmarkContract] = TypeAdapter(BenchmarkContract)
 
 
