@@ -7,7 +7,9 @@ cache-hit flag rather than from what is on disk.
 """
 
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,8 @@ DEVTOOLS = REPO_ROOT / "devtools"
 MAKEFILE = REPO_ROOT / "Makefile"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 TOOLS_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "tools.yml"
+DOCS_WORKFLOWS = [REPO_ROOT / ".github" / "workflows" / name for name in ("docs.yml", "docs-deploy.yml")]
+TOOLS_FILE = "carmel-tools" + ".env"
 
 SCRIPTS = sorted(DEVTOOLS.glob("*.sh"))
 
@@ -102,7 +106,7 @@ class TestTargetsInCommand:
         assert targets_in_command("") == set()
 
     def test_command_without_make(self) -> None:
-        assert targets_in_command("conda activate crml_env") == set()
+        assert targets_in_command("conda activate t3_env") == set()
 
     def test_plain_invocation(self) -> None:
         assert targets_in_command("make install") == {"install"}
@@ -129,7 +133,7 @@ class TestWorkflowScanning:
     def test_block_run_steps_are_scanned(self, tmp_path: Path) -> None:
         workflow = tmp_path / "block.yml"
         workflow.write_text(
-            "jobs:\n  x:\n    steps:\n      - run: |\n          conda activate crml_env\n          make install\n"
+            "jobs:\n  x:\n    steps:\n      - run: |\n          conda activate t3_env\n          make install\n"
         )
         assert make_targets_invoked_by(workflow) == {"install"}
 
@@ -203,27 +207,125 @@ class TestStateNotFlags:
         assert "outputs.cache-hit" not in TOOLS_WORKFLOW.read_text()
 
 
-class TestTheActivationHook:
-    """`conda run` deactivates the current environment before activating the target.
+def run_install_carmel(tmp_path: Path, *, with_t3: bool = True, **overrides: str) -> subprocess.CompletedProcess[str]:
+    """Run ``install_carmel.sh`` against throwaway stack dirs with a fake ``uv`` on PATH.
 
-    So a `deactivate.d` hook unsetting the tool paths strips them from T3's
-    environment at the moment Carmel launches T3 — which is what T3 needs them
-    for. It cost a red CI lane once; the variables must outlive deactivation.
+    The fake records its arguments and exits 0, so the run exercises only the
+    script's own logic: the sync call it makes and the tool-path file it writes.
+    """
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    fake_uv = fake_bin / "uv"
+    fake_uv.write_text(f'#!/usr/bin/env bash\necho "$*" >> {tmp_path / "uv-calls.log"}\n')
+    fake_uv.chmod(0o755)
+    stack = tmp_path / "stack"
+    for name in ("RMG-Py", "RMG-database", "ARC") + (("T3",) if with_t3 else ()):
+        (stack / name).mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "CARMEL_STACK_ROOT": str(stack),
+        "CARMEL_TOOLS_ENV_FILE": str(tmp_path / TOOLS_FILE),
+        **overrides,
+    }
+    return subprocess.run(
+        ["bash", str(DEVTOOLS / "install_carmel.sh")], env=env, capture_output=True, text=True, check=False
+    )
+
+
+class TestTheToolPathsFile:
+    """``install_carmel.sh`` records the tool paths in ``carmel-tools.env``.
+
+    Carmel's own environment is a uv ``.venv``, which has no activation hooks, so
+    the file is the one place a user (``uv run --env-file``) and the tools lane
+    (``source``) read the paths back from.
     """
 
-    def test_no_deactivate_hook_is_written(self) -> None:
-        script = (DEVTOOLS / "install_carmel.sh").read_text()
-        assert 'rm -f "$deactivate_hook"' in script, "a stale deactivate hook must be removed"
-        assert '>"$deactivate_hook' not in script, (
-            "writing a deactivate.d hook unsets the tool paths inside `conda run -n t3_env`"
-        )
+    def test_the_installer_syncs_from_the_lock(self, tmp_path: Path) -> None:
+        result = run_install_carmel(tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert (tmp_path / "uv-calls.log").read_text().split("\n")[0] == "sync --locked --extra dev"
 
-    def test_hook_values_are_shell_quoted(self) -> None:
-        """A path with a space would truncate a variable; one with $(...) would run."""
-        script = (DEVTOOLS / "install_carmel.sh").read_text()
-        exports = re.findall(r"^\s*(?:printf|echo).*export (\w+)", script, flags=re.MULTILINE)
+    def test_every_tool_path_is_written_single_quoted(self, tmp_path: Path) -> None:
+        result = run_install_carmel(tmp_path)
+        assert result.returncode == 0, result.stderr
+        text = (tmp_path / TOOLS_FILE).read_text()
+        exports = dict(re.findall(r"^export (\w+)='([^']*)'$", text, flags=re.MULTILINE))
         assert set(exports) == {"T3_CONDA_ENV", "T3_PATH", "ARC_PATH", "RMG_PATH", "RMG_DB_PATH"}
-        assert "%q" in script
+        assert exports["T3_PATH"] == str(tmp_path / "stack" / "T3")
+        assert exports["T3_CONDA_ENV"] == "t3_env"
+        assert not (tmp_path / f"{TOOLS_FILE}.tmp").exists()
+
+    def test_a_path_with_a_single_quote_is_refused_and_nothing_is_written(self, tmp_path: Path) -> None:
+        quoted = tmp_path / "it's"
+        quoted.mkdir()
+        result = run_install_carmel(tmp_path, RMG_PATH=str(quoted))
+        assert result.returncode != 0
+        assert "single quote" in result.stderr
+        assert not (tmp_path / TOOLS_FILE).exists()
+        assert not (tmp_path / f"{TOOLS_FILE}.tmp").exists()
+
+    def test_a_stale_file_is_removed_when_t3_is_gone(self, tmp_path: Path) -> None:
+        (tmp_path / TOOLS_FILE).write_text("export T3_PATH='/gone'\n")
+        result = run_install_carmel(tmp_path, with_t3=False)
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / TOOLS_FILE).exists()
+
+    def test_the_installer_writes_atomically(self) -> None:
+        script = (DEVTOOLS / "install_carmel.sh").read_text()
+        assert 'mv -f "$CARMEL_TOOLS_ENV_FILE.tmp" "$CARMEL_TOOLS_ENV_FILE"' in script
+
+    def test_the_file_is_gitignored(self) -> None:
+        lines = (REPO_ROOT / ".gitignore").read_text().splitlines()
+        assert TOOLS_FILE in lines
+
+    @pytest.fixture
+    def written_file(self, tmp_path: Path) -> Path:
+        """A real file from the installer, with a path holding a space and ``$(...)``."""
+        odd = tmp_path / "a b $(touch pwned)"
+        (odd / "T3").mkdir(parents=True)
+        (odd / "RMG-database").mkdir()
+        result = run_install_carmel(tmp_path, T3_PATH=str(odd / "T3"), RMG_DB_PATH=str(odd / "RMG-database"))
+        assert result.returncode == 0, result.stderr
+        return tmp_path / TOOLS_FILE
+
+    def test_bash_source_reads_the_file_back_verbatim(self, written_file: Path, tmp_path: Path) -> None:
+        result = subprocess.run(
+            ["bash", "-c", 'set -a; source "$1"; set +a; printf "%s" "$T3_PATH"', "_", str(written_file)],
+            env={"PATH": "/usr/bin:/bin"},
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert result.stdout == str(tmp_path / "a b $(touch pwned)" / "T3")
+        assert not (tmp_path / "pwned").exists()
+
+    def test_uv_env_file_reads_the_file_back_verbatim(self, written_file: Path, tmp_path: Path) -> None:
+        """Run in a clean environment: ``uv run --env-file`` never overrides a variable already set."""
+        uv = shutil.which("uv")
+        assert uv, "uv is not on PATH; Carmel's environment is managed by uv"
+        result = subprocess.run(
+            [
+                uv,
+                "run",
+                "--no-project",
+                "--python",
+                sys.executable,
+                "--env-file",
+                str(written_file),
+                "python",
+                "-c",
+                "import os; print(os.environ['T3_PATH'], end='')",
+            ],
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "UV_CACHE_DIR": str(tmp_path / "uv-cache")},
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == str(tmp_path / "a b $(touch pwned)" / "T3")
 
 
 class TestMakefileWiring:
@@ -337,10 +439,10 @@ class TestThePythonFloorIsDeclaredOnce:
             "remove target-version: ruff reads requires-python, and a second copy of the floor drifts from it"
         )
 
-    def test_the_conda_environment_matches_the_floor(self) -> None:
-        text = (REPO_ROOT / "environment.yml").read_text()
-        match = re.search(r"python\s*>=\s*(\d+)\.(\d+)", text)
-        assert match, "environment.yml no longer pins a python floor for crml_env"
+    def test_the_lockfile_matches_the_floor(self) -> None:
+        text = (REPO_ROOT / "uv.lock").read_text()
+        match = re.search(r'^requires-python\s*=\s*">=\s*(\d+)\.(\d+)"', text, flags=re.MULTILINE)
+        assert match, "uv.lock records no requires-python"
         assert (int(match.group(1)), int(match.group(2))) == self.floor()
 
     def test_the_conftest_interpreter_guard_matches_the_floor(self) -> None:
@@ -356,7 +458,7 @@ class TestThePythonFloorIsDeclaredOnce:
         assert match, "tests/conftest.py no longer guards the interpreter version"
         assert (int(match.group(1)), int(match.group(2))) == self.floor()
 
-    @pytest.mark.parametrize("workflow", ["ci.yml", "docs.yml"], ids=lambda name: name)
+    @pytest.mark.parametrize("workflow", ["ci.yml", "docs.yml", "docs-deploy.yml"], ids=lambda name: name)
     def test_every_workflow_python_matches_the_floor(self, workflow: str) -> None:
         """A lane on an older Python tests something users cannot install."""
         major, minor = self.floor()
@@ -365,3 +467,98 @@ class TestThePythonFloorIsDeclaredOnce:
         assert declared, f"{workflow} declares no python-version"
         for value in declared:
             assert value == f"{major}.{minor}", f"{workflow} runs on {value}, but the floor is {major}.{minor}"
+
+
+REQUIRED_JOB_NAMES = {
+    "lint": "Lint + format + typecheck (required)",
+    "test": "Tests + packaging smoke (required)",
+    "agents": "Agents extra — tests + typecheck (required)",
+}
+
+
+class TestCiInstallsThroughUv:
+    """Carmel's lanes install from ``uv.lock`` through uv, never through pip.
+
+    The required job names are literal status-check contexts in the repo's
+    branch-protection ruleset, so they are pinned here too.
+    """
+
+    @pytest.mark.parametrize("workflow", [CI_WORKFLOW, *DOCS_WORKFLOWS], ids=lambda p: p.name)
+    def test_every_python_job_sets_up_uv_pinned_by_sha(self, workflow: Path) -> None:
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        checked = 0
+        for job_name, job in jobs.items():
+            uses = [str(step.get("uses", "")) for step in job.get("steps", [])]
+            runs = " ".join(str(step.get("run", "")) for step in job.get("steps", []))
+            assert not any(u.startswith("actions/setup-python") for u in uses), f"{job_name} still sets up pip"
+            assert "pip install" not in runs.replace("uv pip install", ""), f"{job_name} still installs through pip"
+            if not any(word in runs for word in ("make ", "uv ", "mkdocs")):
+                continue
+            checked += 1
+            setup = [u for u in uses if u.startswith("astral-sh/setup-uv@")]
+            assert setup, f"{workflow.name} / {job_name} runs Python tooling without astral-sh/setup-uv"
+            assert re.fullmatch(r"astral-sh/setup-uv@[0-9a-f]{40}", setup[0]), f"{setup[0]} is not pinned by SHA"
+        assert checked, f"{workflow.name} has no job running Python tooling; this test checked nothing"
+
+    @pytest.mark.parametrize("workflow", [CI_WORKFLOW, *DOCS_WORKFLOWS], ids=lambda p: p.name)
+    def test_every_sync_is_locked(self, workflow: Path) -> None:
+        syncs = re.findall(r"uv sync[^\n]*", workflow.read_text())
+        assert syncs or workflow == CI_WORKFLOW, f"{workflow.name} never syncs"
+        for line in syncs:
+            assert "--locked" in line, f"{workflow.name}: {line!r} may rewrite the lock"
+
+    def test_the_lint_job_fails_on_a_stale_lock(self) -> None:
+        steps = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["lint"]["steps"]
+        assert any(str(step.get("run", "")).strip() == "uv lock --check" for step in steps)
+
+    def test_the_required_job_names_are_unchanged(self) -> None:
+        jobs = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]
+        assert {job_id: job["name"] for job_id, job in jobs.items()} == REQUIRED_JOB_NAMES
+
+    def test_the_test_job_keeps_its_matrix_suffix(self) -> None:
+        """The ruleset context is ``Tests + packaging smoke (required) (3.14)``."""
+        matrix = yaml.safe_load(CI_WORKFLOW.read_text())["jobs"]["test"]["strategy"]["matrix"]
+        assert matrix == {"python-version": ["3.14"]}
+
+    def test_the_packaging_smoke_builds_with_uv(self) -> None:
+        text = CI_WORKFLOW.read_text()
+        assert "uv build --wheel --out-dir dist" in text
+        assert "dist/*.whl" in text
+
+    def test_the_tools_lane_sets_up_uv_before_make_install(self) -> None:
+        steps = yaml.safe_load(TOOLS_WORKFLOW.read_text())["jobs"]["tools"]["steps"]
+        uses = [i for i, step in enumerate(steps) if str(step.get("uses", "")).startswith("astral-sh/setup-uv@")]
+        install = [i for i, step in enumerate(steps) if "make install" in str(step.get("run", ""))]
+        assert uses and install and uses[0] < install[0]
+
+
+class TestTheMakefileUsesUv:
+    """Carmel's targets go through uv; the conda tool-env targets do not move."""
+
+    @staticmethod
+    def recipe(target: str) -> list[str]:
+        """Return the recipe lines of one Makefile target, leading tab stripped."""
+        pattern = rf"^{re.escape(target)}:[^\n]*\n((?:\t[^\n]*\n)+)"
+        match = re.search(pattern, MAKEFILE.read_text(), flags=re.MULTILINE)
+        assert match, f"no recipe for {target}"
+        return [line[1:] for line in match.group(1).splitlines()]
+
+    def test_the_conda_tool_env_targets_are_unchanged(self) -> None:
+        assert self.recipe("install-rmg") == ["bash $(DEVTOOLS_DIR)/install_rmg.sh"]
+        assert self.recipe("install-t3") == ["bash $(DEVTOOLS_DIR)/install_t3.sh"]
+
+    def test_install_targets_sync_from_the_lock(self) -> None:
+        assert self.recipe("install-dev") == ["uv sync --locked --extra dev"]
+        assert self.recipe("install-agents-dev") == ["uv sync --locked --extra dev --extra agents"]
+
+    def test_uv_run_syncs_the_dev_extra(self) -> None:
+        match = re.search(r"^UV_RUN := (.*)$", MAKEFILE.read_text(), flags=re.MULTILINE)
+        assert match, "no UV_RUN in the Makefile"
+        assert match.group(1).split() == ["uv", "run", "--locked", "--extra", "dev"]
+
+    @pytest.mark.parametrize("target", ["test", "lint", "typecheck", "format"])
+    def test_tool_targets_run_inside_the_uv_env(self, target: str) -> None:
+        commands = [line for line in self.recipe(target) if not line.startswith("\t")]
+        assert commands
+        for line in commands:
+            assert line.lstrip("@").startswith("$(UV_RUN) "), f"{target}: {line!r} runs outside the uv env"

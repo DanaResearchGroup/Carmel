@@ -28,11 +28,14 @@ RMG_DB_PATH="${RMG_DB_PATH:-$CARMEL_STACK_ROOT/RMG-database}"
 ARC_PATH="${ARC_PATH:-$CARMEL_STACK_ROOT/ARC}"
 T3_PATH="${T3_PATH:-$CARMEL_STACK_ROOT/T3}"
 
-# The three environments. Their python requirements are mutually exclusive, so
+# The two conda tool environments. Carmel itself lives in a uv project
+# environment (.venv); the three python requirements are mutually exclusive, so
 # no single environment can hold the stack; see docs/installation.md.
 RMG_ENV="${RMG_ENV:-rmg_env}"
 T3_CONDA_ENV="${T3_CONDA_ENV:-t3_env}"
-CARMEL_ENV="${CARMEL_ENV:-crml_env}"
+
+# Where install_carmel.sh records the tool paths for Carmel's uv environment.
+CARMEL_TOOLS_ENV_FILE="${CARMEL_TOOLS_ENV_FILE:-$CARMEL_ROOT/carmel-tools.env}"
 
 CARMEL_RMG_PY_URL="${CARMEL_RMG_PY_URL:-https://github.com/ReactionMechanismGenerator/RMG-Py.git}"
 CARMEL_RMG_DB_URL="${CARMEL_RMG_DB_URL:-https://github.com/ReactionMechanismGenerator/RMG-database.git}"
@@ -53,6 +56,12 @@ die() {
 setup_conda() {
     command -v conda >/dev/null 2>&1 ||
         die "conda is not on PATH. Install Miniforge first: https://conda-forge.org/download/"
+}
+
+# Check that uv, which manages Carmel's own environment, is on PATH.
+setup_uv() {
+    command -v uv >/dev/null 2>&1 ||
+        die "uv is not on PATH. Install it first: https://docs.astral.sh/uv/getting-started/installation/"
 }
 
 # -F, not a regex: an environment named `t3.env` must not match `t3xenv`.

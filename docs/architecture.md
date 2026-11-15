@@ -317,13 +317,14 @@ centralized in the `T3Layout` constants block at the top of that file.
 ### Three-env deployment model and T3 invocation
 
 Carmel, T3, and RMG have mutually exclusive Python requirements and
-normally live in **three separate conda environments**:
+normally live in **three separate environments**: Carmel's own is a uv
+project environment, and the chemistry tools' two are conda environments:
 
-| Env         | Contains        | Python pin |
-|-------------|-----------------|------------|
-| `rmg_env`   | RMG-Py, Arkane  | `>=3.9,<3.12` |
-| `t3_env`    | T3 **and** ARC  | `=3.14` (T3 imports ARC in-process, so they must share an env; T3 in turn launches RMG as a subprocess under `rmg_env`) |
-| `crml_env`  | Carmel itself   | `>=3.14` |
+| Env         | Managed by | Contains        | Python pin |
+|-------------|------------|-----------------|------------|
+| `.venv`     | uv         | Carmel itself   | `>=3.14` |
+| `rmg_env`   | conda      | RMG-Py, Arkane  | `>=3.9,<3.12` |
+| `t3_env`    | conda      | T3 **and** ARC  | `=3.14` (T3 imports ARC in-process, so they must share an env; T3 in turn launches RMG as a subprocess under `rmg_env`) |
 
 Because of this, `_find_t3_executable()` and `is_t3_importable()` /
 `_t3_version()` must never assume T3 runs under Carmel's own
@@ -341,7 +342,7 @@ environment. Resolution order:
 - Otherwise Carmel falls back to `sys.executable` — the correct choice
   for a single-env developer setup where Carmel and T3 share an
   environment (e.g. a from-source checkout with `t3`/`arc` installed
-  directly into `crml_env`).
+  directly into Carmel's environment).
 - If either variable is set but unusable (`conda` absent from `PATH`;
   `$T3_PYTHON` missing or non-executable), Carmel logs a warning and
   degrades to the next rule rather than raising, so a bad env var cannot

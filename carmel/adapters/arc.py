@@ -295,16 +295,28 @@ def _arc_python_command() -> list[str]:
     Returns:
         The argv prefix to prepend to a python invocation to run it inside
         ARC's environment.
+
+    Raises:
+        ToolEnvironmentError: The selected conda source names an env whose
+            own interpreter cannot be resolved.
     """
-    return _launcher.launch_command(ARC_SOURCES, logger=_log, tool_label="ARC", which=shutil.which)
+    return _launcher.launch_command(
+        ARC_SOURCES,
+        logger=_log,
+        tool_label="ARC",
+        runner=_arc_run_in_process_group,
+        probe_timeout=_ARC_IMPORT_PROBE_TIMEOUT_S,
+        which=shutil.which,
+    )
 
 
 def _arc_conda_env_error() -> str | None:
     """Return why ARC's configured conda env cannot be used, or None if fine/unset.
 
     See :func:`carmel.adapters.t3._t3_conda_env_error` for the full
-    rationale: :func:`_arc_python_command` is deliberately non-raising and
-    falls back silently on a misconfigured conda env, so this is the
+    rationale: :func:`_arc_python_command` falls back silently when
+    ``conda`` is missing and raises when the named env cannot be resolved,
+    so this is the
     explicit, callable check that :meth:`ARCAdapter.run` uses to turn a
     broken ``$ARC_CONDA_ENV``/``$T3_CONDA_ENV`` into a clean, typed failure
     up front instead of a silent downgrade to the wrong interpreter.
@@ -331,8 +343,12 @@ def is_arc_importable() -> bool:
     process — see :func:`carmel.adapters.t3.is_t3_importable` for the full
     three-env rationale, which applies identically here.
     """
+    try:
+        command = _arc_python_command()
+    except _launcher.ToolEnvironmentError:
+        return False
     return _launcher.probe_importable(
-        _arc_python_command(), "arc", timeout=_ARC_IMPORT_PROBE_TIMEOUT_S, runner=_arc_run_in_process_group
+        command, "arc", timeout=_ARC_IMPORT_PROBE_TIMEOUT_S, runner=_arc_run_in_process_group
     )
 
 
@@ -343,8 +359,12 @@ def _arc_version() -> str | None:
     command in a subprocess rather than importing ``arc`` into Carmel's own
     process.
     """
+    try:
+        command = _arc_python_command()
+    except _launcher.ToolEnvironmentError:
+        return None
     return _launcher.probe_version(
-        _arc_python_command(), "arc", timeout=_ARC_IMPORT_PROBE_TIMEOUT_S, runner=_arc_run_in_process_group
+        command, "arc", timeout=_ARC_IMPORT_PROBE_TIMEOUT_S, runner=_arc_run_in_process_group
     )
 
 
@@ -385,7 +405,10 @@ def _find_arc_executable() -> list[str] | None:
     than a bare interpreter path, so that conda activation hooks actually
     run.
     """
-    cmd = _arc_python_command()
+    try:
+        cmd = _arc_python_command()
+    except _launcher.ToolEnvironmentError:
+        return None
     host_discovery_allowed = cmd == [sys.executable]
     return _launcher.find_executable(
         path_env_var="ARC_PATH",

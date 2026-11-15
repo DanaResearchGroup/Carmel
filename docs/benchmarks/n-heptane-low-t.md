@@ -285,15 +285,15 @@ on `PATH`.
 From the repository root, run:
 
 ```bash
-python benchmarks/n-heptane-low-t/reproduce.py \
+uv run python benchmarks/n-heptane-low-t/reproduce.py \
   --census-root path/to/i116-alkane-census \
   --support-root path/to/i117-contract \
   --split-report path/to/R-032a_n-heptane-study-split_2026-10-02.json \
   --download-dir path/to/n-heptane-downloads
-python -m pytest
-ruff check
-ruff format --check
-mypy carmel Carmel.py
+uv run pytest
+uv run ruff check
+uv run ruff format --check
+uv run mypy carmel Carmel.py
 ```
 
 The reproduction reparses the untouched census mechanism texts and author glossary,

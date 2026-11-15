@@ -37,12 +37,11 @@ governance.
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
 
-# Install (the chemistry stack, all three environments, and Carmel)
+# Install (the chemistry stack and its two conda environments, then Carmel with uv)
 make install
-conda activate crml_env
 
 # Launch the UI
-carmel serve --workspaces ./workspaces
+uv run --env-file carmel-tools.env carmel serve --workspaces ./workspaces
 ```
 
 Then open http://127.0.0.1:5000.
