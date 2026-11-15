@@ -34,6 +34,7 @@ def test_positive_species_define_the_intersection_and_bound_compression():
 
 
 def test_transcribed_temperature_ranges_are_pinned():
+    """Every supported species retains its published polynomial temperature bounds."""
     expected = {
         "H2": (200.0, 1000.0, 3500.0),
         "O2": (200.0, 1000.0, 3500.0),
@@ -43,6 +44,7 @@ def test_transcribed_temperature_ranges_are_pinned():
         "CO2": (200.0, 1000.0, 3500.0),
         "H2O": (200.0, 1000.0, 3500.0),
         "NC5H12": (200.0, 1000.0, 6000.0),
+        "IC5H12": (200.0, 1000.0, 6000.0),
         "HE": (200.0, 1000.0, 6000.0),
     }
     assert {key: entry.temperature_ranges for key, entry in NASA7.items()} == expected

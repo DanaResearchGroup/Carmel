@@ -16,6 +16,7 @@ from pydantic import ValidationError
 from carmel.benchmarks import holdout, iso_pentane, n_heptane, n_pentane
 from carmel.benchmarks.revision import FROZEN_REVISIONS, JSRWindowTarget
 from carmel.benchmarks.schema import validate_contract_json
+from tests.ic5_acceptance import REVISION2_CANONICAL, reverse_a2
 
 ROOT = Path(__file__).resolve().parents[1]
 CASE3 = ROOT / "benchmarks/iso-pentane-low-t/contract.json"
@@ -38,17 +39,18 @@ def canonical_sha256(document: dict[str, Any]) -> str:
 
 
 def a1_document() -> dict[str, Any]:
-    """The committed contract with the two revision-2 keys removed."""
-    previous = json.loads(CASE3.read_bytes())
+    """Recover A-1 by reversing A-2 and removing the two revision-2 keys."""
+    previous = reverse_a2(json.loads(CASE3.read_bytes()))
     del previous["revision"]
     del previous["scoring"]["target_chemistry"]
     return previous
 
 
 def test_only_revision_keys_differ_from_the_a1_contract() -> None:
+    """Reconstructed revision 2 differs from A-1 only in its two declared additions."""
     previous = a1_document()
     assert canonical_sha256(previous) == A1_CANONICAL_SHA256
-    revised = json.loads(CASE3.read_bytes())
+    revised = reverse_a2(json.loads(CASE3.read_bytes()))
     assert (
         revised["revision"]["previous_contract_sha256"]
         == hashlib.sha256((json.dumps(previous, indent=2) + "\n").encode()).hexdigest()
@@ -61,18 +63,24 @@ def test_only_revision_keys_differ_from_the_a1_contract() -> None:
         if revised["scoring"].get(key) != previous["scoring"].get(key)
     )
     assert scoring_changed == ["target_chemistry"]
-    assert FROZEN_REVISIONS["iso-pentane-low-t"] == canonical_sha256(revised) != A1_CANONICAL_SHA256
+    assert canonical_sha256(revised) == REVISION2_CANONICAL != A1_CANONICAL_SHA256
+    assert FROZEN_REVISIONS["iso-pentane-low-t"] == canonical_sha256(json.loads(CASE3.read_bytes()))
 
 
 def test_reproducer_rebuilds_the_committed_contract_byte_for_byte() -> None:
+    """The same revision-2 transformation preserves both historical and current splits."""
     pytest.importorskip("rdkit")  # the reproducer loads the case-1/2 reproducers, which import it
     reproducer = runpy.run_path(str(ROOT / "benchmarks/iso-pentane-low-t/reproduce.py"))
-    previous = a1_document()
+    previous = json.loads(CASE3.read_bytes())
+    del previous["revision"]
+    del previous["scoring"]["target_chemistry"]
     before = copy.deepcopy(previous)
     revised = reproducer["apply_revision"](previous)
     assert previous == before
     rebuilt = iso_pentane.Contract.model_validate(revised).model_dump_json(indent=2) + "\n"
     assert rebuilt.encode() == CASE3.read_bytes()
+    historical = a1_document()
+    assert reproducer["apply_revision"](historical) == reverse_a2(json.loads(CASE3.read_bytes()))
 
 
 def test_target_literals_equal_the_frozen_split_totals() -> None:

@@ -1,0 +1,44 @@
+{
+  "cantera_version": "3.2.0",
+  "gri30_yaml_sha256": "06650b1e0ee0012f6903d5328b1bb218cb6007d07f8ebe375d18f24811039345",
+  "burcat_excerpt_sha256": "c7235a7bbcb3dde2a2cfb49b0f547fe30f7196bfa47cb1f3d9447fa898d209b3",
+  "procedure": "Set TPX, save entropy and specific volume; set SV=(entropy, initial_specific_volume/volume_ratio). No reaction mechanism or kinetics integration.",
+  "cases": [
+    {
+      "initial_temperature_k": 295,
+      "initial_pressure_pa": 101325,
+      "volume_ratio": 10,
+      "composition": {
+        "IC5H12": 0.01,
+        "O2": 0.21,
+        "N2": 0.78
+      },
+      "temperature_k": 680.4807257571447,
+      "pressure_pa": 2337278.2894014465
+    },
+    {
+      "initial_temperature_k": 378,
+      "initial_pressure_pa": 101325,
+      "volume_ratio": 11.27354854499006,
+      "composition": {
+        "IC5H12": 0.01,
+        "O2": 0.21,
+        "N2": 0.78
+      },
+      "temperature_k": 875.5678387792058,
+      "pressure_pa": 2645911.126718771
+    },
+    {
+      "initial_temperature_k": 700,
+      "initial_pressure_pa": 101325,
+      "volume_ratio": 15,
+      "composition": {
+        "IC5H12": 0.01,
+        "O2": 0.21,
+        "N2": 0.78
+      },
+      "temperature_k": 1580.3587418693428,
+      "pressure_pa": 3431353.9182838104
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 """Offline pinned NASA-7 mixture isentropic RCM label estimates.
 
-The original seven species come from GRI-Mech 3.0. NC5H12 and HE come from
+The original seven species come from GRI-Mech 3.0. NC5H12, IC5H12 and HE come from
 Burcat's mechanism-neutral thermochemical database. Exact source pins are
 recorded below and in ``docs/rcm-t3-export.md``.
 """
@@ -89,6 +89,11 @@ NASA7: Mapping[str, Nasa7] = MappingProxyType(
             (200.0, 1000.0, 6000.0),
             (2.5, 0, 0, 0, 0, -745.375, 0.928723974),
             (2.5, 0, 0, 0, 0, -745.375, 0.928723974),
+        ),
+        "IC5H12": Nasa7(
+            (200.0, 1000.0, 6000.0),
+            (10.481631, 0.0342018698, -1.20571041e-05, 1.91951808e-09, -1.13803609e-13, -24355.7061, -31.0177093),
+            (2.19440218, 0.0361717165, 3.01586516e-05, -5.87986428e-08, 2.47059837e-11, -20909.7364, 17.185155),
         ),
     }
 )

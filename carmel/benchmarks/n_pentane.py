@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
 import zipfile
 from builtins import bytes as ByteString
 from collections import Counter
+from collections.abc import Callable, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, ClassVar, Literal, Self
 from xml.etree import ElementTree
@@ -370,13 +372,29 @@ def split_totals(split: Split) -> dict[str, int]:
     return dict(counts)
 
 
-def series_counts(record: Any) -> tuple[int, int, int, int]:
+def series_counts(
+    record: Any, *, classification_temperatures: Sequence[float] | None = None
+) -> tuple[int, int, int, int]:
+    """Count observations and inclusive 600–900 K rows using explicit or source temperatures.
+
+    An optional temperature vector affects classification only and must align with every
+    point. The default retains the source-temperature convention of existing contracts.
+    """
     series = record.envelope.series[0]
+    if classification_temperatures is not None and (
+        len(classification_temperatures) != len(series.points)
+        or any(not math.isfinite(t) or t <= 0 for t in classification_temperatures)
+    ):
+        raise ValueError("classification temperatures must be finite, positive and aligned with all points")
     constants = {item.axis_id: item.value for item in series.constants}
     low_rows = low_observations = observations = 0
-    for point in series.points:
+    for index, point in enumerate(series.points):
         coordinates = {**constants, **{item.axis_id: item.value for item in point.coordinates}}
-        temperature = float(coordinates["temperature"].canonical_decimal_value)
+        temperature = (
+            float(coordinates["temperature"].canonical_decimal_value)
+            if classification_temperatures is None
+            else classification_temperatures[index]
+        )
         observations += len(point.observations)
         if 600 <= temperature <= 900:
             low_rows += 1
@@ -384,8 +402,17 @@ def series_counts(record: Any) -> tuple[int, int, int, int]:
     return len(series.points), observations, low_rows, low_observations
 
 
-def load_split(contract: PentaneContractBase, archive_source: Path | bytes) -> dict[str, int]:
-    """Reverify archive/member pins and run every frozen member through Carmel's readers."""
+def load_split(
+    contract: PentaneContractBase,
+    archive_source: Path | bytes,
+    *,
+    count_record: Callable[[Any], tuple[int, int, int, int]] = series_counts,
+) -> dict[str, int]:
+    """Reverify pins and replay acceptance and counts with the contract's counting rule.
+
+    Existing callers retain source-temperature classification. A case-specific counter
+    must return the same four count fields, without changing the parsed record.
+    """
     raw_archive = archive_source if isinstance(archive_source, bytes) else read_pinned_file(archive_source)
     contract.split.archive.verify(raw_archive)
     archive = contract.split.archive.to_pinned_archive()
@@ -409,7 +436,7 @@ def load_split(contract: PentaneContractBase, archive_source: Path | bytes) -> d
                     record = parser(raw, archive, item.path)
                     actual_acceptance = "supported"
                     actual_reason = None
-                    actual_counts = series_counts(record)
+                    actual_counts = count_record(record)
                 except RespecthRefusal as exc:
                     actual_acceptance = "refused"
                     actual_reason = exc.reason.value

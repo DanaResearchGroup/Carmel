@@ -352,6 +352,25 @@ def test_split_loader_uses_the_verified_archive_bytes(tmp_path: Path, monkeypatc
     assert n_pentane.load_split(contract, archive_bytes)["holdout_supported_files"] == 1
 
 
+def test_split_loader_replays_counts_with_the_supplied_counter(tmp_path: Path, monkeypatch) -> None:
+    """A case-specific counter replaces source-temperature counts and receives the parsed record."""
+    contract, archive_path, item, _ = _archive_contract(tmp_path)
+    record = _record(1000, 1000)
+    seen = []
+    monkeypatch.setattr(n_pentane, "parse_series_record", lambda *args: record)
+    with pytest.raises(ValueError, match="parsed counts changed"):
+        n_pentane.load_split(contract, archive_path)
+
+    def counter(parsed):
+        seen.append(parsed)
+        return 2, 4, 1, 2
+
+    totals = n_pentane.load_split(contract, archive_path, count_record=counter)
+    assert seen == [record]
+    assert totals["holdout_low_temperature_rows"] == item.low_temperature_rows == 1
+    assert totals["holdout_low_temperature_observations"] == 2
+
+
 def test_split_loader_replays_typed_refusal(tmp_path: Path, monkeypatch) -> None:
     contract, archive_path, item, study = _archive_contract(tmp_path, acceptance="refused", reason="unmapped_property")
     study.set = "development"
