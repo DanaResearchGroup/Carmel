@@ -12,8 +12,18 @@ from typing import Any
 import numpy as np
 
 from carmel.benchmarks.cantera_worker import checkpoint_fingerprint, validate_row_refusal
-from carmel.benchmarks.holdout import _metric_limits, build_separation_report, score_metric
+from carmel.benchmarks.contract import read_pinned_file
+from carmel.benchmarks.holdout import (
+    _metric_limits,
+    _target_chemistry,
+    build_separation_report,
+    load_contract,
+    score_metric,
+)
 from carmel.benchmarks.holdout_idt import idt_metric
+from carmel.benchmarks.iso_pentane import Contract as IsoPentaneContract
+from carmel.benchmarks.n_pentane import Contract as PentaneContract
+from carmel.benchmarks.revision import FROZEN_REVISIONS
 
 BOOTSTRAP_REPLICATES = 10000
 BOOTSTRAP_SEED = 20261018
@@ -24,6 +34,7 @@ JSR_SPECIES_GROUPS = {
     "O2": ("O2",),
 }
 PairErrors = dict[tuple[str, str], tuple[float, float]]
+BENCHMARKS_DIR = Path(__file__).resolve().parents[2] / "benchmarks"
 
 
 def paired_interval(errors: PairErrors, *, seed: int = BOOTSTRAP_SEED) -> dict[str, Any]:
@@ -138,10 +149,48 @@ def bootstrap_definition(seed: int) -> dict[str, Any]:
     }
 
 
+def saved_report_contract(report: dict[str, Any]) -> tuple[PentaneContract | IsoPentaneContract, str]:
+    """Find and verify the committed contract that a saved JSR report was scored against.
+
+    The report must record its ``case`` and ``holdout_fingerprint.contract_sha256``. The case
+    names a committed ``benchmarks/<case>/contract.json``, which is validated by
+    ``holdout.load_contract`` (schema and frozen revision digest), as ``run_harness`` does. The
+    recorded digest must equal the sha256 of those bytes or, one revision back, the contract's
+    ``revision.previous_contract_sha256``; any other digest is refused, naming both accepted
+    digests. Returns the contract and the sha256 of its committed bytes.
+    """
+    case = report.get("case")
+    fingerprint = report.get("holdout_fingerprint")
+    recorded = fingerprint.get("contract_sha256") if isinstance(fingerprint, dict) else None
+    if not isinstance(case, str) or not isinstance(recorded, str):
+        raise ValueError("saved report does not record its case and holdout_fingerprint.contract_sha256")
+    if case not in FROZEN_REVISIONS:
+        raise ValueError(f"saved report names case {case!r}, which has no committed contract")
+    contract_bytes = read_pinned_file(BENCHMARKS_DIR / case / "contract.json")
+    contract = load_contract(contract_bytes)
+    committed = hashlib.sha256(contract_bytes).hexdigest()
+    revision = getattr(contract, "revision", None)
+    previous = revision.previous_contract_sha256 if revision is not None else None
+    if recorded not in (committed, previous):
+        raise ValueError(
+            f"saved report contract {recorded} is neither the committed {case} contract {committed} "
+            f"nor its recorded predecessor {previous}"
+        )
+    return contract, committed
+
+
 def rescore_saved_jsr(report_path: Path) -> dict[str, Any]:
-    """Rebuild simulated values from the original checkpoint without writing to it."""
+    """Rebuild a saved JSR report's simulated values and scores from its checkpoint.
+
+    Nothing is written. Every reported simulated value must match the original checkpoint row
+    with the same fingerprint. ``metric`` is rescored from the rebuilt rows, and
+    ``target_chemistry`` is recomputed through the same dispatch as a fresh score, using the
+    committed contract found by :func:`saved_report_contract`; its digest is recorded as
+    ``target_chemistry_contract_sha256``. A stored target is never copied through.
+    """
     report_bytes = report_path.read_bytes()
     report: dict[str, Any] = json.loads(report_bytes)
+    contract, contract_sha256 = saved_report_contract(report)
     request = json.loads(report_path.with_name("request.json").read_bytes())
     expected = {
         row["row_id"]: checkpoint_fingerprint(
@@ -211,6 +260,8 @@ def rescore_saved_jsr(report_path: Path) -> dict[str, Any]:
         elif result.get("reason") != row.get("refusal"):
             raise ValueError("checkpoint and reported refusal differ")
     rebuilt["metric"] = score_metric(rebuilt["metric_rows"])
+    rebuilt["target_chemistry"] = _target_chemistry(contract, rebuilt["metric_rows"])
+    rebuilt["target_chemistry_contract_sha256"] = contract_sha256
     rebuilt["rescore_inputs"] = {
         "report_path": str(report_path),
         "report_sha256": hashlib.sha256(report_bytes).hexdigest(),
