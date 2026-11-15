@@ -17,6 +17,7 @@ import pytest
 from carmel.benchmarks import cantera_worker as worker
 from carmel.benchmarks import holdout, holdout_idt, iso_pentane, n_heptane, n_pentane
 from carmel.benchmarks.schema import validate_contract_json
+from tests.ic5_acceptance import reverse_a2
 
 ROOT = Path(__file__).resolve().parents[1]
 # Opt-in directory of local pinned evidence; when unset, the real-data tests skip.
@@ -56,11 +57,12 @@ def mechanism(native: bool = False) -> dict[str, Any]:
     ],
 )
 def test_contract_revision_is_required_and_entire_document_is_frozen(case: str, loader: Any, tmp_path: Path) -> None:
+    """Verify the historical predecessor and reject unrecorded changes in every case."""
     path = ROOT / "benchmarks" / case / "contract.json"
     document = json.loads(path.read_bytes())
     assert validate_contract_json(path.read_bytes()).revision.number == 2
     assert loader(path).revision.number == 2
-    previous = copy.deepcopy(document)
+    previous = reverse_a2(document) if case == "iso-pentane-low-t" else copy.deepcopy(document)
     revision = previous.pop("revision")
     previous["scoring"].pop("target_chemistry")
     previous["scoring"].pop("excited_state_submechanism_sha256", None)

@@ -28,9 +28,10 @@ from carmel.benchmarks.cantera_worker import (  # noqa: E402
     trim_unsound_plog_levels,
 )
 from carmel.benchmarks.chemkin import mechanism, normalize_for_ck2yaml  # noqa: E402
-from carmel.benchmarks.iso_pentane import Contract, load_split, xml_temperature_max  # noqa: E402
-from carmel.benchmarks.n_pentane import formula_key, require_structural_absence  # noqa: E402
+from carmel.benchmarks.iso_pentane import Contract, load_split, series_counts, xml_temperature_max  # noqa: E402
+from carmel.benchmarks.n_pentane import ArchivePin, formula_key, require_structural_absence  # noqa: E402
 from carmel.benchmarks.structure import classify, features, reaction_signature  # noqa: E402
+from carmel.services.respecth import parse_idt_record  # noqa: E402
 
 EVIDENCE = Path.home() / "runs/i116-alkane-census/evidence"
 RUN = Path.home() / "runs/i137-ic5-contract"
@@ -60,7 +61,7 @@ REVISION = {
 
 
 def apply_revision(document):
-    """Return the A-1 contract document with the revision-2 target chemistry and record added.
+    """Add only the historical revision-2 target chemistry and record to a document.
 
     The input is not modified. Every other key, including the primary score, ground truth,
     split and holdout fields, is carried over unchanged.
@@ -69,6 +70,26 @@ def apply_revision(document):
     revised["scoring"] = {**document["scoring"], "target_chemistry": dict(TARGET_WINDOW)}
     revised["revision"] = dict(REVISION)
     return revised
+
+
+def frozen_split(archive):
+    """Reproduce the case-3 split with compressed-temperature development counts.
+
+    The shared builder determines membership and reader acceptance. Only supported
+    development count fields use the case-3 rule; holdout data is carried unchanged.
+    """
+    split = PENTANE["frozen_split"](archive, fuel="IC5H12", holdout_doi="10.1016/j.combustflame.2021.111678")
+    pin = ArchivePin.model_validate(split["archive"]).to_pinned_archive()
+    with zipfile.ZipFile(io.BytesIO(archive)) as source:
+        for study in split["studies"]:
+            if study["set"] != "development":
+                continue
+            for item in study["files"]:
+                if item["acceptance"] != "supported":
+                    continue
+                record = parse_idt_record(source.read(item["path"]), pin, item["path"])
+                _, _, item["low_temperature_rows"], item["low_temperature_observations"] = series_counts(record)
+    return split
 
 
 def require(condition, message):
@@ -330,7 +351,7 @@ def build(run_dir, cantera_python):
     )
     glossary = pinned(Path.home() / "runs/i117-contract/i117-glossary.pdf", CASE1["support_sources"][0])
     archive = pinned(EVIDENCE / "pentane_indirect_v2.5.zip", CASE2["split"]["archive"])
-    split = PENTANE["frozen_split"](archive, fuel="IC5H12", holdout_doi="10.1016/j.combustflame.2021.111678")
+    split = frozen_split(archive)
     bounds = {}
     pressures = []
     with zipfile.ZipFile(io.BytesIO(archive)) as z:

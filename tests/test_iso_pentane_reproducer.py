@@ -189,6 +189,7 @@ def _holdout_xml(doi, pressure_units="atm"):
 
 
 def _build_inputs(reproducer, tmp_path, monkeypatch, *, page_links=True, pressure_units="atm", bib_split=False):
+    """Isolate build orchestration from source parsing and mechanism conversion."""
     g = reproducer.g
     home = tmp_path / "home"
     evidence, run = home / "evidence", home / "run"
@@ -228,6 +229,7 @@ def _build_inputs(reproducer, tmp_path, monkeypatch, *, page_links=True, pressur
         EVIDENCE=evidence,
         RUN=run,
         PENTANE=pentane,
+        frozen_split=lambda archive: split,
         source_pin=lambda filename, url, date, raw, digest: {
             "filename": filename,
             "source_url": url,
@@ -310,3 +312,29 @@ def test_main_refuses_a_contract_that_differs_from_the_evidence(reproducer, monk
     changed["leakage_limits"] = [*changed["leakage_limits"], "one more limit"]
     with pytest.raises(ValueError, match="frozen contract differs from reproduced evidence"):
         _main(reproducer, monkeypatch, tmp_path, changed)
+
+
+def test_frozen_split_counts_supported_rcm_points_by_compressed_temperature(reproducer):
+    """Only supported development RCM members are recounted; refusals and holdout stay as built."""
+    fixtures = ROOT / "tests/fixtures/respecth"
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as target:
+        for name in ("x40011001", "x40011008"):
+            target.writestr(f"{name}.xml", (fixtures / f"{name}-rcm-excerpt.xml").read_bytes())
+    archive = buffer.getvalue()
+    shared = reproducer.g["PENTANE"]["frozen_split"](
+        archive, fuel="IC5H12", holdout_doi="10.1016/j.combustflame.2021.111678"
+    )
+    split = reproducer.g["frozen_split"](archive)
+    sets = {study["set"]: study for study in split["studies"]}
+    development, holdout = sets["development"], sets["holdout"]
+    assert holdout == next(s for s in shared["studies"] if s["set"] == "holdout")
+    admitted, refused = development["files"]
+    assert (admitted["path"], admitted["acceptance"]) == ("x40011001.xml", "supported")
+    # The source temperature is 378 K; the derived compressed temperature is about 886 K.
+    assert (admitted["low_temperature_rows"], admitted["low_temperature_observations"]) == (1, 1)
+    assert (refused["acceptance"], refused["refusal_reason"]) == ("refused", "rcm_thermo_unavailable")
+    shared_files = next(s for s in shared["studies"] if s["set"] == "development")["files"]
+    assert shared_files[0]["low_temperature_rows"] == 0
+    assert refused == shared_files[1]
+    assert {k: v for k, v in split.items() if k != "studies"} == {k: v for k, v in shared.items() if k != "studies"}
