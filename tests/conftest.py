@@ -51,7 +51,7 @@ class HttpDoubleServer(http.server.ThreadingHTTPServer):
 if sys.version_info < (3, 14):  # noqa: UP036
     raise RuntimeError(
         f"Carmel's tests require Python >= 3.14; this interpreter is {sys.version.split()[0]} "
-        f"at {sys.executable}. Run `conda activate crml_env` first."
+        f"at {sys.executable}. Run them through `uv run pytest`."
     )
 
 

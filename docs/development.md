@@ -4,11 +4,13 @@
 
 ### Prerequisites
 
-- [Conda](https://conda-forge.org/download/), git, and a C toolchain
-- For real T3 execution: T3 and ARC in their own environment (see
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) for
+  Carmel's own environment
+- For real T3 execution: [conda](https://conda-forge.org/download/), git
+  and a C toolchain, for T3 and ARC in their own conda environment (see
   "Three-env deployment model" below) — do **not** try to install them
-  into `crml_env`, their Python pins are mutually exclusive with Carmel's.
-  `make install` sets all three environments up for you.
+  into Carmel's `.venv`, their Python pins are mutually exclusive with
+  Carmel's. `make install` sets all three environments up for you.
 
 ### Initial Setup
 
@@ -17,17 +19,22 @@ Working on Carmel's own code, with no real T3 execution:
 ```bash
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
-conda env create -f environment.yml
-conda activate crml_env
-make install-dev
+make install-dev          # uv sync --locked --extra dev, into .venv
+uv run --extra dev pytest # --extra dev re-syncs the dev tools after a lock change
 ```
+
+`make install-agents-dev` adds the `agents` extra (pydantic-ai, pypdf,
+rdkit), which `make typecheck` needs. After changing a dependency in
+`pyproject.toml`, run `uv lock` and commit `uv.lock`; CI runs
+`uv lock --check` and refuses a stale one.
 
 To also run real campaigns, use `make install` instead — it builds all three
 environments and the external chemistry stack. See
 [installation.md](installation.md) for the full guide, the individual targets,
 and how to point it at checkouts you already have.
 
-**Activate `crml_env` before running anything.** Carmel's floor of Python
+**Run everything through `uv run`** (or the `make` targets, which do).
+Carmel's floor of Python
 3.14 is not only a packaging constraint: the source uses 3.14 syntax, so an
 older interpreter fails while *parsing* it. Running `pytest` on, say, 3.12
 reports a `SyntaxError` during collection rather than anything about
@@ -47,13 +54,14 @@ tool flags one, check which interpreter it is running before changing anything.
 ### Three-env deployment model
 
 Carmel, T3, and RMG have mutually exclusive Python requirements and
-normally live in three separate conda environments:
+live in three separate environments. Carmel's is a uv project environment;
+the chemistry tools need conda-only packages and stay on conda:
 
-| Env        | Contains          | Python pin       |
-|------------|-------------------|------------------|
-| `rmg_env`  | RMG-Py, Arkane    | `>=3.9,<3.12`    |
-| `t3_env`   | T3 **and** ARC    | `=3.14`          |
-| `crml_env` | Carmel itself     | `>=3.14`         |
+| Env        | Managed by | Contains          | Python pin       |
+|------------|------------|-------------------|------------------|
+| `.venv`    | uv         | Carmel itself     | `>=3.14`         |
+| `rmg_env`  | conda      | RMG-Py, Arkane    | `>=3.9,<3.12`    |
+| `t3_env`   | conda      | T3 **and** ARC    | `=3.14`          |
 
 T3 imports ARC in-process, so they must share an environment (`t3_env`);
 T3 in turn launches RMG as a subprocess under `rmg_env`. Name T3's
@@ -85,7 +93,7 @@ export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
 
 Resolution order is `T3_CONDA_ENV` → `T3_PYTHON` → `sys.executable`. The
 last is only correct for a single-env developer setup where T3 and ARC are
-installed directly into `crml_env`. See
+installed directly into Carmel's environment. See
 [architecture.md](architecture.md#three-env-deployment-model-and-t3-invocation)
 for full details, including how an invalid value for either variable is
 handled.
@@ -93,8 +101,18 @@ handled.
 ## Running the UI
 
 ```bash
-carmel serve --workspaces ./workspaces
+uv run carmel serve --workspaces ./workspaces
 ```
+
+On a full-stack install (`make install`, so T3 and ARC are present), load the
+tool paths that `make install-carmel` wrote, so the UI can launch T3:
+
+```bash
+uv run --env-file carmel-tools.env carmel serve --workspaces ./workspaces
+```
+
+`make install-dev` does not write `carmel-tools.env`, so a Carmel-only checkout
+uses the plain `uv run` form.
 
 Then open http://127.0.0.1:5000 in a browser.
 
@@ -140,10 +158,14 @@ implementation.
 make test                                       # Run all tests with coverage
 
 # Or target specific tests directly:
-pytest tests/test_schemas.py
-pytest tests/test_services.py
-pytest tests/test_t3_adapter.py
-pytest tests/test_ui.py
+uv run pytest tests/test_schemas.py
+uv run pytest tests/test_services.py
+uv run pytest tests/test_t3_adapter.py
+uv run pytest tests/test_ui.py
+
+# Full-stack install only: the real T3 execution test needs carmel-tools.env,
+# which make install-carmel writes; without it that test skips.
+uv run --env-file carmel-tools.env pytest tests/test_t3_adapter.py
 ```
 
 ### Test Organization
@@ -318,7 +340,7 @@ without updating the ruleset orphans the requirement and blocks every PR
 while every check shows green.
 
 Caches are keyed on the upstream commit SHAs rather than on Carmel's own
-`environment.yml`, since those revisions are what actually gets installed.
+`uv.lock`, since those revisions are what actually gets installed.
 No install step is gated on a cache hit: the installers decide from what is
 on disk, so the caches supply state and never a verdict.
 

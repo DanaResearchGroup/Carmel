@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Install everything Carmel needs to run a real campaign: the external
-# chemistry stack, the three conda environments, and Carmel itself.
+# chemistry stack, the two conda tool environments, and Carmel itself (uv).
 #
 # Safe to re-run. Every step checks what is actually on disk, so a second run
 # verifies in seconds instead of rebuilding.
@@ -25,7 +25,7 @@ Installs, in order:
   1. RMG-Py, RMG-database, ARC and T3 into \$CARMEL_STACK_ROOT
   2. $RMG_ENV   — RMG-Py and Arkane
   3. $T3_CONDA_ENV    — T3 and ARC together
-  4. $CARMEL_ENV  — Carmel itself, plus a hook recording the tool paths
+  4. .venv     — Carmel itself (uv), plus carmel-tools.env recording the tool paths
 
   --update   Fast-forward existing upstream checkouts
 
@@ -51,9 +51,8 @@ cat <<EOF
 
 Done. To use Carmel:
 
-    conda activate $CARMEL_ENV
-    carmel --help
+    uv run --env-file $CARMEL_TOOLS_ENV_FILE carmel --help
 
 The tool paths (T3_CONDA_ENV, T3_PATH, ARC_PATH, RMG_PATH, RMG_DB_PATH) are
-exported by that activation, so nothing else has to be set by hand.
+in $CARMEL_TOOLS_ENV_FILE, so nothing else has to be set by hand.
 EOF
