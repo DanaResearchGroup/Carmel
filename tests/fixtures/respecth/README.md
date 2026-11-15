@@ -36,3 +36,14 @@ and common properties from `x10011001.xml` in the pinned pentane archive
 `72872e417d4834420d02e7fa745569ed2e67eb71a063c9a20c9b414ad1e52a52`).
 The other eight data rows are omitted. This test-only excerpt exercises the
 IC5H12 stated-phi audit and replay without requiring archive downloads.
+
+### Iso-pentane RCM excerpts
+
+`x40011001-rcm-excerpt.xml` and `x40011008-rcm-excerpt.xml` retain the first
+observation and its complete linked volume history from the corresponding
+`pentane_indirect_v2.5.zip` members (archive SHA-256
+`b34d6e78a0600bffba9bf7f04f59d9479d6d1314df9964e4071902c929a65e56`).
+Other observations and histories were removed and XML whitespace was normalized.
+Composition, initial conditions and history samples are unmodified; the second
+excerpt exercises the real 292 K refusal. The archive's source attribution and
+CC BY 4.0 terms above apply.

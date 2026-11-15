@@ -169,6 +169,7 @@ def test_xml_temperature_bounds_refuse_incomplete_or_invalid_data(raw):
 
 @pytest.mark.parametrize("drift", [False, True])
 def test_split_loader_verifies_actual_temperature_bound(tmp_path, monkeypatch, drift):
+    """The case-3 counter and temperature audit consume one verified archive snapshot."""
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w") as z:
         z.writestr("x.xml", _xml())
@@ -177,8 +178,10 @@ def test_split_loader_verifies_actual_temperature_bound(tmp_path, monkeypatch, d
     path.write_bytes(raw)
     contract = SimpleNamespace(holdout_file_max_temperature_k={"x.xml": 1000 if drift else 1100})
 
-    def verify(c, data):
+    def verify(c, data, *, count_record):
+        """Check the case-specific counter while the loader uses its pinned snapshot."""
         assert c is contract and hashlib.sha256(data).digest() == hashlib.sha256(raw).digest()
+        assert count_record is iso_pentane.series_counts
         path.unlink()  # Temperature replay must consume the same verified snapshot.
         return {"holdout_rows": 1}
 

@@ -10,6 +10,7 @@ import pytest
 from carmel.schemas.datasets import Absent
 from carmel.services.respecth import RespecthRefusal, parse_idt_record, replay_idt_record
 from carmel.services.respecth_archive import load_manifest
+from tests.ic5_acceptance import reverse_a2
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/respecth/x10011001-idt-excerpt.xml"
@@ -57,8 +58,8 @@ def test_ic5_phi_inside_existing_tolerance_is_accepted():
 
 
 def test_case3_a1_changes_only_the_three_shock_acceptances():
-    """Undoing revision 2, then the six allowed leaves, recovers the entire previous frozen digest."""
-    document = json.loads((ROOT / "benchmarks/iso-pentane-low-t/contract.json").read_bytes())
+    """Reverse A-2 and revision 2, then prove the original six A-1 leaves exactly."""
+    document = reverse_a2(json.loads((ROOT / "benchmarks/iso-pentane-low-t/contract.json").read_bytes()))
     del document["revision"]
     del document["scoring"]["target_chemistry"]
     changed = []
