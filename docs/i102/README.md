@@ -10,7 +10,7 @@ the first time the lane has been measured over a real corpus.
 ## Reproduce
 
 ```bash
-python -m carmel.tools.corpus_table_survey \
+uv run python -m carmel.tools.corpus_table_survey \
   --workspace <scratch>/ws \
   --out docs/i102/corpus_survey_results_n300_seed0.jsonl \
   --root "$CORPUS_ROOT/_2 Post" \

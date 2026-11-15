@@ -164,6 +164,15 @@ def _action() -> PlannedAction:
 # ---------------------------------------------------------------------------
 
 
+def _stub_conda_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every conda env resolve to ``/opt/conda/envs/<env>/bin/python`` without running conda."""
+    from carmel.adapters import _launcher
+
+    monkeypatch.setattr(
+        _launcher, "resolve_conda_interpreter", lambda _conda, env, **_kwargs: f"/opt/conda/envs/{env}/bin/python"
+    )
+
+
 class TestT3Discovery:
     def test_is_t3_installed_returns_bool(self) -> None:
         assert isinstance(is_t3_installed(), bool)
@@ -730,6 +739,8 @@ class TestT3CondaEnvError:
     def test_env_usable_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
 
+        _stub_conda_interpreter(monkeypatch)
+
         monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
         monkeypatch.setattr(t3_module.shutil, "which", lambda _name: "/usr/bin/conda")
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
@@ -945,6 +956,8 @@ class TestFindT3Executable:
     def test_env_path_carries_conda_run_prefix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
 
+        _stub_conda_interpreter(monkeypatch)
+
         script = tmp_path / T3_LAYOUT.EXECUTABLE_SCRIPT
         script.write_text("# T3")
         monkeypatch.setenv("T3_PATH", str(tmp_path))
@@ -960,12 +973,14 @@ class TestFindT3Executable:
             "-n",
             "t3_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/t3_env/bin/python",
             str(script),
         ]
 
     def test_module_invocation_carries_conda_run_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
+
+        _stub_conda_interpreter(monkeypatch)
 
         monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
         monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
@@ -980,7 +995,7 @@ class TestFindT3Executable:
             "-n",
             "t3_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/t3_env/bin/python",
             "-m",
             T3_LAYOUT.EXECUTABLE_MODULE,
         ]
@@ -996,6 +1011,8 @@ class TestFindT3Executable:
         may be used.
         """
         from carmel.adapters import t3 as t3_module
+
+        _stub_conda_interpreter(monkeypatch)
 
         repo_root = tmp_path / "carmel_side_T3"
         pkg = repo_root / "t3"
@@ -1016,7 +1033,7 @@ class TestFindT3Executable:
             "-n",
             "t3_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/t3_env/bin/python",
             "-m",
             T3_LAYOUT.EXECUTABLE_MODULE,
         ]
@@ -1027,6 +1044,8 @@ class TestFindT3Executable:
         ``importlib.util.find_spec`` one.
         """
         from carmel.adapters import t3 as t3_module
+
+        _stub_conda_interpreter(monkeypatch)
 
         monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
         monkeypatch.setattr(t3_module, "is_t3_importable", lambda: True)
@@ -1045,7 +1064,7 @@ class TestFindT3Executable:
             "-n",
             "t3_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/t3_env/bin/python",
             "-m",
             T3_LAYOUT.EXECUTABLE_MODULE,
         ]
@@ -1107,6 +1126,8 @@ class TestT3PythonCommand:
     def test_conda_env_set_and_conda_on_path_uses_conda_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import t3 as t3_module
 
+        _stub_conda_interpreter(monkeypatch)
+
         monkeypatch.setenv("T3_CONDA_ENV", "t3_env")
         monkeypatch.setattr(t3_module.shutil, "which", lambda name: "/opt/conda/bin/conda" if name == "conda" else None)
         assert _t3_python_command() == [
@@ -1115,7 +1136,7 @@ class TestT3PythonCommand:
             "-n",
             "t3_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/t3_env/bin/python",
         ]
 
     def test_conda_env_set_but_conda_not_on_path_falls_back_with_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:

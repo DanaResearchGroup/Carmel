@@ -58,7 +58,7 @@ concurrency:
 #
 #   rmg_env   RMG-Py and Arkane          python >=3.9,<3.12
 #   t3_env    T3 and ARC together        python =3.14
-#   crml_env  Carmel itself              python >=3.14
+#   .venv     Carmel itself (uv)         python >=3.14
 #
 # They are separate processes, not imports. T3 launches RMG as a subprocess
 # under rmg_env (T3/t3/runners/rmg_runner.py), and Carmel launches T3 as a
@@ -77,7 +77,7 @@ concurrency:
 #
 # The upstream stack is cloned at the top of the job so its commit SHAs can key
 # three caches: conda's package tarballs, the solved environments, and RMG-Py's
-# compiled Cython extensions. Those SHAs — not Carmel's own environment.yml —
+# compiled Cython extensions. Those SHAs — not Carmel's own uv.lock —
 # are what determine whether a cached environment is still valid, because they
 # are what actually gets installed. Anything whose cache hit SKIPS a build step
 # is keyed on an exact match with no restore-keys; see the comments on the
@@ -102,7 +102,7 @@ jobs:
       # Cloned BEFORE the conda setup so the upstream commit SHAs are available
       # to key the caches below. The upstream stack is what actually gets
       # installed, so the caches must be keyed on those revisions — not on
-      # Carmel's own environment.yml, which describes a different environment
+      # Carmel's own uv.lock, which describes a different environment
       # entirely and never changes when RMG/ARC/T3 do.
       #
       # `make install` would clone these itself, and does on a developer
@@ -156,18 +156,19 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-conda-pkgs-
 
-      # All three solved environments — the expensive artifact. Deliberately NO
+      # Both solved conda environments — the expensive artifact. Deliberately NO
       # restore-keys: the build steps below are skipped on a hit, so a
       # near-miss would silently test a stack built from different upstream
       # revisions than the ones just checked out. An exact-match-or-rebuild
-      # policy is the only honest one when a hit suppresses the build. Carmel's
-      # own environment.yml joins the key because crml_env is built from it.
+      # policy is the only honest one when a hit suppresses the build. The key
+      # is the upstream stack pins alone: Carmel's own environment is a uv
+      # .venv outside this cache, so uv.lock does not belong in it.
       - name: Cache the solved conda environments
         id: cache-envs
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: ${{ env.CONDA_ROOT }}/envs
-          key: ${{ runner.os }}-envs-${{ steps.pins.outputs.stack }}-${{ hashFiles('environment.yml') }}
+          key: ${{ runner.os }}-envs-${{ steps.pins.outputs.stack }}
 
       # ARC has the same property as RMG-Py below: `arc.molecule.graph` and
       # friends are Cython extensions declared in ARC's setup.py, and they
@@ -219,6 +220,11 @@ jobs:
       # The job carries `continue-on-error: true` so a collapse anywhere in
       # this heavy install chain (flaky upstream environment, large chemistry
       # stack, or a corrupt restored cache) cannot redden the required lanes.
+      - name: Set up uv for Carmel's own environment
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2  # v10.3.3
+        with:
+          python-version: "3.14"
+
       - name: Install the chemistry stack and Carmel
         run: CARMEL_STACK_ROOT="$HOME" make install
 
@@ -228,16 +234,16 @@ jobs:
       # rather than let a mangled interpreter masquerade as a real test result.
       - name: Verify the three environments are usable
         run: |
-          for env_name in rmg_env t3_env crml_env; do
+          for env_name in rmg_env t3_env; do
             conda run -n "$env_name" python -c "import sys; print('$env_name', sys.version)" || {
               echo "::error::Environment $env_name is unusable. Bump the cache key or clear the caches."
               exit 1
             }
           done
 
-      # These are not restated here — they are read back out of the activation
-      # hook `make install` wrote into crml_env, which is what a user gets from
-      # `conda activate crml_env`. So the hook is load-bearing in CI: if it is
+      # These are not restated here — they are read back out of the
+      # carmel-tools.env file `make install` wrote, which is what a user reads
+      # with `uv run --env-file`. So the file is load-bearing in CI: if it is
       # missing or wrong, this step fails by name instead of the lane quietly
       # working off values only CI has.
       #
@@ -257,7 +263,7 @@ jobs:
       # interpreter is the mode that does NOT work.
       - name: Export the tool paths the installer recorded
         run: |
-          hook="$CONDA_ROOT/envs/crml_env/etc/conda/activate.d/carmel.sh"
+          hook="$GITHUB_WORKSPACE/carmel-tools.env"
           if [ ! -f "$hook" ]; then
             echo "::error::the installer did not write $hook"
             exit 1
@@ -272,7 +278,7 @@ jobs:
             # adapter needs ARC_PATH to find the script (importability alone is
             # not enough). Without this the real ARC execution test hits
             # TOOL_NOT_FOUND before launch and the gate below would pass having
-            # run zero ARC. The activate hook exports it when $HOME/ARC exists.
+            # run zero ARC. The tool-path file exports it when $HOME/ARC exists.
             echo "ARC_PATH=$ARC_PATH"
             echo "RMG_PATH=$RMG_PATH"
             echo "RMG_DB_PATH=$RMG_DB_PATH"
@@ -325,8 +331,7 @@ jobs:
       # be visible. If it is not, the @requires_t3 marker skips them cleanly.
       - name: Run T3-dependent tests
         run: |
-          conda activate crml_env
-          pytest tests/test_t3_adapter.py -v --junitxml=t3-report.xml
+          uv run --locked pytest tests/test_t3_adapter.py -v --junitxml=t3-report.xml
 
       # The whole point of this lane is the real T3 path, so a skipped
       # real-execution test is a failure here — not a fact to report and move
@@ -344,8 +349,7 @@ jobs:
       - name: Require that the real T3 execution test actually ran
         if: always()
         run: |
-          conda activate crml_env
-          python - <<'PY'
+          uv run --locked python - <<'PY'
           import pathlib
           import xml.etree.ElementTree as ET
 
@@ -378,12 +382,11 @@ jobs:
       # (@requires_arc) is now a strict "must not skip" gate — like the T3 one
       # above — because the ARC adapter launches ARC through its conda env the
       # way the T3 adapter does (a bare `python ARC.py` would run under
-      # crml_env, where arc is not importable). The gate is the step after this.
+      # Carmel's uv environment, where arc is not importable). The gate is the step after this.
       - name: Run ARC-dependent tests
         if: always()
         run: |
-          conda activate crml_env
-          pytest tests/test_arc_adapter.py -v --junitxml=arc-report.xml
+          uv run --locked pytest tests/test_arc_adapter.py -v --junitxml=arc-report.xml
 
       # The whole point of this lane is the real ARC path, so a skipped
       # real-execution test is a failure here — not a fact to report and move
@@ -401,8 +404,7 @@ jobs:
       - name: Require that the real ARC execution test actually ran
         if: always()
         run: |
-          conda activate crml_env
-          python - <<'PY'
+          uv run --locked python - <<'PY'
           import pathlib
           import xml.etree.ElementTree as ET
 

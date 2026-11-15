@@ -206,7 +206,7 @@ candidate locking. ChemKED's NOx-doped points are excluded.
 From the repository root, using the required environment:
 
 ```bash
-/home/alon/anaconda3/envs/crml_env/bin/python \
+uv run --locked python \
   benchmarks/n-pentane-low-t/reproduce.py \
   --v-old /home/alon/runs/i116-alkane-census/evidence/nc5-49.txt \
   --v-new /home/alon/runs/i116-alkane-census/evidence/c5-2015.txt \

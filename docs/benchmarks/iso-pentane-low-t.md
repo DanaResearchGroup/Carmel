@@ -235,7 +235,7 @@ historical separation, subject to v_new’s unauthenticated publication-era iden
 ## Reproduction
 
 ```bash
-~/anaconda3/envs/crml_env/bin/python benchmarks/iso-pentane-low-t/reproduce.py
+uv run --locked python benchmarks/iso-pentane-low-t/reproduce.py
 ```
 
 Run under the dispatch’s systemd resource limits and capture stdout/stderr in

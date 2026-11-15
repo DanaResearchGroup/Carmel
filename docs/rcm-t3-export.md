@@ -8,10 +8,10 @@ parsing and replay share the mixture, linked-history and derived-temperature
 admission checks.
 
 ```sh
-carmel data export-t3 --source chemked --fuel n-heptane --output n-heptane.yaml
-carmel data export-t3 --source all --history-only --output rcm.yaml --offline
-carmel data export-t3 --source all --history-only --derived-labels --output rcm-labelled.yaml --offline
-carmel data export-t3 --source respecth --study x40000001.xml --study x40000002_x.xml --output split.yaml
+uv run carmel data export-t3 --source chemked --fuel n-heptane --output n-heptane.yaml
+uv run carmel data export-t3 --source all --history-only --output rcm.yaml --offline
+uv run carmel data export-t3 --source all --history-only --derived-labels --output rcm-labelled.yaml --offline
+uv run carmel data export-t3 --source respecth --study x40000001.xml --study x40000002_x.xml --output split.yaml
 ```
 
 `--study` is repeatable and matches an exact file/member path, basename or DOI.

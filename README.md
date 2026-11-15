@@ -23,25 +23,39 @@ Carmel automates the iterative cycle of building, validating, refining, validati
 
 ## Installation
 
-You need [conda](https://conda-forge.org/download/) on your `PATH`, git, and a
-C toolchain. Then:
+Carmel itself is managed by [uv](https://docs.astral.sh/uv/getting-started/installation/),
+from the committed `uv.lock`. The chemistry tools it drives (RMG-Py, Arkane,
+ARC, T3) stay on [conda](https://conda-forge.org/download/), because they need
+conda-only packages. For a full install you need uv and conda on your `PATH`,
+git, and a C toolchain. Then:
 
 ```bash
 git clone https://github.com/DanaResearchGroup/Carmel.git
 cd Carmel
 make install
-conda activate crml_env
-carmel --help
+uv run --env-file carmel-tools.env carmel --help
 ```
 
 `make install` clones the external chemistry stack (RMG-Py, RMG-database, ARC,
-T3), builds the three conda environments Carmel needs, installs Carmel, and
-records where everything ended up. Budget around 40 minutes the first time;
-re-running takes seconds, because every step checks what is already on disk.
+T3), builds its two conda environments, syncs Carmel into a uv `.venv`, and
+records where the tools ended up in `carmel-tools.env`. Budget around 40 minutes the
+first time; re-running takes seconds, because every step checks what is
+already on disk.
 
-Working on Carmel's own code and not running real campaigns? `make install-dev`
-installs Carmel and its dev dependencies into the current environment and
-stops there.
+Working on Carmel's own code and not running real campaigns? You need uv
+only:
+
+```bash
+uv sync --extra dev        # or: make install-dev
+uv run pytest
+uv run carmel --help
+```
+
+| Environment | Managed by | Holds |
+| --- | --- | --- |
+| `.venv` | uv (`uv.lock`) | Carmel and its dev tools; the `agents` extra is optional (`make install-agents-dev`) |
+| `rmg_env` | conda | RMG-Py, Arkane |
+| `t3_env` | conda | T3 and ARC |
 
 Run `make help` for the individual targets, and see
 [docs/installation.md](docs/installation.md) for pointing the installer at
@@ -51,8 +65,8 @@ checkouts you already have, and for troubleshooting.
 
 T3, ARC and RMG-Py have mutually exclusive Python requirements, so they cannot
 share one environment. Carmel runs them as **separate processes**: `rmg_env`
-holds RMG-Py and Arkane, `t3_env` holds T3 and ARC together, and `crml_env`
-holds Carmel.
+holds RMG-Py and Arkane, `t3_env` holds T3 and ARC together (both conda), and
+Carmel's uv `.venv` holds Carmel.
 
 Carmel launches T3 with `conda run -n $T3_CONDA_ENV`, which runs that
 environment's activation hooks. That is not the same as naming the
@@ -61,9 +75,9 @@ Open Babel, whose conda package sets `BABEL_LIBDIR`/`BABEL_DATADIR` from an
 activation hook. Skip the hook and Open Babel loads no plugins, so `import arc`
 — and therefore `import t3` — fails outright.
 
-`make install` writes `T3_CONDA_ENV` (along with `T3_PATH`, `RMG_PATH` and
-`RMG_DB_PATH`) into `crml_env`'s own activation hook, so `conda activate
-crml_env` is all the setup there is. `T3_PYTHON` remains supported for
+`make install` writes `T3_CONDA_ENV` (along with `T3_PATH`, `ARC_PATH`,
+`RMG_PATH` and `RMG_DB_PATH`) to `carmel-tools.env`, so `uv run --env-file
+carmel-tools.env …` is all the setup there is. `T3_PYTHON` remains supported for
 deployments with no conda in the picture, and names T3's interpreter directly:
 
 ```bash
@@ -71,7 +85,7 @@ export T3_PYTHON=/path/to/conda/envs/t3_env/bin/python
 ```
 
 If neither is set, Carmel falls back to its own interpreter — only correct if
-T3/ARC happen to be installed directly into `crml_env`. See
+T3/ARC happen to be installed directly into Carmel's environment. See
 [docs/architecture.md](docs/architecture.md#three-env-deployment-model-and-t3-invocation)
 for the full layout.
 
@@ -79,13 +93,13 @@ for the full layout.
 
 ```bash
 # Show version
-carmel version
+uv run carmel version
 
 # Validate a configuration file
-carmel validate-config config.yaml
+uv run carmel validate-config config.yaml
 
 # Initialize a new workspace
-carmel init-workspace my-campaign
+uv run carmel init-workspace my-campaign
 ```
 
 ### Configuration
@@ -132,8 +146,8 @@ make install-dev # Editable install with dev deps, current environment only
 To run a specific test:
 
 ```bash
-pytest tests/test_config.py
-pytest tests/test_config.py::TestCarmelConfig::test_minimal_config
+uv run pytest tests/test_config.py
+uv run pytest tests/test_config.py::TestCarmelConfig::test_minimal_config
 ```
 
 ## License

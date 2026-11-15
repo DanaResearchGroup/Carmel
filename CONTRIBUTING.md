@@ -64,12 +64,11 @@ holds commercial extensions that plug into the core through the typed contracts 
 ## Development workflow
 
 ```bash
-# Create and activate the conda environment
-conda env create -f environment.yml
-conda activate crml_env
-
-# Editable install with dev dependencies
+# Sync Carmel and its dev dependencies into .venv with uv, from uv.lock
 make install-dev
+
+# Run the tools inside that environment
+uv run pytest
 ```
 
 To also run real campaigns, `make install` builds the whole external
