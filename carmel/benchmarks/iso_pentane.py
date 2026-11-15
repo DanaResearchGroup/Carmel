@@ -62,7 +62,7 @@ class Contract(PentaneContractBase):
         "development_files": 20,
         "development_rows": 121,
         "development_observations": 121,
-        "development_supported_files": 0,
+        "development_supported_files": 3,
         "holdout_files": 4,
         "holdout_rows": 58,
         "holdout_observations": 812,

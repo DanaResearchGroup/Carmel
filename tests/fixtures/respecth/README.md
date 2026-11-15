@@ -29,3 +29,10 @@ maintainers ask users to cite are in the repository `NOTICE`.
 member `x00011003.xml`. It retains one NC5H12 common-composition component, one
 NC5H12 series column, and one data row to guard the legacy non-IDT role and replay
 semantics without committing the full archive member.
+
+`x10011001-idt-excerpt.xml` retains the first data row and the original metadata
+and common properties from `x10011001.xml` in the pinned pentane archive
+(original member SHA-256
+`72872e417d4834420d02e7fa745569ed2e67eb71a063c9a20c9b414ad1e52a52`).
+The other eight data rows are omitted. This test-only excerpt exercises the
+IC5H12 stated-phi audit and replay without requiring archive downloads.

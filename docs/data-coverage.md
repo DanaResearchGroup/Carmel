@@ -98,3 +98,17 @@ the conflicting-volume file's 6 points and the second-maximum files' 12 points
 remain refused. Across every pinned
 archive, H2 and syngas counts are unchanged and only these n-pentane development
 records gain acceptance.
+
+## Iso-pentane shock-tube admission (revision A-1)
+
+Case 3's development split admits the three Bugler 2016 shock-tube files
+`x10011001.xml`–`x10011003.xml`: 28 points, none in 600–900 K. The stated phi
+is checked using IC5H12's oxygen demand of 8 mol O2/mol fuel and the existing
+absolute `1e-6` tolerance. No composition roles or conversion tables change.
+All 75 RCM points remain `rcm_thermo_unavailable`; all 18 second-maximum points
+remain `unmapped_ignition_definition`. The NASA7 table is unchanged.
+
+The table above is the dated 2026-10-17 census. This admission adds three IDT
+files / 28 points to that snapshot; RCM and non-IDT yields are unchanged.
+See [case 3 revision A-1](benchmarks/iso-pentane-low-t.md#acceptance-revision-a-1)
+for the declared acceptance revision and frozen digests.
