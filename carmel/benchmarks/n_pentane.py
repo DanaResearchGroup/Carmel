@@ -128,7 +128,7 @@ class Scoring(FrozenModel):
 
 
 class RevisedScoring(Scoring):
-    """Case-2 scoring after revision 2 (I-135); case 3 has not adopted it yet."""
+    """Case-2 scoring after revision 2 (I-135); case 3 has its own revised scoring."""
 
     target_chemistry: EtherTarget
 

@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from carmel.benchmarks import cantera_worker as worker
-from carmel.benchmarks import holdout, holdout_idt, n_heptane, n_pentane
+from carmel.benchmarks import holdout, holdout_idt, iso_pentane, n_heptane, n_pentane
 from carmel.benchmarks.schema import validate_contract_json
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,7 +48,12 @@ def mechanism(native: bool = False) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    "case,loader", [("n-heptane-low-t", n_heptane.load_contract), ("n-pentane-low-t", n_pentane.load_contract)]
+    "case,loader",
+    [
+        ("n-heptane-low-t", n_heptane.load_contract),
+        ("n-pentane-low-t", n_pentane.load_contract),
+        ("iso-pentane-low-t", iso_pentane.load_contract),
+    ],
 )
 def test_contract_revision_is_required_and_entire_document_is_frozen(case: str, loader: Any, tmp_path: Path) -> None:
     path = ROOT / "benchmarks" / case / "contract.json"

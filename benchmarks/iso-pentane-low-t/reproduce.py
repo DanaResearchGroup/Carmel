@@ -41,6 +41,35 @@ CASE2 = json.loads((REPO / "benchmarks/n-pentane-low-t/contract.json").read_byte
 CASE1 = json.loads((REPO / "benchmarks/n-heptane-low-t/contract.json").read_bytes())
 THERMO_URL = "https://nuigalway.ie/media/researchcentres/combustionchemistrycentre/files/mechanismdownloads/"
 
+TARGET_WINDOW = {
+    "temperature_min_k": 600,
+    "temperature_max_k": 900,
+    "inclusive": True,
+    "frozen_rows": 31,
+    "frozen_scalars": 434,
+    "metric": "existing_species_balanced_jsr_metric",
+}
+REVISION = {
+    "number": 2,
+    "previous_contract_sha256": "a71d19cfea8e8c03cb571f3c4b64086c50d95f6986e6a79d734092342cc7c3d4",
+    "reason": (
+        "Owner-authorized secondary-score revision before any candidate was scored: declare the "
+        "target-chemistry score as the 600-900 K inclusive window of the existing JSR holdout."
+    ),
+}
+
+
+def apply_revision(document):
+    """Return the A-1 contract document with the revision-2 target chemistry and record added.
+
+    The input is not modified. Every other key, including the primary score, ground truth,
+    split and holdout fields, is carried over unchanged.
+    """
+    revised = dict(document)
+    revised["scoring"] = {**document["scoring"], "target_chemistry": dict(TARGET_WINDOW)}
+    revised["revision"] = dict(REVISION)
+    return revised
+
 
 def require(condition, message):
     if not condition:
@@ -345,7 +374,7 @@ def build(run_dir, cantera_python):
             max(bounds.values()),
         )
     truth = mapped_truth(old, new, old_thermo, new_thermo, glossary)
-    return dict(
+    document = dict(
         schema_version=1,
         case="iso-pentane-low-t",
         mechanisms=dict(v_old=old_pin, v_new=CASE2["mechanisms"]["v_new"]),
@@ -376,7 +405,7 @@ def build(run_dir, cantera_python):
         ),
         **truth,
         split=split,
-        # Case 2's frozen scoring before its revision-2 target chemistry; case 3 adopts that revision separately.
+        # Case 2's frozen scoring without its ether target; apply_revision adds the case-3 window target.
         scoring={key: value for key, value in CASE2["scoring"].items() if key != "target_chemistry"},
         leakage_limits=[
             "v_new and the four Bugler2015 chemistry classes are shared with case 2; this tests transfer "
@@ -396,6 +425,7 @@ def build(run_dir, cantera_python):
             "Its digitized numeric XML observations retain their provenance; no point is redigitized.",
         ],
     )
+    return apply_revision(document)
 
 
 def main():

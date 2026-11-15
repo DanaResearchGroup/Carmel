@@ -179,6 +179,30 @@ This is an acceptance revision, separate from the secondary-score revision 2.
 The contract's historical leakage prose still describes the original freeze;
 A-1 supersedes only its statement that no development observations are supported.
 
+## Secondary-score revision 2
+
+**Case 3, revision 2** adds a target-chemistry sub-score, as cases 1 and 2 did. The
+target is the 600–900 K window of the existing JSR holdout: every holdout row whose
+temperature lies in [600, 900] K, inclusive, over every measured species. It uses the
+same species-balanced JSR metric and the same detection-limit clamps as the aggregate,
+so it equals the aggregate's `low_temperature_600_900_k` subset. The holdout has no
+cyclic ethers, so case 2's ether target would score zero rows.
+
+The window holds 31 rows and 434 scalars from all four Zhong et al. files
+(x00011009: 9, x00011010: 8, x00011011: 9, x00011012: 5). The holdout's lowest
+temperature is 700 K. The contract freezes both counts in `scoring.target_chemistry`.
+The harness refuses a run whose window holds other counts. A measured species with no
+scored row in the window is reported with `scored_rows: 0` and a null score.
+
+The revision adds only `scoring.target_chemistry` and the `revision` record. The
+primary score, ground truth, split, acceptance table and every holdout field are
+unchanged. `revision.previous_contract_sha256` is
+`a71d19cfea8e8c03cb571f3c4b64086c50d95f6986e6a79d734092342cc7c3d4`, the SHA-256 of the
+A-1 document written as `json.dumps(document, indent=2) + "\n"`, the case 1 and 2
+convention. The canonical contract digest changes from
+`2bcc848601a39b86d26038c82c87e240f78add3f3a7941efb47355b1acf714b3` (A-1) to
+`de584a9e6991e01a824dadf48c522fdd0251007863580d0654d61c5282548b1b`.
+
 ## Scores and leakage limits
 
 Classify the generated baseline first. Each of G1–G4 present in the baseline earns

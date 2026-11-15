@@ -30,9 +30,11 @@ def test_contract_validates_and_preserves_case2_pins_and_scoring():
     assert isinstance(contract, Contract)
     assert split_totals(contract.split) == Contract.expected_totals
     case2 = json.loads((ROOT / "benchmarks/n-pentane-low-t/contract.json").read_bytes())
-    # Case 3 carries case 2's scoring as frozen before revision 2 added target chemistry.
-    assert raw["scoring"] == {k: v for k, v in case2["scoring"].items() if k != "target_chemistry"}
-    assert "revision" not in raw
+    # Case 3 shares case 2's scoring except for its own revision-2 target chemistry.
+    shared = {k: v for k, v in raw["scoring"].items() if k != "target_chemistry"}
+    assert shared == {k: v for k, v in case2["scoring"].items() if k != "target_chemistry"}
+    assert raw["scoring"]["target_chemistry"]["frozen_rows"] == 31
+    assert raw["revision"]["number"] == 2
     assert raw["mechanisms"]["v_new"] == case2["mechanisms"]["v_new"]
     assert raw["split"]["archive"] == case2["split"]["archive"]
     assert contract.conversion["v_old"].converted_reactions == 3796 + 3068

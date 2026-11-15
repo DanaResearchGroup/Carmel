@@ -57,8 +57,10 @@ def test_ic5_phi_inside_existing_tolerance_is_accepted():
 
 
 def test_case3_a1_changes_only_the_three_shock_acceptances():
-    """Undoing the six allowed leaves recovers the entire previous frozen digest."""
+    """Undoing revision 2, then the six allowed leaves, recovers the entire previous frozen digest."""
     document = json.loads((ROOT / "benchmarks/iso-pentane-low-t/contract.json").read_bytes())
+    del document["revision"]
+    del document["scoring"]["target_chemistry"]
     changed = []
     refused = {}
     for study in document["split"]["studies"]:
