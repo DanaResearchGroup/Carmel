@@ -11611,7 +11611,15 @@
       "species with no stated detection limit and no positive frozen observation",
       "unsupported reactor condition or solver failure"
     ],
-    "locking": "Lock candidate, baseline, contract hash, structural matcher, JSR adapter and simulator before one holdout evaluation; no holdout-driven retries, tuning or exclusions."
+    "locking": "Lock candidate, baseline, contract hash, structural matcher, JSR adapter and simulator before one holdout evaluation; no holdout-driven retries, tuning or exclusions.",
+    "target_chemistry": {
+      "temperature_min_k": 600,
+      "temperature_max_k": 900,
+      "inclusive": true,
+      "frozen_rows": 31,
+      "frozen_scalars": 434,
+      "metric": "existing_species_balanced_jsr_metric"
+    }
   },
   "leakage_limits": [
     "v_new and the four Bugler2015 chemistry classes are shared with case 2; this tests transfer to a branched fuel, not an independent historical chemistry discovery.",
@@ -11795,5 +11803,10 @@
     "x00011010.xml": 1000.0,
     "x00011011.xml": 1100.0,
     "x00011012.xml": 1100.0
+  },
+  "revision": {
+    "number": 2,
+    "previous_contract_sha256": "a71d19cfea8e8c03cb571f3c4b64086c50d95f6986e6a79d734092342cc7c3d4",
+    "reason": "Owner-authorized secondary-score revision before any candidate was scored: declare the target-chemistry score as the 600-900 K inclusive window of the existing JSR holdout."
   }
 }

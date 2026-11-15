@@ -225,6 +225,9 @@ are included in the lock; checkpoints from the former refusal policy cannot resu
 Case 1 now reports `target_chemistry` alongside `metric`, restricted to 600–1000 K
 inclusive and split by reactor group. Case 2 reports its five named C5 ethers in
 `target_chemistry`, preserving `metric.all` and `metric.low_temperature_600_900_k`.
+Case 3 reports the 600–900 K inclusive window of its JSR holdout in `target_chemistry`,
+over every measured species, and refuses a run whose window does not hold the frozen
+31 rows and 434 scalars.
 
 `carmel score-holdout-idt` uses the same worker, per-row subprocesses, thread pins,
 conversion rules, source-line reaction keys, lock fingerprint and `rows.jsonl` checkpoint.

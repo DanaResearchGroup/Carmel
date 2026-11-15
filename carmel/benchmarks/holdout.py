@@ -27,7 +27,11 @@ from carmel.benchmarks.cantera_worker import (
 )
 from carmel.benchmarks.chemkin import mechanism, normalize_for_ck2yaml
 from carmel.benchmarks.contract import FrozenModel, read_pinned_file
-from carmel.benchmarks.n_pentane import Contract, load_contract
+from carmel.benchmarks.iso_pentane import Contract as IsoPentaneContract
+from carmel.benchmarks.n_pentane import Contract as PentaneContract
+from carmel.benchmarks.n_pentane import PentaneContractBase
+from carmel.benchmarks.revision import JSRWindowTarget
+from carmel.benchmarks.schema import validate_contract_json
 from carmel.schemas.datasets import Absent
 from carmel.services.artifacts import write_bytes, write_text
 from carmel.services.respecth_series import SpeciesIdentity, parse_series_record
@@ -227,7 +231,7 @@ def _declares_detection_limit(raw: bytes) -> bool:
     return False
 
 
-def _load_rows(contract: Contract, archive_path: Path) -> list[dict[str, Any]]:
+def _load_rows(contract: PentaneContractBase, archive_path: Path) -> list[dict[str, Any]]:
     archive_bytes = read_pinned_file(archive_path)
     contract.split.archive.verify(archive_bytes)
     rows: list[dict[str, Any]] = []
@@ -290,7 +294,7 @@ def _canonical_sha256(value: Any) -> str:
 
 
 def _frozen_holdout_fingerprint(
-    contract_bytes: bytes, contract: Contract, rows: list[dict[str, Any]]
+    contract_bytes: bytes, contract: PentaneContractBase, rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
     split = contract.split.model_dump(mode="json")
     scored_rows = [
@@ -480,6 +484,57 @@ def target_jsr_metric(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for species in TARGET_ETHERS
     }
     return {"species": dict(TARGET_ETHERS), "total_observations": len(selected), **metric}
+
+
+def target_window_metric(rows: list[dict[str, Any]], target: JSRWindowTarget) -> dict[str, Any]:
+    """Score the frozen temperature window of a JSR holdout with the existing metric.
+
+    Detection limits come from every holdout row, as for the aggregate, and the per-species
+    scores are the aggregate's ``low_temperature_600_900_k`` subset. Every measured species is
+    reported; one with no scored row in the window gets an explicit zero-count entry. The run is
+    refused when the window's row or scalar count differs from the frozen target counts.
+    """
+    selected = [
+        row for row in rows if target.temperature_min_k <= float(row["temperature_k"]) <= target.temperature_max_k
+    ]
+    window_rows = len({row["row_id"] for row in selected})
+    if (window_rows, len(selected)) != (target.frozen_rows, target.frozen_scalars):
+        raise ValueError(
+            f"target window holds {window_rows} rows and {len(selected)} scalars, "
+            f"not the frozen {target.frozen_rows} and {target.frozen_scalars}"
+        )
+    limits, refusals, sources = _metric_limits(rows)
+    metric = score_metric(rows, metric_limits=(limits, refusals, sources))["low_temperature_600_900_k"]
+    metric["per_species"] = {
+        species: metric["per_species"].get(
+            species, {"score": None, "scored_rows": 0, "detection_limit": limits.get(species)}
+        )
+        for species in sorted({row["species"] for row in rows})
+    }
+    return {
+        "temperature_min_k": target.temperature_min_k,
+        "temperature_max_k": target.temperature_max_k,
+        "inclusive": target.inclusive,
+        "total_rows": window_rows,
+        "total_observations": len(selected),
+        **metric,
+    }
+
+
+def load_contract(data: bytes) -> PentaneContract | IsoPentaneContract:
+    """Validate contract bytes, including the recorded digest, and accept only JSR-holdout cases."""
+    contract = validate_contract_json(data)
+    if not isinstance(contract, PentaneContract | IsoPentaneContract):
+        raise ValueError(f"the JSR holdout harness does not score case {contract.case}")
+    return contract
+
+
+def _target_chemistry(contract: Any, metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the contract's target-chemistry score: its JSR window, or else the declared ethers."""
+    target = getattr(getattr(contract, "scoring", None), "target_chemistry", None)
+    if isinstance(target, JSRWindowTarget):
+        return target_window_metric(metric_rows, target)
+    return target_jsr_metric(metric_rows)
 
 
 def _temperature_band(temperature_k: float) -> str:
@@ -722,7 +777,7 @@ def run_harness(
 ) -> dict[str, Any]:
     """Score one pinned mechanism against a frozen contract holdout."""
     contract_bytes = read_pinned_file(contract_path)
-    contract = load_contract(contract_path)
+    contract = load_contract(contract_bytes)
     mechanism_bytes = read_pinned_file(mechanism_path)
     contract.mechanisms[mechanism_key].verify(mechanism_bytes)
     thermo_bytes = read_pinned_file(thermo_path)
@@ -731,6 +786,15 @@ def run_harness(
     normalized_mechanism = normalize_for_ck2yaml(mechanism_bytes, file=mechanism_path.name)
     normalized_thermo = normalize_for_ck2yaml(thermo_bytes, file=thermo_path.name)
     rows = _load_rows(contract, archive_path)
+    # A target window that no longer holds its frozen counts is refused here, before any simulation.
+    _target_chemistry(
+        contract,
+        [
+            {"row_id": row["row_id"], "species": species, "temperature_k": row["temperature_k"]}
+            for row in rows
+            for species in row["observations"]
+        ],
+    )
     holdout_fingerprint = _frozen_holdout_fingerprint(contract_bytes, contract, rows)
     mechanism_labels, reactions = mechanism(normalized_mechanism.data)
     labels = {label for row in rows for label in (*row["inlet"], *row["observations"])}
@@ -903,6 +967,6 @@ def run_harness(
         "detection_limits": metric_limits[0],
         "detection_limit_sources": metric_limits[2],
         "metric": score_metric(metric_rows, metric_limits=metric_limits),
-        "target_chemistry": target_jsr_metric(metric_rows),
+        "target_chemistry": _target_chemistry(contract, metric_rows),
         "metric_rows": metric_rows,
     }

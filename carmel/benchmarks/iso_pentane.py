@@ -17,11 +17,13 @@ from carmel.benchmarks.contract import FrozenModel, read_pinned_file
 from carmel.benchmarks.n_pentane import (
     PentaneContractBase,
     Pin,
+    Scoring,
     Sha256,
 )
 from carmel.benchmarks.n_pentane import (
     load_split as load_c5_split,
 )
+from carmel.benchmarks.revision import JSRWindowTarget, Revision, verify_revision
 
 
 class ThermoPin(Pin):
@@ -48,8 +50,25 @@ class Conversion(FrozenModel):
     normalization: dict[Literal["mechanism", "thermo"], Normalization]
 
 
+class RevisedScoring(Scoring):
+    """Case-3 scoring after revision 2: the shared C5 scoring plus a JSR-window target.
+
+    The target chemistry is the 600-900 K inclusive window of the existing JSR holdout,
+    scored over every measured species with the aggregate's balanced JSR metric.
+    """
+
+    target_chemistry: JSRWindowTarget
+
+
 class Contract(PentaneContractBase):
+    """The frozen case-3 (iso-pentane low-T) contract at secondary-score revision 2.
+
+    It reuses the shared C5 invariants and adds the case-3 thermo, conversion and holdout
+    temperature audits, the revised scoring and the revision record.
+    """
+
     case: Literal["iso-pentane-low-t"]
+    scoring: RevisedScoring
     thermo_sources: dict[Literal["v_old", "v_new"], ThermoPin]
     structure_source: Pin
     companion_page: Pin
@@ -57,6 +76,7 @@ class Contract(PentaneContractBase):
     conversion: dict[Literal["v_old", "v_new"], Conversion]
     holdout_max_temperature_k: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     holdout_file_max_temperature_k: dict[str, Annotated[float, Field(gt=0, allow_inf_nan=False)]]
+    revision: Revision
 
     expected_totals: ClassVar[dict[str, int]] = {
         "development_files": 20,
@@ -110,7 +130,11 @@ class Contract(PentaneContractBase):
 
 
 def load_contract(path: Path) -> Contract:
-    return Contract.model_validate_json(read_pinned_file(path))
+    """Validate the case-3 contract and refuse it unless its digest is a recorded revision."""
+    data = read_pinned_file(path)
+    contract = Contract.model_validate_json(data)
+    verify_revision(data)
+    return contract
 
 
 def xml_temperature_max(raw: bytes) -> float:
