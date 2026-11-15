@@ -295,6 +295,7 @@ _EQUIVALENCE_RATIO_O2_DEMAND: Mapping[str, Decimal] = {
     "H2": Decimal("0.5"),
     "CO": Decimal("0.5"),
     "NC5H12": Decimal("8"),
+    "IC5H12": Decimal("8"),
 }
 _EQUIVALENCE_RATIO_DILUENTS = frozenset({"Ar", "He", "N2"})
 _EQUIVALENCE_RATIO_TOLERANCE = Decimal("1e-6")

@@ -108,3 +108,12 @@ on V5, so previously admitted envelopes stay byte-identical. Torr uses the exact
 rational factor `101325/760`, with Decimal working precision 4096 and half-even
 rounding, preserving source significant digits in the rounded value. Tables
 V1–V5 retain their published serialized identities.
+
+## Iso-pentane development split, revision A-1
+
+IC5H12's oxygen demand of 8 now supports the source-stated equivalence-ratio
+check for the three Bugler 2016 shock-tube files (28 points). The existing
+`1e-6` tolerance and conversion-table bindings apply. This admission adds no
+NASA7 species: IC5H12 compression records remain `rcm_thermo_unavailable`,
+and `d/dt second max` remains `unmapped_ignition_definition`. Derived-label
+opt-in behavior and the T3 export format are unchanged.

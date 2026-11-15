@@ -11345,8 +11345,8 @@
             "observations": 9,
             "low_temperature_rows": 0,
             "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "unmapped_property"
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x10011002.xml",
@@ -11355,8 +11355,8 @@
             "observations": 12,
             "low_temperature_rows": 0,
             "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "unmapped_property"
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x10011003.xml",
@@ -11365,8 +11365,8 @@
             "observations": 7,
             "low_temperature_rows": 0,
             "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "unmapped_property"
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011001.xml",

@@ -122,23 +122,24 @@ from each XML record, keeping whole studies together.
 
 | Set | XML bibliography | Files | Rows | Scalar observations | 600–900 K rows / observations |
 |---|---|---:|---:|---:|---:|
-| Development | Bugler et al., Combustion and Flame 163 (2016) 138–156; DOI 10.1016/j.combustflame.2015.09.014 | 20 | 121 | 121 | Reader-refused |
+| Development | Bugler et al., Combustion and Flame 163 (2016) 138–156; DOI 10.1016/j.combustflame.2015.09.014 | 20 | 121 | 121 | 0 / 0 supported |
 | Holdout | Zhong, Qiu, Li, Huang and Han, Combustion and Flame 235 (2022) 111678; DOI 10.1016/j.combustflame.2021.111678 | 4 | 58 | 812 | 31 / 434 |
 
 The holdout title is *Experimental and kinetic study on the pyrolysis and oxidation
 of isopentane in a jet-stirred reactor*. Its XML publication year is 2022; the DOI
 contains 2021. It is not Bugler 2015. The whole study includes oxidation files
 `x00011009`–`011` and pyrolysis `012`. The observations are digitized in the archive.
-All four files pass the existing reader. All 121 development points remain refused:
-28 unmapped-property, 75 RCM-thermo-unavailable, and 18 ignition-definition points.
+All four holdout files pass the reader. Revision A-1 admits 28 development
+shock-tube points; 75 RCM-thermo-unavailable and 18 ignition-definition points
+remain refused.
 No refused point is repaired or scored. This is a material limitation for a future
 development/search run, even though the structural benchmark and holdout are loadable.
 
 | File | Set | Rows | Observations | Reader result | Reason |
 |---|---|---:|---:|---|---|
-| `x10011001.xml` | development | 9 | 9 | refused | unmapped_property |
-| `x10011002.xml` | development | 12 | 12 | refused | unmapped_property |
-| `x10011003.xml` | development | 7 | 7 | refused | unmapped_property |
+| `x10011001.xml` | development | 9 | 9 | supported | — |
+| `x10011002.xml` | development | 12 | 12 | supported | — |
+| `x10011003.xml` | development | 7 | 7 | supported | — |
 | `x40011001.xml` | development | 3 | 3 | refused | rcm_thermo_unavailable |
 | `x40011002.xml` | development | 7 | 7 | refused | rcm_thermo_unavailable |
 | `x40011003.xml` | development | 9 | 9 | refused | rcm_thermo_unavailable |
@@ -161,6 +162,23 @@ development/search run, even though the structural benchmark and holdout are loa
 | `x00011011.xml` | holdout | 17 | 238 | supported | — |
 | `x00011012.xml` | holdout | 13 | 182 | supported | — |
 
+## Acceptance revision A-1
+
+**Case 3, development split, revision A-1** admits only the three shock-tube
+files above. IC5H12's oxygen demand of 8 enables the existing composition
+cross-check of source-stated phi, with the unchanged absolute `1e-6` tolerance.
+The change precedes any case-3 T3 candidate score and uses no model results.
+
+The canonical contract digest changes from
+`8f2d7b4f7cb021ebbdb2819f8b05fa9b359b5e2ab2ed195e0a5ca0017aac0a5e` to
+`2bcc848601a39b86d26038c82c87e240f78add3f3a7941efb47355b1acf714b3`.
+Only each newly supported item's `acceptance` (`refused` → `supported`) and
+`refusal_reason` (`unmapped_property` → `null`) change. All counts, holdout
+items, scientific pins, scoring and other contract content stay identical.
+This is an acceptance revision, separate from the secondary-score revision 2.
+The contract's historical leakage prose still describes the original freeze;
+A-1 supersedes only its statement that no development observations are supported.
+
 ## Scores and leakage limits
 
 Classify the generated baseline first. Each of G1–G4 present in the baseline earns
@@ -180,7 +198,8 @@ The development study shares authors, archive and mechanism validation with case
 The XML holdout bibliography is Zhong et al., Combustion and Flame 235 (2022) 111678, DOI 10.1016/j.combustflame.2021.111678. These authors differ from Bugler et al. and the study postdates the named 2015 revision, strengthening historical blindness; the maintained v_new bytes are not an authenticated 2015 snapshot, so absolute blindness is not established.
 The shared ReSpecTh archive is a common curation channel, not independent evidence of chemistry.
 Keep v_new, author glossary, mapped truth and labels out of revision prompts and retrieval until locking; score type recovery once with baseline credit, not rate or thermo tuning.
-Korcek chemistry is excluded. Preserve all reader refusals, including all 121 development IDT points; this contract currently provides no reader-supported development observations.
+Korcek chemistry is excluded. Preserve the 93 remaining development IDT refusals.
+The 28 supported shock-tube observations contain no 600–900 K development points.
 Holdout includes pyrolysis x00011012 and oxidation x00011009-011 as one whole study. Its digitized numeric XML observations retain their provenance; no point is redigitized.
 
 Lock candidate, baseline, contract hash, matcher and simulator before one holdout
