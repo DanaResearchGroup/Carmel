@@ -50,7 +50,7 @@ class EtherTarget(FrozenModel):
 FROZEN_REVISIONS = {
     "n-heptane-low-t": "f9389f365e688a52815abe594d059c44bdb3438df7dbf98e387d7c1bd968520c",
     "n-pentane-low-t": "e83ea400fe20335c4d3661d03191c51212f5ad3adb139e8640ce13ed99848605",
-    "iso-pentane-low-t": "de584a9e6991e01a824dadf48c522fdd0251007863580d0654d61c5282548b1b",
+    "iso-pentane-low-t": "6cebf1232e9b33f1d65ae3f0bc4232415aa52742c76a368312cb6b6158ebf6ea",
 }
 
 

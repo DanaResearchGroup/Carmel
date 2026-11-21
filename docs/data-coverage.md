@@ -34,7 +34,7 @@ Every mapped record replayed successfully against the downloaded, pinned bytes.
 
 - `incomplete_record`: required source fields are absent; lift it by adding or recovering those fields in the source record.
 - `history_nonmonotone_time`, `history_nonpositive_volume`, `history_no_compression`, `history_missing_initial_state`, `history_invalid`: an unusable compression history or initial state; each carries its source-specific detail.
-- `rcm_thermo_unavailable`: derived labels require the supported nine-species NASA7 mixture. Initial, trial and solved temperatures must lie in the material species' admissible intersection: H2/O2/CO/CO2/H2O require 200–3500 K; NC5H12/HE require 200–6000 K; N2/Ar's published range is 300–5000 K, with an operator-approved 5 K low-temperature allowance down to 295 K. No other species or upper bound receives a tolerance. Exact-zero components do not constrain that intersection. Exact source Kelvin admission precedes float conversion.
+- `rcm_thermo_unavailable`: derived labels require the supported ten-species NASA7 mixture. Initial, trial and solved temperatures must lie in the material species' admissible intersection: H2/O2/CO/CO2/H2O require 200–3500 K; NC5H12/IC5H12/HE require 200–6000 K; N2/Ar's published range is 300–5000 K, with an operator-approved 5 K low-temperature allowance down to 295 K. No other species or upper bound receives a tolerance. Exact-zero components do not constrain that intersection. Exact source Kelvin admission precedes float conversion.
 - `implausible_ignition_temperature`: stated or derived ignition conditions below the 500 K backstop; initial pre-compression temperatures are not ignition labels.
 - `schema_rejected`: the mapped value does not satisfy the lane schema; lift it by adding an explicit schema mapping that preserves the source evidence.
 - `unmapped_unit`: the unit is outside the pinned conversion table, or a native value cannot be bound or converted under the schema and canonical numeric bounds. Unknown units need a reviewed table entry; unrepresentable values remain refused.
@@ -105,10 +105,22 @@ Case 3's development split admits the three Bugler 2016 shock-tube files
 `x10011001.xml`–`x10011003.xml`: 28 points, none in 600–900 K. The stated phi
 is checked using IC5H12's oxygen demand of 8 mol O2/mol fuel and the existing
 absolute `1e-6` tolerance. No composition roles or conversion tables change.
-All 75 RCM points remain `rcm_thermo_unavailable`; all 18 second-maximum points
-remain `unmapped_ignition_definition`. The NASA7 table is unchanged.
+At A-1, all 75 RCM points remained `rcm_thermo_unavailable`; all 18 second-maximum
+points remained `unmapped_ignition_definition`. A-1 left the NASA7 table unchanged.
 
 The table above is the dated 2026-10-17 census. This admission adds three IDT
 files / 28 points to that snapshot; RCM and non-IDT yields are unchanged.
 See [case 3 revision A-1](benchmarks/iso-pentane-low-t.md#acceptance-revision-a-1)
 for the declared acceptance revision and frozen digests.
+
+## Iso-pentane RCM admission
+
+Adding the iso-pentane record from the same pinned Burcat source admits eleven
+more ReSpecTh IDT files / 64 points: `x40011001`–`007` and `x40011009`–`012`.
+The pentane archive now has 32 admitted IDT files / 269 points. The complete
+ReSpecTh IDT census is 248 files / 2,196 points; H2 and syngas are unchanged.
+`x40011008` remains refused as `rcm_thermo_unavailable` (11 points);
+`x40011013`–`017` remain `unmapped_ignition_definition` (18 points).
+All 624 previously admitted ReSpecTh records have identical full serialized
+hashes, including every non-IDT record and holdout. All 351 ChemKED parse results
+are identical, including the 318 admitted records' full serialized hashes.

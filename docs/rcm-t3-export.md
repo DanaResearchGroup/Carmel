@@ -62,7 +62,7 @@ end-of-compression temperature/pressure labels by default. `--derived-labels`
 `;eoc=derived-isentropic`. Stated labels remain present in either mode.
 The pure-Python ideal-gas entropy solver evaluates
 NASA7 temperature-dependent heat capacities for H2, O2, N2, AR, CO, CO2, H2O,
-NC5H12 and HE. H2, O2, CO, CO2 and H2O support 200–3500 K; NC5H12 and HE
+NC5H12, IC5H12 and HE. H2, O2, CO, CO2 and H2O support 200–3500 K; NC5H12, IC5H12 and HE
 support 200–6000 K; N2 and Ar support 300–5000 K.
 The operator-approved `N2_AR_LOW_T_EXTRAPOLATION_K = 5` admits initial N2/Ar
 temperatures down to 295 K: their low-T polynomials are nearly flat over a few
@@ -114,6 +114,18 @@ V1–V5 retain their published serialized identities.
 IC5H12's oxygen demand of 8 now supports the source-stated equivalence-ratio
 check for the three Bugler 2016 shock-tube files (28 points). The existing
 `1e-6` tolerance and conversion-table bindings apply. This admission adds no
-NASA7 species: IC5H12 compression records remain `rcm_thermo_unavailable`,
+NASA7 species: at A-1, IC5H12 compression records remained `rcm_thermo_unavailable`,
 and `d/dt second max` remains `unmapped_ignition_definition`. Derived-label
 opt-in behavior and the T3 export format are unchanged.
+
+## Iso-pentane RCM thermo support
+
+The pinned Burcat `THERM.DAT` record `C5H12,i-pentane` (P10/85) now supplies
+IC5H12 NASA7 coefficients over 200–6000 K. Its source SHA-256 is
+`1bcc0261e5003a94496c07632a5727e312fc9055a18e61fdb7c2d5bdca8eacaa`, retrieved
+2026-10-17, as for NC5H12 and helium. No mixture-domain, solver or extrapolation
+rule changes. Eleven Bugler iso-pentane RCM files / 64 points now parse and replay.
+`x40011008.xml` still refuses all 11 points because its first point starts at
+292 K, below the mixture's 295 K floor. The 18 second-maximum points retain
+`unmapped_ignition_definition`. Source temperatures remain initial temperatures;
+the record and export formats and derived-label opt-in are unchanged.

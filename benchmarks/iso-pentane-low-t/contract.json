@@ -11373,40 +11373,40 @@
             "sha256": "962151b2d1d27e3ff8d08d5014fe4d7f2a5f048151e521c6e0566ded1c195ab1",
             "rows": 3,
             "observations": 3,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 1,
+            "low_temperature_observations": 1,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011002.xml",
             "sha256": "93953d8085928b9822cf5a2fafe7812f255f3f415181c18e3b62524f42857643",
             "rows": 7,
             "observations": 7,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 5,
+            "low_temperature_observations": 5,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011003.xml",
             "sha256": "2237e267eea7d64db1ad2669fd488bba70f9510ba0d01f6328d2d293d1570a4f",
             "rows": 9,
             "observations": 9,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 7,
+            "low_temperature_observations": 7,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011004.xml",
             "sha256": "f822188a3285e60ceaf3847cd1116e9da3fac5c1d22467ca7578ac33d02cb5eb",
             "rows": 9,
             "observations": 9,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 7,
+            "low_temperature_observations": 7,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011005.xml",
@@ -11415,18 +11415,18 @@
             "observations": 1,
             "low_temperature_rows": 0,
             "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011006.xml",
             "sha256": "41a7c8d0d38b671051707f71e4aeb967e8ae25964d61c3eaaa8ddfa87dc2802c",
             "rows": 10,
             "observations": 10,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 10,
+            "low_temperature_observations": 10,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011007.xml",
@@ -11435,8 +11435,8 @@
             "observations": 2,
             "low_temperature_rows": 0,
             "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011008.xml",
@@ -11453,40 +11453,40 @@
             "sha256": "9de0a35414aa83c3fd66ab59e172f0f5118547dd6d3bca2e655cc5a2ffedb291",
             "rows": 5,
             "observations": 5,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 3,
+            "low_temperature_observations": 3,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011010.xml",
             "sha256": "95c8cc43adf3d00b1d46d59e12038f5a2191454b57d65ab76e96792b1a498980",
             "rows": 7,
             "observations": 7,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 7,
+            "low_temperature_observations": 7,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011011.xml",
             "sha256": "381ccdc5d4f40e1e87a35c50747d644b3db97efb53a51cf2801dab1a3e2a7008",
             "rows": 4,
             "observations": 4,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 3,
+            "low_temperature_observations": 3,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011012.xml",
             "sha256": "ad581a6df873836c05a50b1657e1911d7c4489f7424ded78e57a68576fb00ed6",
             "rows": 7,
             "observations": 7,
-            "low_temperature_rows": 0,
-            "low_temperature_observations": 0,
-            "acceptance": "refused",
-            "refusal_reason": "rcm_thermo_unavailable"
+            "low_temperature_rows": 7,
+            "low_temperature_observations": 7,
+            "acceptance": "supported",
+            "refusal_reason": null
           },
           {
             "path": "x40011013.xml",

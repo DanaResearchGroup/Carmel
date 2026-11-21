@@ -122,16 +122,16 @@ from each XML record, keeping whole studies together.
 
 | Set | XML bibliography | Files | Rows | Scalar observations | 600–900 K rows / observations |
 |---|---|---:|---:|---:|---:|
-| Development | Bugler et al., Combustion and Flame 163 (2016) 138–156; DOI 10.1016/j.combustflame.2015.09.014 | 20 | 121 | 121 | 0 / 0 supported |
+| Development | Bugler et al., Combustion and Flame 163 (2016) 138–156; DOI 10.1016/j.combustflame.2015.09.014 | 20 | 121 | 121 | 50 / 50 supported |
 | Holdout | Zhong, Qiu, Li, Huang and Han, Combustion and Flame 235 (2022) 111678; DOI 10.1016/j.combustflame.2021.111678 | 4 | 58 | 812 | 31 / 434 |
 
 The holdout title is *Experimental and kinetic study on the pyrolysis and oxidation
 of isopentane in a jet-stirred reactor*. Its XML publication year is 2022; the DOI
 contains 2021. It is not Bugler 2015. The whole study includes oxidation files
 `x00011009`–`011` and pyrolysis `012`. The observations are digitized in the archive.
-All four holdout files pass the reader. Revision A-1 admits 28 development
-shock-tube points; 75 RCM-thermo-unavailable and 18 ignition-definition points
-remain refused.
+All four holdout files pass the reader. A-1 admitted 28 development shock-tube
+points. A-2 admits another 64 RCM points; 11 RCM-thermo-unavailable and 18
+ignition-definition points remain refused.
 No refused point is repaired or scored. This is a material limitation for a future
 development/search run, even though the structural benchmark and holdout are loadable.
 
@@ -140,18 +140,18 @@ development/search run, even though the structural benchmark and holdout are loa
 | `x10011001.xml` | development | 9 | 9 | supported | — |
 | `x10011002.xml` | development | 12 | 12 | supported | — |
 | `x10011003.xml` | development | 7 | 7 | supported | — |
-| `x40011001.xml` | development | 3 | 3 | refused | rcm_thermo_unavailable |
-| `x40011002.xml` | development | 7 | 7 | refused | rcm_thermo_unavailable |
-| `x40011003.xml` | development | 9 | 9 | refused | rcm_thermo_unavailable |
-| `x40011004.xml` | development | 9 | 9 | refused | rcm_thermo_unavailable |
-| `x40011005.xml` | development | 1 | 1 | refused | rcm_thermo_unavailable |
-| `x40011006.xml` | development | 10 | 10 | refused | rcm_thermo_unavailable |
-| `x40011007.xml` | development | 2 | 2 | refused | rcm_thermo_unavailable |
+| `x40011001.xml` | development | 3 | 3 | supported | — |
+| `x40011002.xml` | development | 7 | 7 | supported | — |
+| `x40011003.xml` | development | 9 | 9 | supported | — |
+| `x40011004.xml` | development | 9 | 9 | supported | — |
+| `x40011005.xml` | development | 1 | 1 | supported | — |
+| `x40011006.xml` | development | 10 | 10 | supported | — |
+| `x40011007.xml` | development | 2 | 2 | supported | — |
 | `x40011008.xml` | development | 11 | 11 | refused | rcm_thermo_unavailable |
-| `x40011009.xml` | development | 5 | 5 | refused | rcm_thermo_unavailable |
-| `x40011010.xml` | development | 7 | 7 | refused | rcm_thermo_unavailable |
-| `x40011011.xml` | development | 4 | 4 | refused | rcm_thermo_unavailable |
-| `x40011012.xml` | development | 7 | 7 | refused | rcm_thermo_unavailable |
+| `x40011009.xml` | development | 5 | 5 | supported | — |
+| `x40011010.xml` | development | 7 | 7 | supported | — |
+| `x40011011.xml` | development | 4 | 4 | supported | — |
+| `x40011012.xml` | development | 7 | 7 | supported | — |
 | `x40011013.xml` | development | 5 | 5 | refused | unmapped_ignition_definition |
 | `x40011014.xml` | development | 5 | 5 | refused | unmapped_ignition_definition |
 | `x40011015.xml` | development | 3 | 3 | refused | unmapped_ignition_definition |
@@ -202,6 +202,73 @@ A-1 document written as `json.dumps(document, indent=2) + "\n"`, the case 1 and 
 convention. The canonical contract digest changes from
 `2bcc848601a39b86d26038c82c87e240f78add3f3a7941efb47355b1acf714b3` (A-1) to
 `de584a9e6991e01a824dadf48c522fdd0251007863580d0654d61c5282548b1b`.
+
+## Acceptance revision A-2
+
+**Case 3, development split, revision A-2** admits eleven additional RCM files
+(64 points) through the existing pinned Burcat source's `C5H12,i-pentane` NASA7
+record. The polynomial domain is 200–6000 K; the mixture domain and the 295 K
+N2/Ar floor are unchanged. `x40011008` still refuses all 11 points, and the
+18 second-maximum points keep their exact ignition-definition refusal.
+
+classification temperature = T_C for RCM, the post-shock temperature for shock tubes.
+
+The [independent temperature cross-check](iso-pentane-rcm-crosscheck.md) identifies
+49/64 admitted points uniquely without using derived T_C to select assignments.
+All 49 are within 15 K; the full per-file distribution and the 14 ambiguous and
+one unmatched point are reported there. Case 3 now counts precompression RCM
+points using the existing entropy solver's derived T_C, with 50 rows / 50
+observations in 600–900 K inclusive. This affects count fields only: original
+coordinates, record serialization, scores, weights and holdout fields do not move.
+Cases 1 and 2 keep their existing counting conventions.
+
+A-2 re-pins from revision 2's canonical digest
+`de584a9e6991e01a824dadf48c522fdd0251007863580d0654d61c5282548b1b` to
+`6cebf1232e9b33f1d65ae3f0bc4232415aa52742c76a368312cb6b6158ebf6ea`.
+Each listed file changes `acceptance: refused → supported` and
+`refusal_reason: rcm_thermo_unavailable → null`. Rows and observations are
+unchanged. Only the following count leaves additionally change:
+
+| Development file | Rows / observations | Low-T rows / observations, before → after |
+|---|---:|---:|
+| `x40011001.xml` | 3 / 3 | 0 / 0 → 1 / 1 |
+| `x40011002.xml` | 7 / 7 | 0 / 0 → 5 / 5 |
+| `x40011003.xml` | 9 / 9 | 0 / 0 → 7 / 7 |
+| `x40011004.xml` | 9 / 9 | 0 / 0 → 7 / 7 |
+| `x40011005.xml` | 1 / 1 | 0 / 0 → 0 / 0 |
+| `x40011006.xml` | 10 / 10 | 0 / 0 → 10 / 10 |
+| `x40011007.xml` | 2 / 2 | 0 / 0 → 0 / 0 |
+| `x40011009.xml` | 5 / 5 | 0 / 0 → 3 / 3 |
+| `x40011010.xml` | 7 / 7 | 0 / 0 → 7 / 7 |
+| `x40011011.xml` | 4 / 4 | 0 / 0 → 3 / 3 |
+| `x40011012.xml` | 7 / 7 | 0 / 0 → 7 / 7 |
+
+The explicit test-side reversal ledger restores the entire revision-2 canonical
+document and original file bytes. Removing revision 2's two added keys then
+recovers A-1's canonical and file-form hashes; reversing A-1's three shock
+acceptance pairs recovers the first freeze. `revision.number`, `reason` and
+`previous_contract_sha256` remain revision 2's historical record, unchanged.
+A-2 does not add a schema field or rewrite the frozen historical leakage prose.
+
+The no-score inventory is **PASS**: a read-only scan of 19,445 candidate artifact
+paths under the run directory inspected 11,765 JSON/YAML metadata files. Its
+only case-3 matches were the contract-construction conversion audit and copies of
+earlier no-score inventories, none a scored report. No case-3 score was produced on the
+revision-2 digest. The reader/classification work ran no kinetic-model simulation.
+All 624 previously admitted ReSpecTh records and 318 ChemKED records retain
+identical full serialized hashes, including all four case-3 holdouts.
+
+The scoring arithmetic does not read development classification counts. Full
+contract/split identity hashing does include those fields; the delegate explicitly
+exempted that provenance dependency. Fingerprint logic is unchanged. **Every
+case-3 report made before A-2 is not comparable with one made after A-2**, because
+the fingerprint moves; both compared reports must use the post-A-2 digest.
+
+The other-case survey found nine supported case-2 RCM files / 65 points counted
+by initial temperature (zero in-window, versus 53 by derived T_C). They require
+a separate authorized revision and independent cross-check; none is changed here.
+Case 1's five RCM-ideal files / 15 points use stated compressed conditions without
+compression histories and do not share this precompression-count problem.
 
 ## Scores and leakage limits
 

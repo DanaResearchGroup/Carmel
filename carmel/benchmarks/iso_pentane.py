@@ -6,7 +6,7 @@ import io
 import math
 import zipfile
 from pathlib import Path
-from typing import Annotated, ClassVar, Literal, Self
+from typing import Annotated, Any, ClassVar, Literal, Self
 from xml.etree import ElementTree
 
 from pydantic import Field, model_validator
@@ -23,7 +23,15 @@ from carmel.benchmarks.n_pentane import (
 from carmel.benchmarks.n_pentane import (
     load_split as load_c5_split,
 )
+from carmel.benchmarks.n_pentane import (
+    series_counts as source_series_counts,
+)
 from carmel.benchmarks.revision import JSRWindowTarget, Revision, verify_revision
+from carmel.schemas.datasets import Absent
+from carmel.services.rcm_history import in_si_decimal
+from carmel.services.rcm_thermo import check_initial_temperature, isentropic_eoc, solver_composition
+from carmel.services.respecth import RespecthIdtRecord
+from carmel.services.t3_export import point_history
 
 
 class ThermoPin(Pin):
@@ -61,7 +69,7 @@ class RevisedScoring(Scoring):
 
 
 class Contract(PentaneContractBase):
-    """The frozen case-3 (iso-pentane low-T) contract at secondary-score revision 2.
+    """The case-3 contract at secondary-score revision 2 and acceptance revision A-2.
 
     It reuses the shared C5 invariants and adds the case-3 thermo, conversion and holdout
     temperature audits, the revised scoring and the revision record.
@@ -82,7 +90,7 @@ class Contract(PentaneContractBase):
         "development_files": 20,
         "development_rows": 121,
         "development_observations": 121,
-        "development_supported_files": 3,
+        "development_supported_files": 14,
         "holdout_files": 4,
         "holdout_rows": 58,
         "holdout_observations": 812,
@@ -156,10 +164,47 @@ def xml_temperature_max(raw: bytes) -> float:
     return max(values)
 
 
+def series_counts(record: Any) -> tuple[int, int, int, int]:
+    """Classify case-3 precompression RCM points by derived compressed temperature.
+
+    Source coordinates and serialized records remain untouched. Each point uses its
+    linked history and the same pinned mixture, admission bounds and entropy solver
+    as the reader. Shock tubes, stated RCM states and JSR records keep source counts.
+    """
+    if (
+        not isinstance(record, RespecthIdtRecord)
+        or isinstance(record.rcm_conditions, Absent)
+        or record.rcm_conditions.state != "pre_compression"
+    ):
+        return source_series_counts(record)
+    if len(record.rcm_states) != len(record.envelope.series[0].points):
+        raise ValueError("RCM classification requires one initial state per point")
+    if isinstance(record.envelope.composition, Absent):
+        raise ValueError("RCM classification requires an initial composition")
+    composition = {
+        c.species_raw_name: in_si_decimal(c.amount)
+        for c in record.envelope.composition.components
+        if not in_si_decimal(c.amount).is_zero()
+    }
+    mixture = solver_composition(composition)
+    temperatures = []
+    for index in range(len(record.rcm_states)):
+        history, state = point_history(record, index)
+        if history is None or state is None:
+            raise ValueError("RCM classification requires a linked history and initial state")
+        initial_temperature = in_si_decimal(state.initial_temperature)
+        check_initial_temperature(initial_temperature, composition, volume_ratio=history.volume_ratio_decimal)
+        temperature, _ = isentropic_eoc(
+            float(initial_temperature), float(in_si_decimal(state.initial_pressure)), history.volume_ratio, mixture
+        )
+        temperatures.append(temperature)
+    return source_series_counts(record, classification_temperatures=temperatures)
+
+
 def load_split(contract: Contract, archive_source: Path | bytes) -> dict[str, int]:
     """Use the shared reader replay, then verify the temperature-dependent review domain."""
     raw = archive_source if isinstance(archive_source, bytes) else read_pinned_file(archive_source)
-    totals = load_c5_split(contract, raw)
+    totals = load_c5_split(contract, raw, count_record=series_counts)
     with zipfile.ZipFile(io.BytesIO(raw)) as source:
         for path, bound in contract.holdout_file_max_temperature_k.items():
             if xml_temperature_max(source.read(path)) != bound:

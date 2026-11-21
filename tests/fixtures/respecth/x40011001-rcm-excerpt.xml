@@ -1,0 +1,149 @@
+<experiment>
+  <fileAuthor>P. Wang and T. Nagy</fileAuthor>
+  <fileVersion>
+    <major>1</major>
+    <minor>0</minor>
+  </fileVersion>
+  <ReSpecThVersion>
+    <major>2</major>
+    <minor>5</minor>
+  </ReSpecThVersion>
+  <bibliographyLink>
+    <description>John Bugler, Brandon Marks, Olivier Mathieu, Rachel Archuleta, Alejandro Camou, Claire Gr&#233;goire, Karl A. Heufer, Eric L. Petersen, Henry J. Curran: An ignition delay time and chemical kinetic modeling study of the pentane isomers</description>
+    <referenceDOI>10.1016/j.combustflame.2015.09.014</referenceDOI>
+    <details>
+      <author>John Bugler, Brandon Marks, Olivier Mathieu, Rachel Archuleta, Alejandro Camou, Claire Gr&#233;goire, Karl A. Heufer, Eric L. Petersen, Henry J. Curran</author>
+      <journal>Combust. Flame</journal>
+      <pages>138-156</pages>
+      <title>An ignition delay time and chemical kinetic modeling study of the pentane isomers</title>
+      <volume>163</volume>
+      <year>2016</year>
+    </details>
+  </bibliographyLink>
+  <experimentType>ignition delay measurement</experimentType>
+  <apparatus>
+    <kind>rapid compression machine</kind>
+  </apparatus>
+  <commonProperties>
+    <property name="initial composition" sourcetype="reported">
+      <component>
+        <speciesLink preferredKey="AR" CAS="7440-37-1" InChI="1S/Ar" SMILES="[Ar]" chemName="argon" />
+        <amount units="mole fraction">+2.60450580E-012</amount>
+      </component>
+      <component>
+        <speciesLink preferredKey="H2O" CAS="7732-18-5" InChI="1S/H2O/h1H2" SMILES="O" chemName="water" />
+        <amount units="mole fraction">+2.60450580E-010</amount>
+      </component>
+      <component>
+        <speciesLink preferredKey="HE" CAS="7440-59-7" InChI="1S/He" SMILES="[He]" chemName="helium" />
+        <amount units="mole fraction">+2.60450580E-012</amount>
+      </component>
+      <component>
+        <speciesLink preferredKey="IC5H12" CAS="78-78-4" InChI="1S/C5H12/c1-4-5(2)3/h5H,4H2,1-3H3" SMILES="CCC(C)C" chemName="isopentane" />
+        <amount units="mole fraction">+7.81351740E-003</amount>
+      </component>
+      <component>
+        <speciesLink preferredKey="N2" CAS="7727-37-9" InChI="1S/N2/c1-2" SMILES="N#N" chemName="nitrogen" />
+        <amount units="mole fraction">+7.83826020E-001</amount>
+      </component>
+      <component>
+        <speciesLink preferredKey="O2" CAS="7782-44-7" InChI="1S/O2/c1-2" SMILES="O=O" chemName="oxygen" />
+        <amount units="mole fraction">+2.08360460E-001</amount>
+      </component>
+    </property>
+    <property name="evaluated standard deviation" sourcetype="estimated" units="unitless" reference="ignition delay" kind="relative" method="generic uncertainty">
+      <value>0.1</value>
+    </property>
+  </commonProperties>
+  <dataGroup id="dg1">
+    <property name="temperature" id="x2" label="T" sourcetype="reported" units="K" />
+    <property name="ignition delay" id="x3" label="tau" sourcetype="reported" units="us" />
+    <property name="pressure" id="x1" label="P" sourcetype="reported" units="atm" />
+    <dataPoint>
+      <x1>0.37507</x1>
+      <x2>378.00</x2>
+      <x3>1.54E+05</x3>
+    </dataPoint>
+  </dataGroup>
+  <ignitionType target="p" type="d/dt max" />
+  <dataGroup id="dg2" label="V-t history" dataPointLink="1">
+    <property name="time" id="x4" label="t" sourcetype="calculated" units="s" />
+    <property name="volume" id="x5" label="V" sourcetype="calculated" units="cm3" />
+    <dataPoint>
+      <x4>0.00000000E+00</x4>
+      <x5>1.00000000E+00</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>6.12389340E-02</x4>
+      <x5>1.00000000E+00</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>6.81730957E-02</x4>
+      <x5>6.06338379E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.20621580E-02</x4>
+      <x5>2.58119750E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.25640710E-02</x4>
+      <x5>2.18149610E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.28657570E-02</x4>
+      <x5>1.92583770E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.31601900E-02</x4>
+      <x5>1.67740880E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.38141590E-02</x4>
+      <x5>1.23271030E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.44412000E-02</x4>
+      <x5>9.43769840E-02</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.53121620E-02</x4>
+      <x5>8.87032150E-02</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.73364920E-02</x4>
+      <x5>9.37502670E-02</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>7.93712430E-02</x4>
+      <x5>9.68909840E-02</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>8.64589500E-02</x4>
+      <x5>1.01595300E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>1.00891870E-01</x4>
+      <x5>1.05861980E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>1.30966330E-01</x4>
+      <x5>1.10330140E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>1.93701300E-01</x4>
+      <x5>1.15854070E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>3.12361440E-01</x4>
+      <x5>1.22613100E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>4.36228730E-01</x4>
+      <x5>1.29047390E-01</x5>
+    </dataPoint>
+    <dataPoint>
+      <x4>4.99950000E-01</x4>
+      <x5>1.31795430E-01</x5>
+    </dataPoint>
+  </dataGroup>
+</experiment>
