@@ -180,6 +180,15 @@ def _action(**params: object) -> PlannedAction:
 # ---------------------------------------------------------------------------
 
 
+def _stub_conda_interpreter(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make every conda env resolve to ``/opt/conda/envs/<env>/bin/python`` without running conda."""
+    from carmel.adapters import _launcher
+
+    monkeypatch.setattr(
+        _launcher, "resolve_conda_interpreter", lambda _conda, env, **_kwargs: f"/opt/conda/envs/{env}/bin/python"
+    )
+
+
 class TestARCDiscovery:
     def test_is_arc_importable_returns_bool(self) -> None:
         assert isinstance(is_arc_importable(), bool)
@@ -200,7 +209,7 @@ class TestARCDiscovery:
         from carmel.adapters import arc as arc_module
 
         # `is_arc_installed` is isolated from whatever happens to be on this
-        # machine's own crml_env sys.path (which may genuinely have `arc`
+        # machine's own Carmel-environment sys.path (which may genuinely have `arc`
         # installed, e.g. under the collapsed single-env deployment) so the
         # divergence demonstrated here is deterministic either way.
         monkeypatch.setattr(arc_module.importlib.util, "find_spec", lambda _name: None)
@@ -341,6 +350,8 @@ class TestFindARCExecutable:
     def test_env_path_carries_conda_run_prefix(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
 
+        _stub_conda_interpreter(monkeypatch)
+
         script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
         script.write_text("# ARC")
         monkeypatch.setenv("ARC_PATH", str(tmp_path))
@@ -356,7 +367,7 @@ class TestFindARCExecutable:
             "-n",
             "arc_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/arc_env/bin/python",
             str(script),
         ]
 
@@ -413,6 +424,8 @@ class TestFindARCExecutable:
         unset, since ARC and T3 may share a single environment."""
         from carmel.adapters import arc as arc_module
 
+        _stub_conda_interpreter(monkeypatch)
+
         script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
         script.write_text("# ARC")
         monkeypatch.setenv("ARC_PATH", str(tmp_path))
@@ -428,7 +441,7 @@ class TestFindARCExecutable:
             "-n",
             "shared_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/shared_env/bin/python",
             str(script),
         ]
 
@@ -437,6 +450,8 @@ class TestFindARCExecutable:
         $T3_CONDA_ENV — ARC-specific configuration wins over the shared
         fallback."""
         from carmel.adapters import arc as arc_module
+
+        _stub_conda_interpreter(monkeypatch)
 
         script = tmp_path / ARC_LAYOUT.EXECUTABLE_SCRIPT
         script.write_text("# ARC")
@@ -454,7 +469,7 @@ class TestFindARCExecutable:
             "-n",
             "arc_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/arc_env/bin/python",
             str(script),
         ]
 
@@ -1114,6 +1129,8 @@ class TestARCCondaEnvError:
     def test_env_usable_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from carmel.adapters import arc as arc_module
 
+        _stub_conda_interpreter(monkeypatch)
+
         monkeypatch.setenv("ARC_CONDA_ENV", "arc_env")
         monkeypatch.setattr(arc_module.shutil, "which", lambda _name: "/usr/bin/conda")
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
@@ -1190,6 +1207,8 @@ class TestARCCondaEnvError:
             [("conda", "SOME_CONDA_ENV")],
             logger=_launcher._log,
             tool_label="ARC",
+            runner=lambda *_a, **_k: subprocess.CompletedProcess(args=[], returncode=0),
+            probe_timeout=1.0,
             which=lambda _name: None,
         )
         assert result == [sys.executable]
@@ -1201,6 +1220,8 @@ class TestARCCondaEnvError:
         the broken python source to the same conda source.
         """
         from carmel.adapters import arc as arc_module
+
+        _stub_conda_interpreter(monkeypatch)
 
         monkeypatch.setenv("ARC_PYTHON", "/nonexistent/carmel-not-a-binary")
         monkeypatch.setenv("T3_CONDA_ENV", "shared_env")
@@ -1224,7 +1245,7 @@ class TestARCCondaEnvError:
             "-n",
             "shared_env",
             "--no-capture-output",
-            "python",
+            "/opt/conda/envs/shared_env/bin/python",
         ]
 
 
