@@ -11,7 +11,11 @@ from typing import Any
 
 import numpy as np
 
-from carmel.benchmarks.cantera_worker import checkpoint_fingerprint, validate_row_refusal
+from carmel.benchmarks.cantera_worker import (
+    checkpoint_fingerprint,
+    checkpoint_fingerprint_pre_lock_v0,
+    validate_row_refusal,
+)
 from carmel.benchmarks.contract import read_pinned_file
 from carmel.benchmarks.holdout import (
     _metric_limits,
@@ -35,6 +39,11 @@ JSR_SPECIES_GROUPS = {
 }
 PairErrors = dict[tuple[str, str], tuple[float, float]]
 BENCHMARKS_DIR = Path(__file__).resolve().parents[2] / "benchmarks"
+PRE_LOCK_V0 = "pre_lock_v0"
+PRE_LOCK_V0_LOCK_BINDING = (
+    "none: pre_lock_v0 checkpoint fingerprints bind the mechanism, the row, thread_env and the start "
+    "method; these rows are bound to no simulation lock and no PLOG validation"
+)
 
 
 def paired_interval(errors: PairErrors, *, seed: int = BOOTSTRAP_SEED) -> dict[str, Any]:
@@ -187,36 +196,85 @@ def rescore_saved_jsr(report_path: Path) -> dict[str, Any]:
     ``target_chemistry`` is recomputed through the same dispatch as a fresh score, using the
     committed contract found by :func:`saved_report_contract`; its digest is recorded as
     ``target_chemistry_contract_sha256``. A stored target is never copied through.
+
+    Checkpoint lines are matched under today's fingerprint form first. Only when no line matches
+    it, the legacy ``pre_lock_v0`` form is tried, from the report's recorded ``thread_env`` and
+    ``row_process_start_method``, and it must match every line. Such a rescore drops the report's
+    lock fields, is labelled lock-unbound, and records the run's own lock from ``response.json``
+    when that file records one. That file is used only when it records the report's mechanism
+    and, for every saved checkpoint row, the same result.
     """
     report_bytes = report_path.read_bytes()
     report: dict[str, Any] = json.loads(report_bytes)
     contract, contract_sha256 = saved_report_contract(report)
     request = json.loads(report_path.with_name("request.json").read_bytes())
-    expected = {
-        row["row_id"]: checkpoint_fingerprint(
-            report["inputs"]["mechanism_semantic_sha256"],
-            row,
-            report["simulation_lock_sha256"],
-            report["plog_validation_sha256"],
-        )
-        for row in request["rows"]
-    }
-    if len(expected) != len(request["rows"]):
+    mechanism_sha256 = report["inputs"]["mechanism_semantic_sha256"]
+    has_lock = "simulation_lock_sha256" in report
+    expected = (
+        {
+            row["row_id"]: checkpoint_fingerprint(
+                mechanism_sha256,
+                row,
+                report["simulation_lock_sha256"],
+                report["plog_validation_sha256"],
+            )
+            for row in request["rows"]
+        }
+        if has_lock
+        else {}
+    )
+    if len({row["row_id"] for row in request["rows"]}) != len(request["rows"]):
         raise ValueError("duplicate saved request row IDs")
     checkpoint_path = report_path.with_name("rows.jsonl")
-    checkpoint = checkpoint_path.read_bytes() if expected or checkpoint_path.exists() else None
+    checkpoint = checkpoint_path.read_bytes() if request["rows"] or checkpoint_path.exists() else None
+    entries = [json.loads(line) for line in (checkpoint or b"").splitlines()]
+    legacy_inputs, legacy_gap = _pre_lock_v0_inputs(report)
+    legacy = (
+        {
+            row["row_id"]: checkpoint_fingerprint_pre_lock_v0(mechanism_sha256, row, *legacy_inputs)
+            for row in request["rows"]
+        }
+        if legacy_inputs is not None
+        else {}
+    )
+    unmatched = [entry for entry in entries if expected.get(entry["result"]["row_id"]) != entry["fingerprint"]]
+    form = None
+    response_path, response_bytes, response = report_path.with_name("response.json"), None, None
+    if entries and len(unmatched) == len(entries) and legacy_inputs is not None:
+        form = PRE_LOCK_V0
+        response_path, response_bytes, response = _read_run_response(report_path, legacy_inputs)
+        expected = legacy
+        unmatched = [entry for entry in entries if expected.get(entry["result"]["row_id"]) != entry["fingerprint"]]
+        if unmatched:
+            raise ValueError(
+                f"{len(unmatched)}/{len(entries)} checkpoint fingerprints do not match the pre_lock_v0 form, "
+                "which must match every line"
+            )
+    elif any(legacy.get(entry["result"]["row_id"]) == entry["fingerprint"] for entry in unmatched):
+        raise ValueError("mixed checkpoint fingerprint forms")
+    if not has_lock and form != PRE_LOCK_V0:
+        gap = f"report lacks {legacy_gap}" if legacy_gap else "the checkpoint has no lines"
+        raise ValueError(
+            "report lacks simulation_lock_sha256, so no checkpoint line can match today's form; "
+            f"pre_lock_v0 not checked: {gap}"
+        )
     results: dict[str, dict[str, Any]] = {}
-    for line in (checkpoint or b"").splitlines():
-        entry = json.loads(line)
+    for entry in entries:
         row = entry["result"]
         if row["row_id"] not in expected or entry["fingerprint"] != expected[row["row_id"]]:
             continue
         if row["row_id"] in results and row != results[row["row_id"]]:
             raise ValueError(f"conflicting saved checkpoint row: {row['row_id']}")
         results[row["row_id"]] = row
+    if form == PRE_LOCK_V0 and response is not None:
+        _check_run_response_identity(response, mechanism_sha256, results)
+    run_lock, run_lock_problem = _run_recorded_lock(response) if form == PRE_LOCK_V0 else (None, None)
     reported = {row["row_id"]: row for row in report["row_results"]}
     if len(reported) != len(report["row_results"]):
         raise ValueError("duplicate saved report row IDs")
+    if set(results) != set(expected) and set(expected) <= {entry["result"]["row_id"] for entry in entries}:
+        gap = f"; pre_lock_v0 not checked: report lacks {legacy_gap}" if legacy_gap and len(results) == 0 else ""
+        raise ValueError(f"{len(unmatched)}/{len(entries)} checkpoint fingerprints do not match{gap}")
     if set(results) != set(expected) or not set(expected) <= set(reported):
         raise ValueError("checkpoint and report cover different rows")
     for row_id in reported.keys() - expected.keys():
@@ -234,7 +292,18 @@ def rescore_saved_jsr(report_path: Path) -> dict[str, Any]:
             reason = result.get("reason")
             if not isinstance(reason, str) or not reason.strip():
                 raise ValueError(f"checkpoint requires a nonempty refusal reason: {row_id}")
-            validate_row_refusal(reason, report.get("simulation_lock", {}))
+            if form != PRE_LOCK_V0:
+                validate_row_refusal(reason, report.get("simulation_lock", {}))
+            else:
+                try:
+                    validate_row_refusal(reason, run_lock or {})
+                except ValueError as error:
+                    if run_lock_problem is None:
+                        raise
+                    lockless = "" if has_lock else "; report lacks simulation_lock_sha256"
+                    raise ValueError(
+                        f"{error}: the run's recorded lock is unusable: {run_lock_problem}{lockless}"
+                    ) from error
             if reported[row_id].get("reason") != reason:
                 raise ValueError(f"checkpoint and reported refusal differ: {row_id}")
     rebuilt = copy.deepcopy(report)
@@ -268,11 +337,108 @@ def rescore_saved_jsr(report_path: Path) -> dict[str, Any]:
         "rows_path": str(report_path.with_name("rows.jsonl")),
         "rows_sha256": hashlib.sha256(checkpoint).hexdigest() if checkpoint is not None else None,
     }
+    if form == PRE_LOCK_V0:
+        rebuilt.pop("simulation_lock_sha256", None)
+        rebuilt.pop("simulation_lock", None)
+        rebuilt["rescore_inputs"]["checkpoint_fingerprint_form"] = PRE_LOCK_V0
+        rebuilt["rescore_inputs"]["simulation_lock_binding"] = PRE_LOCK_V0_LOCK_BINDING
+        run_lock = response.get("simulation_lock_sha256") if response is not None else None
+        if isinstance(run_lock, str) and response_bytes is not None:
+            rebuilt["rescore_inputs"]["run_recorded_lock"] = {
+                "simulation_lock_sha256": run_lock,
+                "source_path": str(response_path),
+                "source_sha256": hashlib.sha256(response_bytes).hexdigest(),
+            }
     return rebuilt
+
+
+def _pre_lock_v0_inputs(report: dict[str, Any]) -> tuple[tuple[dict[str, str], str] | None, str | None]:
+    """Read the run's thread environment and start method from the report's own fields.
+
+    Returns the two inputs, or ``None`` with the name of the field that is missing or ill-typed.
+    """
+    thread_env = report.get("thread_env")
+    if (
+        not isinstance(thread_env, dict)
+        or not thread_env
+        or not all(isinstance(k, str) and isinstance(v, str) for k, v in thread_env.items())
+    ):
+        return None, "a recorded thread_env"
+    start_method = report.get("row_process_start_method")
+    if not isinstance(start_method, str) or not start_method.strip():
+        return None, "a recorded row_process_start_method"
+    return (thread_env, start_method), None
+
+
+def _lock_sha256(lock: dict[str, Any]) -> str:
+    """Hash a simulation lock's canonical bytes, as the worker hashes the lock it records."""
+    return hashlib.sha256(json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _run_recorded_lock(response: dict[str, Any] | None) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the run's recorded simulation lock when it binds to its recorded digest.
+
+    Otherwise return ``None`` with the reason the lock cannot be used.
+    """
+    if response is None:
+        return None, "no response.json"
+    lock = response.get("simulation_lock")
+    if not isinstance(lock, dict):
+        return None, "response.json holds no simulation_lock object"
+    if response.get("simulation_lock_sha256") != _lock_sha256(lock):
+        return None, "simulation_lock does not bind to its simulation_lock_sha256"
+    return lock, None
+
+
+def _read_run_response(
+    report_path: Path, legacy_inputs: tuple[dict[str, str], str]
+) -> tuple[Path, bytes | None, dict[str, Any] | None]:
+    """Read the run directory's ``response.json`` and refuse if it disagrees with the report."""
+    path = report_path.with_name("response.json")
+    if not path.exists():
+        return path, None, None
+    raw = path.read_bytes()
+    response = json.loads(raw)
+    if not isinstance(response, dict):
+        raise ValueError("saved response.json is not an object")
+    thread_env, start_method = legacy_inputs
+    for field, value in (("thread_env", thread_env), ("row_process_start_method", start_method)):
+        if field in response and response[field] != value:
+            raise ValueError(f"saved report and response.json record different {field}")
+    return path, raw, response
+
+
+def _check_run_response_identity(
+    response: dict[str, Any], mechanism_sha256: str, results: dict[str, dict[str, Any]]
+) -> None:
+    """Refuse a ``response.json`` that does not record this report's mechanism and saved rows."""
+    recorded = response.get("mechanism_semantic_sha256")
+    if not isinstance(recorded, str):
+        raise ValueError("response.json lacks a mechanism_semantic_sha256")
+    if recorded != mechanism_sha256:
+        raise ValueError("saved report and response.json record different mechanism_semantic_sha256")
+    rows = response.get("rows")
+    if not isinstance(rows, list) or not all(isinstance(r, dict) and isinstance(r.get("row_id"), str) for r in rows):
+        raise ValueError("response.json holds no rows list keyed by row_id")
+    by_id: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["row_id"] in by_id:
+            raise ValueError(f"duplicate response.json row ID: {row['row_id']}")
+        by_id[row["row_id"]] = row
+    for row_id, result in results.items():
+        if row_id not in by_id:
+            raise ValueError(f"response.json lacks saved row {row_id}")
+        if by_id[row_id] != result:
+            raise ValueError(f"saved row {row_id} differs between rows.jsonl and response.json")
 
 
 def jsr_intervals(old: dict[str, Any], new: dict[str, Any], *, seed: int = BOOTSTRAP_SEED) -> dict[str, Any]:
     """Paired row bootstrap of the existing species-balanced intersection metric."""
+    for name, report in (("v_old", old), ("v_new", new)):
+        if (report.get("rescore_inputs") or {}).get("checkpoint_fingerprint_form") == PRE_LOCK_V0:
+            raise ValueError(
+                f"{name} is a {PRE_LOCK_V0} rescore: pairing needs a simulation lock this report does not carry"
+            )
     separation = build_separation_report(old, new)
     common = set(separation["primary"]["row_ids"])
     limits = _metric_limits(old["metric_rows"])

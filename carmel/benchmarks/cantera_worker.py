@@ -18,7 +18,7 @@ import sys
 import tempfile
 import time
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from multiprocessing import get_context
 from pathlib import Path
@@ -989,6 +989,28 @@ def checkpoint_fingerprint(
             "mechanism_semantic_sha256": mechanism_sha256,
             "plog_validation_sha256": plog_validation_identity,
             "simulation_lock_sha256": simulation_lock_identity,
+            "row": row,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def checkpoint_fingerprint_pre_lock_v0(
+    mechanism_sha256: str, row: dict[str, Any], thread_env: Mapping[str, str], start_method: str
+) -> str:
+    """Identify a row under the legacy pre-lock checkpoint form, for reading saved checkpoints only.
+
+    This form binds the mechanism, the row, the thread environment and the process start method,
+    but no simulation lock and no PLOG validation. No write path calls it.
+    """
+    payload = json.dumps(
+        {
+            "mechanism_semantic_sha256": mechanism_sha256,
+            "thread_env": dict(thread_env),
+            "process_start_method": start_method,
             "row": row,
         },
         sort_keys=True,

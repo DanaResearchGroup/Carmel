@@ -12,7 +12,7 @@ from typing import Any
 
 import pytest
 
-from carmel.benchmarks import holdout, holdout_intervals
+from carmel.benchmarks import cantera_worker, holdout, holdout_intervals
 from carmel.benchmarks.holdout import score_metric
 from carmel.benchmarks.holdout_intervals import idt_separation, jsr_intervals, paired_interval, rescore_saved_jsr
 
@@ -359,7 +359,7 @@ def test_rescore_never_falls_back_to_row_id_when_saved_identity_changes(tmp_path
         else:
             report["simulation_lock_sha256" if component == "lock" else "plog_validation_sha256"] = "changed"
         path.write_text(json.dumps(report))
-    with pytest.raises(ValueError, match="different rows"):
+    with pytest.raises(ValueError, match="checkpoint fingerprints do not match"):
         rescore_saved_jsr(path)
 
 
@@ -663,3 +663,460 @@ def test_stored_case2_reports_rescore_byte_identically(key: str) -> None:
     assert _canonical(rebuilt["target_chemistry"]) == _canonical(holdout.target_jsr_metric(stored["metric_rows"]))
     assert rebuilt["target_chemistry_contract_sha256"] == CASE2_SHA256
     assert rebuilt["holdout_fingerprint"] == stored["holdout_fingerprint"]
+
+
+LEGACY_ENV = {"OMP_NUM_THREADS": "2", "MKL_NUM_THREADS": "2"}
+LEGACY_START = "forkserver"
+
+
+def _legacy_fingerprint(row: dict[str, Any], thread_env: Any, start_method: Any) -> str:
+    """Hash the pre-lock checkpoint identity independently of the worker."""
+    identity = {
+        "mechanism_semantic_sha256": "saved-mechanism",
+        "thread_env": thread_env,
+        "process_start_method": start_method,
+        "row": row,
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _write_legacy_jsr(
+    tmp_path: Path, count: int = 3, response: dict[str, Any] | None = None, *, write_response: bool = True
+) -> tuple[Path, dict[str, Any]]:
+    """Write a saved JSR run whose checkpoint is keyed wholly under the pre-lock form."""
+    temperatures = tuple(600.0 + i for i in range(count))
+    metric_rows = [
+        {
+            "row_id": str(i),
+            "species": s,
+            "experimental": exp,
+            "simulated": sim,
+            "temperature_k": t,
+            "detection_limit": None,
+        }
+        for i, t in enumerate(temperatures)
+        for s, exp, sim in (("CH4", 0.01, 0.02), ("O2", 0.1, 0.2))
+    ]
+    report = _jsr_report()
+    report.update(
+        metric_rows=metric_rows,
+        metric=score_metric(metric_rows),
+        row_results=[
+            {"row_id": str(i), "status": "ok", "reason": None, "temperature_k": t} for i, t in enumerate(temperatures)
+        ],
+    )
+    rows = [{"row_id": str(i), "status": "ok", "mole_fractions": {"CH4": 0.02, "O2": 0.2}} for i in range(count)]
+    path = _write_saved_jsr(tmp_path, report, rows, temperatures)
+    report.update(thread_env=LEGACY_ENV, row_process_start_method=LEGACY_START)
+    path.write_text(json.dumps(report))
+    requests = {r["row_id"]: r for r in json.loads((tmp_path / "request.json").read_text())["rows"]}
+    entries = [
+        {"fingerprint": _legacy_fingerprint(requests[r["row_id"]], LEGACY_ENV, LEGACY_START), "result": r} for r in rows
+    ]
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps(e) + "\n" for e in entries))
+    if write_response:
+        recorded = {"thread_env": LEGACY_ENV, "row_process_start_method": LEGACY_START, "simulation_lock_sha256": "run"}
+        identity = {"mechanism_semantic_sha256": "saved-mechanism", "rows": rows}
+        (tmp_path / "response.json").write_text(
+            json.dumps({**identity, **(recorded if response is None else response)})
+        )
+    return path, report
+
+
+def _inputs(tmp_path: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(tmp_path.iterdir())}
+
+
+def test_rescore_accepts_whole_file_pre_lock_v0_and_labels_it(tmp_path: Path) -> None:
+    """A checkpoint keyed wholly under pre_lock_v0 rescores, labelled lock-unbound, with the run's own lock."""
+    path, report = _write_legacy_jsr(tmp_path)
+    assert LEGACY_ENV != cantera_worker.THREAD_ENV and LEGACY_START != cantera_worker.ROW_PROCESS_START_METHOD
+    before = _inputs(tmp_path)
+    rebuilt = rescore_saved_jsr(path)
+    assert before == _inputs(tmp_path)
+    assert rebuilt["metric"] == report["metric"]
+    inputs = rebuilt["rescore_inputs"]
+    assert inputs["checkpoint_fingerprint_form"] == "pre_lock_v0"
+    assert "bound to no simulation lock" in inputs["simulation_lock_binding"]
+    assert "simulation_lock_sha256" not in rebuilt and "simulation_lock" not in rebuilt
+    response = tmp_path / "response.json"
+    assert inputs["run_recorded_lock"] == {
+        "simulation_lock_sha256": "run",
+        "source_path": str(response),
+        "source_sha256": hashlib.sha256(response.read_bytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("response", [None, {"thread_env": LEGACY_ENV}])
+def test_rescore_pre_lock_v0_omits_run_lock_without_a_run_written_source(
+    tmp_path: Path, response: dict[str, Any] | None
+) -> None:
+    """With no response.json, or one that records no lock, no run_recorded_lock appears."""
+    path, _ = _write_legacy_jsr(tmp_path, response=response, write_response=response is not None)
+    inputs = rescore_saved_jsr(path)["rescore_inputs"]
+    assert inputs["checkpoint_fingerprint_form"] == "pre_lock_v0"
+    assert "run_recorded_lock" not in inputs
+
+
+def test_rescore_refuses_pre_lock_v0_file_with_one_altered_line(tmp_path: Path) -> None:
+    """One altered line among 144 pre_lock_v0 lines refuses the whole file."""
+    path, _ = _write_legacy_jsr(tmp_path, count=144)
+    checkpoint = tmp_path / "rows.jsonl"
+    entries = [json.loads(line) for line in checkpoint.read_text().splitlines()]
+    entries[71]["fingerprint"] = "0" * 64
+    checkpoint.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    with pytest.raises(ValueError, match=r"^1/144 checkpoint fingerprints do not match the pre_lock_v0 form"):
+        rescore_saved_jsr(path)
+
+
+@pytest.mark.parametrize(
+    "defect",
+    ["no_thread_env", "no_start_method", "thread_env_list", "thread_env_empty", "thread_env_int", "start_blank"],
+)
+def test_rescore_pre_lock_v0_refuses_without_recorded_run_fields(tmp_path: Path, defect: str) -> None:
+    """A missing or ill-typed thread_env or start method refuses; no constant or default stands in."""
+    path, report = _write_legacy_jsr(tmp_path)
+    if defect == "no_thread_env":
+        del report["thread_env"]
+    elif defect == "no_start_method":
+        del report["row_process_start_method"]
+    elif defect == "start_blank":
+        report["row_process_start_method"] = " "
+    else:
+        report["thread_env"] = {"thread_env_list": ["1"], "thread_env_empty": {}, "thread_env_int": {"A": 1}}[defect]
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match=r"^3/3 checkpoint fingerprints do not match; pre_lock_v0 not checked"):
+        rescore_saved_jsr(path)
+
+
+@pytest.mark.parametrize("field", ["thread_env", "row_process_start_method"])
+def test_rescore_pre_lock_v0_refuses_when_response_disagrees(tmp_path: Path, field: str) -> None:
+    """The report's run fields must agree with the run's own response.json."""
+    response = {"thread_env": LEGACY_ENV, "row_process_start_method": LEGACY_START}
+    response[field] = {"OMP_NUM_THREADS": "1"} if field == "thread_env" else "spawn"
+    path, _ = _write_legacy_jsr(tmp_path, response=response)
+    with pytest.raises(ValueError, match=f"record different {field}"):
+        rescore_saved_jsr(path)
+
+
+@pytest.mark.parametrize("majority", ["today", "pre_lock_v0"])
+def test_rescore_refuses_mixed_fingerprint_forms(tmp_path: Path, majority: str) -> None:
+    """A checkpoint holding lines of both forms refuses, whichever form holds most lines."""
+    path, report = _write_legacy_jsr(tmp_path)
+    checkpoint = tmp_path / "rows.jsonl"
+    legacy = checkpoint.read_text().splitlines()
+    results = [json.loads(line)["result"] for line in legacy]
+    _write_saved_jsr(tmp_path, copy.deepcopy(report), results, (600.0, 601.0, 602.0))
+    path.write_text(json.dumps(report))
+    today = checkpoint.read_text().splitlines()
+    lines = today[:2] + legacy[2:] if majority == "today" else today[:1] + legacy[1:]
+    checkpoint.write_text("".join(line + "\n" for line in lines))
+    with pytest.raises(ValueError, match="mixed checkpoint fingerprint forms"):
+        rescore_saved_jsr(path)
+
+
+def test_rescore_counts_fingerprint_mismatches(tmp_path: Path) -> None:
+    """When every row is present but no fingerprint matches, the refusal says so with real counts."""
+    report = _jsr_report()
+    rows = [{"row_id": str(i), "status": "ok", "mole_fractions": {"CH4": 0.02, "O2": 0.2}} for i in range(3)]
+    path = _write_saved_jsr(tmp_path, report, rows)
+    report["plog_validation_sha256"] = "changed"
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match=r"^3/3 checkpoint fingerprints do not match"):
+        rescore_saved_jsr(path)
+
+
+def test_today_form_rescore_output_carries_no_legacy_labels(tmp_path: Path) -> None:
+    """A today's-form rescore keeps its lock fields and its original four rescore_inputs keys."""
+    report = _jsr_report()
+    rows = [{"row_id": str(i), "status": "ok", "mole_fractions": {"CH4": 0.02, "O2": 0.2}} for i in range(3)]
+    report.update(thread_env=LEGACY_ENV, row_process_start_method=LEGACY_START)
+    rebuilt = rescore_saved_jsr(_write_saved_jsr(tmp_path, report, rows))
+    assert set(rebuilt["rescore_inputs"]) == {"report_path", "report_sha256", "rows_path", "rows_sha256"}
+    assert rebuilt["simulation_lock_sha256"] == report["simulation_lock_sha256"]
+    assert rebuilt["simulation_lock"] == report["simulation_lock"]
+
+
+@pytest.mark.parametrize("position", ["v_old", "v_new"])
+def test_jsr_intervals_refuse_a_pre_lock_v0_rescore(tmp_path: Path, position: str) -> None:
+    """Pairing refuses a pre_lock_v0 rescore, which carries no simulation lock to pair on."""
+    path, _ = _write_legacy_jsr(tmp_path)
+    legacy = rescore_saved_jsr(path)
+    other = _jsr_report()
+    pair = (legacy, other) if position == "v_old" else (other, legacy)
+    with pytest.raises(ValueError, match=f"{position} is a pre_lock_v0 rescore: pairing needs a simulation lock"):
+        jsr_intervals(*pair)
+
+
+def _schema1_lock(*, timeout: bool = True) -> dict[str, Any]:
+    """Return a schema-1 lock built from the committed lock, with or without the JSR timeout."""
+    lock = cantera_worker.simulation_lock(600.0, "3.1.0")
+    lock["schema_version"] = 1
+    if timeout:
+        lock["jsr"]["steady_state_timeout_s"] = 600.0
+    return lock
+
+
+def _write_legacy_timeout_jsr(
+    tmp_path: Path, restamp: dict[str, Any], response: dict[str, Any] | None
+) -> tuple[Path, dict[str, Any]]:
+    """Write a pre_lock_v0 run whose row 0 is a matching steady_state_timeout refusal."""
+    path, report = _write_legacy_jsr(tmp_path, response=response, write_response=response is not None)
+    report["row_results"][0].update(status="refused", reason="steady_state_timeout")
+    for row in report["metric_rows"]:
+        if row["row_id"] == "0":
+            row.update(simulated=None, refusal="steady_state_timeout")
+    report["metric"] = score_metric(report["metric_rows"])
+    report["simulation_lock"] = restamp
+    path.write_text(json.dumps(report))
+    checkpoint = tmp_path / "rows.jsonl"
+    entries = [json.loads(line) for line in checkpoint.read_text().splitlines()]
+    entries[0]["result"] = {"row_id": "0", "status": "refused", "reason": "steady_state_timeout"}
+    checkpoint.write_text("".join(json.dumps(e) + "\n" for e in entries))
+    if response is not None:
+        recorded = json.loads((tmp_path / "response.json").read_text())
+        recorded["rows"][0] = entries[0]["result"]
+        (tmp_path / "response.json").write_text(json.dumps(recorded))
+    return path, report
+
+
+def _bound_response(lock: dict[str, Any]) -> dict[str, Any]:
+    """Return a response.json body that records the lock bound to its own digest."""
+    return {
+        "thread_env": LEGACY_ENV,
+        "row_process_start_method": LEGACY_START,
+        "simulation_lock": lock,
+        "simulation_lock_sha256": holdout_intervals._lock_sha256(lock),
+    }
+
+
+def test_lock_sha256_matches_the_worker_digest() -> None:
+    """The rescore's lock digest equals the digest the worker records for the same lock."""
+    lock = cantera_worker.simulation_lock(600.0, "3.1.0")
+    assert hashlib.sha256(
+        json.dumps(lock, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest() == cantera_worker.simulation_lock_sha256(600.0, "3.1.0")
+
+
+def test_rescore_pre_lock_v0_checks_timeouts_against_the_run_lock(tmp_path: Path) -> None:
+    """A schema-2 restamp does not refuse a timeout row whose run lock is a bound schema-1 lock."""
+    restamp = {**_schema1_lock(), "schema_version": 2}
+    path, report = _write_legacy_timeout_jsr(tmp_path, restamp, _bound_response(_schema1_lock()))
+    before = _inputs(tmp_path)
+    rebuilt = rescore_saved_jsr(path)
+    assert before == _inputs(tmp_path)
+    assert rebuilt["metric"] == report["metric"]
+    assert rebuilt["rescore_inputs"]["checkpoint_fingerprint_form"] == "pre_lock_v0"
+    assert "simulation_lock" not in rebuilt
+
+
+@pytest.mark.parametrize(
+    ("defect", "problem"),
+    [
+        ("absent", "no response.json"),
+        ("no_lock", "holds no simulation_lock object"),
+        ("lock_not_object", "holds no simulation_lock object"),
+        ("no_digest", "does not bind to its simulation_lock_sha256"),
+        ("wrong_digest", "does not bind to its simulation_lock_sha256"),
+    ],
+)
+def test_rescore_pre_lock_v0_refuses_timeouts_without_a_bound_run_lock(
+    tmp_path: Path, defect: str, problem: str
+) -> None:
+    """A timeout row on the pre_lock_v0 path refuses when the run's lock is missing or unbound."""
+    response: dict[str, Any] | None = _bound_response(_schema1_lock())
+    assert response is not None
+    if defect == "absent":
+        response = None
+    elif defect == "no_lock":
+        del response["simulation_lock"]
+    elif defect == "lock_not_object":
+        response["simulation_lock"] = "lock"
+    elif defect == "no_digest":
+        del response["simulation_lock_sha256"]
+    else:
+        response["simulation_lock"]["jsr"]["rtol"] = 1.0
+    path, _ = _write_legacy_timeout_jsr(tmp_path, {**_schema1_lock(), "schema_version": 2}, response)
+    with pytest.raises(ValueError, match=f"^steady_state_timeout requires its historical simulation lock: .*{problem}"):
+        rescore_saved_jsr(path)
+
+
+def test_rescore_pre_lock_v0_restamp_never_rescues_a_timeout(tmp_path: Path) -> None:
+    """A valid schema-1 restamp cannot accept a timeout the bound run lock does not support."""
+    path, _ = _write_legacy_timeout_jsr(tmp_path, _schema1_lock(), _bound_response(_schema1_lock(timeout=False)))
+    with pytest.raises(ValueError, match=r"^steady_state_timeout requires its historical simulation lock$"):
+        rescore_saved_jsr(path)
+
+
+def test_today_form_timeout_still_checks_the_report_lock(tmp_path: Path) -> None:
+    """Today's form judges a timeout by the report's lock and ignores a bound response.json lock."""
+    report = _jsr_report()
+    report["simulation_lock"] = {**_schema1_lock(), "schema_version": 2}
+    rows = [{"row_id": str(i), "status": "ok", "mole_fractions": {"CH4": 0.02, "O2": 0.2}} for i in range(3)]
+    rows[0].update(status="refused", reason="steady_state_timeout")
+    report["row_results"][0].update(status="refused", reason="steady_state_timeout")
+    path = _write_saved_jsr(tmp_path, report, rows)
+    (tmp_path / "response.json").write_text(json.dumps(_bound_response(_schema1_lock())))
+    with pytest.raises(ValueError, match=r"^steady_state_timeout requires its historical simulation lock$"):
+        rescore_saved_jsr(path)
+
+
+def test_rescore_pre_lock_v0_accepts_a_matching_response(tmp_path: Path) -> None:
+    """A response.json recording this run's mechanism and saved rows is used for the lock and the label."""
+    path, report = _write_legacy_timeout_jsr(tmp_path, _schema1_lock(), _bound_response(_schema1_lock()))
+    before = _inputs(tmp_path)
+    rebuilt = rescore_saved_jsr(path)
+    assert before == _inputs(tmp_path)
+    assert rebuilt["metric"] == report["metric"]
+    response = tmp_path / "response.json"
+    assert rebuilt["rescore_inputs"]["run_recorded_lock"] == {
+        "simulation_lock_sha256": holdout_intervals._lock_sha256(_schema1_lock()),
+        "source_path": str(response),
+        "source_sha256": hashlib.sha256(response.read_bytes()).hexdigest(),
+    }
+
+
+def _edit_response(tmp_path: Path, edit: Any) -> None:
+    """Apply ``edit`` to the saved response.json body in place."""
+    response = tmp_path / "response.json"
+    body = json.loads(response.read_text())
+    edit(body)
+    response.write_text(json.dumps(body))
+
+
+@pytest.mark.parametrize(
+    ("mechanism", "message"),
+    [
+        ("other-mechanism", "^saved report and response.json record different mechanism_semantic_sha256$"),
+        (None, "^response.json lacks a mechanism_semantic_sha256$"),
+        (7, "^response.json lacks a mechanism_semantic_sha256$"),
+    ],
+)
+def test_rescore_pre_lock_v0_refuses_another_runs_mechanism(tmp_path: Path, mechanism: Any, message: str) -> None:
+    """A response.json with another, missing or ill-typed mechanism refuses, even with a bound schema-1 lock."""
+    path, _ = _write_legacy_timeout_jsr(tmp_path, _schema1_lock(), _bound_response(_schema1_lock()))
+    rescore_saved_jsr(path)
+
+    def edit(body: dict[str, Any]) -> None:
+        if mechanism is None:
+            del body["mechanism_semantic_sha256"]
+        else:
+            body["mechanism_semantic_sha256"] = mechanism
+
+    _edit_response(tmp_path, edit)
+    with pytest.raises(ValueError, match=message):
+        rescore_saved_jsr(path)
+
+
+@pytest.mark.parametrize(
+    ("defect", "message"),
+    [
+        ("row_ok", "^saved row 0 differs between rows.jsonl and response.json$"),
+        ("row_missing", "^response.json lacks saved row 1$"),
+        ("no_rows", "^response.json holds no rows list keyed by row_id$"),
+        ("rows_object", "^response.json holds no rows list keyed by row_id$"),
+        ("row_without_id", "^response.json holds no rows list keyed by row_id$"),
+        ("duplicate", "^duplicate response.json row ID: 2$"),
+    ],
+)
+def test_rescore_pre_lock_v0_refuses_a_response_row_mismatch(tmp_path: Path, defect: str, message: str) -> None:
+    """A response.json whose rows do not record every saved checkpoint result refuses."""
+    path, _ = _write_legacy_timeout_jsr(tmp_path, _schema1_lock(), _bound_response(_schema1_lock()))
+    rescore_saved_jsr(path)
+
+    def edit(body: dict[str, Any]) -> None:
+        rows = body["rows"]
+        if defect == "row_ok":
+            rows[0] = {"row_id": "0", "status": "ok", "mole_fractions": {"CH4": 0.02, "O2": 0.2}}
+        elif defect == "row_missing":
+            del rows[1]
+        elif defect == "no_rows":
+            del body["rows"]
+        elif defect == "rows_object":
+            body["rows"] = {row["row_id"]: row for row in rows}
+        elif defect == "row_without_id":
+            del rows[2]["row_id"]
+        else:
+            rows.append(dict(rows[2]))
+
+    _edit_response(tmp_path, edit)
+    with pytest.raises(ValueError, match=message):
+        rescore_saved_jsr(path)
+
+
+def _rerun_dir(source: Path, target: Path, rebuilt: dict[str, Any]) -> Path:
+    """Copy a run's request, checkpoint and response beside a rescore output written as its report."""
+    target.mkdir()
+    for name in ("request.json", "rows.jsonl", "response.json"):
+        if (source / name).exists():
+            (target / name).write_bytes((source / name).read_bytes())
+    path = target / "report.json"
+    path.write_text(json.dumps(rebuilt))
+    return path
+
+
+def test_rescore_of_a_pre_lock_v0_rescore_is_accepted_again(tmp_path: Path) -> None:
+    """A saved pre_lock_v0 rescore, rescored again from the same run files, stays pre_lock_v0 with an equal metric."""
+    first_dir = tmp_path / "run"
+    first_dir.mkdir()
+    path, report = _write_legacy_jsr(first_dir)
+    first = rescore_saved_jsr(path)
+    assert "simulation_lock_sha256" not in first
+    second_path = _rerun_dir(first_dir, tmp_path / "again", first)
+    before = _inputs(second_path.parent)
+    second = rescore_saved_jsr(second_path)
+    assert before == _inputs(second_path.parent)
+    assert second["rescore_inputs"]["checkpoint_fingerprint_form"] == "pre_lock_v0"
+    assert second["metric"] == first["metric"] == report["metric"]
+    assert second["rescore_inputs"]["report_sha256"] == hashlib.sha256(second_path.read_bytes()).hexdigest()
+    assert second["rescore_inputs"]["run_recorded_lock"]["simulation_lock_sha256"] == "run"
+
+
+@pytest.mark.parametrize("missing", ["thread_env", "row_process_start_method"])
+def test_rescore_refuses_a_lockless_report_without_legacy_inputs(tmp_path: Path, missing: str) -> None:
+    """A report lacking its lock and a legacy input is refused with a ValueError naming both gaps."""
+    path, report = _write_legacy_jsr(tmp_path)
+    del report["simulation_lock_sha256"], report[missing]
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match=rf"^report lacks simulation_lock_sha256.*report lacks a recorded {missing}"):
+        rescore_saved_jsr(path)
+
+
+def test_rescore_refuses_a_lockless_report_with_an_empty_checkpoint(tmp_path: Path) -> None:
+    """A lock-less report whose checkpoint has no lines is refused, never accepted under today's form."""
+    path, report = _write_legacy_jsr(tmp_path)
+    del report["simulation_lock_sha256"]
+    path.write_text(json.dumps(report))
+    (tmp_path / "rows.jsonl").write_text("")
+    with pytest.raises(ValueError, match=r"^report lacks simulation_lock_sha256.*the checkpoint has no lines"):
+        rescore_saved_jsr(path)
+
+
+def test_rescore_of_a_timeout_rescore_names_the_absent_report_lock(tmp_path: Path) -> None:
+    """Rescoring a timeout rescore whose run lock is gone names the report's absent lock in the refusal."""
+    first_dir = tmp_path / "run"
+    first_dir.mkdir()
+    path, _ = _write_legacy_timeout_jsr(
+        first_dir, {**_schema1_lock(), "schema_version": 2}, _bound_response(_schema1_lock())
+    )
+    second_path = _rerun_dir(first_dir, tmp_path / "again", rescore_saved_jsr(path))
+    (second_path.parent / "response.json").unlink()
+    with pytest.raises(ValueError, match=r"no response\.json; report lacks simulation_lock_sha256$"):
+        rescore_saved_jsr(second_path)
+
+
+def test_today_form_report_with_lock_fields_is_accepted_as_before(tmp_path: Path) -> None:
+    """A today's-form report rescores to the report itself plus only the recomputed target and rescore inputs."""
+    report = _jsr_report()
+    rows = [{"row_id": str(i), "status": "ok", "mole_fractions": {"CH4": 0.02, "O2": 0.2}} for i in range(3)]
+    path = _write_saved_jsr(tmp_path, report, rows)
+    stored = json.loads(path.read_bytes())
+    rebuilt = rescore_saved_jsr(path)
+    added = {"target_chemistry", "target_chemistry_contract_sha256", "rescore_inputs"}
+    assert {k: v for k, v in rebuilt.items() if k not in added} == stored
+    assert rebuilt["rescore_inputs"] == {
+        "report_path": str(path),
+        "report_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "rows_path": str(tmp_path / "rows.jsonl"),
+        "rows_sha256": hashlib.sha256((tmp_path / "rows.jsonl").read_bytes()).hexdigest(),
+    }
