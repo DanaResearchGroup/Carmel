@@ -2062,6 +2062,7 @@ def test_score_holdout_cli_writes_the_report(tmp_path: Path, monkeypatch: pytest
 
 
 def test_run_harness_builds_a_telemetry_rich_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The harness reports telemetry after an ether-target preflight that sees only row metadata."""
     monkeypatch.setattr(holdout, "canonical", lambda value: value)
     contract_path = tmp_path / "contract.json"
     mechanism_path = tmp_path / "mechanism.inp"
@@ -2123,7 +2124,17 @@ def test_run_harness_builds_a_telemetry_rich_report(tmp_path: Path, monkeypatch:
         ),
     )
 
+    events: list[tuple[str, list[dict[str, Any]]]] = []
+    real_target_chemistry = holdout._target_chemistry
+
+    def recording_target_chemistry(contract: Any, metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        events.append(("target", [dict(entry) for entry in metric_rows]))
+        return real_target_chemistry(contract, metric_rows)
+
+    monkeypatch.setattr(holdout, "_target_chemistry", recording_target_chemistry)
+
     def fake_worker(request: WorkerRequest, **_: Any) -> WorkerResponse:
+        events.append(("worker", []))
         assert request.row_timeout_s == 12.0
         assert request.workers == 3
         assert request.observable == "jsr"
@@ -2186,6 +2197,16 @@ def test_run_harness_builds_a_telemetry_rich_report(tmp_path: Path, monkeypatch:
         workers=3,
     )
 
+    first_run = list(events)
+    assert [kind for kind, _ in first_run] == ["target", "worker", "target"]
+    preflight = first_run[0][1]
+    assert all(set(entry) == {"row_id", "species", "temperature_k"} for entry in preflight)
+    assert preflight == [
+        {"row_id": row["row_id"], "species": species, "temperature_k": row["temperature_k"]}
+        for row in rows
+        for species in row["observations"]
+    ]
+    assert len(preflight) == 5
     assert report["convergence_gate"]["passed"] is False
     assert report["row_results"][0]["status"] == "ok"
     assert report["row_results"][1] == {

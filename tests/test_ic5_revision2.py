@@ -262,3 +262,115 @@ def test_harness_refuses_a_drifted_window_before_any_simulation(
             run_dir=tmp_path / "run",
             cantera_python=Path("fake-python"),
         )
+
+
+def test_harness_scores_a_held_window_after_a_metadata_only_preflight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A case-3 window holding its frozen counts passes a metadata-only preflight, then simulates and scores."""
+    from types import SimpleNamespace
+
+    from carmel.benchmarks.cantera_worker import THREAD_ENV, simulation_lock, simulation_lock_sha256
+
+    paths = {name: tmp_path / name for name in ("contract.json", "mechanism.inp", "thermo.dat", "split.zip")}
+    for path in paths.values():
+        path.write_bytes(b"x\n")
+    products = [f"P{index:02d}" for index in range(14)]
+    contract = SimpleNamespace(
+        case="iso-pentane-low-t",
+        mechanisms={"v_old": SimpleNamespace(verify=lambda _: None)},
+        scoring=SimpleNamespace(target_chemistry=TARGET),
+        split=SimpleNamespace(
+            archive=SimpleNamespace(sha256="f" * 64),
+            model_dump=lambda **_: {"archive": {"sha256": "f" * 64}, "studies": []},
+        ),
+        old_species=(SimpleNamespace(label="FUEL", smiles="C"),),
+        new_species=tuple(SimpleNamespace(label=label, smiles=label) for label in products),
+    )
+    temperatures = [600.0 + 10.0 * index for index in range(31)] + [1000.0]
+    rows = [
+        {
+            "row_id": f"r:{index}",
+            "record": "synthetic.xml",
+            "temperature_k": temperature,
+            "pressure_pa": 101325.0,
+            "residence_time_s": 2.0,
+            "volume_m3": 8.5e-5,
+            "inlet": {"FUEL": 1.0},
+            "observations": {label: 0.01 for label in products},
+            "record_structures": {},
+        }
+        for index, temperature in enumerate(temperatures)
+    ]
+    events: list[tuple[str, list[dict[str, Any]]]] = []
+    real_target_chemistry = holdout._target_chemistry
+
+    def recording_target_chemistry(contract: Any, metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        events.append(("target", copy.deepcopy(metric_rows)))
+        return real_target_chemistry(contract, metric_rows)
+
+    def fake_worker(request: holdout.WorkerRequest, **_: Any) -> holdout.WorkerResponse:
+        events.append(("worker", []))
+        return holdout.WorkerResponse.model_validate(
+            {
+                "schema_version": 1,
+                "status": "ok",
+                "rows": [
+                    {
+                        "row_id": row.row_id,
+                        "status": "ok",
+                        "mole_fractions": {label: 0.02 for label in products},
+                        "wall_time_s": 0.25,
+                        "integrator_steps": 42,
+                    }
+                    for row in request.rows
+                ],
+                "converter": {"events": [], "refusals": [], "returncode": 0, "log": ""},
+                "trimmed_yaml_sha256": "d" * 64,
+                "mechanism_semantic_sha256": "e" * 64,
+                "cantera_version": "3.2.0",
+                "row_workers": 1,
+                "configured_workers": 1,
+                "row_timeout_s": 12.0,
+                "checkpoint_path": str(tmp_path / "run" / "rows.jsonl"),
+                "thread_env": THREAD_ENV,
+                "row_process_start_method": "spawn",
+                "load_average_at_start": [1.0, 2.0, 3.0],
+                "simulation_lock": simulation_lock(12.0, "3.2.0"),
+                "simulation_lock_sha256": simulation_lock_sha256(12.0, "3.2.0"),
+            }
+        )
+
+    monkeypatch.setattr(holdout, "canonical", lambda value: value)
+    monkeypatch.setattr(holdout, "load_contract", lambda _: contract)
+    monkeypatch.setattr(holdout, "_load_rows", lambda *_: rows)
+    monkeypatch.setattr(holdout, "mechanism", lambda _: (["FUEL", *products], [{"equation": "FUEL=P00", "line": 7}]))
+    monkeypatch.setattr(holdout, "_target_chemistry", recording_target_chemistry)
+    monkeypatch.setattr(holdout, "invoke_cantera_worker", fake_worker)
+    report = holdout.run_harness(
+        contract_path=paths["contract.json"],
+        mechanism_path=paths["mechanism.inp"],
+        mechanism_key="v_old",
+        thermo_path=paths["thermo.dat"],
+        thermo_url="https://example.test/thermo.dat",
+        thermo_retrieval_date="2026-11-23",
+        thermo_sha256=hashlib.sha256(b"x\n").hexdigest(),
+        archive_path=paths["split.zip"],
+        run_dir=tmp_path / "run",
+        cantera_python=Path("fake-python"),
+        row_timeout_s=12.0,
+        workers=1,
+    )
+
+    assert [kind for kind, _ in events] == ["target", "worker", "target"]
+    preflight = events[0][1]
+    assert all(set(entry) == {"row_id", "species", "temperature_k"} for entry in preflight)
+    assert preflight == [
+        {"row_id": row["row_id"], "species": label, "temperature_k": row["temperature_k"]}
+        for row in rows
+        for label in row["observations"]
+    ]
+    assert len(preflight) == 32 * 14
+    assert report["rows"]["converged"] == 32
+    assert report["target_chemistry"] == holdout.target_window_metric(report["metric_rows"], TARGET)
+    assert (report["target_chemistry"]["total_rows"], report["target_chemistry"]["total_observations"]) == (31, 434)
