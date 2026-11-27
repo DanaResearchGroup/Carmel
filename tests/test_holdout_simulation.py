@@ -2476,3 +2476,37 @@ def test_response_accepts_timeout_rows_only_under_historical_lock(reason: str, o
     data["simulation_lock"] = simulation_lock(3600.0, "3.2.0")
     with pytest.raises(ValueError, match="historical simulation lock"):
         WorkerResponse.model_validate(data)
+
+
+def test_write_path_neither_writes_nor_loads_pre_lock_v0(tmp_path: Path) -> None:
+    """The legacy pre-lock form is read-only: the worker never writes it and never resumes from it."""
+    row = _worker_row()
+    thread_env, start_method = cantera_worker.THREAD_ENV, cantera_worker.ROW_PROCESS_START_METHOD
+    legacy = cantera_worker.checkpoint_fingerprint_pre_lock_v0("mechanism", row, thread_env, start_method)
+    checkpoint = tmp_path / "rows.jsonl"
+    result = {"row_id": row["row_id"], "status": "ok", "mole_fractions": {"CH4": 0.1}}
+    cantera_worker._append_checkpoint(checkpoint, "mechanism", row, result, 600.0, "3.2.0")
+    assert json.loads(checkpoint.read_text())["fingerprint"] != legacy
+    checkpoint.write_text(json.dumps({"fingerprint": legacy, "result": result}) + "\n")
+    assert cantera_worker._load_checkpoint(checkpoint, [row], "mechanism", 600.0, "3.2.0") == {}
+    tree = ast.parse(Path(cantera_worker.__file__).read_text())
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "checkpoint_fingerprint_pre_lock_v0"
+    ]
+    assert calls == []
+
+
+def test_both_fingerprint_forms_are_pinned() -> None:
+    """Today's form and the legacy pre-lock form each hash a fixed row to a fixed value."""
+    row = {"row_id": "r0", "temperature_k": 700.0}
+    env = {"OMP_NUM_THREADS": "1"}
+    assert cantera_worker.checkpoint_fingerprint("m", row, "lock", "plog") == (
+        "e0e11a39a11dfe72de00d8fe40e09707f40c5ed8308c6421b833b91a7785d462"
+    )
+    assert cantera_worker.checkpoint_fingerprint_pre_lock_v0("m", row, env, "spawn") == (
+        "9140978a7b419e34147cd3854dcb00feffbf676c11b132dac0301e342b94ff82"
+    )
